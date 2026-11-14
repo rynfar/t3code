@@ -15,7 +15,13 @@ use crate::server_config::ServerSettings;
 pub const DISCOVER: &str = "server.discoverSourceControl";
 
 /// The merge method select: `last` saves null.
-pub const MERGE_METHODS: [(&str, &str); 4] = [("last", "Last selected"), ("merge", "Merge"), ("squash", "Squash and merge"), ("rebase", "Rebase and merge")];
+pub const MERGE_METHODS: [(&str, &str); 5] = [
+    ("last", "Last selected"),
+    ("merge", "Merge"),
+    ("squash", "Squash and merge"),
+    ("rebase", "Rebase and merge"),
+    ("fast-forward", "Fast-forward merge"),
+];
 
 pub fn merge_method_value(method: Option<MergeMethod>) -> &'static str {
     method.map_or("last", MergeMethod::as_str)
@@ -27,6 +33,7 @@ pub fn parse_merge_method(value: &str) -> Option<Option<MergeMethod>> {
         "merge" => Some(Some(MergeMethod::Merge)),
         "squash" => Some(Some(MergeMethod::Squash)),
         "rebase" => Some(Some(MergeMethod::Rebase)),
+        "fast-forward" => Some(Some(MergeMethod::FastForward)),
         _ => None,
     }
 }

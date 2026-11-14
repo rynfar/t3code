@@ -71,6 +71,8 @@ pub enum T3McpSummaryAction {
     EnvironmentLink,
     EnvironmentUnlink,
     EnvironmentUpdate,
+    ThemeRead,
+    ThemeSet,
     AttachmentPrepare,
     AttachmentDiscard,
     AttachmentSend,
@@ -85,6 +87,7 @@ pub enum T3McpSummaryAction {
     Device,
     HtmlPreview,
     HtmlRender,
+    SendToUser,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +226,8 @@ const T3_MCP_TOOLS: &[T3McpToolDefinition] = &[
     t3_tool("t3_environment_link", "Ask to link", "Asking to link", "Asked to link", "an environment", T3McpSummaryAction::EnvironmentLink),
     t3_tool("t3_environment_unlink", "Forget", "Forgetting", "Forgot", "a linked environment", T3McpSummaryAction::EnvironmentUnlink),
     t3_tool("t3_environment_preferences_update", "Update", "Updating", "Updated", "environment preferences", T3McpSummaryAction::EnvironmentUpdate),
+    t3_tool("t3_theme_read", "Read", "Reading", "Read", "themes", T3McpSummaryAction::ThemeRead),
+    t3_tool("t3_theme_set", "Set", "Setting", "Set", "the theme", T3McpSummaryAction::ThemeSet),
     t3_tool("t3_thread_launch", "Launch", "Launching", "Launched", "a project thread", T3McpSummaryAction::ThreadCreate),
     t3_tool("t3_project_list", "List", "Listing", "Listed", "projects", T3McpSummaryAction::ProjectList),
     t3_tool("t3_project_read", "Read", "Reading", "Read", "a project", T3McpSummaryAction::ProjectRead),
@@ -235,6 +240,7 @@ const T3_MCP_TOOLS: &[T3McpToolDefinition] = &[
     t3_tool("t3_thread_send_attachments", "Send", "Sending", "Sent", "attachments", T3McpSummaryAction::AttachmentSend),
     t3_tool("html_preview", "Preview", "Previewing", "Previewed", "an HTML page", T3McpSummaryAction::HtmlPreview),
     t3_tool("html_render", "Render", "Rendering", "Rendered", "an HTML page", T3McpSummaryAction::HtmlRender),
+    t3_tool("send_to_user", "Send", "Sending", "Sent", "a message", T3McpSummaryAction::SendToUser),
 ];
 
 fn lookup_tool(name: &str) -> Option<&'static T3McpToolDefinition> {
@@ -774,6 +780,8 @@ pub fn summarize_t3_tool_calls(action: T3McpSummaryAction, calls: &[T3ToolSummar
         ProjectClone => phrase("Cloned", "clone", &quantity_plural(count_entities(entity_ids("cwd")), "repository", "repositories")),
         EnvironmentRead => phrase("Checked", "check", &format!("environment preferences {times}")),
         EnvironmentUpdate => phrase("Updated", "update", &format!("environment preferences {times}")),
+        ThemeRead => phrase("Checked", "check", &format!("themes {times}")),
+        ThemeSet => phrase("Set", "set", &format!("the theme {times}")),
         EnvironmentLinks => phrase("Listed", "list", &format!("linked environments {times}")),
         EnvironmentLink => phrase("Asked to link", "ask to link", &quantity(selected.len(), "environment")),
         EnvironmentUnlink => phrase("Forgot", "forget", &quantity(count_entities(entity_ids("environmentId")), "linked environment")),
@@ -839,6 +847,7 @@ pub fn summarize_t3_tool_calls(action: T3McpSummaryAction, calls: &[T3ToolSummar
         Device => phrase("Used", "use", &format!("device controls {times}")),
         HtmlPreview => phrase("Previewed", "preview", &quantity(selected.len(), "HTML page")),
         HtmlRender => phrase("Rendered", "render", &quantity(selected.len(), "HTML page")),
+        SendToUser => phrase("Sent", "send", &quantity(selected.len(), "message")),
         Capabilities => phrase("Checked", "check", &format!("orchestration capabilities {times}")),
     };
     (label, failed_count)
@@ -897,5 +906,11 @@ mod tests {
         }]);
         assert_eq!(label, "Started 1 review guide, 1 failed");
         assert_eq!(failed, 1);
+
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("t3_theme_read"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::ThemeRead));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("t3_theme_set"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::ThemeSet));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("send_to_user"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::SendToUser));
+        assert_eq!(summarize_t3_tool_calls(T3McpSummaryAction::ThemeSet, &[T3ToolSummaryCall { input: None, output: None, outcome: T3ToolOutcome::Completed }]).0, "Set the theme 1 time");
+        assert_eq!(summarize_t3_tool_calls(T3McpSummaryAction::SendToUser, &[T3ToolSummaryCall { input: None, output: None, outcome: T3ToolOutcome::Completed }]).0, "Sent 1 message");
     }
 }

@@ -253,6 +253,44 @@ fn completion_gate_matches_web_once_only_and_skip_cases() {
 }
 
 #[test]
+fn request_id_attends_replacing_requests_and_wake_release_honors_grace_and_pause() {
+    let mut gate = NotificationGate::default();
+    let key = "thread";
+    let working = Observation::default();
+    let req1 = Observation {
+        attention: Some("approval:req-1".into()),
+        request_id: Some("req-1".into()),
+        ..Default::default()
+    };
+    let req2 = Observation {
+        attention: Some("input:req-2".into()),
+        request_id: Some("req-2".into()),
+        ..Default::default()
+    };
+    assert_eq!(gate.observe(&key, Some(&working), &req1, false, false), Some(NotificationKind::Input));
+    assert_eq!(gate.observe(&key, Some(&req1), &req2, false, false), Some(NotificationKind::Input));
+    // Returning to req-1 before attention clears does not re-notify.
+    assert_eq!(gate.observe(&key, Some(&req2), &req1, false, false), None);
+    // Clearing attention resets attended requests, so a later req-1 notifies again.
+    assert_eq!(gate.observe(&key, Some(&req1), &working, false, false), None);
+    assert_eq!(gate.observe(&key, Some(&working), &req1, false, false), Some(NotificationKind::Input));
+
+    let wake_done = Observation {
+        settled: true,
+        completed_at: Some(1_000),
+        background_wake: true,
+        ..Default::default()
+    };
+    assert_eq!(gate.observe_at(&key, Some(&working), &wake_done, false, false, 10_000), None);
+    assert!(gate.flush_due(14_999).is_empty());
+    gate.pause();
+    assert!(gate.flush_due(20_000).is_empty(), "paused release does not fire");
+    assert_eq!(gate.observe_at(&key, Some(&wake_done), &wake_done, false, false, 20_000), None);
+    assert!(gate.flush_due(24_999).is_empty());
+    assert_eq!(gate.flush_due(25_000), vec![key]);
+}
+
+#[test]
 fn background_environments_keep_independent_gates_pending_and_click_destinations() {
     let mut watched = EnvironmentNotifications::default();
     let mut pending = PendingNotifications::default();
@@ -418,4 +456,69 @@ fn newly_linked_parent_retires_only_child_delivery_and_ignores_late_confirmation
     assert!(!pending.confirm(&in_flight, DeliveryOutcome::Accepted));
     assert_eq!(pending.badge_count(), 1);
     assert_eq!(pending.destination(&other.tag), Some(&parent));
+}
+
+#[test]
+fn environment_notifications_flush_due_respects_grace_pause_and_visibility() {
+    let mut watched = EnvironmentNotifications::default();
+    let mut shell = ShellState::default();
+    let set = |shell: &mut ShellState, threads: Vec<ThreadShell>| {
+        shell.apply(ShellStreamItem::Snapshot {
+            snapshot: Box::new(ShellSnapshot { threads, ..Default::default() }),
+            resolved_repository_identity_roots: None,
+        });
+    };
+    let wake_thread = |id: &str, status: &str, completed_at: Option<&str>| {
+        thread(
+            id,
+            status,
+            json!({
+                "latestRunBackgroundWake": true,
+                "latestRunCompletedAt": completed_at,
+            }),
+        )
+    };
+    let linked_for = |shell: &ShellState| {
+        let threads = &shell.snapshot.as_ref().unwrap().threads;
+        LinkedRequests::build(&[LinkedEnvironment { saved_id: "env", canonical_id: "env", threads }])
+    };
+
+    set(&mut shell, vec![wake_thread("vis", "running", None), wake_thread("hid", "running", None)]);
+    let linked = linked_for(&shell);
+    let mut visibility = NotificationVisibility::default();
+    assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 1_000).is_empty());
+
+    set(
+        &mut shell,
+        vec![
+            wake_thread("vis", "completed", Some("2026-11-01T00:01:00.000Z")),
+            wake_thread("hid", "completed", Some("2026-11-01T00:01:00.000Z")),
+        ],
+    );
+    let linked = linked_for(&shell);
+    assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 10_000).is_empty());
+    assert_eq!(watched.next_deadline(), Some(10_000 + RELEASED_COMPLETION_GRACE_MS));
+    assert!(watched.flush_due(&visibility, 14_999).is_empty());
+
+    // Pause clears pending deadlines until reconnect re-observes the snapshot.
+    watched.pause("env");
+    assert_eq!(watched.next_deadline(), None);
+    assert!(watched.flush_due(&visibility, 20_000).is_empty());
+
+    assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 20_000).is_empty());
+    assert_eq!(watched.next_deadline(), Some(20_000 + RELEASED_COMPLETION_GRACE_MS));
+    assert!(watched.flush_due(&visibility, 24_999).is_empty());
+
+    // Hiding a thread before flush drops its notification while consuming the release.
+    visibility.hidden.insert(ThreadKey::new("env", "hid"));
+    let flushed = watched.flush_due(&visibility, 25_000);
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].0, "env");
+    assert_eq!(kinds(&flushed[0].1), [("vis", "Thread completed")]);
+    assert_eq!(watched.next_deadline(), None);
+
+    // Unhiding afterward does not replay the consumed completion.
+    visibility.hidden.clear();
+    assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 26_000).is_empty());
+    assert!(watched.flush_due(&visibility, 40_000).is_empty());
 }

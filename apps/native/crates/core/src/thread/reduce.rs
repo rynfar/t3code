@@ -19,7 +19,10 @@ pub fn apply_event(projection: &mut ThreadProjection, event: DomainEvent, option
     // A turn item bumps activity only once it is applied: a dropped partial update changes nothing.
     let touches_activity = !matches!(
         event.body,
-        EventBody::ThreadTouched(_) | EventBody::Unknown(_) | EventBody::TurnItemUpserted(_)
+        EventBody::ThreadTouched(_)
+            | EventBody::ThreadVisitRecorded
+            | EventBody::Unknown(_)
+            | EventBody::TurnItemUpserted(_)
     );
     if touches_activity {
         projection.updated_at = event.occurred_at.clone();
@@ -28,14 +31,21 @@ pub fn apply_event(projection: &mut ThreadProjection, event: DomainEvent, option
         EventBody::ThreadReplaced(thread) | EventBody::ThreadDeleted(thread) | EventBody::ThreadTouched(thread) => {
             projection.thread = *thread;
         }
+        EventBody::ThreadVisitRecorded => {}
         // Pull request links are not modeled natively yet; the activity bump above still applies.
         EventBody::ThreadPullRequestLinkUpdated | EventBody::CheckpointRollbackRequested => {}
         EventBody::RunUpserted(run) => {
-            let prev_status = projection.runs.iter().find(|r| r.id == run.id).map(|r| r.status.as_str());
-            let hides = matches!(run.status.as_str(), "rolled_back" | "cancelled") && prev_status != Some(run.status.as_str());
+            let run_id = run.id.clone();
+            let prev_status = projection.runs.iter().find(|r| r.id == run_id).map(|r| r.status.as_str());
+            let hides = matches!(run.status.as_str(), "rolled_back" | "queued" | "cancelled")
+                && prev_status != Some(run.status.as_str());
+            let left_queue = prev_status == Some("queued") && run.status != "queued";
             upsert_by(&mut projection.runs, *run, |r| &r.id);
             if hides {
                 refresh_visible_items(projection);
+            }
+            if left_queue {
+                restore_queued_user_items(projection, &run_id);
             }
         }
         EventBody::RunBackgroundWorkCancelled { run_id, restart_cancelled_background_work } => {
@@ -175,6 +185,20 @@ fn renumber(rows: &mut [ProjectedTurnItem]) {
     }
 }
 
+fn restore_queued_user_items(projection: &mut ThreadProjection, run_id: &str) {
+    let candidates: Vec<Arc<TurnItem>> = projection
+        .turn_items
+        .iter()
+        .filter(|item| item.run_id.as_deref() == Some(run_id) && item.is_queued_user_message())
+        .cloned()
+        .collect();
+    for item in candidates {
+        if is_item_visible(projection, &item) {
+            upsert_visible_item(projection, item, ApplyOptions::default());
+        }
+    }
+}
+
 fn remove_visible_item(rows: &mut Vec<ProjectedTurnItem>, source_item_id: &str) {
     if let Some(index) = rows.iter().position(|row| row.source_item_id == source_item_id) {
         rows.remove(index);
@@ -192,8 +216,8 @@ fn is_item_visible(projection: &ThreadProjection, item: &TurnItem) -> bool {
     if run_status == Some("rolled_back") {
         return false;
     }
-    // Cancelled queued input never reached the provider and must stay out of the transcript.
-    if run_status == Some("cancelled") && item.is_queued_user_message() {
+    // Queued or cancelled queued input never reached the provider and stays out of the transcript.
+    if matches!(run_status, Some("queued" | "cancelled")) && item.is_queued_user_message() {
         return false;
     }
     !is_superseded_interrupt(item, &projection.attempts, |run_id| {
@@ -233,7 +257,7 @@ impl<'a> ItemVisibilityFilter<'a> {
         let statuses: HashMap<&str, &str> = projection
             .runs
             .iter()
-            .filter(|run| matches!(run.status.as_str(), "rolled_back" | "cancelled"))
+            .filter(|run| matches!(run.status.as_str(), "rolled_back" | "queued" | "cancelled"))
             .map(|run| (run.id.as_str(), run.status.as_str()))
             .collect();
         let mut superseded_roots: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -262,8 +286,8 @@ impl<'a> ItemVisibilityFilter<'a> {
         if status == Some("rolled_back") {
             return false;
         }
-        // Cancelled queued input never reached the provider and must stay out of the transcript.
-        if status == Some("cancelled") && item.is_queued_user_message() {
+        // Queued or cancelled queued input never reached the provider and stays out of the transcript.
+        if matches!(status, Some("queued" | "cancelled")) && item.is_queued_user_message() {
             return false;
         }
         !(matches!(item.kind, TurnItemKind::RunInterruptResult { .. })

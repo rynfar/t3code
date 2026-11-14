@@ -381,6 +381,7 @@ fn summary_action_priority(key: SummaryGroupKey) -> u8 {
                 | T::ProjectDelete
                 | T::ProjectClone
                 | T::EnvironmentUpdate
+                | T::ThemeSet
                 | T::AttachmentPrepare
                 | T::AttachmentDiscard
                 | T::AttachmentSend => 0,

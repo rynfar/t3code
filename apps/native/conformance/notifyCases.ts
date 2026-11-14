@@ -28,10 +28,13 @@ function gateCase(seed: number) {
     }
     const key = rng.pick(keys);
     const settled = rng.chance(0.5);
+    const attention = rng.pick([null, null, "run-1:input", "run-1:approval", "run-2:failed"]);
     const next: Observation = {
-      attention: rng.pick([null, null, "run-1:input", "run-1:approval", "run-2:failed"]),
+      attention,
+      requestId: attention === null ? null : rng.pick([null, "req-1", "req-2"]),
       settled,
       completedAt: settled ? rng.pick([null, 100, 200, 300, 400]) : null,
+      backgroundWake: false,
     };
     const options = { archived: rng.chance(0.1), quiet: rng.chance(0.15) };
     const prior = previous.get(key);

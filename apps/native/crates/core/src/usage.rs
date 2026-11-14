@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::auth::AuthSessionState;
-use crate::server_config::{ServerProvider, lenient_vec};
+use crate::server_config::lenient_vec;
 
 pub mod method {
     pub const GET_USAGE_SUMMARY: &str = "server.getUsageSummary";
@@ -210,15 +210,10 @@ pub struct UsageSource {
     pub distinct_sessions: u64,
     #[serde(default)]
     pub message: Option<String>,
-    /// `enableCursorKeychain` when reading Cursor's account usage needs the keychain.
-    #[serde(default)]
-    pub action: Option<String>,
     /// A cached reply during a refresh; ask again with `awaitRefresh` for fresh data.
     #[serde(default)]
     pub refreshing: bool,
 }
-
-pub const ENABLE_CURSOR_KEYCHAIN: &str = "enableCursorKeychain";
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -341,30 +336,6 @@ pub fn decode_summary(value: Value) -> Result<UsageSummary, String> {
     serde_json::from_value(value).map_err(|error| format!("Could not read usage: {error}"))
 }
 
-/// `needsCursorKeychainAccess`: Cursor's account usage is a keychain grant away.
-pub fn needs_cursor_keychain_access(summary: Option<&UsageSummary>, providers: &[ServerProvider]) -> bool {
-    summary.is_some_and(|summary| summary.sources.iter().any(|source| source.action.as_deref() == Some(ENABLE_CURSOR_KEYCHAIN)))
-        && providers.iter().any(|provider| provider.driver == "cursor" && provider.status == "ready")
-}
-
-/// `cursorKeychainAccessEnvironments`: an environment already reading the Cursor account reports
-/// every machine's history, so the prompt would only add duplicates.
-pub fn cursor_keychain_prompt(summaries: &[(Option<&UsageSummary>, bool)]) -> Vec<usize> {
-    let has_account = summaries.iter().any(|(summary, _)| {
-        summary.is_some_and(|summary| {
-            summary.sources.iter().any(|source| source.fingerprint.provider == UsageProvider::Cursor && source.fingerprint.host_id == "cursor.com")
-        })
-    });
-    if has_account {
-        return Vec::new();
-    }
-    summaries.iter().enumerate().filter(|(_, (_, needs))| *needs).map(|(index, _)| index).collect()
-}
-
-pub fn enable_cursor_keychain_patch() -> Value {
-    json!({ "patch": { "cursorKeychainUsageEnabled": true } })
-}
-
 /// `server.refreshProviders` as the web sends it for Limits.
 pub fn refresh_providers_payload() -> Value {
     crate::providers::RefreshProviders::Limits.payload()
@@ -418,7 +389,6 @@ pub struct EnvironmentUsage {
     pub can_read_diagnostics: bool,
     pub error: Option<String>,
     pub summary: Option<std::sync::Arc<UsageSummary>>,
-    pub needs_cursor_keychain_access: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

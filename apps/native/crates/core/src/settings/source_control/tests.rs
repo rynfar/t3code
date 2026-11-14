@@ -43,6 +43,7 @@ fn source_control_changes_patch_only_what_they_change() {
     let payload = |change: SourceControlChange| change.into_server().payload()["patch"].clone();
     assert_eq!(payload(SourceControlChange::MergeMethod(None)), json!({ "pullRequestMergeMethod": null }));
     assert_eq!(parse_merge_method("squash"), Some(Some(MergeMethod::Squash)));
+    assert_eq!(parse_merge_method("fast-forward"), Some(Some(MergeMethod::FastForward)));
     assert_eq!(merge_method_value(None), "last");
     assert_eq!(
         payload(SourceControlChange::WritingMode { mode: WritingMode::Custom, custom_instructions: Some(" Be brief ".into()) }),

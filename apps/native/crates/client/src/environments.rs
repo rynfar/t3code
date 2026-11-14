@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use t3_core::auth::AuthSessionState;
 use t3_core::sidebar::fleet::EnvironmentSummary;
@@ -15,6 +16,7 @@ use t3_core::notifications::{
 use t3_core::server_config::ServerConfigState;
 use t3_core::shell::ShellState;
 use t3_core::sidebar::tag_filter::{self, ThreadKey};
+use t3_core::sidebar::time::Ms;
 use tokio::sync::{mpsc, watch};
 
 use crate::auth::Credentials;
@@ -114,6 +116,8 @@ enum Command {
     Activate(Option<String>),
     Remove(String),
     Enabled(bool),
+    #[cfg(test)]
+    SetClock(Ms),
 }
 
 pub struct Environments {
@@ -178,6 +182,11 @@ impl Environments {
             prepare,
         });
     }
+    #[cfg(test)]
+    pub(crate) fn set_clock(&self, now: Ms) {
+        let _ = self.commands.send(Command::SetClock(now));
+    }
+
     pub fn is_current(&self, event: &EnvironmentEvent) -> bool {
         let (id, generation) = match event {
             EnvironmentEvent::Activated { id, generation, .. }
@@ -413,7 +422,13 @@ fn visibility(entries: &HashMap<String, Entry>, linked: &LinkedRequests) -> Noti
 async fn reobserve(
     entries: &HashMap<String, Entry>, watchers: &mut EnvironmentNotifications,
     visible: &mut NotificationVisibility, output: &mpsc::Sender<EnvironmentEvent>, enabled: bool,
+    now: Ms,
 ) {
+    for (id, entry) in entries {
+        if entry.status != ConnectionStatus::Connected || !entry.shell.synchronized || entry.shell.snapshot.is_none() {
+            watchers.pause(id);
+        }
+    }
     let environments = entries.iter().filter_map(|(id, entry)| {
         if entry.status != ConnectionStatus::Connected || !entry.shell.synchronized { return None; }
         let snapshot = entry.shell.snapshot.as_ref()?;
@@ -426,7 +441,7 @@ async fn reobserve(
     if !enabled { return; }
     for environment in environments {
         let entry = &entries[environment.saved_id];
-        let notifications = watchers.observe_linked(environment.saved_id, &entry.shell, visible, &linked);
+        let notifications = watchers.observe_linked_at(environment.saved_id, &entry.shell, visible, &linked, now);
         if !notifications.is_empty() {
             let _ = output.send(EnvironmentEvent::Notifications { id: environment.saved_id.into(), generation: entry.generation, notifications }).await;
         }
@@ -440,13 +455,52 @@ async fn run(
     view: watch::Sender<Arc<FleetView>>,
 ) {
     let (frames, mut input) = mpsc::channel::<(String, u64, RelayFrame)>(128);
+    let epoch = tokio::time::Instant::now();
+    #[cfg(test)]
+    let mut manual_now: Option<Ms> = None;
+    let current_now = |#[cfg(test)] manual: Option<Ms>| {
+        #[cfg(test)]
+        if let Some(now) = manual {
+            return now;
+        }
+        tokio::time::Instant::now().saturating_duration_since(epoch).as_millis() as Ms
+    };
     let mut entries: HashMap<String, Entry> = HashMap::new();
     let mut active = None;
     let mut watchers = EnvironmentNotifications::default();
     let mut visible = NotificationVisibility::default();
     loop {
+        #[cfg(test)]
+        let deadline_sleep = async {
+            match (watchers.next_deadline(), manual_now) {
+                (Some(deadline), Some(now)) if deadline <= now => {}
+                (Some(_), Some(_)) => std::future::pending::<()>().await,
+                (Some(deadline), None) => tokio::time::sleep_until(epoch + Duration::from_millis(deadline.max(0) as u64)).await,
+                (None, _) => std::future::pending::<()>().await,
+            }
+        };
+        #[cfg(not(test))]
+        let deadline_sleep = async {
+            match watchers.next_deadline() {
+                Some(deadline) => tokio::time::sleep_until(epoch + Duration::from_millis(deadline.max(0) as u64)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             _ = output.closed() => return,
+            _ = deadline_sleep => {
+                if enabled {
+                    #[cfg(test)]
+                    let now = current_now(manual_now);
+                    #[cfg(not(test))]
+                    let now = current_now();
+                    for (id, notifications) in watchers.flush_due(&visible, now) {
+                        if let Some(entry) = entries.get(&id) {
+                            let _ = output.send(EnvironmentEvent::Notifications { id, generation: entry.generation, notifications }).await;
+                        }
+                    }
+                }
+            }
             command = commands.recv() => match command {
                 None => return,
                 #[cfg(feature = "test-support")]
@@ -456,7 +510,11 @@ async fn run(
                     let credentials = Credentials { http_base: "http://fixture.invalid".into(), access_token: String::new() };
                     entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status });
                     publish(&entries, &id, true, &view);
-                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
+                    #[cfg(test)]
+                    let now = current_now(manual_now);
+                    #[cfg(not(test))]
+                    let now = current_now();
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled, now).await;
                     let _ = reply.send(tx);
                 }
                 Some(Command::ApplySettings { owner, settings, revision, reply }) => {
@@ -489,7 +547,11 @@ async fn run(
                     entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status: ConnectionStatus::Connecting });
                     publish(&entries, &id, true, &view);
                     tracing::info!(environment = %id, watched = entries.len(), "watching environment with one supervisor");
-                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
+                    #[cfg(test)]
+                    let now = current_now(manual_now);
+                    #[cfg(not(test))]
+                    let now = current_now();
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled, now).await;
                 }
                 Some(Command::Activate(id)) => {
                     if active != id && let Some(prior) = active.as_ref().and_then(|id| entries.get(id)) { prior.client.close_all_threads(); }
@@ -503,12 +565,24 @@ async fn run(
                     watchers.remove(&id);
                     publish(&entries, &id, true, &view);
                     if active.as_ref() == Some(&id) { active = None; }
-                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
+                    #[cfg(test)]
+                    let now = current_now(manual_now);
+                    #[cfg(not(test))]
+                    let now = current_now();
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled, now).await;
                 }
                 Some(Command::Enabled(next)) => {
                     if next == enabled { continue; }
                     watchers.clear(); enabled = next;
-                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await;
+                    #[cfg(test)]
+                    let now = current_now(manual_now);
+                    #[cfg(not(test))]
+                    let now = current_now();
+                    reobserve(&entries, &mut watchers, &mut visible, &output, enabled, now).await;
+                }
+                #[cfg(test)]
+                Some(Command::SetClock(now)) => {
+                    manual_now = Some(now);
                 }
             },
             frame = input.recv() => {
@@ -544,7 +618,13 @@ async fn run(
                 }
                 if changed || config_changed || lifecycle_changed || revisions != (entry.config.settings_revision(), entry.config.keybindings_revision()) {
                     publish(&entries, &id, changed || lifecycle_changed, &view);
-                    if changed || config_changed || lifecycle_changed { reobserve(&entries, &mut watchers, &mut visible, &output, enabled).await; }
+                    if changed || config_changed || lifecycle_changed {
+                        #[cfg(test)]
+                        let now = current_now(manual_now);
+                        #[cfg(not(test))]
+                        let now = current_now();
+                        reobserve(&entries, &mut watchers, &mut visible, &output, enabled, now).await;
+                    }
                 }
                 if active.as_ref() == Some(&id) {
                     let events = batch.into_iter().filter(|e| !matches!(e, ClientEvent::Status(_) | ClientEvent::Moved { .. })).collect::<Vec<_>>();

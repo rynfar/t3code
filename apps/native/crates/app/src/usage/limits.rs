@@ -21,8 +21,6 @@ use crate::icons::Icon;
 use crate::right_panel::{focusable, tooltip_view};
 use crate::theme::{hsla, palette};
 
-const CURSOR_KEYCHAIN_COPY: &str = "Requires access to your Cursor login in macOS Keychain.";
-
 fn pace_icon(pace: LimitPace, id: SharedString, cx: &App) -> impl IntoElement {
     let p = palette(cx);
     let glyph = match pace {
@@ -92,21 +90,8 @@ impl UsageView {
     pub(super) fn render_limits(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let data = self.data.limits(self.state.read(cx));
-        let environment = self.data.environment(self.state.read(cx));
-        let show_cursor = !self.data.hidden().contains(&t3_core::usage::UsageProvider::Cursor)
-            && !t3_core::usage::cursor_keychain_prompt(&[(environment.summary.as_deref(), environment.needs_cursor_keychain_access)]).is_empty();
-        let prompt_at = data.pools.iter().position(|pool| pool.driver == "claudeAgent").max(data.pools.iter().position(|pool| pool.driver == "codex")).map_or(0, |index| index + 1);
-        let empty = data.pools.is_empty() && data.notices.is_empty() && !show_cursor && data.links.is_empty();
-        let mut sections: Vec<AnyElement> = Vec::new();
-        for (index, pool) in data.pools.iter().enumerate() {
-            if index == prompt_at && show_cursor {
-                sections.push(self.render_cursor_limits(cx));
-            }
-            sections.push(self.render_pool(pool, window, cx));
-        }
-        if prompt_at >= data.pools.len() && show_cursor {
-            sections.push(self.render_cursor_limits(cx));
-        }
+        let empty = data.pools.is_empty() && data.notices.is_empty() && data.links.is_empty();
+        let sections: Vec<AnyElement> = data.pools.iter().map(|pool| self.render_pool(pool, window, cx)).collect();
         v_flex()
             .gap(r(32.))
             .when(empty, |this| {
@@ -168,30 +153,6 @@ impl UsageView {
                         .child(v_flex().min_w_0().gap(r(2.)).children(data.notices.iter().map(|notice| div().font_weight(FontWeight::MEDIUM).child(notice.clone())))),
                 )
             })
-    }
-
-    /// `CursorEnableLimits`.
-    fn render_cursor_limits(&self, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(cx);
-        v_flex()
-            .gap(r(12.))
-            .child(h_flex().gap(r(8.)).child(div().size(r(20.)).flex().items_center().justify_center().child(brand_mark("cursor", 16., hsla(p.foreground), cx))).child(heading("Cursor", cx)))
-            .child(
-                v_flex()
-                    .items_start()
-                    .gap(r(12.))
-                    .p(r(16.))
-                    .rounded(r(8.))
-                    .border_1()
-                    .border_color(hsla(p.border).opacity(0.6))
-                    .child(div().text_size(r(12.)).text_color(hsla(p.muted_foreground)).child(CURSOR_KEYCHAIN_COPY))
-                    .child(
-                        ActionButton::new("usage-cursor-limits-enable", "Enable", ButtonVariant::Outline, ButtonSize::Sm)
-                            .disabled(self.data.keychain_pending)
-                            .on_click(cx.listener(|this, _, _, cx| this.enable_cursor_keychain(cx))),
-                    ),
-            )
-            .into_any_element()
     }
 
     fn render_pool(&mut self, pool: &LimitPool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

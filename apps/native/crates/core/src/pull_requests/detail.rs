@@ -154,6 +154,7 @@ pub fn merge_method_label(method: MergeMethod) -> &'static str {
     match method {
         MergeMethod::Squash => "Squash and merge",
         MergeMethod::Rebase => "Rebase and merge",
+        MergeMethod::FastForward => "Fast-forward merge",
         MergeMethod::Merge | MergeMethod::Unknown => "Merge",
     }
 }

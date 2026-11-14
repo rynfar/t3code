@@ -31,7 +31,7 @@ use snooze::SnoozePreset;
 pub const MIN_AUTO_SETTLE_DAYS: u32 = 1;
 pub const MAX_AUTO_SETTLE_DAYS: u32 = 90;
 /// `DEFAULT_SIDEBAR_AUTO_SETTLE_AFTER_DAYS`, also what the switch turns back on to.
-pub const DEFAULT_AUTO_SETTLE_DAYS: u32 = 3;
+pub const DEFAULT_AUTO_SETTLE_DAYS: u32 = 7;
 
 /// The workspace choices with `resolveEnvModeLabel`'s labels.
 pub const ENV_MODES: [(ThreadEnvMode, &str); 2] = [(ThreadEnvMode::Local, "Current checkout"), (ThreadEnvMode::Worktree, "New worktree")];

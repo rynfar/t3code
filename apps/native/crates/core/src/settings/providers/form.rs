@@ -137,8 +137,9 @@ pub fn decode_environment<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
     if let Some(Value::Array(rows)) = &mut environment {
         for row in rows {
             if let Some(row) = row.as_object_mut() {
-                if let Some(secret) = row.remove("secret") {
+                if let Some(secret) = row.remove("secret").filter(|value| !value.is_null()) {
                     row.insert("value".into(), secret);
+                    row.insert("sensitive".into(), json!(true));
                 }
                 row.entry("value").or_insert(json!(""));
                 row.entry("sensitive").or_insert(json!(false));
@@ -613,7 +614,9 @@ mod tests {
         assert!(!valid_one_password_reference("op://vault//field"));
         for (driver, fields) in FIELDS.iter() {
             for field in fields {
-                assert!(!field.accepts_secret_reference);
+                if field.accepts_secret_reference {
+                    assert!(field.secret, "{driver}.{}: secret ref field must be secret", field.key);
+                }
                 assert!(matches!(field.control.as_str(), "text" | "password" | "select"));
                 for (input, accepted) in &field.validation {
                     if !field.persist && input.trim().is_empty() {
@@ -813,5 +816,28 @@ mod tests {
             }
             assert_eq!(command_args(&edited), expected);
         }
+    }
+    #[test]
+    fn decode_environment_marks_secret_references_sensitive() {
+        let secret = json!({ "source": "one_password", "reference": "op://vault/item/field" });
+        let config: ProviderInstanceConfig = serde_json::from_value(json!({
+            "id": "p1",
+            "driver": "codex",
+            "label": "Codex",
+            "environment": [
+                { "name": "TOKEN_EXPLICIT_FALSE", "value": "", "sensitive": false, "secret": secret },
+                { "name": "TOKEN_OMITTED", "secret": secret },
+                { "name": "PLAIN_VAR", "value": "plain" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            config.environment,
+            Some(json!([
+                { "name": "TOKEN_EXPLICIT_FALSE", "value": secret, "sensitive": true },
+                { "name": "TOKEN_OMITTED", "value": secret, "sensitive": true },
+                { "name": "PLAIN_VAR", "value": "plain", "sensitive": false }
+            ]))
+        );
     }
 }

@@ -365,8 +365,10 @@ fn shelf_matches_typescript() {
 fn observation(value: &Value) -> Option<Observation> {
     (!value.is_null()).then(|| Observation {
         attention: text(value, "attention"),
+        request_id: text(value, "requestId"),
         settled: value["settled"].as_bool() == Some(true),
         completed_at: value["completedAt"].as_i64(),
+        background_wake: value["backgroundWake"].as_bool() == Some(true),
     })
 }
 

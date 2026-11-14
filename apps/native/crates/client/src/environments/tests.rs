@@ -919,3 +919,115 @@ async fn handed_off_server_guard_rejects_same_saved_replacement_and_removal() {
         drop((held_lifecycle,connection,client,owner,other));
     }
 }
+
+#[tokio::test]
+async fn background_wake_completions_honor_grace_release_and_pause_on_disconnect() {
+    let mut server = FakeServer::start().await;
+    let (mut owner, mut events) = Environments::start(&tokio::runtime::Handle::current(), true);
+    owner.set_clock(1_000);
+    owner.watch("env", server.credentials(), None);
+    owner.activate(Some("env"));
+    activated(&mut events, "env").await;
+    let mut conn = server.connection().await;
+    let stream = shell(&mut conn).await;
+    let row = |status: &str, completed: Option<&str>| {
+        json!({
+            "id": "wake-thread", "projectId": "p", "title": "Wake task", "providerInstanceId": "replay",
+            "modelSelection": {"instanceId": "replay", "model": "replay"}, "runtimeMode": "auto", "interactionMode": "default",
+            "lineage": {"rootThreadId": "wake-thread"}, "status": status, "latestRunId": "r1",
+            "latestRunCompletedAt": completed, "latestRunBackgroundWake": true,
+            "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1,
+            "createdAt": "2026-11-01T00:00:00Z", "updatedAt": "2026-11-01T00:00:00Z"
+        })
+    };
+    conn.chunk(&stream, json!([{"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[],"threads":[row("running", None)]}},{"kind":"synchronized"}])).await;
+    loop {
+        match events.recv().await.unwrap() {
+            EnvironmentEvent::Notifications { .. } => panic!("initial snapshot must not notify"),
+            EnvironmentEvent::Active { id, events: batch, .. }
+                if id == "env"
+                    && batch.iter().any(|event| matches!(event, ClientEvent::Shell(t3_core::shell::ShellStreamItem::Synchronized))) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Completing a background-wake run holds notification until the 5s grace window expires.
+    conn.chunk(&stream, json!([{"kind":"thread.updated","sequence":2,"location":"active","thread":row("completed", Some("2026-11-01T00:01:00Z"))}])).await;
+    assert!(notification_batch(&mut events, "env").await.is_empty(), "wake completion must not notify immediately");
+    owner.set_clock(5_999);
+    let _ = owner.client("env").await;
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, EnvironmentEvent::Notifications { .. }), "wake completion must wait full 5s grace");
+    }
+
+    // Disconnecting pauses the grace timer; advancing past 5s stays quiet while disconnected.
+    drop(conn);
+    loop {
+        if let EnvironmentEvent::Status { id, status, .. } = events.recv().await.unwrap()
+            && id == "env"
+            && status != ConnectionStatus::Connected
+        {
+            break;
+        }
+    }
+    owner.set_clock(20_000);
+    let _ = owner.client("env").await;
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, EnvironmentEvent::Notifications { .. }), "paused release must not fire while disconnected");
+    }
+
+    // Reconnecting with the same completion restarts the 5s timer and then flushes it.
+    let mut conn = server.connection().await;
+    let stream = shell(&mut conn).await;
+    conn.chunk(&stream, json!([{"kind":"snapshot","snapshot":{"snapshotSequence":1,"projects":[],"threads":[row("completed", Some("2026-11-01T00:01:00Z"))]}},{"kind":"synchronized"}])).await;
+    loop {
+        match events.recv().await.unwrap() {
+            EnvironmentEvent::Notifications { .. } => panic!("reconnect must restart grace rather than notifying immediately"),
+            EnvironmentEvent::Active { id, events: batch, .. }
+                if id == "env"
+                    && batch.iter().any(|event| matches!(event, ClientEvent::Shell(t3_core::shell::ShellStreamItem::Synchronized))) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    owner.set_clock(24_999);
+    let _ = owner.client("env").await;
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, EnvironmentEvent::Notifications { .. }), "restarted grace must wait full 5s");
+    }
+    owner.set_clock(25_000);
+    let fired = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let EnvironmentEvent::Notifications { id, notifications, .. } = events.recv().await.unwrap() {
+                break (id, notifications);
+            }
+        }
+    })
+    .await
+    .expect("grace release fires after 5s reconnect window");
+    assert_eq!(fired.0, "env");
+    assert_eq!(fired.1.len(), 1);
+    assert_eq!(fired.1[0].thread_id, "wake-thread");
+    assert_eq!(fired.1[0].title, "Thread completed");
+
+    // Replacing the watched server via Command::Watch pauses any pending grace timer.
+    let mut next_server = FakeServer::start().await;
+    conn.chunk(&stream, json!([{"kind":"thread.updated","sequence":2,"location":"active","thread":row("running", None)}])).await;
+    assert!(notification_batch(&mut events, "env").await.is_empty());
+    owner.set_clock(30_000);
+    conn.chunk(&stream, json!([{"kind":"thread.updated","sequence":3,"location":"active","thread":row("completed", Some("2026-11-01T00:02:00Z"))}])).await;
+    assert!(notification_batch(&mut events, "env").await.is_empty());
+    owner.watch("env", next_server.credentials(), None);
+    let mut next_conn = next_server.connection().await;
+    let _next_stream = shell(&mut next_conn).await;
+    owner.set_clock(40_000);
+    let _ = owner.client("env").await;
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, EnvironmentEvent::Notifications { .. }), "Command::Watch must pause pending grace before sync");
+    }
+}

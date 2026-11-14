@@ -142,7 +142,7 @@ pub fn usage_source_messages<'a>(sources: impl IntoIterator<Item = &'a UsageSour
         let relevant = matches!(source.status, UsageSourceStatus::Partial | UsageSourceStatus::Failed)
             || source.fingerprint.provider == UsageProvider::Cursor
             || (source.status == UsageSourceStatus::Missing && source.malformed_records > 0);
-        if source.action.is_some() || !relevant {
+        if !relevant {
             continue;
         }
         let mut message = source.message.clone();

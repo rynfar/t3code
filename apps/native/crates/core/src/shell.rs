@@ -157,6 +157,9 @@ pub struct ThreadShell {
     /// Stop was requested for the latest run; its end is quiet (no completion notification).
     #[serde(default)]
     pub latest_run_stop_requested: Option<bool>,
+    /// The latest run answers a background-work progress wake, like a Monitor line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run_background_wake: Option<bool>,
     #[serde(default)]
     pub latest_run_requested_at: Option<String>,
     #[serde(default)]

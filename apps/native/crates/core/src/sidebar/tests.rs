@@ -192,6 +192,33 @@ fn tracker_forgets_removed_threads() {
 }
 
 #[test]
+fn tracker_skips_grace_for_stale_completed_runs_and_marks_launching_threads() {
+    let mut tracker = InboxReturnTracker::default();
+    tracker.observe(&[working("a", true)], 100_000);
+    let mut stale = working("a", false);
+    stale.latest_run = Some(RunSummary {
+        run_id: "run-1".into(),
+        status: "completed".into(),
+        requested_at: None,
+        started_at: None,
+        completed_at: Some(100_000 - super::inbox::STALE_EXIT_MS),
+    });
+    let observation = tracker.observe(&[stale.clone()], 100_000);
+    assert!(!observation.is_working(&stale));
+    assert_eq!(observation.returned_at(&stale), Some(100_000));
+    assert_eq!(tracker.next_deadline(), None);
+
+    let mut fresh = working("launch", false);
+    fresh.latest_run = None;
+    fresh.runtime = None;
+    fresh.updated_at = Some(55_000);
+    let launched = super::inbox::as_launching_thread(fresh);
+    assert_eq!(launched.runtime.as_ref().map(|r| r.status.as_str()), Some("preparing"));
+    assert_eq!(launched.runtime.as_ref().and_then(|r| r.updated_at), Some(55_000));
+    assert!(is_thread_working(&launched));
+}
+
+#[test]
 fn inbox_sort_orders_by_actual_return() {
     let mut tracker = InboxReturnTracker::default();
     let a = SidebarThread { created_at: Some(0), ..working("a", false) };
@@ -1570,7 +1597,7 @@ fn scoped_sections_follow_loaded_config_per_owner_and_keep_cached_disconnects() 
     shell.snapshot = Some(snapshot(vec![
         wire_thread("snoozed", json!({"pinnedAt":SNOOZED_AT,"settledOverride":"settled","settledAt":SNOOZED_AT,"snoozedAt":SNOOZED_AT,"snoozedUntil":FUTURE_WAKE})),
         wire_thread("settled", json!({"pinnedAt":SNOOZED_AT,"settledOverride":"settled","settledAt":SNOOZED_AT})),
-        wire_thread("working", json!({"status":"running","latestRunId":"run","activeRunId":"run"})),
+        wire_thread("working", json!({"status":"running","latestRunId":"run","activeRunId":"run","updatedAt":NOW})),
     ]));
     shell.synchronized = true;
     let absent = ServerConfigState::default();
