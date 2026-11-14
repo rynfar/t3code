@@ -243,6 +243,20 @@ pub(crate) fn compact_data(value: &Value) -> Option<Value> {
     if budget.exceeded { None } else { data }
 }
 
+/// Non-error `compactDynamicToolOutput(...).taskId`.
+pub(crate) fn compact_ok_task_id(value: &Value) -> Option<String> {
+    let mut budget = Budget { bytes: MAX_PARSED_BYTES, nodes: MAX_ENVELOPE_NODES, exceeded: false };
+    let (data, failed) = read_result(value, &mut budget, 0);
+    if failed || budget.exceeded {
+        return None;
+    }
+    data?
+        .get("taskId")
+        .and_then(Value::as_str)
+        .filter(|id| id.len() <= 256 && !id.trim().is_empty())
+        .map(str::to_owned)
+}
+
 /// The trailing `" complete"` some ACP providers append to a tool's title.
 fn normalize_tool_label(value: &str) -> &str {
     let trimmed = value.trim_end_matches(is_js_whitespace);
@@ -319,18 +333,23 @@ fn prefixed_tool(label: &str) -> Option<&str> {
     })
 }
 
-/// `resolveT3McpToolId(name) === "html_render"`. No other known tool name ends in `html_render`,
-/// so the longest-suffix rule needs only this one.
-pub fn is_html_render_tool(name: &str) -> bool {
+/// `resolveT3McpToolId(name) === tool_id` for distinct T3 MCP tools (`html_render`, `delegate_task`).
+pub(crate) fn is_t3_mcp_tool(name: &str, tool_id: &str) -> bool {
     let label = normalize_tool_label(name);
     if let Some((server, tool)) = mcp_tool(label) {
-        return T3_MCP_SERVER_ALIASES.contains(&server.to_ascii_lowercase().as_str()) && tool == TOOL_NAME;
+        return T3_MCP_SERVER_ALIASES.contains(&server.to_ascii_lowercase().as_str()) && tool == tool_id;
     }
     if let Some(tool) = namespaced_tool(label) {
-        return tool == TOOL_NAME;
+        return tool == tool_id;
     }
     let candidate = prefixed_tool(label).unwrap_or(label);
-    candidate == TOOL_NAME || (strip_prefix_ci(label, "t3-code-").is_some() && label.ends_with("_html_render"))
+    candidate == tool_id
+        || (strip_prefix_ci(label, "t3-code-").is_some()
+            && label.strip_suffix(tool_id).is_some_and(|prefix| prefix.ends_with('_')))
+}
+
+pub fn is_html_render_tool(name: &str) -> bool {
+    is_t3_mcp_tool(name, TOOL_NAME)
 }
 
 /// `htmlRenderFromToolItem` for a completed `dynamic_tool` item: the reference in an

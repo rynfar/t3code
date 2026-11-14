@@ -1,11 +1,13 @@
 //! Work, tool and reasoning rows: `TimelineWorkGroupRows.tsx`, `TimelineWorkEntryRow.tsx` and
 //! `TimelinePendingApprovalRow.tsx`, laid out per design system §7.7; an open tool row shows the
-//! inspector (`inspector.rs`). Approval actions belong to the composer, so the row shows state only.
+//! inspector (`inspector.rs`).
 
 use std::sync::Arc;
 
 use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListSizingBehavior, ListState, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, list, prelude::FluentBuilder, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_core::commands::ApprovalDecision;
+use t3_core::requests::{self, PendingApproval};
 use t3_core::timeline::{
     EntryBody, RowKind, TimelineRow, WorkIcon, WorkLogEntry, answered_questions, detail_revision, entry_body, entry_can_expand, entry_fetches_detail,
     has_question_answer, live_thought_line, live_work_entry_label, question_answer_preview, question_text_preview, summary_icon, work_entry_display_indicates_tool_failure,
@@ -16,8 +18,9 @@ use t3_core::turn_item::{TurnItem, TurnItemKind};
 use super::command_output;
 use super::inspector::{Fetch, ItemInspector, Mode, plain_body, question_history};
 use super::markdown::{MarkdownStore, prose};
-use super::parts::{InlineTone, chevron, focusable, icon_slot, inline_button, outline_button, timestamp, work_line, work_row_frame};
+use super::parts::{InlineTone, chevron, focusable, icon_slot, inline_button, inline_button_with, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
+use crate::composer::controls::{Float, MenuItem, floating, menu_surface};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
@@ -44,11 +47,11 @@ pub fn work_icon(icon: WorkIcon) -> Icon {
     }
 }
 
-fn pending_approval<'a>(entry: &'a WorkLogEntry, env: &RowEnv) -> Option<&'a WorkLogEntry> {
-    match entry.item.as_ref().map(|i| &i.kind) {
-        Some(TurnItemKind::ApprovalRequest { request_id, .. }) if env.pending_approvals.contains(request_id) => Some(entry),
-        _ => None,
-    }
+fn pending_approval<'a>(entry: &WorkLogEntry, env: &'a RowEnv) -> Option<&'a PendingApproval> {
+    let Some(TurnItemKind::ApprovalRequest { request_id, .. }) = entry.item.as_ref().map(|i| &i.kind) else {
+        return None;
+    };
+    env.approvals.iter().find(|approval| approval.request_id == *request_id)
 }
 
 /// `WorkGroupSection`: one standalone row per entry, or the open list of a group.
@@ -126,8 +129,8 @@ fn entry_row(
     markdown: &mut MarkdownStore,
     cx: &mut Context<ThreadView>,
 ) -> AnyElement {
-    if pending_approval(entry, env).is_some() {
-        return approval_row(entry, cx);
+    if let Some(approval) = pending_approval(entry, env) {
+        return approval_card(approval, Some(&entry.created_at), grouped, env, cx);
     }
     let p = palette(cx);
     if let Some(item) = entry.item.as_ref()
@@ -333,28 +336,148 @@ fn fetch_state(entry: &WorkLogEntry, item: &TurnItem, env: &RowEnv) -> Fetch {
     }
 }
 
-fn approval_icon(kind: &str) -> (Icon, &'static str) {
+fn approval_icon(kind: &str) -> Icon {
     match kind {
-        "command" => (Icon::WorkTerminal, "Command approval"),
-        "file-change" => (Icon::WorkSquarePen, "File change approval"),
-        "file-read" => (Icon::WorkEye, "File read approval"),
-        "permission" => (Icon::WorkWrench, "App permission approval"),
-        _ => (Icon::WorkHammer, "App access approval"),
+        "command" => Icon::WorkTerminal,
+        "file-change" => Icon::WorkSquarePen,
+        "file-read" => Icon::WorkEye,
+        "permission" => Icon::WorkWrench,
+        _ => Icon::WorkHammer,
     }
 }
 
-/// `TimelinePendingApprovalRow`, without the actions the composer owns.
-fn approval_row(entry: &WorkLogEntry, cx: &App) -> AnyElement {
+/// `TimelinePendingApprovalRow`: inline approval card for matched timeline rows and unmatched
+/// footer approvals.
+pub fn approval_card(
+    approval: &PendingApproval,
+    created_at: Option<&str>,
+    grouped: bool,
+    env: &RowEnv,
+    cx: &mut Context<ThreadView>,
+) -> AnyElement {
     let p = palette(cx);
-    let Some(item) = entry.item.as_ref() else { return div().into_any_element() };
-    let TurnItemKind::ApprovalRequest { request_kind, prompt, reason, app_name, .. } = &item.kind else { return div().into_any_element() };
-    let (icon, label) = approval_icon(request_kind);
-    let detail = prompt.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| label.to_owned());
-    work_row_frame(SharedString::from(format!("approval:{}", entry.id)), false)
+    let dark = cx.theme().is_dark();
+    let icon = approval_icon(&approval.request_kind);
+    let (label, _) = approval.presentation();
+    let detail = approval.detail.as_deref().filter(|text| !text.is_empty()).unwrap_or(label).to_owned();
+    let request_id = approval.request_id.clone();
+    let disabled = !env.can_operate_thread || env.rewinding || env.responding_approvals.contains(&request_id);
+    let menu_open = env.open_approval_menu == Some(request_id.as_str()) && !disabled;
+    let override_open = env.open_approval_override == Some(request_id.as_str());
+    let (primary, more) = approval.split_options();
+    let more: Vec<(ApprovalDecision, String, bool)> =
+        more.into_iter().map(|option| (option.decision, option.label.clone(), option.warning.is_some())).collect();
+
+    let primary_actions: Vec<AnyElement> = primary
+        .into_iter()
+        .map(|option| {
+            let (request_id, decision) = (request_id.clone(), option.decision);
+            let tone = if decision == ApprovalDecision::Accept { InlineTone::Default } else { InlineTone::Muted };
+            let icon = option.warning.as_ref().map(|_| Icon::TriangleAlert);
+            let warning = option.warning.clone().map(SharedString::from);
+            inline_button_with(
+                SharedString::from(format!("approval-{}:{}", decision.as_str(), request_id)),
+                option.label.clone(),
+                icon,
+                warning,
+                tone,
+                disabled,
+                cx.listener(move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    view.respond_to_approval(request_id.clone(), decision, cx);
+                }),
+                cx,
+            )
+        })
+        .collect();
+    let more_control = (!more.is_empty()).then(|| {
+        let menu_request_id = request_id.clone();
+        let item_request_id = request_id.clone();
+        div()
+            .relative()
+            .child(inline_button(
+                SharedString::from(format!("approval-more:{request_id}")),
+                "More",
+                InlineTone::Muted,
+                disabled,
+                cx.listener(move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    if !disabled {
+                        view.toggle_approval_menu(menu_request_id.clone(), cx);
+                    }
+                }),
+                cx,
+            ))
+            .when(menu_open, |this| {
+                this.child(floating(
+                    Float::AboveEnd,
+                    menu_surface(cx)
+                        .occlude()
+                        .mb(px(4.))
+                        .on_mouse_down_out(cx.listener(|view, _, _, cx| view.close_approval_menu(cx)))
+                        .children(more.iter().map(|(decision, label, warning)| {
+                            let (request_id, decision) = (item_request_id.clone(), *decision);
+                            let item = MenuItem::new(SharedString::from(format!("more-{}:{request_id}", decision.as_str())), label.clone())
+                                .disabled(disabled)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    cx.stop_propagation();
+                                    view.respond_to_approval(request_id.clone(), decision, cx);
+                                }));
+                            if *warning { item.icon(Icon::TriangleAlert, hsla(p.warning)) } else { item }
+                        })),
+                ))
+            })
+            .into_any_element()
+    });
+
+    let override_control = approval.full_access_override.as_deref().map(|kind| {
+        let explanation = requests::full_access_override_explanation(kind);
+        let override_request_id = request_id.clone();
+        div()
+            .relative()
+            .child(inline_button_with(
+                SharedString::from(format!("approval-override:{request_id}")),
+                requests::FULL_ACCESS_OVERRIDE_QUESTION,
+                None,
+                Some(SharedString::from(explanation)),
+                InlineTone::Muted,
+                false,
+                cx.listener(move |view, _, _, cx| {
+                    cx.stop_propagation();
+                    view.toggle_approval_override(override_request_id.clone(), cx);
+                }),
+                cx,
+            ))
+            .when(override_open, |this| {
+                this.child(floating(
+                    Float::AboveStart,
+                    div()
+                        .occlude()
+                        .mb(px(4.))
+                        .w(px(300.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(hsla(p.border))
+                        .bg(hsla(if dark { p.popover } else { p.card }))
+                        .p(px(10.))
+                        .text_xs()
+                        .line_height(px(16.))
+                        .text_color(hsla(p.foreground))
+                        .on_mouse_down_out(cx.listener(|view, _, _, cx| view.close_approval_override(cx)))
+                        .child(explanation),
+                ))
+            })
+            .into_any_element()
+    });
+
+    let ts = created_at.or_else(|| (!approval.created_at.is_empty()).then_some(approval.created_at.as_str()));
+    let trailing: Vec<AnyElement> = ts.map(|iso| timestamp(&env.clock, iso, false, cx)).into_iter().collect();
+
+    work_row_frame(SharedString::from(format!("approval:{}", approval.request_id)), grouped)
         .child(work_line(
             Some(icon_slot(icon, hsla(p.icon_muted))),
             div()
-                .id(SharedString::from(format!("approval-detail:{}", entry.id)))
+                .id(SharedString::from(format!("approval-detail:{}", approval.request_id)))
                 .max_h(rem(160.))
                 .overflow_y_scroll()
                 .font_family(cx.theme().mono_font_family.clone())
@@ -363,7 +486,7 @@ fn approval_row(entry: &WorkLogEntry, cx: &App) -> AnyElement {
                 .text_color(hsla(p.foreground))
                 .child(detail)
                 .into_any_element(),
-            Vec::new(),
+            trailing,
             true,
             cx,
         ))
@@ -373,15 +496,39 @@ fn approval_row(entry: &WorkLogEntry, cx: &App) -> AnyElement {
                 .gap(rem(4.))
                 .pb(rem(4.))
                 .text_xs()
-                .children(app_name.clone().map(|name| div().text_color(hsla(p.muted_foreground)).child(name)))
-                .children(reason.clone().map(|reason| div().text_color(hsla(p.muted_foreground)).child(reason)))
+                .children(approval.app_name.clone().map(|name| div().text_color(hsla(p.muted_foreground)).child(name)))
+                .children(approval.reason.clone().map(|reason| div().text_color(hsla(p.muted_foreground)).child(reason)))
                 .child(
                     h_flex()
-                        .gap(rem(4.))
-                        .text_color(hsla(p.warning_foreground))
-                        .child(Icon::Shield.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.warning_foreground)))
-                        .child("Waiting for approval"),
-                ),
+                        .flex_wrap()
+                        .items_center()
+                        .gap_x(px(8.))
+                        .gap_y(px(4.))
+                        .when(approval.live, |this| {
+                            this.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_color(hsla(p.warning_foreground))
+                                    .child(Icon::Shield.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.warning_foreground)))
+                                    .child("Waiting for approval"),
+                            )
+                            .child(div().text_color(hsla(p.muted_foreground)).child("·"))
+                            .children(primary_actions)
+                            .children(more_control)
+                        })
+                        .when(!approval.live, |this| {
+                            this.child(
+                                div()
+                                    .text_color(hsla(p.warning_foreground))
+                                    .child("Provider process is gone. Interrupt or restart the run to respond."),
+                            )
+                        })
+                        .children(override_control),
+                )
+                .children(env.approval_errors.get(&approval.request_id).map(|err| {
+                    div().text_color(hsla(p.destructive)).child(err.clone())
+                })),
         )
         .into_any_element()
 }
@@ -398,8 +545,8 @@ fn live_activity(label: AnyElement, icon: Icon, failed: bool, cx: &App) -> gpui:
 pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
     let RowKind::WorkLive { entry, group_id, expanded, active, thought, .. } = &row.kind else { return div().into_any_element() };
     let (id, expanded, active, thought) = (row.id.as_str(), *expanded, *active, thought.as_ref());
-    if pending_approval(entry, env).is_some() {
-        return approval_row(entry, cx);
+    if let Some(approval) = pending_approval(entry, env) {
+        return approval_card(approval, Some(&entry.created_at), false, env, cx);
     }
     let p = palette(cx);
     let failed = work_entry_display_indicates_tool_failure(entry);
