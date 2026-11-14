@@ -499,6 +499,31 @@ fn capsule_progress_slow_retry_dismiss_and_saved_results_match_web() {
     settle_machine(&mut run, "b", None, true, None);
     assert!(run.is_none(), "all-done Servers phase auto-closes run");
 
+    // Retry skips failed servers already reconnected on the target version.
+    let mut already_updated_run = Some(UpdateEverythingRun::from_plan(&plan, false, 1_000));
+    begin_servers_phase(&mut already_updated_run, 2_000);
+    settle_machine(&mut already_updated_run, "a", Some("timeout".into()), false, None);
+    settle_machine(&mut already_updated_run, "b", Some("offline".into()), false, None);
+    let retried = retry_failed_servers_with_versions(&mut already_updated_run, 10_000, |id| {
+        match id {
+            "a" => Some("1.0.0"),
+            "b" => Some("0.9.0"),
+            _ => None,
+        }
+    });
+    assert_eq!(
+        retried
+            .iter()
+            .map(|(server, _)| server.environment_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b"]
+    );
+    let current = already_updated_run.as_ref().unwrap();
+    assert_eq!(current.machines[0].result, Some(MachineResult::Done));
+    assert!(current.machines[0].server.is_none());
+    assert_eq!(current.machines[1].result, None);
+    assert!(current.machines[1].server.is_some());
+
     // Dismissing settled machines clears the run when none remain.
     let mut dismiss_run = Some(UpdateEverythingRun::from_plan(&plan, false, 1_000));
     begin_servers_phase(&mut dismiss_run, 2_000);

@@ -14,6 +14,13 @@ use t3_core::thread_actions::{self as actions, UndoKind};
 use super::controller::{Deletion, SystemZone, now_ms, time_label, uuid};
 use crate::app_state::{AppEvent, AppState};
 
+struct ScopedBulkAttempt {
+    accepted: bool,
+    interrupted: bool,
+    waiter: Option<gpui::Task<actions::TitleRegenerationResult>>,
+    error_message: Option<String>,
+}
+
 impl AppState {
     pub(crate) fn click_scoped_sidebar_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, modifiers: Modifiers, cx: &mut Context<Self>) {
         let toggle = if cfg!(target_os = "macos") { modifiers.platform } else { modifiers.control };
@@ -148,18 +155,67 @@ impl AppState {
         }
     }
 
-    /// One at a time, stopping at the first failure, then clears the selection.
-    fn regenerate_titles(&mut self, mut ids: Vec<String>, cx: &mut Context<Self>) {
+    /// Clears selection immediately and dispatches all eligible title regenerations concurrently.
+    fn regenerate_titles(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        self.clear_thread_selection(cx);
         if ids.is_empty() {
-            self.clear_thread_selection(cx);
             return;
         }
-        let id = ids.remove(0);
-        self.dispatch_then(actions::regenerate_title(&uuid(), &id), Some("Failed to regenerate thread titles"), cx, move |state, ok, cx| {
-            if ok {
-                state.regenerate_titles(ids, cx);
+        let Some(client) = self.client_handle() else { return };
+        let runtime = self.runtime().clone();
+        let dispatches: Vec<_> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let owner = crate::context_menu::ThreadMenuOwner::capture(self, &id)?;
+                let request_id = uuid();
+                let command = actions::regenerate_title(&request_id, &id);
+                let task = runtime.spawn(client.clone().dispatch(command));
+                Some((id, request_id, owner, task))
+            })
+            .collect();
+        if dispatches.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let replies = futures::future::join_all(dispatches.into_iter().map(
+                |(id, request_id, owner, task)| async move {
+                    let reply = task.await.unwrap_or(Err(t3_client::session::RpcError::Closed));
+                    (id, request_id, owner, reply)
+                },
+            ))
+            .await;
+            let mut waiters = Vec::new();
+            let mut results = Vec::new();
+            let current = this.update(cx, |state, cx| {
+                if !crate::context_menu::ThreadMenuOwner::can_operate(state) {
+                    return false;
+                }
+                for (id, request_id, owner, reply) in replies {
+                    if !owner.response_current(state) {
+                        continue;
+                    }
+                    match reply {
+                        Ok(payload) => {
+                            let sequence = payload.get("sequence").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                            waiters.push(state.spawn_local_title_regeneration_waiter(id, request_id, sequence, cx));
+                        }
+                        Err(error) => {
+                            results.push(AppState::title_regeneration_rpc_result(&error));
+                        }
+                    }
+                }
+                true
+            });
+            if !matches!(current, Ok(true)) {
+                return;
             }
-        });
+            let mut all = futures::future::join_all(waiters).await;
+            all.extend(results);
+            let _ = this.update(cx, |state, cx| {
+                state.show_title_regeneration_toast(&all, cx);
+            });
+        })
+        .detach();
     }
 
     /// `deleteSelectedThreadEntries`: failures stay selected; no co-deleted thread is a fallback.
@@ -480,24 +536,33 @@ impl AppState {
         !selected_set || owner.key().is_some_and(|key| self.sidebar.fleet.ordered.iter().any(|index| self.sidebar.fleet.threads[*index].key == key))
     }
 
-    fn scoped_bulk_attempt(&mut self, owner: crate::context_menu::ThreadMenuOwner, target: t3_client::environments::Destination, action: BulkAction, snoozed_until: Option<i64>, selected_set: bool, cx: &mut Context<Self>) -> gpui::Task<(bool, bool)> {
+    fn scoped_bulk_attempt(&mut self, owner: crate::context_menu::ThreadMenuOwner, target: t3_client::environments::Destination, action: BulkAction, snoozed_until: Option<i64>, selected_set: bool, cx: &mut Context<Self>) -> gpui::Task<ScopedBulkAttempt> {
         let prepared = (|| {
             let snoozing = matches!(action, BulkAction::Snooze | BulkAction::SnoozePreset(_) | BulkAction::SnoozeCustom);
             if (snoozing && snoozed_until.is_none_or(|until| until <= now_ms())) || !target.is_current(&self.fleet)
                 || !self.scoped_bulk_visible(&owner, selected_set) || !self.scoped_bulk_target(&owner).is_some_and(|row| action.eligible(&row) && action.ready(&row))
                 || !target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)) { return None; }
+            let request_id = uuid();
             let command = match &action {
-                BulkAction::Unpin => actions::unpin(&uuid(), &owner.thread),
-                BulkAction::Settle => actions::settle(&uuid(), &owner.thread),
-                BulkAction::RegenerateTitles => actions::regenerate_title(&uuid(), &owner.thread),
-                BulkAction::MarkUnread => actions::mark_unread(&uuid(), &owner.thread),
-                BulkAction::Snooze | BulkAction::SnoozePreset(_) | BulkAction::SnoozeCustom => actions::snooze(&uuid(), &owner.thread, snoozed_until?),
+                BulkAction::Unpin => actions::unpin(&request_id, &owner.thread),
+                BulkAction::Settle => actions::settle(&request_id, &owner.thread),
+                BulkAction::RegenerateTitles => actions::regenerate_title(&request_id, &owner.thread),
+                BulkAction::MarkUnread => actions::mark_unread(&request_id, &owner.thread),
+                BulkAction::Snooze | BulkAction::SnoozePreset(_) | BulkAction::SnoozeCustom => actions::snooze(&request_id, &owner.thread, snoozed_until?),
                 BulkAction::Delete => return None,
             };
             let undo = self.scoped_undo_claim(&owner, command.get("type").and_then(serde_json::Value::as_str).unwrap_or_default());
-            Some((command, undo))
+            Some((request_id, command, undo))
         })();
-        let Some((command, undo)) = prepared else { return gpui::Task::ready((false, false)); };
+        let Some((request_id, command, undo)) = prepared else {
+            return gpui::Task::ready(ScopedBulkAttempt {
+                accepted: false,
+                interrupted: false,
+                waiter: None,
+                error_message: None,
+            });
+        };
+        let regenerate = action == BulkAction::RegenerateTitles;
         let dispatched = target.client.dispatch(command);
         cx.spawn(async move |this, cx| {
             let result = dispatched.await;
@@ -506,20 +571,49 @@ impl AppState {
                 Err(t3_client::session::RpcError::Failure(failure)) => failure.tag.is_none() && failure.message == "Interrupted" && failure.error.is_null(),
                 Ok(_) => false,
             };
-            let accepted = this.update(cx, |state, cx| {
+            let error_message = result.as_ref().err().map(ToString::to_string);
+            this.update(cx, |state, cx| {
                 let current = target.is_current(&state.fleet)
                     && (owner.current(state) || (owner.key().is_some_and(|key| state.scoped_thread(&key).is_none()) && owner.response_after_placement(state))) && owner.can_operate_owner(state)
                     && owner.destination.as_ref().and_then(|owner| state.scoped_environment(&owner.saved_id)).is_some_and(|entry| entry.config.config.is_some())
                     && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
-                if result.is_ok() && current {
+                if let Ok(payload) = &result && current {
                     if let Some((claim, action, plan)) = undo { state.sidebar.undo.show(action, claim, plan, now_ms()); state.after_undo_change(cx); cx.emit(AppEvent::Notice); }
-                    true
+                    let waiter = if regenerate {
+                        let sequence = payload.get("sequence").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                        owner.destination.as_ref().map(|dest| {
+                            state.spawn_scoped_title_regeneration_waiter(
+                                dest.saved_id.clone(),
+                                owner.thread.clone(),
+                                request_id,
+                                sequence,
+                                cx,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    ScopedBulkAttempt {
+                        accepted: true,
+                        interrupted,
+                        waiter,
+                        error_message: None,
+                    }
                 } else {
                     if let Some((claim, _, _)) = undo { state.sidebar.undo.finish(&claim); }
-                    false
+                    ScopedBulkAttempt {
+                        accepted: false,
+                        interrupted,
+                        waiter: None,
+                        error_message,
+                    }
                 }
-            }).unwrap_or(false);
-            (accepted, interrupted)
+            }).unwrap_or(ScopedBulkAttempt {
+                accepted: false,
+                interrupted,
+                waiter: None,
+                error_message: None,
+            })
         })
     }
 
@@ -576,11 +670,21 @@ impl AppState {
             let mut saved = 0;
             let mut failed = 0;
             let mut concurrent = Vec::new();
+            let mut regen_waiters = Vec::new();
+            let mut regen_results = Vec::new();
             for (owner, target) in eligible.into_iter().zip(targets) {
                 let current = this.read_with(cx, |state, _| target.is_current(&state.fleet) && state.scoped_bulk_visible(&owner, clear_selection)
                     && state.scoped_bulk_target(&owner).is_some_and(|row| action.eligible(&row) && action.ready(&row))
                     && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))).unwrap_or(false);
-                if !current { failed += 1; if regenerate { break; } else { continue; } }
+                if !current {
+                    failed += 1;
+                    if regenerate {
+                        regen_results.push(actions::TitleRegenerationResult::Failure("The destination or thread is no longer available.".into()));
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
                 if unpin {
                     let (sent, confirmation) = tokio::sync::oneshot::channel();
                     let asked = this.update(cx, |state, cx| {
@@ -596,18 +700,51 @@ impl AppState {
                 let attempt = this.update(cx, |state, cx| state.scoped_bulk_attempt(owner, target, action.clone(), snoozed_until, clear_selection, cx)).ok();
                 if let Some(attempt) = attempt {
                     if snoozing { concurrent.push(attempt); continue; }
-                    let (accepted, interrupted) = attempt.await;
-                    if accepted { saved += 1; } else { failed += 1; }
+                    let ScopedBulkAttempt { accepted, interrupted, waiter, error_message } = attempt.await;
+                    if accepted {
+                        saved += 1;
+                        if let Some(waiter) = waiter {
+                            regen_waiters.push(waiter);
+                        }
+                    } else {
+                        failed += 1;
+                        if regenerate {
+                            regen_results.push(if interrupted {
+                                actions::TitleRegenerationResult::Interrupted
+                            } else {
+                                actions::TitleRegenerationResult::Failure(error_message.unwrap_or_else(|| "An error occurred.".into()))
+                            });
+                        }
+                    }
                     if interrupted || (regenerate && !accepted) { break; }
-                } else { failed += 1; if regenerate { break; } }
+                } else {
+                    failed += 1;
+                    if regenerate {
+                        regen_results.push(actions::TitleRegenerationResult::Failure("An error occurred.".into()));
+                        break;
+                    }
+                }
             }
             // Snooze owns every already-dispatched attempt; interruption cannot cancel remote writes.
-            for (accepted, _) in futures::future::join_all(concurrent).await {
-                if accepted { saved += 1; } else { failed += 1; }
+            for attempt in futures::future::join_all(concurrent).await {
+                if attempt.accepted { saved += 1; } else { failed += 1; }
             }
             let _ = this.update(cx, |state, cx| {
                 if regenerate && failed == 0 && clear_selection { state.clear_thread_selection(cx); }
-                if failed > 0 { state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread actions incomplete").description(format!("{saved} change(s) saved; {failed} failed")), cx); }
+                if regenerate {
+                    if !regen_waiters.is_empty() || !regen_results.is_empty() {
+                        cx.spawn(async move |this, cx| {
+                            let mut all = futures::future::join_all(regen_waiters).await;
+                            all.extend(regen_results);
+                            let _ = this.update(cx, |state, cx| {
+                                state.show_title_regeneration_toast(&all, cx);
+                            });
+                        })
+                        .detach();
+                    }
+                } else if failed > 0 {
+                    state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread actions incomplete").description(format!("{saved} change(s) saved; {failed} failed")), cx);
+                }
                 cx.emit(AppEvent::Notice);
             });
         })

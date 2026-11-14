@@ -959,3 +959,280 @@ async fn circular_update_button_mutes_during_run_and_capsule_popover_escapes(
         "Escape closes #update-capsule-popover"
     );
 }
+
+#[gpui::test]
+async fn dialog_open_checks_provider_updates_across_connected_machines_and_clears_checking(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _base_fixture) = cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+        let (state, fixture) =
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+        crate::settings::init(state.clone(), cx);
+        init(cx);
+        (state, fixture)
+    });
+    let (mut fixture_a, _events_a) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-a",
+        "Alpha",
+        json!({
+            "environment": { "environmentId": "env-a", "label": "Alpha", "serverVersion": "0.1.0" },
+            "providers": []
+        }),
+        &["providers:manage", "environment:maintain"],
+    )
+    .await;
+    let (mut fixture_b, _events_b) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-b",
+        "Beta",
+        json!({
+            "environment": { "environmentId": "env-b", "label": "Beta", "serverVersion": "0.1.0" },
+            "providers": []
+        }),
+        &["providers:manage"],
+    )
+    .await;
+    let control = cx.new(|cx| UpdateControl::new(state, cx));
+    let (_root, vcx) = cx.add_window_view(|_, cx| Harness {
+        outer: cx.focus_handle().tab_stop(true),
+        control: control.clone(),
+    });
+    control.update(vcx, |ctrl, cx| {
+        ctrl.plan = updates::Plan {
+            servers: vec![updates::ServerTarget {
+                environment_id: "env-a".into(),
+                label: "Alpha".into(),
+                target_version: "0.2.0".into(),
+                self_update: "npm".into(),
+            }],
+            providers: Vec::new(),
+            restarts: Vec::new(),
+            rows: Vec::new(),
+        };
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear();
+    });
+    let button_center = vcx
+        .debug_bounds("update-everything")
+        .expect("#update-everything renders")
+        .center();
+    vcx.simulate_mouse_move(button_center, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: button_center,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: button_center,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    control.read_with(vcx, |ctrl, cx| {
+        assert!(ctrl.dialog.read(cx).checking);
+    });
+    let (method_a, input_a, reply_a) = fixture_a.next_request().await;
+    let (method_b, input_b, reply_b) = fixture_b.next_request().await;
+    assert_eq!(method_a, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
+    assert_eq!(method_b, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
+    assert_eq!(input_a, json!({ "refreshModels": true }));
+    assert_eq!(input_b, json!({ "refreshModels": true }));
+    // Reopening / re-triggering while in flight must not dispatch a duplicate wave.
+    control.update(vcx, |ctrl, cx| ctrl.refresh_providers_for_dialog(cx));
+    vcx.run_until_parked();
+    control.read_with(vcx, |ctrl, cx| {
+        assert!(ctrl.dialog.read(cx).checking);
+    });
+    let _ = reply_a.send(Ok(json!({ "providers": [] })));
+    let _ = reply_b.send(Ok(json!({ "providers": [] })));
+    let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+    let mut settled_tx = Some(settled_tx);
+    let dialog_entity = control.read_with(vcx, |ctrl, _| ctrl.dialog.clone());
+    let _obs = vcx.update(|_, cx| {
+        cx.observe(&dialog_entity, move |dialog, cx| {
+            if !dialog.read(cx).checking
+                && let Some(tx) = settled_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        })
+    });
+    vcx.run_until_parked();
+    if !dialog_entity.read_with(vcx, |d, _| !d.checking) {
+        settled_rx.await.unwrap();
+        vcx.run_until_parked();
+    }
+    control.read_with(vcx, |ctrl, cx| {
+        assert!(!ctrl.dialog.read(cx).checking);
+    });
+    // After the in-flight wave settles, reopening dispatches a fresh wave (proving the earlier
+    // duplicate trigger did not queue an extra request on the fixtures).
+    control.update(vcx, |ctrl, cx| ctrl.refresh_providers_for_dialog(cx));
+    vcx.run_until_parked();
+    let (method_a2, _, reply_a2) = fixture_a.next_request().await;
+    let (method_b2, _, reply_b2) = fixture_b.next_request().await;
+    assert_eq!(method_a2, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
+    assert_eq!(method_b2, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
+    let _ = reply_a2.send(Ok(json!({ "providers": [] })));
+    let _ = reply_b2.send(Ok(json!({ "providers": [] })));
+}
+
+#[gpui::test]
+async fn retry_failed_skips_already_updated_server_in_fleet(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _base_fixture) = cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+        let (state, fixture) =
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+        crate::settings::init(state.clone(), cx);
+        init(cx);
+        (state, fixture)
+    });
+    let (_fixture_retry, _events) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-retry",
+        "RetryBox",
+        json!({
+            "environment": {
+                "environmentId": "env-retry",
+                "label": "RetryBox",
+                "serverVersion": "0.2.0",
+                "capabilities": { "serverSelfUpdate": "npm" }
+            },
+            "providers": []
+        }),
+        &["environment:maintain"],
+    )
+    .await;
+    let control = cx.new(|cx| UpdateControl::new(state, cx));
+    cx.run_until_parked();
+
+    control.update(cx, |ctrl, cx| {
+        ctrl.capsule_open = true;
+        ctrl.run = Some(updates::UpdateEverythingRun {
+            track_switch: false,
+            phase: updates::UpdateRunPhase::Servers,
+            machines: vec![updates::UpdateRunMachine {
+                environment_id: "env-retry".into(),
+                label: "RetryBox".into(),
+                updates_providers: false,
+                server: Some(updates::ServerTarget {
+                    environment_id: "env-retry".into(),
+                    label: "RetryBox".into(),
+                    target_version: "0.2.0".into(),
+                    self_update: "npm".into(),
+                }),
+                handed_off_version: None,
+                started_at_ms: now_ms(),
+                result: Some(updates::MachineResult::Failed),
+                failure: Some("timed out".into()),
+                provider_failure: None,
+            }],
+        });
+        ctrl.retry_failed(cx);
+    });
+    cx.run_until_parked();
+    control.read_with(cx, |ctrl, _| {
+        assert!(ctrl.run.is_none());
+        assert!(!ctrl.capsule_open);
+    });
+}
+
+#[test]
+fn production_update_dialog_checking_frame() {
+    let Some(out) = std::env::var_os("T3_UPDATE_CAPTURE") else {
+        return;
+    };
+    let out = std::path::PathBuf::from(out);
+    std::fs::create_dir_all(&out).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut cx = HeadlessAppContext::with_platform(
+        gpui_platform::current_platform(true).text_system(),
+        Arc::new(crate::icons::Assets),
+        gpui_platform::current_headless_renderer,
+    );
+    let state = cx.update(|cx| {
+        cx.set_global(
+            serde_json::from_value::<crate::chatgpt_setup::Fixture>(json!({
+                "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            }))
+            .unwrap(),
+        );
+        crate::boot(runtime.handle().clone(), cx)
+    });
+    state.update(&mut cx, |state, _| state.stop_pump());
+    let mut harness = None;
+    let window = cx
+        .open_window(gpui::size(gpui::px(640.), gpui::px(420.)), |_window, cx| {
+            let outer = cx.focus_handle();
+            let control = cx.new(|cx| UpdateControl::new(state.clone(), cx));
+            let view = cx.new(|_| Harness { outer, control });
+            harness = Some(view.clone());
+            view
+        })
+        .unwrap();
+    let harness = harness.unwrap();
+    let plan = Plan {
+        servers: vec![t3_core::updates::ServerTarget {
+            environment_id: "local".into(),
+            label: "Studio Mac".into(),
+            target_version: "0.9.0".into(),
+            self_update: "npm".into(),
+        }],
+        providers: vec![t3_core::updates::ProviderTarget {
+            environment_id: "local".into(),
+            driver: "codex".into(),
+            instance_id: "codex".into(),
+        }],
+        rows: vec![t3_core::updates::Row {
+            environment_id: "local".into(),
+            label: "Studio Mac".into(),
+            app: Some("0.9.0".into()),
+            providers: vec!["Codex".into()],
+            skipped: None,
+        }],
+        restarts: vec![t3_core::updates::RestartingMachine {
+            environment_id: "local".into(),
+            continues_threads: true,
+        }],
+    };
+    cx.update_window(window.into(), |_, window, cx| {
+        let control = harness.read(cx).control.clone();
+        control.update(cx, |ctrl, cx| {
+            ctrl.dialog.update(cx, |dialog, cx| {
+                dialog.open(plan, true, window, cx);
+                dialog.set_checking(true, cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear();
+    })
+    .unwrap();
+    cx.capture_screenshot(window.into())
+        .unwrap()
+        .save(out.join("update-dialog-checking.png"))
+        .unwrap();
+}

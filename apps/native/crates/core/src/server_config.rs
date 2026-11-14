@@ -278,6 +278,19 @@ impl PartialEq for CheckedAt {
     }
 }
 
+/// Server wall-clock timestamp carried by `server.getConfig` snapshots.
+///
+/// Always compares equal so snapshot refreshes for `serverTime` drift alone do
+/// not trigger spurious UI re-renders.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ServerTime(pub Option<String>);
+
+impl PartialEq for ServerTime {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 /// `ServerProvider`: one provider instance as the server reports it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -776,6 +789,8 @@ pub struct ServerConfig {
     pub environment_theme_definitions: Vec<crate::themes::ThemeDefinition>,
     #[serde(default)]
     pub environment: EnvironmentDescriptor,
+    #[serde(default)]
+    pub server_time: ServerTime,
     #[serde(default)]
     pub cwd: String,
     /// `ResolvedKeybindingsConfig`, kept raw for the keymap (ledger KB-USER).

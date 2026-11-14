@@ -178,8 +178,8 @@ impl SnoozeRequest {
             grants.as_ref(),
             |id| {
                 state.thread_shell(id).is_some()
-                    && state.sidebar.model.thread(id).is_some_and(|thread| {
-                        !snoozing || t3_core::sidebar::settled::can_snooze(thread, now)
+                    && state.snapshot_thread(id).is_some_and(|thread| {
+                        !snoozing || t3_core::sidebar::settled::can_snooze(&thread, now)
                     })
             },
         )

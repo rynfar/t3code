@@ -1,6 +1,7 @@
 pub mod assistant_citations;
 pub mod auth;
 pub mod client_settings;
+pub mod clock;
 pub mod command_output;
 pub mod shell_command;
 pub mod commands;

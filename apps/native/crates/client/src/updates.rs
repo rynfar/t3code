@@ -2,9 +2,10 @@
 //! prepare/commit/lifecycle handoff; the server remains authoritative for authorization.
 use crate::environments::{Destination, DestinationError, EnvironmentView, FleetView};
 use crate::session::RpcError;
-use crate::supervisor::ConnectionStatus;
+use crate::supervisor::{ClientHandle, ConnectionStatus};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::time::Duration;
 use t3_core::server_config::{ServerConfig, ServerProvider};
 use t3_core::sidebar::grouping::EnvironmentOwner;
 use t3_core::updates::{
@@ -426,6 +427,58 @@ async fn execute_server_targets(
     updates::collect_update_everything_result(&refs, provider_outcomes)
 }
 
+/// `nudgeReconnectDuringUpdateRestart` (`client-runtime/src/state/server.ts`):
+/// triggers an immediate reconnect after `interval` whenever an environment
+/// waiting on a restart falls into backoff (`Reconnecting`).
+pub async fn nudge_reconnect_during_restart(
+    environment_id: String,
+    mut view: watch::Receiver<Arc<FleetView>>,
+    client: ClientHandle,
+    interval: Duration,
+) {
+    loop {
+        let reconnecting = matches!(
+            view.borrow().environment(&environment_id).map(|e| &e.status),
+            Some(ConnectionStatus::Reconnecting { .. })
+        );
+        if reconnecting {
+            let sleep = tokio::time::sleep(interval);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => {
+                        if matches!(
+                            view.borrow().environment(&environment_id).map(|e| &e.status),
+                            Some(ConnectionStatus::Reconnecting { .. })
+                        ) {
+                            client.retry_now();
+                        }
+                        break;
+                    }
+                    changed = view.changed() => {
+                        if changed.is_err() { return; }
+                        if !matches!(
+                            view.borrow().environment(&environment_id).map(|e| &e.status),
+                            Some(ConnectionStatus::Reconnecting { .. })
+                        ) {
+                            break;
+                        }
+                    }
+                }
+            }
+            if !matches!(
+                view.borrow().environment(&environment_id).map(|e| &e.status),
+                Some(ConnectionStatus::Reconnecting { .. })
+            ) {
+                continue;
+            }
+        }
+        if view.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 pub async fn retry_servers_with_progress(
     targets: Vec<(ServerTarget, Option<String>)>,
     destinations: Vec<UpdateDestination>,
@@ -655,12 +708,32 @@ impl GuardedUpdate<'_> {
         let mut view = self.view.clone();
         let mut grants = self.destination.client.session_state();
         let mut generation = self.destination.client.connection_generation();
+        let mut nudge_at: Option<tokio::time::Instant> = None;
         loop {
             if self.check()? && after.is_none_or(|after| self.generation() > after) { return Ok(()); }
+            let reconnecting = self.continuation.load(Ordering::Relaxed)
+                && matches!(
+                    view.borrow().environment(&self.capture.owner.saved_id).map(|e| &e.status),
+                    Some(ConnectionStatus::Reconnecting { .. })
+                );
+            if reconnecting {
+                nudge_at.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(1));
+            } else {
+                nudge_at = None;
+            }
             tokio::select! {
                 changed = view.changed() => changed.map_err(|_| refused("environment view closed"))?,
                 changed = grants.changed() => changed.map_err(|_| refused("session grants closed"))?,
                 changed = generation.changed() => changed.map_err(|_| refused("connection closed"))?,
+                _ = async {
+                    match nudge_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    nudge_at = None;
+                    self.destination.client.retry_now();
+                }
             }
         }
     }
@@ -1294,6 +1367,67 @@ mod tests {
         )));
         let _ = boot_task.await.unwrap();
         let _ = track_task.await.unwrap();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn nudge_reconnect_during_restart_calls_retry_now_on_reconnecting_only() {
+        let session: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["environment:maintain"]
+        }))
+        .unwrap();
+        let (client, mut fixture) = crate::supervisor::ClientFixture::handle(session);
+        let owner = EnvironmentOwner {
+            saved_id: "env-nudge".into(),
+            canonical_id: Some("env-nudge".into()),
+            generation: 1,
+            connection_generation: 1,
+            shell_generation: 0,
+        };
+        let make_view = |status: ConnectionStatus| {
+            let config = t3_core::server_config::ServerConfigState::default();
+            let shell = t3_core::shell::ShellState::default();
+            let summary = Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                owner.clone(),
+                &shell,
+                &config,
+            ));
+            Arc::new(FleetView {
+                revision: 1,
+                environments: vec![Arc::new(EnvironmentView {
+                    summary,
+                    status,
+                    config,
+                    grants: None,
+                    settings_revision: 0,
+                    keybindings_revision: 0,
+                })],
+            })
+        };
+        let (view_tx, view_rx) = watch::channel(make_view(ConnectionStatus::Blocked {
+            reason: "ssh".into(),
+        }));
+        let task = tokio::spawn(nudge_reconnect_during_restart(
+            "env-nudge".into(),
+            view_rx,
+            client,
+            Duration::from_millis(10),
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(fixture.take_commands().is_empty(), "blocked status must not trigger retry_now");
+
+        let _ = view_tx.send(make_view(ConnectionStatus::Reconnecting {
+            reason: "restarting".into(),
+            attempt: 1,
+        }));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            fixture.take_commands().contains(&"retry"),
+            "reconnecting status must nudge retry_now"
+        );
+        drop(view_tx);
+        let _ = task.await;
     }
 }
 
