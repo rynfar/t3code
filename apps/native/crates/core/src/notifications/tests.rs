@@ -457,3 +457,68 @@ fn newly_linked_parent_retires_only_child_delivery_and_ignores_late_confirmation
     assert_eq!(pending.badge_count(), 1);
     assert_eq!(pending.destination(&other.tag), Some(&parent));
 }
+
+#[test]
+fn environment_notifications_flush_due_respects_grace_pause_and_visibility() {
+    let mut watched = EnvironmentNotifications::default();
+    let mut shell = ShellState::default();
+    let set = |shell: &mut ShellState, threads: Vec<ThreadShell>| {
+        shell.apply(ShellStreamItem::Snapshot {
+            snapshot: Box::new(ShellSnapshot { threads, ..Default::default() }),
+            resolved_repository_identity_roots: None,
+        });
+    };
+    let wake_thread = |id: &str, status: &str, completed_at: Option<&str>| {
+        thread(
+            id,
+            status,
+            json!({
+                "latestRunBackgroundWake": true,
+                "latestRunCompletedAt": completed_at,
+            }),
+        )
+    };
+    let linked_for = |shell: &ShellState| {
+        let threads = &shell.snapshot.as_ref().unwrap().threads;
+        LinkedRequests::build(&[LinkedEnvironment { saved_id: "env", canonical_id: "env", threads }])
+    };
+
+    set(&mut shell, vec![wake_thread("vis", "running", None), wake_thread("hid", "running", None)]);
+    let linked = linked_for(&shell);
+    let mut visibility = NotificationVisibility::default();
+    assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 1_000).is_empty());
+
+    set(
+        &mut shell,
+        vec![
+            wake_thread("vis", "completed", Some("2026-11-01T00:01:00.000Z")),
+            wake_thread("hid", "completed", Some("2026-11-01T00:01:00.000Z")),
+        ],
+    );
+    let linked = linked_for(&shell);
+    assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 10_000).is_empty());
+    assert_eq!(watched.next_deadline(), Some(10_000 + RELEASED_COMPLETION_GRACE_MS));
+    assert!(watched.flush_due(&visibility, 14_999).is_empty());
+
+    // Pause clears pending deadlines until reconnect re-observes the snapshot.
+    watched.pause("env");
+    assert_eq!(watched.next_deadline(), None);
+    assert!(watched.flush_due(&visibility, 20_000).is_empty());
+
+    assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 20_000).is_empty());
+    assert_eq!(watched.next_deadline(), Some(20_000 + RELEASED_COMPLETION_GRACE_MS));
+    assert!(watched.flush_due(&visibility, 24_999).is_empty());
+
+    // Hiding a thread before flush drops its notification while consuming the release.
+    visibility.hidden.insert(ThreadKey::new("env", "hid"));
+    let flushed = watched.flush_due(&visibility, 25_000);
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(flushed[0].0, "env");
+    assert_eq!(kinds(&flushed[0].1), [("vis", "Thread completed")]);
+    assert_eq!(watched.next_deadline(), None);
+
+    // Unhiding afterward does not replay the consumed completion.
+    visibility.hidden.clear();
+    assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 26_000).is_empty());
+    assert!(watched.flush_due(&visibility, 40_000).is_empty());
+}

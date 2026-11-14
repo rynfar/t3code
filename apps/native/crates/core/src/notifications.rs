@@ -312,6 +312,11 @@ impl<K: Eq + Hash + Clone> NotificationGate<K> {
         }
     }
 
+    /// Earliest active grace deadline across pending wake completions.
+    pub fn next_deadline(&self) -> Option<Ms> {
+        self.releases.values().filter_map(|release| release.deadline).min()
+    }
+
     /// Releases queued wake completions whose grace window expired at or before `now`.
     pub fn flush_due(&mut self, now: Ms) -> Vec<K> {
         let due: Vec<(K, Ms)> = self
@@ -372,6 +377,7 @@ struct Observed {
     request: Option<SubagentRequest>,
     observation: Observation,
     status: ThreadStatus,
+    title: String,
 }
 
 fn status_key(status: ThreadStatus) -> &'static str {
@@ -431,6 +437,7 @@ fn observe_row(raw: &ThreadShell, request: Option<SubagentRequest>, revision: Op
         request,
         observation: Observation { attention, request_id, settled, completed_at, background_wake },
         status,
+        title: raw.title.clone(),
     }
 }
 
@@ -446,14 +453,22 @@ pub struct ThreadNotifications {
 impl ThreadNotifications {
     /// Hidden transitions still reach the gate, so revealing a thread never replays them.
     pub fn observe_visible(&mut self, shell: &ShellState, hidden: &HashSet<String>) -> Vec<ThreadNotification> {
-        self.observe(shell).into_iter().filter(|notification| !hidden.contains(&notification.thread_id)).collect()
+        self.observe_visible_at(shell, hidden, 0)
+    }
+
+    pub fn observe_visible_at(&mut self, shell: &ShellState, hidden: &HashSet<String>, now: Ms) -> Vec<ThreadNotification> {
+        self.observe_at(shell, now).into_iter().filter(|notification| !hidden.contains(&notification.thread_id)).collect()
     }
 
     /// Rows the shell has not replaced since the last call keep their observation untouched.
     pub fn observe(&mut self, shell: &ShellState) -> Vec<ThreadNotification> {
+        self.observe_at(shell, 0)
+    }
+
+    pub fn observe_at(&mut self, shell: &ShellState, now: Ms) -> Vec<ThreadNotification> {
         let Some(snapshot) = &shell.snapshot else { return Vec::new() };
         let requests = pending_subagent_requests(&snapshot.threads);
-        self.observe_requests(shell, &requests, |thread| thread.lineage.is_listed())
+        self.observe_requests_at(shell, &requests, |thread| thread.lineage.is_listed(), now)
     }
 
     pub fn pause(&mut self) {
@@ -461,7 +476,34 @@ impl ThreadNotifications {
         self.gate.pause();
     }
 
-    fn observe_requests(&mut self, shell: &ShellState, requests: &HashMap<String, SubagentRequest>, listed: impl Fn(&ThreadShell) -> bool) -> Vec<ThreadNotification> {
+    pub fn next_deadline(&self) -> Option<Ms> {
+        self.gate.next_deadline()
+    }
+
+    pub fn flush_due(&mut self, now: Ms) -> Vec<ThreadNotification> {
+        self.gate
+            .flush_due(now)
+            .into_iter()
+            .filter_map(|thread_id| {
+                let state = self.previous.get(&thread_id)?;
+                Some(ThreadNotification {
+                    thread_id,
+                    kind: NotificationKind::Completion,
+                    status: state.status,
+                    title: notification_title(NotificationKind::Completion, state.status),
+                    body: state.title.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn observe_requests_at(
+        &mut self,
+        shell: &ShellState,
+        requests: &HashMap<String, SubagentRequest>,
+        listed: impl Fn(&ThreadShell) -> bool,
+        now: Ms,
+    ) -> Vec<ThreadNotification> {
         let Some(snapshot) = &shell.snapshot else { return Vec::new() };
         let threads = &snapshot.threads;
         let mut previous = std::mem::take(&mut self.previous);
@@ -490,13 +532,13 @@ impl ThreadNotifications {
             let Some(state) = self.previous.get(&raw.id) else { continue };
             let archived = raw.archived_at.is_some();
             let quiet = raw.latest_run_stop_requested == Some(true);
-            if let Some(kind) = self.gate.observe(&raw.id, prior.as_ref(), &state.observation, archived, quiet) {
+            if let Some(kind) = self.gate.observe_at(&raw.id, prior.as_ref(), &state.observation, archived, quiet, now) {
                 notifications.push(ThreadNotification {
                     thread_id: raw.id.clone(),
                     kind,
                     status: state.status,
                     title: notification_title(kind, state.status),
-                    body: raw.title.clone(),
+                    body: state.title.clone(),
                 });
             }
         }
@@ -525,10 +567,55 @@ impl EnvironmentNotifications {
     }
 
     pub fn observe_linked(&mut self, environment: &str, shell: &ShellState, visibility: &NotificationVisibility, linked: &LinkedRequests) -> Vec<ThreadNotification> {
+        self.observe_linked_at(environment, shell, visibility, linked, 0)
+    }
+
+    pub fn observe_linked_at(
+        &mut self,
+        environment: &str,
+        shell: &ShellState,
+        visibility: &NotificationVisibility,
+        linked: &LinkedRequests,
+        now: Ms,
+    ) -> Vec<ThreadNotification> {
         let Some(requests) = linked.requests.get(environment) else { return Vec::new() };
-        self.watched.entry(environment.to_owned()).or_default().observe_requests(shell, requests, |thread| {
-            thread.lineage.is_listed() && !linked.delegated_under_parent.contains(&ThreadKey::new(environment, &thread.id))
-        }).into_iter().filter(|notification| visibility.visible(&ThreadKey::new(environment, &notification.thread_id))).collect()
+        self.watched
+            .entry(environment.to_owned())
+            .or_default()
+            .observe_requests_at(
+                shell,
+                requests,
+                |thread| thread.lineage.is_listed() && !linked.delegated_under_parent.contains(&ThreadKey::new(environment, &thread.id)),
+                now,
+            )
+            .into_iter()
+            .filter(|notification| visibility.visible(&ThreadKey::new(environment, &notification.thread_id)))
+            .collect()
+    }
+
+    pub fn pause(&mut self, environment: &str) {
+        if let Some(watcher) = self.watched.get_mut(environment) {
+            watcher.pause();
+        }
+    }
+
+    pub fn next_deadline(&self) -> Option<Ms> {
+        self.watched.values().filter_map(ThreadNotifications::next_deadline).min()
+    }
+
+    pub fn flush_due(&mut self, visibility: &NotificationVisibility, now: Ms) -> Vec<(String, Vec<ThreadNotification>)> {
+        let mut ready = Vec::new();
+        for (environment, watcher) in &mut self.watched {
+            let notifications: Vec<ThreadNotification> = watcher
+                .flush_due(now)
+                .into_iter()
+                .filter(|notification| visibility.visible(&ThreadKey::new(environment, &notification.thread_id)))
+                .collect();
+            if !notifications.is_empty() {
+                ready.push((environment.clone(), notifications));
+            }
+        }
+        ready
     }
 
     pub fn remove(&mut self, environment: &str) { self.watched.remove(environment); }
