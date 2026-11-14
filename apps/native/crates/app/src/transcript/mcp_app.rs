@@ -2,35 +2,55 @@
 //! WebKit only transports messages; the protocol host lives in `t3_core::mcp_apps`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, Global, GlobalElementId, InspectorElementId, LayoutId, Pixels, Task, Window,
-    div, prelude::*, px, relative,
+    AnyElement, App, AvailableSpace, Bounds, Context, Element, ElementId, Entity, FocusHandle, Focusable, Global, GlobalElementId, InspectorElementId,
+    KeyDownEvent, LayoutId, MouseButton, PathPromptOptions, Pixels, SharedString, Subscription, Task, Window, div, prelude::*, px, relative,
 };
 use gpui_component::ActiveTheme;
 use serde_json::{Value, json};
-use t3_core::mcp_apps::{Action, DEFAULT_HEIGHT, Host, MAX_HEIGHT, Operation, TEARDOWN_TIMEOUT_MS};
+use t3_core::commands::{self, DispatchMode, method};
+use t3_core::mcp_apps::{Action, DEFAULT_HEIGHT, DownloadItem, Host, MAX_HEIGHT, Operation, TEARDOWN_TIMEOUT_MS};
 use t3_core::timeline::McpAppEntry;
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, uuid_v4};
+use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 use crate::webview::{self, Layer, Page, WebEvent, WebView};
 
 const MAX_PAGES: usize = 24;
 const MAX_VIEWS: usize = 6;
+const FULLSCREEN_BAR_HEIGHT: f32 = 40.;
 const TRANSPORT: &str = include_str!("mcp_app_transport.js");
 type Key = (String, String, String, String, gpui::EntityId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayMode {
+    Inline,
+    Fullscreen,
+}
+
+impl DisplayMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            DisplayMode::Inline => "inline",
+            DisplayMode::Fullscreen => "fullscreen",
+        }
+    }
+}
 
 struct Frames {
     state: Entity<AppState>,
     pages: HashMap<Key, (u64, Entity<McpFrame>)>,
     views: Vec<Weak<WebView>>,
+    fullscreen: Option<Entity<McpFullscreen>>,
     clock: u64,
 }
 impl Global for Frames {}
@@ -41,20 +61,53 @@ pub fn init(state: &Entity<AppState>, cx: &mut App) {
             state: state.clone(),
             pages: HashMap::new(),
             views: Vec::new(),
+            fullscreen: None,
             clock: 0,
         });
     }
+}
+
+pub fn is_fullscreen_open(cx: &App) -> bool {
+    let Some(frames) = cx.try_global::<Frames>() else { return false };
+    let Some(fullscreen) = &frames.fullscreen else { return false };
+    fullscreen.read(cx).is_valid(cx)
+}
+
+pub fn fullscreen(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    let fullscreen = cx.try_global::<Frames>()?.fullscreen.clone()?;
+    if !fullscreen.read(cx).is_valid(cx) {
+        let frame = fullscreen.read(cx).frame.clone();
+        cx.defer(move |cx| {
+            frame.update(cx, |frame, cx| frame.exit_fullscreen(cx));
+            if let Some(frames) = cx.try_global::<Frames>()
+                && frames.fullscreen.as_ref().is_some_and(|fs| fs == &fullscreen)
+            {
+                cx.global_mut::<Frames>().fullscreen = None;
+                cx.refresh_windows();
+            }
+        });
+        return None;
+    }
+    let viewport = window.viewport_size();
+    let width = f32::from(viewport.width);
+    let height = (f32::from(viewport.height) - FULLSCREEN_BAR_HEIGHT).max(0.);
+    let frame = fullscreen.read(cx).frame.clone();
+    frame.update(cx, |frame, cx| {
+        frame.set_fullscreen_size(width, height, cx);
+        frame.sync_theme(cx);
+    });
+    Some(fullscreen.into_any_element())
 }
 
 pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>) -> AnyElement {
     let Some(frames) = cx.try_global::<Frames>() else {
         return div().into_any_element();
     };
-    let Some(environment) = frames.state.read(cx).environment() else {
+    let Some(environment) = frames.state.read(cx).environment().map(str::to_owned) else {
         return div().into_any_element();
     };
     let key = (
-        environment.to_owned(),
+        environment.clone(),
         entry.source_thread_id.clone(),
         entry.source_item_id.clone(),
         entry.reference.attachment_id.clone(),
@@ -68,7 +121,7 @@ pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>
         let Some(client) = state.read(cx).client_handle() else {
             return div().into_any_element();
         };
-        let frame = cx.new(|cx| McpFrame::new(state, &client, entry, cx));
+        let frame = cx.new(|cx| McpFrame::new(environment, state, &client, entry, cx));
         cx.global_mut::<Frames>().pages.insert(key.clone(), (0, frame.clone()));
         frame
     };
@@ -83,7 +136,10 @@ pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>
             .global::<Frames>()
             .pages
             .iter()
-            .filter(|(k, (_, f))| *k != &key && f.read(cx).view.strong_count() == 0)
+            .filter(|(k, (_, f))| {
+                let f = f.read(cx);
+                *k != &key && f.view.is_none() && f.teardown_timer.is_none() && f.display_mode != DisplayMode::Fullscreen
+            })
             .min_by_key(|(_, (used, _))| *used)
             .map(|(k, _)| k.clone());
         let Some(oldest) = oldest else { break };
@@ -94,6 +150,7 @@ pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>
 }
 
 struct McpFrame {
+    environment: String,
     connection: t3_client::mcp_apps::AppConnection,
     state: Entity<AppState>,
     runtime: tokio::runtime::Handle,
@@ -102,23 +159,35 @@ struct McpFrame {
     failed: bool,
     height: u32,
     width: f32,
+    fullscreen_size: Option<(f32, f32)>,
+    display_mode: DisplayMode,
+    theme_revision: usize,
     context: Value,
     tool: Option<Value>,
     detail: Option<Arc<TurnItem>>,
     host: Option<Host>,
-    view: Weak<WebView>,
+    view: Option<Rc<WebView>>,
     generation: u64,
     closed: bool,
     load: Option<Task<()>>,
     detail_task: Option<Task<()>>,
     events: Option<Task<()>>,
     teardown_timer: Option<Task<()>>,
+    _state_sub: Subscription,
 }
 
 impl McpFrame {
-    fn new(state: Entity<AppState>, client: &t3_client::supervisor::ClientHandle, entry: Arc<McpAppEntry>, cx: &mut Context<Self>) -> Self {
+    fn new(environment: String, state: Entity<AppState>, client: &t3_client::supervisor::ClientHandle, entry: Arc<McpAppEntry>, cx: &mut Context<Self>) -> Self {
         let runtime = state.read(cx).runtime().clone();
+        let state_sub = cx.observe(&state, |frame, _, cx| {
+            if frame.display_mode == DisplayMode::Fullscreen && frame.awaiting_user(cx) {
+                frame.exit_fullscreen(cx);
+            }
+        });
+        let theme_revision = crate::theme::revision(cx);
+        let context = host_context(DisplayMode::Inline, 0., None, None, cx);
         let mut frame = Self {
+            environment,
             connection: t3_client::mcp_apps::AppConnection::new(client),
             state,
             runtime,
@@ -127,17 +196,21 @@ impl McpFrame {
             failed: false,
             height: DEFAULT_HEIGHT,
             width: 0.,
-            context: host_context(cx),
+            fullscreen_size: None,
+            display_mode: DisplayMode::Inline,
+            theme_revision,
+            context,
             tool: None,
             detail: None,
             host: None,
-            view: Weak::new(),
+            view: None,
             generation: 0,
             closed: false,
             load: None,
             detail_task: None,
             events: None,
             teardown_timer: None,
+            _state_sub: state_sub,
         };
         frame.load(cx);
         frame.fetch_detail(cx);
@@ -146,6 +219,20 @@ impl McpFrame {
             frame.audit_teardown(cx);
         }
         frame
+    }
+
+    fn conversation_thread_id(&self, cx: &App) -> String {
+        self.state.read(cx).selected_thread.clone().unwrap_or_else(|| self.entry.source_thread_id.clone())
+    }
+
+    fn awaiting_user(&self, cx: &App) -> bool {
+        let tid = self.conversation_thread_id(cx);
+        self.state
+            .read(cx)
+            .thread_state(&tid)
+            .projection
+            .as_ref()
+            .is_some_and(|projection| !t3_core::requests::pending_requests(projection).is_empty())
     }
 
     fn client(&self, cx: &App) -> Option<t3_client::supervisor::ClientHandle> {
@@ -252,9 +339,10 @@ impl McpFrame {
     }
 
     fn update_context(&mut self, cx: &mut Context<Self>) {
-        self.context["containerDimensions"]["width"] = json!(self.width.round());
-        if let Some(tool) = &self.tool {
-            self.context["toolInfo"] = json!({"tool":tool});
+        self.theme_revision = crate::theme::revision(cx);
+        self.context = host_context(self.display_mode, self.width, self.fullscreen_size, self.tool.as_ref(), cx);
+        if let Some(view) = &self.view {
+            view.set_dark(self.context["theme"] == "dark");
         }
         if let Some(host) = &mut self.host {
             let actions = host.update_context(self.context.clone());
@@ -262,28 +350,136 @@ impl McpFrame {
         }
     }
 
+    fn sync_theme(&mut self, cx: &mut Context<Self>) {
+        if self.theme_revision != crate::theme::revision(cx) {
+            self.update_context(cx);
+        }
+    }
+
+    fn set_fullscreen_size(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
+        let next = Some((width, height));
+        if self.fullscreen_size != next {
+            self.fullscreen_size = next;
+            if self.display_mode == DisplayMode::Fullscreen {
+                self.update_context(cx);
+            }
+        }
+    }
+
     fn dispose_host(&mut self) {
         self.generation += 1;
         self.teardown_timer = None;
         self.events = None;
-        self.view = Weak::new();
+        self.view = None;
+        self.display_mode = DisplayMode::Inline;
+        self.fullscreen_size = None;
         if let Some(mut host) = self.host.take() {
             host.dispose();
         }
     }
 
+    fn clear_global_fullscreen(&self, my_id: gpui::EntityId, cx: &mut App) {
+        if let Some(frames) = cx.try_global::<Frames>()
+            && frames.fullscreen.as_ref().is_some_and(|fs| fs.read(cx).frame.entity_id() == my_id)
+        {
+            cx.global_mut::<Frames>().fullscreen = None;
+            cx.refresh_windows();
+        }
+    }
+
+    fn exit_fullscreen(&mut self, cx: &mut Context<Self>) {
+        if self.display_mode != DisplayMode::Fullscreen {
+            self.clear_global_fullscreen(cx.entity_id(), cx);
+            return;
+        }
+        self.display_mode = DisplayMode::Inline;
+        self.fullscreen_size = None;
+        if let Some(view) = &self.view {
+            view.set_layer(Layer::Transcript);
+        }
+        let restore = if let Some(frames) = cx.try_global::<Frames>()
+            && frames.fullscreen.as_ref().is_some_and(|fs| fs.read(cx).frame.entity_id() == cx.entity_id())
+        {
+            cx.global_mut::<Frames>().fullscreen.take().and_then(|fs| fs.read(cx).restore.clone())
+        } else {
+            None
+        };
+        if let Some(previous) = restore
+            && let Some(window) = cx.active_window()
+        {
+            let _ = window.update(cx, |_, window, cx| {
+                previous.focus(window, cx);
+            });
+        }
+        self.update_context(cx);
+        cx.notify();
+        cx.refresh_windows();
+    }
+
+    fn try_enter_fullscreen(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.closed || self.awaiting_user(cx) || crate::dialog::is_open(cx) {
+            return false;
+        }
+        let my_id = cx.entity_id();
+        if let Some(frames) = cx.try_global::<Frames>()
+            && frames.fullscreen.as_ref().is_some_and(|fs| fs.read(cx).frame.entity_id() != my_id)
+        {
+            return false;
+        }
+        if !self.view.as_ref().is_some_and(|v| v.take_activation()) {
+            return false;
+        }
+        let Some(window_handle) = cx.active_window() else { return false };
+        self.enter_fullscreen_on_window(window_handle, cx)
+    }
+
+    fn enter_fullscreen_on_window(&mut self, window_handle: gpui::AnyWindowHandle, cx: &mut Context<Self>) -> bool {
+        if let Some(view) = &self.view {
+            view.set_layer(Layer::Modal);
+        }
+        self.display_mode = DisplayMode::Fullscreen;
+        let frame_entity = cx.entity();
+        let state = self.state.clone();
+        let environment = self.environment.clone();
+        let restore = window_handle
+            .update(cx, |_, window, cx| {
+                let viewport = window.viewport_size();
+                self.fullscreen_size = Some((f32::from(viewport.width), (f32::from(viewport.height) - FULLSCREEN_BAR_HEIGHT).max(0.)));
+                window.focused(cx)
+            })
+            .ok()
+            .flatten();
+        let overlay = cx.new(|cx| McpFullscreen {
+            frame: frame_entity,
+            state,
+            environment,
+            focus: cx.focus_handle(),
+            restore,
+        });
+        let focus = overlay.read(cx).focus.clone();
+        cx.global_mut::<Frames>().fullscreen = Some(overlay);
+        self.update_context(cx);
+        cx.notify();
+        cx.refresh_windows();
+        let _ = window_handle.update(cx, |_, window, cx| {
+            window.focus(&focus, cx);
+        });
+        true
+    }
+
     fn install_host(&mut self, cx: &mut Context<Self>) {
-        self.dispose_host();
+        self.generation += 1;
+        self.teardown_timer = None;
         self.host = Some(Host::new(self.entry.reference.clone(), self.context.clone(), env!("CARGO_PKG_VERSION")));
         self.deliver_tool(cx);
     }
 
     fn detach_host(&mut self, cx: &mut Context<Self>) {
+        self.clear_global_fullscreen(cx.entity_id(), cx);
         if self.teardown_timer.is_some() {
             self.closed = true;
             cx.notify();
         }
-        // The viewport owns the WebView; a detached document cannot acknowledge cleanup.
         self.dispose_host();
     }
 
@@ -298,6 +494,15 @@ impl McpFrame {
             && let Some(host) = &mut self.host
         {
             let actions = host.receive(text);
+            self.actions(actions, cx);
+        }
+    }
+
+    fn complete_request(&mut self, generation: u64, token: u64, result: Result<Value, String>, cx: &mut Context<Self>) {
+        if self.generation == generation
+            && let Some(host) = &mut self.host
+        {
+            let actions = host.complete(token, result);
             self.actions(actions, cx);
         }
     }
@@ -319,18 +524,20 @@ impl McpFrame {
                     if webview::is_offscreen() && fixture::audit_enabled() {
                         eprintln!("MCP bridge host -> {message}");
                     }
-                    if let Some(view) = self.view.upgrade() {
+                    if let Some(view) = &self.view {
                         view.evaluate(&format!("window.__t3McpReceive({message});"));
                     }
                 }
                 Action::Height(height) => {
-                    if self.height != height {
+                    if self.display_mode != DisplayMode::Fullscreen && self.height != height {
                         self.height = height;
                         cx.notify();
                     }
                 }
+                Action::ExitFullscreen => self.exit_fullscreen(cx),
                 Action::Close => {
                     self.closed = true;
+                    self.clear_global_fullscreen(cx.entity_id(), cx);
                     self.dispose_host();
                     cx.notify();
                 }
@@ -341,49 +548,335 @@ impl McpFrame {
                         let _ = this.update(cx, |frame, cx| frame.teardown_timeout(generation, cx));
                     }));
                 }
-                Action::Request {
-                    token,
-                    operation: Operation::OpenLink { url },
-                } => {
-                    let result = if self.view.upgrade().is_some_and(|v| v.take_activation()) {
-                        cx.open_url(&url);
-                        Ok(json!({}))
-                    } else {
-                        Err("Links open only from a click in the app.".into())
-                    };
-                    if let Some(host) = &mut self.host {
-                        let actions = host.complete(token, result);
-                        self.actions(actions, cx);
-                    }
-                }
-                Action::Request { token, operation } => {
-                    let Some(client) = self.client(cx) else {
-                        if let Some(host) = &mut self.host {
-                            let actions = host.complete(token, Err("The app's environment is not connected.".into()));
-                            self.actions(actions, cx);
-                        }
-                        continue;
-                    };
-                    let target = self.target();
-                    let generation = self.generation;
-                    let job = self
-                        .runtime
-                        .spawn(async move { t3_client::mcp_apps::execute(&client, &target, operation).await });
-                    cx.spawn(async move |this, cx| {
-                        let result = job.await.unwrap_or_else(|e| Err(e.to_string()));
-                        let _ = this.update(cx, |frame, cx| {
-                            if frame.generation == generation
-                                && let Some(host) = &mut frame.host
-                            {
-                                let actions = host.complete(token, result);
-                                frame.actions(actions, cx);
-                            }
-                        });
-                    })
-                    .detach();
-                }
+                Action::Request { token, operation } => self.handle_request(token, operation, cx),
             }
         }
+    }
+
+    fn ask_user(
+        &mut self,
+        title: impl Into<SharedString>,
+        description: impl Into<SharedString>,
+        confirm_label: impl Into<SharedString>,
+        on_decision: impl FnOnce(&mut Self, Result<bool, String>, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.exit_fullscreen(cx);
+        let generation = self.generation;
+        let frame = cx.weak_entity();
+        let on_decision = std::cell::RefCell::new(Some(on_decision));
+        let confirm_frame = frame.clone();
+        let cancel_frame = frame;
+        let confirm_cb = on_decision.borrow_mut().take().expect("decision callback");
+        let shared_cb = Rc::new(std::cell::RefCell::new(Some(confirm_cb)));
+        let cancel_cb = shared_cb.clone();
+        let fallback_cb = shared_cb.clone();
+        let asked = crate::dialog::ask_available_cancellable(
+            title,
+            description,
+            confirm_label,
+            move |_, cx| {
+                let Some(cb) = shared_cb.borrow_mut().take() else { return };
+                let _ = confirm_frame.update(cx, |frame, cx| {
+                    if frame.generation == generation {
+                        cb(frame, Ok(true), cx);
+                    }
+                });
+            },
+            move |_, cx| {
+                let Some(cb) = cancel_cb.borrow_mut().take() else { return };
+                let _ = cancel_frame.update(cx, |frame, cx| {
+                    if frame.generation == generation {
+                        cb(frame, Ok(false), cx);
+                    }
+                });
+            },
+            cx,
+        );
+        if !asked
+            && let Some(cb) = fallback_cb.borrow_mut().take()
+        {
+            cb(self, Err("T3 could not ask for approval here.".into()), cx);
+        }
+    }
+
+    fn handle_request(&mut self, token: u64, operation: Operation, cx: &mut Context<Self>) {
+        let generation = self.generation;
+        match operation {
+            Operation::OpenLink { url } => {
+                let result = if self.view.as_ref().is_some_and(|v| v.take_activation()) {
+                    cx.open_url(&url);
+                    Ok(json!({}))
+                } else {
+                    Err("Links open only from a click in the app.".into())
+                };
+                self.complete_request(generation, token, result, cx);
+            }
+            Operation::RequestDisplayMode { mode } => {
+                let next = match mode.as_str() {
+                    "inline" => {
+                        self.exit_fullscreen(cx);
+                        "inline"
+                    }
+                    "fullscreen" => {
+                        if self.try_enter_fullscreen(cx) {
+                            "fullscreen"
+                        } else {
+                            self.display_mode.as_str()
+                        }
+                    }
+                    _ => self.display_mode.as_str(),
+                };
+                self.complete_request(generation, token, Ok(json!({ "mode": next })), cx);
+            }
+            Operation::CallTool { name, arguments } => {
+                let Some(client) = self.client(cx) else {
+                    self.complete_request(generation, token, Err("The app's environment is not connected.".into()), cx);
+                    return;
+                };
+                let target = self.target();
+                let preflight_client = client.clone();
+                let preflight_target = target.clone();
+                let preflight_name = name.clone();
+                let job = self.runtime.spawn(async move {
+                    t3_client::mcp_apps::tool_info(&preflight_client, &preflight_target, &preflight_name).await
+                });
+                cx.spawn(async move |this, cx| {
+                    let info = job.await.unwrap_or_else(|e| Err(e.to_string()));
+                    let _ = this.update(cx, |frame, cx| {
+                        if frame.generation != generation {
+                            return;
+                        }
+                        let info = match info {
+                            Ok(info) => info,
+                            Err(err) => {
+                                frame.complete_request(generation, token, Err(err), cx);
+                                return;
+                            }
+                        };
+                        if !info.callable {
+                            frame.complete_request(generation, token, Err("This app cannot call that tool.".into()), cx);
+                            return;
+                        }
+                        let label = info.title.as_deref().unwrap_or(&name);
+                        let args_text = serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| arguments.to_string());
+                        let title = format!("Allow {} to run {}?", frame.entry.reference.server, label);
+                        let run_call = move |frame: &mut McpFrame, cx: &mut Context<McpFrame>| {
+                            let call_client = client.clone();
+                            let call_target = target.clone();
+                            let call_name = name.clone();
+                            let call_args = arguments.clone();
+                            let job = frame.runtime.spawn(async move {
+                                t3_client::mcp_apps::call_tool_unchecked(&call_client, &call_target, &call_name, call_args).await
+                            });
+                            cx.spawn(async move |this, cx| {
+                                let result = job.await.unwrap_or_else(|e| Err(e.to_string()));
+                                let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, result, cx));
+                            })
+                            .detach();
+                        };
+                        if info.read_only {
+                            run_call(frame, cx);
+                            return;
+                        }
+                        frame.ask_user(
+                            title,
+                            args_text,
+                            "Allow",
+                            move |frame, decision, cx| match decision {
+                                Ok(true) => run_call(frame, cx),
+                                Ok(false) => frame.complete_request(generation, token, Err("Declined by the user.".into()), cx),
+                                Err(err) => frame.complete_request(generation, token, Err(err), cx),
+                            },
+                            cx,
+                        );
+                    });
+                })
+                .detach();
+            }
+            Operation::ReadResource { uri } => {
+                let Some(client) = self.client(cx) else {
+                    self.complete_request(generation, token, Err("The app's environment is not connected.".into()), cx);
+                    return;
+                };
+                let target = self.target();
+                let job = self.runtime.spawn(async move { t3_client::mcp_apps::read_resource(&client, &target, &uri).await });
+                cx.spawn(async move |this, cx| {
+                    let result = job.await.unwrap_or_else(|e| Err(e.to_string()));
+                    let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, result, cx));
+                })
+                .detach();
+            }
+            Operation::SendMessage { text } => {
+                if self.client(cx).is_none() {
+                    self.complete_request(generation, token, Err("Messages are not available here.".into()), cx);
+                    return;
+                }
+                let conv_id = self.conversation_thread_id(cx);
+                let has_thread = {
+                    let state = self.state.read(cx);
+                    state.thread_shell(&conv_id).is_some() || state.thread_state(&conv_id).projection.is_some()
+                };
+                if !has_thread {
+                    self.complete_request(generation, token, Err("Messages are not available here.".into()), cx);
+                    return;
+                }
+                let title = format!("Send this message from {}?", self.entry.reference.server);
+                self.ask_user(
+                    title,
+                    text.clone(),
+                    "Send",
+                    move |frame, decision, cx| match decision {
+                        Ok(true) => {
+                            let cmd = commands::send_message(&uuid_v4(), &conv_id, &text, &DispatchMode::QueueAfterActive);
+                            let rpc = frame.state.read(cx).rpc(method::DISPATCH_COMMAND, cmd);
+                            cx.spawn(async move |this, cx| {
+                                let result = rpc.await.map(|_| json!({})).map_err(|e| e.to_string());
+                                let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, result, cx));
+                            })
+                            .detach();
+                        }
+                        Ok(false) => frame.complete_request(generation, token, Err("Declined by the user.".into()), cx),
+                        Err(err) => frame.complete_request(generation, token, Err(err), cx),
+                    },
+                    cx,
+                );
+            }
+            Operation::UpdateModelContext { content, structured_content } => {
+                let Some(client) = self.client(cx) else {
+                    self.complete_request(generation, token, Err("The app's environment is not connected.".into()), cx);
+                    return;
+                };
+                let target = self.target();
+                let conv_id = self.conversation_thread_id(cx);
+                let job = self.runtime.spawn(async move {
+                    t3_client::mcp_apps::update_model_context(&client, &target, &conv_id, content, structured_content).await
+                });
+                cx.spawn(async move |this, cx| {
+                    let result = job.await.unwrap_or_else(|e| Err(e.to_string())).map(|_| json!({}));
+                    let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, result, cx));
+                })
+                .detach();
+            }
+            Operation::DownloadFile { files } => {
+                let Some(client) = self.client(cx) else {
+                    self.complete_request(generation, token, Err("The app's environment is not connected.".into()), cx);
+                    return;
+                };
+                let names = files
+                    .iter()
+                    .map(|file| match file {
+                        DownloadItem::Embedded { name, .. } | DownloadItem::Link { name, .. } => name.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let title = format!("Save {} from {}?", names, self.entry.reference.server);
+                let target = self.target();
+                self.ask_user(
+                    title,
+                    "",
+                    "Save",
+                    move |frame, decision, cx| {
+                        if !matches!(decision, Ok(true)) {
+                            frame.complete_request(generation, token, Ok(json!({ "isError": true })), cx);
+                            return;
+                        }
+                        let job = frame.runtime.spawn(async move {
+                            t3_client::mcp_apps::resolve_downloads(&client, &target, &files).await
+                        });
+                        cx.spawn(async move |this, cx| {
+                            let resolved = match job.await {
+                                Ok(Ok(files)) => files,
+                                Ok(Err(t3_client::mcp_apps::DownloadError::Refusal(_))) => {
+                                    let _ = this.update(cx, |frame, cx| {
+                                        frame.complete_request(generation, token, Ok(json!({ "isError": true })), cx);
+                                    });
+                                    return;
+                                }
+                                Ok(Err(t3_client::mcp_apps::DownloadError::Failure(err))) => {
+                                    let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, Err(err), cx));
+                                    return;
+                                }
+                                Err(err) => {
+                                    let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, Err(err.to_string()), cx));
+                                    return;
+                                }
+                            };
+                            let _ = this.update(cx, |frame, cx| {
+                                if frame.generation != generation {
+                                    return;
+                                }
+                                frame.save_downloads(generation, token, resolved, cx);
+                            });
+                        })
+                        .detach();
+                    },
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn save_downloads(
+        &mut self,
+        generation: u64,
+        token: u64,
+        mut resolved: Vec<t3_client::mcp_apps::ResolvedDownload>,
+        cx: &mut Context<Self>,
+    ) {
+        let default_dir = std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Downloads"))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        if resolved.len() == 1 {
+            let file = resolved.remove(0);
+            let rx = cx.prompt_for_new_path(&default_dir, Some(&file.name));
+            cx.spawn(async move |this, cx| {
+                let Ok(Ok(Some(dest))) = rx.await else {
+                    let _ = this.update(cx, |frame, cx| {
+                        frame.complete_request(generation, token, Ok(json!({ "isError": true })), cx);
+                    });
+                    return;
+                };
+                let write = cx.background_executor().spawn(async move { std::fs::write(&dest, &file.bytes) }).await;
+                let result = write.map(|_| json!({})).map_err(|e| e.to_string());
+                let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, result, cx));
+            })
+            .detach();
+            return;
+        }
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose folder to save MCP app files".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut dirs))) = rx.await else {
+                let _ = this.update(cx, |frame, cx| {
+                    frame.complete_request(generation, token, Ok(json!({ "isError": true })), cx);
+                });
+                return;
+            };
+            let Some(dir) = dirs.pop() else {
+                let _ = this.update(cx, |frame, cx| {
+                    frame.complete_request(generation, token, Ok(json!({ "isError": true })), cx);
+                });
+                return;
+            };
+            let write = cx
+                .background_executor()
+                .spawn(async move {
+                    for file in resolved {
+                        std::fs::write(dir.join(&file.name), &file.bytes)?;
+                    }
+                    Ok::<_, std::io::Error>(())
+                })
+                .await;
+            let result = write.map(|_| json!({})).map_err(|e| e.to_string());
+            let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, result, cx));
+        })
+        .detach();
     }
 
     fn inline_view(&mut self, width: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<Rc<WebView>> {
@@ -391,7 +884,7 @@ impl McpFrame {
             self.width = width;
             self.update_context(cx);
         }
-        if let Some(view) = self.view.upgrade() {
+        if let Some(view) = self.view.clone() {
             return Some(view);
         }
         if self.host.is_some() {
@@ -403,13 +896,32 @@ impl McpFrame {
         if !webview::available(window) || !window.is_window_active() {
             return None;
         }
-        let frames = cx.global_mut::<Frames>();
-        frames.views.retain(|v| v.strong_count() > 0);
-        if frames.views.len() >= MAX_VIEWS {
-            return None;
+        let my_id = cx.entity_id();
+        loop {
+            {
+                let frames = cx.global_mut::<Frames>();
+                frames.views.retain(|v| v.strong_count() > 0);
+                if frames.views.len() < MAX_VIEWS {
+                    break;
+                }
+            }
+            let reclaim = cx
+                .global::<Frames>()
+                .pages
+                .values()
+                .filter(|(_, f)| {
+                    let guard = f.read(cx);
+                    f.entity_id() != my_id
+                        && guard.teardown_timer.is_none()
+                        && guard.display_mode != DisplayMode::Fullscreen
+                        && guard.view.as_ref().is_some_and(|v| !v.is_shown())
+                })
+                .min_by_key(|(used, _)| *used)
+                .map(|(_, f)| f.clone());
+            let reclaim = reclaim?;
+            reclaim.update(cx, |frame, cx| frame.detach_host(cx));
         }
         let html = self.html.clone()?;
-        self.context = host_context(cx);
         self.update_context(cx);
         let dark = self.context["theme"] == "dark";
         let page = Page {
@@ -417,15 +929,15 @@ impl McpFrame {
             dark,
             scroll_through: false,
             script: TRANSPORT.into(),
-            allow_popups: true,
+            allow_popups: false,
             content_security_policy: Some(self.entry.reference.content_security_policy()),
         };
         let (events, mut received) = mpsc::unbounded();
         let view = WebView::new(page, Layer::Transcript, events, window, cx)?;
+        self.view = Some(view.clone());
         self.install_host(cx);
         let generation = self.generation;
-        self.view = Rc::downgrade(&view);
-        cx.global_mut::<Frames>().views.push(self.view.clone());
+        cx.global_mut::<Frames>().views.push(Rc::downgrade(&view));
         self.events = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = received.next().await {
                 if this
@@ -435,7 +947,7 @@ impl McpFrame {
                         }
                         match event {
                             WebEvent::Message(text) => frame.receive_message(generation, &text, cx),
-                            WebEvent::OpenUrl(url) => cx.open_url(&url),
+                            WebEvent::OpenUrl(_) => {}
                         }
                     })
                     .is_err()
@@ -499,6 +1011,10 @@ impl McpFrame {
 
 impl Render for McpFrame {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_theme(cx);
+        if self.display_mode == DisplayMode::Fullscreen && self.awaiting_user(cx) {
+            self.exit_fullscreen(cx);
+        }
         let p = palette(cx);
         if self.closed {
             return div()
@@ -525,6 +1041,10 @@ impl Render for McpFrame {
                 ))
                 .into_any_element();
         }
+        if self.display_mode == DisplayMode::Fullscreen {
+            // Preserve inline row height during fullscreen to prevent timeline jumps.
+            return div().w_full().h(px(self.height as f32)).into_any_element();
+        }
         let body = if self.html.is_some() {
             FrameElement { frame: cx.entity() }.into_any_element()
         } else {
@@ -547,6 +1067,94 @@ impl Render for McpFrame {
             })
             .child(body)
             .into_any_element()
+    }
+}
+
+struct McpFullscreen {
+    frame: Entity<McpFrame>,
+    state: Entity<AppState>,
+    environment: String,
+    focus: FocusHandle,
+    restore: Option<FocusHandle>,
+}
+
+impl Focusable for McpFullscreen {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl McpFullscreen {
+    fn is_valid(&self, cx: &App) -> bool {
+        let frame = self.frame.read(cx);
+        !frame.closed
+            && frame.display_mode == DisplayMode::Fullscreen
+            && !frame.awaiting_user(cx)
+            && self.state.read(cx).environment() == Some(self.environment.as_str())
+    }
+
+    fn close(&self, _: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.frame.update(cx, |frame, cx| frame.exit_fullscreen(cx));
+    }
+}
+
+impl Render for McpFullscreen {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let dark = cx.theme().is_dark();
+        let (server, view) = {
+            let frame = self.frame.read(cx);
+            (frame.entry.reference.server.clone(), frame.view.clone())
+        };
+        let page = match view {
+            Some(view) => webview::web_view("mcp-app-fullscreen-page", view, dark).into_any_element(),
+            None => div().size_full().into_any_element(),
+        };
+        div()
+            .id("mcp-app-fullscreen")
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.close(Some(window), cx);
+                }
+            }))
+            .absolute()
+            .inset_0()
+            .size_full()
+            .occlude()
+            .bg(hsla(p.background))
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(webview::occluder("mcp-app-fullscreen-cover", Layer::Modal))
+            .child(
+                div()
+                    .h(px(FULLSCREEN_BAR_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(rem(12.))
+                    .border_b_1()
+                    .border_color(hsla(p.border))
+                    .child(div().min_w_0().truncate().text_sm().text_color(hsla(p.foreground)).child(server))
+                    .child(
+                        div()
+                            .id("mcp-app-fullscreen-exit")
+                            .h(px(28.))
+                            .w(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(rem(6.))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(hsla(p.accent)))
+                            .on_click(cx.listener(|this, _, window, cx| this.close(Some(window), cx)))
+                            .child(Icon::Minimize2.render(px(16.), hsla(p.foreground))),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().w_full().child(page))
     }
 }
 
@@ -617,7 +1225,7 @@ impl Element for FrameElement {
     }
 }
 
-fn host_context(cx: &App) -> Value {
+fn host_context(display_mode: DisplayMode, inline_width: f32, fullscreen_size: Option<(f32, f32)>, tool: Option<&Value>, cx: &App) -> Value {
     let p = palette(cx);
     let pairs = [
         ("--color-background-primary", p.background),
@@ -650,7 +1258,25 @@ fn host_context(cx: &App) -> Value {
             crate::theme::metrics::RADIUS * crate::theme::preferences(cx).interface_font_size / crate::theme::metrics::ROOT_FONT_SIZE
         )),
     );
-    json!({"theme":if cx.theme().is_dark() {"dark"} else {"light"},"styles":{"variables":variables},"displayMode":"inline","availableDisplayModes":["inline"],"containerDimensions":{"width":0,"maxHeight":MAX_HEIGHT},"platform":"desktop","userAgent":format!("t3-code/{}",env!("CARGO_PKG_VERSION")),"deviceCapabilities":{"touch":false,"hover":true},"safeAreaInsets":{"top":0,"right":0,"bottom":0,"left":0}})
+    let dimensions = match (display_mode, fullscreen_size) {
+        (DisplayMode::Fullscreen, Some((width, height))) => json!({"width": width.round(), "height": height.round()}),
+        _ => json!({"width": inline_width.round(), "maxHeight": MAX_HEIGHT}),
+    };
+    let mut context = json!({
+        "theme": if cx.theme().is_dark() { "dark" } else { "light" },
+        "styles": { "variables": variables },
+        "displayMode": display_mode.as_str(),
+        "availableDisplayModes": ["inline", "fullscreen"],
+        "containerDimensions": dimensions,
+        "platform": "desktop",
+        "userAgent": format!("t3-code/{}", env!("CARGO_PKG_VERSION")),
+        "deviceCapabilities": { "touch": false, "hover": true },
+        "safeAreaInsets": { "top": 0, "right": 0, "bottom": 0, "left": 0 },
+    });
+    if let Some(tool) = tool {
+        context["toolInfo"] = json!({ "tool": tool });
+    }
+    context
 }
 
 #[cfg(feature = "snapshot")]
@@ -709,5 +1335,252 @@ pub mod fixture {
             item,
         });
         Cow::Owned(items)
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use gpui::size;
+    use t3_core::client_settings::AppearanceMode;
+
+    fn test_entry(id: &str) -> Arc<McpAppEntry> {
+        let item: TurnItem = serde_json::from_value(json!({
+            "id": id,
+            "threadId": "thread-1",
+            "runId": null,
+            "nodeId": null,
+            "parentItemId": null,
+            "ordinal": 1,
+            "status": "completed",
+            "title": null,
+            "startedAt": "2026-01-01T00:00:00.000Z",
+            "completedAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+            "type": "dynamic_tool",
+            "toolName": "weather.get_weather",
+            "input": {"city": "Oslo"},
+            "outputOmitted": false,
+            "output": {
+                "t3McpApp": {
+                    "attachmentId": format!("{id}.html"),
+                    "server": "weather",
+                    "tool": "get_weather",
+                    "resourceUri": "ui://weather/dashboard",
+                    "prefersBorder": true
+                }
+            }
+        }))
+        .unwrap();
+        let reference = t3_core::mcp_apps::read_reference(&json!({
+            "attachmentId": format!("{id}.html"),
+            "server": "weather",
+            "tool": "get_weather",
+            "resourceUri": "ui://weather/dashboard",
+            "prefersBorder": true
+        }))
+        .unwrap();
+        Arc::new(McpAppEntry {
+            run_id: None,
+            reference,
+            source_thread_id: "thread-1".into(),
+            source_item_id: id.into(),
+            item: Arc::new(item),
+        })
+    }
+
+    fn setup_test_state(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        tokio::runtime::Runtime,
+        Entity<AppState>,
+        t3_client::supervisor::ClientHandle,
+        String,
+        t3_client::supervisor::ClientFixture,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, env) = cx.update(|cx| {
+            init(&state, cx);
+            let client = state.read(cx).client_handle().unwrap();
+            let env = client.environment().to_owned();
+            (client, env)
+        });
+        (runtime, state, client, env, fixture)
+    }
+
+    #[gpui::test]
+    async fn fullscreen_guards_step_aside_teardown_and_live_theme_updates(cx: &mut gpui::TestAppContext) {
+        let (_runtime, state, client, env, _fixture) = setup_test_state(cx);
+        cx.update(|cx| {
+            state.update(cx, |s, _| {
+                s.selected_thread = Some("thread-1".into());
+                let projection: t3_core::thread::ThreadProjection = serde_json::from_value(json!({
+                    "thread": {
+                        "id": "thread-1", "projectId": "p-1", "title": "T",
+                        "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-01T00:00:00.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "codex", "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                        "runtimeMode": "full-access", "interactionMode": "default", "lineage": { "rootThreadId": "thread-1" }
+                    },
+                    "runs": [], "attempts": [], "nodes": [], "subagents": [],
+                    "providerSessions": [], "providerThreads": [], "providerTurns": [],
+                    "runtimeRequests": [], "messages": [], "plans": [], "turnItems": [],
+                    "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [],
+                    "contextTransfers": [], "visibleTurnItems": [],
+                    "updatedAt": "2026-01-01T00:00:00.000Z"
+                }))
+                .unwrap();
+                s.thread.projection = Some(projection);
+            });
+        });
+        let window = cx.open_window(size(px(1024.), px(768.)), |_, cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+
+        let (frame, other) = cx.update(|cx| {
+            assert!(!is_fullscreen_open(cx));
+            let frame = cx.new(|cx| McpFrame::new(env.clone(), state.clone(), &client, test_entry("item-1"), cx));
+            let other = cx.new(|cx| McpFrame::new(env.clone(), state.clone(), &client, test_entry("item-2"), cx));
+            (frame, other)
+        });
+
+        // Cannot enter fullscreen without live WebView activation.
+        cx.update(|cx| {
+            frame.update(cx, |f, cx| {
+                assert!(!f.try_enter_fullscreen(cx));
+            });
+            assert!(!is_fullscreen_open(cx));
+        });
+
+        // Simulate entering fullscreen on the window and initializing the host bridge.
+        cx.update(|cx| {
+            frame.update(cx, |f, cx| {
+                f.install_host(cx);
+                let generation = f.generation;
+                f.receive_message(generation, r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#, cx);
+                assert!(f.enter_fullscreen_on_window(window.into(), cx));
+                assert_eq!(f.display_mode, DisplayMode::Fullscreen);
+                assert_eq!(f.context["displayMode"], "fullscreen");
+                assert!(f.context["containerDimensions"].get("height").is_some());
+                assert!(f.context["containerDimensions"].get("maxHeight").is_none());
+
+                // Size notifications are ignored in fullscreen.
+                f.receive_message(generation, r#"{"jsonrpc":"2.0","method":"ui/notifications/size-changed","params":{"height":120}}"#, cx);
+                assert_eq!(f.height, DEFAULT_HEIGHT);
+            });
+            assert!(is_fullscreen_open(cx));
+
+            // Second frame cannot take fullscreen while the first is open.
+            other.update(cx, |o, cx| {
+                assert!(!o.try_enter_fullscreen(cx));
+            });
+        });
+
+        // `request-teardown` in fullscreen exits back to inline instead of closing.
+        cx.update(|cx| {
+            frame.update(cx, |f, cx| {
+                let generation = f.generation;
+                f.receive_message(generation, r#"{"jsonrpc":"2.0","method":"ui/notifications/request-teardown"}"#, cx);
+                assert!(!f.closed);
+                assert!(f.host.is_some());
+                assert_eq!(f.display_mode, DisplayMode::Inline);
+                assert_eq!(f.context["displayMode"], "inline");
+            });
+            assert!(!is_fullscreen_open(cx));
+        });
+
+        // Pending approval/input causes reactive step-aside from fullscreen back to inline.
+        cx.update(|cx| {
+            frame.update(cx, |f, cx| {
+                assert!(f.enter_fullscreen_on_window(window.into(), cx));
+            });
+            assert!(is_fullscreen_open(cx));
+            state.update(cx, |s, cx| {
+                let proj = s.thread.projection.as_mut().unwrap();
+                let req: t3_core::thread::Entity = serde_json::from_value(json!({
+                    "id": "req-1",
+                    "kind": "command_approval",
+                    "status": "pending",
+                    "responseCapability": { "type": "live" },
+                    "createdAt": "2026-01-01T00:00:00.000Z"
+                }))
+                .unwrap();
+                proj.runtime_requests.push(req);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!is_fullscreen_open(cx));
+            let f = frame.read(cx);
+            assert_eq!(f.display_mode, DisplayMode::Inline);
+            assert!(!f.closed);
+        });
+
+        // Live theme revision updates sync context.
+        cx.update(|cx| {
+            let mut prefs = crate::theme::preferences(cx).clone();
+            prefs.mode = if frame.read(cx).context["theme"] == "dark" {
+                AppearanceMode::Light
+            } else {
+                AppearanceMode::Dark
+            };
+            crate::theme::set_preferences(prefs, cx);
+            frame.update(cx, |f, cx| f.sync_theme(cx));
+            let expected = if cx.theme().is_dark() { "dark" } else { "light" };
+            assert_eq!(frame.read(cx).context["theme"], expected);
+        });
+    }
+
+    #[gpui::test]
+    async fn confirmation_dialog_steps_aside_cancels_and_guards_reentry(cx: &mut gpui::TestAppContext) {
+        let (_runtime, state, client, env, _fixture) = setup_test_state(cx);
+        let window = cx.open_window(size(px(800.), px(600.)), |_, cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+        let dialog_entity = window.entity(cx).unwrap();
+
+        let frame = cx.update(|cx| cx.new(|cx| McpFrame::new(env, state.clone(), &client, test_entry("item-dlg"), cx)));
+        let decisions = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let d1 = decisions.clone();
+        let d2 = decisions.clone();
+
+        cx.update(|cx| {
+            frame.update(cx, |f, cx| {
+                assert!(f.enter_fullscreen_on_window(window.into(), cx));
+                f.ask_user(
+                    "Save report.csv from weather?",
+                    "",
+                    "Save",
+                    move |_, res, _| d1.borrow_mut().push(res),
+                    cx,
+                );
+                assert_eq!(f.display_mode, DisplayMode::Inline);
+            });
+            assert!(!is_fullscreen_open(cx));
+            assert!(crate::dialog::is_open(cx));
+
+            // Re-entrant confirmation returns refusal immediately without clobbering open dialog.
+            frame.update(cx, |f, cx| {
+                f.ask_user(
+                    "Second?",
+                    "",
+                    "Allow",
+                    move |_, res, _| d2.borrow_mut().push(res),
+                    cx,
+                );
+            });
+        });
+
+        let _ = cx.update_window(window.into(), |_, window, cx| {
+            dialog_entity.update(cx, |d, cx| d.resolve_for_test(false, window, cx));
+        });
+        cx.update(|cx| {
+            assert!(!crate::dialog::is_open(cx));
+        });
+        assert_eq!(
+            *decisions.borrow(),
+            vec![
+                Err("T3 could not ask for approval here.".into()),
+                Ok(false),
+            ]
+        );
     }
 }

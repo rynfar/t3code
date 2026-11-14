@@ -2,8 +2,9 @@
 //! `shared/src/toolOutput.ts` and `client-runtime/src/mcpApps/host.ts` (inline first slice).
 
 mod host;
-pub use host::{Action, Host, Operation, normalize_result};
+pub use host::{Action, DownloadItem, Host, Operation, normalize_result};
 
+use base64::Engine;
 use serde_json::{Value, json};
 
 #[cfg(test)]
@@ -14,6 +15,8 @@ pub const DEFAULT_HEIGHT: u32 = 320;
 pub const MAX_HEIGHT: u32 = 2000;
 pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_HTML_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
+pub const MAX_DOWNLOAD_NAME: usize = 200;
 pub const TEARDOWN_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +26,7 @@ pub struct Reference {
     pub tool: String,
     pub resource_uri: String,
     pub csp: Value,
+    pub permissions: Value,
     pub prefers_border: bool,
 }
 
@@ -62,14 +66,50 @@ pub fn read_reference(value: &Value) -> Option<Reference> {
             csp[key] = json!(domains);
         }
     }
+    let mut permissions = json!({});
+    if let Some(raw_perms) = value.get("permissions").and_then(Value::as_object) {
+        for key in ["camera", "microphone", "geolocation", "clipboardWrite"] {
+            if raw_perms.get(key).is_some_and(Value::is_object) {
+                permissions[key] = json!({});
+            }
+        }
+    }
     Some(Reference {
         attachment_id: name("attachmentId")?,
         server: name("server")?,
         tool: name("tool")?,
         resource_uri: uri.into(),
         csp,
+        permissions,
         prefers_border: value.get("prefersBorder") == Some(&Value::Bool(true)),
     })
+}
+
+pub fn download_name(uri: Option<&str>, name: Option<&str>) -> String {
+    let raw = match name.filter(|s| !s.trim().is_empty()) {
+        Some(name) => name,
+        None => match uri {
+            Some(uri) => uri.split(['/', '?', '#']).rfind(|part| !part.is_empty()).unwrap_or("download"),
+            None => "download",
+        },
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) || (c as u32) < 32 { '-' } else { c })
+        .take(MAX_DOWNLOAD_NAME)
+        .collect();
+    if sanitized.is_empty() { "download".into() } else { sanitized }
+}
+
+pub fn resource_bytes(content: &Value) -> Option<Vec<u8>> {
+    let obj = content.as_object()?;
+    if let Some(text) = obj.get("text").and_then(Value::as_str) {
+        return Some(text.as_bytes().to_vec());
+    }
+    if let Some(blob) = obj.get("blob").and_then(Value::as_str) {
+        return base64::engine::general_purpose::STANDARD.decode(blob).ok();
+    }
+    None
 }
 
 fn valid_domain(domain: &str) -> bool {

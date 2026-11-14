@@ -5,7 +5,7 @@ use crate::session::RpcError;
 use crate::supervisor::ClientHandle;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use t3_core::mcp_apps::{MAX_HTML_BYTES, Operation, Reference};
+use t3_core::mcp_apps::{DownloadItem, MAX_DOWNLOAD_BYTES, MAX_HTML_BYTES, Operation, Reference, resource_bytes};
 
 /// A cached app keeps its environment identity, never an authenticated supervisor handle.
 pub struct AppConnection {
@@ -43,6 +43,8 @@ pub struct ToolInfo {
     pub callable: bool,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default)]
+    pub title: Option<String>,
     pub tool: Option<Value>,
 }
 
@@ -74,10 +76,57 @@ pub async fn tool_info(client: &ClientHandle, target: &Target, name: &str) -> Re
 pub async fn call_tool(client: &ClientHandle, target: &Target, name: &str, arguments: Value) -> Result<Value, String> {
     let info = tool_info(client, target, name).await?;
     require_read_only(&info)?;
+    call_tool_unchecked(client, target, name, arguments).await
+}
+
+pub async fn call_tool_unchecked(client: &ClientHandle, target: &Target, name: &str, arguments: Value) -> Result<Value, String> {
     let mut payload = target.payload();
     payload["name"] = json!(name);
     payload["arguments"] = arguments;
     client.request("mcpApps.callTool", payload).await.map_err(request_error)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDownload {
+    pub name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadError {
+    Refusal(String),
+    Failure(String),
+}
+
+pub async fn resolve_downloads(client: &ClientHandle, target: &Target, files: &[DownloadItem]) -> Result<Vec<ResolvedDownload>, DownloadError> {
+    let mut resolved = Vec::with_capacity(files.len());
+    for file in files {
+        let (name, mime_type, bytes) = match file {
+            DownloadItem::Embedded { name, mime_type, bytes } => (name.clone(), mime_type.clone(), bytes.clone()),
+            DownloadItem::Link { name, uri, mime_type } => {
+                let response = read_resource(client, target, uri).await.map_err(DownloadError::Failure)?;
+                let content = response
+                    .get("contents")
+                    .and_then(Value::as_array)
+                    .and_then(|contents| contents.first())
+                    .ok_or_else(|| DownloadError::Refusal(format!("{name} has no contents.")))?;
+                let bytes = resource_bytes(content).ok_or_else(|| DownloadError::Refusal(format!("{name} has no contents.")))?;
+                let resolved_mime = content
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| mime_type.clone())
+                    .unwrap_or_else(|| "application/octet-stream".into());
+                (name.clone(), resolved_mime, bytes)
+            }
+        };
+        if bytes.len() > MAX_DOWNLOAD_BYTES {
+            return Err(DownloadError::Refusal(format!("{name} is too large to save.")));
+        }
+        resolved.push(ResolvedDownload { name, mime_type, bytes });
+    }
+    Ok(resolved)
 }
 
 fn require_read_only(info: &ToolInfo) -> Result<(), String> {
@@ -119,6 +168,10 @@ pub async fn execute(client: &ClientHandle, target: &Target, operation: Operatio
         Operation::CallTool { name, arguments } => call_tool(client, target, &name, arguments).await,
         Operation::ReadResource { uri } => read_resource(client, target, &uri).await,
         Operation::OpenLink { .. } => Err("Links must be opened by the client.".into()),
+        Operation::SendMessage { .. }
+        | Operation::UpdateModelContext { .. }
+        | Operation::RequestDisplayMode { .. }
+        | Operation::DownloadFile { .. } => Err("This MCP app request is handled by the UI host.".into()),
     }
 }
 
@@ -247,5 +300,49 @@ mod tests {
         };
         assert_eq!(request_error(error("tool-not-callable")), "This app cannot call that tool.");
         assert_eq!(request_error(error("future-reason")), "McpAppRequestError");
+    }
+
+    #[tokio::test]
+    async fn resolve_downloads_fetches_links_and_enforces_size_and_empty_guards() {
+        let mut server = FakeServer::start().await;
+        let (client, _events) = supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+        let mut socket = server.connection().await;
+        let target = Target {
+            thread_id: "source-thread".into(),
+            item_id: "source-item".into(),
+        };
+
+        let items = vec![
+            DownloadItem::Embedded {
+                name: "local.txt".into(),
+                mime_type: "text/plain".into(),
+                bytes: b"hello".to_vec(),
+            },
+            DownloadItem::Link {
+                name: "remote.csv".into(),
+                uri: "ui://todos/export".into(),
+                mime_type: None,
+            },
+        ];
+        let (c, t) = (client.clone(), target.clone());
+        let job = tokio::spawn(async move { resolve_downloads(&c, &t, &items).await });
+        let req = socket.request("mcpApps.readResource").await;
+        assert_eq!(req["payload"]["uri"], "ui://todos/export");
+        socket
+            .send(json!({"_tag":"Exit","requestId":req["id"],"exit":{"_tag":"Success","value":{"contents":[{"uri":"ui://todos/export","mimeType":"text/csv","text":"a,b"}]}}}))
+            .await;
+        let resolved = job.await.unwrap().unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].bytes, b"hello");
+        assert_eq!(resolved[1].mime_type, "text/csv");
+        assert_eq!(resolved[1].bytes, b"a,b");
+
+        let oversized = vec![DownloadItem::Embedded {
+            name: "huge.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            bytes: vec![0u8; MAX_DOWNLOAD_BYTES + 1],
+        }];
+        let err = resolve_downloads(&client, &target, &oversized).await.unwrap_err();
+        assert_eq!(err, DownloadError::Refusal("huge.bin is too large to save.".into()));
     }
 }

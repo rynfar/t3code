@@ -651,7 +651,9 @@ impl ThreadView {
     }
 
     fn is_follow_paused(&self, cx: &gpui::App) -> bool {
-        crate::transcript::html_render::is_fullscreen_open(cx) || self.viewer.read(cx).is_open()
+        crate::transcript::html_render::is_fullscreen_open(cx)
+            || crate::transcript::mcp_app::is_fullscreen_open(cx)
+            || self.viewer.read(cx).is_open()
     }
 
     /// The rows in view and where they sit, before a change. A gap not yet scrolled into still

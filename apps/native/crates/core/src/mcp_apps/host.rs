@@ -1,14 +1,24 @@
-use super::{MAX_MESSAGE_BYTES, PROTOCOL_VERSION, Reference, clamp_height};
-use serde_json::{Value, json};
+use super::{MAX_MESSAGE_BYTES, PROTOCOL_VERSION, Reference, clamp_height, download_name, resource_bytes};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 const TEARDOWN_ID: &str = "t3-host-0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadItem {
+    Embedded { name: String, mime_type: String, bytes: Vec<u8> },
+    Link { name: String, uri: String, mime_type: Option<String> },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
     CallTool { name: String, arguments: Value },
     ReadResource { uri: String },
     OpenLink { url: String },
+    SendMessage { text: String },
+    UpdateModelContext { content: Option<Vec<Value>>, structured_content: Option<Map<String, Value>> },
+    RequestDisplayMode { mode: String },
+    DownloadFile { files: Vec<DownloadItem> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,6 +26,7 @@ pub enum Action {
     Post(Value),
     Request { token: u64, operation: Operation },
     Height(u32),
+    ExitFullscreen,
     StartTeardownTimer,
     Close,
 }
@@ -28,6 +39,7 @@ pub struct Host {
     disposed: bool,
     teardown_pending: bool,
     sent_context: Option<Value>,
+    app_display_modes: Option<Vec<String>>,
     tool_call: Option<(Value, Option<Value>)>,
     tool_sent: bool,
     next_token: u64,
@@ -67,6 +79,7 @@ impl Host {
             disposed: false,
             teardown_pending: false,
             sent_context: None,
+            app_display_modes: None,
             tool_call: None,
             tool_sent: false,
             next_token: 0,
@@ -107,17 +120,51 @@ impl Host {
                     actions.extend(self.update_context(self.context.clone()));
                     actions
                 }
-                "ui/notifications/size-changed" => params["height"].as_f64().map(|h| vec![Action::Height(clamp_height(h))]).unwrap_or_default(),
-                "ui/notifications/request-teardown" => self.teardown(),
+                "ui/notifications/size-changed" => {
+                    if self.context.get("displayMode").and_then(Value::as_str) == Some("fullscreen") {
+                        return vec![];
+                    }
+                    params["height"].as_f64().map(|h| vec![Action::Height(clamp_height(h))]).unwrap_or_default()
+                }
+                "ui/notifications/request-teardown" => {
+                    if self.context.get("displayMode").and_then(Value::as_str) == Some("fullscreen") {
+                        vec![Action::ExitFullscreen]
+                    } else {
+                        self.teardown()
+                    }
+                }
                 _ => vec![],
             };
         };
         let operation = match method {
             "ui/initialize" => {
+                self.app_display_modes = params
+                    .get("appCapabilities")
+                    .and_then(|caps| caps.get("availableDisplayModes"))
+                    .and_then(Value::as_array)
+                    .map(|modes| modes.iter().filter_map(Value::as_str).map(str::to_owned).collect());
                 self.sent_context = Some(self.context.clone());
+                let mut sandbox = json!({ "csp": self.app.csp });
+                if self.app.permissions.as_object().is_some_and(|perms| !perms.is_empty()) {
+                    sandbox["permissions"] = self.app.permissions.clone();
+                }
                 return vec![post(
                     id,
-                    json!({"protocolVersion":PROTOCOL_VERSION, "hostInfo":{"name":"t3-code","version":self.version}, "hostCapabilities":{"openLinks":{},"serverTools":{},"serverResources":{},"logging":{},"sandbox":{"csp":self.app.csp}}, "hostContext":self.context}),
+                    json!({
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "hostInfo": {"name": "t3-code", "version": self.version},
+                        "hostCapabilities": {
+                            "openLinks": {},
+                            "serverTools": {},
+                            "serverResources": {},
+                            "logging": {},
+                            "message": { "text": {} },
+                            "updateModelContext": { "text": {}, "structuredContent": {} },
+                            "downloadFile": {},
+                            "sandbox": sandbox,
+                        },
+                        "hostContext": self.context,
+                    }),
                 )];
             }
             "ping" => return vec![post(id, json!({}))],
@@ -146,7 +193,58 @@ impl Host {
                 };
                 Operation::OpenLink { url: url.into() }
             }
-            "ui/request-display-mode" => return vec![post(id, json!({"mode":"inline"}))],
+            "ui/message" => {
+                let Some(text) = parse_user_message(params) else {
+                    return vec![fail(id, -32602, "Only text messages from the user role are supported.")];
+                };
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return vec![fail(id, -32602, "ui/message needs non-empty text.")];
+                }
+                Operation::SendMessage { text: trimmed.into() }
+            }
+            "ui/update-model-context" => {
+                let content = match params.get("content") {
+                    None => None,
+                    Some(Value::Array(items)) => Some(items.clone()),
+                    Some(_) => {
+                        return vec![fail(id, -32602, "Model context needs content blocks or an object of structured content.")];
+                    }
+                };
+                let structured_content = match params.get("structuredContent") {
+                    None => None,
+                    Some(Value::Object(map)) => Some(map.clone()),
+                    Some(_) => {
+                        return vec![fail(id, -32602, "Model context needs content blocks or an object of structured content.")];
+                    }
+                };
+                Operation::UpdateModelContext { content, structured_content }
+            }
+            "ui/download-file" => {
+                let Some(files) = parse_downloads(params.get("contents")) else {
+                    return vec![fail(id, -32602, "ui/download-file needs embedded resources or resource links.")];
+                };
+                Operation::DownloadFile { files }
+            }
+            "ui/request-display-mode" => {
+                let current = self.context.get("displayMode").and_then(Value::as_str).unwrap_or("inline");
+                let requested = params.get("mode").and_then(Value::as_str);
+                let host_allows = requested.is_some_and(|mode| {
+                    self.context
+                        .get("availableDisplayModes")
+                        .and_then(Value::as_array)
+                        .is_some_and(|modes| modes.iter().any(|entry| entry.as_str() == Some(mode)))
+                });
+                let app_allows = requested.is_some_and(|mode| {
+                    self.app_display_modes.as_ref().is_none_or(|modes| modes.iter().any(|entry| entry == mode))
+                });
+                match requested {
+                    Some(mode) if host_allows && app_allows && mode != current => {
+                        Operation::RequestDisplayMode { mode: mode.into() }
+                    }
+                    _ => return vec![post(id, json!({ "mode": current }))],
+                }
+            }
             _ => return vec![fail(id, -32601, &format!("Method not found: {method}"))],
         };
         if self.pending.len() >= 16 {
@@ -256,4 +354,71 @@ impl Host {
         self.dispose();
         vec![Action::Close]
     }
+}
+
+fn parse_user_message(params: &Value) -> Option<String> {
+    if params.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let content = params.get("content")?;
+    let blocks: Vec<&Value> = if let Some(arr) = content.as_array() {
+        arr.iter().collect()
+    } else if content.is_object() {
+        vec![content]
+    } else {
+        return None;
+    };
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            return None;
+        }
+        parts.push(block.get("text").and_then(Value::as_str)?);
+    }
+    Some(parts.join("\n"))
+}
+
+fn parse_downloads(contents: Option<&Value>) -> Option<Vec<DownloadItem>> {
+    let entries = contents?.as_array()?;
+    if entries.is_empty() {
+        return None;
+    }
+    let mut files = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let obj = entry.as_object()?;
+        match obj.get("type").and_then(Value::as_str)? {
+            "resource" => {
+                let resource = obj.get("resource")?.as_object()?;
+                let resource_val = obj.get("resource")?;
+                let bytes = resource_bytes(resource_val)?;
+                let uri = resource.get("uri").and_then(Value::as_str);
+                let name = resource.get("name").and_then(Value::as_str);
+                let mime_type = resource
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream")
+                    .to_owned();
+                files.push(DownloadItem::Embedded {
+                    name: download_name(uri, name),
+                    mime_type,
+                    bytes,
+                });
+            }
+            "resource_link" => {
+                let uri = obj.get("uri").and_then(Value::as_str)?.to_owned();
+                let name = obj.get("name").and_then(Value::as_str);
+                let mime_type = obj.get("mimeType").and_then(Value::as_str).map(str::to_owned);
+                files.push(DownloadItem::Link {
+                    name: download_name(Some(&uri), name),
+                    uri,
+                    mime_type,
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(files)
 }

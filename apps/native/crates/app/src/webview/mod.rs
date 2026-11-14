@@ -129,7 +129,7 @@ struct AppliedPlacement {
 
 pub struct WebView {
     native: NativeView,
-    layer: Layer,
+    layer: Cell<Layer>,
     occluders: Rc<Occluders>,
     leases: Cell<usize>,
     /// The frame, visible part, and cutouts last applied; `None` while hidden.
@@ -171,12 +171,22 @@ impl WebView {
         let native = NativeView::new(window, &page, events)?;
         Some(Rc::new(WebView {
             native,
-            layer,
+            layer: Cell::new(layer),
             occluders: occluders(window, cx),
             leases: Cell::new(0),
             applied: RefCell::new(None),
             dark: Cell::new(page.dark),
         }))
+    }
+
+    pub fn set_layer(&self, layer: Layer) {
+        if self.layer.replace(layer) != layer {
+            self.applied.borrow_mut().take();
+        }
+    }
+
+    pub fn is_shown(&self) -> bool {
+        self.leases.get() > 0
     }
 
     pub fn set_zoom(&self, zoom: f64) {
@@ -199,7 +209,7 @@ impl WebView {
 
     pub fn is_focused(&self) -> bool { self.native.is_focused() }
 
-    fn set_dark(&self, dark: bool) {
+    pub fn set_dark(&self, dark: bool) {
         if self.dark.replace(dark) != dark {
             self.native.set_dark(dark);
         }
@@ -215,11 +225,12 @@ impl WebView {
     /// Places the view for the frame being presented: `bounds` clipped to `clip`, minus what
     /// higher layers cover, with higher-layer cutouts masked out.
     fn present(&self, bounds: Bounds<Pixels>, clip: Bounds<Pixels>) {
-        let visible = self.occluders.visible(bounds.intersect(&clip), self.layer);
+        let layer = self.layer.get();
+        let visible = self.occluders.visible(bounds.intersect(&clip), layer);
         if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
             return self.hide();
         }
-        let cutouts = self.occluders.cutouts(visible, self.layer);
+        let cutouts = self.occluders.cutouts(visible, layer);
         let next = AppliedPlacement { bounds, visible, cutouts };
         if self.applied.borrow().as_ref() != Some(&next) {
             self.native.place(next.bounds, next.visible, &next.cutouts);
