@@ -1,13 +1,13 @@
-//! What the agent waits on, attached above the composer: the approval banner with its decisions
-//! (`TimelinePendingApprovalRow.tsx`, `ComposerPendingApprovalActions.tsx`) and the question
-//! banner with its options (`ComposerPendingUserInputPanel.tsx`), plus the answering flow from
-//! `usePendingThreadRequests.ts`: the prompt edits the active question's own answer while the
-//! thread's draft waits aside.
+//! What the agent waits on, attached above the composer: the question banner with its options
+//! (`ComposerPendingUserInputPanel.tsx`), plus the answering flow from `usePendingThreadRequests.ts`:
+//! the prompt edits the active question's own answer while the thread's draft waits aside.
 
-use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
+use std::sync::Arc;
+
+use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, Styled, Window, div, prelude::*, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_core::commands::{self, ApprovalDecision};
-use t3_core::requests::{self, PendingApproval, PendingUserInput, Question};
+use t3_core::commands;
+use t3_core::requests::{self, PendingUserInput, Question};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Float, MenuItem, checkbox, floating, kbd, menu_surface, radio};
 use super::{AUTO_ADVANCE, Composer, Target};
@@ -92,6 +92,7 @@ impl Composer {
             self.stash = Some(self.prompt(cx));
         }
         self.answering = active.clone();
+        self.question_collapsed = None;
         self.auto_advance = None;
         match active {
             Some(request_id) => {
@@ -125,7 +126,7 @@ impl Composer {
             return;
         }
         let Some(input) = self.active_input().cloned() else { return };
-        if !input.can_respond() || self.question_responding(&input.request_id, cx) {
+        if !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx) {
             return;
         }
         let drafts = self.question_answer_drafts(&input, cx);
@@ -146,7 +147,7 @@ impl Composer {
     }
 
     pub(super) fn previous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_rewinding(cx) || self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
+        if self.is_rewinding(cx) || !self.can_answer(cx) || self.active_input().is_some_and(|input| self.question_responding(&input.request_id, cx)) { return; }
         let Some(answers) = self.answering.as_ref().and_then(|request_id| self.answers.get_mut(request_id)) else { return };
         answers.index = answers.index.saturating_sub(1);
         self.show_active_answer(window, cx);
@@ -155,7 +156,7 @@ impl Composer {
 
     /// Picks an option. Single-select questions move on once the pick settles, as the web does.
     pub(super) fn toggle_option(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_rewinding(cx) {
+        if self.is_rewinding(cx) || !self.can_answer(cx) {
             return;
         }
         let Some((request_id, question)) = self.active_question() else { return };
@@ -169,7 +170,18 @@ impl Composer {
         let next = requests::toggle_option(&question, draft, &value);
         answers.drafts.insert(question.id.clone(), next);
         if let Some(stash) = self.stash.as_mut() {
-            *stash = requests::carry_displaced_answer(stash, &displaced);
+            let next_stash = requests::carry_displaced_answer(stash, &displaced);
+            let carried = !displaced.trim().is_empty() && next_stash != *stash;
+            *stash = next_stash;
+            if carried {
+                self.state.update(cx, |state, cx| {
+                    state.show_toast(
+                        crate::toast::Toast::new(crate::toast::ToastKind::Info, "Your typed text was set aside")
+                            .description("It will be back in the composer once the question is answered."),
+                        cx,
+                    );
+                });
+            }
         }
         self.set_prompt("", window, cx);
         if !question.multi_select {
@@ -214,9 +226,17 @@ impl Composer {
         self.run_question_request(key, command, "Failed to dismiss the question.", cx);
     }
 
-    /// The digit shortcuts (1–9) pick options while the prompt is not focused.
+    fn is_question_collapsed(&self, input: &PendingUserInput) -> bool {
+        let index = self.question_index(input);
+        input.questions.get(index).is_some_and(|question| self.question_collapsed.as_deref() == Some(question.id.as_str()))
+    }
+
+    /// The digit shortcuts (1–9) pick options while the prompt is not focused and the question is expanded.
     pub(super) fn pick_by_digit(&mut self, digit: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.is_rewinding(cx) {
+        if self.is_rewinding(cx) || !self.can_answer(cx) {
+            return false;
+        }
+        if self.active_input().is_some_and(|input| self.is_question_collapsed(input)) {
             return false;
         }
         let Some((_, question)) = self.active_question() else { return false };
@@ -225,140 +245,29 @@ impl Composer {
         true
     }
 
-    pub(super) fn render_approval(&self, approval: &PendingApproval, count: usize, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(cx);
-        let (label, detail_label) = approval.presentation();
-        let kind_icon = match approval.request_kind.as_str() {
-            "command" => Icon::Terminal,
-            "file-change" => Icon::SquarePen,
-            "file-read" => Icon::Eye,
-            "mcp-elicitation" => Icon::Hammer,
-            _ => Icon::Wrench,
-        };
-        let responding = self.is_rewinding(cx) || self.responding.contains(&approval.request_id);
-        let (primary, more) = approval.split_options();
-        let more: Vec<(ApprovalDecision, String, bool)> =
-            more.into_iter().map(|option| (option.decision, option.label.clone(), option.warning.is_some())).collect();
-        let actions = h_flex().flex_wrap().gap(px(8.)).children(primary.into_iter().map(|option| {
-            let (request_id, decision) = (approval.request_id.clone(), option.decision);
-            let variant = if decision == ApprovalDecision::Accept { ButtonVariant::Default } else { ButtonVariant::Outline };
-            let mut button = Button::new(SharedString::from(format!("approval-{}", decision.as_str())), variant, ButtonSize::Xs)
-                .label(option.label.clone())
-                .disabled(responding)
-                .on_click(cx.listener(move |this, _, _, cx| this.respond_to_approval(request_id.clone(), decision, cx)));
-            if option.warning.is_some() {
-                button = button.icon(Icon::TriangleAlert);
-            }
-            if let Some(warning) = &option.warning {
-                button = button.tooltip(warning.clone());
-            }
-            button
-        }));
-        let actions = actions.when(!more.is_empty(), |this| {
-            this.child(
-                div().relative().child(
-                    Button::new("approval-more", ButtonVariant::Outline, ButtonSize::IconXs)
-                        .icon(Icon::Ellipsis)
-                        .tooltip("More approval options")
-                        .disabled(responding)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if responding || Self::guard_reopen(&mut this.menu_dismissed) {
-                                return;
-                            }
-                            this.approval_menu_open = !this.approval_menu_open;
-                            cx.notify();
-                        })),
-                )
-                .when(self.approval_menu_open && !responding, |this| {
-                    let request_id = approval.request_id.clone();
-                    this.child(floating(
-                        Float::AboveEnd,
-                        menu_surface(cx)
-                                    .occlude()
-                                    .mb(px(4.))
-                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                        this.approval_menu_open = false;
-                                        this.menu_dismissed = Some(std::time::Instant::now());
-                                        cx.notify();
-                                    }))
-                                    .children(more.iter().map(|(decision, label, warning)| {
-                                        let (request_id, decision) = (request_id.clone(), *decision);
-                                        let item = MenuItem::new(SharedString::from(format!("more-{}", decision.as_str())), label.clone())
-                                            .on_click(cx.listener(move |this, _, _, cx| this.respond_to_approval(request_id.clone(), decision, cx)));
-                                        if *warning { item.icon(Icon::TriangleAlert, hsla(p.warning)) } else { item }
-                                    })),
-                    ))
-                }),
-            )
-        });
-        let content = v_flex()
-            .child(
-                h_flex()
-                    .h(px(28.))
-                    .px(px(4.))
-                    .gap(px(4.))
-                    .child(div().w(px(24.)).flex().justify_center().child(kind_icon.render(px(16.), hsla(p.icon_muted))))
-                    .child(div().flex_1().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(label))
-                    .when(count > 1, |this| this.child(div().px(px(6.)).text_color(hsla(p.muted_foreground)).child(format!("1/{count}")))),
-            )
-            .child(
-                v_flex()
-                    .pl(px(32.))
-                    .pr(px(12.))
-                    .pb(px(6.))
-                    .gap(px(4.))
-                    .child(
-                        div()
-                            .id("approval-detail")
-                            .max_h(px(160.))
-                            .overflow_y_scroll()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_xs()
-                            .line_height(px(20.))
-                            .text_color(hsla(p.foreground))
-                            .child(SharedString::from(approval.detail.clone().unwrap_or_else(|| detail_label.to_owned()))),
-                    )
-                    .children(approval.app_name.clone().map(|name| div().text_color(hsla(p.muted_foreground)).child(name)))
-                    .children(approval.reason.clone().map(|reason| div().text_color(hsla(p.muted_foreground)).child(reason)))
-                    .child(match approval.live {
-                        true => h_flex()
-                            .flex_wrap()
-                            .gap(px(8.))
-                            .child(
-                                h_flex()
-                                    .gap(px(4.))
-                                    .text_color(hsla(p.warning_foreground))
-                                    .child(Icon::Shield.render(px(12.), hsla(p.warning_foreground)))
-                                    .child("Waiting for approval"),
-                            )
-                            .child(actions)
-                            .children(approval.full_access_override.as_deref().map(|kind| {
-                                let explanation = requests::full_access_override_explanation(kind);
-                                div()
-                                    .id("full-access-override")
-                                    .text_color(hsla(p.muted_foreground))
-                                    .hover(|this| this.underline())
-                                    .child(requests::FULL_ACCESS_OVERRIDE_QUESTION)
-                                    .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(explanation).build(window, cx))
-                            }))
-                            .into_any_element(),
-                        false => div()
-                            .text_color(hsla(p.warning_foreground))
-                            .child("Provider process is gone. Interrupt or restart the run to respond.")
-                            .into_any_element(),
-                    }),
-            );
-        banner_surface(true, content, cx).into_any_element()
-    }
-
-    pub(super) fn render_question(&self, input: &PendingUserInput, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_question(&mut self, input: &PendingUserInput, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let index = self.question_index(input);
-        let Some(question) = input.questions.get(index) else { return div().into_any_element() };
-        let responding = self.is_rewinding(cx) || self.question_responding(&input.request_id, cx) || !input.can_respond();
+        let Some(question) = input.questions.get(index).cloned() else { return div().into_any_element() };
+        let collapsed = self.question_collapsed.as_deref() == Some(question.id.as_str());
+        let responding = self.is_rewinding(cx) || !self.can_answer(cx) || self.question_responding(&input.request_id, cx) || !input.can_respond();
         let drafts = self.answers.get(&self.answer_key(&input.request_id)).map(|answers| &answers.drafts);
-        let draft = drafts.and_then(|drafts| drafts.get(&question.id));
+        let draft = drafts.and_then(|drafts| drafts.get(&question.id)).cloned();
         let request_id = input.request_id.clone();
+        let question_id = question.id.clone();
+        let prompt_markdown = (!collapsed).then(|| {
+            let text: Arc<str> = Arc::from(question.question.as_str());
+            let key = format!("composer-question:{}:{}", self.answer_key(&input.request_id), question.id);
+            let action_ctx = crate::transcript::markdown::links::MarkdownActionContext {
+                state: self.state.clone(),
+                owner: cx.entity().entity_id(),
+                cwd: self.menu_cwd(cx),
+                thread_id: self.thread_id(),
+                thread_view: None,
+            };
+            self.question_markdown.state_in_context(&key, &text, Some(action_ctx), cx)
+        });
+        let collapsed_preview = question.question.replace('\n', " ");
         let content = v_flex()
             .child(
                 h_flex()
@@ -366,10 +275,64 @@ impl Composer {
                     .pl(px(16.))
                     .pr(px(4.))
                     .gap(px(4.))
-                    .child(div().flex_1().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(question.header.clone()))
-                    .when(input.questions.len() > 1, |this| {
-                        this.child(div().px(px(6.)).text_color(hsla(p.muted_foreground)).child(format!("{}/{}", index + 1, input.questions.len())))
-                    })
+                    .child(
+                        h_flex()
+                            .id("question-toggle")
+                            .debug_selector(|| "question-toggle".to_owned())
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .items_center()
+                            .gap(px(6.))
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .hover(|this| this.bg(hsla(p.foreground).opacity(0.05)))
+                            .tooltip(move |window, cx| {
+                                let label = if collapsed { "Show the question and its options" } else { "Hide the question and its options" };
+                                gpui_component::tooltip::Tooltip::new(label).build(window, cx)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.question_collapsed = if collapsed { None } else { Some(question_id.clone()) };
+                                cx.notify();
+                            }))
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_color(hsla(p.muted_foreground))
+                                            .when(collapsed, |this| this.max_w(gpui::relative(0.5)))
+                                            .child(question.header.clone()),
+                                    )
+                                    .when(collapsed, |this| {
+                                        this.child(div().flex_none().text_color(hsla(p.muted_foreground).opacity(0.4)).child("·"))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_color(hsla(p.secondary_label))
+                                                    .child(collapsed_preview),
+                                            )
+                                    }),
+                            )
+                            .when(input.questions.len() > 1, |this| {
+                                this.child(div().flex_none().px(px(6.)).text_color(hsla(p.muted_foreground)).child(format!("{}/{}", index + 1, input.questions.len())))
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px(px(4.))
+                                    .flex()
+                                    .items_center()
+                                    .child((if collapsed { Icon::ChevronRight } else { Icon::ChevronDown }).render(px(14.), hsla(p.muted_foreground))),
+                            ),
+                    )
                     .when(input.dismissible, |this| {
                         this.child(
                             Button::new("question-dismiss", ButtonVariant::Outline, ButtonSize::IconXs)
@@ -380,52 +343,55 @@ impl Composer {
                         )
                     }),
             )
-            .child(
-                v_flex()
-                    .id("question-body")
-                    .max_h(px(384.))
-                    .overflow_y_scroll()
-                    .pl(px(22.))
-                    .pr(px(16.))
-                    .pb(px(4.))
-                    .child(div().pt(px(8.)).text_sm().line_height(px(22.75)).text_color(hsla(p.foreground).opacity(0.85)).child(question.question.clone()))
-                    .child(v_flex().mt(px(6.)).ml(px(-6.)).children(question.options.iter().enumerate().map(|(position, option)| {
-                        let value = option.answer_value().to_owned();
-                        let selected = requests::is_option_selected(question, draft, &value);
-                        h_flex()
-                            .id(("question-option", position))
-                            .items_start()
-                            .gap(px(10.))
-                            .py(px(6.))
-                            .pl(px(6.))
-                            .rounded(px(6.))
-                            .text_color(if selected { hsla(p.foreground) } else { hsla(p.foreground).opacity(0.7) })
-                            .when(responding, |this| this.opacity(0.5))
-                            .when(!responding, |this| {
-                                this.cursor_pointer()
-                                    .when(!selected, |this| this.hover(|this| this.bg(hsla(p.muted).opacity(0.3))))
-                                    .on_click(cx.listener(move |this, _, window, cx| this.toggle_option(value.clone(), window, cx)))
-                            })
-                            .child(div().h(px(20.)).flex().items_center().child(if question.multi_select {
-                                checkbox(selected, cx)
-                            } else {
-                                radio(selected, cx)
-                            }))
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap(px(2.))
-                                    .child(div().text_sm().line_height(px(20.)).font_weight(FontWeight::MEDIUM).child(option.label.clone()))
-                                    .when(!option.description.is_empty() && option.description != option.label, |this| {
-                                        this.child(div().text_size(px(11.)).text_color(hsla(p.secondary_label)).child(option.description.clone()))
-                                    }),
-                            )
-                            .when(position < 9, |this| {
-                                this.child(div().h(px(20.)).w(px(24.)).flex().items_center().justify_center().child(kbd((position + 1).to_string(), cx)))
-                            })
-                    }))),
-            );
+            .when_some(prompt_markdown, |this, state| {
+                this.child(
+                    v_flex()
+                        .id("question-body")
+                        .debug_selector(|| "question-body".to_owned())
+                        .max_h(px(384.))
+                        .overflow_y_scroll()
+                        .pl(px(22.))
+                        .pr(px(16.))
+                        .pb(px(4.))
+                        .child(div().pt(px(8.)).child(crate::transcript::markdown::prose(&state, cx)))
+                        .child(v_flex().mt(px(6.)).ml(px(-6.)).children(question.options.iter().enumerate().map(|(position, option)| {
+                            let value = option.answer_value().to_owned();
+                            let selected = requests::is_option_selected(&question, draft.as_ref(), &value);
+                            h_flex()
+                                .id(("question-option", position))
+                                .items_start()
+                                .gap(px(10.))
+                                .py(px(6.))
+                                .pl(px(6.))
+                                .rounded(px(6.))
+                                .text_color(if selected { hsla(p.foreground) } else { hsla(p.foreground).opacity(0.7) })
+                                .when(responding, |this| this.opacity(0.5))
+                                .when(!responding, |this| {
+                                    this.cursor_pointer()
+                                        .when(!selected, |this| this.hover(|this| this.bg(hsla(p.muted).opacity(0.3))))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.toggle_option(value.clone(), window, cx)))
+                                })
+                                .child(div().h(px(20.)).flex().items_center().child(if question.multi_select {
+                                    checkbox(selected, cx)
+                                } else {
+                                    radio(selected, cx)
+                                }))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap(px(2.))
+                                        .child(div().text_sm().line_height(px(20.)).font_weight(FontWeight::MEDIUM).child(option.label.clone()))
+                                        .when(!option.description.is_empty() && option.description != option.label, |this| {
+                                            this.child(div().text_size(px(11.)).text_color(hsla(p.secondary_label)).child(option.description.clone()))
+                                        }),
+                                )
+                                .when(position < 9, |this| {
+                                    this.child(div().h(px(20.)).w(px(24.)).flex().items_center().justify_center().child(kbd((position + 1).to_string(), cx)))
+                                })
+                        }))),
+                )
+            });
         banner_surface(false, content, cx)
             .track_focus(&self.question_focus)
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| window.focus(&this.question_focus, cx)))

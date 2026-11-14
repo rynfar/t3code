@@ -650,38 +650,6 @@ impl Composer {
         }
         if shown {self.error = Some(error);} else {tracing::warn!(%error, "Send failed; retained the original target's draft");}
     }
-
-    pub(super) fn respond_to_approval(&mut self, request_id: String, decision: ApprovalDecision, cx: &mut Context<Self>) {
-        if self.is_rewinding(cx) {
-            return;
-        }
-        let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
-        if !self.snapshot.pending.approvals.iter().any(|approval| approval.request_id == request_id && approval.live) {
-            return;
-        }
-        if !self.responding.insert(request_id.clone()) {
-            return;
-        }
-        self.approval_menu_open = false;
-        let command = commands::respond_to_approval(&uuid_v4(), &thread_id, &request_id, decision, None);
-        self.run_request(request_id, command, "Failed to submit approval decision.", cx);
-    }
-
-    pub(super) fn run_request(&mut self, request_id: String, command: Value, failure: &'static str, cx: &mut Context<Self>) {
-        let request = self.state.read(cx).rpc(method::DISPATCH_COMMAND, command);
-        cx.spawn(async move |this, cx| {
-            let result = request.await;
-            let _ = this.update(cx, |this, cx| {
-                this.responding.remove(&request_id);
-                if let Err(error) = result {
-                    this.error = Some(format!("{failure} {error}"));
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
 }
 
 #[cfg(feature = "snapshot")]

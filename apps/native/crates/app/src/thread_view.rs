@@ -73,6 +73,14 @@ pub struct ThreadView {
     turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
     fork_support: HashMap<String, bool>,
     forking: std::collections::HashSet<String>,
+    pending_approvals: Vec<t3_core::requests::PendingApproval>,
+    responding_approvals: HashSet<String>,
+    approval_errors: HashMap<String, String>,
+    can_operate_thread: bool,
+    open_approval_menu: Option<String>,
+    approval_menu_dismissed: Option<std::time::Instant>,
+    open_approval_override: Option<String>,
+    approval_override_dismissed: Option<std::time::Instant>,
     /// What `turn_diffs` was derived from: the message count and the checkpoints.
     turn_diff_source: Option<(usize, Vec<t3_core::thread::Entity>)>,
     banners: status::Banners,
@@ -137,6 +145,11 @@ impl ThreadView {
             AppEvent::Phase => {
                 this.watch_banner_grants(cx);
                 this.sync_command_outputs(cx);
+                this.can_operate_thread = this.state.read(cx).can_operate_threads();
+                if !this.pending_approvals.is_empty() {
+                    this.remeasure_approvals();
+                    cx.notify();
+                }
             },
             AppEvent::Rewind => {
                 this.check_rewind(cx);
@@ -165,6 +178,7 @@ impl ThreadView {
         if let Some(setup) = &setup {
             subscriptions.push(cx.subscribe(setup, |this, _, _: &SetupEvent, cx| this.sync_setup(cx)));
         }
+        let can_operate_thread = state.read(cx).can_operate_threads();
         ThreadView {
             state,
             list: ListState::new(0, ListAlignment::Bottom, px(600.)),
@@ -194,6 +208,14 @@ impl ThreadView {
             turn_diffs: HashMap::new(),
             fork_support: HashMap::new(),
             forking: std::collections::HashSet::new(),
+            pending_approvals: Vec::new(),
+            responding_approvals: HashSet::new(),
+            approval_errors: HashMap::new(),
+            can_operate_thread,
+            open_approval_menu: None,
+            approval_menu_dismissed: None,
+            open_approval_override: None,
+            approval_override_dismissed: None,
             turn_diff_source: None,
             banners: status::Banners::default(),
             local_error: None,
@@ -250,6 +272,13 @@ impl ThreadView {
             self.reset_status();
             self.turn_diffs.clear();
             self.turn_diff_source = None;
+            self.pending_approvals.clear();
+            self.responding_approvals.clear();
+            self.approval_errors.clear();
+            self.open_approval_menu = None;
+            self.approval_menu_dismissed = None;
+            self.open_approval_override = None;
+            self.approval_override_dismissed = None;
             self.reset_rewind();
             self.anchor_gap.borrow_mut().take();
             self.list.reset(0);
@@ -262,6 +291,7 @@ impl ThreadView {
             cx.notify();
         }
         let state = self.state.read(cx);
+        self.can_operate_thread = state.can_operate_threads();
         match self.thread_state(state).projection.as_ref() {
             Some(projection) => {
                 #[cfg(feature = "snapshot")]
@@ -275,6 +305,16 @@ impl ThreadView {
                 update_entries(&mut self.entries_cache, items, &projection.attempts, &projection.nodes, &projection.plans);
                 self.activity = derive_activity(projection);
                 self.fork_support = fork_support(projection);
+                self.pending_approvals = t3_core::requests::pending_requests(projection).approvals;
+                let pending_ids: HashSet<&str> = self.pending_approvals.iter().map(|a| a.request_id.as_str()).collect();
+                self.responding_approvals.retain(|id| pending_ids.contains(id.as_str()));
+                self.approval_errors.retain(|id, _| pending_ids.contains(id.as_str()));
+                if self.open_approval_menu.as_deref().is_some_and(|id| !pending_ids.contains(id)) {
+                    self.open_approval_menu = None;
+                }
+                if self.open_approval_override.as_deref().is_some_and(|id| !pending_ids.contains(id)) {
+                    self.open_approval_override = None;
+                }
                 let thread = &projection.thread;
                 self.workspace_root =
                     thread.worktree_path.clone().or_else(|| state.shell.project(&thread.project_id).map(|p| p.workspace_root.clone()));
@@ -282,6 +322,11 @@ impl ThreadView {
             None => {
                 self.entries_cache = EntriesCache::default();
                 self.activity = ThreadActivity::default();
+                self.pending_approvals.clear();
+                self.responding_approvals.clear();
+                self.approval_errors.clear();
+                self.open_approval_menu = None;
+                self.open_approval_override = None;
             }
         }
         let paused = self.is_follow_paused(cx);
@@ -1062,7 +1107,7 @@ impl ThreadView {
     }
 
     /// The pieces a row draws from, borrowed apart from the markdown states it may create.
-    fn with_env<R>(&mut self, render: impl FnOnce(&RowEnv, &mut MarkdownStore) -> R) -> R {
+    pub(super) fn with_env<R>(&mut self, render: impl FnOnce(&RowEnv, &mut MarkdownStore) -> R) -> R {
         let env = RowEnv {
             state: &self.state,
             thread_id: self.thread_id.as_deref(),
@@ -1070,7 +1115,13 @@ impl ThreadView {
             clock: self.clock,
             workspace_root: self.workspace_root.as_deref(),
             ui: &self.ui,
-            pending_approvals: &self.activity.pending_approval_ids,
+            approvals: &self.pending_approvals,
+            responding_approvals: &self.responding_approvals,
+            open_approval_menu: self.open_approval_menu.as_deref(),
+            open_approval_override: self.open_approval_override.as_deref(),
+            approval_errors: &self.approval_errors,
+            can_operate_thread: self.can_operate_thread,
+            rewinding: self.rewind.busy,
             window_height: self.window_height,
             details: &self.details,
             group_lists: &self.group_lists,
@@ -1094,6 +1145,123 @@ impl ThreadView {
 
     pub fn render_group_member(&mut self, entry: &Arc<WorkLogEntry>, cx: &mut Context<Self>) -> gpui::AnyElement {
         self.with_env(|env, markdown| render_group_member(entry, env, markdown, cx))
+    }
+
+    pub(crate) fn unmatched_pending_approvals(&self) -> Vec<t3_core::requests::PendingApproval> {
+        let matched: HashSet<&str> = self
+            .rows
+            .iter()
+            .flat_map(|row| match &row.kind {
+                RowKind::Work { entries, .. } => entries.as_slice(),
+                RowKind::WorkLive { entries, .. } => entries.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|entry| match entry.item.as_ref().map(|item| &item.kind) {
+                Some(t3_core::turn_item::TurnItemKind::ApprovalRequest { request_id, .. }) => Some(request_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.pending_approvals
+            .iter()
+            .filter(|approval| !matched.contains(approval.request_id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn respond_to_approval(
+        &mut self,
+        request_id: String,
+        decision: t3_core::commands::ApprovalDecision,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rewind.busy {
+            return;
+        }
+        let Some(thread_id) = self.thread_id.clone() else { return };
+        let state = self.state.read(cx);
+        if !state.can_operate_threads() {
+            return;
+        }
+        if !self.pending_approvals.iter().any(|approval| approval.request_id == request_id && approval.live) {
+            return;
+        }
+        if !self.responding_approvals.insert(request_id.clone()) {
+            return;
+        }
+        self.approval_errors.remove(&request_id);
+        self.open_approval_menu = None;
+        self.open_approval_override = None;
+        let command = t3_core::commands::respond_to_approval(&crate::app_state::uuid_v4(), &thread_id, &request_id, decision, None);
+        let request = state.rpc(t3_core::commands::method::DISPATCH_COMMAND, command);
+        let view = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            let result = request.await;
+            let _ = view.update(cx, |view, cx| {
+                view.responding_approvals.remove(&request_id);
+                if let Err(error) = result {
+                    let message = error.to_string();
+                    let detail = if message.trim().is_empty() {
+                        "Failed to submit approval decision.".to_owned()
+                    } else {
+                        format!("Failed to submit approval decision. {message}")
+                    };
+                    view.approval_errors.insert(request_id.clone(), detail.clone());
+                    view.state.update(cx, |state, cx| {
+                        state.show_toast(
+                            crate::toast::Toast::new(crate::toast::ToastKind::Error, "Failed to submit approval decision").description(detail),
+                            cx,
+                        );
+                    });
+                }
+                view.remeasure_approvals();
+                cx.notify();
+            });
+        })
+        .detach();
+        self.remeasure_approvals();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_approval_menu(&mut self, request_id: String, cx: &mut Context<Self>) {
+        if guard_reopen(&mut self.approval_menu_dismissed) {
+            return;
+        }
+        self.open_approval_override = None;
+        self.open_approval_menu = (self.open_approval_menu.as_deref() != Some(request_id.as_str())).then_some(request_id);
+        cx.notify();
+    }
+
+    pub(crate) fn close_approval_menu(&mut self, cx: &mut Context<Self>) {
+        if self.open_approval_menu.take().is_some() {
+            self.approval_menu_dismissed = Some(std::time::Instant::now());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_approval_override(&mut self, request_id: String, cx: &mut Context<Self>) {
+        if guard_reopen(&mut self.approval_override_dismissed) {
+            return;
+        }
+        self.open_approval_menu = None;
+        self.open_approval_override = (self.open_approval_override.as_deref() != Some(request_id.as_str())).then_some(request_id);
+        cx.notify();
+    }
+
+    pub(crate) fn close_approval_override(&mut self, cx: &mut Context<Self>) {
+        if self.open_approval_override.take().is_some() {
+            self.approval_override_dismissed = Some(std::time::Instant::now());
+            cx.notify();
+        }
+    }
+
+    fn remeasure_approvals(&self) {
+        self.remeasure_where(|row| match &row.kind {
+            RowKind::Work { entries, .. } | RowKind::WorkLive { entries, .. } => entries
+                .iter()
+                .any(|entry| entry.item.as_ref().is_some_and(|item| matches!(item.kind, t3_core::turn_item::TurnItemKind::ApprovalRequest { .. }))),
+            _ => false,
+        });
+        self.remeasure_footer();
     }
 }
 
@@ -1166,6 +1334,11 @@ impl ThreadView {
             store.update(cx, |store, cx| store.work_locally(cx));
         }
     }
+}
+
+/// The click that dismissed a floating popover also lands on its trigger.
+fn guard_reopen(dismissed: &mut Option<std::time::Instant>) -> bool {
+    dismissed.take().is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(250))
 }
 
 /// Returns whether `key` is now in the set.
@@ -2345,5 +2518,157 @@ mod tests {
             assert!(view.ui.expanded_runs.contains("r1"));
             assert_eq!(view.ui.work_fold_for_run("r1"), FoldWorkState::default());
         });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn pending_approvals_render_inline_and_unmatched_footer_and_gate_actions(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "running", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+                "kind": "snapshot",
+                "snapshotSequence": 1,
+                "hasMoreHistory": false,
+                "projection": {
+                    "thread": {
+                        "id": "t1", "projectId": "checkout-a", "title": "T1",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"}
+                    },
+                    "runs": [{
+                        "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "userMessageId": "m0", "rootNodeId": null, "status": "running",
+                        "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+                        "completedAt": null
+                    }],
+                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [], "providerTurns": [],
+                    "runtimeRequests": [
+                        {
+                            "id": "req-matched",
+                            "kind": "command",
+                            "status": "pending",
+                            "responseCapability": { "type": "live" },
+                            "createdAt": "2026-04-01T00:00:02.000Z"
+                        },
+                        {
+                            "id": "req-unmatched",
+                            "kind": "file-change",
+                            "status": "pending",
+                            "responseCapability": { "type": "not_resumable" },
+                            "createdAt": "2026-04-01T00:00:03.000Z"
+                        }
+                    ],
+                    "messages": [], "plans": [],
+                    "turnItems": [
+                        {
+                            "id": "ap-1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                            "ordinal": 1, "type": "approval_request", "status": "running", "title": null,
+                            "startedAt": "2026-04-01T00:00:02.000Z", "completedAt": null, "updatedAt": "2026-04-01T00:00:02.000Z",
+                            "requestId": "req-matched", "requestKind": "command",
+                            "prompt": "cargo test", "reason": "Verify tests", "fullAccessOverride": "workspace_write"
+                        }
+                    ],
+                    "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [
+                        {
+                            "position": 0, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": "ap-1",
+                            "item": {
+                                "id": "ap-1", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                                "ordinal": 1, "type": "approval_request", "status": "running", "title": null,
+                                "startedAt": "2026-04-01T00:00:02.000Z", "completedAt": null, "updatedAt": "2026-04-01T00:00:02.000Z",
+                                "requestId": "req-matched", "requestKind": "command",
+                                "prompt": "cargo test", "reason": "Verify tests", "fullAccessOverride": "workspace_write"
+                            }
+                        }
+                    ],
+                    "updatedAt": "2026-04-01T00:00:05.000Z"
+                }
+            }"#).unwrap();
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::Thread);
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.pending_approvals.len(), 2);
+            let unmatched: Vec<String> = view.unmatched_pending_approvals().into_iter().map(|a| a.request_id).collect();
+            assert_eq!(unmatched, vec!["req-unmatched"]);
+            assert!(view.footer_shown());
+        });
+
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.respond_to_approval("req-matched".into(), t3_core::commands::ApprovalDecision::Accept, cx);
+            });
+        });
+        view.read_with(vcx, |view, _| {
+            assert!(view.responding_approvals.is_empty(), "read-only session must not dispatch approval response");
+        });
+
+        let (op_client, _op_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.install_active_environment(op_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            });
+            view.update(cx, |view, cx| {
+                view.toggle_approval_override("req-matched".into(), cx);
+                assert_eq!(view.open_approval_override.as_deref(), Some("req-matched"));
+                view.toggle_approval_menu("req-matched".into(), cx);
+                assert_eq!(view.open_approval_menu.as_deref(), Some("req-matched"));
+                assert_eq!(view.open_approval_override, None);
+                view.respond_to_approval("req-unmatched".into(), t3_core::commands::ApprovalDecision::Accept, cx);
+                assert!(!view.responding_approvals.contains("req-unmatched"), "non-live approval must stay unactionable");
+                view.respond_to_approval("req-matched".into(), t3_core::commands::ApprovalDecision::Accept, cx);
+            });
+        });
+        view.read_with(vcx, |view, _| {
+            assert!(view.responding_approvals.contains("req-matched"));
+            assert_eq!(view.open_approval_menu, None);
+        });
+        vcx.run_until_parked();
     }
 }

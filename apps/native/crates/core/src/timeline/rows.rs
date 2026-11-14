@@ -1,6 +1,5 @@
 //! Timeline entries to rows: `deriveMessagesTimelineRows`
-//! (`apps/web/src/components/chat/MessagesTimeline.logic.ts`). Not ported yet: MCP-app frames, revert targets, per-turn diff summaries, deferred-work loading,
-//! idle-resume compaction titles and the T3 delegate-row filter.
+//! (`apps/web/src/components/chat/MessagesTimeline.logic.ts`). Not ported yet: MCP-app frames, revert targets, per-turn diff summaries, deferred-work loading.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use super::presentation::{
     single_tool_call_label, summarize_tool_group, tool_group_action, tool_group_summary_kind, work_entry_display_indicates_tool_failure,
     work_entry_indicates_tool_success, work_entry_is_visible_in_group, work_log_entry_is_tool_like, ToolGroupAction,
 };
-use super::compaction::{Compaction, compacting_label, compaction_title};
+use super::compaction::{Compaction, claude_resume_compaction_age, compacting_label, compaction_title};
 use super::folds::{
     FoldInput, active_visual_response_run_ids, breaks_group, complete_superseded_reply_ids, failed_item, is_active_turn_activity,
     is_compaction_command, is_pending_approval, is_subagent, live_subagent_entry_ids, starts_response, superseded_attempt_folds,
@@ -138,6 +137,41 @@ fn settle_superseded_reasoning(entries: &[Arc<TimelineEntry>], cache: &mut RowsC
     out
 }
 
+/// Hide delegation tool rows whose `taskId` already identifies an `app_owned` child subagent card.
+fn without_subagent_delegation_rows(entries: Vec<Arc<TimelineEntry>>) -> Vec<Arc<TimelineEntry>> {
+    let mut children_by_run: HashMap<String, HashSet<String>> = HashMap::new();
+    for entry in &entries {
+        if let EntryKind::Event { item, .. } = &entry.kind
+            && let TurnItemKind::Subagent { subagent_id, origin, .. } = &item.kind
+            && origin.as_deref() == Some("app_owned")
+            && let Some(run_id) = &item.run_id
+        {
+            children_by_run.entry(run_id.clone()).or_default().insert(subagent_id.clone());
+        }
+    }
+    if children_by_run.is_empty() {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let Some(work) = entry.work() else { return true };
+            if work_entry_display_indicates_tool_failure(work) {
+                return true;
+            }
+            let Some(item) = work.item.as_ref() else { return true };
+            let (Some(run_id), TurnItemKind::DynamicTool { tool_name: Some(name), output: Some(output), .. }) = (&item.run_id, &item.kind) else {
+                return true;
+            };
+            if !matches!(item.status.as_str(), "running" | "completed") || !crate::html_render::is_t3_mcp_tool(name, "delegate_task") {
+                return true;
+            }
+            let Some(task_id) = crate::html_render::compact_ok_task_id(output) else { return true };
+            !children_by_run.get(run_id).is_some_and(|children| children.contains(&task_id))
+        })
+        .collect()
+}
+
 fn row(id: impl Into<String>, created_at: Option<String>, kind: RowKind) -> TimelineRow {
     TimelineRow { id: id.into(), created_at, continues_work_log: false, kind }
 }
@@ -223,7 +257,8 @@ fn fold_setup(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity) -> Fold
 /// The fold hiding each entry, so find can open it: `timelineTurnFoldRunIdsByEntryId`, plus the
 /// superseded-attempt folds (entry id to attempt id).
 pub fn fold_membership(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity) -> (HashMap<String, String>, HashMap<String, String>) {
-    let setup = fold_setup(entries, activity);
+    let entries = without_subagent_delegation_rows(entries.to_vec());
+    let setup = fold_setup(&entries, activity);
     let mut runs = HashMap::new();
     for fold in setup.folds.values() {
         for id in &fold.hidden {
@@ -240,7 +275,7 @@ pub fn fold_membership(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity
 }
 
 fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow> {
-    let entries = settle_superseded_reasoning(input.entries, cache);
+    let entries = without_subagent_delegation_rows(settle_superseded_reasoning(input.entries, cache));
     let entries = entries.as_slice();
     let activity = input.activity;
     let pending = &activity.pending_approval_ids;
@@ -349,9 +384,13 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
     let mut rows: Vec<TimelineRow> = Vec::new();
     let mut has_activity_row = false;
     let working_row = || {
-        compaction
-            .working_row()
-            .map(|compacting| row(WORKING_ROW_ID, activity.active_turn_started_at.clone(), RowKind::Working { compacting }))
+        compaction.working_row().map(|compacting| {
+            let started = compaction
+                .resume_started_at()
+                .map(str::to_owned)
+                .or_else(|| activity.active_turn_started_at.clone());
+            row(WORKING_ROW_ID, started, RowKind::Working { compacting })
+        })
     };
     let mut index = 0;
     while index < entries.len() {
@@ -418,6 +457,9 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
                     _ => ("completed", None, None, None),
                 };
                 let reason = compaction.reason(work.run_id.as_deref());
+                let title = reason
+                    .map(|reason| compaction_title(reason).to_owned())
+                    .or_else(|| compaction.resume_age(&entry.id).map(|age| format!("Context compacted after {age} idle")));
                 let failed = status == "failed";
                 rows.push(row(
                     entry.id.clone(),
@@ -429,13 +471,19 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
                         },
                         tokens: compaction_tokens(status, before, after),
                         active,
-                        title: reason.map(|reason| compaction_title(reason).to_owned()),
+                        title,
                         failed,
                         failure: if failed { summary.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) } else { None },
                     },
                 ));
             }
             EntryKind::Work(work) => {
+                if work.run_id.as_ref().is_some_and(|run| compaction.compacted.contains(run))
+                    && work.question_answer.as_ref().and_then(claude_resume_compaction_age).is_some()
+                {
+                    index += 1;
+                    continue;
+                }
                 if is_pending_approval(work, pending)
                     || work.run_id.as_ref().is_some_and(|run| itemized.contains(run))
                     || breaks_group(work)
@@ -477,8 +525,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             EntryKind::HtmlRender(render) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::HtmlRender(render.clone()))),
             EntryKind::Event { item, visibility } => {
                 if let Some(previous) = rows.last_mut()
-                    && let RowKind::Event { item: previous_item, visibility: previous_visibility, subagents, .. } = &mut previous.kind
-                    && *previous_visibility == *visibility
+                    && let RowKind::Event { item: previous_item, subagents, .. } = &mut previous.kind
                     && is_subagent(item)
                     && is_subagent(previous_item)
                     && previous_item.run_id == item.run_id
@@ -806,4 +853,178 @@ fn finalize_grouping(mut rows: Vec<TimelineRow>) -> Vec<TimelineRow> {
         }
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::thread::Visibility;
+    use crate::timeline::activity::LatestRun;
+    use crate::timeline::{ToolSource, work_entry_is_visible_in_group};
+
+    fn entry_work(id: &str, created_at: &str, work: WorkLogEntry) -> Arc<TimelineEntry> {
+        Arc::new(TimelineEntry { id: id.into(), created_at: created_at.into(), attempt: None, kind: EntryKind::Work(Arc::new(work)) })
+    }
+
+    fn turn_item(value: serde_json::Value) -> Arc<TurnItem> {
+        Arc::new(serde_json::from_value(value).expect("valid turn item"))
+    }
+
+    fn activity(is_working: bool, latest_run: Option<LatestRun>, active_turn_started_at: Option<&str>) -> ThreadActivity {
+        ThreadActivity {
+            is_working,
+            latest_run,
+            active_turn_started_at: active_turn_started_at.map(str::to_owned),
+            pending_approval_ids: HashSet::new(),
+            runless_work_active: false,
+            running_run_id: None,
+        }
+    }
+
+    fn run(run_id: &str, status: &str) -> LatestRun {
+        LatestRun {
+            run_id: run_id.into(),
+            status: status.into(),
+            started_at: Some("2026-11-01T00:00:00.000Z".into()),
+            completed_at: (status != "running").then(|| "2026-11-01T00:10:00.000Z".into()),
+            turn_ended: false,
+        }
+    }
+
+    fn resume_question_work(id: &str, run_id: &str) -> WorkLogEntry {
+        WorkLogEntry {
+            id: id.into(),
+            created_at: "2026-11-01T00:01:00.000Z".into(),
+            run_id: Some(run_id.into()),
+            label: "Compact before continuing?".into(),
+            item_type: Some("user_input_request"),
+            status: Some(ToolStatus::Completed),
+            question_answer: Some(json!({
+                "questionTextById": {
+                    "q1": "This session is 2h 5m old and uses 240,000 tokens. Compact it before continuing?"
+                },
+                "answers": { "q1": "Compact and continue" }
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn compaction_work(id: &str, run_id: &str, created_at: &str, status: &str) -> WorkLogEntry {
+        let item = turn_item(json!({
+            "id": id, "threadId": "t1", "runId": run_id, "ordinal": 2, "status": status,
+            "updatedAt": created_at, "startedAt": created_at,
+            "type": "compaction", "beforeTokenCount": 240000, "afterTokenCount": 32000
+        }));
+        WorkLogEntry {
+            id: id.into(),
+            created_at: created_at.into(),
+            run_id: Some(run_id.into()),
+            label: if status == "running" { "Compacting context".into() } else { "Compacted context".into() },
+            source_activity: Some(SourceActivity::Compaction),
+            item_type: Some("compaction"),
+            status: Some(if status == "running" { ToolStatus::InProgress } else { ToolStatus::Completed }),
+            item: Some(item),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resume_compaction_shows_idle_title_and_hides_answered_question() {
+        let entries = vec![
+            entry_work("q-resume", "2026-11-01T00:01:00.000Z", resume_question_work("q-resume", "r1")),
+            entry_work("c1", "2026-11-01T00:02:00.000Z", compaction_work("c1", "r1", "2026-11-01T00:02:00.000Z", "completed")),
+        ];
+        let act = activity(false, Some(run("r1", "completed")), None);
+        let empty = HashSet::new();
+        let rows = derive_rows(
+            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &empty, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None },
+            &mut RowsCache::default(),
+        );
+        assert!(rows.iter().all(|r| r.id != "q-resume"), "answered resume question should fold into compaction");
+        let Some(compaction) = rows.iter().find(|r| r.id == "c1") else { panic!("expected compaction row") };
+        assert!(matches!(
+            &compaction.kind,
+            RowKind::ContextCompaction { title: Some(title), active: false, .. } if title == "Context compacted after 2h 5m idle"
+        ));
+    }
+
+    #[test]
+    fn active_resume_compaction_shows_compacting_working_row_and_hides_active_divider() {
+        let entries = vec![
+            entry_work("q-resume", "2026-11-01T00:01:00.000Z", resume_question_work("q-resume", "r1")),
+            entry_work("c1", "2026-11-01T00:05:00.000Z", compaction_work("c1", "r1", "2026-11-01T00:05:00.000Z", "running")),
+        ];
+        let act = activity(true, Some(run("r1", "running")), Some("2026-11-01T00:00:00.000Z"));
+        let empty = HashSet::new();
+        let rows = derive_rows(
+            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &empty, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None },
+            &mut RowsCache::default(),
+        );
+        assert!(rows.iter().all(|r| !matches!(r.kind, RowKind::ContextCompaction { .. })));
+        let Some(working) = rows.iter().find(|r| matches!(r.kind, RowKind::Working { .. })) else { panic!("expected working row") };
+        assert_eq!(working.created_at.as_deref(), Some("2026-11-01T00:05:00.000Z"));
+        assert!(matches!(working.kind, RowKind::Working { compacting: true }));
+    }
+
+    #[test]
+    fn without_subagent_delegation_hides_matching_non_failed_delegate_row() {
+        let sub_item = turn_item(json!({
+            "id": "sub-entry", "threadId": "t1", "runId": "r1", "ordinal": 2, "status": "running",
+            "updatedAt": "2026-11-01T00:02:00.000Z", "type": "subagent",
+            "subagentId": "sub-1", "origin": "app_owned", "label": "Worker"
+        }));
+        let delegate_ok_item = turn_item(json!({
+            "id": "del-ok", "threadId": "t1", "runId": "r1", "ordinal": 1, "status": "completed",
+            "updatedAt": "2026-11-01T00:01:00.000Z", "type": "dynamic_tool",
+            "toolName": "mcp__t3-code__delegate_task",
+            "output": { "structuredContent": { "taskId": "sub-1" } }
+        }));
+        let delegate_err_item = turn_item(json!({
+            "id": "del-err", "threadId": "t1", "runId": "r1", "ordinal": 3, "status": "completed",
+            "updatedAt": "2026-11-01T00:03:00.000Z", "type": "dynamic_tool",
+            "toolName": "mcp__t3-code__delegate_task",
+            "output": { "isError": true, "structuredContent": { "taskId": "sub-1" } }
+        }));
+        let delegate_other_item = turn_item(json!({
+            "id": "del-other", "threadId": "t1", "runId": "r1", "ordinal": 4, "status": "completed",
+            "updatedAt": "2026-11-01T00:04:00.000Z", "type": "dynamic_tool",
+            "toolName": "mcp__t3-code__delegate_task",
+            "output": { "structuredContent": { "taskId": "unmatched" } }
+        }));
+        let tool_work = |id: &str, ts: &str, item: Arc<TurnItem>| WorkLogEntry {
+            id: id.into(),
+            created_at: ts.into(),
+            run_id: Some("r1".into()),
+            label: "Delegate a child task".into(),
+            item_type: Some("dynamic_tool"),
+            status: Some(ToolStatus::Completed),
+            tool_source: Some(ToolSource { key: "mcp:t3-code".into(), name: "t3-code".into(), kind: "mcp".into() }),
+            item: Some(item),
+            ..Default::default()
+        };
+        assert!(work_entry_is_visible_in_group(&tool_work("del-ok", "2026-11-01T00:01:00.000Z", delegate_ok_item.clone()), false));
+        let entries = vec![
+            entry_work("del-ok", "2026-11-01T00:01:00.000Z", tool_work("del-ok", "2026-11-01T00:01:00.000Z", delegate_ok_item)),
+            Arc::new(TimelineEntry { id: "sub-entry".into(), created_at: "2026-11-01T00:02:00.000Z".into(), attempt: None, kind: EntryKind::Event { item: sub_item, visibility: Visibility::Local } }),
+            entry_work("del-err", "2026-11-01T00:03:00.000Z", tool_work("del-err", "2026-11-01T00:03:00.000Z", delegate_err_item)),
+            entry_work("del-other", "2026-11-01T00:04:00.000Z", tool_work("del-other", "2026-11-01T00:04:00.000Z", delegate_other_item)),
+        ];
+        let act = activity(false, Some(run("r1", "completed")), None);
+        let empty = HashSet::new();
+        let expanded_runs = HashSet::from(["r1".to_owned()]);
+        let rows = derive_rows(
+            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &expanded_runs, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None },
+            &mut RowsCache::default(),
+        );
+        let work_ids: Vec<&str> = rows.iter().flat_map(|r| match &r.kind {
+            RowKind::Work { entries, .. } => entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            RowKind::WorkToggle { entries, .. } => entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        }).collect();
+        assert!(!work_ids.contains(&"del-ok"), "matching non-failed delegate_task should be hidden, got {work_ids:?}");
+        assert!(work_ids.contains(&"del-err"), "failed isError delegate_task stays visible, got {work_ids:?}");
+        assert!(work_ids.contains(&"del-other"), "unmatched delegate_task stays visible, got {work_ids:?}");
+    }
 }

@@ -183,7 +183,7 @@ fn remove_visible_item(rows: &mut Vec<ProjectedTurnItem>, source_item_id: &str) 
 }
 
 /// `isOrchestrationV2TurnItemVisible`.
-pub(crate) fn is_item_visible(projection: &ThreadProjection, item: &TurnItem) -> bool {
+fn is_item_visible(projection: &ThreadProjection, item: &TurnItem) -> bool {
     let run_status = item
         .run_id
         .as_deref()
@@ -221,50 +221,70 @@ fn is_superseded_interrupt(
     superseded && !has_interrupt_request(run_id)
 }
 
-/// `activeVisibleTurnItems`: drops local rows whose run state now hides them.
-fn refresh_visible_items(projection: &mut ThreadProjection) {
-    let statuses: HashMap<&str, &str> = projection
-        .runs
-        .iter()
-        .filter(|run| matches!(run.status.as_str(), "rolled_back" | "cancelled"))
-        .map(|run| (run.id.as_str(), run.status.as_str()))
-        .collect();
-    let mut superseded_roots: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for attempt in projection.attempts.iter().filter(|a| a.status == "superseded") {
-        superseded_roots.entry(attempt.run_id.as_str()).or_default().insert(attempt.root_node_id.as_str());
-    }
-    if statuses.is_empty() && superseded_roots.is_empty() {
-        return;
-    }
-    let interrupt_runs: HashSet<&str> = if superseded_roots.is_empty() {
-        HashSet::new()
-    } else {
-        projection
-            .turn_items
+/// Precomputed visibility predicate (`isOrchestrationV2TurnItemVisible`) for batch scans.
+pub(crate) struct ItemVisibilityFilter<'a> {
+    statuses: HashMap<&'a str, &'a str>,
+    superseded_roots: HashMap<&'a str, HashSet<&'a str>>,
+    interrupt_runs: HashSet<&'a str>,
+}
+
+impl<'a> ItemVisibilityFilter<'a> {
+    pub(crate) fn new(projection: &'a ThreadProjection) -> Self {
+        let statuses: HashMap<&str, &str> = projection
+            .runs
             .iter()
-            .filter(|item| matches!(item.kind, TurnItemKind::RunInterruptRequest { .. }))
-            .filter_map(|item| item.run_id.as_deref())
-            .collect()
-    };
-    let visible = |item: &TurnItem| {
-        let status = item.run_id.as_deref().and_then(|id| statuses.get(id).copied());
+            .filter(|run| matches!(run.status.as_str(), "rolled_back" | "cancelled"))
+            .map(|run| (run.id.as_str(), run.status.as_str()))
+            .collect();
+        let mut superseded_roots: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for attempt in projection.attempts.iter().filter(|a| a.status == "superseded") {
+            superseded_roots.entry(attempt.run_id.as_str()).or_default().insert(attempt.root_node_id.as_str());
+        }
+        let interrupt_runs: HashSet<&str> = if superseded_roots.is_empty() {
+            HashSet::new()
+        } else {
+            projection
+                .turn_items
+                .iter()
+                .filter(|item| matches!(item.kind, TurnItemKind::RunInterruptRequest { .. }))
+                .filter_map(|item| item.run_id.as_deref())
+                .collect()
+        };
+        Self { statuses, superseded_roots, interrupt_runs }
+    }
+
+    pub(crate) fn has_hidden_rules(&self) -> bool {
+        !self.statuses.is_empty() || !self.superseded_roots.is_empty()
+    }
+
+    pub(crate) fn is_visible(&self, item: &TurnItem) -> bool {
+        let status = item.run_id.as_deref().and_then(|id| self.statuses.get(id).copied());
         if status == Some("rolled_back") {
             return false;
         }
+        // Cancelled queued input never reached the provider and must stay out of the transcript.
         if status == Some("cancelled") && item.is_queued_user_message() {
             return false;
         }
         !(matches!(item.kind, TurnItemKind::RunInterruptResult { .. })
             && item.run_id.as_deref().zip(item.node_id.as_deref()).is_some_and(|(run, node)| {
-                superseded_roots.get(run).is_some_and(|roots| roots.contains(node))
-                    && !interrupt_runs.contains(run)
+                self.superseded_roots.get(run).is_some_and(|roots| roots.contains(node))
+                    && !self.interrupt_runs.contains(run)
             }))
-    };
+    }
+}
+
+/// `activeVisibleTurnItems`: drops local rows whose run state now hides them.
+fn refresh_visible_items(projection: &mut ThreadProjection) {
+    let filter = ItemVisibilityFilter::new(projection);
+    if !filter.has_hidden_rules() {
+        return;
+    }
     let before = projection.visible_turn_items.len();
     let keep: Vec<bool> = projection
         .visible_turn_items
         .iter()
-        .map(|row| row.visibility != Visibility::Local || visible(&row.item))
+        .map(|row| row.visibility != Visibility::Local || filter.is_visible(&row.item))
         .collect();
     if keep.iter().all(|k| *k) {
         return;
