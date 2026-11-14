@@ -959,3 +959,184 @@ async fn circular_update_button_mutes_during_run_and_capsule_popover_escapes(
         "Escape closes #update-capsule-popover"
     );
 }
+
+#[gpui::test]
+async fn dialog_open_checks_provider_updates_across_connected_machines_and_clears_checking(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _base_fixture) = cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+        let (state, fixture) =
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+        crate::settings::init(state.clone(), cx);
+        init(cx);
+        (state, fixture)
+    });
+    let (mut fixture_a, _events_a) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-a",
+        "Alpha",
+        json!({
+            "environment": { "environmentId": "env-a", "label": "Alpha", "serverVersion": "0.1.0" },
+            "providers": []
+        }),
+        &["providers:manage", "environment:maintain"],
+    )
+    .await;
+    let (mut fixture_b, _events_b) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-b",
+        "Beta",
+        json!({
+            "environment": { "environmentId": "env-b", "label": "Beta", "serverVersion": "0.1.0" },
+            "providers": []
+        }),
+        &["providers:manage"],
+    )
+    .await;
+    let control = cx.new(|cx| UpdateControl::new(state, cx));
+    let (_root, vcx) = cx.add_window_view(|_, cx| Harness {
+        outer: cx.focus_handle().tab_stop(true),
+        control: control.clone(),
+    });
+    control.update(vcx, |ctrl, cx| {
+        ctrl.plan = updates::Plan {
+            servers: vec![updates::ServerTarget {
+                environment_id: "env-a".into(),
+                label: "Alpha".into(),
+                target_version: "0.2.0".into(),
+                self_update: "npm".into(),
+            }],
+            providers: Vec::new(),
+            restarts: Vec::new(),
+            rows: Vec::new(),
+        };
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear();
+    });
+    let button_center = vcx
+        .debug_bounds("update-everything")
+        .expect("#update-everything renders")
+        .center();
+    vcx.simulate_mouse_move(button_center, None::<gpui::MouseButton>, Default::default());
+    vcx.simulate_event(gpui::MouseDownEvent {
+        button: gpui::MouseButton::Left,
+        position: button_center,
+        modifiers: Default::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    vcx.simulate_event(gpui::MouseUpEvent {
+        button: gpui::MouseButton::Left,
+        position: button_center,
+        modifiers: Default::default(),
+        click_count: 1,
+    });
+    vcx.run_until_parked();
+    control.read_with(vcx, |ctrl, cx| {
+        assert!(ctrl.dialog.read(cx).checking);
+    });
+    let (method_a, input_a, reply_a) = fixture_a.next_request().await;
+    let (method_b, input_b, reply_b) = fixture_b.next_request().await;
+    assert_eq!(method_a, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
+    assert_eq!(method_b, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
+    assert_eq!(input_a, json!({ "refreshModels": true }));
+    assert_eq!(input_b, json!({ "refreshModels": true }));
+    let _ = reply_a.send(Ok(json!({ "providers": [] })));
+    let _ = reply_b.send(Ok(json!({ "providers": [] })));
+    let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+    let mut settled_tx = Some(settled_tx);
+    let dialog_entity = control.read_with(vcx, |ctrl, _| ctrl.dialog.clone());
+    let _obs = vcx.update(|_, cx| {
+        cx.observe(&dialog_entity, move |dialog, cx| {
+            if !dialog.read(cx).checking
+                && let Some(tx) = settled_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        })
+    });
+    vcx.run_until_parked();
+    if !dialog_entity.read_with(vcx, |d, _| !d.checking) {
+        settled_rx.await.unwrap();
+        vcx.run_until_parked();
+    }
+    control.read_with(vcx, |ctrl, cx| {
+        assert!(!ctrl.dialog.read(cx).checking);
+    });
+}
+
+#[gpui::test]
+async fn retry_failed_skips_already_updated_server_in_fleet(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _base_fixture) = cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+        let (state, fixture) =
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+        crate::settings::init(state.clone(), cx);
+        init(cx);
+        (state, fixture)
+    });
+    let (_fixture_retry, _events) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-retry",
+        "RetryBox",
+        json!({
+            "environment": {
+                "environmentId": "env-retry",
+                "label": "RetryBox",
+                "serverVersion": "0.2.0",
+                "capabilities": { "serverSelfUpdate": "npm" }
+            },
+            "providers": []
+        }),
+        &["environment:maintain"],
+    )
+    .await;
+    let control = cx.new(|cx| UpdateControl::new(state, cx));
+    cx.run_until_parked();
+
+    control.update(cx, |ctrl, cx| {
+        ctrl.capsule_open = true;
+        ctrl.run = Some(updates::UpdateEverythingRun {
+            track_switch: false,
+            phase: updates::UpdateRunPhase::Servers,
+            machines: vec![updates::UpdateRunMachine {
+                environment_id: "env-retry".into(),
+                label: "RetryBox".into(),
+                updates_providers: false,
+                server: Some(updates::ServerTarget {
+                    environment_id: "env-retry".into(),
+                    label: "RetryBox".into(),
+                    target_version: "0.2.0".into(),
+                    self_update: "npm".into(),
+                }),
+                handed_off_version: None,
+                started_at_ms: now_ms(),
+                result: Some(updates::MachineResult::Failed),
+                failure: Some("timed out".into()),
+                provider_failure: None,
+            }],
+        });
+        ctrl.retry_failed(cx);
+    });
+    cx.run_until_parked();
+    control.read_with(cx, |ctrl, _| {
+        assert!(ctrl.run.is_none());
+        assert!(!ctrl.capsule_open);
+    });
+}

@@ -328,8 +328,18 @@ impl ContextMenu {
     }
 
     fn open_thread(&mut self, thread_id: &str, position: Point<Pixels>, sidebar: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.state.read(cx).sidebar.model.thread(thread_id).cloned() else {
+            self.state.update(cx, |state, cx| {
+                state.show_toast(
+                    crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread actions unavailable")
+                        .description("This thread has not loaded yet."),
+                    cx,
+                );
+            });
+            return;
+        };
         let state = self.state.read(cx);
-        let Some(thread) = state.sidebar.model.thread(thread_id) else { return };
+        let thread = &thread;
         let project_filter = sidebar.then(|| ThreadProjectFilter::capture(state, thread_id)).flatten();
         let now = now_ms();
         let presets = state.snooze_presets();
@@ -376,6 +386,16 @@ impl ContextMenu {
     }
 
     pub(crate) fn open_for_scoped_thread(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).scoped_thread(key).is_none() {
+            self.state.update(cx, |state, cx| {
+                state.show_toast(
+                    crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread actions unavailable")
+                        .description("This thread has not loaded yet."),
+                    cx,
+                );
+            });
+            return;
+        }
         let state = self.state.read(cx);
         let Some(owner) = ThreadMenuOwner::capture_scoped(state, key) else { return; };
         let Some(row) = state.scoped_thread(key) else { return; };

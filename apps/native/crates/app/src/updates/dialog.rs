@@ -16,6 +16,7 @@ pub struct UpdateDialog {
     pub(super) plan: Option<Plan>,
     captures: Result<Vec<CapturedUpdateOwner>, String>,
     pub(super) fixture: bool,
+    pub(super) checking: bool,
     pub(super) counts: Vec<(String, usize)>,
     expanded: bool,
     focus: FocusHandle,
@@ -35,6 +36,19 @@ impl UpdateDialog {
                 )
                 && !this.fixture
             {
+                if this.checking && matches!(event, AppEvent::ServerConfig | AppEvent::Phase) {
+                    let control = cx.try_global::<Host>().and_then(|h| h.control.upgrade());
+                    let state = this.state.read(cx);
+                    let next_plan = plan_with(state, |id| {
+                        control
+                            .as_ref()
+                            .is_some_and(|c| c.read(cx).is_updating(id))
+                    });
+                    if next_plan.has_updates() {
+                        this.captures = t3_client::updates::capture(&next_plan, &state.fleet);
+                        this.plan = Some(next_plan);
+                    }
+                }
                 let counts = this.running_counts(cx);
                 if counts != this.counts
                     || matches!(event, AppEvent::ServerConfig | AppEvent::Phase)
@@ -49,6 +63,7 @@ impl UpdateDialog {
             plan: None,
             captures: Ok(Vec::new()),
             fixture: false,
+            checking: false,
             counts: Vec::new(),
             expanded: false,
             focus: cx.focus_handle(),
@@ -62,12 +77,19 @@ impl UpdateDialog {
     pub fn open(&mut self, plan: Plan, fixture: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.plan = Some(plan);
         self.fixture = fixture;
+        self.checking = false;
         self.expanded = false;
         self.captures = t3_client::updates::capture(self.plan.as_ref().unwrap(), &self.state.read(cx).fleet);
         self.counts = self.running_counts(cx);
         self.previous_focus = window.focused(cx);
         window.focus(&self.cancel_focus, cx);
         cx.notify();
+    }
+    pub(super) fn set_checking(&mut self, checking: bool, cx: &mut Context<Self>) {
+        if self.checking != checking {
+            self.checking = checking;
+            cx.notify();
+        }
     }
     fn running_counts(&self, cx: &App) -> Vec<(String, usize)> {
         let Some(plan) = &self.plan else {
@@ -130,6 +152,7 @@ impl UpdateDialog {
     }
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.plan = None;
+        self.checking = false;
         self.captures = Ok(Vec::new());
         if let Some(focus) = self.previous_focus.take() {
             window.focus(&focus, cx);
@@ -179,6 +202,12 @@ impl Render for UpdateDialog {
                 "{n} provider {}",
                 if n == 1 { "update" } else { "updates" }
             ));
+        }
+        if self.checking {
+            if !description.is_empty() {
+                description.push_str(" · ");
+            }
+            description.push_str("Checking for more…");
         }
         let mut rows = div()
             .id("update-machine-rows")

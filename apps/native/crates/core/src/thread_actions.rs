@@ -107,6 +107,122 @@ pub fn regenerate_title(command_id: &str, thread_id: &str) -> Value {
     json!({ "type": "thread.metadata.update", "commandId": command_id, "threadId": thread_id, "regenerateTitle": true })
 }
 
+/// Settled result of a `thread.metadata.update { regenerateTitle: true }`
+/// command observed via `ThreadShell.last_title_regeneration`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitleRegenerationOutcome {
+    pub status: String,
+    pub message: Option<String>,
+}
+
+/// Command-plus-outcome result for `title_regeneration_toast`
+/// (`apps/web/src/components/threadTitleRegenerationToast.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitleRegenerationResult {
+    Success(Option<TitleRegenerationOutcome>),
+    Failure(String),
+    Interrupted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitleRegenerationToast {
+    pub is_error: bool,
+    pub title: String,
+    pub description: Option<String>,
+}
+
+/// Returns `None` while regeneration is still pending, `Some(None)` if the
+/// snapshot moved past `request_sequence` and either dropped the thread or
+/// cleared `titleRegeneration` without recording `lastTitleRegeneration` for
+/// `request_id`, and `Some(Some(outcome))` when settled.
+pub fn settled_title_regeneration_outcome(
+    snapshot_sequence: u64,
+    request_sequence: u64,
+    request_id: &str,
+    last: Option<&crate::shell::LastTitleRegeneration>,
+    active: Option<&Value>,
+    thread_exists: bool,
+) -> Option<Option<TitleRegenerationOutcome>> {
+    if snapshot_sequence < request_sequence {
+        return None;
+    }
+    if !thread_exists {
+        return Some(None);
+    }
+    if let Some(last) = last
+        && last.request_id == request_id
+    {
+        return Some(Some(TitleRegenerationOutcome {
+            status: last.status.clone(),
+            message: last.message.clone(),
+        }));
+    }
+    let still_active = active
+        .and_then(|value| value.get("requestId"))
+        .and_then(Value::as_str)
+        == Some(request_id);
+    if still_active { None } else { Some(None) }
+}
+
+pub fn title_regeneration_toast(
+    results: &[TitleRegenerationResult],
+) -> Option<TitleRegenerationToast> {
+    let failures: Vec<&str> = results
+        .iter()
+        .filter_map(|result| match result {
+            TitleRegenerationResult::Failure(message) => Some(message.as_str()),
+            TitleRegenerationResult::Interrupted => None,
+            TitleRegenerationResult::Success(Some(outcome)) if outcome.status == "failed" => {
+                Some(outcome.message.as_deref().unwrap_or("Title generation failed."))
+            }
+            TitleRegenerationResult::Success(_) => None,
+        })
+        .collect();
+    if !failures.is_empty() {
+        return Some(TitleRegenerationToast {
+            is_error: true,
+            title: if results.len() == 1 {
+                "Failed to regenerate thread title".to_owned()
+            } else {
+                format!("Failed to regenerate {} of {} thread titles", failures.len(), results.len())
+            },
+            description: Some(failures[0].to_owned()),
+        });
+    }
+    let kept = results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result,
+                TitleRegenerationResult::Success(Some(outcome)) if outcome.status == "unchanged"
+            )
+        })
+        .count();
+    if kept == 0 {
+        return None;
+    }
+    if results.len() == 1 {
+        return Some(TitleRegenerationToast {
+            is_error: false,
+            title: "Title kept".to_owned(),
+            description: Some("The current title already fits this thread.".to_owned()),
+        });
+    }
+    Some(TitleRegenerationToast {
+        is_error: false,
+        title: if kept == results.len() {
+            "Titles kept".to_owned()
+        } else {
+            format!("Kept {kept} of {} titles", results.len())
+        },
+        description: Some(if kept == results.len() {
+            "The current titles already fit these threads.".to_owned()
+        } else {
+            "Those titles already fit their threads.".to_owned()
+        }),
+    })
+}
+
 /// What a rename commit does (`commitThreadRename` in `Sidebar.tsx`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenameOutcome {
@@ -358,8 +474,8 @@ pub fn build_menu(state: &ThreadActionMenuState) -> Vec<MenuItem> {
     if state.supports.auto_settle_opt_out {
         let mut auto = MenuItem::new(A::AutoSettle, "Auto-settle behavior", Some("timer"));
         auto.children = vec![
-            MenuItem { checked: Some(state.auto_settle_enabled), ..MenuItem::new(A::AutoSettleEnabled, "Enabled", None) },
-            MenuItem { checked: Some(!state.auto_settle_enabled), ..MenuItem::new(A::AutoSettleDisabled, "Disabled", None) },
+            MenuItem { checked: Some(state.auto_settle_enabled), ..MenuItem::new(A::AutoSettleEnabled, "Follow settings", None) },
+            MenuItem { checked: Some(!state.auto_settle_enabled), ..MenuItem::new(A::AutoSettleDisabled, "Never", None) },
         ];
         items.push(auto);
     }
@@ -799,5 +915,109 @@ mod tests {
         let plain = visit("c2", "t1", 1_700_000_000_000);
         assert!(plain.get("opened").is_none());
         assert!(plain.get("searchQuery").is_none());
+    }
+
+    #[test]
+    fn auto_settle_menu_uses_follow_settings_and_never_labels() {
+        let items = build_menu(&ThreadActionMenuState {
+            supports: Supports { auto_settle_opt_out: true, ..supports() },
+            ..state(&[])
+        });
+        let auto = items.iter().find(|item| item.action == ThreadAction::AutoSettle).unwrap();
+        let child_labels: Vec<&str> = auto.children.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(child_labels, ["Follow settings", "Never"]);
+    }
+
+    #[test]
+    fn title_regeneration_outcome_waits_for_sequence_and_reports_outcomes() {
+        let active = Some(json!({ "requestId": "req-1" }));
+        let last = crate::shell::LastTitleRegeneration {
+            request_id: "req-1".into(),
+            status: "unchanged".into(),
+            message: None,
+            completed_at: "2026-11-14T00:00:00.000Z".into(),
+        };
+        assert_eq!(settled_title_regeneration_outcome(4, 5, "req-1", Some(&last), active.as_ref(), true), None);
+        assert_eq!(settled_title_regeneration_outcome(5, 5, "req-1", None, active.as_ref(), true), None);
+        assert_eq!(settled_title_regeneration_outcome(5, 5, "req-1", None, None, true), Some(None));
+        assert_eq!(settled_title_regeneration_outcome(5, 5, "req-1", None, active.as_ref(), false), Some(None));
+        assert_eq!(
+            settled_title_regeneration_outcome(5, 5, "req-1", Some(&last), None, true),
+            Some(Some(TitleRegenerationOutcome { status: "unchanged".into(), message: None }))
+        );
+    }
+
+    #[test]
+    fn title_regeneration_toast_formats_failures_and_kept_titles() {
+        assert_eq!(
+            title_regeneration_toast(&[TitleRegenerationResult::Success(Some(TitleRegenerationOutcome {
+                status: "updated".into(),
+                message: None,
+            }))]),
+            None
+        );
+        assert_eq!(
+            title_regeneration_toast(&[TitleRegenerationResult::Interrupted]),
+            None
+        );
+        assert_eq!(
+            title_regeneration_toast(&[TitleRegenerationResult::Success(Some(TitleRegenerationOutcome {
+                status: "unchanged".into(),
+                message: None,
+            }))]),
+            Some(TitleRegenerationToast {
+                is_error: false,
+                title: "Title kept".into(),
+                description: Some("The current title already fits this thread.".into()),
+            })
+        );
+        assert_eq!(
+            title_regeneration_toast(&[
+                TitleRegenerationResult::Success(Some(TitleRegenerationOutcome {
+                    status: "unchanged".into(),
+                    message: None,
+                })),
+                TitleRegenerationResult::Success(Some(TitleRegenerationOutcome {
+                    status: "unchanged".into(),
+                    message: None,
+                })),
+            ]),
+            Some(TitleRegenerationToast {
+                is_error: false,
+                title: "Titles kept".into(),
+                description: Some("The current titles already fit these threads.".into()),
+            })
+        );
+        assert_eq!(
+            title_regeneration_toast(&[
+                TitleRegenerationResult::Success(Some(TitleRegenerationOutcome {
+                    status: "unchanged".into(),
+                    message: None,
+                })),
+                TitleRegenerationResult::Success(Some(TitleRegenerationOutcome {
+                    status: "updated".into(),
+                    message: None,
+                })),
+            ]),
+            Some(TitleRegenerationToast {
+                is_error: false,
+                title: "Kept 1 of 2 titles".into(),
+                description: Some("Those titles already fit their threads.".into()),
+            })
+        );
+        assert_eq!(
+            title_regeneration_toast(&[
+                TitleRegenerationResult::Success(Some(TitleRegenerationOutcome {
+                    status: "failed".into(),
+                    message: Some("Model error".into()),
+                })),
+                TitleRegenerationResult::Failure("Timed out".into()),
+            ]),
+            Some(TitleRegenerationToast {
+                is_error: true,
+                title: "Failed to regenerate 2 of 2 thread titles".into(),
+                description: Some("Model error".into()),
+            })
+        );
     }
 }

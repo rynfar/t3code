@@ -3256,3 +3256,142 @@ mod footer_tests {
         state.update(vcx, |s, _| s.stop_pump());
     }
 }
+
+#[cfg(all(test, feature = "snapshot"))]
+mod sb_380_tests {
+    use super::*;
+    use crate::context_menu::project_filter_tests::install_state;
+    use serde_json::json;
+    use t3_core::thread_actions::ThreadAction;
+
+    #[gpui::test]
+    async fn unloaded_menu_quiet_copies_and_title_regeneration_toast(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::settings::init(state.clone(), cx);
+            (state, fixture)
+        });
+        let (menu, vcx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+
+        // 1. Unloaded thread menu opens an informative toast rather than failing silently.
+        menu.update_in(vcx, |menu, window, cx| {
+            menu.open_for_thread("missing-thread", gpui::point(px(10.), px(10.)), window, cx);
+        });
+        state.read_with(vcx, |s, _| {
+            let toast = s.toasts.latest().expect("missing thread should toast");
+            assert_eq!(toast.title.as_ref(), "Thread actions unavailable");
+            assert_eq!(
+                toast.description.as_deref(),
+                Some("This thread has not loaded yet.")
+            );
+        });
+
+        // Clear toasts, then verify routine copy actions do not emit success toasts (#36527).
+        state.update(vcx, |s, _| {
+            s.toasts = Default::default();
+        });
+        state.update(vcx, |s, cx| {
+            if let Some(thread) = s
+                .shell
+                .snapshot
+                .as_mut()
+                .and_then(|snap| snap.threads.iter_mut().find(|t| t.id == "menu-thread"))
+            {
+                thread.branch = Some("feat/quiet-copy".into());
+                thread.worktree_path = Some("/tmp/wt-quiet".into());
+            }
+            s.run_thread_action("menu-thread", ThreadAction::CopyBranch, &[], cx);
+            s.run_thread_action("menu-thread", ThreadAction::CopyPath, &[], cx);
+            s.run_thread_action("menu-thread", ThreadAction::CopyThreadId, &[], cx);
+            s.run_thread_action("menu-thread", ThreadAction::CopyThread, &[], cx);
+        });
+        state.read_with(vcx, |s, _| {
+            assert!(
+                s.toasts.latest().is_none(),
+                "routine copy actions must not emit success toasts"
+            );
+        });
+
+        // 3. Single-thread RegenerateTitle emits commandId and toasts outcome on delta (#31418).
+        state.update(vcx, |s, cx| {
+            s.run_thread_action("menu-thread", ThreadAction::RegenerateTitle, &[], cx);
+        });
+        let (method, params, reply) = fixture.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(params["type"], "thread.metadata.update");
+        assert_eq!(params["threadId"], "menu-thread");
+        assert_eq!(params["regenerateTitle"], true);
+        let command_id = params["commandId"].as_str().unwrap().to_owned();
+        let _ = reply.send(Ok(json!({ "sequence": 10 })));
+
+        let (toast_tx, toast_rx) = tokio::sync::oneshot::channel();
+        let mut toast_tx = Some(toast_tx);
+        let _sub = vcx.update(|_, cx| {
+            cx.subscribe(&state, move |s, event: &AppEvent, cx| {
+                if *event == AppEvent::Notice
+                    && s.read(cx).toasts.latest().is_some()
+                    && let Some(tx) = toast_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        state.update(vcx, |s, cx| {
+            let delta = t3_core::shell::ShellStreamItem::ThreadUpdated {
+                sequence: 10,
+                location: "active".into(),
+                thread: serde_json::from_value(json!({
+                    "id": "menu-thread",
+                    "projectId": "checkout-b",
+                    "title": "menu-thread",
+                    "providerInstanceId": "replay",
+                    "modelSelection": {"instanceId": "replay", "model": "replay"},
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "lineage": {"rootThreadId": "menu-thread"},
+                    "branch": "feat/quiet-copy",
+                    "worktreePath": "/tmp/wt-quiet",
+                    "latestTurn": null,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "archivedAt": null,
+                    "deletedAt": null,
+                    "status": "idle",
+                    "latestRunId": null,
+                    "activeRunId": null,
+                    "hasActionableProposedPlan": false,
+                    "itemCount": 0,
+                    "visibleItemCount": 0,
+                    "lastTitleRegeneration": {
+                        "requestId": command_id,
+                        "status": "unchanged",
+                        "previousTitle": "menu-thread",
+                        "title": "menu-thread",
+                        "completedAt": "2026-01-01T00:01:00Z"
+                    }
+                }))
+                .unwrap(),
+            };
+            s.shell.apply(delta);
+            s.rebuild_sidebar(cx);
+        });
+        let already = state.read_with(vcx, |s, _| s.toasts.latest().is_some());
+        if !already {
+            toast_rx.await.unwrap();
+        }
+        state.read_with(vcx, |s, _| {
+            let toast = s.toasts.latest().expect("title regeneration toast must arrive");
+            assert_eq!(toast.title.as_ref(), "Title kept");
+        });
+
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+}

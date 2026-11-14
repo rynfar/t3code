@@ -647,7 +647,12 @@ impl AppState {
             ThreadAction::Archive => actions::archive(&uuid(), id),
             ThreadAction::Delete => { self.delete_scoped_threads(vec![owner], cx); return; }
             ThreadAction::MarkUnread => actions::mark_unread(&uuid(), id),
-            ThreadAction::RegenerateTitle => actions::regenerate_title(&uuid(), id),
+            ThreadAction::RegenerateTitle => {
+                let command_id = uuid();
+                let request = actions::regenerate_title(&command_id, id);
+                self.run_scoped_regenerate_title(owner, command_id, request, cx);
+                return;
+            }
             ThreadAction::AutoSettle | ThreadAction::AutoSettleEnabled => actions::set_auto_settle(&uuid(), id, true),
             ThreadAction::AutoSettleDisabled => actions::set_auto_settle(&uuid(), id, false),
             ThreadAction::SnoozePreset(preset) => {
@@ -674,14 +679,14 @@ impl AppState {
                 return;
             }
             ThreadAction::TurnIntoProject => { self.promote_scoped(owner, cx); return; }
-            ThreadAction::CopyThreadId => { self.copy(id.clone(), "Thread ID copied", Some(id.clone()), cx); return; }
+            ThreadAction::CopyThreadId => { self.copy(id.clone(), cx); return; }
             ThreadAction::CopyPath => {
                 let path = self.scoped_thread(key).and_then(|row| row.thread.worktree_path.clone()).or_else(|| owner.project_ref().and_then(|key| self.scoped_project(&key)).map(|project| project.project.workspace_root.clone()));
-                if let Some(path) = path { self.copy(path.clone(), "Path copied", Some(path), cx); }
+                if let Some(path) = path { self.copy(path, cx); }
                 return;
             }
             ThreadAction::CopyBranch => {
-                if let Some(branch) = self.scoped_thread(key).and_then(|row| row.thread.branch.clone()) { self.copy(branch, "Copied branch name", None, cx); }
+                if let Some(branch) = self.scoped_thread(key).and_then(|row| row.thread.branch.clone()) { self.copy(branch, cx); }
                 return;
             }
             ThreadAction::CopyThread => {
@@ -689,7 +694,6 @@ impl AppState {
                     && let Some(row) = self.scoped_thread(key)
                     && let Some(reference) = actions::thread_reference(&row.thread.title, environment.summary.owner.canonical_id.as_deref(), id) {
                     crate::composer::clipboard::write(reference.text, reference.fragment, cx);
-                    self.show_toast(Toast::new(ToastKind::Success, "Thread copied").description(reference.description), cx);
                 }
                 return;
             }
@@ -1660,20 +1664,23 @@ impl AppState {
                 self.dispatch_then(actions::set_auto_settle(&uuid(), thread_id, enabled), Some("Failed to update auto-settle"), cx, |_, _, _| {});
             }
             ThreadAction::RegenerateTitle if !thread.regenerating_title => {
-                self.dispatch_then(actions::regenerate_title(&uuid(), thread_id), Some("Failed to regenerate thread title"), cx, |_, _, _| {});
+                let command_id = uuid();
+                let command = actions::regenerate_title(&command_id, thread_id);
+                let tid = thread_id.to_owned();
+                self.dispatch_title_regeneration(command, tid, command_id, cx);
             }
             ThreadAction::MarkUnread => self.mark_thread_unread(thread_id, cx),
             ThreadAction::Archive => self.request_archive_thread(thread_id, cx),
             ThreadAction::CopyPath => {
                 let path = thread.worktree_path.clone().or_else(|| self.shell.project(&thread.project_id).map(|project| project.workspace_root.clone()));
                 match path {
-                    Some(path) => self.copy(path.clone(), "Path copied", Some(path), cx),
+                    Some(path) => self.copy(path, cx),
                     None => self.show_toast(Toast::new(ToastKind::Error, "Path unavailable").description("This thread does not have a workspace path to copy."), cx),
                 }
             }
             ThreadAction::CopyBranch => {
                 if let Some(branch) = thread.branch.clone() {
-                    self.copy(branch.clone(), "Branch copied", Some(branch), cx);
+                    self.copy(branch, cx);
                 }
             }
             ThreadAction::CopyThread => {
@@ -1686,12 +1693,8 @@ impl AppState {
                     return;
                 };
                 crate::composer::clipboard::write(reference.text, reference.fragment, cx);
-                self.show_toast(
-                    Toast::new(ToastKind::Success, "Thread copied").description(reference.description),
-                    cx,
-                );
             }
-            ThreadAction::CopyThreadId => self.copy(thread.id.clone(), "Thread ID copied", Some(thread.id.clone()), cx),
+            ThreadAction::CopyThreadId => self.copy(thread.id.clone(), cx),
             ThreadAction::Find => {
                 self.select_thread(thread_id, cx);
                 cx.dispatch_action(&crate::thread_view::FindInThread);
@@ -1700,10 +1703,208 @@ impl AppState {
         }
     }
 
-    fn copy(&mut self, text: String, title: &'static str, description: Option<String>, cx: &mut Context<Self>) {
+    fn copy(&mut self, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        let toast = Toast::new(ToastKind::Success, title);
-        self.show_toast(if let Some(description) = description { toast.description(description) } else { toast }, cx);
+    }
+
+    pub(crate) fn show_title_regeneration_toast(
+        &mut self,
+        results: &[actions::TitleRegenerationResult],
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(toast) = actions::title_regeneration_toast(results) {
+            let mut item = Toast::new(
+                if toast.is_error { ToastKind::Error } else { ToastKind::Info },
+                toast.title,
+            );
+            if let Some(description) = toast.description {
+                item = item.description(description);
+            }
+            self.show_toast(item, cx);
+        }
+    }
+
+    pub(crate) fn title_regeneration_rpc_result(error: &RpcError) -> actions::TitleRegenerationResult {
+        let interrupted = match error {
+            RpcError::Closed => true,
+            RpcError::Failure(failure) => {
+                failure.tag.is_none() && failure.message == "Interrupted" && failure.error.is_null()
+            }
+        };
+        if interrupted {
+            actions::TitleRegenerationResult::Interrupted
+        } else {
+            actions::TitleRegenerationResult::Failure(error.to_string())
+        }
+    }
+
+    pub(crate) fn spawn_local_title_regeneration_waiter(
+        &self,
+        thread_id: String,
+        request_id: String,
+        sequence: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<actions::TitleRegenerationResult> {
+        let entity = cx.entity();
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            let (tx, mut rx) = futures::channel::mpsc::unbounded();
+            let sub = cx.subscribe(&entity, move |_, event: &AppEvent, _| {
+                if matches!(event, AppEvent::Shell | AppEvent::Phase) {
+                    let _ = tx.unbounded_send(());
+                }
+            });
+            let result = loop {
+                let check = this.read_with(cx, |state, _| {
+                    let thread = state.thread_shell(&thread_id);
+                    let outcome = actions::settled_title_regeneration_outcome(
+                        state.shell.sequence().unwrap_or(0),
+                        sequence,
+                        &request_id,
+                        thread.and_then(|thread| thread.last_title_regeneration.as_ref()),
+                        thread.and_then(|thread| thread.title_regeneration.as_ref()),
+                        thread.is_some(),
+                    );
+                    if outcome.is_none()
+                        && (state.phase != Phase::Online(ConnectionStatus::Connected) || !state.shell.synchronized)
+                    {
+                        return Some(None);
+                    }
+                    outcome
+                });
+                match check {
+                    Ok(Some(outcome)) => break actions::TitleRegenerationResult::Success(outcome),
+                    Err(_) => break actions::TitleRegenerationResult::Success(None),
+                    Ok(None) => {}
+                }
+                if rx.next().await.is_none() {
+                    break actions::TitleRegenerationResult::Success(None);
+                }
+            };
+            drop(sub);
+            result
+        })
+    }
+
+    pub(crate) fn spawn_scoped_title_regeneration_waiter(
+        &self,
+        env_id: String,
+        thread_id: String,
+        request_id: String,
+        sequence: u64,
+        cx: &mut Context<Self>,
+    ) -> Task<actions::TitleRegenerationResult> {
+        let mut view = self.connections.view();
+        cx.spawn(async move |this, cx| loop {
+            let Ok(query) = this.read_with(cx, |state, _| state.connections.thread_title_regeneration(&env_id, &thread_id)) else {
+                return actions::TitleRegenerationResult::Success(None);
+            };
+            let Some(snapshot) = query.await else {
+                return actions::TitleRegenerationResult::Success(None);
+            };
+            if let Some(outcome) = actions::settled_title_regeneration_outcome(
+                snapshot.sequence,
+                sequence,
+                &request_id,
+                snapshot.last_title_regeneration.as_ref(),
+                snapshot.title_regeneration.as_ref(),
+                snapshot.thread_exists,
+            ) {
+                return actions::TitleRegenerationResult::Success(outcome);
+            }
+            if snapshot.disconnected || view.changed().await.is_err() {
+                return actions::TitleRegenerationResult::Success(None);
+            }
+        })
+    }
+
+    fn dispatch_title_regeneration(
+        &mut self,
+        command: Value,
+        thread_id: String,
+        request_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = crate::context_menu::ThreadMenuOwner::capture(self, &thread_id);
+        let Some(client) = self.client_handle() else { return };
+        let task = self.runtime().spawn(client.dispatch(command));
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or(Err(RpcError::Closed));
+            let outcome = match result {
+                Err(error) => {
+                    let valid = this.read_with(cx, |state, _| {
+                        !owner.as_ref().is_some_and(|owner| {
+                            !owner.response_current(state) || !crate::context_menu::ThreadMenuOwner::can_operate(state)
+                        })
+                    }).unwrap_or(false);
+                    if !valid { return; }
+                    Self::title_regeneration_rpc_result(&error)
+                }
+                Ok(reply) => {
+                    let sequence = reply.get("sequence").and_then(Value::as_u64).unwrap_or(0);
+                    let waiter = this.update(cx, |state, cx| {
+                        state.spawn_local_title_regeneration_waiter(thread_id, request_id, sequence, cx)
+                    });
+                    match waiter {
+                        Ok(waiter) => waiter.await,
+                        Err(_) => return,
+                    }
+                }
+            };
+            let _ = this.update(cx, |state, cx| {
+                state.show_title_regeneration_toast(&[outcome], cx);
+            });
+        })
+        .detach();
+    }
+
+    fn run_scoped_regenerate_title(
+        &mut self,
+        owner: crate::context_menu::ThreadMenuOwner,
+        request_id: String,
+        command: Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(destination) = owner.destination.clone() else { return; };
+        let scope = t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
+        if !owner.current(self) || !self.scoped_ready(&destination, scope) { return; }
+        let env_id = destination.saved_id.clone();
+        let thread_id = owner.thread.clone();
+        let resolve = self.connections.destination(&destination, scope);
+        cx.spawn(async move |this, cx| {
+            let Ok(target) = resolve.await else { return; };
+            let valid = this.read_with(cx, |state, _| {
+                target.is_current(&state.fleet)
+                    && owner.current(state)
+                    && state.scoped_ready(&destination, scope)
+                    && target.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(scope))
+            }).unwrap_or(false);
+            if !valid { return; }
+            let result = target.client.dispatch(command).await;
+            let outcome = match result {
+                Err(error) => {
+                    let still_valid = this.read_with(cx, |state, _| {
+                        owner.response_current(state) && state.scoped_ready(&destination, scope)
+                    }).unwrap_or(false);
+                    if !still_valid { return; }
+                    Self::title_regeneration_rpc_result(&error)
+                }
+                Ok(reply) => {
+                    let sequence = reply.get("sequence").and_then(Value::as_u64).unwrap_or(0);
+                    let waiter = this.update(cx, |state, cx| {
+                        state.spawn_scoped_title_regeneration_waiter(env_id, thread_id, request_id, sequence, cx)
+                    });
+                    match waiter {
+                        Ok(waiter) => waiter.await,
+                        Err(_) => return,
+                    }
+                }
+            };
+            let _ = this.update(cx, |state, cx| {
+                state.show_title_regeneration_toast(&[outcome], cx);
+            });
+        })
+        .detach();
     }
 
     /// `undoLatestThreadAction`: restores the latest group of same-kind actions.
