@@ -153,11 +153,12 @@ impl ThreadMenuOwner {
                 _ => true,
             };
         }
+        let thread = state.sidebar.model.thread(&self.thread).cloned().or_else(|| state.thread_shell(&self.thread).map(|shell| t3_core::sidebar::thread::present_thread(shell, None)));
         match action {
             ThreadAction::ShareGuest => state.can_share_with_guest(),
             ThreadAction::TurnIntoProject => state.can_turn_into_project(&self.thread),
-            ThreadAction::Archive => state.sidebar.model.thread(&self.thread).is_some_and(|thread| thread.can_archive()),
-            ThreadAction::RegenerateTitle => state.sidebar.capabilities.config_loaded && state.sidebar.model.thread(&self.thread).is_some_and(|thread| !thread.regenerating_title),
+            ThreadAction::Archive => thread.as_ref().is_some_and(|thread| thread.can_archive()),
+            ThreadAction::RegenerateTitle => state.sidebar.capabilities.config_loaded && thread.as_ref().is_some_and(|thread| !thread.regenerating_title),
             ThreadAction::AutoSettle | ThreadAction::AutoSettleEnabled | ThreadAction::AutoSettleDisabled => state.sidebar.capabilities.auto_settle_opt_out,
             ThreadAction::Pin | ThreadAction::Unpin | ThreadAction::Settle | ThreadAction::Unsettle => state.sidebar.capabilities.config_loaded,
             ThreadAction::NewThreadOnBranch | ThreadAction::CopyBranch => self.branch.as_ref().is_some_and(|branch| !branch.is_empty()),
@@ -328,7 +329,9 @@ impl ContextMenu {
     }
 
     fn open_thread(&mut self, thread_id: &str, position: Point<Pixels>, sidebar: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.state.read(cx).sidebar.model.thread(thread_id).cloned() else {
+        let Some(thread) = self.state.read(cx).sidebar.model.thread(thread_id).cloned().or_else(|| {
+            self.state.read(cx).thread_shell(thread_id).map(|shell| t3_core::sidebar::thread::present_thread(shell, None))
+        }) else {
             self.state.update(cx, |state, cx| {
                 state.show_toast(
                     crate::toast::Toast::new(crate::toast::ToastKind::Error, "Thread actions unavailable")

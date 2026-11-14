@@ -127,6 +127,7 @@ pub struct UpdateControl {
     handoff_timer: Option<Task<()>>,
     restart_nudges: HashMap<String, AbortOnDrop>,
     provider_check_epoch: u64,
+    provider_check_in_flight: Option<u64>,
     active_runs: usize,
     run_updated_servers: Vec<String>,
     run_updated_providers: usize,
@@ -293,6 +294,7 @@ impl UpdateControl {
             handoff_timer: None,
             restart_nudges: HashMap::new(),
             provider_check_epoch: 0,
+            provider_check_in_flight: None,
             active_runs: 0,
             run_updated_servers: Vec::new(),
             run_updated_providers: 0,
@@ -1070,8 +1072,14 @@ impl UpdateControl {
 
     pub(super) fn refresh_providers_for_dialog(&mut self, cx: &mut Context<Self>) {
         if self.fixture {
+            self.provider_check_in_flight = None;
             self.dialog
                 .update(cx, |dialog, cx| dialog.set_checking(false, cx));
+            return;
+        }
+        if self.provider_check_in_flight.is_some() {
+            self.dialog
+                .update(cx, |dialog, cx| dialog.set_checking(true, cx));
             return;
         }
         self.provider_check_epoch = self.provider_check_epoch.wrapping_add(1);
@@ -1104,6 +1112,7 @@ impl UpdateControl {
                 .update(cx, |dialog, cx| dialog.set_checking(false, cx));
             return;
         }
+        self.provider_check_in_flight = Some(epoch);
         self.dialog
             .update(cx, |dialog, cx| dialog.set_checking(true, cx));
         let task = runtime.spawn(async move {
@@ -1126,7 +1135,8 @@ impl UpdateControl {
         cx.spawn(async move |this, cx| {
             let _ = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.provider_check_epoch == epoch {
+                if this.provider_check_in_flight == Some(epoch) {
+                    this.provider_check_in_flight = None;
                     this.dialog
                         .update(cx, |dialog, cx| dialog.set_checking(false, cx));
                 }
@@ -1160,6 +1170,8 @@ impl UpdateControl {
             self.connection = state.connection_id();
             self.visible_after = None;
             self.dismissed.clear();
+            self.provider_check_in_flight = None;
+            self.provider_check_epoch = self.provider_check_epoch.wrapping_add(1);
             self._grants = state.client_handle().map(|client| {
                 let mut grants = client.session_state();
                 cx.spawn(async move |this, cx| {

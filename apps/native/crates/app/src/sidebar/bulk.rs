@@ -155,64 +155,64 @@ impl AppState {
         }
     }
 
-    /// One at a time, stopping at the first failure, then clears the selection.
+    /// Clears selection immediately and dispatches all eligible title regenerations concurrently.
     fn regenerate_titles(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
-        self.regenerate_titles_step(ids, Vec::new(), Vec::new(), cx);
-    }
-
-    fn regenerate_titles_step(
-        &mut self,
-        mut ids: Vec<String>,
-        mut waiters: Vec<gpui::Task<actions::TitleRegenerationResult>>,
-        mut results: Vec<actions::TitleRegenerationResult>,
-        cx: &mut Context<Self>,
-    ) {
+        self.clear_thread_selection(cx);
         if ids.is_empty() {
-            self.clear_thread_selection(cx);
-            if !waiters.is_empty() || !results.is_empty() {
-                cx.spawn(async move |this, cx| {
-                    let mut all = futures::future::join_all(waiters).await;
-                    all.extend(results);
-                    let _ = this.update(cx, |state, cx| {
-                        state.show_title_regeneration_toast(&all, cx);
-                    });
-                })
-                .detach();
-            }
             return;
         }
-        let id = ids.remove(0);
-        let request_id = uuid();
-        let command = actions::regenerate_title(&request_id, &id);
-        let owner = crate::context_menu::ThreadMenuOwner::capture(self, &id);
         let Some(client) = self.client_handle() else { return };
-        let task = self.runtime().spawn(client.dispatch(command));
+        let runtime = self.runtime().clone();
+        let dispatches: Vec<_> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let owner = crate::context_menu::ThreadMenuOwner::capture(self, &id)?;
+                let request_id = uuid();
+                let command = actions::regenerate_title(&request_id, &id);
+                let task = runtime.spawn(client.clone().dispatch(command));
+                Some((id, request_id, owner, task))
+            })
+            .collect();
+        if dispatches.is_empty() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
-            let reply = task.await.unwrap_or(Err(t3_client::session::RpcError::Closed));
+            let replies = futures::future::join_all(dispatches.into_iter().map(
+                |(id, request_id, owner, task)| async move {
+                    let reply = task.await.unwrap_or(Err(t3_client::session::RpcError::Closed));
+                    (id, request_id, owner, reply)
+                },
+            ))
+            .await;
+            let mut waiters = Vec::new();
+            let mut results = Vec::new();
+            let current = this.update(cx, |state, cx| {
+                if !crate::context_menu::ThreadMenuOwner::can_operate(state) {
+                    return false;
+                }
+                for (id, request_id, owner, reply) in replies {
+                    if !owner.response_current(state) {
+                        continue;
+                    }
+                    match reply {
+                        Ok(payload) => {
+                            let sequence = payload.get("sequence").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                            waiters.push(state.spawn_local_title_regeneration_waiter(id, request_id, sequence, cx));
+                        }
+                        Err(error) => {
+                            results.push(AppState::title_regeneration_rpc_result(&error));
+                        }
+                    }
+                }
+                true
+            });
+            if !matches!(current, Ok(true)) {
+                return;
+            }
+            let mut all = futures::future::join_all(waiters).await;
+            all.extend(results);
             let _ = this.update(cx, |state, cx| {
-                if owner.as_ref().is_some_and(|owner| {
-                    !owner.response_current(state) || !crate::context_menu::ThreadMenuOwner::can_operate(state)
-                }) {
-                    return;
-                }
-                match reply {
-                    Ok(payload) => {
-                        let sequence = payload.get("sequence").and_then(serde_json::Value::as_u64).unwrap_or(0);
-                        waiters.push(state.spawn_local_title_regeneration_waiter(id, request_id, sequence, cx));
-                        state.regenerate_titles_step(ids, waiters, results, cx);
-                    }
-                    Err(error) => {
-                        results.push(AppState::title_regeneration_rpc_result(&error));
-                        cx.spawn(async move |this, cx| {
-                            let mut all = futures::future::join_all(waiters).await;
-                            all.extend(results);
-                            let _ = this.update(cx, |state, cx| {
-                                state.show_title_regeneration_toast(&all, cx);
-                            });
-                        })
-                        .detach();
-                    }
-                }
+                state.show_title_regeneration_toast(&all, cx);
             });
         })
         .detach();
