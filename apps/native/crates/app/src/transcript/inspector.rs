@@ -27,7 +27,7 @@ use t3_core::timeline::{
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 use t3_core::vcs::format_diff_count;
 
-use super::media::{answer_attachment, tool_output_image};
+use super::media::{answer_attachment, tool_output_image_gallery};
 use super::parts::mono_frame;
 use crate::icons::Icon;
 use crate::selectable_text::{Highlights, SelectableText};
@@ -169,15 +169,26 @@ fn resolve(text: &str, runs: &Runs, cx: &App) -> Option<Highlights> {
             let muted = HighlightStyle { color: Some(hsla(palette(cx).muted_foreground)), ..HighlightStyle::default() };
             Some(keys.iter().map(|range| (range.clone(), muted)).collect())
         }
-        Runs::Json(tokens) => Some(tokens.iter().filter_map(|(range, token)| theme.style(token.capture()).map(|style| (range.clone(), style))).collect()),
-        Runs::Code(highlighter) => {
-            Some(highlighter.styles(&(0..text.len()), &*theme).into_iter().filter(|(_, style)| *style != HighlightStyle::default()).collect())
-        }
+        Runs::Json(tokens) => Some(
+            tokens
+                .iter()
+                .filter_map(|(range, token)| super::command_output::resolve_syntax_style(&theme, token.capture()).map(|style| (range.clone(), style)))
+                .collect(),
+        ),
+        Runs::Code(highlighter) => Some(
+            highlighter
+                .styles(&(0..text.len()), &super::command_output::CommandStyleResolver(&theme))
+                .into_iter()
+                .filter(|(_, style)| *style != HighlightStyle::default())
+                .collect(),
+        ),
     }
 }
 
 /// One piece of the inspector, top to bottom.
 enum Block {
+    /// `reasoning`: bordered muted italic markdown card (`V2ItemInspector.tsx`).
+    Reasoning(SharedString),
     /// `ToolCallBody`: the command, arguments and output, in mono at code size.
     Call(Vec<CallPart>),
     /// `StructuredValue` on its own.
@@ -287,6 +298,7 @@ impl Budget {
     /// Spends the item's text; `false` once the budget runs out.
     fn item(&mut self, item: &TurnItem) -> bool {
         match &item.kind {
+            TurnItemKind::Reasoning { text, .. } => self.spend(text.len()),
             TurnItemKind::CommandExecution { input, output, .. } => self.spend(input.len()) && self.text(output.as_deref()),
             TurnItemKind::DynamicTool { tool_name, input, output, .. } => {
                 self.text(tool_name.as_deref()) && self.value(input) && output.as_ref().is_none_or(|output| self.value(output))
@@ -508,13 +520,14 @@ impl RenderOnce for ItemInspector {
         };
         let owner = self.owner;
         let prepared = cache(cx).update(cx, |cache, cx| cache.get(key, owner, cx));
-        let ItemInspector { id, mut output_slot, mut open_diff, mode, .. } = self;
+        let ItemInspector { id, owner, mut output_slot, mut open_diff, .. } = self;
+        let mode = self.mode;
         let p = palette(cx);
         let children: Vec<AnyElement> = prepared
             .iter()
             .flat_map(|prepared| prepared.blocks.iter())
             .enumerate()
-            .map(|(index, block)| render_block(&format!("{id}:{index}"), block, &mut output_slot, &mut open_diff, cx))
+            .map(|(index, block)| render_block(&format!("{id}:{index}"), owner, block, &mut output_slot, &mut open_diff, cx))
             .collect();
         match mode {
             // `FetchedToolOutput`: `mt-1.5 space-y-1.5`, in mono.
@@ -555,6 +568,7 @@ fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Opt
     }
     let structured = |value: Option<&str>| value.filter(|text| !text.is_empty()).map(|text| Block::Structured(Text::plain(text.to_owned())));
     match &item.kind {
+        TurnItemKind::Reasoning { text, .. } if !text.is_empty() => vec![Block::Reasoning(text.clone().into())],
         TurnItemKind::CommandExecution { input, exit_code, .. } => {
             let mut parts = images();
             parts.extend(call_parts(ToolCallLines::command(input), None));
@@ -719,10 +733,72 @@ fn selectable(id: &str, text: impl Into<SharedString>) -> SelectableText {
     SelectableText::new(SharedString::from(id.to_owned()), text)
 }
 
-fn render_block(id: &str, block: &Block, output_slot: &mut Option<Option<AnyElement>>, open_diff: &mut Option<AnyElement>, cx: &mut App) -> AnyElement {
+/// Single newlines become markdown hard breaks outside fenced code blocks (`lineBreaks`).
+fn with_line_breaks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut fenced = false;
+    for (index, line) in text.split('\n').enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if index > 0 {
+            out.push_str(if fenced { "\n" } else { "  \n" });
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+#[derive(IntoElement)]
+struct ReasoningMarkdown {
+    id: SharedString,
+    owner: EntityId,
+    text: SharedString,
+}
+
+impl RenderOnce for ReasoningMarkdown {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        let owner = self.owner;
+        let store = window.use_keyed_state(ElementId::Name(SharedString::from(format!("{}:md-store", self.id))), cx, |_, _| {
+            super::markdown::MarkdownStore::new(owner)
+        });
+        let source: Arc<str> = Arc::from(with_line_breaks(&self.text));
+        let key = self.id.to_string();
+        let state = store.update(cx, |store, cx| {
+            store.begin_frame();
+            store.state(&key, &source, cx)
+        });
+        div()
+            .w_full()
+            .min_w_0()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(hsla(p.border).opacity(0.45))
+            .bg(hsla(p.muted).opacity(0.15))
+            .p(px(8.))
+            .text_size(px(14.))
+            .line_height(px(22.75))
+            .italic()
+            .text_color(hsla(p.muted_foreground))
+            .child(super::markdown::markdown_view(&state, cx))
+    }
+}
+
+fn render_block(
+    id: &str,
+    owner: EntityId,
+    block: &Block,
+    output_slot: &mut Option<Option<AnyElement>>,
+    open_diff: &mut Option<AnyElement>,
+    cx: &mut App,
+) -> AnyElement {
     let p = palette(cx);
     let mono_xs = |cx: &App| div().min_w_0().font_family(cx.theme().mono_font_family.clone()).text_xs();
     match block {
+        Block::Reasoning(text) => ReasoningMarkdown { id: SharedString::from(id.to_owned()), owner, text: text.clone() }.into_any_element(),
         Block::Call(parts) => {
             let parts: Vec<AnyElement> = parts.iter().enumerate().map(|(index, part)| render_part(&format!("{id}:{index}"), part, output_slot, cx)).collect();
             mono_frame(cx).child(v_flex().w_full().min_w_0().gap(px(6.)).children(parts)).into_any_element()
@@ -825,7 +901,11 @@ fn render_part(id: &str, part: &CallPart, output_slot: &mut Option<Option<AnyEle
         CallPart::Key(key) => div().text_color(hsla(p.muted_foreground)).child(selectable(id, key.clone())).into_any_element(),
         CallPart::Structured(text) => structured(id, text, cx),
         CallPart::Images(images) => {
-            let images = images.iter().enumerate().map(|(index, source)| tool_output_image(SharedString::from(format!("{id}:image:{index}")), source.clone(), TOOL_OUTPUT_IMAGE, cx)).collect::<Vec<_>>();
+            let images = images
+                .iter()
+                .enumerate()
+                .map(|(index, _)| tool_output_image_gallery(SharedString::from(format!("{id}:image:{index}")), images, index, TOOL_OUTPUT_IMAGE, cx))
+                .collect::<Vec<_>>();
             v_flex().w_full().min_w_0().gap(px(6.)).items_start().children(images).into_any_element()
         }
         CallPart::Output { line } => {
@@ -1062,5 +1142,43 @@ mod tests {
         assert_eq!(text.highlights_with(light, || style(0x999999ff)), style(0x111111ff), "the same theme keeps its colors");
         assert_eq!(text.highlights_with(other_light, || style(0x222222ff)), style(0x222222ff), "another palette resolves again");
         assert_eq!(text.highlights_with(ThemeKey(2, 11), || style(0x333333ff)), style(0x333333ff), "another syntax theme too");
+    }
+
+    #[test]
+    fn reasoning_item_derives_card_block_and_counts_toward_budget() {
+        let make = |text: &str| {
+            Arc::new(
+                serde_json::from_value::<TurnItem>(serde_json::json!({
+                    "id": "reason-1", "threadId": "thread", "runId": null, "nodeId": null, "parentItemId": null, "ordinal": 1, "status": "completed",
+                    "title": null, "startedAt": null, "completedAt": null, "updatedAt": "2026-10-01T00:00:00Z",
+                    "type": "reasoning", "text": text, "streaming": false,
+                }))
+                .expect("reasoning item decodes"),
+            )
+        };
+        let empty = make("");
+        assert!(derive_blocks(&empty, &Fetch::None, Mode::Full, None, false).is_empty());
+        assert!(key(empty, Fetch::None).inline());
+
+        let filled = make("line one\nline two");
+        let blocks = derive_blocks(&filled, &Fetch::None, Mode::Full, None, false);
+        assert!(matches!(blocks.as_slice(), [Block::Reasoning(text)] if text == "line one\nline two"));
+        assert!(key(filled, Fetch::None).inline());
+
+        let big = make(&"r".repeat(INLINE_BUDGET + 1));
+        assert!(!key(big, Fetch::None).inline());
+        assert_eq!(with_line_breaks("a\nb\n```ts\nc\nd\n```\ne"), "a  \nb  \n```ts\nc\nd\n```  \ne");
+    }
+
+    #[test]
+    fn structured_code_and_json_use_web_syntax_roles() {
+        let dark = crate::theme::test_syntax_theme(true);
+        let style = super::super::command_output::resolve_syntax_style(&dark, "function.method.call");
+        assert_eq!(style.and_then(|s| s.color), Some(hsla(0x9D6AFBFF)));
+
+        let ts = code("obj.run(1);".to_owned(), "typescript");
+        let Runs::Code(highlighter) = ts.runs else { panic!("expected typescript highlighter") };
+        let styles = highlighter.styles(&(0..ts.text.len()), &super::super::command_output::CommandStyleResolver(&dark));
+        assert!(styles.iter().any(|(_, s)| s.color == Some(hsla(0x9D6AFBFF))));
     }
 }

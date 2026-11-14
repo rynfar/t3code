@@ -297,7 +297,7 @@ fn command_scripts(node: tree_sitter::Node<'_>, source: &str, found: &mut Vec<Em
     let written = if program == "cat" {
         redirects
             .iter()
-            .filter(|r| r.kind() == "file_redirect" && descriptor(**r, source, "1"))
+            .filter(|r| is_stdout_file_redirect(**r, source))
             .filter_map(|r| r.child_by_field_name("destination"))
             .next_back()
             .map(|n| source[n.byte_range()].to_owned())
@@ -336,6 +336,14 @@ fn descriptor(node: tree_sitter::Node<'_>, source: &str, fd: &str) -> bool {
     node.child_by_field_name("descriptor").is_none_or(|n| &source[n.byte_range()] == fd)
 }
 
+fn is_stdout_file_redirect(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    if node.kind() != "file_redirect" || !descriptor(node, source, "1") {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| !child.is_named() && matches!(&source[child.byte_range()], ">" | ">>" | ">|" | "&>" | "&>>"))
+}
+
 fn delimiter_language(name: &str) -> Option<&'static str> {
     Some(match name {
         "py" | "python" => "python",
@@ -356,23 +364,278 @@ fn delimiter_language(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Full filename/extension catalog matching `@pierre/diffs`'s `getFiletypeFromFileName`,
+/// mapping GPUI-bundled grammar aliases (`bash`, `xml`, `yaml`, `javascript`, `css`, `json`)
+/// so supported languages highlight and unbundled languages clear shell string styles.
 fn file_language(path: &str) -> Option<&'static str> {
     let path = path.trim_matches(['\'', '"']);
-    if matches!(path.rsplit(['/', '\\']).next()?, "Gemfile" | "Rakefile" | "Guardfile" | "Capfile" | "Berksfile" | "Brewfile" | "Vagrantfile" | "Thorfile" | "Appraisals" | "Dangerfile") {
-        return Some("ruby");
+    if path.is_empty() {
+        return None;
+    }
+    let basename = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if let Some(language) = exact_filetype(path).or_else(|| exact_filetype(basename)) {
+        return Some(language);
+    }
+    if let Some((stem, last)) = basename.rsplit_once('.')
+        && let Some((_, prev)) = stem.rsplit_once('.')
+        && let Some(language) = compound_filetype(prev, last)
+    {
+        return Some(language);
+    }
+    if let Some((_, ext)) = basename.rsplit_once('.')
+        && let Some(language) = extension_filetype(ext)
+    {
+        return Some(language);
     }
     crate::files::syntax_language(path).or_else(|| {
-        let extension = path.rsplit('.').next()?.to_ascii_lowercase();
-        match extension.as_str() {
-            "ps1" | "psm1" | "psd1" => Some("powershell"),
-            "pl" => Some("prolog"),
-            "pm" => Some("perl"),
-            "rake" | "gemspec" | "jbuilder" | "builder" | "rabl" | "arb" | "ru" | "podspec" => Some("ruby"),
-            "fish" => Some("fish"),
-            "applescript" | "scpt" => Some("applescript"),
-            "xsl" | "xslt" => Some("xml"),
-            _ => delimiter_language(&extension),
+        let extension = basename.rsplit('.').next()?.to_ascii_lowercase();
+        delimiter_language(&extension)
+    })
+}
+
+fn exact_filetype(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "CMakeLists.txt" => "cmake",
+        "CODEOWNERS" => "codeowners",
+        "Dockerfile" | "dockerfile" => "dockerfile",
+        "COMMIT_EDITMSG" => "git-commit",
+        "git-rebase-todo" => "git-rebase",
+        "Makefile" | "makefile" => "makefile",
+        "BUCK" | "BUILD" | "PACKAGE" | "WORKSPACE" | "Tiltfile" => "python",
+        "Gemfile" | "Rakefile" | "Guardfile" | "Capfile" | "Berksfile" | "Brewfile" | "Vagrantfile" | "Thorfile" | "Appraisals" | "Dangerfile" => {
+            "ruby"
         }
+        _ => return None,
+    })
+}
+
+fn compound_filetype(prev: &str, last: &str) -> Option<&'static str> {
+    Some(match (prev, last) {
+        ("component", "html") => "angular-html",
+        ("component", "ts") => "angular-ts",
+        ("blade", "php") => "blade",
+        ("vine", "ts") => "vue-vine",
+        _ => return None,
+    })
+}
+
+fn extension_filetype(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "1c" => "1c",
+        "abap" => "abap",
+        "as" => "actionscript-3",
+        "ada" | "adb" | "ads" => "ada",
+        "adoc" | "asciidoc" => "asciidoc",
+        "conf" => "nginx",
+        "htaccess" => "apache",
+        "cls" | "tex" | "ltx" | "sty" => "tex",
+        "trigger" => "apex",
+        "apl" => "apl",
+        "applescript" | "scpt" => "applescript",
+        "ara" => "ara",
+        "asm" => "asm",
+        "s" => "riscv",
+        "astro" => "astro",
+        "awk" => "awk",
+        "bal" => "ballerina",
+        "sh" | "bash" | "zsh" => "bash",
+        "bat" | "cmd" => "cmd",
+        "be" => "berry",
+        "beancount" => "beancount",
+        "bib" => "bibtex",
+        "bicep" => "bicep",
+        "bsl" => "bsl",
+        "c" => "c",
+        "h" | "mm" => "objective-cpp",
+        "cs" => "csharp",
+        "cpp" | "hpp" | "cc" | "cxx" | "hh" => "cpp",
+        "cdc" => "cdc",
+        "cairo" => "cairo",
+        "clar" => "clarity",
+        "clj" | "cljs" | "cljc" => "clojure",
+        "soy" => "soy",
+        "cmake" => "cmake",
+        "cob" | "cbl" | "cobol" => "cobol",
+        "ql" => "ql",
+        "coffee" => "coffeescript",
+        "lisp" | "cl" | "lsp" => "lisp",
+        "log" => "log",
+        "v" | "vh" => "verilog",
+        "cql" => "cql",
+        "cr" => "crystal",
+        "css" | "scss" => "css",
+        "csv" => "csv",
+        "cue" => "cue",
+        "cypher" | "cyp" => "cypher",
+        "d" => "d",
+        "dart" => "dart",
+        "dax" => "dax",
+        "desktop" => "desktop",
+        "diff" | "patch" => "diff",
+        "env" => "dotenv",
+        "dm" => "dream-maker",
+        "edge" => "edge",
+        "el" => "emacs-lisp",
+        "ex" | "exs" => "elixir",
+        "elm" => "elm",
+        "erb" => "erb",
+        "erl" | "hrl" => "erlang",
+        "f" | "for" => "fortran-fixed-form",
+        "fs" | "fsi" | "fsx" => "fsharp",
+        "f03" => "f03",
+        "f08" => "f08",
+        "f18" => "f18",
+        "f77" => "f77",
+        "f90" | "f95" => "fortran-free-form",
+        "fnl" => "fennel",
+        "fish" => "fish",
+        "ftl" => "ftl",
+        "tres" | "res" => "gdresource",
+        "gd" => "gdscript",
+        "gdshader" => "gdshader",
+        "gs" => "genie",
+        "feature" => "gherkin",
+        "gjs" => "glimmer-js",
+        "gleam" => "gleam",
+        "gts" => "glimmer-ts",
+        "glsl" | "vert" | "frag" => "glsl",
+        "shader" => "shaderlab",
+        "gp" | "plt" | "gnuplot" => "gnuplot",
+        "go" => "go",
+        "graphql" | "gql" => "graphql",
+        "groovy" | "gvy" => "groovy",
+        "hack" => "hack",
+        "haml" => "haml",
+        "hbs" | "handlebars" => "handlebars",
+        "hs" | "lhs" => "haskell",
+        "hx" => "haxe",
+        "hcl" => "hcl",
+        "hjson" => "hjson",
+        "hlsl" | "fx" => "hlsl",
+        "html" | "htm" => "html",
+        "http" | "rest" => "http",
+        "hxml" => "hxml",
+        "hy" => "hy",
+        "imba" => "imba",
+        "ini" | "cfg" => "ini",
+        "jade" | "pug" => "pug",
+        "java" => "java",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "jinja" | "jinja2" | "j2" => "jinja",
+        "jison" => "jison",
+        "jl" => "julia",
+        "json" | "json5" | "jsonc" | "jsonl" => "json",
+        "jsonnet" | "libsonnet" => "jsonnet",
+        "jssm" => "jssm",
+        "kt" => "kotlin",
+        "kts" => "kts",
+        "kql" => "kusto",
+        "lean" => "lean4",
+        "less" => "less",
+        "liquid" => "liquid",
+        "lit" => "lit",
+        "ll" => "llvm",
+        "logo" => "logo",
+        "lua" => "lua",
+        "luau" => "luau",
+        "mk" => "makefile",
+        "md" | "markdown" => "markdown",
+        "marko" => "marko",
+        "m" | "wl" | "nb" => "wolfram",
+        "mat" => "matlab",
+        "mdc" => "mdc",
+        "mdx" => "mdx",
+        "wiki" | "mediawiki" => "wikitext",
+        "mmd" | "mermaid" => "mermaid",
+        "mips" => "mipsasm",
+        "mojo" | "🔥" => "mojo",
+        "move" => "move",
+        "nar" => "narrat",
+        "nf" => "nextflow",
+        "nim" | "nims" | "nimble" => "nim",
+        "nix" => "nix",
+        "nu" => "nushell",
+        "ml" | "mli" | "mll" | "mly" => "ocaml",
+        "odin" => "odin",
+        "pas" | "p" => "pascal",
+        "pl" | "pro" | "P" => "prolog",
+        "pm" | "t" => "perl",
+        "raku" | "p6" | "pl6" => "raku",
+        "php" | "phtml" => "php",
+        "pls" => "plsql",
+        "sql" => "sql",
+        "po" => "po",
+        "polar" => "polar",
+        "pcss" => "postcss",
+        "pot" => "pot",
+        "potx" => "potx",
+        "pq" | "pqm" => "powerquery",
+        "ps1" | "psm1" | "psd1" => "powershell",
+        "prisma" => "prisma",
+        "properties" => "properties",
+        "proto" => "protobuf",
+        "pp" => "puppet",
+        "purs" => "purescript",
+        "py" | "pyw" | "pyi" | "bazel" | "bxl" | "bzl" | "bzlmod" | "star" | "sky" => "python",
+        "qml" => "qml",
+        "qmldir" => "qmldir",
+        "qss" => "qss",
+        "r" | "R" => "r",
+        "rkt" | "rktl" => "racket",
+        "razor" | "cshtml" => "razor",
+        "rb" | "rbw" | "rake" | "gemspec" | "jbuilder" | "builder" | "rabl" | "arb" | "ru" | "podspec" => "ruby",
+        "reg" => "reg",
+        "regex" => "regexp",
+        "rel" => "rel",
+        "rs" => "rust",
+        "rst" => "rst",
+        "sas" => "sas",
+        "sass" => "sass",
+        "scala" | "sc" => "scala",
+        "scm" | "ss" | "sld" => "scheme",
+        "sdbl" => "sdbl",
+        "shadergraph" => "shader",
+        "st" => "smalltalk",
+        "sol" => "solidity",
+        "sparql" | "rq" => "sparql",
+        "spl" => "splunk",
+        "config" => "ssh-config",
+        "do" | "ado" | "dta" => "stata",
+        "styl" | "stylus" => "stylus",
+        "svelte" => "svelte",
+        "swift" => "swift",
+        "sv" | "svh" => "system-verilog",
+        "service" | "socket" | "device" | "timer" => "systemd",
+        "talon" => "talonscript",
+        "tasl" => "tasl",
+        "tcl" => "tcl",
+        "templ" => "templ",
+        "tf" => "tf",
+        "tfvars" => "tfvars",
+        "toml" => "toml",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsp" => "typespec",
+        "tsv" => "tsv",
+        "tsx" => "tsx",
+        "ttl" => "turtle",
+        "twig" => "twig",
+        "typ" => "typst",
+        "vv" => "v",
+        "vala" | "vapi" => "vala",
+        "vb" | "vbs" | "bas" => "vb",
+        "vhd" | "vhdl" => "vhdl",
+        "vim" => "vimscript",
+        "vue" => "vue",
+        "vy" => "vyper",
+        "wasm" | "wat" => "wasm",
+        "wy" => "文言",
+        "wgsl" => "wgsl",
+        "wit" => "wit",
+        "xml" | "xsl" | "xslt" => "xml",
+        "yaml" | "yml" => "yaml",
+        "zs" => "zenscript",
+        "zig" => "zig",
+        _ => return None,
     })
 }
 
@@ -432,6 +695,20 @@ mod tests {
             ("tee app.fish <<'EOF'\nset n 2\nEOF", "fish", "set n 2\n"),
             ("cat > app.pl <<'EOF'\nmy $n = 2;\nEOF", "prolog", "my $n = 2;\n"),
             ("cat > app.applescript <<'EOF'\nset n to 2\nEOF", "applescript", "set n to 2\n"),
+            ("cat > main.c <<'EOF'\nint main(void) { return 0; }\nEOF", "c", "int main(void) { return 0; }\n"),
+            ("cat > main.cpp <<'EOF'\nint x = 1;\nEOF", "cpp", "int x = 1;\n"),
+            ("cat > App.java <<'EOF'\nclass App {}\nEOF", "java", "class App {}\n"),
+            ("cat > init.lua <<'EOF'\nlocal x = 1\nEOF", "lua", "local x = 1\n"),
+            ("cat > app.component.html <<'EOF'\n<div>hi</div>\nEOF", "angular-html", "<div>hi</div>\n"),
+            ("cat > view.blade.php <<'EOF'\n@if($ok)\n@endif\nEOF", "blade", "@if($ok)\n@endif\n"),
+            ("cat > dir/CMakeLists.txt <<'EOF'\nproject(demo)\nEOF", "cmake", "project(demo)\n"),
+            ("cat > Dockerfile <<'EOF'\nFROM alpine\nEOF", "dockerfile", "FROM alpine\n"),
+            ("tee Makefile <<'EOF'\nall:\n\techo hi\nEOF", "makefile", "all:\n\techo hi\n"),
+            ("cat > CODEOWNERS <<'EOF'\n* @team\nEOF", "codeowners", "* @team\n"),
+            ("cat > BUILD <<'EOF'\npy_library(name = 'a')\nEOF", "python", "py_library(name = 'a')\n"),
+            ("cat > rules.P <<'EOF'\nparent(a, b).\nEOF", "prolog", "parent(a, b).\n"),
+            ("cat > prog.p <<'EOF'\nprogram p; begin end.\nEOF", "pascal", "program p; begin end.\n"),
+            ("cat &> app.zig <<'EOF'\nconst x = 1;\nEOF", "zig", "const x = 1;\n"),
             ("kubectl apply -f - <<'YAML'\nkind: Pod\nYAML", "yaml", "kind: Pod\n"),
             ("echo \"$(node -e 'console.log(1)')\"", "javascript", "console.log(1)"),
         ] {
@@ -453,7 +730,15 @@ mod tests {
         assert_eq!(found[0].text, "node -e \"console.log('hi')\"");
         let quote = found[0].text.find('"').unwrap();
         assert_eq!(&source[found[0].spans[quote].clone()], "\\\"");
-        for source in ["python3 build.py <<EOF\ndata\nEOF", "python3 -m json.tool <<EOF\n{}\nEOF", "rg -n 'foo' src", "bash -lc ' '", "node -e 'broken"] {
+        for source in [
+            "python3 build.py <<EOF\ndata\nEOF",
+            "python3 -m json.tool <<EOF\n{}\nEOF",
+            "rg -n 'foo' src",
+            "bash -lc ' '",
+            "node -e 'broken",
+            "cat < main.c <<'EOF'\nint x = 1;\nEOF",
+            "cat > notes.txt <<'EOF'\nplain text\nEOF",
+        ] {
             assert!(scripts(source).is_empty(), "{source}");
         }
     }
