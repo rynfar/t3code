@@ -486,7 +486,7 @@ fn markdown_image_content(image: &MarkdownImage, scope_key: &str, index: usize, 
     }
     let Some(source) = resolved.source else { return unavailable("Image unavailable", &image.alt, cx) };
     let id = SharedString::from(md_image_id(scope_key, index, &image.url));
-    framed_image(id, source, name, ImageFrame { alt: &image.alt, max_height: 480., preview: image.link.is_none(), hints: image.hints, gallery: gallery_doc.cloned() }, scope, cx)
+    framed_image(id, source, name, ImageFrame { alt: &image.alt, max_height: 480., preview: image.link.is_none(), hints: image.hints, gallery: gallery_doc.cloned(), gallery_items: None }, scope, cx)
 }
 
 /// `ChatMarkdownAssetImage` for an image a tool returned: within 480 wide and 256 tall
@@ -494,7 +494,24 @@ fn markdown_image_content(image: &MarkdownImage, scope_key: &str, index: usize, 
 pub fn tool_output_image(id: SharedString, source: MediaSource, alt: &str, cx: &mut App) -> AnyElement {
     let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone());
     let Some(scope) = scope else { return unavailable("Image", alt, cx) };
-    framed_image(id, source, SharedString::from(alt.to_owned()), ImageFrame { alt, max_height: 256., preview: true, hints: MediaHints::default(), gallery: None }, &scope, cx)
+    framed_image(id, source, SharedString::from(alt.to_owned()), ImageFrame { alt, max_height: 256., preview: true, hints: MediaHints::default(), gallery: None, gallery_items: None }, &scope, cx)
+}
+
+/// Like `tool_output_image`, opening the viewer with all tool output images in the group.
+pub fn tool_output_image_gallery(id: SharedString, sources: &[MediaSource], index: usize, alt: &str, cx: &mut App) -> AnyElement {
+    let Some(source) = sources.get(index).cloned() else { return unavailable("Image", alt, cx) };
+    let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone());
+    let Some(scope) = scope else { return unavailable("Image", alt, cx) };
+    let name: SharedString = alt.to_owned().into();
+    let items: Vec<ViewerItem> = sources.iter().map(|src| ViewerItem::image(src.clone(), name.clone())).collect();
+    framed_image(
+        id,
+        source,
+        name,
+        ImageFrame { alt, max_height: 256., preview: true, hints: MediaHints::default(), gallery: None, gallery_items: Some((items, index)) },
+        &scope,
+        cx,
+    )
 }
 
 struct ImageFrame<'a> {
@@ -503,6 +520,7 @@ struct ImageFrame<'a> {
     preview: bool,
     hints: MediaHints,
     gallery: Option<MediaDocument>,
+    gallery_items: Option<(Vec<ViewerItem>, usize)>,
 }
 
 fn image_frame_size(natural: Option<(u32, u32)>, hints: MediaHints, max_height: f32) -> (f32, f32) {
@@ -534,7 +552,14 @@ fn image_frame_size(natural: Option<(u32, u32)>, hints: MediaHints, max_height: 
 
 /// An image at its own aspect, at most 480 wide and `max_height` tall, radius 8 with a 40%
 /// border. A 16:9 frame holds its place until the size is known.
-fn framed_image(id: SharedString, source: MediaSource, name: SharedString, ImageFrame { alt, max_height, preview, hints, gallery }: ImageFrame<'_>, scope: &MediaScope, cx: &mut App) -> AnyElement {
+fn framed_image(
+    id: SharedString,
+    source: MediaSource,
+    name: SharedString,
+    ImageFrame { alt, max_height, preview, hints, gallery, gallery_items }: ImageFrame<'_>,
+    scope: &MediaScope,
+    cx: &mut App,
+) -> AnyElement {
     let p = palette(cx);
     if matches!(media::peek(&source, cx), ImageState::Failed(_)) {
         return div().id(id).relative().child(unavailable("Image unavailable", alt, cx)).child(media::observe_image(source, scope.clone())).into_any_element();
@@ -555,7 +580,11 @@ fn framed_image(id: SharedString, source: MediaSource, name: SharedString, Image
         .bg(hsla(p.muted).opacity(0.6))
         .when(preview, |frame| frame.cursor_pointer().on_click(move |_, window, cx| {
             cx.stop_propagation();
-            open_gallery_item(gallery.as_ref(), &click_scope, item.clone(), window, cx);
+            if let Some((items, index)) = gallery_items.clone() {
+                let _ = click_scope.viewer.update(cx, |viewer, cx| viewer.open_with_scope(items, index, Some(click_scope.clone()), window, cx));
+            } else {
+                open_gallery_item(gallery.as_ref(), &click_scope, item.clone(), window, cx);
+            }
         }));
     frame.child(pixels).child(div().absolute().inset_0().rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.4))).into_any_element()
 }

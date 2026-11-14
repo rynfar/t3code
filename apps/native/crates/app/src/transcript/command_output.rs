@@ -142,7 +142,16 @@ pub fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> Opti
                         .autoscroll(&slot.scroll),
                 ),
         );
-    Some(v_flex().w_full().min_w_0().when(output.truncated, |this| this.child(note(TRUNCATED, cx))).child(scroller).into_any_element())
+    Some(
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .when(output.truncated, |this| {
+                this.child(div().mb(px(4.)).text_size(px(11.)).italic().text_color(hsla(palette(cx).muted_foreground)).child(TRUNCATED))
+            })
+            .child(scroller)
+            .into_any_element(),
+    )
 }
 
 /// `ShellCommandBlock.tsx` and `HighlightedTokens.tsx`, shared by streamed command rows and
@@ -259,11 +268,18 @@ fn cached_command(
     styles
 }
 
-struct CommandStyleResolver<'a>(&'a gpui_component::highlighter::HighlightTheme);
+pub(super) struct CommandStyleResolver<'a>(pub(super) &'a gpui_component::highlighter::HighlightTheme);
 impl gpui_base::input::HighlightStyleResolver for CommandStyleResolver<'_> {
     fn style(&self, name: &str) -> Option<HighlightStyle> {
-        crate::theme::syntax_style(name, self.0.appearance.is_dark()).or_else(|| self.0.style(name))
+        resolve_syntax_style(self.0, name)
     }
+}
+
+pub(super) fn resolve_syntax_style(
+    theme: &gpui_component::highlighter::HighlightTheme,
+    name: &str,
+) -> Option<HighlightStyle> {
+    crate::theme::syntax_style(name, theme.appearance.is_dark()).or_else(|| theme.style(name))
 }
 
 fn command_styles(
@@ -286,14 +302,15 @@ fn command_styles(
         // This highlighter emits local.* captures as colors; explicit syntax captures keep identifiers styled.
         ruby.locals = "".into();
         LanguageRegistry::singleton().register("ruby", &ruby);
-        for name in ["fish", "applescript", "prolog"] {
-            LanguageRegistry::singleton().register(name, &LanguageConfig::plain(name));
-        }
     });
     if *budget == 0 {
         return Vec::new();
     }
     *budget -= 1;
+    // Unbundled embedded languages have no grammar here; emit default style so they clear outer shell string colors.
+    if LanguageRegistry::singleton().language(language).is_none() {
+        return if code.is_empty() { Vec::new() } else { vec![(0..code.len(), HighlightStyle::default())] };
+    }
     let mut highlighter = SyntaxHighlighter::new(language);
     highlighter.update(None, &Rope::from_str(code), None);
     if highlighter.tree().is_none() { return vec![(0..code.len(), HighlightStyle::default())]; }
@@ -394,9 +411,14 @@ mod syntax_tests {
     fn filename_detection_matches_the_web_supported_and_plain_languages() {
         assert_colors("cat > app.pl <<'EOF'\nmy $n = 2;\nEOF", true, &[("my $n = 2;", None)]);
         assert_colors("cat > app.pm <<'EOF'\nmy $n = 2;\nEOF", true, &[("$n", Some(0xFFA359FF))]);
-        for path in ["app.rake", "app.gemspec", "Rakefile"] {
+        for path in ["app.rake", "app.gemspec", "Rakefile", "Brewfile"] {
             assert_colors(&format!("cat > {path} <<'EOF'\nx = true\nEOF"), true, &[("x", Some(0xFFA359FF)), ("true", Some(0x68CDF2FF))]);
         }
+        assert_colors("cat > BUILD <<'EOF'\ndef f():\n    return True\nEOF", true, &[("def", Some(0xFF678DFF)), ("True", Some(0xFFD452FF))]);
+        assert_colors("cat > main.c <<'EOF'\nint x = 1;\nEOF", true, &[("int x = 1;", None)]);
+        assert_colors("cat > Dockerfile <<'EOF'\nFROM alpine\nEOF", true, &[("FROM alpine", None)]);
+        assert_colors("cat > Makefile <<'EOF'\nall:\n\techo hi\nEOF", true, &[("all:", None)]);
+        assert_colors("cat > view.blade.php <<'EOF'\n@if($ok)\nEOF", true, &[("@if($ok)", None)]);
     }
 
     #[test]
