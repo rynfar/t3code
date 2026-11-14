@@ -124,6 +124,17 @@ impl LinkOrigin {
     }
 }
 
+/// Result of the most recent title-regeneration request for a thread shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastTitleRegeneration {
+    pub request_id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub completed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadShell {
@@ -211,6 +222,8 @@ pub struct ThreadShell {
     pub opens: Option<serde_json::Value>,
     #[serde(default)]
     pub title_regeneration: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_title_regeneration: Option<LastTitleRegeneration>,
     #[serde(default)]
     pub pinned_at: Option<String>,
     #[serde(default)]

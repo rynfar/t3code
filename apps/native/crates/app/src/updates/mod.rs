@@ -72,7 +72,10 @@ use gpui::{
     App, Context, Entity, Global, IntoElement, ParentElement, Render, Styled, Subscription, Task,
     WeakEntity, Window, div, prelude::*, px,
 };
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use t3_client::updates::{CapturedUpdateOwner, UpdateDestination, UpdateEvent};
 use t3_core::{
     settings::search::Section,
@@ -99,6 +102,14 @@ struct ResumedHandoff {
     failures: Vec<String>,
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct UpdateControl {
     state: Entity<AppState>,
     dialog: Entity<dialog::UpdateDialog>,
@@ -114,6 +125,9 @@ pub struct UpdateControl {
     capsule_open: bool,
     capsule_timer: Option<Task<()>>,
     handoff_timer: Option<Task<()>>,
+    restart_nudges: HashMap<String, AbortOnDrop>,
+    provider_check_epoch: u64,
+    provider_check_in_flight: Option<u64>,
     active_runs: usize,
     run_updated_servers: Vec<String>,
     run_updated_providers: usize,
@@ -278,6 +292,9 @@ impl UpdateControl {
             capsule_open: false,
             capsule_timer: None,
             handoff_timer: None,
+            restart_nudges: HashMap::new(),
+            provider_check_epoch: 0,
+            provider_check_in_flight: None,
             active_runs: 0,
             run_updated_servers: Vec::new(),
             run_updated_providers: 0,
@@ -492,6 +509,7 @@ impl UpdateControl {
         if self.fixture {
             self.capsule_timer = None;
             self.handoff_timer = None;
+            self.restart_nudges.clear();
             return;
         }
         let active = self
@@ -551,6 +569,53 @@ impl UpdateControl {
             }));
         } else {
             self.handoff_timer = None;
+        }
+
+        let handed_off_ids: Vec<String> = if self.active_runs == 0 {
+            self.run
+                .as_ref()
+                .map(|run| {
+                    run.machines
+                        .iter()
+                        .filter(|m| m.result.is_none() && m.handed_off_version.is_some())
+                        .map(|m| m.environment_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        self.restart_nudges
+            .retain(|id, _| handed_off_ids.contains(id));
+        if !handed_off_ids.is_empty() {
+            let (view, runtime, lookups) = {
+                let state = self.state.read(cx);
+                let lookups: Vec<(String, _)> = handed_off_ids
+                    .into_iter()
+                    .filter(|id| !self.restart_nudges.contains_key(id))
+                    .map(|id| {
+                        let client_fut = state.connections.client(&id);
+                        (id, client_fut)
+                    })
+                    .collect();
+                (state.connections.view(), state.runtime().clone(), lookups)
+            };
+            for (id, client_fut) in lookups {
+                let view = view.clone();
+                let env_id = id.clone();
+                let handle = runtime.spawn(async move {
+                    if let Some(client) = client_fut.await {
+                        t3_client::updates::nudge_reconnect_during_restart(
+                            env_id,
+                            view,
+                            client,
+                            Duration::from_secs(1),
+                        )
+                        .await;
+                    }
+                });
+                self.restart_nudges.insert(id, AbortOnDrop(handle));
+            }
         }
     }
 
@@ -832,9 +897,34 @@ impl UpdateControl {
         if self.fixture {
             return;
         }
-        let targets: Vec<(ServerTarget, Option<String>)> =
-            updates::retry_failed_servers(&mut self.run, now_ms());
+        let targets: Vec<(ServerTarget, Option<String>)> = {
+            let state = self.state.read(cx);
+            updates::retry_failed_servers_with_versions(&mut self.run, now_ms(), |id| {
+                state
+                    .fleet
+                    .environment(id)
+                    .filter(|entry| {
+                        entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                            && entry.summary.synchronized
+                    })
+                    .and_then(|entry| entry.config.config.as_ref())
+                    .map(|config| config.environment.server_version.as_str())
+            })
+        };
+        if self.run.is_none() {
+            self.capsule_open = false;
+            self.clear_run_outcomes();
+        }
         if targets.is_empty() {
+            if self.run.is_none() {
+                self.persist_saved_result(&UpdateEverythingResult::default());
+            } else {
+                self.persist_saved_result(&self.in_flight_result());
+            }
+            self.refresh_timers(cx);
+            self.sync(cx);
+            cx.emit(());
+            cx.notify();
             return;
         }
         for (target, _) in &targets {
@@ -980,6 +1070,81 @@ impl UpdateControl {
         .detach();
     }
 
+    pub(super) fn refresh_providers_for_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.fixture {
+            self.provider_check_in_flight = None;
+            self.dialog
+                .update(cx, |dialog, cx| dialog.set_checking(false, cx));
+            return;
+        }
+        if self.provider_check_in_flight.is_some() {
+            self.dialog
+                .update(cx, |dialog, cx| dialog.set_checking(true, cx));
+            return;
+        }
+        self.provider_check_epoch = self.provider_check_epoch.wrapping_add(1);
+        let epoch = self.provider_check_epoch;
+        let (lookups, runtime) = {
+            let state = self.state.read(cx);
+            let lookups: Vec<_> = state
+                .fleet
+                .environments
+                .iter()
+                .filter(|entry| {
+                    entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                        && entry.summary.synchronized
+                        && entry.summary.config_loaded
+                        && entry
+                            .grants
+                            .as_ref()
+                            .is_some_and(|s| s.grants(t3_core::usage::PROVIDERS_MANAGE_SCOPE))
+                })
+                .map(|entry| {
+                    state
+                        .connections
+                        .destination(&entry.summary.owner, t3_core::usage::PROVIDERS_MANAGE_SCOPE)
+                })
+                .collect();
+            (lookups, state.runtime().clone())
+        };
+        if lookups.is_empty() {
+            self.dialog
+                .update(cx, |dialog, cx| dialog.set_checking(false, cx));
+            return;
+        }
+        self.provider_check_in_flight = Some(epoch);
+        self.dialog
+            .update(cx, |dialog, cx| dialog.set_checking(true, cx));
+        let task = runtime.spawn(async move {
+            let mut set = tokio::task::JoinSet::new();
+            for lookup in lookups {
+                set.spawn(async move {
+                    if let Ok(dest) = lookup.await {
+                        let _ = dest
+                            .client
+                            .request(
+                                t3_core::settings::providers::SERVER_REFRESH_PROVIDERS,
+                                serde_json::json!({ "refreshModels": true }),
+                            )
+                            .await;
+                    }
+                });
+            }
+            while set.join_next().await.is_some() {}
+        });
+        cx.spawn(async move |this, cx| {
+            let _ = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.provider_check_in_flight == Some(epoch) {
+                    this.provider_check_in_flight = None;
+                    this.dialog
+                        .update(cx, |dialog, cx| dialog.set_checking(false, cx));
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn dismiss_settled(&mut self, cx: &mut Context<Self>) {
         updates::dismiss_settled_machines(&mut self.run);
         if let Some(run) = &self.run {
@@ -1005,6 +1170,8 @@ impl UpdateControl {
             self.connection = state.connection_id();
             self.visible_after = None;
             self.dismissed.clear();
+            self.provider_check_in_flight = None;
+            self.provider_check_epoch = self.provider_check_epoch.wrapping_add(1);
             self._grants = state.client_handle().map(|client| {
                 let mut grants = client.session_state();
                 cx.spawn(async move |this, cx| {
@@ -1641,6 +1808,7 @@ impl UpdateControl {
                         this.dialog.update(cx, |dialog, cx| {
                             dialog.open(plan, this.fixture, window, cx)
                         });
+                        this.refresh_providers_for_dialog(cx);
                     });
                 },
                 window,

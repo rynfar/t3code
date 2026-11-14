@@ -1031,3 +1031,33 @@ async fn background_wake_completions_honor_grace_release_and_pause_on_disconnect
         assert!(!matches!(event, EnvironmentEvent::Notifications { .. }), "Command::Watch must pause pending grace before sync");
     }
 }
+
+#[tokio::test]
+async fn server_config_snapshot_records_server_clock_offset() {
+    let mut server = FakeServer::start().await;
+    let (mut owner, _events) = Environments::start(&tokio::runtime::Handle::current(), false);
+    let mut view = owner.view();
+    owner.watch("clock-env", server.credentials(), None);
+    let mut conn = server.connection().await;
+    let _shell = shell_config(
+        &mut conn,
+        json!({
+            "environment": { "environmentId": "canonical-clock-env" },
+            "serverTime": "2036-11-14T00:00:00.000Z"
+        }),
+    )
+    .await;
+    while !view
+        .borrow()
+        .environment("clock-env")
+        .is_some_and(|entry| entry.config.config.is_some())
+    {
+        view.changed().await.unwrap();
+    }
+
+    let base_ms = 1_700_000_000_000i64;
+    let shifted_saved = t3_core::clock::to_server_clock("clock-env", base_ms);
+    let shifted_canonical = t3_core::clock::to_server_clock("canonical-clock-env", base_ms);
+    assert!(shifted_saved > base_ms + 1_000_000, "saved env id should reflect future serverTime");
+    assert_eq!(shifted_canonical, shifted_saved);
+}

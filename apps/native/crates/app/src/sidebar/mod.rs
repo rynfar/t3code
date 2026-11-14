@@ -132,7 +132,141 @@ pub struct SidebarPane {
     menu_open: bool,
     snooze_grant_watch: Option<((u64, u64), Task<()>)>,
     snooze_access: bool,
+    checkout_repos: std::collections::HashMap<CheckoutRepoKey, CheckoutRepoEntry>,
     _subscriptions: Vec<Subscription>,
+}
+
+const CHECKOUT_RETRY_MIN: Duration = Duration::from_secs(2);
+const CHECKOUT_RETRY_MAX: Duration = Duration::from_secs(30);
+const SUBSCRIBE_VCS_BRANCH: &str = "subscribeVcsBranch";
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct CheckoutRepoKey {
+    scope_env_id: Option<String>,
+    connection_id: Option<u64>,
+    owner_connection_generation: u64,
+    cwd: String,
+}
+
+pub(super) struct CheckoutRepoEntry {
+    is_repo: Option<bool>,
+    _net: hover::AbortOnDrop<()>,
+    _ui: Task<()>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VcsBranchRepoStatus {
+    #[serde(default)]
+    is_repo: Option<bool>,
+}
+
+fn checkout_git_cwd(thread: &t3_core::sidebar::thread::SidebarThread, root: Option<&str>) -> Option<String> {
+    if thread.branch.as_deref().is_none_or(str::is_empty) && thread.worktree_path.as_deref().is_none_or(str::is_empty) {
+        return None;
+    }
+    thread
+        .worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .or_else(|| root.map(str::trim).filter(|path| !path.is_empty()))
+        .map(str::to_owned)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckoutRepoChunk {
+    Known(bool),
+    FallbackToStatus,
+    Ignore,
+}
+
+fn parse_checkout_repo_chunk(use_status_fallback: bool, value: serde_json::Value) -> CheckoutRepoChunk {
+    if use_status_fallback {
+        let Ok(event) = serde_json::from_value::<t3_core::vcs::VcsStatusEvent>(value) else {
+            return CheckoutRepoChunk::Ignore;
+        };
+        match event {
+            t3_core::vcs::VcsStatusEvent::Snapshot { local, .. }
+            | t3_core::vcs::VcsStatusEvent::LocalUpdated { local } => CheckoutRepoChunk::Known(local.is_repo),
+            t3_core::vcs::VcsStatusEvent::RemoteUpdated { .. }
+            | t3_core::vcs::VcsStatusEvent::Unknown => CheckoutRepoChunk::Ignore,
+        }
+    } else {
+        let Ok(status) = serde_json::from_value::<VcsBranchRepoStatus>(value) else {
+            return CheckoutRepoChunk::Ignore;
+        };
+        match status.is_repo {
+            Some(is_repo) => CheckoutRepoChunk::Known(is_repo),
+            // Older servers omit `isRepo` on `subscribeVcsBranch`; switch to `subscribeVcsStatus`.
+            None => CheckoutRepoChunk::FallbackToStatus,
+        }
+    }
+}
+
+fn spawn_checkout_repo_stream(
+    client_fut: std::pin::Pin<Box<dyn std::future::Future<Output = Option<t3_client::supervisor::ClientHandle>> + Send>>,
+    runtime: &tokio::runtime::Handle,
+    cwd: String,
+) -> (hover::AbortOnDrop<()>, tokio::sync::mpsc::UnboundedReceiver<bool>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let net = runtime.spawn(async move {
+        let Some(client) = client_fut.await else {
+            return;
+        };
+        let mut delay = CHECKOUT_RETRY_MIN;
+        let mut use_status_fallback = false;
+        let branch_payload = serde_json::json!({ "cwd": cwd });
+        let status_payload = t3_core::vcs::status_subscription(&cwd);
+        loop {
+            let result = if use_status_fallback {
+                client.stream(t3_core::vcs::method::SUBSCRIBE_VCS_STATUS, status_payload.clone()).await
+            } else {
+                client.stream(SUBSCRIBE_VCS_BRANCH, branch_payload.clone()).await
+            };
+            match result {
+                Ok(mut stream) => {
+                    while let Some(item) = stream.receiver.recv().await {
+                        match item {
+                            Ok(value) => match parse_checkout_repo_chunk(use_status_fallback, value) {
+                                CheckoutRepoChunk::Known(is_repo) => {
+                                    delay = CHECKOUT_RETRY_MIN;
+                                    if tx.send(is_repo).is_err() {
+                                        return;
+                                    }
+                                }
+                                CheckoutRepoChunk::FallbackToStatus => {
+                                    use_status_fallback = true;
+                                    break;
+                                }
+                                CheckoutRepoChunk::Ignore => {}
+                            },
+                            Err(t3_client::session::RpcError::Failure(_)) if !use_status_fallback => {
+                                use_status_fallback = true;
+                                break;
+                            }
+                            Err(t3_client::session::RpcError::Closed) => break,
+                            Err(_) => {}
+                        }
+                    }
+                    if use_status_fallback && !tx.is_closed() {
+                        continue;
+                    }
+                }
+                Err(t3_client::session::RpcError::Failure(_)) if !use_status_fallback => {
+                    use_status_fallback = true;
+                    continue;
+                }
+                Err(_) => {}
+            }
+            if tx.is_closed() {
+                return;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(CHECKOUT_RETRY_MAX);
+        }
+    });
+    (hover::AbortOnDrop(net), rx)
 }
 
 impl SidebarPane {
@@ -383,6 +517,7 @@ impl SidebarPane {
             menu_open: false,
             snooze_grant_watch: None,
             snooze_access: false,
+            checkout_repos: std::collections::HashMap::new(),
             _subscriptions: subscriptions,
         };
         #[cfg(feature = "snapshot")]
@@ -449,7 +584,154 @@ impl SidebarPane {
             }
         }
         self.row_keys = keys;
+        let state = self.state.read(cx);
+        self.prune_checkout_repos(state);
         self.schedule_clock(cx);
+    }
+
+    pub(super) fn ensure_checkout_repo(
+        &mut self,
+        key: Option<&t3_core::sidebar::tag_filter::ThreadKey>,
+        thread: &t3_core::sidebar::thread::SidebarThread,
+        cx: &mut Context<Self>,
+    ) -> Option<bool> {
+        let state = self.state.read(cx);
+        let root = match key {
+            Some(key) => state
+                .scoped_project(&t3_core::sidebar::grouping::ProjectRef {
+                    environment_id: key.environment_id.clone(),
+                    project_id: thread.project_id.clone(),
+                })
+                .map(|project| project.project.workspace_root.as_str()),
+            None => state
+                .shell
+                .project(&thread.project_id)
+                .map(|project| project.workspace_root.as_str()),
+        };
+        let cwd = checkout_git_cwd(thread, root)?;
+        let (repo_key, client_fut): (
+            CheckoutRepoKey,
+            std::pin::Pin<Box<dyn std::future::Future<Output = Option<t3_client::supervisor::ClientHandle>> + Send>>,
+        ) = match key {
+            None => {
+                let client = state.client_handle()?;
+                (
+                    CheckoutRepoKey {
+                        scope_env_id: None,
+                        connection_id: state.connection_id(),
+                        owner_connection_generation: 0,
+                        cwd: cwd.clone(),
+                    },
+                    Box::pin(async move { Some(client) }),
+                )
+            }
+            Some(key) => {
+                let env = state.scoped_environment(&key.environment_id)?;
+                let owner = env.summary.owner.clone();
+                if !state.scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
+                    return None;
+                }
+                let destination = state
+                    .connections
+                    .destination(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE);
+                (
+                    CheckoutRepoKey {
+                        scope_env_id: Some(key.environment_id.clone()),
+                        connection_id: None,
+                        owner_connection_generation: owner.connection_generation,
+                        cwd: cwd.clone(),
+                    },
+                    Box::pin(async move { destination.await.ok().map(|dest| dest.client) }),
+                )
+            }
+        };
+        if let Some(entry) = self.checkout_repos.get(&repo_key) {
+            return entry.is_repo;
+        }
+        #[cfg(feature = "snapshot")]
+        if state.sidebar.snapshot_fixture {
+            return None;
+        }
+        let runtime = state.runtime().clone();
+        let (net, mut rx) = spawn_checkout_repo_stream(client_fut, &runtime, cwd);
+        let ui_key = repo_key.clone();
+        let ui = cx.spawn(async move |this, cx| {
+            while let Some(is_repo) = rx.recv().await {
+                let keep = this
+                    .update(cx, |this, cx| {
+                        let Some(entry) = this.checkout_repos.get_mut(&ui_key) else {
+                            return false;
+                        };
+                        if entry.is_repo != Some(is_repo) {
+                            entry.is_repo = Some(is_repo);
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        });
+        self.checkout_repos.insert(
+            repo_key,
+            CheckoutRepoEntry {
+                is_repo: None,
+                _net: net,
+                _ui: ui,
+            },
+        );
+        None
+    }
+
+    fn prune_checkout_repos(&mut self, state: &AppState) {
+        if self.checkout_repos.is_empty() {
+            return;
+        }
+        let mut active = std::collections::HashSet::new();
+        if state.fleet.environments.is_empty() {
+            let connection_id = state.connection_id();
+            for thread in &state.sidebar.model.threads {
+                if let Some(cwd) = checkout_git_cwd(
+                    thread,
+                    state
+                        .shell
+                        .project(&thread.project_id)
+                        .map(|p| p.workspace_root.as_str()),
+                ) {
+                    active.insert(CheckoutRepoKey {
+                        scope_env_id: None,
+                        connection_id,
+                        owner_connection_generation: 0,
+                        cwd,
+                    });
+                }
+            }
+        } else {
+            for row in &state.sidebar.fleet.threads {
+                let Some(env) = state.scoped_environment(&row.key.environment_id) else {
+                    continue;
+                };
+                if let Some(cwd) = checkout_git_cwd(
+                    &row.thread,
+                    state
+                        .scoped_project(&t3_core::sidebar::grouping::ProjectRef {
+                            environment_id: row.key.environment_id.clone(),
+                            project_id: row.thread.project_id.clone(),
+                        })
+                        .map(|p| p.project.workspace_root.as_str()),
+                ) {
+                    active.insert(CheckoutRepoKey {
+                        scope_env_id: Some(row.key.environment_id.clone()),
+                        connection_id: None,
+                        owner_connection_generation: env.summary.owner.connection_generation,
+                        cwd,
+                    });
+                }
+            }
+        }
+        self.checkout_repos.retain(|key, _| active.contains(key));
     }
 
     /// Relative times tick each minute; working durations each second, but only while one was
@@ -1661,9 +1943,9 @@ mod sb_sections_pane_tests {
     use t3_core::sidebar::older_settled::GET_OLDER_SETTLED_THREADS;
     use t3_core::sidebar::{SETTLED_TAIL_INITIAL_COUNT, Shelf};
 
-    struct CachedPaneHost {
-        pane: Entity<SidebarPane>,
-        menu: Entity<ContextMenu>,
+    pub(super) struct CachedPaneHost {
+        pub(super) pane: Entity<SidebarPane>,
+        pub(super) menu: Entity<ContextMenu>,
     }
 
     impl Render for CachedPaneHost {
@@ -1742,7 +2024,7 @@ mod sb_sections_pane_tests {
             let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
-            CachedPaneHost { pane, menu }
+            super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
         });
         let pane = root.read_with(vcx, |host, _| host.pane.clone());
         let notifications = Rc::new(Cell::new(0));
@@ -2050,7 +2332,7 @@ mod sb_sections_pane_tests {
             let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
-            CachedPaneHost { pane, menu }
+            super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
         });
         let pane = root.read_with(vcx, |host, _| host.pane.clone());
         vcx.run_until_parked();
@@ -2567,7 +2849,7 @@ mod sb_sections_pane_tests {
             let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
-            CachedPaneHost { pane, menu }
+            super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
         });
         let pane = root.read_with(vcx, |host, _| host.pane.clone());
         vcx.run_until_parked();
@@ -2714,7 +2996,7 @@ mod sb_sections_pane_tests {
             let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
-            CachedPaneHost { pane, menu }
+            super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
         });
         let pane = root.read_with(vcx, |host, _| host.pane.clone());
         vcx.run_until_parked();
@@ -2848,7 +3130,7 @@ mod sb_sections_pane_tests {
             let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
             let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
             let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
-            CachedPaneHost { pane, menu }
+            super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
         });
         let pane = root.read_with(vcx, |host, _| host.pane.clone());
         pane.update(vcx, |p, cx| {
@@ -3254,5 +3536,456 @@ mod footer_tests {
 
         let _ = root;
         state.update(vcx, |s, _| s.stop_pump());
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod sb_380_tests {
+    use super::*;
+    use crate::context_menu::project_filter_tests::install_state;
+    use serde_json::json;
+    use t3_core::thread_actions::ThreadAction;
+
+    #[gpui::test]
+    async fn unloaded_menu_quiet_copies_and_title_regeneration_toast(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::settings::init(state.clone(), cx);
+            (state, fixture)
+        });
+        let (menu, vcx) = cx.add_window_view(|_, cx| ContextMenu::new(state.clone(), cx));
+
+        // 1. Unloaded thread menu opens an informative toast rather than failing silently.
+        menu.update_in(vcx, |menu, window, cx| {
+            menu.open_for_thread("missing-thread", gpui::point(px(10.), px(10.)), window, cx);
+        });
+        state.read_with(vcx, |s, _| {
+            let toast = s.toasts.latest().expect("missing thread should toast");
+            assert_eq!(toast.title.as_ref(), "Thread actions unavailable");
+            assert_eq!(
+                toast.description.as_deref(),
+                Some("This thread has not loaded yet.")
+            );
+        });
+
+        // Clear toasts, then verify routine copy actions do not emit success toasts (#36527).
+        state.update(vcx, |s, _| {
+            s.toasts = Default::default();
+        });
+        state.update(vcx, |s, cx| {
+            if let Some(thread) = s
+                .shell
+                .snapshot
+                .as_mut()
+                .and_then(|snap| snap.threads.iter_mut().find(|t| t.id == "menu-thread"))
+            {
+                thread.branch = Some("feat/quiet-copy".into());
+                thread.worktree_path = Some("/tmp/wt-quiet".into());
+            }
+            s.run_thread_action("menu-thread", ThreadAction::CopyBranch, &[], cx);
+            s.run_thread_action("menu-thread", ThreadAction::CopyPath, &[], cx);
+            s.run_thread_action("menu-thread", ThreadAction::CopyThreadId, &[], cx);
+            s.run_thread_action("menu-thread", ThreadAction::CopyThread, &[], cx);
+        });
+        state.read_with(vcx, |s, _| {
+            assert!(
+                s.toasts.latest().is_none(),
+                "routine copy actions must not emit success toasts"
+            );
+        });
+
+        // 3. Single-thread RegenerateTitle emits commandId and toasts outcome on delta (#31418).
+        state.update(vcx, |s, cx| {
+            s.run_thread_action("menu-thread", ThreadAction::RegenerateTitle, &[], cx);
+        });
+        let (method, params, reply) = fixture.next_request().await;
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(params["type"], "thread.metadata.update");
+        assert_eq!(params["threadId"], "menu-thread");
+        assert_eq!(params["regenerateTitle"], true);
+        let command_id = params["commandId"].as_str().unwrap().to_owned();
+        let _ = reply.send(Ok(json!({ "sequence": 10 })));
+
+        let (toast_tx, toast_rx) = tokio::sync::oneshot::channel();
+        let mut toast_tx = Some(toast_tx);
+        let _sub = vcx.update(|_, cx| {
+            cx.subscribe(&state, move |s, event: &AppEvent, cx| {
+                if *event == AppEvent::Notice
+                    && s.read(cx).toasts.latest().is_some()
+                    && let Some(tx) = toast_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        state.update(vcx, |s, cx| {
+            let delta = t3_core::shell::ShellStreamItem::ThreadUpdated {
+                sequence: 10,
+                location: "active".into(),
+                thread: serde_json::from_value(json!({
+                    "id": "menu-thread",
+                    "projectId": "checkout-b",
+                    "title": "menu-thread",
+                    "providerInstanceId": "replay",
+                    "modelSelection": {"instanceId": "replay", "model": "replay"},
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "lineage": {"rootThreadId": "menu-thread"},
+                    "branch": "feat/quiet-copy",
+                    "worktreePath": "/tmp/wt-quiet",
+                    "latestTurn": null,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "archivedAt": null,
+                    "deletedAt": null,
+                    "status": "idle",
+                    "latestRunId": null,
+                    "activeRunId": null,
+                    "hasActionableProposedPlan": false,
+                    "itemCount": 0,
+                    "visibleItemCount": 0,
+                    "lastTitleRegeneration": {
+                        "requestId": command_id,
+                        "status": "unchanged",
+                        "previousTitle": "menu-thread",
+                        "title": "menu-thread",
+                        "completedAt": "2026-01-01T00:01:00Z"
+                    }
+                }))
+                .unwrap(),
+            };
+            s.shell.apply(delta);
+            s.rebuild_sidebar(cx);
+            cx.emit(AppEvent::Shell);
+        });
+        let already = state.read_with(vcx, |s, _| s.toasts.latest().is_some());
+        if !already {
+            toast_rx.await.unwrap();
+        }
+        state.read_with(vcx, |s, _| {
+            let toast = s.toasts.latest().expect("title regeneration toast must arrive");
+            assert_eq!(toast.title.as_ref(), "Title kept");
+        });
+
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+
+    #[test]
+    fn checkout_repo_chunk_parses_branch_status_and_falls_back_when_is_repo_missing() {
+        assert_eq!(
+            parse_checkout_repo_chunk(false, json!({ "refName": "main", "isRepo": true })),
+            CheckoutRepoChunk::Known(true)
+        );
+        assert_eq!(
+            parse_checkout_repo_chunk(false, json!({ "refName": null, "isRepo": false })),
+            CheckoutRepoChunk::Known(false)
+        );
+        assert_eq!(
+            parse_checkout_repo_chunk(false, json!({ "refName": null })),
+            CheckoutRepoChunk::FallbackToStatus
+        );
+        assert_eq!(
+            parse_checkout_repo_chunk(
+                true,
+                json!({
+                    "_tag": "snapshot",
+                    "local": { "isRepo": false, "hasWorkingTreeChanges": false },
+                    "remote": null
+                })
+            ),
+            CheckoutRepoChunk::Known(false)
+        );
+        assert_eq!(
+            parse_checkout_repo_chunk(
+                true,
+                json!({ "_tag": "localUpdated", "local": { "isRepo": true, "hasWorkingTreeChanges": false } })
+            ),
+            CheckoutRepoChunk::Known(true)
+        );
+        assert_eq!(
+            parse_checkout_repo_chunk(true, json!({ "_tag": "remoteUpdated", "remote": null })),
+            CheckoutRepoChunk::Ignore
+        );
+    }
+
+    #[gpui::test]
+    async fn removed_checkout_strips_row_badges_and_header_menu_works_when_project_filtered(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::settings::init(state.clone(), cx);
+            state.update(cx, |s, cx| {
+                s.server_config.apply(
+                    serde_json::from_value(json!({
+                        "type": "snapshot",
+                        "config": {
+                            "environment": { "environmentId": "fixture-env", "label": "Fixture" },
+                            "cwd": "/fixture",
+                            "providers": []
+                        }
+                    }))
+                    .unwrap(),
+                );
+                s.sync_server_config(cx);
+                if let Some(thread) = s
+                    .shell
+                    .snapshot
+                    .as_mut()
+                    .and_then(|snap| snap.threads.iter_mut().find(|t| t.id == "menu-thread"))
+                {
+                    thread.branch = Some("feat/wt".into());
+                    thread.worktree_path = Some("/tmp/wt-removed".into());
+                    thread.pinned_at = Some("2026-01-01T00:00:00Z".into());
+                }
+                s.rebuild_sidebar(cx);
+            });
+            (state, fixture)
+        });
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        let menu = root.read_with(vcx, |host, _| host.menu.clone());
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| window.draw(cx).clear());
+        vcx.run_until_parked();
+        assert!(
+            fixture.take_commands().contains(&SUBSCRIBE_VCS_BRANCH),
+            "rendering a row with branch/worktree must subscribe to subscribeVcsBranch"
+        );
+        assert!(
+            vcx.debug_bounds("thread-worktree-menu-thread").is_some(),
+            "worktree badge renders while checkout is not reported removed"
+        );
+
+        // Once checkout status reports `isRepo: false`, row drops worktree/branch badges cleanly.
+        pane.update(vcx, |pane, cx| {
+            for entry in pane.checkout_repos.values_mut() {
+                entry.is_repo = Some(false);
+            }
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            vcx.debug_bounds("thread-worktree-menu-thread").is_none(),
+            "removed checkout must strip worktree badge from rendered sidebar row"
+        );
+
+        // Filter out project `checkout-b` from `sidebar.model`, then open header menu for `menu-thread`:
+        // loaded shell fallback must open the menu cleanly instead of toasting "Thread actions unavailable".
+        let groups = pane.read_with(vcx, |pane, cx| pane.project_groups(cx));
+        state.update(vcx, |s, cx| {
+            let other = groups
+                .iter()
+                .find(|g| g.member_project_ids.iter().all(|id| id != "checkout-b"))
+                .expect("project_filter_tests install_state has another project group")
+                .clone();
+            let mut scope = s.sidebar.project_filter_scope.clone();
+            scope.toggle(&other, &groups, false);
+            s.set_project_scope(scope, cx);
+        });
+        assert!(state.read_with(vcx, |s, _| s.sidebar.model.thread("menu-thread").is_none()));
+        menu.update_in(vcx, |menu, window, cx| {
+            menu.open_for_header("menu-thread", gpui::point(px(20.), px(20.)), window, cx);
+        });
+        vcx.run_until_parked();
+        state.read_with(vcx, |s, _| {
+            assert!(
+                s.toasts.latest().is_none(),
+                "project-filtered loaded thread must open header menu without error toast"
+            );
+        });
+        menu.read_with(vcx, |menu, _| {
+            assert!(menu.is_open(), "header menu must open for project-filtered loaded thread");
+        });
+        state.update(vcx, |s, _| s.stop_pump());
+    }
+
+    #[gpui::test]
+    async fn local_bulk_regenerate_titles_clears_selection_and_dispatches_concurrently(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::settings::init(state.clone(), cx);
+            state.update(cx, |s, cx| {
+                s.server_config.apply(
+                    serde_json::from_value(json!({
+                        "type": "snapshot",
+                        "config": {
+                            "environment": { "environmentId": "fixture-env", "label": "Fixture" },
+                            "cwd": "/fixture",
+                            "providers": []
+                        }
+                    }))
+                    .unwrap(),
+                );
+                s.sync_server_config(cx);
+                s.sidebar.capabilities.config_loaded = true;
+                s.sidebar.capabilities.can_operate = true;
+                let extra: t3_core::shell::ThreadShell = serde_json::from_value(json!({
+                    "id": "menu-thread-2",
+                    "projectId": "checkout-b",
+                    "title": "menu-thread-2",
+                    "providerInstanceId": "replay",
+                    "modelSelection": {"instanceId": "replay", "model": "replay"},
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "lineage": {"rootThreadId": "menu-thread-2"},
+                    "branch": null,
+                    "worktreePath": null,
+                    "latestTurn": null,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "archivedAt": null,
+                    "deletedAt": null,
+                    "status": "idle",
+                    "latestRunId": null,
+                    "activeRunId": null,
+                    "hasActionableProposedPlan": false,
+                    "itemCount": 0,
+                    "visibleItemCount": 0
+                }))
+                .unwrap();
+                s.shell.apply(t3_core::shell::ShellStreamItem::ThreadUpdated {
+                    sequence: 1,
+                    location: "active".into(),
+                    thread: Box::new(extra),
+                });
+                assert!(s.thread_shell("menu-thread-2").is_some());
+                s.rebuild_sidebar(cx);
+                s.sidebar.selection.toggle("menu-thread");
+                s.sidebar.selection.toggle("menu-thread-2");
+            });
+            (state, fixture)
+        });
+
+        state.update(cx, |s, cx| {
+            s.run_bulk_action(
+                &["menu-thread".into(), "menu-thread-2".into()],
+                t3_core::sidebar::selection::BulkAction::RegenerateTitles,
+                &[],
+                cx,
+            );
+        });
+        // Selection must clear immediately on start, before either RPC replies.
+        state.read_with(cx, |s, _| {
+            assert!(
+                s.sidebar.selection.is_empty(),
+                "local bulk RegenerateTitles must clear selection immediately"
+            );
+        });
+
+        // Both dispatches must arrive concurrently before replying to the first.
+        let (m1, p1, r1) = fixture.next_request().await;
+        let (m2, p2, r2) = fixture.next_request().await;
+        assert_eq!(m1, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(m2, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(p1["type"], "thread.metadata.update");
+        assert_eq!(p2["type"], "thread.metadata.update");
+        assert_eq!(p1["regenerateTitle"], true);
+        assert_eq!(p2["regenerateTitle"], true);
+
+        let (toast_tx, toast_rx) = tokio::sync::oneshot::channel();
+        let mut toast_tx = Some(toast_tx);
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&state, move |s, event: &AppEvent, cx| {
+                if *event == AppEvent::Notice
+                    && s.read(cx).toasts.latest().is_some()
+                    && let Some(tx) = toast_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+
+        let ok_id = p2["commandId"].as_str().unwrap().to_owned();
+        let ok_thread = p2["threadId"].as_str().unwrap().to_owned();
+        let _ = r1.send(Err(t3_client::session::RpcError::Failure(
+            t3_core::rpc::RpcFailure {
+                tag: Some("InternalError".into()),
+                message: "boom".into(),
+                error: serde_json::Value::Null,
+            },
+        )));
+        let _ = r2.send(Ok(json!({ "sequence": 20 })));
+
+        state.update(cx, |s, cx| {
+            let delta = t3_core::shell::ShellStreamItem::ThreadUpdated {
+                sequence: 20,
+                location: "active".into(),
+                thread: serde_json::from_value(json!({
+                    "id": ok_thread,
+                    "projectId": "checkout-b",
+                    "title": "New Title",
+                    "providerInstanceId": "replay",
+                    "modelSelection": {"instanceId": "replay", "model": "replay"},
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "lineage": {"rootThreadId": ok_thread},
+                    "branch": null,
+                    "worktreePath": null,
+                    "latestTurn": null,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:01:00Z",
+                    "archivedAt": null,
+                    "deletedAt": null,
+                    "status": "idle",
+                    "latestRunId": null,
+                    "activeRunId": null,
+                    "hasActionableProposedPlan": false,
+                    "itemCount": 0,
+                    "visibleItemCount": 0,
+                    "lastTitleRegeneration": {
+                        "requestId": ok_id,
+                        "status": "updated",
+                        "previousTitle": "menu-thread-2",
+                        "title": "New Title",
+                        "completedAt": "2026-01-01T00:01:00Z"
+                    }
+                }))
+                .unwrap(),
+            };
+            s.shell.apply(delta);
+            s.rebuild_sidebar(cx);
+            cx.emit(AppEvent::Shell);
+        });
+        let already = state.read_with(cx, |s, _| s.toasts.latest().is_some());
+        if !already {
+            toast_rx.await.unwrap();
+        }
+        state.read_with(cx, |s, _| {
+            let toast = s.toasts.latest().expect("combined bulk outcome toast must appear");
+            assert_eq!(toast.title.as_ref(), "Failed to regenerate 1 of 2 thread titles");
+        });
+        state.update(cx, |s, _| s.stop_pump());
     }
 }

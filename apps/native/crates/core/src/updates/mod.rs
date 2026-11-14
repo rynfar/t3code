@@ -1027,17 +1027,37 @@ pub fn retry_failed_servers(
     run: &mut Option<UpdateEverythingRun>,
     now_ms: i64,
 ) -> Vec<(ServerTarget, Option<String>)> {
+    retry_failed_servers_with_versions(run, now_ms, |_| None)
+}
+
+/// Retries failed server machines in `run`, skipping any server that has
+/// already reconnected on the target version (`!behind(live_version, target)`).
+pub fn retry_failed_servers_with_versions<'a>(
+    run: &mut Option<UpdateEverythingRun>,
+    now_ms: i64,
+    mut live_server_version: impl FnMut(&str) -> Option<&'a str>,
+) -> Vec<(ServerTarget, Option<String>)> {
     let Some(current) = run.as_mut() else {
         return Vec::new();
     };
     if current.track_switch {
         return Vec::new();
     }
+    let mut already_updated = Vec::new();
     let mut targets = Vec::new();
     for machine in &mut current.machines {
         if machine.result == Some(MachineResult::Failed)
             && let Some(server) = machine.server.clone()
         {
+            if live_server_version(&server.environment_id)
+                .is_some_and(|version| !behind(version, &server.target_version))
+            {
+                already_updated.push((
+                    machine.environment_id.clone(),
+                    machine.provider_failure.clone(),
+                ));
+                continue;
+            }
             machine.result = None;
             machine.failure = None;
             machine.handed_off_version = None;
@@ -1045,8 +1065,11 @@ pub fn retry_failed_servers(
             targets.push((server, machine.provider_failure.clone()));
         }
     }
-    if !targets.is_empty() {
+    if !targets.is_empty() || !already_updated.is_empty() {
         current.phase = UpdateRunPhase::Servers;
+    }
+    for (environment_id, provider_failure) in already_updated {
+        settle_machine(run, &environment_id, provider_failure, true, None);
     }
     targets
 }
