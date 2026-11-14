@@ -333,7 +333,7 @@ impl TimelineFollow {
             self.scroll_to_end();
             return;
         }
-        if self.phase == FollowPhase::Released && !self.at_end && at_end {
+        if self.phase == FollowPhase::Released && !self.at_end && at_end && !matches!(source, ScrollSource::Find | ScrollSource::Citation) {
             self.phase = FollowPhase::Following;
             self.at_end = true;
             self.clear_pill();

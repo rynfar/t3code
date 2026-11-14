@@ -217,10 +217,18 @@ fn timeline_follow_hysteresis_and_debounce_pill() {
     assert!(follow.is_at_end());
     assert_eq!(follow.pill_state(false, true, ms(1200)), (false, None));
 
-    // Scrollbar/EndKey explicitly re-arms Following.
-    follow.on_user_navigation(ScrollSource::Scrollbar, false, ms(1300));
+    // Find/Citation reveals stay Released even when jumping near the end while Released away from end.
+    follow.on_user_navigation(ScrollSource::Wheel, false, ms(1320));
     assert!(!follow.is_following());
-    follow.on_user_navigation(ScrollSource::EndKey, false, ms(1310));
+    follow.on_user_navigation(ScrollSource::Find, true, ms(1330));
+    assert!(!follow.is_following());
+    follow.on_user_navigation(ScrollSource::Citation, true, ms(1340));
+    assert!(!follow.is_following());
+
+    // Scrollbar/EndKey explicitly re-arms Following.
+    follow.on_user_navigation(ScrollSource::Scrollbar, false, ms(1350));
+    assert!(!follow.is_following());
+    follow.on_user_navigation(ScrollSource::EndKey, false, ms(1360));
     assert!(follow.is_following());
 }
 

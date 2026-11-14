@@ -293,6 +293,7 @@ impl ThreadView {
     /// row into view, or pages history in when the entry is older than the loaded window.
     pub(super) fn reveal_entry(&mut self, entry_id: &str, source: t3_core::timeline::anchor::ScrollSource, cx: &mut Context<Self>) {
         self.disclosure.cancel();
+        let mut expanded = false;
         for _ in 0..3 {
             if let Some(index) = self.rows.iter().position(|row| row_holds(row, entry_id)) {
                 let row = self.rows[index].clone();
@@ -301,6 +302,7 @@ impl ThreadView {
                         self.load_work_for_group(group_id, cx);
                     }
                     self.rederive(cx);
+                    expanded = true;
                     continue;
                 }
                 if let RowKind::Work { entries, expanded_group: true, .. } = &row.kind
@@ -313,9 +315,15 @@ impl ThreadView {
                 self.pending_restore = None;
                 self.pending_scroll_top = None;
                 self.list.set_tail_reservation(None);
-                self.pending_scroll_source = Some(source);
                 self.list.scroll_to_reveal_item(self.header_count() + index);
-                self.on_observed_list_scroll(cx);
+                if expanded {
+                    self.pending_scroll_source = None;
+                    let now = self.follow_now(cx);
+                    self.follow.on_user_navigation(source, false, now);
+                } else {
+                    self.pending_scroll_source = Some(source);
+                    self.on_observed_list_scroll(cx);
+                }
                 cx.notify();
                 return;
             }
@@ -341,6 +349,7 @@ impl ThreadView {
                 break;
             }
             self.rederive(cx);
+            expanded = true;
         }
         if self.history.as_ref().is_some_and(|history| history.has_more)
             && let Some(find) = self.find.as_mut()

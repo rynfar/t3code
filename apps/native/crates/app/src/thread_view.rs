@@ -1769,9 +1769,28 @@ impl ThreadView {
         self.start_smooth_scroll(SmoothTarget::Delta { remaining: delta }, source, cx);
     }
 
-    fn pointer_in_scrollable_group_list(&self, position: gpui::Point<gpui::Pixels>) -> bool {
-        self.group_lists.borrow().values().any(|list| {
-            list.viewport_bounds().contains(&position) && f32::from(list.max_offset_for_scrollbar().y) > 0.
+    fn scrollable_group_list_at(&self, position: gpui::Point<gpui::Pixels>) -> Option<gpui::ListState> {
+        let outer_bounds = self.list.viewport_bounds();
+        if !outer_bounds.contains(&position) {
+            return None;
+        }
+        let header = self.header_count();
+        let scroll_y = -self.list.scroll_px_offset_for_scrollbar().y;
+        let view_end = scroll_y + outer_bounds.size.height;
+        let groups = self.group_lists.borrow();
+        self.rows.iter().enumerate().find_map(|(ix, row)| {
+            if !matches!(row.kind, RowKind::Work { expanded_group: true, .. }) {
+                return None;
+            }
+            let list = groups.get(&row.id)?;
+            if f32::from(list.max_offset_for_scrollbar().y) <= 0. {
+                return None;
+            }
+            let item_ix = header + ix;
+            let top = self.list.offset_for_item(item_ix);
+            let bottom = self.list.offset_for_item(item_ix + 1);
+            let visible = bottom > top && bottom > scroll_y && top < view_end;
+            (visible && list.viewport_bounds().contains(&position)).then(|| list.clone())
         })
     }
 
@@ -2004,7 +2023,7 @@ impl Render for ThreadView {
             }))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                 let delta = f32::from(event.delta.pixel_delta(px(20.)).y);
-                if event.modifiers.control || delta == 0. || this.pointer_in_scrollable_group_list(event.position) || !this.wheel_should_track(delta) {
+                if event.modifiers.control || delta == 0. || !this.wheel_should_track(delta) {
                     return;
                 }
                 this.smooth_scroll = None;
@@ -2015,7 +2034,36 @@ impl Render for ThreadView {
                 this.pending_scroll_source = Some(anchor::ScrollSource::Wheel);
                 this.dismiss_citation_selection(cx);
             }))
-            .relative().size_full().child(transcript).child(minimap).children(banners).children(find_bar).children(scroll_to_end).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+            .relative().size_full()
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .child(transcript)
+                    .child(
+                        div()
+                            .id("transcript-group-wheel-guard")
+                            .absolute()
+                            .inset_0()
+                            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                                let delta = f32::from(event.delta.pixel_delta(px(20.)).y);
+                                if event.modifiers.control || delta == 0. {
+                                    return;
+                                }
+                                if let Some(group_list) = this.scrollable_group_list_at(event.position) {
+                                    let top = f32::from(group_list.scroll_px_offset_for_scrollbar().y);
+                                    let max = f32::from(group_list.max_offset_for_scrollbar().y);
+                                    let can_scroll = if delta > 0. { top < -0.5 } else { -top < max - 0.5 };
+                                    if can_scroll {
+                                        group_list.set_offset_from_scrollbar(point(px(0.), px(top + delta)));
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }
+                                }
+                            })),
+                    ),
+            )
+            .child(minimap).children(banners).children(find_bar).children(scroll_to_end).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }
 
@@ -3697,6 +3745,215 @@ mod tests {
         vcx.run_until_parked();
         view.read_with(vcx, |view, _| {
             assert_eq!(view.follow.anchored_user_message_id(), Some("t3-m1"));
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn group_list_wheel_and_find_expand_follow_guards(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let mut items = Vec::new();
+        for i in 0..20usize {
+            let msg_id = format!("m{i}");
+            items.push(if i % 2 == 0 {
+                test_user_item("t1", i, &msg_id, &format!("Prompt {i}\nline a\nline b\nline c"))
+            } else {
+                test_assistant_item("t1", i, &msg_id, "r0", &format!("Reply {i}\nline a\nline b\nline c"))
+            });
+        }
+        let mut pos = items.len();
+        items.push(test_user_item("t1", pos, "m-work-u", "Run batch"));
+        pos += 1;
+        for i in 0..24usize {
+            let id = format!("w{i}");
+            items.push(serde_json::json!({
+                "position": pos, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": id,
+                "item": {
+                    "id": id, "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+                    "ordinal": pos + 1, "type": "command_execution", "status": "completed", "title": null,
+                    "startedAt": null, "completedAt": "2026-04-01T00:00:02.000Z", "updatedAt": "2026-04-01T00:00:02.000Z",
+                    "input": format!("echo step {i}"), "output": ""
+                }
+            }));
+            pos += 1;
+        }
+        items.push(test_assistant_item("t1", pos, "m-work-a", "r1", "All steps done."));
+
+        let runs_json = serde_json::json!([{
+            "id": "r1", "ordinal": 2, "providerInstanceId": "replay",
+            "modelSelection": {"instanceId": "replay", "model": "replay"},
+            "userMessageId": "m-work-u", "rootNodeId": null, "status": "completed",
+            "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+            "completedAt": "2026-04-01T00:00:03.000Z"
+        }]);
+        let snap = test_snapshot_json("t1", runs_json.clone(), items.clone());
+        state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": pos + 1, "visibleItemCount": pos + 1
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+
+        // 1. Scroll up away from bottom, then reveal a hidden work entry: expanding splices 0px rows
+        //    and must keep Released instead of flipping to Following before layout measures them.
+        vcx.update(|window, cx| {
+            let focus = view.read(cx).citation_ui.selection_focus.clone();
+            window.focus(&focus, cx);
+        });
+        vcx.simulate_keystrokes("pageup");
+        vcx.background_executor.advance_clock(Duration::from_millis(180));
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| assert!(!view.follow.is_following()));
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| view.reveal_entry("w0", anchor::ScrollSource::Find, cx));
+        });
+        view.read_with(vcx, |view, _| {
+            assert!(!view.follow.is_following(), "expanding collapsed group during reveal must stay Released before prepaint");
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(!view.follow.is_following(), "must remain Released after layout measures expanded group");
+        });
+
+        // 2. Scroll to end where the expanded group_list is visible on-screen; wheeling inside it
+        //    scrolls only group_list without moving outer list until group_list hits its top limit.
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.scroll_to_end_from_pill(cx)));
+        vcx.background_executor.advance_clock(Duration::from_millis(180));
+        vcx.run_until_parked();
+
+        let (group_id, group_center, outer_before) = view.read_with(vcx, |view, _| {
+            assert!(view.follow.is_following());
+            let (id, list) = view
+                .group_lists
+                .borrow()
+                .iter()
+                .find(|(_, l)| f32::from(l.max_offset_for_scrollbar().y) > 0.)
+                .map(|(k, l)| (k.clone(), l.clone()))
+                .expect("expected an on-screen scrollable group_list");
+            let b = list.viewport_bounds();
+            assert!(view.scrollable_group_list_at(b.center()).is_some(), "visible group_list must match");
+            (id, b.center(), view.list.scroll_px_offset_for_scrollbar().y)
+        });
+
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: group_center,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-60.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            let group_y = f32::from(view.group_lists.borrow().get(&group_id).unwrap().scroll_px_offset_for_scrollbar().y);
+            assert!(group_y < -0.5, "down wheel over group_list should scroll inner list (got {group_y})");
+            assert_eq!(view.list.scroll_px_offset_for_scrollbar().y, outer_before, "outer list must not scroll while inner group_list consumes wheel");
+            assert!(view.follow.is_following());
+        });
+
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: group_center,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(20.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            let group_y = f32::from(view.group_lists.borrow().get(&group_id).unwrap().scroll_px_offset_for_scrollbar().y);
+            assert!(group_y < -0.5, "partial up wheel inside group_list stays inside inner list (got {group_y})");
+            assert_eq!(view.list.scroll_px_offset_for_scrollbar().y, outer_before);
+            assert!(view.follow.is_following());
+        });
+
+        // Scroll group_list back to top, then wheel UP again: must chain to outer list and release follow.
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: group_center,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(200.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: group_center,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(80.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            window.simulate_next_frame(cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(!view.follow.is_following(), "up wheel at top of group_list must chain to outer list and release follow");
+        });
+
+        // 3. Scroll back to bottom, append enough trailing messages so the open group_list scrolls
+        //    off-screen above the top (retaining stale viewport_bounds), then wheel UP over its old
+        //    window coordinates: must NOT suppress Wheel tracking and must release follow.
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.scroll_to_end_from_pill(cx)));
+        vcx.background_executor.advance_clock(Duration::from_millis(180));
+        vcx.run_until_parked();
+        let mut pushed_items = items;
+        for i in 0..20usize {
+            let p = pushed_items.len();
+            let id = format!("m-after-{i}");
+            pushed_items.push(if i % 2 == 0 {
+                test_user_item("t1", p, &id, &format!("After prompt {i}\nline a\nline b\nline c"))
+            } else {
+                test_assistant_item("t1", p, &id, "r1", &format!("After reply {i}\nline a\nline b\nline c"))
+            });
+        }
+        let snap_after = test_snapshot_json("t1", runs_json, pushed_items);
+        state.update(vcx, |state, cx| {
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap_after).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(view.follow.is_following());
+            assert!(view.scrollable_group_list_at(group_center).is_none(), "off-screen group_list must not match stale bounds");
+        });
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: group_center,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(80.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            window.simulate_next_frame(cx);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(!view.follow.is_following(), "wheel UP at old off-screen group_list coordinates must release follow");
         });
     }
 }
