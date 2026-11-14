@@ -362,6 +362,7 @@ impl Render for Composer {
                     div().id("composer-stream-error").debug_selector(|| "composer-stream-error".to_owned()).pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))
                 .when(self.fixed.is_none(), |this| this.child(self.limit_recovery.clone()))
+                .children(self.render_usage_limits_banner(cx))
                 .children(question.as_ref().map(|input| self.render_question(input, cx)))
                 .when(question.is_none(), |this| {
                     this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))

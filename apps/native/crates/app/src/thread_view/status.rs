@@ -54,6 +54,7 @@ const BACKGROUND_STOP_RETRY: Duration = Duration::from_secs(10);
 pub struct ThreadFooter {
     lines: FooterLines,
     stop_timer: Option<Entity<WorkingTimer>>,
+    background_timer: Option<Entity<WorkingTimer>>,
     status_pending: bool,
     goal_pending: bool,
     force_stopping: bool,
@@ -229,12 +230,16 @@ impl ThreadView {
                 false
             }
         };
-        let state = self.state.read(cx);
+        let thread = self.thread_state(state);
+        let turn_items = thread.projection.as_ref().map(|projection| projection.turn_items.as_slice());
         let shell = self.thread_id.as_deref().and_then(|id| state.thread_shell(id));
         let next = FooterLines {
-            stop: self.thread_state(state).projection.as_ref().and_then(|projection| run_stop(projection, background)),
+            stop: thread.projection.as_ref().and_then(|projection| run_stop(projection, background)),
             children,
-            background: shell.filter(|_| !working).and_then(|shell| background_work(&shell.pending_background_tasks)),
+            background: shell.filter(|_| !working).and_then(|shell| match turn_items {
+                Some(items) => BackgroundWork::with_items(&shell.pending_background_tasks, items),
+                None => background_work(&shell.pending_background_tasks),
+            }),
             syncing,
             goal: shell.and_then(|shell| shell.goal.as_ref()).and_then(|goal| goal_line(goal, working)),
             status: self.thread_id.as_deref().and_then(|id| state.sidebar.model.thread(id)).filter(|_| config_loaded).and_then(|thread| status_line(thread, now)),
@@ -253,6 +258,16 @@ impl ThreadView {
             }
             Some(stop) => {
                 let started = stop.requested_at.clone();
+                Some(cx.new(|cx| WorkingTimer::new(started, TimerKind::Elapsed, cx)))
+            }
+            None => None,
+        };
+        self.footer.background_timer = match next.background.as_ref().and_then(BackgroundWork::only_started_at) {
+            Some(started) if self.footer.background_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(started, TimerKind::Elapsed)) => {
+                self.footer.background_timer.take()
+            }
+            Some(started) => {
+                let started = started.to_owned();
                 Some(cx.new(|cx| WorkingTimer::new(started, TimerKind::Elapsed, cx)))
             }
             None => None,
@@ -365,7 +380,7 @@ impl ThreadView {
         let p = palette(cx);
         let muted = hsla(p.muted_foreground);
         let detail = if cx.theme().is_dark() { muted.opacity(0.6) } else { muted.opacity(0.8) };
-        let line = || h_flex().w_full().min_w_0().gap(px(6.)).px(px(4.)).pb(px(8.)).text_xs().text_color(muted);
+        let line = || h_flex().w_full().min_w_0().gap(px(6.)).px(px(4.)).pb(px(8.)).text_xs().line_height(px(16.)).text_color(muted);
         let text = |title: String, description: Option<String>| {
             h_flex()
                 .flex_1()
@@ -426,6 +441,7 @@ impl ThreadView {
         });
         let work = work.or_else(|| {
             let background = self.footer.lines.background.as_ref()?;
+            let mono = cx.theme().mono_font_family.clone();
             let icon = if background.all_commands() { Icon::Terminal } else { Icon::CircleDashed };
             let stopping = self.footer.background_stop.is_some();
             let open = background.only_child_thread().map(|thread_id| {
@@ -440,11 +456,38 @@ impl ThreadView {
                 cx.listener(|view, _, _, cx| view.stop_background_work(cx)),
                 cx,
             );
+            let title_el = if background.only_command()
+                && let [only] = background.items.as_slice()
+            {
+                let prefix = if background.waiting { "Waiting" } else { "Running" };
+                h_flex()
+                    .flex_none()
+                    .gap(px(4.))
+                    .child(format!("{prefix} ·"))
+                    .child(div().font_family(mono.clone()).child(only.label.clone()))
+                    .into_any_element()
+            } else {
+                div().flex_none().child(background.title.clone()).into_any_element()
+            };
+            let description_el = if background.items.len() > 1 && background.items.iter().all(|item| item.activity.is_none()) {
+                let mut parts: Vec<AnyElement> = Vec::new();
+                for (index, item) in background.items.iter().enumerate() {
+                    if index > 0 {
+                        parts.push(div().child(", ").into_any_element());
+                    }
+                    let label = div().when(item.command, |this| this.font_family(mono.clone())).child(item.label.clone());
+                    parts.push(label.into_any_element());
+                }
+                Some(h_flex().min_w_0().overflow_hidden().ml(px(6.)).text_color(detail).children(parts).into_any_element())
+            } else {
+                background.description().map(|description| div().min_w_0().truncate().ml(px(6.)).text_color(detail).child(description).into_any_element())
+            };
+            let body = h_flex().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(title_el).children(description_el);
             Some(
                 line()
                     .child(div().flex_none().child(icon.render(px(14.), muted)))
-                    .child(text(background.title.clone(), background.description()))
-                    .child(actions().children(open).child(stop))
+                    .child(body)
+                    .child(actions().children(self.footer.background_timer.clone()).children(open).child(stop))
                     .into_any_element(),
             )
         });
@@ -636,12 +679,15 @@ impl ThreadView {
         if let (Some(error), Some(thread_id)) = (&lines.error, self.thread_id.as_deref()) {
             let key = error.banner_key(thread_id);
             let body: Vec<AnyElement> = if error.chatgpt_limit() {
-                let text = if error.workspace_limit() {
-                    "You've reached your workspace's limit for using your ChatGPT plan in other apps. Copy a request to ask your workspace admin for increased usage limits."
-                } else {
-                    "Review your usage settings in ChatGPT."
-                };
-                vec![v_flex().gap(px(4.)).child(div().font_weight(FontWeight::MEDIUM).child("ChatGPT usage limit reached")).child(text).into_any_element()]
+                vec![
+                    v_flex()
+                        .gap(px(4.))
+                        .child(div().font_weight(FontWeight::MEDIUM).child("ChatGPT usage limit reached"))
+                        .when(error.workspace_limit(), |this| {
+                            this.child("You've reached your workspace's limit for using your ChatGPT plan in other apps. Copy a request to ask your workspace admin for increased usage limits.")
+                        })
+                        .into_any_element(),
+                ]
             } else {
                 let collapsed = error_banner_message(&error.message);
                 let expandable = error_can_expand(&error.message, &collapsed);

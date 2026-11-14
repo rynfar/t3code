@@ -30,11 +30,40 @@ pub struct ReportAccount {
     pub limits: UsageLimits,
 }
 
+impl ReportAccount {
+    /// `accountLabel` / `AccountSummary`: `{driver} · {instance}` when distinct, otherwise
+    /// `driver` (or `label` when no native instance backs the account).
+    pub fn summary_label(&self) -> String {
+        let Some(instance_id) = self.instance_id.as_deref() else {
+            return self.label.clone();
+        };
+        let driver = crate::providers::driver_label(&self.driver);
+        let instance = self
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .or_else(|| (instance_id != self.driver).then_some(instance_id));
+        match instance {
+            Some(instance) if !instance.eq_ignore_ascii_case(&driver) => format!("{driver} · {instance}"),
+            _ => driver,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageLimitsReport {
     pub created_at: String,
     pub accounts: Vec<ReportAccount>,
     pub notices: Vec<String>,
+}
+
+impl UsageLimitsReport {
+    pub const COMMAND_NAME: &str = "usage-limits";
+
+    pub fn is_command(prompt: &str) -> bool {
+        prompt.trim().eq_ignore_ascii_case("/usage-limits")
+    }
 }
 
 struct NativeSnapshot<'a> {
