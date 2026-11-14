@@ -8,14 +8,16 @@ use serde_json::Value;
 use t3_core::composer::records;
 
 pub(super) fn chips(
-    message_id: &str,
+    message: &t3_core::timeline::ChatMessage,
     presentation: &records::SentPresentation,
+    citations: &[t3_core::assistant_citations::Citation],
     all: &[Value],
-    source: Option<&std::sync::Arc<t3_core::turn_item::TurnItem>>,
     excluded_attachment_ids: &[&str],
     env: &super::RowEnv,
     cx: &mut Context<ThreadView>,
 ) -> Option<AnyElement> {
+    let message_id = message.id.as_str();
+    let source = message.item.as_ref();
     let (state, ui) = (env.state, env.ui);
     let linked: Vec<_> = presentation
         .records(all)
@@ -25,7 +27,7 @@ pub(super) fn chips(
             att_id.is_empty() || !excluded_attachment_ids.contains(&att_id)
         })
         .collect();
-    if linked.is_empty() {
+    if linked.is_empty() && citations.is_empty() {
         return None;
     }
     let mut row = h_flex()
@@ -84,6 +86,28 @@ pub(super) fn chips(
             ))
         });
         row = row.child(element);
+    }
+    let owner = cx.entity().entity_id();
+    let citation_ink = crate::composer::context::Ink::Accent(crate::theme::palette(cx).context_chip_citation);
+    for (i, citation) in citations.iter().enumerate() {
+        let app_state = state.clone();
+        let cite = citation.clone();
+        let chip = crate::composer::context::chip_shell(
+            &format!("sent-citation:{message_id}:{i}"),
+            crate::icons::Icon::Quote,
+            citation.label(),
+            citation_ink,
+            true,
+            cx,
+        )
+        .on_click(move |event, window, cx| {
+            if event.modifiers().platform {
+                super::markdown::links::navigate_to_citation_source(cite.clone(), &app_state, cx);
+            } else {
+                super::markdown::links::open_sent_citation_popover(cite.clone(), event.position(), app_state.clone(), owner, window, cx);
+            }
+        });
+        row = row.child(div().relative().flex_shrink_0().max_w_full().child(chip));
     }
     Some(row.into_any_element())
 }

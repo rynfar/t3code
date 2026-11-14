@@ -745,6 +745,16 @@ fn render_user_audio_cards(id: &str, audios: &[Value], audio_only: bool, cx: &Ap
     )
 }
 
+fn action_context(env: &RowEnv, cx: &Context<ThreadView>) -> super::markdown::links::MarkdownActionContext {
+    super::markdown::links::MarkdownActionContext {
+        state: env.state.clone(),
+        owner: cx.entity().entity_id(),
+        cwd: env.workspace_root.map(str::to_owned),
+        thread_id: env.thread_id.map(str::to_owned),
+        thread_view: Some(cx.entity().downgrade()),
+    }
+}
+
 pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
     let RowKind::Message { message, grouped_with_next, grouped_with_previous, continues_steer, .. } = &row.kind else {
         return div().into_any_element();
@@ -769,6 +779,7 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
     };
     let context_item = message.item.clone();
     let presentation = markdown.user_context(id, &raw_text);
+    let presented_citations = t3_core::assistant_citations::present_user_citations(presentation.display_text.as_ref(), &raw_text);
     let body_text = t3_core::composer::records::body_text_without_attachment_refs(&raw_text, records, attachments);
     let partitioned = partition_user_attachments(attachments, &body_text);
     let excluded_attachment_ids: Vec<&str> = partitioned
@@ -778,8 +789,8 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .chain(partitioned.audios.iter().map(|audio| audio.get("id").and_then(Value::as_str).unwrap_or("")))
         .filter(|id| !id.is_empty())
         .collect();
-    let context_chips = super::context::chips(id, &presentation, records, context_item.as_ref(), &excluded_attachment_ids, env, cx);
-    let display_text = presentation.display_text.as_ref();
+    let context_chips = super::context::chips(message, &presentation, &presented_citations.citations, records, &excluded_attachment_ids, env, cx);
+    let display_text = presented_citations.display_text.as_str();
     let collapsible = should_collapse_user_message(display_text);
     let expanded = env.ui.expanded_messages.contains(id);
     let collapsed = collapsible && !expanded;
@@ -875,11 +886,12 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
             .into_any_element();
     }
 
+    let action_ctx = action_context(env, cx);
     let body = if body_text.trim().is_empty() || display_text.trim().is_empty() {
         None
     } else {
         let source: Arc<str> = Arc::from(with_line_breaks(display_text));
-        let state = markdown.state(&format!("user:{id}"), &source, cx);
+        let state = markdown.state_in_context(&format!("user:{id}"), &source, Some(action_ctx), cx);
         Some(markdown_view(&state, cx))
     };
     let images = t3_core::media::image_attachments(attachments);
@@ -1120,20 +1132,25 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
     };
     let (id, show_meta, show_copy, copy_streaming) = (row.id.as_str(), *show_assistant_meta, *show_copy, *copy_streaming);
     let text: Arc<str> = if message.text.is_empty() && !message.streaming { Arc::from("(empty response)") } else { message.text.clone() };
+    let action_ctx = action_context(env, cx);
     let segments = split_codex_assistant_segments(&text);
     let body = if segments.len() == 1
         && let CodexAssistantSegment::Markdown(rewritten) = &segments[0]
     {
         let source: Arc<str> = Arc::from(rewritten.as_str());
-        let state = markdown.state(&format!("assistant:{id}"), &source, cx);
+        let state = markdown.state_in_context(&format!("assistant:{id}"), &source, Some(action_ctx), cx);
         let selection_state = state.clone();
         let message_id = message.id.clone();
         let full_text = source.clone();
+        let bounds_cell = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
+        let bounds_paint = bounds_cell.clone();
         div()
             .id(SharedString::from(format!("assistant-select:{id}")))
+            .relative()
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
-                view.capture_citation_selection(selection_state.clone(), message_id.clone(), full_text.clone(), event.position, window, cx);
+                view.capture_citation_selection(selection_state.clone(), message_id.clone(), full_text.clone(), (event.position, bounds_cell.get()), window, cx);
             }))
+            .child(gpui::canvas(move |bounds, _, _| bounds_paint.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
             .child(prose(&state, cx))
             .into_any_element()
     } else {
@@ -1143,14 +1160,18 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
             .children(segments.into_iter().enumerate().map(|(seg_idx, segment)| match segment {
                 CodexAssistantSegment::Markdown(seg_text) => {
                     let seg_arc: Arc<str> = Arc::from(seg_text);
-                    let state = markdown.state(&format!("assistant:{id}:{seg_idx}"), &seg_arc, cx);
+                    let state = markdown.state_in_context(&format!("assistant:{id}:{seg_idx}"), &seg_arc, Some(action_ctx.clone()), cx);
                     let selection_state = state.clone();
                     let message_id = message.id.clone();
+                    let bounds_cell = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
+                    let bounds_paint = bounds_cell.clone();
                     div()
                         .id(SharedString::from(format!("assistant-select:{id}:{seg_idx}")))
+                        .relative()
                         .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
-                            view.capture_citation_selection(selection_state.clone(), message_id.clone(), seg_arc.clone(), event.position, window, cx);
+                            view.capture_citation_selection(selection_state.clone(), message_id.clone(), seg_arc.clone(), (event.position, bounds_cell.get()), window, cx);
                         }))
+                        .child(gpui::canvas(move |bounds, _, _| bounds_paint.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
                         .child(prose(&state, cx))
                         .into_any_element()
                 }
@@ -1521,7 +1542,7 @@ pub fn plan_card(id: &str, plan: &Arc<ProposedPlan>, env: &RowEnv, markdown: &mu
     } else {
         strip_displayed_plan_markdown(&plan.markdown)
     });
-    let prose_state = markdown.state(&format!("plan:{id}:{}", u8::from(collapsed)), &body, cx);
+    let prose_state = markdown.state_in_context(&format!("plan:{id}:{}", u8::from(collapsed)), &body, Some(action_context(env, cx)), cx);
     let key = id.to_owned();
     let view = cx.entity();
     PlanCard {

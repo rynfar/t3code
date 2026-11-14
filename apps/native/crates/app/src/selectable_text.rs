@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Element, ElementId, Entity, FocusHandle, GlobalElementId, HighlightStyle, Hitbox,
-    HitboxBehavior, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Styled, StyledText, Subscription, TextLayout, TextStyleRefinement, Window,
-    WrappedLineLayout, div, fill, point, px,
+    App, Bounds, ClipboardItem, Context, CursorStyle, DismissEvent, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, HighlightStyle,
+    Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Styled, StyledText, Subscription, TextLayout,
+    TextStyleRefinement, WeakEntity, Window, WrappedLineLayout, div, fill, point, px,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Copy, SelectAll};
@@ -34,6 +34,93 @@ pub fn init(cx: &mut App) {
 
 pub type Highlights = Arc<[(Range<usize>, HighlightStyle)]>;
 
+#[derive(Default)]
+struct ActiveSelection(Option<WeakEntity<State>>);
+impl Global for ActiveSelection {}
+
+/// Handle to a rendered `SelectableText` instance for reading or clearing its selection.
+#[derive(Clone)]
+pub struct SelectableTextHandle(Entity<State>);
+
+impl SelectableTextHandle {
+    pub fn selected_text(&self, cx: &App) -> Option<String> {
+        self.0.read(cx).selected().map(str::to_owned)
+    }
+
+    pub fn clear_selection(&self, cx: &mut App) {
+        self.0.update(cx, |state, cx| {
+            if state.selection.take().is_some() {
+                cx.notify();
+            }
+        });
+        clear_active_selection_if(&self.0, cx);
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(text: impl Into<SharedString>, cx: &mut App) -> Self {
+        use gpui::AppContext;
+        let text: SharedString = text.into();
+        let entity = cx.new(|cx| State {
+            focus: cx.focus_handle(),
+            text,
+            origin: 0,
+            selection: None,
+            dragging: false,
+            menu: None,
+            scroll: None,
+            layout: None,
+            visible_end: None,
+            painted_scroll: px(0.),
+            pointer: Point::default(),
+            autoscrolling: false,
+        });
+        Self(entity)
+    }
+
+    #[cfg(test)]
+    pub fn select_all(&self, cx: &mut App) {
+        self.0.update(cx, |state, cx| {
+            state.selection = Some(Selection::all(&state.text));
+            cx.notify();
+        });
+        set_active_selection(&self.0, cx);
+    }
+}
+
+pub fn active_selected_text(cx: &App) -> Option<String> {
+    let weak = cx.try_global::<ActiveSelection>()?.0.as_ref()?;
+    let entity = weak.upgrade()?;
+    entity.read(cx).selected().map(str::to_owned)
+}
+
+pub fn clear_active_selection(cx: &mut App) {
+    let Some(entity) = cx.try_global::<ActiveSelection>().and_then(|active| active.0.as_ref()).and_then(WeakEntity::upgrade) else {
+        return;
+    };
+    SelectableTextHandle(entity).clear_selection(cx);
+}
+
+fn set_active_selection(entity: &Entity<State>, cx: &mut App) {
+    let weak = entity.downgrade();
+    if cx.has_global::<ActiveSelection>() {
+        cx.global_mut::<ActiveSelection>().0 = Some(weak);
+    } else {
+        cx.set_global(ActiveSelection(Some(weak)));
+    }
+}
+
+fn clear_active_selection_if(entity: &Entity<State>, cx: &mut App) {
+    let id = entity.entity_id();
+    if cx.has_global::<ActiveSelection>() {
+        let active = cx.global_mut::<ActiveSelection>();
+        if active.0.as_ref().is_some_and(|weak| weak.entity_id() == id) {
+            active.0 = None;
+        }
+    }
+}
+
+type StateCallback = Arc<dyn Fn(&SelectableTextHandle, &mut App)>;
+
 #[derive(IntoElement)]
 pub struct SelectableText {
     id: ElementId,
@@ -43,12 +130,27 @@ pub struct SelectableText {
     scroll: Option<ScrollHandle>,
     tab_stop: bool,
     tail_ellipsis: bool,
+    on_state: Option<StateCallback>,
 }
 
 impl SelectableText {
     /// `id` keys the selection, so it stays the same while the text is on screen.
     pub fn new(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Self {
-        SelectableText { id: id.into(), text: text.into(), highlights: None, origin: 0, scroll: None, tab_stop: true, tail_ellipsis: false }
+        SelectableText {
+            id: id.into(),
+            text: text.into(),
+            highlights: None,
+            origin: 0,
+            scroll: None,
+            tab_stop: true,
+            tail_ellipsis: false,
+            on_state: None,
+        }
+    }
+
+    pub fn on_state(mut self, f: impl Fn(&SelectableTextHandle, &mut App) + 'static) -> Self {
+        self.on_state = Some(Arc::new(f));
+        self
     }
 
     pub fn tab_stop(mut self, tab_stop: bool) -> Self {
@@ -235,6 +337,12 @@ impl RenderOnce for SelectableText {
             state.scroll = self.scroll;
             (state.focus.clone(), state.selection.as_ref().map(Selection::range).filter(|range| !range.is_empty()))
         });
+        if selected.is_none() {
+            clear_active_selection_if(&state, cx);
+        }
+        if let Some(on_state) = &self.on_state {
+            on_state(&SelectableTextHandle(state.clone()), cx);
+        }
         let (copy_state, all_state, menu_state, menu_focus) = (state.clone(), state.clone(), state.clone(), focus.clone());
         // The context menu draws inside this div: it gets the app's font, the text keeps the caller's.
         let font_family = window.text_style().font_family;
@@ -249,7 +357,8 @@ impl RenderOnce for SelectableText {
                 all_state.update(cx, |state, cx| {
                     state.selection = Some(Selection::all(&state.text));
                     cx.notify();
-                })
+                });
+                set_active_selection(&all_state, cx);
             })
             .child(TextElement::new(state, self.text, self.highlights, selected, font_family, self.tail_ellipsis))
             .context_menu(move |menu, _, cx| {
@@ -378,6 +487,7 @@ impl Element for TextElement {
                     state.dragging = true;
                     cx.notify();
                 });
+                set_active_selection(&state, cx);
             }
         });
         // Capture phase, so the drag follows the pointer over anything that stops it.
@@ -402,12 +512,18 @@ impl Element for TextElement {
             let state = self.state.clone();
             move |event: &MouseUpEvent, phase, _, cx| {
                 if phase.capture() && event.button == MouseButton::Left && state.read(cx).dragging {
-                    state.update(cx, |state, cx| {
+                    let has_selection = state.update(cx, |state, cx| {
                         // The release settles the end, even where an auto-scroll step left it behind.
                         state.extend_to(event.position);
                         state.dragging = false;
                         cx.notify();
+                        state.selected().is_some()
                     });
+                    if has_selection {
+                        set_active_selection(&state, cx);
+                    } else {
+                        clear_active_selection_if(&state, cx);
+                    }
                 }
             }
         });
@@ -422,6 +538,7 @@ impl Element for TextElement {
                         state.selection = None;
                         cx.notify();
                     });
+                    clear_active_selection_if(&state, cx);
                 }
             });
         }

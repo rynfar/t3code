@@ -327,5 +327,7 @@ fn titles_read_links_as_labels() {
     assert_eq!(title_text(&format!("compare {} now", thread.reference())), "compare Fix login now");
     assert_eq!(title_text("![a.png](t3-context://v1/image/image_1)"), "Attached image");
     assert_eq!(title_text("![a](t3-context://v1/image/i1) ![b](t3-context://v1/image/i2)"), "Attached images");
+    let cite = crate::assistant_citations::Citation::from_selection("e".into(), "t".into(), "m".into(), "quoted text", 0..11).unwrap().with_comment("fix this");
+    assert_eq!(title_text(&format!("Check {}", cite.serialize())), "Check quoted text Comment: fix this");
     assert_eq!(title_text("  "), "");
 }
