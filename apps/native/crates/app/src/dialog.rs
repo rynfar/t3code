@@ -25,6 +25,17 @@ pub(crate) fn ask(
     on_confirm: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
     cx: &mut App,
 ) {
+    ask_inner(title, description, confirm_label, on_confirm, None, cx);
+}
+
+fn ask_inner(
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    confirm_label: impl Into<SharedString>,
+    on_confirm: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
+    on_cancel: Option<OnConfirm>,
+    cx: &mut App,
+) {
     let Some(dialog) = cx.try_global::<Host>().and_then(|host| host.0.upgrade()) else { return };
     let focus = dialog.update(cx, |dialog, cx| {
         dialog.pending = Some(Pending {
@@ -32,6 +43,7 @@ pub(crate) fn ask(
             description: description.into(),
             confirm_label: confirm_label.into(),
             on_confirm: Box::new(on_confirm),
+            on_cancel,
         });
         cx.notify();
         dialog.focus.clone()
@@ -57,8 +69,26 @@ pub(crate) fn ask_available(
 ) -> bool {
     let Some(dialog) = cx.try_global::<Host>().and_then(|host| host.0.upgrade()) else { return false; };
     if dialog.read(cx).pending.is_some() { return false; }
-    ask(title, description, confirm_label, on_confirm, cx);
+    ask_inner(title, description, confirm_label, on_confirm, None, cx);
     true
+}
+
+pub(crate) fn ask_available_cancellable(
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    confirm_label: impl Into<SharedString>,
+    on_confirm: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
+    on_cancel: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
+    cx: &mut App,
+) -> bool {
+    let Some(dialog) = cx.try_global::<Host>().and_then(|host| host.0.upgrade()) else { return false; };
+    if dialog.read(cx).pending.is_some() { return false; }
+    ask_inner(title, description, confirm_label, on_confirm, Some(Box::new(on_cancel)), cx);
+    true
+}
+
+pub(crate) fn is_open(cx: &App) -> bool {
+    cx.try_global::<Host>().and_then(|host| host.0.upgrade()).is_some_and(|dialog| dialog.read(cx).is_open())
 }
 
 impl AppState {
@@ -115,6 +145,7 @@ struct Pending {
     description: SharedString,
     confirm_label: SharedString,
     on_confirm: OnConfirm,
+    on_cancel: Option<OnConfirm>,
 }
 
 pub struct ConfirmDialog {
@@ -150,6 +181,7 @@ impl ConfirmDialog {
             description: description.into(),
             confirm_label: confirm_label.into(),
             on_confirm: Box::new(on_confirm),
+            on_cancel: None,
         });
         self.previous_focus = window.focused(cx);
         window.focus(&self.focus, cx);
@@ -160,11 +192,18 @@ impl ConfirmDialog {
 
     pub(crate) fn is_open(&self) -> bool { self.pending.is_some() }
 
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn resolve_for_test(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.resolve(confirmed, window, cx);
+    }
+
     fn resolve(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.take() else { return };
         if self.focus.is_focused(window) && let Some(focus) = self.previous_focus.take() { window.focus(&focus, cx); }
         if confirmed {
             self.state.update(cx, |state, cx| (pending.on_confirm)(state, cx));
+        } else if let Some(on_cancel) = pending.on_cancel {
+            self.state.update(cx, |state, cx| on_cancel(state, cx));
         }
         cx.notify();
     }

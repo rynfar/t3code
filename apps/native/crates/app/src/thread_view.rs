@@ -651,7 +651,9 @@ impl ThreadView {
     }
 
     fn is_follow_paused(&self, cx: &gpui::App) -> bool {
-        crate::transcript::html_render::is_fullscreen_open(cx) || self.viewer.read(cx).is_open()
+        crate::transcript::html_render::is_fullscreen_open(cx)
+            || crate::transcript::mcp_app::is_fullscreen_open(cx)
+            || self.viewer.read(cx).is_open()
     }
 
     /// The rows in view and where they sit, before a change. A gap not yet scrolled into still
@@ -1064,6 +1066,7 @@ impl ThreadView {
         let env = RowEnv {
             state: &self.state,
             thread_id: self.thread_id.as_deref(),
+            embedded: self.fixed.is_some(),
             clock: self.clock,
             workspace_root: self.workspace_root.as_deref(),
             ui: &self.ui,
