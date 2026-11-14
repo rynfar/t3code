@@ -572,6 +572,11 @@ fn defaults_compile_with_known_commands() {
     for command in THREAD_JUMP_KEYBINDING_COMMANDS.iter().chain(&MODEL_PICKER_JUMP_KEYBINDING_COMMANDS) {
         assert!(STATIC_KEYBINDING_COMMANDS.contains(command));
     }
+    assert!(is_keybinding_command("thread.regenerateTitle"));
+    let dictation = raw.iter().find(|rule| rule.command == "composer.dictation").unwrap();
+    assert_eq!((dictation.key.as_str(), dictation.when.as_deref()), ("mod+shift+d", Some("!terminalFocus")));
+    let preview_find = raw.iter().find(|rule| rule.command == "preview.find").unwrap();
+    assert_eq!((preview_find.key.as_str(), preview_find.when.as_deref()), ("mod+f", Some("previewFocus")));
 }
 
 #[test]
@@ -638,10 +643,11 @@ fn decodes_wire_rules_and_skips_entries_it_cannot_decode() {
         { "command": "diff.toggle", "shortcut": { "key": "d" } },
         { "command": "diff.toggle", "shortcut": shortcut, "whenAst": { "type": "xor", "left": {}, "right": {} } },
         { "command": "diff.toggle", "shortcut": shortcut, "whenAst": { "type": "identifier", "name": "" } },
-        { "command": "diff.toggle", "shortcut": { "key": "   ", "metaKey": false, "ctrlKey": false, "shiftKey": false, "altKey": false, "modKey": true } },
+        { "command": "diff.toggle", "shortcut": { "key": "", "metaKey": false, "ctrlKey": false, "shiftKey": false, "altKey": false, "modKey": true } },
         { "command": "diff.toggle", "shortcut": { "key": "x".repeat(65), "metaKey": false, "ctrlKey": false, "shiftKey": false, "altKey": false, "modKey": true } },
         "not an object",
-        { "command": "script.run-tests.run", "shortcut": { "key": " r ", "metaKey": true, "ctrlKey": false, "shiftKey": true, "altKey": false, "modKey": false } },
+        { "command": "composer.dictation", "shortcut": { "key": " ", "metaKey": false, "ctrlKey": false, "shiftKey": false, "altKey": false, "modKey": true } },
+        { "command": "thread.regenerateTitle", "shortcut": { "key": "r", "metaKey": true, "ctrlKey": false, "shiftKey": true, "altKey": false, "modKey": false } },
     ]);
     let decoded = decode_resolved_keybindings(&wire);
     assert_eq!(
@@ -653,7 +659,12 @@ fn decodes_wire_rules_and_skips_entries_it_cannot_decode() {
                 when_ast: Some(and(ident("terminalOpen"), not(ident("terminalFocus")))),
             },
             ResolvedKeybindingRule {
-                command: "script.run-tests.run".into(),
+                command: "composer.dictation".into(),
+                shortcut: sc("mod+space"),
+                when_ast: None,
+            },
+            ResolvedKeybindingRule {
+                command: "thread.regenerateTitle".into(),
                 shortcut: sc("meta+shift+r"),
                 when_ast: None
             },

@@ -324,7 +324,7 @@
       "placeholder": "Optional",
       "secret": true,
       "control": "password",
-      "acceptsSecretReference": false,
+      "acceptsSecretReference": true,
       "validation": {
         "99999": true,
         "100000": true,
@@ -381,7 +381,7 @@
       "placeholder": "Optional",
       "secret": true,
       "control": "password",
-      "acceptsSecretReference": false,
+      "acceptsSecretReference": true,
       "validation": {
         "99999": true,
         "100000": true,

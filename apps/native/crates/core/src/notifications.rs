@@ -200,14 +200,27 @@ pub enum NotificationKind {
     Completion,
 }
 
+/// Matches the push relay's completion confirmation: a final wake can start right after a progress wake.
+pub const RELEASED_COMPLETION_GRACE_MS: Ms = 5_000;
+
 /// `ThreadNotificationObservation`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Observation {
-    /// Run and status while the thread needs attention.
+    /// Status and request key, or status and run without a request, while the thread needs attention.
     pub attention: Option<String>,
+    /// The pending request's id, when it has one; `None` whenever `attention` is `None`.
+    pub request_id: Option<String>,
     /// Idle, with its latest run completed.
     pub settled: bool,
     pub completed_at: Option<Ms>,
+    /// The latest run answers a background-work progress wake, like a Monitor line.
+    pub background_wake: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Release {
+    at: Ms,
+    deadline: Option<Ms>,
 }
 
 /// `createThreadNotificationGate`: attention changes notify input; a newer completion notifies
@@ -215,11 +228,13 @@ pub struct Observation {
 #[derive(Debug, Clone)]
 pub struct NotificationGate<K> {
     handled: HashMap<K, Ms>,
+    attended: HashMap<K, HashSet<String>>,
+    releases: HashMap<K, Release>,
 }
 
 impl<K> Default for NotificationGate<K> {
     fn default() -> Self {
-        NotificationGate { handled: HashMap::new() }
+        NotificationGate { handled: HashMap::new(), attended: HashMap::new(), releases: HashMap::new() }
     }
 }
 
@@ -232,29 +247,98 @@ impl<K: Eq + Hash + Clone> NotificationGate<K> {
         }
     }
 
+    fn attend(&mut self, key: &K, prior: Option<&Observation>, next: &Observation) -> bool {
+        let Some(attention) = next.attention.as_deref() else {
+            self.attended.remove(key);
+            return false;
+        };
+        if next.request_id.is_none() {
+            return Some(attention) != prior.and_then(|prior| prior.attention.as_deref());
+        }
+        self.attended.entry(key.clone()).or_default().insert(attention.to_owned())
+    }
+
     pub fn observe(&mut self, key: &K, prior: Option<&Observation>, next: &Observation, archived: bool, quiet: bool) -> Option<NotificationKind> {
+        self.observe_at(key, prior, next, archived, quiet, 0)
+    }
+
+    pub fn observe_at(
+        &mut self,
+        key: &K,
+        prior: Option<&Observation>,
+        next: &Observation,
+        archived: bool,
+        quiet: bool,
+        now: Ms,
+    ) -> Option<NotificationKind> {
+        // The grace survives updates that keep the wake's completion; anything else cancels it.
+        if !archived
+            && !quiet
+            && let Some(pending) = self.releases.get_mut(key)
+            && Some(pending.at) == next.completed_at
+        {
+            if pending.deadline.is_none() {
+                pending.deadline = Some(now + RELEASED_COMPLETION_GRACE_MS);
+            }
+            return None;
+        }
+        self.releases.remove(key);
         if prior.is_none() || archived || quiet {
             self.skip(key, next.completed_at);
         }
-        let prior = prior.filter(|_| !archived)?;
-        if next.attention.is_some() && next.attention != prior.attention {
+        let fresh = self.attend(key, prior, next);
+        if prior.is_none() || archived {
+            return None;
+        }
+        if fresh {
             return Some(NotificationKind::Input);
         }
         let at = next.completed_at.filter(|_| next.settled)?;
         if self.handled.get(key).is_some_and(|handled| at <= *handled) {
             return None;
         }
+        if next.background_wake {
+            self.releases.insert(key.clone(), Release { at, deadline: Some(now + RELEASED_COMPLETION_GRACE_MS) });
+            return None;
+        }
         self.handled.insert(key.clone(), at);
         Some(NotificationKind::Completion)
+    }
+
+    /// Stops grace timers while the snapshot is stale; the next observation restarts or drops them.
+    pub fn pause(&mut self) {
+        for release in self.releases.values_mut() {
+            release.deadline = None;
+        }
+    }
+
+    /// Releases queued wake completions whose grace window expired at or before `now`.
+    pub fn flush_due(&mut self, now: Ms) -> Vec<K> {
+        let due: Vec<(K, Ms)> = self
+            .releases
+            .iter()
+            .filter_map(|(key, release)| release.deadline.filter(|deadline| *deadline <= now).map(|_| (key.clone(), release.at)))
+            .collect();
+        let mut fired = Vec::with_capacity(due.len());
+        for (key, at) in due {
+            self.releases.remove(&key);
+            self.handled.insert(key.clone(), at);
+            fired.push(key);
+        }
+        fired
     }
 
     /// Forgets threads that left the snapshot.
     pub fn retain(&mut self, keep: impl Fn(&K) -> bool) {
         self.handled.retain(|key, _| keep(key));
+        self.releases.retain(|key, _| keep(key));
+        self.attended.retain(|key, _| keep(key));
     }
 
     pub fn clear(&mut self) {
+        self.releases.clear();
         self.handled.clear();
+        self.attended.clear();
     }
 }
 
@@ -290,6 +374,25 @@ struct Observed {
     status: ThreadStatus,
 }
 
+fn status_key(status: ThreadStatus) -> &'static str {
+    match status {
+        ThreadStatus::Approval => "approval",
+        ThreadStatus::Input => "input",
+        ThreadStatus::Request => "request",
+        ThreadStatus::Failed => "failed",
+        ThreadStatus::Limited => "limited",
+        _ => "",
+    }
+}
+
+fn monitor_holds_wake_completion(raw: &ThreadShell) -> bool {
+    raw.latest_run_background_wake == Some(true)
+        && raw
+            .pending_background_tasks
+            .iter()
+            .any(|task| task.kind == "monitor" && !task.task_id.starts_with("pull-request-watch:"))
+}
+
 fn observe_row(raw: &ThreadShell, request: Option<SubagentRequest>, revision: Option<u64>) -> Observed {
     let thread = present_thread(raw, request);
     let run = thread.latest_run.as_ref();
@@ -297,14 +400,38 @@ fn observe_row(raw: &ThreadShell, request: Option<SubagentRequest>, revision: Op
     if status == ThreadStatus::Ready && run.is_some_and(|run| run.status == "failed") {
         status = ThreadStatus::Failed;
     }
-    let attention = matches!(
+    let needs_attention = matches!(
         status,
         ThreadStatus::Input | ThreadStatus::Request | ThreadStatus::Approval | ThreadStatus::Failed | ThreadStatus::Limited
-    )
-    .then(|| format!("{}:{status:?}", run.map_or("", |run| run.run_id.as_str())));
-    let settled = status == ThreadStatus::Ready && run.is_some_and(|run| run.status == "completed");
+    );
+    let request_id = if needs_attention {
+        let own_id = raw.pending_runtime_request.as_ref().map(|req| req.id.clone());
+        if thread.has_pending_approvals {
+            own_id
+        } else if thread.pending_subagent_request == Some(SubagentRequest::Approval) {
+            None
+        } else if thread.has_pending_user_input {
+            own_id
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let attention = needs_attention.then(|| match &request_id {
+        Some(id) => format!("{}:{id}", status_key(status)),
+        None => format!("{}:{}", run.map_or("", |run| run.run_id.as_str()), status_key(status)),
+    });
+    let completed = status == ThreadStatus::Ready && run.is_some_and(|run| run.status == "completed");
+    let settled = completed && !monitor_holds_wake_completion(raw);
     let completed_at = run.and_then(|run| run.completed_at).filter(|_| settled);
-    Observed { revision, request, observation: Observation { attention, settled, completed_at }, status }
+    let background_wake = raw.latest_run_background_wake == Some(true);
+    Observed {
+        revision,
+        request,
+        observation: Observation { attention, request_id, settled, completed_at, background_wake },
+        status,
+    }
 }
 
 /// `observeThreads` for one environment: turns status transitions in the live shell into
@@ -312,6 +439,7 @@ fn observe_row(raw: &ThreadShell, request: Option<SubagentRequest>, revision: Op
 #[derive(Debug, Clone, Default)]
 pub struct ThreadNotifications {
     previous: HashMap<String, Observed>,
+    reconnecting: bool,
     gate: NotificationGate<String>,
 }
 
@@ -328,6 +456,11 @@ impl ThreadNotifications {
         self.observe_requests(shell, &requests, |thread| thread.lineage.is_listed())
     }
 
+    pub fn pause(&mut self) {
+        self.reconnecting = true;
+        self.gate.pause();
+    }
+
     fn observe_requests(&mut self, shell: &ShellState, requests: &HashMap<String, SubagentRequest>, listed: impl Fn(&ThreadShell) -> bool) -> Vec<ThreadNotification> {
         let Some(snapshot) = &shell.snapshot else { return Vec::new() };
         let threads = &snapshot.threads;
@@ -337,7 +470,7 @@ impl ThreadNotifications {
             let request = requests.get(&raw.id).copied();
             let revision = shell.revision(&raw.id);
             let (key, prior) = match previous.remove_entry(raw.id.as_str()) {
-                Some((key, prior)) if revision.is_some() && prior.revision == revision && prior.request == request => {
+                Some((key, prior)) if !self.reconnecting && revision.is_some() && prior.revision == revision && prior.request == request => {
                     self.previous.insert(key, prior);
                     continue;
                 }
@@ -347,6 +480,7 @@ impl ThreadNotifications {
             self.previous.insert(key, observe_row(raw, request, revision));
             changed.push((raw, prior));
         }
+        self.reconnecting = false;
         if !previous.is_empty() {
             let current = &self.previous;
             self.gate.retain(|key| current.contains_key(key));

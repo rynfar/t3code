@@ -62,6 +62,7 @@ pub const STATIC_KEYBINDING_COMMANDS: &[&str] = &[
     "preview.zoomIn",
     "preview.zoomOut",
     "preview.resetZoom",
+    "preview.find",
     "commandPalette.toggle",
     "filePicker.toggle",
     "projectSearch.toggle",
@@ -73,6 +74,7 @@ pub const STATIC_KEYBINDING_COMMANDS: &[&str] = &[
     "composer.sendAlternate",
     "composer.sendBackground",
     "composer.sendAndNewThread",
+    "composer.dictation",
     "composer.host",
     "composer.cycleHost",
     "composer.effort",
@@ -114,6 +116,7 @@ pub const STATIC_KEYBINDING_COMMANDS: &[&str] = &[
     "thread.copyReference",
     "thread.settle",
     "thread.pin",
+    "thread.regenerateTitle",
     "thread.undo",
     "thread.jump.1",
     "thread.jump.2",
@@ -194,6 +197,7 @@ const DEFAULT_KEYBINDINGS_BEFORE_JUMPS: &[RawRule] = &[
     ("mod+t", "rightPanel.new", Some("rightPanelOpen && !terminalFocus")),
     ("mod+d", "terminal.split", Some("terminalFocus")),
     ("mod+shift+d", "terminal.splitVertical", Some("terminalFocus")),
+    ("mod+shift+d", "composer.dictation", Some("!terminalFocus")),
     ("mod+n", "terminal.new", Some("terminalFocus")),
     ("mod+w", "terminal.close", Some("terminalFocus")),
     ("mod+w", "rightPanel.close", Some("!terminalFocus")),
@@ -206,6 +210,7 @@ const DEFAULT_KEYBINDINGS_BEFORE_JUMPS: &[RawRule] = &[
     ("mod++", "preview.zoomIn", Some("previewFocus")),
     ("mod+-", "preview.zoomOut", Some("previewFocus")),
     ("mod+0", "preview.resetZoom", Some("previewFocus")),
+    ("mod+f", "preview.find", Some("previewFocus")),
     ("mod+k", "commandPalette.toggle", Some("!terminalFocus")),
     ("mod+p", "filePicker.toggle", Some("!terminalFocus")),
     ("mod+shift+f", "projectSearch.toggle", Some("!terminalFocus")),
@@ -493,16 +498,14 @@ fn decode_when_is_valid(node: &KeybindingWhenNode) -> bool {
 }
 
 fn decode_resolved_keybinding_rule(value: &Value) -> Option<ResolvedKeybindingRule> {
-    let mut rule = ResolvedKeybindingRule::deserialize(value).ok()?;
-    let key = rule.shortcut.key.trim();
-    let key_length = key.encode_utf16().count();
+    let rule = ResolvedKeybindingRule::deserialize(value).ok()?;
+    let key_length = rule.shortcut.key.encode_utf16().count();
     if key_length == 0 || key_length > MAX_KEYBINDING_VALUE_LENGTH || !is_keybinding_command(&rule.command) {
         return None;
     }
     if !rule.when_ast.as_ref().is_none_or(decode_when_is_valid) {
         return None;
     }
-    rule.shortcut.key = key.to_owned();
     Some(rule)
 }
 

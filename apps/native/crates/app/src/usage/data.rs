@@ -11,7 +11,6 @@ use gpui::{App, Context, Entity, Task};
 use serde_json::json;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::auth::AuthSessionState;
-use t3_core::commands::method as commands_method;
 use t3_core::usage::format::make_window;
 use t3_core::usage::limits::{self, ExternalUsageLink, LimitEnvironment, LimitPool, Redeem};
 use t3_core::usage::merge::{AnsweredUsage, MergedUsage, merge_usage};
@@ -56,7 +55,6 @@ pub(super) struct UsageData {
     pub label: String,
     pub environment_id: String,
     pub limits_now: i64,
-    pub keychain_pending: bool,
     /// `resolveHour12`: the clock the timestamp setting picks; the system default reads 12-hour.
     pub hour12: bool,
     pub merged: Arc<MergedUsage>,
@@ -97,7 +95,6 @@ impl UsageData {
             label: String::new(),
             environment_id: String::new(),
             limits_now: now_ms(),
-            keychain_pending: false,
             hour12: hour12(),
             merged: Arc::new(MergedUsage::default()),
             kept: None,
@@ -186,8 +183,7 @@ impl UsageData {
     }
 
     /// The environment as the page's helpers read it.
-    pub fn environment(&self, state: &AppState) -> EnvironmentUsage {
-        let providers = state.server_config.config.as_ref().map(|config| config.providers.as_slice()).unwrap_or_default();
+    pub fn environment(&self, _state: &AppState) -> EnvironmentUsage {
         EnvironmentUsage {
             environment_id: self.environment_id.clone(),
             label: self.label.clone(),
@@ -196,7 +192,6 @@ impl UsageData {
             can_read_diagnostics: self.access.can_read_diagnostics,
             error: self.error.clone().or_else(|| self.access.error.map(str::to_owned)),
             summary: self.summary.clone(),
-            needs_cursor_keychain_access: usage::needs_cursor_keychain_access(self.summary.as_deref(), providers),
         }
     }
 
@@ -340,28 +335,6 @@ impl UsageView {
                 view.data.refreshing = false;
                 view.data.limits_now = now_ms();
                 view.data.invalidate_limits();
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-
-    /// `CursorEnableButton`: lets the server read Cursor's account usage from the keychain.
-    pub(super) fn enable_cursor_keychain(&mut self, cx: &mut Context<Self>) {
-        if self.data.keychain_pending {
-            return;
-        }
-        self.data.keychain_pending = true;
-        let request = self.state.read(cx).rpc(commands_method::SERVER_UPDATE_SETTINGS, usage::enable_cursor_keychain_patch());
-        self.data.action = Some(cx.spawn(async move |this, cx| {
-            let enabled = request.await.is_ok();
-            let _ = this.update(cx, |view, cx| {
-                view.data.keychain_pending = false;
-                if enabled {
-                    view.load(true, cx);
-                    cx.global_mut::<Host>().limits_refresh_after = 0;
-                    view.refresh_limits(false, cx);
-                }
                 cx.notify();
             });
         }));

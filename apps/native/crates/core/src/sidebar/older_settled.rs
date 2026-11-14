@@ -114,7 +114,7 @@ pub fn count_key(threads: &[ThreadShell], before_ms: Ms, removed_at: &HashMap<St
         .filter_map(|thread| {
             let older = is_older_settled(thread, before_ms);
             let old = parse_iso(&thread.created_at).is_some_and(|created| created < before_ms);
-            (older || old).then(|| format!("{}:{}", thread.id, u8::from(older)))
+            (older || old).then(|| format!("{}:{}:{}", thread.id, thread.project_id, u8::from(older)))
         })
         .collect();
     rows.sort();

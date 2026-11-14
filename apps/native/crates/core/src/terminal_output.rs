@@ -306,9 +306,11 @@ fn apply_sgr(attributes: &mut Attributes, params: &[f64]) {
             attributes.fg.clear();
         } else if code == 49. {
             attributes.bg.clear();
-        } else if code == 38. || code == 48. {
+        } else if code == 38. || code == 48. || code == 58. {
             let (color, next) = extended_color(code, params, index);
-            if let Some(color) = color {
+            if let Some(color) = color
+                && code != 58.
+            {
                 if code == 38. { attributes.fg = color } else { attributes.bg = color }
             }
             index = next;
@@ -365,19 +367,59 @@ fn to_int32(value: f64) -> i64 {
     (if wrapped >= 2_147_483_648. { wrapped - 4_294_967_296. } else { wrapped }) as i64
 }
 
+#[derive(Clone, Copy)]
+enum PendingParam {
+    Code,
+    Mode,
+    Count(usize),
+}
+
 /// Colon color sub-parameters carry an optional color-space id absent from the semicolon form.
 fn csi_params(params: &str) -> Vec<f64> {
     let mut numbers = Vec::new();
+    let mut pending = PendingParam::Code;
     for part in params.split(';') {
-        if !part.contains(':') {
-            numbers.push(js_number(part));
-            continue;
-        }
         let mut sub: Vec<f64> = part.split(':').map(js_number).collect();
-        if (sub[0] == 38. || sub[0] == 48.) && sub.get(1) == Some(&2.) && sub.len() >= 6 {
-            sub.remove(2);
+        let head = sub[0];
+        match pending {
+            PendingParam::Count(remaining) => {
+                numbers.push(head);
+                pending = if remaining > 1 { PendingParam::Count(remaining - 1) } else { PendingParam::Code };
+            }
+            PendingParam::Mode => {
+                pending = PendingParam::Code;
+                if sub.len() == 1 {
+                    numbers.push(head);
+                    if head == 5. || head == 2. {
+                        pending = PendingParam::Count(if head == 5. { 1 } else { 3 });
+                    }
+                    continue;
+                }
+                if head == 2. && sub.len() >= 5 {
+                    sub.remove(1);
+                }
+                let take = if head == 5. { 2 } else if head == 2. { 4 } else { 1 };
+                numbers.extend_from_slice(&sub[..sub.len().min(take)]);
+            }
+            PendingParam::Code => {
+                if sub.len() == 1 {
+                    numbers.push(head);
+                    if head == 38. || head == 48. || head == 58. {
+                        pending = PendingParam::Mode;
+                    }
+                    continue;
+                }
+                if head != 38. && head != 48. && head != 58. {
+                    numbers.push(if head == 4. && sub[1] == 0. { 24. } else { head });
+                    continue;
+                }
+                if sub[1] == 2. && sub.len() >= 6 {
+                    sub.remove(2);
+                }
+                let take = if sub[1] == 5. { 3 } else if sub[1] == 2. { 5 } else { 2 };
+                numbers.extend_from_slice(&sub[..sub.len().min(take)]);
+            }
         }
-        numbers.extend(sub);
     }
     numbers
 }
@@ -385,6 +427,10 @@ fn csi_params(params: &str) -> Vec<f64> {
 /// Length of a complete escape sequence starting at `index` (an ESC), `None` while unfinished.
 fn escape_length(input: &[u16], index: usize) -> Option<usize> {
     let next = *input.get(index + 1)?;
+    // A second ESC restarts the sequence.
+    if next == ESC {
+        return Some(1);
+    }
     if next == b'[' as u16 {
         return (index + 2..input.len()).find(|&cursor| (0x40..=0x7e).contains(&input[cursor])).map(|cursor| cursor - index + 1);
     }
@@ -395,22 +441,30 @@ fn escape_length(input: &[u16], index: usize) -> Option<usize> {
             match input[cursor] {
                 0x07 => return Some(cursor - index + 1),
                 NEWLINE => return Some(cursor - index),
+                // Like xterm.js, an ESC that does not start ST ends the string and begins the next sequence.
                 ESC => {
                     let after = *input.get(cursor + 1)?;
-                    if after == b'\\' as u16 {
-                        return Some(cursor - index + 2);
-                    }
+                    return Some(if after == b'\\' as u16 { cursor - index + 2 } else { cursor - index });
                 }
                 _ => {}
             }
         }
         return None;
     }
-    // Charset designations take three units; other sequences take two.
-    if b"()*+".iter().any(|&b| next == u16::from(b)) {
-        return (index + 2 < input.len()).then_some(3);
+    // ECMA-35: any intermediate bytes (0x20-0x2F, e.g. charset designations, DECALN) precede one final byte.
+    let mut cursor = index + 1;
+    while cursor < input.len() && (0x20..=0x2f).contains(&input[cursor]) {
+        cursor += 1;
     }
-    Some(2)
+    if cursor >= input.len() {
+        return None;
+    }
+    // After intermediates, a control or ESC is not a final byte; end before it so it is still processed.
+    let final_byte = input[cursor];
+    if cursor > index + 1 && !(0x30..=0x7e).contains(&final_byte) {
+        return Some(cursor - index);
+    }
+    Some(cursor - index + 1)
 }
 
 struct Terminal {
@@ -900,7 +954,7 @@ fn span_style(pen: &str, palette: &[Rgb; 16]) -> Option<SpanStyle> {
     if let Some(Some(back)) = background
         && color.flatten().is_none_or(|fore| contrast_ratio(fore, back) < 3.)
     {
-        color = Some(Some(if luminance(back) > 0.35 { BADGE_DARK_TEXT } else { BADGE_LIGHT_TEXT }));
+        color = Some(Some(if luminance(back) > 0.3 { BADGE_DARK_TEXT } else { BADGE_LIGHT_TEXT }));
     }
     Some(SpanStyle {
         color: color.flatten(),

@@ -127,8 +127,6 @@ pub enum ButtonVariant {
 pub enum ButtonSize {
     /// 32 tall, 14px text.
     Default,
-    /// 28 tall, 14px text.
-    Sm,
     /// 24 tall, 12px text.
     Xs,
 }
@@ -172,7 +170,6 @@ impl RenderOnce for ActionButton {
         let dark = cx.theme().is_dark();
         let (height, pad, text, icon_size, gap) = match self.size {
             ButtonSize::Default => (32., 11., 14., 16., 8.),
-            ButtonSize::Sm => (28., 9., 14., 16., 6.),
             ButtonSize::Xs => (24., 7., 12., 14., 4.),
         };
         let transparent = gpui::transparent_black();

@@ -5,11 +5,29 @@
 use std::collections::HashMap;
 
 use super::settled::effective_snoozed;
-use super::thread::SidebarThread;
+use super::thread::{RuntimeSummary, SidebarThread};
 use super::time::Ms;
 
 /// How long a thread that stopped working keeps reading as working.
 pub const WORKING_EXIT_GRACE_MS: Ms = 2_000;
+/// A run that ended this long ago has no continuation about to start, so its thread gets no grace.
+pub const STALE_EXIT_MS: Ms = 60_000;
+
+/// Marks a newly launched thread as preparing until its first run or runtime lands.
+pub fn as_launching_thread(mut thread: SidebarThread) -> SidebarThread {
+    if thread.latest_run.is_some() || thread.runtime.is_some() {
+        return thread;
+    }
+    thread.runtime = Some(RuntimeSummary {
+        status: "preparing".to_owned(),
+        active_run_id: None,
+        activity_started_at: None,
+        last_error: None,
+        last_error_class: None,
+        updated_at: thread.updated_at,
+    });
+    thread
+}
 
 fn runtime_is_active(thread: &SidebarThread) -> bool {
     thread.runtime.as_ref().is_some_and(|runtime| matches!(runtime.status.as_str(), "preparing" | "queued" | "starting" | "running" | "waiting"))
@@ -116,10 +134,15 @@ impl InboxReturnTracker {
                 || thread.latest_run.as_ref().is_some_and(|run| run.status == "failed");
             let moved = previous.is_some_and(|previous| previous.placement != placement);
             let excluded = thread.archived || thread.deleted || thread.pinned || thread.is_settled() || effective_snoozed(thread, now);
+            let ended_long_ago = thread
+                .latest_run
+                .as_ref()
+                .and_then(|run| run.completed_at)
+                .is_some_and(|ended_at| ended_at <= now - STALE_EXIT_MS);
             let actual = is_thread_working(thread);
             let was_working = previous.is_some_and(|previous| previous.working);
             // Only shelf placement is held: execution state and attention requests stay authoritative.
-            let deadline = (!actual && was_working && !actionable && !moved && !excluded)
+            let deadline = (!actual && was_working && !actionable && !moved && !excluded && !ended_long_ago)
                 .then(|| previous.and_then(|previous| previous.deadline).unwrap_or(now + WORKING_EXIT_GRACE_MS));
             let working = actual || deadline.is_some_and(|deadline| deadline > now);
             if was_working && !working {

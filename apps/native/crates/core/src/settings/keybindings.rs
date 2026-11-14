@@ -36,11 +36,13 @@ pub fn command_label(command: &str) -> String {
         "composer.sendAlternate" => return "Composer: Opposite Queue or Steer Action".to_owned(),
         "composer.sendBackground" => return "Composer: Start in Background".to_owned(),
         "composer.sendAndNewThread" => return "Composer: Send and Start New Thread".to_owned(),
+        "composer.dictation" => return "Composer: Start or Finish Dictation".to_owned(),
         "thread.steerQueuedMessage" => return "Queue: Send First Queued Message".to_owned(),
         "thread.editQueuedMessage" => return "Queue: Edit Last Queued Message".to_owned(),
         "thread.copyReference" => return "Pull Request: Copy Link or Thread".to_owned(),
         "view.reopenClosed" => return "Reopen Closed Tab".to_owned(),
         "preview.focusUrl" => return "Preview: Focus URL".to_owned(),
+        "preview.find" => return "Preview: Find on Page".to_owned(),
         _ => {}
     }
     if let Some((_, label)) = USAGE_COMMANDS.iter().find(|(id, _)| *id == command) {

@@ -253,6 +253,44 @@ fn completion_gate_matches_web_once_only_and_skip_cases() {
 }
 
 #[test]
+fn request_id_attends_replacing_requests_and_wake_release_honors_grace_and_pause() {
+    let mut gate = NotificationGate::default();
+    let key = "thread";
+    let working = Observation::default();
+    let req1 = Observation {
+        attention: Some("approval:req-1".into()),
+        request_id: Some("req-1".into()),
+        ..Default::default()
+    };
+    let req2 = Observation {
+        attention: Some("input:req-2".into()),
+        request_id: Some("req-2".into()),
+        ..Default::default()
+    };
+    assert_eq!(gate.observe(&key, Some(&working), &req1, false, false), Some(NotificationKind::Input));
+    assert_eq!(gate.observe(&key, Some(&req1), &req2, false, false), Some(NotificationKind::Input));
+    // Returning to req-1 before attention clears does not re-notify.
+    assert_eq!(gate.observe(&key, Some(&req2), &req1, false, false), None);
+    // Clearing attention resets attended requests, so a later req-1 notifies again.
+    assert_eq!(gate.observe(&key, Some(&req1), &working, false, false), None);
+    assert_eq!(gate.observe(&key, Some(&working), &req1, false, false), Some(NotificationKind::Input));
+
+    let wake_done = Observation {
+        settled: true,
+        completed_at: Some(1_000),
+        background_wake: true,
+        ..Default::default()
+    };
+    assert_eq!(gate.observe_at(&key, Some(&working), &wake_done, false, false, 10_000), None);
+    assert!(gate.flush_due(14_999).is_empty());
+    gate.pause();
+    assert!(gate.flush_due(20_000).is_empty(), "paused release does not fire");
+    assert_eq!(gate.observe_at(&key, Some(&wake_done), &wake_done, false, false, 20_000), None);
+    assert!(gate.flush_due(24_999).is_empty());
+    assert_eq!(gate.flush_due(25_000), vec![key]);
+}
+
+#[test]
 fn background_environments_keep_independent_gates_pending_and_click_destinations() {
     let mut watched = EnvironmentNotifications::default();
     let mut pending = PendingNotifications::default();

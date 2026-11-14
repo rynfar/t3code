@@ -152,9 +152,8 @@ fn source_messages_combine_skipped_records_once_per_source() {
     let cursor = merge_into(source("cursor", "demo-host", "/demo/codex", 1, "ok"), json!({"message": "Cursor history is limited to the last 30 days."}));
     let cursor: UsageSource = serde_json::from_value(cursor).unwrap();
     assert_eq!(usage_source_messages([&combined, &cursor]), [read_failure.to_owned(), cursor.message.clone().unwrap(), format_malformed_usage_warning(1)]);
-    let handled = malformed(1, json!({"action": "enableCursorKeychain"}));
     let healthy = malformed(1, json!({"status": "ok"}));
-    assert!(usage_source_messages([&handled, &healthy]).is_empty());
+    assert!(usage_source_messages([&healthy]).is_empty());
 }
 
 #[test]
@@ -268,7 +267,6 @@ fn environment(summary: Option<UsageSummary>, pending: bool) -> EnvironmentUsage
         can_read_diagnostics: true,
         error: None,
         summary: summary.map(Arc::new),
-        needs_cursor_keychain_access: false,
     }
 }
 
@@ -530,12 +528,4 @@ fn context_tokens_and_percentages_read_compactly() {
     assert_eq!(context_window::format_meter_percentage(Some(4.04)).as_deref(), Some("4%"));
     assert_eq!(context_window::format_meter_percentage(Some(9.96)).as_deref(), Some("10%"));
     assert_eq!(context_window::format_meter_percentage(Some(42.5)).as_deref(), Some("43%"));
-}
-
-#[test]
-fn cursor_keychain_prompt_stays_quiet_once_the_account_reports() {
-    let needs = summary(vec![], vec![merge_into(source("cursor", "mac", "/cursor", 0, "ok"), json!({"action": "enableCursorKeychain"}))], json!({}));
-    let account = summary(vec![], vec![source("cursor", "cursor.com", "/account", 0, "ok")], json!({}));
-    assert_eq!(cursor_keychain_prompt(&[(Some(&needs), true)]), [0]);
-    assert!(cursor_keychain_prompt(&[(Some(&needs), true), (Some(&account), false)]).is_empty());
 }

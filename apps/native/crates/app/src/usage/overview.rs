@@ -25,8 +25,6 @@ use crate::right_panel::{focusable, tooltip_view};
 use crate::sidebar::controller::SystemZone;
 use crate::theme::{Palette, hsla, palette};
 
-const CURSOR_KEYCHAIN_COPY: &str = "Requires access to your Cursor login in macOS Keychain.";
-
 fn fade<E: Styled>(element: E, loading: bool) -> E {
     if loading { element.opacity(LOADING_OPACITY) } else { element }
 }
@@ -190,7 +188,7 @@ impl UsageView {
             },
             cx,
         );
-        let summary = self.render_summary(&merged, metric, &loading, &active, &environment, cx);
+        let summary = self.render_summary(&merged, metric, &loading, &active, cx);
         let chart_section = v_flex()
             .min_w_0()
             .flex_1()
@@ -256,29 +254,19 @@ impl UsageView {
         metric: ChartMetric,
         loading: &LoadingState,
         active: &[UsageProvider],
-        environment: &usage::EnvironmentUsage,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = palette(cx);
         let headline = if metric == ChartMetric::Cost { format_usd(merged.cost_usd) } else { format_tokens(merged.total_tokens as f64) };
         let unpriced = merged.cost_quality.unpriced_share;
         let with_data = usage::providers_with_usage(&merged.providers);
-        let show_cursor_prompt = !self.data.hidden().contains(&UsageProvider::Cursor)
-            && !usage::cursor_keychain_prompt(&[(environment.summary.as_deref(), environment.needs_cursor_keychain_access)]).is_empty();
-        let insert_at = active.iter().position(|provider| *provider == UsageProvider::Claude).max(active.iter().position(|provider| *provider == UsageProvider::Codex)).map_or(0, |index| index + 1);
         let state = self.state.read(cx);
         let chatgpt = !self.data.hidden().contains(&UsageProvider::Codex)
             && state.server_config.config.as_ref().is_some_and(|config| config.providers.iter().any(t3_core::usage::limits::uses_chatgpt_sharing));
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (index, provider) in active.iter().enumerate() {
-            if index == insert_at && show_cursor_prompt {
-                rows.push(self.render_cursor_row(cx));
-            }
-            rows.push(self.render_provider_row(merged, *provider, metric, loading.is_loading(*provider), !with_data.contains(provider), cx));
-        }
-        if insert_at >= active.len() && show_cursor_prompt {
-            rows.push(self.render_cursor_row(cx));
-        }
+        let rows: Vec<AnyElement> = active
+            .iter()
+            .map(|provider| self.render_provider_row(merged, *provider, metric, loading.is_loading(*provider), !with_data.contains(provider), cx))
+            .collect();
         v_flex()
             .min_w_0()
             .gap(r(20.))
@@ -368,39 +356,6 @@ impl UsageView {
                     .child(fade(div().flex_none().text_size(r(14.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(figure), loading)),
             )
             .child(fade(div().text_size(r(12.)).text_color(hsla(p.muted_foreground)).when(awaiting, |this| this.invisible()).child(detail), loading))
-            .into_any_element()
-    }
-
-    /// `CursorEnableRow`.
-    fn render_cursor_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(cx);
-        let pending = self.data.keychain_pending;
-        h_flex()
-            .min_w_0()
-            .items_baseline()
-            .justify_between()
-            .gap(r(16.))
-            .text_size(r(14.))
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap(r(8.))
-                    .child(dot(provider_color(UsageProvider::Cursor, p)))
-                    .child(brand_mark("cursor", 16., hsla(p.foreground), cx))
-                    .child(div().truncate().child("Cursor")),
-            )
-            .child(
-                div()
-                    .id("usage-cursor-enable")
-                    .flex_none()
-                    .text_color(hsla(p.foreground))
-                    .when(pending, |this| this.opacity(0.64))
-                    .when(!pending, |this| this.cursor_pointer().hover(|style| style.underline()))
-                    .tooltip(|window, cx| tooltip_view(CURSOR_KEYCHAIN_COPY.into(), window, cx))
-                    .on_click(cx.listener(|this, _, _, cx| this.enable_cursor_keychain(cx)))
-                    .child("Enable"),
-            )
             .into_any_element()
     }
 

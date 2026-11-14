@@ -284,6 +284,8 @@ pub enum EventBody {
     ThreadDeleted(Box<AppThread>),
     /// `thread.visited`, `thread.tags-updated`, `thread.marked-unread`: not activity.
     ThreadTouched(Box<AppThread>),
+    /// `thread.visit-recorded`: read-state update (`lastVisitedAt`, `opens` live on `ThreadShell`), not activity.
+    ThreadVisitRecorded,
     ThreadPullRequestLinkUpdated,
     RunUpserted(Box<Run>),
     RunBackgroundWorkCancelled { run_id: String, restart_cancelled_background_work: Option<Value> },
@@ -344,6 +346,7 @@ fn decode_body(kind: &str, payload: Value) -> Result<EventBody, serde_json::Erro
         "thread.visited" | "thread.tags-updated" | "thread.marked-unread" => {
             EventBody::ThreadTouched(Box::new(from(payload)?))
         }
+        "thread.visit-recorded" => EventBody::ThreadVisitRecorded,
         "thread.pull-request-link-updated" => EventBody::ThreadPullRequestLinkUpdated,
         "run.created" | "run.updated" => EventBody::RunUpserted(Box::new(from(payload)?)),
         "run.background-work-cancelled" => EventBody::RunBackgroundWorkCancelled {

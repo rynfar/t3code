@@ -15,7 +15,7 @@ fn settings(value: serde_json::Value) -> ServerSettings {
 fn thread_settings_take_contract_defaults() {
     let decoded = settings(json!({}));
     assert_eq!(decoded.threads, ThreadSettings::default());
-    assert_eq!(decoded.threads.sidebar_auto_settle_after_days, Some(3));
+    assert_eq!(decoded.threads.sidebar_auto_settle_after_days, Some(7));
     assert!(decoded.threads.sidebar_auto_settle_on_merge);
     assert_eq!(decoded.threads.snooze_presets.len(), 5);
     assert_eq!(effective_env_mode(&decoded), ThreadEnvMode::Local);
@@ -48,7 +48,7 @@ fn thread_settings_decode_values_and_drop_bad_ones_alone() {
     assert_eq!(threads.response_streaming_mode, ResponseStreamingMode::Turn);
 
     let out_of_range = settings(json!({"sidebarAutoSettleAfterDays": 400, "snoozePresets": [{"kind": "at", "day": "today", "time": "25:00"}]}));
-    assert_eq!(out_of_range.threads.sidebar_auto_settle_after_days, Some(3));
+    assert_eq!(out_of_range.threads.sidebar_auto_settle_after_days, Some(7));
     assert_eq!(out_of_range.threads.snooze_presets, snooze::default_presets());
 }
 
@@ -56,7 +56,7 @@ fn thread_settings_decode_values_and_drop_bad_ones_alone() {
 fn every_flattened_key_reaches_thread_settings() {
     // A key `ServerSettings` also declares is consumed before the flattened struct sees it.
     let non_default = json!({
-        "sidebarAutoSettleAfterDays": 7,
+        "sidebarAutoSettleAfterDays": 3,
         "sidebarAutoSettleOnMerge": false,
         "sidebarAutoSettleKeepPullRequests": true,
         "autoResumeLimitedThreads": true,
@@ -72,7 +72,7 @@ fn every_flattened_key_reaches_thread_settings() {
         only.insert(key.clone(), non_default[key].clone());
         assert_ne!(settings(serde_json::Value::Object(only)).threads, defaults, "{key} is shadowed");
     }
-    assert_eq!(decoded.sidebar_auto_settle_after_days, Some(7));
+    assert_eq!(decoded.sidebar_auto_settle_after_days, Some(3));
 }
 
 #[test]
@@ -400,8 +400,8 @@ fn binding_rows_mark_sources_defaults_and_conflicts() {
 fn conflicts_compare_resolved_chords_per_platform() {
     let config = json!([{"command": "chat.find", "shortcut": shortcut("f", &["ctrl"])}]);
     let rows = keybindings::binding_rows(&config, false);
-    // Off macOS, mod is Ctrl: a ctrl+f binding collides with mod+f, but meta+f does not.
-    assert_eq!(keybindings::conflict_labels(&rows, "new", "mod+f", "", false), vec!["Chat: Find"]);
+    // Off macOS, mod is Ctrl: a ctrl+f binding collides with mod+f (alongside preview.find's default mod+f), but meta+f does not.
+    assert_eq!(keybindings::conflict_labels(&rows, "new", "mod+f", "", false), vec!["Chat: Find", "Preview: Find on Page"]);
     assert!(keybindings::conflict_labels(&rows, "new", "meta+f", "", false).is_empty());
     assert!(keybindings::conflict_labels(&rows, "new", "", "", false).is_empty());
     assert_eq!(keybindings::conflict_description(&["A".into(), "B".into(), "C".into(), "D".into()]).unwrap(), "Conflicts with A, B, C, and more.");

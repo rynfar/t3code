@@ -33,7 +33,7 @@ literals!(PrState { Open = "open", Closed = "closed", Merged = "merged" });
 literals!(ReviewDecision { Approved = "approved", ChangesRequested = "changes-requested", ReviewRequired = "review-required" });
 literals!(ChecksState { Passing = "passing", Failing = "failing", Pending = "pending" });
 literals!(Mergeability { Mergeable = "mergeable", Conflicting = "conflicting" });
-literals!(MergeMethod { Merge = "merge", Squash = "squash", Rebase = "rebase" });
+literals!(MergeMethod { Merge = "merge", Squash = "squash", Rebase = "rebase", FastForward = "fast-forward" });
 literals!(
     /// `PullRequestAction`.
     Action {
@@ -246,6 +246,8 @@ pub struct MergeCapabilities {
     pub squash: bool,
     #[serde(default)]
     pub rebase: bool,
+    #[serde(default, rename = "fast-forward")]
+    pub fast_forward: bool,
 }
 
 impl MergeCapabilities {
@@ -254,6 +256,7 @@ impl MergeCapabilities {
             MergeMethod::Merge => self.merge,
             MergeMethod::Squash => self.squash,
             MergeMethod::Rebase => self.rebase,
+            MergeMethod::FastForward => self.fast_forward,
             MergeMethod::Unknown => false,
         }
     }
@@ -455,4 +458,24 @@ pub fn decode<T: DeserializeOwned>(value: Value) -> Result<T, String> {
 /// `pullRequests.checks` answers null when the host reports nothing.
 pub fn decode_checks(value: Value) -> Result<Option<Checks>, String> {
     if value.is_null() { Ok(None) } else { decode(value).map(Some) }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn fast_forward_merge_method_and_capability_decode() {
+        let method: MergeMethod = serde_json::from_value(json!("fast-forward")).unwrap();
+        assert_eq!(method, MergeMethod::FastForward);
+        assert_eq!(method.as_str(), "fast-forward");
+
+        let capabilities: MergeCapabilities =
+            serde_json::from_value(json!({ "merge": false, "squash": false, "rebase": false, "fast-forward": true }))
+                .unwrap();
+        assert!(capabilities.allows(MergeMethod::FastForward));
+        assert!(!capabilities.allows(MergeMethod::Merge));
+    }
 }
