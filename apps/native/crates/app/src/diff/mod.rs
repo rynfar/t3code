@@ -12,18 +12,23 @@ mod source;
 mod tree;
 mod view;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     ClipboardItem, Context, Entity, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Pixels, Render,
-    Styled, Subscription, Task, UniformListScrollHandle, Window, div, prelude::*, px,
+    Styled, Subscription, Task, UniformListScrollHandle, Window, div, point, prelude::*, px,
 };
 use gpui_component::v_flex;
 use t3_client::supervisor::ConnectionStatus;
+use t3_core::composer::review::Side;
 use t3_core::diff::{
-    DiffScope, DiffSelection, DiffSession, Layout, ParsedPatch, TurnDiffSummary, turn_diff_summaries, workspace_mutation_id,
+    DiffLine, DiffScope, DiffSelection, DiffSession, FileReveal, FileRevealTarget, Layout,
+    ParsedPatch, RevealAction, ScrollRestore, ScrollRestoreAction, TurnDiffSummary,
+    line_number_for_side, turn_diff_summaries, workspace_mutation_id,
 };
 use t3_core::right_panel::SurfaceKind;
 
@@ -81,12 +86,17 @@ pub struct DiffPanel {
     char_width: Option<Pixels>,
     top_file: Option<usize>,
     selected_file: Option<String>,
-    handled_reveal: Option<(String, String, u64)>,
+    file_reveal: FileReveal,
+    scroll_restore: ScrollRestore,
+    external_scroll_handler: Rc<RefCell<Option<ScrollHandler>>>,
     /// A patch from outside the thread (a pull request's Code tab) replaces the scopes.
     external: Option<External>,
     comments: comments::Comments,
+    comments_config: comments::CommentsConfig,
     _subscription: Subscription,
 }
+
+type ScrollHandler = Box<dyn FnMut(&gpui::ListScrollEvent, &mut Window, &mut gpui::App)>;
 
 struct Fetch {
     network: tokio::task::AbortHandle,
@@ -110,11 +120,6 @@ pub struct External {
 impl DiffPanel {
     pub fn new(state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut panel = Self::construct(state, cx);
-        let entity = cx.entity().downgrade();
-        panel.list.set_scroll_handler(move |_, _, cx| {
-            let entity = entity.clone();
-            cx.defer(move |cx| { if let Some(entity) = entity.upgrade() { entity.update(cx, |panel, cx| panel.load_nearby(cx)); } });
-        });
         #[cfg(feature = "snapshot")]
         if snapshot::install(&mut panel, cx) { return panel; }
         panel.sync(cx);
@@ -131,7 +136,8 @@ impl DiffPanel {
                 this.sync(cx);
             }
         });
-        DiffPanel {
+        let external_scroll_handler: Rc<RefCell<Option<ScrollHandler>>> = Rc::new(RefCell::new(None));
+        let panel = DiffPanel {
             state,
             thread_id: None,
             fingerprint: (0, None),
@@ -172,11 +178,30 @@ impl DiffPanel {
             char_width: None,
             top_file: None,
             selected_file: None,
-            handled_reveal: None,
+            file_reveal: FileReveal::default(),
+            scroll_restore: ScrollRestore::default(),
+            external_scroll_handler: external_scroll_handler.clone(),
             external: None,
             comments: comments::Comments::default(),
+            comments_config: comments::CommentsConfig::default(),
             _subscription: subscription,
-        }
+        };
+        let entity = cx.entity().downgrade();
+        panel.list.set_scroll_handler(move |event, window, cx| {
+            if let Some(handler) = external_scroll_handler.borrow_mut().as_mut() {
+                handler(event, window, cx);
+            }
+            let entity = entity.clone();
+            cx.defer(move |cx| {
+                if let Some(entity) = entity.upgrade() {
+                    entity.update(cx, |panel, cx| {
+                        panel.on_list_scrolled();
+                        panel.load_nearby(cx);
+                    });
+                }
+            });
+        });
+        panel
     }
 
     /// A panel that shows `show_external`'s patch instead of the open thread's scopes.
@@ -219,6 +244,8 @@ impl DiffPanel {
             self.git_fetched_at = None;
             self.connected = false;
             self.comments = comments::Comments::default();
+            self.file_reveal.reset();
+            self.scroll_restore = ScrollRestore::default();
             self._grants = None;
             if let Some(client) = self.state.read(cx).client_handle() {
                 let mut grants = client.session_state();
@@ -243,7 +270,7 @@ impl DiffPanel {
             self.summaries = Arc::new(Vec::new());
             self.workspace_mutation = None;
             self.selected_file = None;
-            self.handled_reveal = None;
+            self.file_reveal.reset();
             self.tree_collapsed.clear();
         }
         let Some(thread_id) = thread_id else {
@@ -565,15 +592,30 @@ impl DiffPanel {
         format!("{}:{section}", self.thread_id.as_deref().unwrap_or_default())
     }
 
+    fn sync_scope_for_rebuild(&mut self) -> String {
+        let scope_key = self.scope_key();
+        if self.comments.scope != scope_key {
+            self.comments = comments::Comments::default();
+            self.comments.scope = scope_key.clone();
+        }
+        if self.scroll_restore.current_scope() != Some(scope_key.as_str()) {
+            self.file_reveal.reset();
+        }
+        if let DiffSelection::Turn { file_path: Some(path), reveal_request_id, .. } = &self.selection {
+            self.file_reveal.request(&scope_key, *reveal_request_id, FileRevealTarget::file(path));
+        }
+        self.scroll_restore.sync_scope(&scope_key, self.file_reveal.has_pending());
+        scope_key
+    }
+
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        let scope_key = self.sync_scope_for_rebuild();
         let Some(parsed) = self.current() else {
             if self.view.take().is_some() {
                 self.list.reset(0);
             }
             return;
         };
-        let scope_key = self.scope_key();
-        if self.comments.scope != scope_key { self.comments = comments::Comments::default(); self.comments.scope = scope_key.clone(); }
 
         let layout = crate::settings::client_settings(cx).diff_layout();
         let files_collapsed_default = crate::settings::client_settings(cx).diff_files_collapsed();
@@ -582,6 +624,9 @@ impl DiffPanel {
         });
         if same {
             self.reveal_requested(cx);
+            if self.scroll_restore.has_pending() {
+                cx.notify();
+            }
             return;
         }
         // A refresh of the scope on screen keeps the reader's place.
@@ -606,7 +651,10 @@ impl DiffPanel {
         if self.comments.editor.as_ref().is_some_and(|editor| !(0..view.parsed.files().len()).any(|i| view.key(i) == Some(editor.file_key.as_str()))) { self.comments.editor = None; }
         let count = view.row_count();
         match changes {
-            Some(changes) => view::apply_row_changes(&self.list, changes),
+            Some(changes) => {
+                view::apply_row_changes(&self.list, changes);
+                let _ = self.list.clone().with_uniform_item_height(px(lines::LINE_HEIGHT));
+            }
             None => self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT)),
         }
         let keep = keep.and_then(|(key, within, offset_in_item)| {
@@ -645,9 +693,11 @@ impl DiffPanel {
     /// `toggleAllDiffFiles`: expands every file when all are collapsed, else collapses all.
     pub fn toggle_all_files(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.view.as_mut() else { return };
+        let scope_key = view.scope_key.clone();
         let fold = !view.all_folded();
         view.set_all_folded(fold);
-        self.session.remember_folds(view.scope_key.clone(), view.folded_keys());
+        self.session.remember_folds(scope_key.clone(), view.folded_keys());
+        self.scroll_restore.discard(&scope_key);
         self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
         cx.notify();
     }
@@ -655,7 +705,7 @@ impl DiffPanel {
     /// Runs `handler` after each scroll of the rows, for a detached panel that loads more as
     /// the reader nears the end.
     pub fn on_rows_scrolled(&self, handler: impl FnMut(&gpui::ListScrollEvent, &mut Window, &mut gpui::App) + 'static) {
-        self.list.set_scroll_handler(handler);
+        *self.external_scroll_handler.borrow_mut() = Some(Box::new(handler));
     }
 
     /// Whether the last row sits within `margin` below the viewport, as last laid out.
@@ -678,9 +728,13 @@ impl DiffPanel {
 
     /// Reveals a file: unfolds it and scrolls its header to the top (`revealDiffFile`).
     pub fn reveal_file(&mut self, file: usize, cx: &mut Context<Self>) {
-        let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|file| file.path().to_owned()) else {
+        let Some((path, scope_key)) = self.view.as_ref().and_then(|view| {
+            view.parsed.files().get(file).map(|f| (f.path().to_owned(), view.scope_key.clone()))
+        }) else {
             return;
         };
+        self.file_reveal.clear_highlight();
+        self.scroll_restore.discard(&scope_key);
         self.set_folded(file, false, cx);
         if let Some(index) = self.view.as_ref().and_then(|view| view.header_row(file)) {
             self.list.scroll_to(ListOffset { item_ix: index, offset_in_item: px(0.) });
@@ -691,17 +745,173 @@ impl DiffPanel {
         cx.notify();
     }
 
-    /// A turn's "files changed" link asked for a file: reveal it once per request.
+    /// Reveals a file path or line range (`useCodeViewFileReveal`), unfolding if collapsed and
+    /// requesting lazy file patches if not loaded yet (host hook for `PR-*` in `#389`).
+    #[allow(dead_code)]
+    pub fn reveal_file_path(
+        &mut self,
+        request_id: u64,
+        target: FileRevealTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let scope_key = self.scope_key();
+        if self.file_reveal.request(&scope_key, request_id, target) {
+            self.scroll_restore.discard(&scope_key);
+            self.reveal_requested(cx);
+            cx.notify();
+        }
+    }
+
+    /// A turn's "files changed" link or `reveal_file_path` asked for a target: resolve once ready.
     fn reveal_requested(&mut self, cx: &mut Context<Self>) {
-        let DiffSelection::Turn { file_path: Some(path), reveal_request_id, .. } = &self.selection else { return };
-        let Some(view) = self.view.as_ref() else { return };
-        let marker = (view.scope_key.clone(), path.clone(), *reveal_request_id);
-        if self.handled_reveal.as_ref() == Some(&marker) {
+        if !self.file_reveal.has_pending() {
             return;
         }
-        if let Some(file) = view.parsed.files().iter().position(|file| file.path() == path) {
-            self.handled_reveal = Some(marker);
-            self.reveal_file(file, cx);
+        if let Some(pending_path) = self.file_reveal.pending_path().map(str::to_owned)
+            && let Some(file_ix) = self.view.as_ref().and_then(|view| {
+                view.parsed.files().iter().position(|f| t3_core::diff::file_matches_path(f, &pending_path))
+            })
+        {
+            // Ensure the file is unfolded before resolving a line target inside its rows.
+            self.set_folded(file_ix, false, cx);
+            if self.file_patch_state(&pending_path).is_some_and(|state| state.files.is_none()) {
+                self.patch_command(source::Command::File(pending_path.clone()));
+            }
+        }
+
+        let action = {
+            let Some(view) = self.view.as_ref() else { return };
+            let patch_pending = !self.is_settled()
+                || self
+                    .file_reveal
+                    .pending_path()
+                    .and_then(|path| self.file_patch_state(path))
+                    .is_some_and(|state| state.files.is_none() && (state.pending || state.error.is_none()));
+            self.file_reveal.resolve_with(view.parsed.files(), patch_pending, |file_ix| {
+                let base = view.header_row(file_ix).unwrap_or(0);
+                let rows = view.file_rows_slice(file_ix).unwrap_or(&[]);
+                (0, base, rows)
+            })
+        };
+
+        match action {
+            RevealAction::None => {}
+            RevealAction::RequestPatch { path } => {
+                self.patch_command(source::Command::File(path));
+            }
+            RevealAction::ScrollToFile { file, path } => {
+                self.set_folded(file, false, cx);
+                if let Some(index) = self.view.as_ref().and_then(|view| view.header_row(file)) {
+                    self.list.scroll_to(ListOffset { item_ix: index, offset_in_item: px(0.) });
+                    self.top_file = Some(file);
+                }
+                self.patch_command(source::Command::File(path.clone()));
+                self.selected_file = Some(path);
+                cx.notify();
+            }
+            RevealAction::ScrollToRow { file, path, row, .. } => {
+                let viewport_h = f32::from(self.list.viewport_bounds().size.height);
+                if viewport_h > 0.0 {
+                    let row_top = f32::from(self.list.offset_for_item(row));
+                    let center_lead = ((viewport_h - lines::LINE_HEIGHT) * 0.5).max(32.0);
+                    let target_top = (row_top - center_lead).max(0.0);
+                    self.list.set_offset_from_scrollbar(point(px(0.), px(-target_top)));
+                } else {
+                    let header = self.view.as_ref().and_then(|view| view.header_row(file)).unwrap_or(0);
+                    let item_ix = row.saturating_sub(2).max(header);
+                    self.list.scroll_to(ListOffset { item_ix, offset_in_item: px(0.) });
+                }
+                self.top_file = Some(file);
+                self.selected_file = Some(path);
+                cx.notify();
+            }
+        }
+    }
+
+    pub(super) fn cancel_navigation_on_interaction(&mut self) {
+        self.file_reveal.cancel_on_user_interaction();
+        self.scroll_restore.cancel_pending();
+    }
+
+    pub(super) fn is_revealed_line(&self, file: usize, line: &DiffLine, side: Option<Side>) -> bool {
+        let Some(view) = &self.view else { return false };
+        let Some(diff) = view.parsed.files().get(file) else { return false };
+        let Some((start, end, target_side)) = self.file_reveal.highlight_for(diff.path()) else {
+            return false;
+        };
+        let row_side = match (side, line.kind) {
+            (Some(s), _) => Some(s),
+            (None, t3_core::diff::LineKind::Deletion) => Some(Side::Deletions),
+            (None, t3_core::diff::LineKind::Addition) => Some(Side::Additions),
+            (None, t3_core::diff::LineKind::Context) => None,
+        };
+        if let (Some(req_side), Some(row_side)) = (target_side, row_side)
+            && req_side != row_side
+        {
+            return false;
+        }
+        let Some(num) = line_number_for_side(line, target_side.or(row_side)) else {
+            return false;
+        };
+        (start..=end).contains(&num)
+    }
+
+    fn is_settled(&self) -> bool {
+        if let Some(external) = &self.external {
+            return !external.pending;
+        }
+        if self.pending {
+            return false;
+        }
+        if let Some(review) = self.review().filter(|review| review.lazy()) {
+            return !review
+                .files()
+                .iter()
+                .any(|file| review.state(file).is_none_or(|state| state.pending));
+        }
+        true
+    }
+
+    fn max_scroll_top_px(&self) -> Option<f32> {
+        let viewport_h = f32::from(self.list.viewport_bounds().size.height);
+        if viewport_h <= 0.0 {
+            return None;
+        }
+        Some(f32::from(self.list.max_offset_for_scrollbar().y).max(0.0))
+    }
+
+    fn on_list_scrolled(&mut self) {
+        if self.view.is_none() {
+            return;
+        }
+        let scope_key = self.scope_key();
+        let top = f32::from(-self.list.scroll_px_offset_for_scrollbar().y);
+        self.scroll_restore.on_scroll(&scope_key, top);
+    }
+
+    pub(super) fn apply_pending_scroll_restore(&mut self, cx: &mut Context<Self>) {
+        if self.file_reveal.has_pending() || !self.scroll_restore.has_pending() {
+            return;
+        }
+        let settled = self.is_settled();
+        let Some(max_top) = self.max_scroll_top_px() else {
+            if !settled && self.review().is_some_and(|review| review.lazy()) {
+                self.patch_command(source::Command::Next);
+            }
+            return;
+        };
+        let scope_key = self.scope_key();
+        let need_more = match self.scroll_restore.apply(&scope_key, max_top, settled) {
+            ScrollRestoreAction::None => false,
+            ScrollRestoreAction::ScrollTo { offset_px, done } => {
+                self.list.set_offset_from_scrollbar(point(px(0.), px(-offset_px)));
+                cx.notify();
+                !done
+            }
+            ScrollRestoreAction::WaitMore => true,
+        };
+        if need_more && !settled && self.review().is_some_and(|review| review.lazy()) {
+            self.patch_command(source::Command::Next);
         }
     }
 
@@ -921,3 +1131,6 @@ impl Render for DiffPanel {
             .child(self.render_body(window, cx))
     }
 }
+
+#[cfg(test)]
+mod tests;

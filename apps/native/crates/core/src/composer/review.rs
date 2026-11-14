@@ -295,9 +295,134 @@ pub fn format_fence(language: &str, contents: &str) -> String {
     format!("{fence}{language}\n{}\n{fence}", contents.trim_end())
 }
 
+/// Speech/dictation lifecycle state for an inline diff comment editor (`TextFieldSpeechControls`
+/// readiness for Phase C5 `#376`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CommentDictationState {
+    #[default]
+    Idle,
+    Preparing,
+    Active,
+}
+
+impl CommentDictationState {
+    pub const fn is_idle(self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    pub const fn is_preparing(self) -> bool {
+        matches!(self, Self::Preparing)
+    }
+
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// True while speech capture owns the comment field so typing and submission wait until idle.
+    pub const fn is_frozen(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    pub const fn blocks_submission(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
+/// Inserts a recognized dictation `transcript` at `[range_start..range_end]` inside `draft`,
+/// adding separating spaces when abutting non-whitespace text, and returns `(next, caret)`.
+pub fn insert_dictation_transcript(
+    draft: &str,
+    range_start: usize,
+    range_end: usize,
+    transcript: &str,
+) -> (String, usize) {
+    let trimmed = transcript.trim();
+    if trimmed.is_empty() {
+        let end = range_end.min(draft.len());
+        return (draft.to_owned(), end);
+    }
+    let mut start = range_start.min(draft.len());
+    while start > 0 && !draft.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = range_end.min(draft.len()).max(start);
+    while end > start && !draft.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let before = &draft[..start];
+    let after = &draft[end..];
+    let need_leading_space =
+        before.chars().next_back().is_some_and(|ch| !ch.is_whitespace());
+    let need_trailing_space =
+        after.chars().next().is_some_and(|ch| !ch.is_whitespace());
+
+    let mut out = String::with_capacity(
+        before.len() + trimmed.len() + after.len() + usize::from(need_leading_space) + usize::from(need_trailing_space),
+    );
+    out.push_str(before);
+    if need_leading_space {
+        out.push(' ');
+    }
+    out.push_str(trimmed);
+    let caret = out.len();
+    if need_trailing_space {
+        out.push(' ');
+    }
+    out.push_str(after);
+    (out, caret)
+}
+
 pub fn is_submit_shortcut(key: &str, meta: bool, ctrl: bool, value: &str, pending: bool) -> bool {
     !pending && (meta || ctrl) && key == "enter" && !value.trim().is_empty()
 }
 
+pub fn is_submit_shortcut_with_dictation(
+    key: &str,
+    meta: bool,
+    ctrl: bool,
+    value: &str,
+    dictation: CommentDictationState,
+) -> bool {
+    is_submit_shortcut(key, meta, ctrl, value, dictation.blocks_submission())
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod dictation_tests {
+    use super::*;
+
+    #[test]
+    fn dictation_blocks_submission_while_preparing_or_active() {
+        assert!(!CommentDictationState::Idle.is_frozen());
+        assert!(CommentDictationState::Preparing.is_frozen());
+        assert!(CommentDictationState::Active.blocks_submission());
+        assert!(is_submit_shortcut_with_dictation(
+            "enter",
+            true,
+            false,
+            "Looks good",
+            CommentDictationState::Idle
+        ));
+        assert!(!is_submit_shortcut_with_dictation(
+            "enter",
+            true,
+            false,
+            "Looks good",
+            CommentDictationState::Active
+        ));
+    }
+
+    #[test]
+    fn dictation_transcript_inserts_with_word_boundaries() {
+        let (next, caret) = insert_dictation_transcript("Fix bug", 7, 7, "in parser");
+        assert_eq!(next, "Fix bug in parser");
+        assert_eq!(caret, next.len());
+
+        let (mid, mid_caret) = insert_dictation_transcript("Check edgecase", 6, 6, "null");
+        assert_eq!(mid, "Check null edgecase");
+        assert_eq!(mid_caret, "Check null".len());
+    }
+}
