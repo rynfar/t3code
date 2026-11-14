@@ -28,6 +28,8 @@ pub enum AssetResource {
     /// An attachment served inline under its own name and type, as an HTML render frame loads
     /// its page.
     InlineAttachment { attachment_id: String, file_name: String, mime_type: String },
+    /// Change-request media hosted behind source-control credentials (`SOURCE_CONTROL_MEDIA_ASSET`).
+    SourceControlMedia { cwd: String, url: String, repository: Option<String> },
 }
 
 impl AssetResource {
@@ -45,12 +47,30 @@ impl AssetResource {
                 "mimeType": mime_type,
                 "disposition": "inline",
             }),
+            AssetResource::SourceControlMedia { cwd, url, repository } => {
+                let mut map = serde_json::Map::new();
+                map.insert("_tag".into(), Value::String("github-media".into()));
+                map.insert("cwd".into(), Value::String(cwd.clone()));
+                map.insert("url".into(), Value::String(url.clone()));
+                if let Some(repository) = repository.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+                    map.insert("repository".into(), Value::String(repository.to_owned()));
+                }
+                Value::Object(map)
+            }
         }
     }
 
     /// `AssetCreateUrlInput`.
     pub fn create_url_request(&self) -> Value {
         json!({ "resource": self.to_json() })
+    }
+
+    /// Direct host fallback URL when `SourceControlMedia` minting fails (`fallbackSrc={hostMediaUrl}`).
+    pub fn fallback_url(&self) -> Option<&str> {
+        match self {
+            AssetResource::SourceControlMedia { url, .. } => Some(url.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -145,6 +165,70 @@ pub fn image_attachments(attachments: &[Value]) -> Vec<ImageAttachment> {
             })
         })
         .collect()
+}
+
+/// One video attachment of a user message (`isVideoAttachment` in `packages/shared/src/video.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoAttachment {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub downloadable: bool,
+}
+
+impl VideoAttachment {
+    pub fn source(&self) -> MediaSource {
+        MediaSource::Asset(AssetResource::Attachment { attachment_id: self.id.clone() })
+    }
+}
+
+fn is_generic_mime(mime: &str) -> bool {
+    matches!(mime, "" | "application/octet-stream" | "binary/octet-stream")
+}
+
+/// Resolves video MIME type from explicit metadata or extension (`videoMimeType`).
+pub fn video_mime_type(mime_type: &str, name: &str) -> Option<String> {
+    let mime = mime_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+    if mime.starts_with("video/") && !is_generic_mime(&mime) {
+        return Some(mime);
+    }
+    if !is_generic_mime(&mime) {
+        return None;
+    }
+    let extension = name.rfind('.').map(|index| &name[index..])?;
+    video_mime_from_extension(extension).map(str::to_owned)
+}
+
+/// Returns true when `attachment` is a user-message video attachment.
+pub fn is_video_attachment(attachment: &Value) -> bool {
+    let kind = text(attachment, "kind");
+    let ty = text(attachment, "type");
+    if ty != "file" && ty != "video" && kind != "video" {
+        return false;
+    }
+    video_mime_type(text(attachment, "mimeType"), text(attachment, "name")).is_some()
+}
+
+/// Extracts video attachments from a user message (`userVideos`).
+pub fn video_attachments(attachments: &[Value]) -> Vec<VideoAttachment> {
+    attachments
+        .iter()
+        .filter(|attachment| is_video_attachment(attachment))
+        .filter_map(|attachment| {
+            let id = text(attachment, "id");
+            (!id.is_empty()).then(|| VideoAttachment {
+                id: id.to_owned(),
+                name: text(attachment, "name").to_owned(),
+                mime_type: video_mime_type(text(attachment, "mimeType"), text(attachment, "name")).unwrap_or_else(|| "video/*".to_owned()),
+                downloadable: attachment.get("downloadable").and_then(Value::as_bool) != Some(false),
+            })
+        })
+        .collect()
+}
+
+/// Returns true when a workspace file path is a supported video preview (`isWorkspaceVideoPreviewPath`).
+pub fn is_workspace_video_preview_path(path: &str) -> bool {
+    video_mime_type("", basename(path)).is_some()
 }
 
 /// A transcript file row (`GuestMessageAttachments.tsx`), including legacy records without size.
@@ -356,6 +440,212 @@ pub enum MediaKind {
     Video,
 }
 
+/// Parsed GitHub/source-control media URL (`gitHubMediaUrl` in `gitHubMedia.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceControlMediaUrl {
+    pub fetch_url: String,
+    pub file_name: Option<String>,
+    pub kind: Option<MediaKind>,
+    pub immutable: bool,
+}
+
+/// Authored dimension and tag-type metadata preserved across HTML -> Markdown preprocessing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct MediaHints {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub explicit_video: bool,
+}
+
+impl MediaHints {
+    pub fn is_empty(self) -> bool {
+        self.width.is_none() && self.height.is_none() && !self.explicit_video
+    }
+}
+
+const MEDIA_TITLE_MARKER: char = '\u{2063}';
+const MEDIA_TITLE_PREFIX: &str = "\u{2063}t3m:";
+
+/// Encodes optional `MediaHints` alongside an optional human title inside an image destination's title.
+pub fn encode_media_title(hints: MediaHints, title: Option<&str>) -> Option<String> {
+    let user_title = title.map(str::trim).filter(|t| !t.is_empty());
+    if hints.is_empty() {
+        return user_title.map(str::to_owned);
+    }
+    let mut parts = Vec::new();
+    if let Some(w) = hints.width.filter(|&w| w > 0) {
+        parts.push(format!("w={w}"));
+    }
+    if let Some(h) = hints.height.filter(|&h| h > 0) {
+        parts.push(format!("h={h}"));
+    }
+    if hints.explicit_video {
+        parts.push("v=1".into());
+    }
+    let mut out = format!("{MEDIA_TITLE_PREFIX}{}{MEDIA_TITLE_MARKER}", parts.join(","));
+    if let Some(user_title) = user_title {
+        out.push_str(user_title);
+    }
+    Some(out)
+}
+
+/// Extracts `MediaHints` and the user-visible title from an encoded Markdown image title.
+pub fn decode_media_title(raw: Option<&str>) -> (Option<String>, MediaHints) {
+    let Some(raw) = raw else { return (None, MediaHints::default()) };
+    let Some(rest) = raw.strip_prefix(MEDIA_TITLE_PREFIX) else {
+        let trimmed = raw.trim();
+        return ((!trimmed.is_empty()).then(|| trimmed.to_owned()), MediaHints::default());
+    };
+    let Some((meta, tail)) = rest.split_once(MEDIA_TITLE_MARKER) else {
+        return (Some(raw.to_owned()), MediaHints::default());
+    };
+    let mut hints = MediaHints::default();
+    for item in meta.split(',') {
+        if let Some(w) = item.strip_prefix("w=").and_then(|v| v.parse::<u32>().ok()).filter(|&v| v > 0) {
+            hints.width = Some(w);
+        } else if let Some(h) = item.strip_prefix("h=").and_then(|v| v.parse::<u32>().ok()).filter(|&v| v > 0) {
+            hints.height = Some(h);
+        } else if item == "v=1" {
+            hints.explicit_video = true;
+        }
+    }
+    let cleaned = tail.trim();
+    ((!cleaned.is_empty()).then(|| cleaned.to_owned()), hints)
+}
+
+/// Strips any internal `MediaHints` prefix from a string.
+pub fn strip_media_title_meta(raw: &str) -> String {
+    if !raw.contains(MEDIA_TITLE_PREFIX) {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut cursor = raw;
+    while let Some(pos) = cursor.find(MEDIA_TITLE_PREFIX) {
+        out.push_str(&cursor[..pos]);
+        let after_prefix = &cursor[pos + MEDIA_TITLE_PREFIX.len()..];
+        if let Some((_, tail)) = after_prefix.split_once(MEDIA_TITLE_MARKER) {
+            cursor = tail;
+        } else {
+            out.push_str(&cursor[pos..]);
+            cursor = "";
+            break;
+        }
+    }
+    out.push_str(cursor);
+    out
+}
+
+fn is_commit_sha(reference: &str) -> bool {
+    reference.len() == 40 && reference.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn file_name_from_segment(segment: &str) -> Option<String> {
+    let decoded = percent_decode(segment);
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+pub fn parse_source_control_media_url(raw_url: &str) -> Option<SourceControlMediaUrl> {
+    let parsed = url::Url::parse(raw_url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let pathname = parsed.path();
+    let trimmed = pathname.strip_prefix('/')?;
+    let segments: Vec<&str> = trimmed.split('/').collect();
+
+    if host == "github.com" || host == "www.github.com" {
+        if segments.len() == 3 && segments[0] == "user-attachments" && segments[1] == "assets" && !segments[2].is_empty() {
+            return Some(SourceControlMediaUrl {
+                fetch_url: format!("https://github.com{pathname}"),
+                file_name: file_name_from_segment(segments[2]),
+                kind: Some(MediaKind::Video),
+                immutable: true,
+            });
+        }
+        if segments.len() == 5
+            && !segments[0].is_empty()
+            && !segments[1].is_empty()
+            && segments[2] == "assets"
+            && !segments[3].is_empty()
+            && segments[3].bytes().all(|b| b.is_ascii_digit())
+            && !segments[4].is_empty()
+        {
+            return Some(SourceControlMediaUrl {
+                fetch_url: format!("https://github.com{pathname}"),
+                file_name: file_name_from_segment(segments[4]),
+                kind: None,
+                immutable: true,
+            });
+        }
+        if segments.len() >= 5
+            && !segments[0].is_empty()
+            && !segments[1].is_empty()
+            && matches!(segments[2], "blob" | "raw")
+            && !segments[3].is_empty()
+        {
+            let rest = segments[4..].join("/");
+            if !rest.is_empty() && !segments.last().is_some_and(|s| s.is_empty()) {
+                return Some(SourceControlMediaUrl {
+                    fetch_url: format!("https://raw.githubusercontent.com/{}/{}/{}/{}", segments[0], segments[1], segments[3], rest),
+                    file_name: segments.last().and_then(|s| file_name_from_segment(s)),
+                    kind: None,
+                    immutable: is_commit_sha(segments[3]),
+                });
+            }
+        }
+        return None;
+    }
+
+    if host == "raw.githubusercontent.com" {
+        if segments.len() >= 4
+            && !segments[0].is_empty()
+            && !segments[1].is_empty()
+            && !segments[2].is_empty()
+            && !segments[3..].join("/").is_empty()
+            && !segments.last().is_some_and(|s| s.is_empty())
+        {
+            return Some(SourceControlMediaUrl {
+                fetch_url: format!("https://raw.githubusercontent.com{pathname}"),
+                file_name: segments.last().and_then(|s| file_name_from_segment(s)),
+                kind: None,
+                immutable: is_commit_sha(segments[2]),
+            });
+        }
+        return None;
+    }
+
+    if host == "media.githubusercontent.com" {
+        if segments.len() >= 5
+            && segments[0] == "media"
+            && !segments[1].is_empty()
+            && !segments[2].is_empty()
+            && !segments[3].is_empty()
+            && !segments[4..].join("/").is_empty()
+            && !segments.last().is_some_and(|s| s.is_empty())
+        {
+            return Some(SourceControlMediaUrl {
+                fetch_url: format!("https://media.githubusercontent.com{pathname}"),
+                file_name: segments.last().and_then(|s| file_name_from_segment(s)),
+                kind: None,
+                immutable: false,
+            });
+        }
+        return None;
+    }
+
+    None
+}
+
+/// Optional source-control credential proxy context for change-request markdown bodies.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MediaResolveOptions<'a> {
+    pub explicit_video: bool,
+    pub source_control_media: bool,
+    pub source_control_cwd: Option<&'a str>,
+    pub source_control_repository: Option<&'a str>,
+}
+
 /// What an authored media destination resolves to (`ResolvedMediaSource`). `source` is `None`
 /// when a host file has no thread to read it through (`access: "unavailable"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +662,16 @@ fn basename(path: &str) -> &str {
 /// `resolveMediaSource`. `image_embed` is markdown image syntax, which may target an endpoint
 /// with no recognizable extension.
 pub fn resolve_media_source(source: &str, thread_id: Option<&str>, workspace_root: Option<&str>, image_embed: bool) -> Option<ResolvedMedia> {
+    resolve_media_source_with_options(source, thread_id, workspace_root, image_embed, MediaResolveOptions::default())
+}
+
+pub fn resolve_media_source_with_options(
+    source: &str,
+    thread_id: Option<&str>,
+    workspace_root: Option<&str>,
+    image_embed: bool,
+    options: MediaResolveOptions<'_>,
+) -> Option<ResolvedMedia> {
     let classified = classify_markdown_image_source(source, workspace_root);
     let (path, direct) = match &classified {
         MarkdownImageSource::Blocked => return None,
@@ -381,6 +681,13 @@ pub fn resolve_media_source(source: &str, thread_id: Option<&str>, workspace_roo
         }
         MarkdownImageSource::WorkspaceFile(path) => (path.clone(), None),
     };
+    let normalized_direct = direct.map(|uri| if uri.starts_with("//") { format!("https:{uri}") } else { uri.to_owned() });
+    let sc_media = if options.source_control_media {
+        normalized_direct.as_deref().and_then(parse_source_control_media_url)
+    } else {
+        None
+    };
+
     let name = basename(&path);
     let extension = name.rfind('.').map(|index| &name[index..]).unwrap_or_default();
     let data_mime = direct.filter(|uri| starts_with_ignore_case(uri, "data:")).and_then(|uri| uri[5..].split([';', ',']).next()).map(str::to_ascii_lowercase);
@@ -388,16 +695,30 @@ pub fn resolve_media_source(source: &str, thread_id: Option<&str>, workspace_roo
         Some(mime) if mime.starts_with("image/") => Some(MediaKind::Image),
         Some(mime) if mime.starts_with("video/") => Some(MediaKind::Video),
         Some(_) => None,
+        None if options.explicit_video => Some(MediaKind::Video),
         None if image_mime_from_extension(extension).is_some() => Some(MediaKind::Image),
         None if video_mime_from_extension(extension).is_some() => Some(MediaKind::Video),
         None if AUDIO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) => return None,
+        None if sc_media.as_ref().and_then(|sc| sc.kind).is_some() => sc_media.as_ref().and_then(|sc| sc.kind),
         None => image_embed.then_some(MediaKind::Image),
     }?;
-    let name = if name.is_empty() { if kind == MediaKind::Video { "video" } else { "image" }.to_owned() } else { name.to_owned() };
-    let source = match (direct, thread_id) {
-        (Some(uri), _) => Some(MediaSource::Direct(if uri.starts_with("//") { format!("https:{uri}") } else { uri.to_owned() })),
-        (None, Some(thread_id)) => Some(MediaSource::Asset(AssetResource::MediaFile { thread_id: thread_id.to_owned(), path })),
-        (None, None) => None,
+    let name = if let Some(sc_name) = sc_media.as_ref().and_then(|sc| sc.file_name.as_deref()).filter(|s| !s.is_empty()) {
+        sc_name.to_owned()
+    } else if name.is_empty() {
+        if kind == MediaKind::Video { "video" } else { "image" }.to_owned()
+    } else {
+        name.to_owned()
+    };
+    let source = match (normalized_direct, sc_media, thread_id) {
+        (Some(_), Some(sc), _) if options.source_control_cwd.is_some_and(|c| !c.trim().is_empty()) => {
+            let cwd = options.source_control_cwd.unwrap().trim().to_owned();
+            let repository = options.source_control_repository.map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned);
+            Some(MediaSource::Asset(AssetResource::SourceControlMedia { cwd, url: sc.fetch_url, repository }))
+        }
+        (Some(uri), Some(sc), _) => Some(MediaSource::Direct(if sc.fetch_url.is_empty() { uri } else { sc.fetch_url })),
+        (Some(uri), None, _) => Some(MediaSource::Direct(uri)),
+        (None, _, Some(thread_id)) => Some(MediaSource::Asset(AssetResource::MediaFile { thread_id: thread_id.to_owned(), path })),
+        (None, _, None) => None,
     };
     Some(ResolvedMedia { kind, name, source })
 }

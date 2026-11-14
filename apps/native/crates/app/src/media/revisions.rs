@@ -48,6 +48,10 @@ impl Revisions {
         }
     }
 
+    pub fn reset(&mut self, key: &Key) {
+        self.records.remove(key);
+    }
+
     pub fn shown_url(&self, key: &Key) -> Option<Result<&str, &str>> {
         self.shown_asset(key)
             .map(|result| result.map(|asset| asset.relative_url.as_str()))

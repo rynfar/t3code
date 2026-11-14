@@ -1442,7 +1442,7 @@ mod tests {
         cx.update(|window, cx| {
             assert!(!crate::transcript::html_render::is_fullscreen_open(cx));
             viewer.update(cx, |v, cx| {
-                v.open(vec![crate::media::ViewerItem { source: t3_core::media::MediaSource::Direct("data:image/png;base64,iVBORw0KGgo=".into()), name: "img".into() }], 0, window, cx);
+                v.open(vec![crate::media::ViewerItem::image(t3_core::media::MediaSource::Direct("data:image/png;base64,iVBORw0KGgo=".into()), "img")], 0, window, cx);
             });
             assert!(viewer.read(cx).is_open());
         });

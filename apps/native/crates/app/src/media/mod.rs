@@ -5,13 +5,14 @@ mod cache;
 mod decode;
 mod element;
 mod revisions;
+pub mod video;
 mod viewer;
 
 use gpui::{App, AppContext, Entity, EntityId, Global, WeakEntity};
 use t3_core::media::{AssetResource, MediaSource};
 
-pub use cache::{ImageState, MediaCache, Variant};
-pub use viewer::{MediaViewer, ViewerItem};
+pub use cache::{ImageState, MediaCache, Variant, VideoUrlState};
+pub use viewer::{MediaViewer, ViewerItem, fullscreen};
 
 use crate::app_state::AppState;
 
@@ -22,6 +23,8 @@ pub struct MediaScope {
     pub thread_id: Option<String>,
     pub workspace_root: Option<String>,
     pub workspace_mutation_id: Option<String>,
+    pub source_control_media: bool,
+    pub source_control_media_repository: Option<String>,
     pub viewer: WeakEntity<MediaViewer>,
 }
 
@@ -45,7 +48,12 @@ pub fn cache(state: &Entity<AppState>, cx: &mut App) -> Entity<MediaCache> {
 pub fn set_scope(scope: MediaScope, cx: &mut App) {
     if let Some(media) = cx.try_global::<Media>()
         && media.scope.as_ref().is_some_and(|current| {
-            current.owner == scope.owner && current.thread_id == scope.thread_id && current.workspace_root == scope.workspace_root && current.workspace_mutation_id == scope.workspace_mutation_id
+            current.owner == scope.owner
+                && current.thread_id == scope.thread_id
+                && current.workspace_root == scope.workspace_root
+                && current.workspace_mutation_id == scope.workspace_mutation_id
+                && current.source_control_media == scope.source_control_media
+                && current.source_control_media_repository == scope.source_control_media_repository
         })
     {
         return;

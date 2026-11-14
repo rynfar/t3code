@@ -5,21 +5,38 @@
 //! Escape or a click on the scrim closes it and gives focus back.
 
 use gpui::{
-    App, Context, FocusHandle, FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Styled, Window, anchored, deferred, div, hsla as gpui_hsla, img, point, prelude::*, px,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, FontWeight, Global, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, Styled, WeakEntity, Window, anchored, deferred, div, hsla as gpui_hsla, img, point, prelude::*, px,
 };
-use t3_core::media::MediaSource;
+use t3_core::media::{MediaHints, MediaKind, MediaSource};
 
+use super::video::{VideoPlayer, VideoPlayerOptions};
 use super::{ImageState, Variant};
 use crate::icons::Icon;
 
 const MAX_ZOOM: f32 = 8.;
 const CAPTION_HEIGHT: f32 = 24.;
 
+#[derive(Default)]
+struct FullscreenViewer(Option<WeakEntity<MediaViewer>>);
+
+impl Global for FullscreenViewer {}
+
 #[derive(Clone)]
 pub struct ViewerItem {
     pub source: MediaSource,
     pub name: SharedString,
+    pub kind: MediaKind,
+}
+
+impl ViewerItem {
+    pub fn image(source: MediaSource, name: impl Into<SharedString>) -> Self {
+        Self { source, name: name.into(), kind: MediaKind::Image }
+    }
+
+    pub fn video(source: MediaSource, name: impl Into<SharedString>) -> Self {
+        Self { source, name: name.into(), kind: MediaKind::Video }
+    }
 }
 
 pub struct MediaViewer {
@@ -30,6 +47,7 @@ pub struct MediaViewer {
     pan: Point<Pixels>,
     drag: Option<(Point<Pixels>, Point<Pixels>)>,
     dragged: bool,
+    video_player: Option<(MediaSource, Entity<VideoPlayer>)>,
     focus: FocusHandle,
     restore_focus: Option<FocusHandle>,
 }
@@ -46,7 +64,7 @@ struct Frame {
 
 impl MediaViewer {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        MediaViewer { items: Vec::new(), index: 0, zoom: 1., pan: Point::default(), drag: None, dragged: false, focus: cx.focus_handle(), restore_focus: None }
+        MediaViewer { items: Vec::new(), index: 0, zoom: 1., pan: Point::default(), drag: None, dragged: false, video_player: None, focus: cx.focus_handle(), restore_focus: None }
     }
 
     pub fn is_open(&self) -> bool { !self.items.is_empty() }
@@ -59,6 +77,7 @@ impl MediaViewer {
         self.items = items;
         self.index = index.min(self.items.len() - 1);
         self.reset_zoom();
+        self.video_player = None;
         self.pin(cx);
         window.focus(&self.focus, cx);
         cx.notify();
@@ -67,6 +86,8 @@ impl MediaViewer {
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.items.clear();
         self.drag = None;
+        self.video_player = None;
+        clear_fullscreen_for(cx.entity_id(), cx);
         if let Some(cache) = cx.try_global::<super::Media>().map(|media| media.cache.clone()) {
             cache.update(cx, |cache, _| cache.unpin_all());
         }
@@ -78,6 +99,12 @@ impl MediaViewer {
 
     fn pin(&self, cx: &mut Context<Self>) {
         let Some(item) = self.items.get(self.index) else { return };
+        if item.kind != MediaKind::Image {
+            if let Some(cache) = cx.try_global::<super::Media>().map(|media| media.cache.clone()) {
+                cache.update(cx, |cache, _| cache.unpin_all());
+            }
+            return;
+        }
         if let Some(cache) = cx.try_global::<super::Media>().map(|media| media.cache.clone()) {
             let source = item.source.clone();
             cache.update(cx, |cache, cx| {
@@ -100,6 +127,7 @@ impl MediaViewer {
         }
         self.index = (self.index as isize + step).rem_euclid(count) as usize;
         self.reset_zoom();
+        self.video_player = None;
         self.pin(cx);
         cx.notify();
     }
@@ -147,7 +175,8 @@ impl MediaViewer {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let natural = self.natural(cx);
+        let kind = self.items.get(self.index).map_or(MediaKind::Image, |item| item.kind);
+        let natural = if kind == MediaKind::Image { self.natural(cx) } else { None };
         let key = event.keystroke.key.as_str();
         let pan_step = px(64.);
         match (key, natural) {
@@ -175,6 +204,25 @@ impl MediaViewer {
     }
 }
 
+fn clear_fullscreen_for(id: gpui::EntityId, cx: &mut App) {
+    if let Some(slot) = cx.try_global::<FullscreenViewer>().and_then(|g| g.0.as_ref())
+        && slot.entity_id() == id
+    {
+        cx.global_mut::<FullscreenViewer>().0 = None;
+    }
+}
+
+/// Fullscreen modal video layer rendered in `workspace.rs` base plane so native `WKWebView`
+/// sits above GPUI overlays and occludes transcript webviews underneath.
+pub fn fullscreen(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    let viewer = cx.try_global::<FullscreenViewer>()?.0.as_ref()?.upgrade()?;
+    let active_video = viewer.read(cx).items.get(viewer.read(cx).index).is_some_and(|item| item.kind == MediaKind::Video);
+    if !active_video || !crate::webview::available(window) {
+        return None;
+    }
+    Some(viewer.update(cx, |this, cx| this.render_modal(true, window, cx)))
+}
+
 /// `media-close` / `media-navigation` buttons: white glyphs on the scrim.
 fn media_button(id: &'static str, icon: Icon, size: f32, filled: bool) -> gpui::Stateful<gpui::Div> {
     div()
@@ -190,113 +238,159 @@ fn media_button(id: &'static str, icon: Icon, size: f32, filled: bool) -> gpui::
         .child(icon.render(px(if filled { 16. } else { 20. }), gpui_hsla(0., 0., 1., if filled { 1. } else { 0.9 })))
 }
 
-impl Render for MediaViewer {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl MediaViewer {
+    fn video_entity(&mut self, item: &ViewerItem, viewport: gpui::Size<Pixels>, cx: &mut Context<Self>) -> Entity<VideoPlayer> {
+        let scope = cx.try_global::<super::Media>().and_then(|media| media.scope.clone());
+        let revision = scope.as_ref().and_then(|scope| super::revision_for(&item.source, scope).map(str::to_owned));
+        let viewer_handle = cx.entity().downgrade();
+        let options = VideoPlayerOptions {
+            source: item.source.clone(),
+            name: item.name.clone(),
+            revision,
+            hints: MediaHints::default(),
+            modal: true,
+            max_width: (f32::from(viewport.width) - if self.items.len() > 1 { 136. } else { 64. }).clamp(240., f32::from(viewport.width) * 0.88),
+            max_height: (f32::from(viewport.height) * 0.78).max(200.),
+            on_expand: None,
+            on_open_external: None,
+            on_close_modal: Some(std::sync::Arc::new(move |window, cx| {
+                if let Some(viewer) = viewer_handle.upgrade() {
+                    viewer.update(cx, |this, cx| this.close(window, cx));
+                }
+            })),
+        };
+        match &self.video_player {
+            Some((source, entity)) if *source == item.source => {
+                entity.update(cx, |player, cx| player.update_options(options, scope, cx));
+                entity.clone()
+            }
+            _ => {
+                let entity = cx.new(|cx| VideoPlayer::new(options, scope, cx));
+                self.video_player = Some((item.source.clone(), entity.clone()));
+                entity
+            }
+        }
+    }
+
+    fn render_modal(&mut self, base_plane: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(item) = self.items.get(self.index).cloned() else { return div().into_any_element() };
         let owner = cx.entity_id();
-        let full = super::image(&item.source, Variant::Full, owner, cx);
-        let shown = match full {
-            ImageState::Ready(image) => Ok(Some(image)),
-            ImageState::Failed(message) => Err(message),
-            ImageState::Loading => match super::image(&item.source, Variant::Thumb, owner, cx) {
-                ImageState::Ready(image) => Ok(Some(image)),
-                _ => Ok(None),
-            },
-        };
-        let natural = self.natural(cx);
         let viewport = window.viewport_size();
         let white = |alpha: f32| gpui_hsla(0., 0., 1., alpha);
         let count = self.items.len();
         let caption: SharedString = if count > 1 { format!("{} ({}/{count})", item.name, self.index + 1).into() } else { item.name.clone() };
-        let state_box = |text: SharedString| {
-            div()
-                .w(px(512.0_f32.min(f32::from(viewport.width) * 0.92)))
-                .h(px(192.))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(12.))
-                .p(px(24.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(white(0.15))
-                .bg(gpui_hsla(0., 0., 0., 1.))
-                .text_sm()
-                .text_color(white(1.))
-                .child(text)
-                .into_any_element()
-        };
-        let media = match (shown, natural) {
-            (Err(message), _) => state_box(message),
-            (Ok(Some(image)), Some(natural)) => {
-                let frame = self.frame(natural, window);
-                self.clamp_pan(&frame);
-                let zoomed = self.zoom > 1.;
+        let (media, observer) = if item.kind == MediaKind::Video {
+            let player = self.video_entity(&item, viewport, cx);
+            (
                 div()
-                    .id("media-viewer-image")
-                    .relative()
-                    .w(px(frame.box_width))
-                    .h(px(frame.box_height))
-                    .overflow_hidden()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(player)
+                    .into_any_element(),
+                None,
+            )
+        } else {
+            let full = super::image(&item.source, Variant::Full, owner, cx);
+            let shown = match full {
+                ImageState::Ready(image) => Ok(Some(image)),
+                ImageState::Failed(message) => Err(message),
+                ImageState::Loading => match super::image(&item.source, Variant::Thumb, owner, cx) {
+                    ImageState::Ready(image) => Ok(Some(image)),
+                    _ => Ok(None),
+                },
+            };
+            let natural = self.natural(cx);
+            let state_box = |text: SharedString| {
+                div()
+                    .w(px(512.0_f32.min(f32::from(viewport.width) * 0.92)))
+                    .h(px(192.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(12.))
+                    .p(px(24.))
                     .rounded(px(8.))
-                    .cursor(if zoomed { if self.drag.is_some() { gpui::CursorStyle::ClosedHand } else { gpui::CursorStyle::OpenHand } } else { gpui::CursorStyle::PointingHand })
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.dragged = false;
-                        if this.zoom > 1. {
-                            this.drag = Some((event.position, this.pan));
-                        }
-                    }))
-                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
-                        let Some((start, pan)) = this.drag else { return };
-                        if !event.dragging() {
-                            this.drag = None;
-                            return;
-                        }
-                        let delta = event.position - start;
-                        if f32::from(delta.x).abs() + f32::from(delta.y).abs() > 3. {
-                            this.dragged = true;
-                        }
-                        this.pan = pan - delta;
-                        let frame = this.frame(natural, window);
-                        this.clamp_pan(&frame);
-                        cx.notify();
-                    }))
-                    .on_mouse_up(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseUpEvent, window, cx| {
-                        this.drag = None;
-                        if std::mem::take(&mut this.dragged) {
-                            cx.notify();
-                            return;
-                        }
-                        let next = if this.zoom > 1. { 1. } else { 2. };
-                        this.zoom_to(next, Some(event.position), natural, window, cx);
-                    }))
-                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
-                        let delta = f32::from(event.delta.pixel_delta(px(16.)).y);
-                        let factor = (delta * if event.modifiers.control { 0.01 } else { 0.002 }).exp();
-                        this.zoom_to(this.zoom * factor, Some(event.position), natural, window, cx);
-                        cx.stop_propagation();
-                    }))
-                    .child(img(image).absolute().left(-self.pan.x).top(-self.pan.y).w(px(frame.width)).h(px(frame.height)))
+                    .border_1()
+                    .border_color(white(0.15))
+                    .bg(gpui_hsla(0., 0., 0., 1.))
+                    .text_sm()
+                    .text_color(white(1.))
+                    .child(text)
                     .into_any_element()
-            }
-            _ => state_box("Loading image…".into()),
+            };
+            let media = match (shown, natural) {
+                (Err(message), _) => state_box(message),
+                (Ok(Some(image)), Some(natural)) => {
+                    let frame = self.frame(natural, window);
+                    self.clamp_pan(&frame);
+                    let zoomed = self.zoom > 1.;
+                    div()
+                        .id("media-viewer-image")
+                        .relative()
+                        .w(px(frame.box_width))
+                        .h(px(frame.box_height))
+                        .overflow_hidden()
+                        .rounded(px(8.))
+                        .cursor(if zoomed { if self.drag.is_some() { gpui::CursorStyle::ClosedHand } else { gpui::CursorStyle::OpenHand } } else { gpui::CursorStyle::PointingHand })
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.dragged = false;
+                            if this.zoom > 1. {
+                                this.drag = Some((event.position, this.pan));
+                            }
+                        }))
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            let Some((start, pan)) = this.drag else { return };
+                            if !event.dragging() {
+                                this.drag = None;
+                                return;
+                            }
+                            let delta = event.position - start;
+                            if f32::from(delta.x).abs() + f32::from(delta.y).abs() > 3. {
+                                this.dragged = true;
+                            }
+                            this.pan = pan - delta;
+                            let frame = this.frame(natural, window);
+                            this.clamp_pan(&frame);
+                            cx.notify();
+                        }))
+                        .on_mouse_up(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseUpEvent, window, cx| {
+                            this.drag = None;
+                            if std::mem::take(&mut this.dragged) {
+                                cx.notify();
+                                return;
+                            }
+                            let next = if this.zoom > 1. { 1. } else { 2. };
+                            this.zoom_to(next, Some(event.position), natural, window, cx);
+                        }))
+                        .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
+                            let delta = f32::from(event.delta.pixel_delta(px(16.)).y);
+                            let factor = (delta * if event.modifiers.control { 0.01 } else { 0.002 }).exp();
+                            this.zoom_to(this.zoom * factor, Some(event.position), natural, window, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(img(image).absolute().left(-self.pan.x).top(-self.pan.y).w(px(frame.width)).h(px(frame.height)))
+                        .into_any_element()
+                }
+                _ => state_box("Loading image…".into()),
+            };
+            let observer = cx.try_global::<super::Media>().and_then(|media| media.scope.clone()).map(|mut scope| {
+                scope.owner = owner;
+                super::observe_image(item.source.clone(), scope)
+            });
+            (media, observer)
         };
-        let observer = cx.try_global::<super::Media>().and_then(|media| media.scope.clone()).map(|mut scope| {
-            scope.owner = owner;
-            super::observe_image(item.source.clone(), scope)
-        });
         let backdrop = div()
             .id("media-viewer")
             .track_focus(&self.focus)
             .key_context("MediaViewer")
             .on_key_down(cx.listener(Self::on_key))
             .relative()
-            .w(viewport.width)
-            .h(viewport.height)
+            .when(base_plane, |el| el.size_full())
+            .when(!base_plane, |el| el.w(viewport.width).h(viewport.height))
             .occlude()
             .bg(gpui_hsla(0., 0., 0., 0.75))
+            .when(base_plane, |el| el.child(crate::webview::occluder("media-viewer-fullscreen-cover", crate::webview::Layer::Modal)))
             .flex()
             .flex_col()
             .items_center()
@@ -336,6 +430,53 @@ impl Render for MediaViewer {
                     ),
                 )
             });
-        deferred(anchored().position(point(px(0.), px(0.))).child(backdrop)).with_priority(60).into_any_element()
+        if base_plane {
+            div().absolute().inset_0().child(backdrop).into_any_element()
+        } else {
+            deferred(anchored().position(point(px(0.), px(0.))).child(backdrop)).with_priority(60).into_any_element()
+        }
+    }
+}
+
+impl Render for MediaViewer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(item) = self.items.get(self.index).cloned() else {
+            clear_fullscreen_for(cx.entity_id(), cx);
+            return div().into_any_element();
+        };
+        if item.kind == MediaKind::Video && crate::webview::available(window) {
+            cx.default_global::<FullscreenViewer>().0 = Some(cx.entity().downgrade());
+            return div().into_any_element();
+        }
+        clear_fullscreen_for(cx.entity_id(), cx);
+        self.render_modal(false, window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn viewer_navigates_mixed_image_and_video_gallery(cx: &mut gpui::TestAppContext) {
+        let (viewer, cx) = cx.add_window_view(|_, cx| MediaViewer::new(cx));
+        let items = vec![
+            ViewerItem::image(MediaSource::Direct("data:image/png;base64,iVBORw0KGgo=".into()), "one.png"),
+            ViewerItem::video(MediaSource::Direct("https://example.com/clip.mp4".into()), "clip.mp4"),
+        ];
+        cx.update(|window, cx| {
+            viewer.update(cx, |v, cx| {
+                v.open(items, 0, window, cx);
+                assert!(v.is_open());
+                assert_eq!(v.index, 0);
+                v.navigate(1, cx);
+                assert_eq!(v.index, 1);
+                assert_eq!(v.items[1].kind, MediaKind::Video);
+                v.navigate(-1, cx);
+                assert_eq!(v.index, 0);
+                v.close(window, cx);
+                assert!(!v.is_open());
+            });
+        });
     }
 }

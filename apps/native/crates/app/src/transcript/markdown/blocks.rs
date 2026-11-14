@@ -18,14 +18,14 @@ use t3_core::markdown::alerts_details::{AlertKind, DetailsBlock, GithubAlert, pa
 use t3_core::markdown::code::{is_code_fence_closed, is_math_language, is_mermaid_language};
 use t3_core::markdown::math::render_tex_unicode;
 use t3_core::markdown::mermaid::render_mermaid_svg;
-use t3_core::markdown::table::TableData;
+use t3_core::markdown::table::{ColumnAlignment, TableData};
 
 use super::links::MarkdownActionContext;
 use crate::icons::Icon;
 use crate::selectable_text::{SelectableText, SelectableTextHandle};
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
-use crate::transcript::parts;
+use crate::transcript::{media, parts};
 
 pub const ALERT_NODE: &str = "t3-alert";
 pub const DETAILS_NODE: &str = "t3-details-block";
@@ -78,6 +78,15 @@ struct TableNodeData {
     key: String,
     data: TableData,
     raw_markdown: String,
+    cell_markdown: Vec<Vec<String>>,
+}
+
+#[derive(Clone)]
+pub(super) struct RichMarkdownMedia {
+    pub(super) parse_document: media::MediaDocument,
+    pub(super) gallery_document: media::MediaDocument,
+    pub(super) scope: media::MediaScopeSource,
+    pub(super) selections: media::MediaSelections,
 }
 
 struct ChildTextState {
@@ -106,14 +115,26 @@ struct MermaidUiState {
 }
 
 /// Attaches custom rich-markdown parsers and renderers onto `base` (preserving existing media hooks).
-pub fn attach_rich_extensions(
+pub(super) fn attach_rich_extensions_with_media(
     base: MarkdownExtensions,
     action_ctx: SharedActionContext,
     nested_views: NestedViews,
     code_meta: SharedCodeMeta,
     math_enabled: SharedMathEnabled,
+    media: RichMarkdownMedia,
 ) -> MarkdownExtensions {
-    attach_extensions_inner(base, action_ctx, nested_views, code_meta, math_enabled, true)
+    attach_extensions_inner(base, action_ctx, nested_views, code_meta, math_enabled, Some(media), true)
+}
+
+fn child_media_base(media: Option<&RichMarkdownMedia>, body: &str) -> MarkdownExtensions {
+    let Some(media_ctx) = media else { return MarkdownExtensions::default() };
+    let parse_document = media::media_document_with_inherited(&media_ctx.parse_document, Arc::from(body));
+    media::markdown_extensions_with_gallery(
+        parse_document,
+        media_ctx.gallery_document.clone(),
+        media_ctx.scope.clone(),
+        media_ctx.selections.clone(),
+    )
 }
 
 fn attach_extensions_inner(
@@ -122,6 +143,7 @@ fn attach_extensions_inner(
     nested_views: NestedViews,
     code_meta: SharedCodeMeta,
     math_enabled: SharedMathEnabled,
+    media: Option<RichMarkdownMedia>,
     intercept_tables: bool,
 ) -> MarkdownExtensions {
     let ctx_for_child = action_ctx.clone();
@@ -138,11 +160,13 @@ fn attach_extensions_inner(
     let nested_alert = nested_for_child.clone();
     let meta_alert = meta_for_child.clone();
     let math_alert = math_for_child.clone();
+    let media_alert = media.clone();
 
     let ctx_details = ctx_for_child.clone();
     let nested_details = nested_for_child.clone();
     let meta_details = meta_for_child.clone();
     let math_details = math_for_child.clone();
+    let media_details = media.clone();
 
     let nested_math = nested_for_child.clone();
 
@@ -153,15 +177,18 @@ fn attach_extensions_inner(
     let nested_table = nested_for_child;
     let meta_table = meta_for_child;
     let math_table = math_for_child;
+    let media_table = media;
 
     with_parsers
         .block_renderer(ALERT_NODE, move |node, window, cx| {
             let Some(data) = node.data::<AlertNodeData>() else { return div().into_any_element() };
-            render_alert_block(data, &ctx_alert, &nested_alert, &meta_alert, &math_alert, window, cx)
+            let env = RichBlockEnv { action_ctx: &ctx_alert, nested_views: &nested_alert, code_meta: &meta_alert, math_enabled: &math_alert, media: media_alert.as_ref() };
+            render_alert_block(data, env, window, cx)
         })
         .block_renderer(DETAILS_NODE, move |node, window, cx| {
             let Some(data) = node.data::<DetailsNodeData>() else { return div().into_any_element() };
-            render_details_block(data, &ctx_details, &nested_details, &meta_details, &math_details, window, cx)
+            let env = RichBlockEnv { action_ctx: &ctx_details, nested_views: &nested_details, code_meta: &meta_details, math_enabled: &math_details, media: media_details.as_ref() };
+            render_details_block(data, env, window, cx)
         })
         .block_renderer(MATH_NODE, move |node, window, cx| {
             let Some(data) = node.data::<MathNodeData>() else { return div().into_any_element() };
@@ -173,7 +200,8 @@ fn attach_extensions_inner(
         })
         .block_renderer(TABLE_NODE, move |node, window, cx| {
             let Some(data) = node.data::<TableNodeData>() else { return div().into_any_element() };
-            render_table_block(data, &ctx_table, &nested_table, &meta_table, &math_table, window, cx)
+            let env = RichBlockEnv { action_ctx: &ctx_table, nested_views: &nested_table, code_meta: &meta_table, math_enabled: &math_table, media: media_table.as_ref() };
+            render_table_block(data, env, window, cx)
         })
 }
 
@@ -196,6 +224,7 @@ fn parse_rich_block(node: &mdast::Node, context: &MarkdownParseContext<'_>, inte
         }
         mdast::Node::Table(tbl) if intercept_tables => {
             let data = TableData::from_mdast(tbl);
+            let cell_markdown = TableData::cell_markdown_rows(tbl, context.source());
             let raw = context
                 .node_source(node)
                 .map(str::to_owned)
@@ -207,7 +236,7 @@ fn parse_rich_block(node: &mdast::Node, context: &MarkdownParseContext<'_>, inte
                 .collect::<Vec<_>>()
                 .join("\n");
             Some(
-                MarkdownNode::new(TABLE_NODE, TableNodeData { key, data, raw_markdown: raw.clone() })
+                MarkdownNode::new(TABLE_NODE, TableNodeData { key, data, raw_markdown: raw.clone(), cell_markdown })
                     .text(plain)
                     .markdown(raw),
             )
@@ -274,15 +303,22 @@ fn node_key(node: &mdast::Node) -> String {
     format!("md-block-{:x}", hasher.finish())
 }
 
+#[derive(Clone, Copy)]
+struct RichBlockEnv<'a> {
+    action_ctx: &'a SharedActionContext,
+    nested_views: &'a NestedViews,
+    code_meta: &'a SharedCodeMeta,
+    math_enabled: &'a SharedMathEnabled,
+    media: Option<&'a RichMarkdownMedia>,
+}
+
 fn render_alert_block(
     data: &AlertNodeData,
-    action_ctx: &SharedActionContext,
-    nested_views: &NestedViews,
-    code_meta: &SharedCodeMeta,
-    math_enabled: &SharedMathEnabled,
+    env: RichBlockEnv<'_>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
     let (accent, icon) = match data.alert.kind {
         AlertKind::Note => (p.info, Icon::Info),
@@ -307,7 +343,15 @@ fn render_alert_block(
     });
     nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
 
-    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), math_enabled.clone(), true);
+    let child_ext = attach_extensions_inner(
+        child_media_base(media, &body),
+        action_ctx.clone(),
+        nested_views.clone(),
+        code_meta.clone(),
+        math_enabled.clone(),
+        media.cloned(),
+        true,
+    );
     let view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
         action_ctx.lock().unwrap().clone(),
@@ -345,13 +389,11 @@ fn render_alert_block(
 
 fn render_details_block(
     data: &DetailsNodeData,
-    action_ctx: &SharedActionContext,
-    nested_views: &NestedViews,
-    code_meta: &SharedCodeMeta,
-    math_enabled: &SharedMathEnabled,
+    env: RichBlockEnv<'_>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
     let body = data.details.body_markdown.clone();
     let default_open = data.details.open;
@@ -374,7 +416,15 @@ fn render_details_block(
         nested_views.lock().unwrap().remove(&data.key);
     }
 
-    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), math_enabled.clone(), true);
+    let child_ext = attach_extensions_inner(
+        child_media_base(media, &body),
+        action_ctx.clone(),
+        nested_views.clone(),
+        code_meta.clone(),
+        math_enabled.clone(),
+        media.cloned(),
+        true,
+    );
     let body_view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
         action_ctx.lock().unwrap().clone(),
@@ -651,10 +701,10 @@ fn render_mermaid_block(
                                         let data_url = svg_data_url(&svg_for_expand);
                                         tv.update(cx, |view, cx| {
                                             view.open_media(
-                                                vec![crate::media::ViewerItem {
-                                                    source: t3_core::media::MediaSource::Direct(data_url),
-                                                    name: "Mermaid diagram".into(),
-                                                }],
+                                                vec![crate::media::ViewerItem::image(
+                                                    t3_core::media::MediaSource::Direct(data_url),
+                                                    "Mermaid diagram",
+                                                )],
                                                 0,
                                                 window,
                                                 cx,
@@ -723,36 +773,48 @@ fn render_mermaid_block(
 
 fn render_table_block(
     data: &TableNodeData,
-    action_ctx: &SharedActionContext,
-    nested_views: &NestedViews,
-    code_meta: &SharedCodeMeta,
-    math_enabled: &SharedMathEnabled,
+    env: RichBlockEnv<'_>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
-    let raw = data.raw_markdown.clone();
-    let key = SharedString::from(format!("table:{}", data.key));
-    let state = window.use_keyed_state(key, cx, |_, cx| ChildTextState {
-        last_body: raw.clone(),
-        entity: cx.new(|cx| TextViewState::markdown(&raw, cx).selectable(true)),
-    });
-    let entity = state.update(cx, |s, cx| {
-        if s.last_body != raw {
-            s.last_body = raw.clone();
-            s.entity.update(cx, |tv, cx| tv.set_text(&raw, cx));
-        }
-        s.entity.clone()
-    });
-    nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
+    let has_media = data.cell_markdown.iter().flatten().any(|cell| super::has_image_syntax(cell));
+    let table_view = if has_media {
+        render_media_table_grid(data, env, window, cx)
+    } else {
+        let raw = data.raw_markdown.clone();
+        let key = SharedString::from(format!("table:{}", data.key));
+        let state = window.use_keyed_state(key, cx, |_, cx| ChildTextState {
+            last_body: raw.clone(),
+            entity: cx.new(|cx| TextViewState::markdown(&raw, cx).selectable(true)),
+        });
+        let entity = state.update(cx, |s, cx| {
+            if s.last_body != raw {
+                s.last_body = raw.clone();
+                s.entity.update(cx, |tv, cx| tv.set_text(&raw, cx));
+            }
+            s.entity.clone()
+        });
+        nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
 
-    let child_ext = attach_extensions_inner(MarkdownExtensions::default(), action_ctx.clone(), nested_views.clone(), code_meta.clone(), math_enabled.clone(), false);
-    let table_view = super::style_markdown_internal(
-        TextView::new(&entity).markdown_extensions(child_ext),
-        action_ctx.lock().unwrap().clone(),
-        code_meta.clone(),
-        cx,
-    );
+        let child_ext = attach_extensions_inner(
+            MarkdownExtensions::default(),
+            action_ctx.clone(),
+            nested_views.clone(),
+            code_meta.clone(),
+            math_enabled.clone(),
+            media.cloned(),
+            false,
+        );
+        super::style_markdown_internal(
+            TextView::new(&entity).markdown_extensions(child_ext),
+            action_ctx.lock().unwrap().clone(),
+            code_meta.clone(),
+            cx,
+        )
+        .into_any_element()
+    };
 
     let md_copy = data.data.to_markdown();
     let csv_copy = data.data.to_csv();
@@ -799,6 +861,88 @@ fn render_table_block(
                 .border_color(hsla(p.border))
                 .child(table_view),
         )
+        .into_any_element()
+}
+
+fn render_media_table_grid(
+    data: &TableNodeData,
+    env: RichBlockEnv<'_>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let p = palette(cx);
+    let cols = data.cell_markdown.iter().map(Vec::len).max().unwrap_or(0).max(data.data.align.len()).max(1);
+    let row_count = data.cell_markdown.len();
+    let mut grid = v_flex().w_full().min_w_0();
+    for (row_idx, row_cells) in data.cell_markdown.iter().enumerate() {
+        let is_header = row_idx == 0;
+        let mut row_el = h_flex()
+            .w_full()
+            .min_w_0()
+            .items_stretch()
+            .when(is_header, |row| row.bg(hsla(p.secondary)))
+            .when(!is_header && row_idx % 2 == 0, |row| row.bg(hsla(p.muted).opacity(0.25)))
+            .when(row_idx + 1 < row_count, |row| row.border_b_1().border_color(hsla(p.border).opacity(0.6)));
+        for col_idx in 0..cols {
+            let cell_md = row_cells.get(col_idx).cloned().unwrap_or_default();
+            let key = SharedString::from(format!("table-cell:{}:{row_idx}:{col_idx}", data.key));
+            let state = window.use_keyed_state(key, cx, |_, cx| ChildTextState {
+                last_body: cell_md.clone(),
+                entity: cx.new(|cx| TextViewState::markdown(&cell_md, cx).selectable(true)),
+            });
+            let entity = state.update(cx, |s, cx| {
+                if s.last_body != cell_md {
+                    s.last_body = cell_md.clone();
+                    s.entity.update(cx, |tv, cx| tv.set_text(&cell_md, cx));
+                }
+                s.entity.clone()
+            });
+            nested_views.lock().unwrap().insert(
+                format!("{}:{row_idx}:{col_idx}", data.key),
+                NestedSelection::Markdown(entity.clone()),
+            );
+            let child_ext = attach_extensions_inner(
+                child_media_base(media, &cell_md),
+                action_ctx.clone(),
+                nested_views.clone(),
+                code_meta.clone(),
+                math_enabled.clone(),
+                media.cloned(),
+                false,
+            );
+            let cell_view = super::style_markdown_internal(
+                TextView::new(&entity).markdown_extensions(child_ext),
+                action_ctx.lock().unwrap().clone(),
+                code_meta.clone(),
+                cx,
+            );
+            let align = data.data.align.get(col_idx).copied().unwrap_or(ColumnAlignment::None);
+            let cell_el = v_flex()
+                .flex_1()
+                .min_w(px(120.))
+                .px(px(10.))
+                .py(px(6.))
+                .justify_center()
+                .when(is_header, |cell| cell.font_weight(FontWeight::SEMIBOLD))
+                .when(align == ColumnAlignment::Center, |cell| cell.items_center().text_center())
+                .when(align == ColumnAlignment::Right, |cell| cell.items_end().text_right())
+                .when(align == ColumnAlignment::Left || align == ColumnAlignment::None, |cell| cell.items_start().text_left())
+                .when(col_idx + 1 < cols, |cell| cell.border_r_1().border_color(hsla(p.border).opacity(0.6)))
+                .child(div().max_w_full().min_w_0().child(cell_view));
+            row_el = row_el.child(cell_el);
+        }
+        grid = grid.child(row_el);
+    }
+    div()
+        .id(SharedString::from(format!("table-media-scroll:{}", data.key)))
+        .w_full()
+        .min_w_0()
+        .overflow_x_scroll()
+        .rounded(px(6.))
+        .border_1()
+        .border_color(hsla(p.border))
+        .child(grid)
         .into_any_element()
 }
 

@@ -14,10 +14,10 @@ use gpui::prelude::FluentBuilder;
 use gpui::{App, AppContext, ClipboardItem, Entity, EntityId, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, Subscription, Task, div, px, rems};
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::{ActiveTheme, h_flex};
-use t3_core::markdown::{DisplayMarkdownOptions, prepare_display_markdown};
+use t3_core::markdown::{DisplayMarkdownOptions, prepare_display_markdown_with_raw_html};
 
 use self::blocks::{
-    CodeFenceMetaMap, NestedSelection, NestedViews, SharedActionContext, SharedCodeMeta, SharedMathEnabled, attach_rich_extensions,
+    CodeFenceMetaMap, NestedSelection, NestedViews, RichMarkdownMedia, SharedActionContext, SharedCodeMeta, SharedMathEnabled, attach_rich_extensions_with_media,
 };
 use self::links::MarkdownActionContext;
 use crate::icons::Icon;
@@ -45,8 +45,16 @@ struct Cached {
     nested_views: NestedViews,
     action_ctx: SharedActionContext,
     code_meta: SharedCodeMeta,
+    media_scope: Arc<Mutex<Option<crate::media::MediaScope>>>,
     _repaint: Subscription,
     updates: Option<MediaUpdates>,
+}
+
+impl Drop for Cached {
+    fn drop(&mut self) {
+        // Nested child TextViewStates hold extensions referencing `nested_views`; clear to break the cycle.
+        self.nested_views.lock().unwrap().clear();
+    }
 }
 
 struct MediaUpdates {
@@ -183,8 +191,21 @@ impl From<&Entity<TextViewState>> for MarkdownState {
     }
 }
 
-fn has_image_syntax(text: &str) -> bool {
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    !needle.is_empty() && bytes.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+pub(super) fn has_image_syntax(text: &str) -> bool {
     text.contains("![")
+        || contains_ascii_ci(text, "<img")
+        || contains_ascii_ci(text, "<video")
+        || contains_ascii_ci(text, "<picture")
+}
+
+fn has_media_syntax(prepared: &str, parse_raw_html: bool) -> bool {
+    prepared.contains("![") || (parse_raw_html && has_image_syntax(prepared))
 }
 
 struct CachedContext {
@@ -233,27 +254,43 @@ impl MarkdownStore {
         action_ctx: Option<MarkdownActionContext>,
         cx: &mut App,
     ) -> MarkdownState {
+        self.state_with_media_scope(key, text, action_ctx, None, cx)
+    }
+
+    /// Like `state_in_context`, plus an optional surface-local `MediaScope` override (for
+    /// example, PR markdown enabling `SourceControlMedia` resolution).
+    pub fn state_with_media_scope(
+        &mut self,
+        key: &str,
+        text: &Arc<str>,
+        action_ctx: Option<MarkdownActionContext>,
+        media_scope: Option<crate::media::MediaScope>,
+        cx: &mut App,
+    ) -> MarkdownState {
         let is_dark = cx.theme().mode.is_dark();
         let cwd = action_ctx.as_ref().and_then(|c| c.cwd.clone());
         let math_enabled = crate::settings::client_settings(cx).math_rendering_enabled();
+        let parse_raw_html = !key.starts_with("user:");
 
         if let Some(cached) = self.states.get_mut(key) {
             cached.drawn = self.frame;
             *cached.action_ctx.lock().unwrap() = action_ctx;
+            *cached.media_scope.lock().unwrap() = media_scope;
             let text_changed = !Arc::ptr_eq(&cached.text, text) && *cached.text != **text;
             let env_changed = cached.is_dark != is_dark || cached.cwd != cwd || cached.math_enabled != math_enabled;
             if text_changed || env_changed {
                 let previous_prepared = cached.prepared.clone();
-                let prepared: Arc<str> = Arc::from(prepare_display_markdown(
+                let prepared: Arc<str> = Arc::from(prepare_display_markdown_with_raw_html(
                     text,
                     DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled },
+                    parse_raw_html,
                 ));
                 cached.text = text.clone();
                 cached.is_dark = is_dark;
                 cached.cwd = cwd;
                 cached.math_enabled = math_enabled;
                 cached.math_enabled_flag.store(math_enabled, Ordering::Relaxed);
-                cached.media |= has_image_syntax(&prepared);
+                cached.media |= has_media_syntax(&prepared, parse_raw_html);
                 if *cached.prepared != *prepared {
                     cached.prepared = prepared.clone();
                     if prepared.contains("```") || prepared.contains("~~~") {
@@ -294,11 +331,12 @@ impl MarkdownStore {
             };
         }
 
-        let prepared: Arc<str> = Arc::from(prepare_display_markdown(
+        let prepared: Arc<str> = Arc::from(prepare_display_markdown_with_raw_html(
             text,
             DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled },
+            parse_raw_html,
         ));
-        let media = has_image_syntax(&prepared);
+        let media = has_media_syntax(&prepared, parse_raw_html);
         let state = cx.new(|cx| TextViewState::markdown(if media { "" } else { &prepared }, cx).selectable(true));
         let owner = self.owner;
         let repaint = cx.observe(&state, move |_, cx| cx.notify(owner));
@@ -306,6 +344,8 @@ impl MarkdownStore {
         let selections = super::media::MediaSelections::default();
         let nested_views = NestedViews::default();
         let shared_ctx: SharedActionContext = Arc::new(Mutex::new(action_ctx));
+        let shared_media_scope = Arc::new(Mutex::new(media_scope));
+        let scope_source = super::media::MediaScopeSource::Override(shared_media_scope.clone());
         let code_meta: SharedCodeMeta = Arc::new(Mutex::new(
             if prepared.contains("```") || prepared.contains("~~~") {
                 CodeFenceMetaMap::from_markdown(&prepared)
@@ -314,13 +354,20 @@ impl MarkdownStore {
             },
         ));
         let math_enabled_flag: SharedMathEnabled = Arc::new(AtomicBool::new(math_enabled));
-        let media_ext = super::media::markdown_extensions_with_selections(document.clone(), None, selections.clone());
-        let extensions = attach_rich_extensions(
+        let media_ext = super::media::markdown_extensions_with_selections(document.clone(), scope_source.clone(), selections.clone());
+        let rich_media = RichMarkdownMedia {
+            parse_document: document.clone(),
+            gallery_document: document.clone(),
+            scope: scope_source,
+            selections: selections.clone(),
+        };
+        let extensions = attach_rich_extensions_with_media(
             media_ext,
             shared_ctx.clone(),
             nested_views.clone(),
             code_meta.clone(),
             math_enabled_flag.clone(),
+            rich_media,
         );
         let updates = media.then(|| MediaUpdates::new(&state, document.clone(), Arc::from(""), prepared.clone(), cx));
         self.states.insert(
@@ -341,6 +388,7 @@ impl MarkdownStore {
                 nested_views: nested_views.clone(),
                 action_ctx: shared_ctx.clone(),
                 code_meta: code_meta.clone(),
+                media_scope: shared_media_scope,
                 _repaint: repaint,
                 updates,
             },
@@ -875,6 +923,64 @@ mod context_tests {
             )
             .expect("compact <details> block selection must resolve to citation");
             assert_eq!(citation.text.trim(), "Quoted inside compact details");
+        });
+    }
+
+    #[gpui::test]
+    fn user_messages_skip_raw_html_while_assistant_normalizes_media_tables_and_headings(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let _app_state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx))
+        });
+        let mut store = MarkdownStore::new(EntityId::from(1u64));
+        let user_src: Arc<str> = "Look at <img src=\"a.png\" width=\"120\">".into();
+        let assistant_src: Arc<str> = concat!(
+            "<h1>Shot <img src=\"head.png\" width=\"24\"></h1>\n\n",
+            "> [!NOTE]\n> <video src=\"https://example.com/clip\" width=\"320\" height=\"180\"></video>\n\n",
+            "<table><tr><th>Item</th></tr><tr><td><img src=\"cell.png\" alt=\"Cell\"></td></tr></table>"
+        )
+        .into();
+
+        cx.update(|cx| {
+            let user_state = store.state_in_context("user:m1", &user_src, None, cx);
+            assert!(!user_state.media);
+            assert_eq!(store.states.get("user:m1").unwrap().prepared.as_ref(), "Look at <img src=\"a.png\" width=\"120\">");
+
+            let scope = crate::media::MediaScope {
+                owner: EntityId::from(1u64),
+                thread_id: Some("t1".into()),
+                workspace_root: Some("/repo".into()),
+                workspace_mutation_id: None,
+                source_control_media: true,
+                source_control_media_repository: Some("org/repo".into()),
+                viewer: gpui::WeakEntity::new_invalid(),
+            };
+            let assistant_state = store.state_with_media_scope("assistant:m2", &assistant_src, None, Some(scope), cx);
+            assert!(assistant_state.media);
+            let doc = assistant_state.document.as_ref().unwrap().read().unwrap().clone();
+            let gallery = doc.gallery_images();
+            let urls: Vec<_> = gallery.iter().map(|(u, _, _)| u.as_str()).collect();
+            assert_eq!(urls, vec!["head.png", "https://example.com/clip", "cell.png"]);
+            assert!(gallery[1].2.explicit_video);
+            assert_eq!(gallery[1].2.width, Some(320));
+            assert_eq!(gallery[1].2.height, Some(180));
+
+            let updated_scope = crate::media::MediaScope {
+                owner: EntityId::from(1u64),
+                thread_id: Some("t1".into()),
+                workspace_root: Some("/repo".into()),
+                workspace_mutation_id: Some("rev-2".into()),
+                source_control_media: true,
+                source_control_media_repository: Some("org/other".into()),
+                viewer: gpui::WeakEntity::new_invalid(),
+            };
+            let reused = store.state_with_media_scope("assistant:m2", &assistant_src, None, Some(updated_scope), cx);
+            assert_eq!(reused.entity.entity_id(), assistant_state.entity.entity_id());
+            let guard = store.states.get("assistant:m2").unwrap().media_scope.lock().unwrap();
+            assert_eq!(guard.as_ref().and_then(|s| s.source_control_media_repository.as_deref()), Some("org/other"));
         });
     }
 }

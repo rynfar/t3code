@@ -96,7 +96,7 @@ fn on_page_event(state: &Entity<AppState>, owner: &PageOwner, view: &WebView, ev
             if let Some(thread_view) = owner.view.upgrade() {
                 thread_view.update(cx, |thread_view, cx| {
                     thread_view.open_media(
-                        vec![crate::media::ViewerItem { source: MediaSource::Direct(src), name: SharedString::from(name) }],
+                        vec![crate::media::ViewerItem::image(MediaSource::Direct(src), name)],
                         0,
                         window,
                         cx,

@@ -178,15 +178,28 @@ pub fn parse_details_fence(lang: Option<&str>, meta: Option<&str>, code: &str) -
     })
 }
 
-/// Rewrites `<picture>...</picture>` for `is_dark`, rewrites `<details>/<summary>` containers into
-/// `t3-details` custom fences (preserving nested fences), and links standalone inline-code file paths.
+/// Rewrites `<picture>`, `<img>`, `<video>`, media-bearing `<a>`/`<h1..h6>`/`<table>`, and `<details>`
+/// containers while preserving fenced code blocks, inline code spans, and linking inline file paths.
 pub fn preprocess_markdown_for_display(source: &str, is_dark: bool, cwd: Option<&str>) -> String {
-    let html_rewritten = preprocess_html_containers(source, is_dark);
+    preprocess_markdown_for_display_with_html(source, is_dark, cwd, true)
+}
+
+pub fn preprocess_markdown_for_display_with_html(
+    source: &str,
+    is_dark: bool,
+    cwd: Option<&str>,
+    parse_raw_html: bool,
+) -> String {
+    let html_rewritten = if parse_raw_html {
+        preprocess_html_containers(source, is_dark)
+    } else {
+        source.to_owned()
+    };
     link_inline_code_file_paths(&html_rewritten, cwd)
 }
 
 fn preprocess_html_containers(source: &str, is_dark: bool) -> String {
-    if !source.contains("<details") && !source.contains("<picture") {
+    if !source.contains('<') {
         return source.to_owned();
     }
 
@@ -227,24 +240,22 @@ fn preprocess_html_containers(source: &str, is_dark: bool) -> String {
             }
         }
 
-        if let Some(next_tag) = find_next_html_container(rest) {
+        if let Some(next_tag) = find_next_html_container_outside_code(rest) {
             out.push_str(&rest[..next_tag.offset]);
             let tag_abs = pos + next_tag.offset;
-            match next_tag.kind {
-                HtmlContainer::Picture => {
-                    if let Some((replacement, consumed)) = rewrite_picture_block(&source[tag_abs..], is_dark) {
-                        out.push_str(&replacement);
-                        pos = tag_abs + consumed;
-                        continue;
-                    }
-                }
-                HtmlContainer::Details => {
-                    if let Some((replacement, consumed)) = rewrite_details_block(&source[tag_abs..]) {
-                        out.push_str(&replacement);
-                        pos = tag_abs + consumed;
-                        continue;
-                    }
-                }
+            let rewritten = match next_tag.kind {
+                HtmlContainer::Picture => rewrite_picture_block(&source[tag_abs..], is_dark),
+                HtmlContainer::Details => rewrite_details_block(&source[tag_abs..], is_dark),
+                HtmlContainer::Img => rewrite_img_tag(&source[tag_abs..]),
+                HtmlContainer::Video => rewrite_video_block(&source[tag_abs..]),
+                HtmlContainer::Anchor => rewrite_media_anchor(&source[tag_abs..], is_dark),
+                HtmlContainer::Heading(level) => rewrite_media_heading(&source[tag_abs..], level, is_dark),
+                HtmlContainer::Table => rewrite_media_table(&source[tag_abs..], is_dark),
+            };
+            if let Some((replacement, consumed)) = rewritten {
+                out.push_str(&replacement);
+                pos = tag_abs + consumed;
+                continue;
             }
             out.push('<');
             pos = tag_abs + 1;
@@ -261,6 +272,11 @@ fn preprocess_html_containers(source: &str, is_dark: bool) -> String {
 enum HtmlContainer {
     Picture,
     Details,
+    Img,
+    Video,
+    Anchor,
+    Heading(u8),
+    Table,
 }
 
 struct NextHtmlTag {
@@ -268,24 +284,415 @@ struct NextHtmlTag {
     kind: HtmlContainer,
 }
 
-fn find_next_html_container(input: &str) -> Option<NextHtmlTag> {
-    let lower = input.to_ascii_lowercase();
-    let pic = lower.find("<picture").filter(|&i| matches_tag_boundary(&lower[i + 8..]));
-    let det = lower.find("<details").filter(|&i| matches_tag_boundary(&lower[i + 8..]));
-    match (pic, det) {
-        (Some(p), Some(d)) => Some(if p < d {
-            NextHtmlTag { offset: p, kind: HtmlContainer::Picture }
-        } else {
-            NextHtmlTag { offset: d, kind: HtmlContainer::Details }
-        }),
-        (Some(p), None) => Some(NextHtmlTag { offset: p, kind: HtmlContainer::Picture }),
-        (None, Some(d)) => Some(NextHtmlTag { offset: d, kind: HtmlContainer::Details }),
-        (None, None) => None,
+fn find_next_html_container_outside_code(input: &str) -> Option<NextHtmlTag> {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            let run = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if let Some(close) = find_closing_backtick_run(&input[i + run..], run) {
+                i += run + close + run;
+                continue;
+            }
+            i += run;
+            continue;
+        }
+        if bytes[i] == b'<'
+            && let Some(kind) = classify_open_tag(&input[i..])
+        {
+            return Some(NextHtmlTag { offset: i, kind });
+        }
+        i += input[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+fn find_closing_backtick_run(rest: &str, run: usize) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut j = 0;
+    while j < bytes.len() {
+        if bytes[j] == b'\n' && bytes.get(j + 1) == Some(&b'\n') {
+            return None;
+        }
+        if bytes[j] == b'`' {
+            let len = bytes[j..].iter().take_while(|&&b| b == b'`').count();
+            if len == run {
+                return Some(j);
+            }
+            j += len;
+            continue;
+        }
+        j += 1;
+    }
+    None
+}
+
+fn classify_open_tag(slice: &str) -> Option<HtmlContainer> {
+    let after = slice.strip_prefix('<')?;
+    let name_len = after.bytes().take_while(|b| b.is_ascii_alphanumeric()).count();
+    if name_len == 0 {
+        return None;
+    }
+    let name = &after[..name_len];
+    let rest = &after[name_len..];
+    if !matches_tag_boundary(rest) {
+        return None;
+    }
+    if name.eq_ignore_ascii_case("picture") {
+        Some(HtmlContainer::Picture)
+    } else if name.eq_ignore_ascii_case("details") {
+        Some(HtmlContainer::Details)
+    } else if name.eq_ignore_ascii_case("img") {
+        Some(HtmlContainer::Img)
+    } else if name.eq_ignore_ascii_case("video") {
+        Some(HtmlContainer::Video)
+    } else if name.eq_ignore_ascii_case("a") {
+        Some(HtmlContainer::Anchor)
+    } else if name.eq_ignore_ascii_case("table") {
+        Some(HtmlContainer::Table)
+    } else if name.len() == 2 && matches!(name.as_bytes()[0], b'h' | b'H') && matches!(name.as_bytes()[1], b'1'..=b'6') {
+        Some(HtmlContainer::Heading(name.as_bytes()[1] - b'0'))
+    } else {
+        None
     }
 }
 
 fn matches_tag_boundary(after_name: &str) -> bool {
-    after_name.starts_with('>') || after_name.starts_with(char::is_whitespace)
+    after_name.starts_with('>') || after_name.starts_with("/>") || after_name.starts_with(char::is_whitespace)
+}
+
+fn find_tag_end(input: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i),
+            None => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn contains_media_hint(input: &str) -> bool {
+    if input.contains("![") {
+        return true;
+    }
+    if !input.contains('<') {
+        return false;
+    }
+    let lower = input.to_ascii_lowercase();
+    ["<img", "<picture", "<video"].iter().any(|needle| {
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(needle) {
+            let abs = start + pos;
+            if matches_tag_boundary(&lower[abs + needle.len()..]) {
+                return true;
+            }
+            start = abs + needle.len();
+        }
+        false
+    })
+}
+
+fn decode_html_entities(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn parse_html_dimension(value: Option<String>) -> Option<u32> {
+    let raw = value?;
+    let trimmed = raw.trim();
+    let digits = trimmed.strip_suffix("px").or_else(|| trimmed.strip_suffix("PX")).unwrap_or(trimmed).trim();
+    digits.parse::<u32>().ok().filter(|&n| n > 0 && n <= 16_384)
+}
+
+fn format_markdown_media(alt: &str, src: &str, title: Option<&str>, hints: crate::media::MediaHints) -> Option<String> {
+    let src = src.trim();
+    if src.is_empty() {
+        return None;
+    }
+    let escaped_alt = alt.replace(['\r', '\n'], " ").replace(']', "\\]");
+    let encoded_title = crate::media::encode_media_title(hints, title);
+    let dest = if src.chars().any(char::is_whitespace) || src.contains(['(', ')', '<', '>']) {
+        format!("<{}>", src.replace('<', "%3C").replace('>', "%3E"))
+    } else {
+        src.to_owned()
+    };
+    let title_part = encoded_title
+        .map(|t| format!(" \"{}\"", t.replace('\\', "\\\\").replace('"', "\\\"")))
+        .unwrap_or_default();
+    Some(format!("![{escaped_alt}]({dest}{title_part})"))
+}
+
+fn rewrite_img_tag(input: &str) -> Option<(String, usize)> {
+    let end = find_tag_end(input)?;
+    let tag = &input[..=end];
+    let src = extract_html_attr(tag, "src")?;
+    let alt = extract_html_attr(tag, "alt").unwrap_or_default();
+    let title = extract_html_attr(tag, "title");
+    let hints = crate::media::MediaHints {
+        width: parse_html_dimension(extract_html_attr(tag, "width")),
+        height: parse_html_dimension(extract_html_attr(tag, "height")),
+        explicit_video: false,
+    };
+    let md = format_markdown_media(&alt, &src, title.as_deref(), hints)?;
+    Some((md, end + 1))
+}
+
+fn rewrite_video_block(input: &str) -> Option<(String, usize)> {
+    let open_end = find_tag_end(input)?;
+    let open_tag = &input[..=open_end];
+    let self_closing = open_tag.trim_end().ends_with("/>");
+    let (block, consumed) = if self_closing {
+        (open_tag, open_end + 1)
+    } else {
+        let lower = input.to_ascii_lowercase();
+        if let Some(close) = lower[open_end + 1..].find("</video>") {
+            let end = open_end + 1 + close + "</video>".len();
+            (&input[..end], end)
+        } else {
+            (open_tag, open_end + 1)
+        }
+    };
+
+    let mut src = extract_html_attr(open_tag, "src");
+    if src.is_none() {
+        for tag in iter_html_tags(block) {
+            if tag.len() >= 7 && tag[..7].eq_ignore_ascii_case("<source") && matches_tag_boundary(&tag[7..])
+                && let Some(candidate) = extract_html_attr(tag, "src")
+                && !candidate.trim().is_empty()
+            {
+                src = Some(candidate);
+                break;
+            }
+        }
+    }
+    let src = src?;
+    let title = extract_html_attr(open_tag, "title");
+    let alt = extract_html_attr(open_tag, "aria-label")
+        .or_else(|| title.clone())
+        .or_else(|| src.rsplit('/').next().map(|s| s.split(['?', '#']).next().unwrap_or(s).to_owned()))
+        .unwrap_or_else(|| "video".to_owned());
+    let hints = crate::media::MediaHints {
+        width: parse_html_dimension(extract_html_attr(open_tag, "width")),
+        height: parse_html_dimension(extract_html_attr(open_tag, "height")),
+        explicit_video: true,
+    };
+    let md = format_markdown_media(&alt, &src, title.as_deref(), hints)?;
+    Some((md, consumed))
+}
+
+fn rewrite_media_anchor(input: &str, is_dark: bool) -> Option<(String, usize)> {
+    let open_end = find_tag_end(input)?;
+    let open_tag = &input[..=open_end];
+    let href = extract_html_attr(open_tag, "href")?;
+    if href.trim().is_empty() {
+        return None;
+    }
+    let lower = input.to_ascii_lowercase();
+    let close_rel = lower[open_end + 1..].find("</a>")?;
+    let inner = &input[open_end + 1..open_end + 1 + close_rel];
+    if !contains_media_hint(inner) || inner.to_ascii_lowercase().contains("<a") {
+        return None;
+    }
+    let rewritten = preprocess_html_containers(inner, is_dark).replace(['\r', '\n'], " ");
+    let label = rewritten.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let dest = if href.chars().any(char::is_whitespace) || href.contains(['(', ')', '<', '>']) {
+        format!("<{}>", href.trim())
+    } else {
+        href.trim().to_owned()
+    };
+    Some((format!("[{label}]({dest})"), open_end + 1 + close_rel + "</a>".len()))
+}
+
+fn rewrite_media_heading(input: &str, level: u8, is_dark: bool) -> Option<(String, usize)> {
+    let open_end = find_tag_end(input)?;
+    let lower = input.to_ascii_lowercase();
+    let close_tag = format!("</h{level}>");
+    let close_rel = lower[open_end + 1..].find(&close_tag)?;
+    let inner = &input[open_end + 1..open_end + 1 + close_rel];
+    if !contains_media_hint(inner) {
+        return None;
+    }
+    let rewritten = preprocess_html_containers(inner, is_dark);
+    let stripped = strip_simple_html_tags(&rewritten).replace(['\r', '\n'], " ");
+    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let hashes = "#".repeat(usize::from(level));
+    Some((format!("\n{hashes} {collapsed}\n"), open_end + 1 + close_rel + close_tag.len()))
+}
+
+fn find_matching_closing_tag(input: &str, tag_name: &str, start_after_open: usize) -> Option<usize> {
+    let lower = input.to_ascii_lowercase();
+    let open_needle = format!("<{tag_name}");
+    let close_needle = format!("</{tag_name}>");
+    let close_pos = lower[start_after_open..].find(&close_needle)?;
+    if lower[start_after_open..start_after_open + close_pos].contains(&open_needle) {
+        // Skip nested tables so inner tags are never mispaired.
+        return None;
+    }
+    Some(start_after_open + close_pos)
+}
+
+fn rewrite_media_table(input: &str, is_dark: bool) -> Option<(String, usize)> {
+    let open_end = find_tag_end(input)?;
+    let close_start = find_matching_closing_tag(input, "table", open_end + 1)?;
+    let body = &input[open_end + 1..close_start];
+    if !contains_media_hint(body) {
+        return None;
+    }
+    let consumed = close_start + "</table>".len();
+    let body_lower = body.to_ascii_lowercase();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut aligns: Vec<Option<&'static str>> = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(tr_rel) = body_lower[cursor..].find("<tr") {
+        let tr_start = cursor + tr_rel;
+        if !matches_tag_boundary(&body_lower[tr_start + 3..]) {
+            cursor = tr_start + 3;
+            continue;
+        }
+        let Some(tr_open_end) = find_tag_end(&body[tr_start..]).map(|e| tr_start + e) else { break };
+        let tr_end = body_lower[tr_open_end + 1..]
+            .find("</tr>")
+            .map(|c| tr_open_end + 1 + c)
+            .unwrap_or(body.len());
+        let tr_body = &body[tr_open_end + 1..tr_end];
+        let tr_lower = tr_body.to_ascii_lowercase();
+
+        let mut cells = Vec::new();
+        let mut col = 0usize;
+        let mut cell_cur = 0usize;
+        while let Some((cell_off, is_th)) = find_next_table_cell(&tr_lower[cell_cur..]) {
+            let cell_abs = cell_cur + cell_off;
+            let Some(cell_open_end) = find_tag_end(&tr_body[cell_abs..]).map(|e| cell_abs + e) else { break };
+            let tag = &tr_body[cell_abs..=cell_open_end];
+            let close_tag = if is_th { "</th>" } else { "</td>" };
+            let cell_close = tr_lower[cell_open_end + 1..]
+                .find(close_tag)
+                .map(|c| cell_open_end + 1 + c)
+                .unwrap_or(tr_body.len());
+            let raw_cell = &tr_body[cell_open_end + 1..cell_close];
+            let colspan = extract_html_attr(tag, "colspan")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 32);
+            let align = extract_html_attr(tag, "align").and_then(|a| match a.trim().to_ascii_lowercase().as_str() {
+                "left" => Some(":---"),
+                "center" => Some(":---:"),
+                "right" => Some("---:"),
+                _ => None,
+            });
+            if aligns.len() <= col {
+                aligns.resize(col + 1, None);
+            }
+            if aligns[col].is_none() {
+                aligns[col] = align;
+            }
+            let normalized = normalize_html_table_cell(raw_cell, is_dark);
+            cells.push(normalized);
+            for _ in 1..colspan {
+                cells.push(String::new());
+            }
+            col += colspan;
+            cell_cur = (cell_close + close_tag.len()).min(tr_body.len());
+        }
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+        cursor = (tr_end + "</tr>".len()).min(body.len());
+    }
+
+    let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if rows.is_empty() || col_count == 0 {
+        return None;
+    }
+    let mut md = String::from("\n");
+    let write_row = |out: &mut String, row: &[String]| {
+        out.push('|');
+        for idx in 0..col_count {
+            out.push(' ');
+            out.push_str(row.get(idx).map(String::as_str).unwrap_or(""));
+            out.push_str(" |");
+        }
+        out.push('\n');
+    };
+    write_row(&mut md, &rows[0]);
+    md.push('|');
+    for idx in 0..col_count {
+        md.push(' ');
+        md.push_str(aligns.get(idx).copied().flatten().unwrap_or("---"));
+        md.push_str(" |");
+    }
+    md.push('\n');
+    for row in rows.iter().skip(1) {
+        write_row(&mut md, row);
+    }
+    Some((md, consumed))
+}
+
+fn find_next_table_cell(lower: &str) -> Option<(usize, bool)> {
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find('<') {
+        let abs = i + pos;
+        let rest = &lower[abs..];
+        if rest.starts_with("<th") && matches_tag_boundary(&rest[3..]) {
+            return Some((abs, true));
+        }
+        if rest.starts_with("<td") && matches_tag_boundary(&rest[3..]) {
+            return Some((abs, false));
+        }
+        i = abs + 1;
+    }
+    None
+}
+
+fn normalize_html_table_cell(raw_cell: &str, is_dark: bool) -> String {
+    let with_media = preprocess_html_containers(raw_cell, is_dark);
+    let mut out = String::with_capacity(with_media.len());
+    let mut i = 0;
+    while i < with_media.len() {
+        let rest = &with_media[i..];
+        if rest.starts_with('<')
+            && let Some(end) = find_tag_end(rest)
+        {
+            let tag = &rest[..=end];
+            let lower = tag.to_ascii_lowercase();
+            if lower.starts_with("<br") {
+                out.push(' ');
+            } else if lower.starts_with("<code") || lower.starts_with("</code") {
+                out.push('`');
+            }
+            i += end + 1;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        match ch {
+            '|' => out.push_str("\\|"),
+            '\r' | '\n' => out.push(' '),
+            _ => out.push(ch),
+        }
+        i += ch.len_utf8();
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn rewrite_picture_block(input: &str, is_dark: bool) -> Option<(String, usize)> {
@@ -298,10 +705,11 @@ fn rewrite_picture_block(input: &str, is_dark: bool) -> Option<(String, usize)> 
     let mut chosen_src: Option<String> = None;
     let mut fallback_src: Option<String> = None;
     let mut alt = String::new();
+    let mut title: Option<String> = None;
+    let mut hints = crate::media::MediaHints::default();
 
     for tag in iter_html_tags(block) {
-        let tag_lower = tag.to_ascii_lowercase();
-        if tag_lower.starts_with("<source") {
+        if tag.len() >= 7 && tag[..7].eq_ignore_ascii_case("<source") && matches_tag_boundary(&tag[7..]) {
             let media = extract_html_attr(tag, "media").unwrap_or_default().to_ascii_lowercase();
             let srcset = extract_html_attr(tag, "srcset").or_else(|| extract_html_attr(tag, "src"));
             if let Some(src) = srcset.and_then(|s| s.split(',').next().map(|part| part.split_whitespace().next().unwrap_or("").to_owned()))
@@ -311,23 +719,28 @@ fn rewrite_picture_block(input: &str, is_dark: bool) -> Option<(String, usize)> 
             {
                 chosen_src = Some(src);
             }
-        } else if tag_lower.starts_with("<img") {
+        } else if tag.len() >= 4 && tag[..4].eq_ignore_ascii_case("<img") && matches_tag_boundary(&tag[4..]) {
             if let Some(src) = extract_html_attr(tag, "src") {
                 fallback_src = Some(src);
             }
             if let Some(a) = extract_html_attr(tag, "alt") {
                 alt = a;
             }
+            if title.is_none() {
+                title = extract_html_attr(tag, "title");
+            }
+            hints.width = hints.width.or_else(|| parse_html_dimension(extract_html_attr(tag, "width")));
+            hints.height = hints.height.or_else(|| parse_html_dimension(extract_html_attr(tag, "height")));
         }
     }
 
     let final_src = chosen_src.or(fallback_src)?;
-    let escaped_alt = alt.replace(']', "\\]");
-    Some((format!("![{escaped_alt}]({final_src})"), consumed))
+    let md = format_markdown_media(&alt, &final_src, title.as_deref(), hints)?;
+    Some((md, consumed))
 }
 
-fn rewrite_details_block(input: &str) -> Option<(String, usize)> {
-    let open_tag_end = input.find('>')?;
+fn rewrite_details_block(input: &str, is_dark: bool) -> Option<(String, usize)> {
+    let open_tag_end = find_tag_end(input)?;
     let open_tag = &input[..=open_tag_end];
     let is_open = open_tag.to_ascii_lowercase().split_whitespace().any(|tok| {
         let tok = tok.trim_end_matches('>');
@@ -375,6 +788,7 @@ fn rewrite_details_block(input: &str) -> Option<(String, usize)> {
     } else {
         ("Details".to_owned(), inner.trim().to_owned())
     };
+    let body = preprocess_html_containers(&body, is_dark);
 
     let fence_ticks = "`".repeat(max_backtick_run(&body).max(3) + 1);
     let summary_json = serde_json::to_string(&summary).unwrap_or_else(|_| "\"Details\"".to_owned());
@@ -401,7 +815,7 @@ fn iter_html_tags(input: &str) -> Vec<&str> {
     let mut i = 0;
     while let Some(start) = input[i..].find('<') {
         let abs = i + start;
-        let Some(end) = input[abs..].find('>') else { break };
+        let Some(end) = find_tag_end(&input[abs..]) else { break };
         tags.push(&input[abs..=abs + end]);
         i = abs + end + 1;
     }
@@ -410,22 +824,27 @@ fn iter_html_tags(input: &str) -> Vec<&str> {
 
 fn extract_html_attr(tag: &str, attr: &str) -> Option<String> {
     let lower = tag.to_ascii_lowercase();
-    let needle = format!("{attr}=");
     let mut pos = 0;
-    while let Some(idx) = lower[pos..].find(&needle) {
+    while let Some(idx) = lower[pos..].find(attr) {
         let abs = pos + idx;
         if abs > 0 && !lower.as_bytes()[abs - 1].is_ascii_whitespace() {
-            pos = abs + needle.len();
+            pos = abs + attr.len();
             continue;
         }
-        let rest = &tag[abs + needle.len()..];
+        let after_name = tag[abs + attr.len()..].trim_start();
+        let Some(after_eq) = after_name.strip_prefix('=') else {
+            pos = abs + attr.len();
+            continue;
+        };
+        let rest = after_eq.trim_start();
         let first = rest.chars().next()?;
         if first == '"' || first == '\'' {
             let inner = &rest[1..];
             let end = inner.find(first)?;
-            return Some(inner[..end].to_owned());
+            return Some(decode_html_entities(&inner[..end]));
         }
-        return Some(rest.split(|c: char| c.is_whitespace() || c == '>').next()?.to_owned());
+        let raw = rest.split(|c: char| c.is_whitespace() || c == '>').next()?;
+        return Some(decode_html_entities(raw.trim_end_matches('/')));
     }
     None
 }
@@ -593,5 +1012,34 @@ mod tests {
         assert!(out_dark.contains("[`apps/native/crates/core/src/lib.rs:42`](apps/native/crates/core/src/lib.rs:42)"));
         assert!(out_dark.contains("[`already.rs`](already.rs)"));
         assert!(!out_dark.contains("[`src/main.rs:1`]"));
+    }
+
+    #[test]
+    fn rewrites_html_media_headings_tables_and_videos_preserving_code_and_dimensions() {
+        let md = concat!(
+            "<h1><img src=\"logo.png\" alt=\"Logo\" width=\"24\" height=\"24\"> Title</h1>\n\n",
+            "<a href=\"https://example.com\"><img src=\"thumb.png\" alt=\"Thumb\" width=\"200\"></a>\n\n",
+            "<video controls width=\"480\" height=\"270\"><source src=\"https://example.com/demo\" type=\"video/mp4\"></video>\n\n",
+            "<table><tr><th>Preview</th><th>Status</th></tr><tr><td align=\"center\"><img src=\"cell.png\" alt=\"Cell\"></td><td>OK | Done</td></tr></table>\n\n",
+            "Inline `<img src=\"ignored.png\">` stays literal.\n",
+        );
+        let out = preprocess_markdown_for_display(md, true, None);
+        assert!(out.contains("# ![Logo](logo.png "), "heading: {out}");
+        assert!(out.contains("[![Thumb](thumb.png "), "anchor: {out}");
+        assert!(out.contains("](https://example.com)"), "anchor dest: {out}");
+        assert!(out.contains("![demo](https://example.com/demo "), "video: {out}");
+        assert!(out.contains("| Preview | Status |"), "table header: {out}");
+        assert!(out.contains("| ![Cell](cell.png) | OK \\| Done |"), "table row: {out}");
+        assert!(out.contains("`<img src=\"ignored.png\">`"), "inline code: {out}");
+
+        let doc = crate::media::MarkdownMediaDocument::new(out.into()).prepare();
+        let gallery = doc.gallery_images();
+        assert_eq!(gallery.len(), 3, "logo, video, table cell (linked thumb excluded): {gallery:?}");
+        assert_eq!(gallery[0].2, crate::media::MediaHints { width: Some(24), height: Some(24), explicit_video: false });
+        assert_eq!(gallery[1].2, crate::media::MediaHints { width: Some(480), height: Some(270), explicit_video: true });
+
+        let raw_disabled = preprocess_markdown_for_display_with_html(md, true, None, false);
+        assert!(raw_disabled.contains("<img src=\"logo.png\""));
+        assert!(raw_disabled.contains("<video controls"));
     }
 }

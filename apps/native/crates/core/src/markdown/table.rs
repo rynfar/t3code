@@ -52,6 +52,27 @@ impl TableData {
         Self { align, rows }
     }
 
+    /// Extracts raw per-cell Markdown slices from `raw_source` for tables containing rich inline nodes
+    /// (images/videos) that need custom block rendering per cell.
+    pub fn cell_markdown_rows(table: &mdast::Table, raw_source: &str) -> Vec<Vec<String>> {
+        table
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                mdast::Node::TableRow(row) => Some(
+                    row.children
+                        .iter()
+                        .filter_map(|cell| match cell {
+                            mdast::Node::TableCell(cell) => Some(extract_cell_markdown(cell, raw_source)),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Serializes the table as GitHub-Flavored Markdown.
     pub fn to_markdown(&self) -> String {
         if self.rows.is_empty() {
@@ -124,13 +145,22 @@ fn escape_markdown_cell(cell: &str) -> String {
     cell.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
+fn extract_cell_markdown(cell: &mdast::TableCell, raw_source: &str) -> String {
+    if let (Some(first), Some(last)) = (cell.children.first().and_then(|n| n.position()), cell.children.last().and_then(|n| n.position()))
+        && let Some(slice) = raw_source.get(first.start.offset..last.end.offset)
+    {
+        return slice.trim().to_owned();
+    }
+    collect_cell_text(cell)
+}
+
 fn collect_cell_text(cell: &mdast::TableCell) -> String {
     fn visit(node: &mdast::Node, out: &mut String) {
         match node {
             mdast::Node::Text(t) => out.push_str(&t.value),
             mdast::Node::InlineCode(c) => out.push_str(&c.value),
             mdast::Node::Break(_) => out.push(' '),
-            mdast::Node::Image(img) => out.push_str(&img.alt),
+            mdast::Node::Image(img) => out.push_str(&crate::media::strip_media_title_meta(&img.alt)),
             _ => {
                 if let Some(children) = node.children() {
                     for child in children {
@@ -169,5 +199,22 @@ mod tests {
             table.to_csv(),
             "Name,Value\nalpha | beta,\"42,000\"\n\"quote \"\"x\"\"\",10"
         );
+    }
+
+    #[test]
+    fn extracts_raw_cell_markdown_and_strips_media_hints_marker() {
+        let hints_title = crate::media::encode_media_title(
+            crate::media::MediaHints { width: Some(120), height: None, explicit_video: false },
+            None,
+        )
+        .unwrap();
+        let raw = format!("| Preview | Note |\n| --- | --- |\n| ![Shot](shot.png \"{hints_title}\") | **Ok** |");
+        let root = markdown::to_mdast(&raw, &markdown::ParseOptions::gfm()).unwrap();
+        let mdast::Node::Table(tbl) = &root.children().unwrap()[0] else { panic!("table") };
+        let cells = TableData::cell_markdown_rows(tbl, &raw);
+        assert_eq!(cells[1][0], format!("![Shot](shot.png \"{hints_title}\")"));
+        assert_eq!(cells[1][1], "**Ok**");
+        let data = TableData::from_mdast(tbl);
+        assert_eq!(data.rows[1], vec!["Shot".to_owned(), "Ok".to_owned()]);
     }
 }
