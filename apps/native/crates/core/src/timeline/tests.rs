@@ -989,12 +989,26 @@ fn a_usage_limited_run_stays_latest_behind_unstarted_runs() {
     let now = parse_iso_ms("2026-01-01T01:00:00Z").expect("now");
     let recovery = limit_recovery(Some(&error), &shell, now).expect("recovery");
     assert_eq!(recovery.id(), "usage-limit-recovery:run-1");
+    assert_eq!(recovery.title(), "ChatGPT usage limit reached");
+    assert!(recovery.chatgpt_limit() && !recovery.workspace_limit());
     assert!(recovery.can_schedule && !recovery.scheduled && !recovery.snoozed && !recovery.reset_passed);
     assert_eq!(recovery.description(now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "Resets 5:00 AM");
     let resume = recovery.toggle_resume("c", "t").expect("resume");
     assert_eq!(resume["limitRecovery"], serde_json::json!({ "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true }));
     assert_eq!(recovery.toggle_snooze("c", "t", now).expect("snooze")["limitRecovery"]["snooze"], true);
     assert_eq!(recovery.toggle_snooze("c", "t", parse_iso_ms("2026-01-01T06:00:00Z").expect("later")), Err(SnoozeRefused));
+
+    let workspace_error = thread_error(&projection_with(run_json("failed"), serde_json::json!([item_json("e1", serde_json::json!({
+        "type": "error",
+        "failure": { "class": "usage_limit", "message": "Workspace limit", "code": super::status::CHATGPT_WORKSPACE_USAGE_LIMIT_CODE, "resetAt": "2026-01-01T05:00:00Z", "retryable": null },
+    }))]), serde_json::json!([]))).expect("workspace error");
+    let workspace_recovery = limit_recovery(Some(&workspace_error), &shell, now).expect("workspace recovery");
+    assert_eq!(workspace_recovery.title(), "ChatGPT usage limit reached");
+    assert!(workspace_recovery.chatgpt_limit() && workspace_recovery.workspace_limit() && workspace_recovery.can_schedule);
+    assert_eq!(
+        workspace_recovery.description(now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }),
+        "You've reached your workspace's limit for using your ChatGPT plan in other apps."
+    );
 
     let scheduled = status_shell(serde_json::json!({
         "snoozedUntil": "2026-01-01T05:00:00.000Z",
@@ -1010,6 +1024,8 @@ fn a_usage_limited_run_stays_latest_behind_unstarted_runs() {
         "type": "error", "failure": { "class": "usage_limit", "message": "Limit", "code": null, "retryable": null },
     }))]), serde_json::json!([]))).expect("an error");
     let recovery = limit_recovery(Some(&no_reset), &shell, now).expect("recovery");
+    assert_eq!(recovery.title(), "Usage limit reached");
+    assert!(!recovery.chatgpt_limit() && !recovery.workspace_limit());
     assert!(!recovery.can_schedule);
     assert_eq!(recovery.description(now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }), "Reset time unavailable; retry manually");
 }
@@ -1318,6 +1334,32 @@ fn background_work_titles_follow_present_pending_background_work() {
     assert_eq!(many.title, "Waiting on 1 subagent, 2 commands and 1 background task");
     assert_eq!(many.description().as_deref(), Some("Explore, a, b, background task"));
     assert_eq!(many.only_child_thread(), None);
+    assert_eq!(many.only_started_at(), None);
+
+    let items: Vec<crate::turn_item::TurnItem> = serde_json::from_value(serde_json::json!([
+        {
+            "id": "turn-s1", "threadId": "t", "runId": "run-1", "nodeId": "root", "ordinal": 1, "status": "running",
+            "title": null, "startedAt": "2026-01-01T00:00:10Z", "completedAt": null, "updatedAt": "2026-01-01T00:00:25Z",
+            "nativeItemRef": { "nativeId": "s1" },
+            "type": "subagent", "subagentId": "sub-1", "subagentName": "Explore", "progress": "  Scanning\n  auth   files "
+        },
+        {
+            "id": "turn-s2", "threadId": "t", "runId": "run-1", "nodeId": "root", "ordinal": 2, "status": "running",
+            "title": null, "startedAt": "2026-01-01T00:00:12Z", "completedAt": null, "updatedAt": "2026-01-01T00:00:30Z",
+            "type": "subagent", "subagentId": "sub-2", "subagentName": "Tester", "progress": "Running tests", "childThreadId": "fallback-child"
+        }
+    ])).unwrap();
+    let single = BackgroundWork::with_items(&[background_task("s1", "subagent", Some("Explore"), None)], &items).unwrap();
+    assert_eq!(single.only_started_at(), Some("2026-01-01T00:00:10Z"));
+    assert_eq!(single.description().as_deref(), Some("Scanning auth files"));
+    let fallback = BackgroundWork::with_items(&[crate::shell::PendingBackgroundTask { task_id: "turn-s2".into(), kind: "subagent".into(), description: Some("Tester".into()), child_thread_id: None, awaited: Some(true) }], &items).unwrap();
+    assert_eq!(fallback.only_child_thread(), Some("fallback-child"));
+    let multi = BackgroundWork::with_items(&[
+        background_task("s1", "subagent", Some("Explore"), None),
+        crate::shell::PendingBackgroundTask { task_id: "turn-s2".into(), kind: "subagent".into(), description: Some("Tester".into()), child_thread_id: None, awaited: Some(true) },
+    ], &items).unwrap();
+    assert_eq!(multi.only_started_at(), None);
+    assert_eq!(multi.description().as_deref(), Some("Tester: Running tests"));
 }
 
 #[test]
@@ -1852,4 +1894,22 @@ fn inherited_event_visibility_survives_entries_to_rows_projection() {
         })
         .collect();
     assert_eq!(visibilities, vec![("item-secret", Visibility::Inherited), ("item-link", Visibility::Local)]);
+}
+
+#[test]
+fn branch_mismatch_rules_gate_on_worktree_content_and_dismissal() {
+    assert_eq!(local_checkout_branch_mismatch("t1", Some("feat/a"), Some("/tmp/wt"), Some("main")), None);
+    assert_eq!(local_checkout_branch_mismatch("t1", Some("main"), None, Some("main")), None);
+    assert_eq!(local_checkout_branch_mismatch("t1", None, None, Some("main")), None);
+    assert_eq!(local_checkout_branch_mismatch("t1", Some("feat/a"), None, Some("  ")), None);
+
+    let mismatch = local_checkout_branch_mismatch("t1", Some("feat/a"), None, Some("main")).expect("mismatch");
+    let key = mismatch.key();
+    assert_eq!(key, "t1:feat/a:main");
+    assert!(!should_show_branch_mismatch_banner(Some(&key), false, false, None));
+    assert!(should_show_branch_mismatch_banner(Some(&key), false, true, None));
+    assert!(should_show_branch_mismatch_banner(Some(&key), false, false, Some(&key)));
+    assert!(!should_show_branch_mismatch_banner(Some(&key), false, false, Some("t1:feat/b:main")));
+    assert!(!should_show_branch_mismatch_banner(Some(&key), true, true, Some(&key)));
+    assert!(!should_show_branch_mismatch_banner(None, false, true, Some(&key)));
 }

@@ -120,5 +120,5 @@ fn thread_setting_commands_use_wire_literals() {
 
 #[test]
 fn config_subscription_requests_published_themes() {
-    assert_eq!(subscribe_server_config(), json!({"workspaceSnapshotsOnDemand":true,"usageLimitSources":true,"environmentThemes":true}));
+    assert_eq!(subscribe_server_config(), json!({"workspaceSnapshotsOnDemand":true,"usageLimitSources":true,"usageLimitsCommand":true,"environmentThemes":true}));
 }

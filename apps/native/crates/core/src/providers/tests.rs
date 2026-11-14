@@ -188,8 +188,14 @@ fn accents_and_badges_mark_instances_apart() {
 #[test]
 fn status_refresh_matches_the_native_subscription_capabilities() {
     assert_eq!(super::RefreshProviders::Status("work-codex").payload(), serde_json::json!({
-        "instanceId": "work-codex", "refreshModels": true, "workspaceSnapshotsOnDemand": true
+        "instanceId": "work-codex", "refreshModels": true, "workspaceSnapshotsOnDemand": true, "usageLimitsCommand": true
     }));
+    assert_eq!(super::RefreshProviders::Settings.payload().get("usageLimitsCommand"), Some(&serde_json::json!(true)));
+    assert_eq!(super::RefreshProviders::Limits.payload().get("usageLimitsCommand"), Some(&serde_json::json!(true)));
+    assert_eq!(
+        super::RefreshProviders::Workspace { instance_id: "codex", cwd: "/repo" }.payload().get("usageLimitsCommand"),
+        Some(&serde_json::json!(true)),
+    );
     assert_eq!(super::RefreshProviders::Status("work-codex").payload().get("usageLimitsCommand"), crate::commands::subscribe_server_config().get("usageLimitsCommand"));
 }
 

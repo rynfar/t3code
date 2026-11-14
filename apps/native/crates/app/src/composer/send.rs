@@ -76,6 +76,19 @@ impl Composer {
             self.save_queued_edit(window, cx);
             return;
         }
+        let prompt = self.prompt(cx);
+        let staged = self.staged_attachments();
+        if t3_core::usage::limits::UsageLimitsReport::is_command(&prompt)
+            && !self.has_non_prompt_content(&prompt, &staged)
+            && self.usage_limits_offered(cx)
+            && self.usage_limits_key(cx).is_some()
+        {
+            if self.open_usage_limits(cx) {
+                self.set_prompt("", window, cx);
+                self.draft_changed(cx);
+            }
+            return;
+        }
         if self.snapshot.setup_blocks_send {
             return;
         }
@@ -84,8 +97,6 @@ impl Composer {
             self.submit_plan_follow_up(window, cx);
             return;
         }
-        let prompt = self.prompt(cx);
-        let staged = self.staged_attachments();
         // Excerpts whose text is gone are left out, links and all (`snapshotComposerSend`).
         let terminals = TerminalSend::of(&prompt, self.current_terminals());
         if !terminals.has_content(staged.len(), self.linked_threads(&prompt) + t3_core::composer::review::referenced(&prompt, self.current_reviews()).len()) {
@@ -284,6 +295,7 @@ impl Composer {
                     }
                     this.restore(taken, error, window, cx);
                 } else {
+                    this.clear_usage_limits_for(&taken.target);
                     this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
                 }
                 cx.notify();
@@ -502,6 +514,7 @@ impl Composer {
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 if result.is_ok() {
+                    this.clear_usage_limits_for(&taken.target);
                     this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
                 }
                 this.finish_launch(intent, (result, worktree_launch), taken, window, cx);
@@ -587,8 +600,11 @@ impl Composer {
                 this.sending = false;
                 if let Some(error) = failure {
                     this.restore(taken, error, window, cx);
-                } else if sends_prompt {
-                    this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
+                } else {
+                    this.clear_usage_limits_for(&taken.target);
+                    if sends_prompt {
+                        this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
+                    }
                 }
                 cx.notify();
             });

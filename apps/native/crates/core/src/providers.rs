@@ -11,7 +11,6 @@ use crate::sidebar::time::parse_iso;
 
 /// Refresh inputs from `ProviderStatusBanner.tsx`, provider settings, Usage and composer menus.
 /// `client-runtime/src/state/server.ts` adds on-demand workspace snapshots to every request.
-/// Native does not opt into `/usage-limits` until the composer can intercept that command.
 pub enum RefreshProviders<'a> {
     Status(&'a str),
     Settings,
@@ -22,7 +21,10 @@ pub enum RefreshProviders<'a> {
 impl RefreshProviders<'_> {
     pub fn payload(self) -> serde_json::Value {
         use serde_json::json;
-        let mut payload = json!({ "workspaceSnapshotsOnDemand": true });
+        let mut payload = json!({
+            "workspaceSnapshotsOnDemand": true,
+            "usageLimitsCommand": true,
+        });
         match self {
             Self::Status(instance_id) => {
                 payload["instanceId"] = json!(instance_id);

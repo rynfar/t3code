@@ -175,6 +175,7 @@ pub fn error_can_expand(full: &str, collapsed: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitRecovery {
     pub run_id: String,
+    pub error_code: Option<String>,
     pub reset_at: Option<String>,
     /// Resume and snooze are offered only when the reset is after the stop.
     pub can_schedule: bool,
@@ -190,7 +191,22 @@ impl LimitRecovery {
         format!("usage-limit-recovery:{}", self.run_id)
     }
 
+    pub fn chatgpt_limit(&self) -> bool {
+        matches!(self.error_code.as_deref(), Some(CHATGPT_USAGE_LIMIT_CODE | CHATGPT_WORKSPACE_USAGE_LIMIT_CODE))
+    }
+
+    pub fn workspace_limit(&self) -> bool {
+        self.error_code.as_deref() == Some(CHATGPT_WORKSPACE_USAGE_LIMIT_CODE)
+    }
+
+    pub fn title(&self) -> &'static str {
+        if self.chatgpt_limit() { "ChatGPT usage limit reached" } else { Self::TITLE }
+    }
+
     pub fn description(&self, now_ms: i64, zone: &dyn Zone, format: TimestampFormat, locale: &dyn TimestampLocale) -> String {
+        if self.workspace_limit() {
+            return "You've reached your workspace's limit for using your ChatGPT plan in other apps.".to_owned();
+        }
         match self.reset_at.as_deref().filter(|reset| !reset.is_empty()).map(|reset| format_upcoming(reset, now_ms, zone, format, locale)) {
             Some(reset) => format!("Resets {reset}"),
             None => "Reset time unavailable; retry manually".to_owned(),
@@ -239,6 +255,7 @@ pub fn limit_recovery(error: Option<&ThreadError>, shell: &ThreadShell, now_ms: 
         scheduled: recovery.is_some_and(|recovery| recovery.auto_resume),
         snoozed: recovery.is_some_and(|recovery| recovery.snooze == Some(true)) && reset_ms.is_some() && snoozed_until == reset_ms && !reset_passed,
         run_id,
+        error_code: error.code.clone(),
         reset_at,
         can_schedule,
         reset_passed,
@@ -484,4 +501,52 @@ pub fn provider_banner(provider: &ServerProvider) -> Option<ProviderBanner> {
         message,
         warning: incompatible.map_or(provider.status == "warning", |advisory| advisory.status != "broken"),
     })
+}
+
+/// `localCheckoutBranchMismatch` (`ChatView.tsx`): mismatch between a non-worktree thread's
+/// recorded branch and the local project checkout's current branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchMismatch {
+    pub thread_id: String,
+    pub thread_branch: String,
+    pub current_branch: String,
+}
+
+impl BranchMismatch {
+    pub fn key(&self) -> String {
+        format!("{}:{}:{}", self.thread_id, self.thread_branch, self.current_branch)
+    }
+}
+
+pub fn local_checkout_branch_mismatch(
+    thread_id: &str,
+    thread_branch: Option<&str>,
+    worktree_path: Option<&str>,
+    current_branch: Option<&str>,
+) -> Option<BranchMismatch> {
+    if worktree_path.is_some() {
+        return None;
+    }
+    let thread_branch = thread_branch.map(str::trim).filter(|branch| !branch.is_empty())?;
+    let current_branch = current_branch.map(str::trim).filter(|branch| !branch.is_empty())?;
+    if thread_branch == current_branch {
+        return None;
+    }
+    Some(BranchMismatch { thread_id: thread_id.to_owned(), thread_branch: thread_branch.to_owned(), current_branch: current_branch.to_owned() })
+}
+
+/// `shouldShowBranchMismatchBanner` (`ChatView.logic.ts`).
+pub fn should_show_branch_mismatch_banner(
+    mismatch_key: Option<&str>,
+    dismissed: bool,
+    composer_has_content: bool,
+    revealed_mismatch_key: Option<&str>,
+) -> bool {
+    let Some(key) = mismatch_key else {
+        return false;
+    };
+    if dismissed {
+        return false;
+    }
+    composer_has_content || revealed_mismatch_key == Some(key)
 }

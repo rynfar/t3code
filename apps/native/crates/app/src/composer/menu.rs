@@ -422,7 +422,16 @@ impl Composer {
                 }
                 self.replace_prompt_range(trigger.range_start, trigger.range_end, &format!("/{} ", command.name()), window, cx);
             }
-            MenuAction::ProviderCommand { name } => self.replace_trigger(&text, &trigger, &format!("/{name} "), window, cx),
+            MenuAction::ProviderCommand { name } => {
+                if name == t3_core::usage::limits::UsageLimitsReport::COMMAND_NAME && self.can_intercept_usage_limits(&text, cx) {
+                    self.replace_prompt_range(trigger.range_start, trigger.range_end, "", window, cx);
+                    self.open_usage_limits(cx);
+                    self.menu.highlighted = None;
+                    cx.notify();
+                    return;
+                }
+                self.replace_trigger(&text, &trigger, &format!("/{name} "), window, cx);
+            }
             MenuAction::Skill { name, .. } => self.replace_trigger(&text, &trigger, &format!("${name} "), window, cx),
             MenuAction::Environment {environment_id,label} => {
                 let record=t3_core::composer::records::environment_record(&environment_id,&label);

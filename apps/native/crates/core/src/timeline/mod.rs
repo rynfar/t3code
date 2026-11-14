@@ -103,9 +103,9 @@ pub use now::{
     format_subagent_display_title,
 };
 pub use status::{
-    CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, GoalLine, LimitRecovery, ProviderBanner, RunStop, SnoozeRefused, StatusLine, ThreadError, elapsed_since,
-    error_banner_message, error_can_expand, goal_line, limit_recovery, presented_latest_run, provider_banner, relative_time_label, run_stop, status_line,
-    thread_error, timeline_thread_error,
+    BranchMismatch, CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, GoalLine, LimitRecovery, ProviderBanner, RunStop, SnoozeRefused, StatusLine,
+    ThreadError, elapsed_since, error_banner_message, error_can_expand, goal_line, limit_recovery, local_checkout_branch_mismatch, presented_latest_run,
+    provider_banner, relative_time_label, run_stop, should_show_branch_mismatch_banner, status_line, thread_error, timeline_thread_error,
 };
 pub use time::{TimestampLocale, format_day_aware, format_duration, format_short_time, format_tokens, format_upcoming, parse_iso_ms, usage_limit_label};
 pub use tool_activity::{claude_skill_invocation, command_display_text, command_program_name, is_javascript_repl_tool, with_visible_control_characters};

@@ -98,6 +98,7 @@ impl Composer {
         let choice = self.choices().and_then(|choices| choices.model.as_ref()).map(|model| &model.instance_id);
         if choice != self.provider_choice.as_ref() { self.sync_provider_target(cx); }
         if self.cancel_pending_send() { cx.notify(); }
+        self.sync_branch_mismatch(cx);
         if let Some(target) = self.snapshot.target.clone() {
             self.record_draft(&target, cx);
         }

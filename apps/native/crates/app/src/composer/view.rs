@@ -355,13 +355,16 @@ impl Render for Composer {
                         cx.propagate();
                     }
                 }))
+                .relative()
                 .w_full()
                 .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
                 .children(self.render_queue(cx))
                 .children(error.map(|error| {
                     div().id("composer-stream-error").debug_selector(|| "composer-stream-error".to_owned()).pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
                 }))
-                .when(self.fixed.is_none(), |this| this.child(self.limit_recovery.clone()))
+                .when(!matches!(self.snapshot.target, Some(Target::Draft(_))) && self.fixed.is_none(), |this| this.child(self.limit_recovery.clone()))
+                .when(!matches!(self.snapshot.target, Some(Target::Draft(_))), |this| this.children(self.render_branch_mismatch_banner(cx)))
+                .when(!matches!(self.snapshot.target, Some(Target::Draft(_))), |this| this.children(self.render_usage_limits_banner(false, cx)))
                 .children(question.as_ref().map(|input| self.render_question(input, cx)))
                 .when(question.is_none(), |this| {
                     this.children(approval.as_ref().map(|approval| self.render_approval(approval, approval_count, cx)))
@@ -433,7 +436,23 @@ impl Render for Composer {
                         ),
                     ),
                 )
-                .children(self.render_workspace(cx).map(|control| h_flex().pt(px(8.)).px(px(8.)).child(control))),
+                .children(self.render_workspace(cx).map(|control| h_flex().pt(px(8.)).px(px(8.)).child(control)))
+                .when(matches!(self.snapshot.target, Some(Target::Draft(_))), |this| {
+                    this.children(self.render_usage_limits_banner(true, cx).map(render_draft_usage_limits_overlay))
+                }),
         )
     }
+}
+
+pub(super) fn render_draft_usage_limits_overlay(banner: AnyElement) -> AnyElement {
+    div()
+        .id("draft-usage-limits-overlay")
+        .debug_selector(|| "draft-usage-limits-overlay".to_owned())
+        .absolute()
+        .left_0()
+        .right_0()
+        .top_full()
+        .pt(px(16.))
+        .child(banner)
+        .into_any_element()
 }

@@ -6,9 +6,10 @@
 
 use serde_json::{Value, json};
 
-use super::command_display_text;
+use super::{command_display_text, parse_iso_ms};
 use crate::shell::{PendingBackgroundTask, ThreadShell};
 use crate::sidebar::thread::{side_chat_request, subagent_request};
+use crate::turn_item::{TurnItem, TurnItemKind};
 
 /// `WS_METHODS.forceStopThread`.
 pub const FORCE_STOP_THREAD: &str = "orchestration.forceStopThread";
@@ -49,6 +50,9 @@ pub struct BackgroundItem {
     /// The label is a command line, drawn in mono.
     pub command: bool,
     pub child_thread_id: Option<String>,
+    pub activity: Option<String>,
+    pub started_at: Option<String>,
+    pub updated_at_ms: i64,
 }
 
 /// `PendingBackgroundWorkPresentation`.
@@ -61,11 +65,38 @@ pub struct BackgroundWork {
 }
 
 impl BackgroundWork {
-    /// The line's detail: every label when there are several; a single task's title says it all.
+    pub fn with_items<T: std::borrow::Borrow<TurnItem>>(tasks: &[PendingBackgroundTask], turn_items: &[T]) -> Option<Self> {
+        background_work_with_items(tasks, turn_items)
+    }
+
+    /// Subagent progress (newest for multi-task, or the sole task's progress), otherwise each label.
     pub fn description(&self) -> Option<String> {
         match self.items.as_slice() {
-            [_] => None,
-            items => Some(items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>().join(", ")),
+            [only] => only.activity.clone(),
+            items => {
+                let newest = items.iter().filter(|item| item.activity.is_some()).fold(None, |best: Option<&BackgroundItem>, item| match best {
+                    Some(kept) if kept.updated_at_ms >= item.updated_at_ms => Some(kept),
+                    _ => Some(item),
+                });
+                if let Some(newest) = newest
+                    && let Some(activity) = newest.activity.as_deref()
+                {
+                    return Some(format!("{}: {activity}", newest.label));
+                }
+                Some(items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>().join(", "))
+            }
+        }
+    }
+
+    /// True when the single task's title ends with a command label to draw in monospace.
+    pub fn only_command(&self) -> bool {
+        matches!(self.items.as_slice(), [only] if only.command && only.label != kind_nouns(&only.kind).1)
+    }
+
+    pub fn only_started_at(&self) -> Option<&str> {
+        match self.items.as_slice() {
+            [only] => only.started_at.as_deref(),
+            _ => None,
         }
     }
 
@@ -90,7 +121,19 @@ fn join_with_and(parts: &[String]) -> String {
     }
 }
 
+fn item_task_key(item: &TurnItem) -> &str {
+    item.native_item_ref
+        .as_ref()
+        .map(|reference| reference.native_id.as_str())
+        .filter(|id| !id.is_empty())
+        .unwrap_or(item.id.as_str())
+}
+
 pub fn background_work(tasks: &[PendingBackgroundTask]) -> Option<BackgroundWork> {
+    background_work_with_items::<TurnItem>(tasks, &[])
+}
+
+fn background_work_with_items<T: std::borrow::Borrow<TurnItem>>(tasks: &[PendingBackgroundTask], turn_items: &[T]) -> Option<BackgroundWork> {
     if tasks.is_empty() {
         return None;
     }
@@ -100,19 +143,43 @@ pub fn background_work(tasks: &[PendingBackgroundTask]) -> Option<BackgroundWork
         .map(|task| {
             let (_, singular, _) = kind_nouns(&task.kind);
             let description = task.description.as_deref().map(str::trim).filter(|text| !text.is_empty());
-            let command = matches!(task.kind.as_str(), "command" | "monitor");
+            let command_kind = matches!(task.kind.as_str(), "command" | "monitor");
             let label = description.map(|text| match task.kind.as_str() {
                 "subagent" => format_subagent_display_title(text).trim().to_owned(),
-                _ if command => command_display_text(text),
+                _ if command_kind => command_display_text(text),
                 _ => text.to_owned(),
             });
             let label = label.filter(|label| !label.is_empty());
+            let item = turn_items.iter().map(std::borrow::Borrow::borrow).rev().find(|candidate| item_task_key(candidate) == task.task_id);
+            let subagent = item.filter(|candidate| matches!(candidate.kind, TurnItemKind::Subagent { .. }));
+            let (activity, subagent_child_thread_id) = match subagent.map(|candidate| &candidate.kind) {
+                Some(TurnItemKind::Subagent { child_thread_id, progress, .. }) => {
+                    let activity = progress
+                        .as_deref()
+                        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .filter(|text| !text.is_empty());
+                    (activity, child_thread_id.clone())
+                }
+                _ => (None, None),
+            };
+            let command = match item.map(|candidate| &candidate.kind) {
+                Some(TurnItemKind::CommandExecution { input, .. }) => label.as_deref().is_some_and(|text| command_display_text(input) == text),
+                Some(_) => false,
+                None => command_kind && label.is_some(),
+            };
+            let started_at = item.and_then(|candidate| candidate.started_at.as_deref()).filter(|s| !s.is_empty()).map(str::to_owned);
+            let updated_at_ms = subagent.and_then(|candidate| parse_iso_ms(&candidate.updated_at)).unwrap_or(0);
             BackgroundItem {
                 task_id: task.task_id.clone(),
                 kind: task.kind.clone(),
-                command: command && label.is_some(),
+                command,
                 label: label.unwrap_or_else(|| singular.to_owned()),
-                child_thread_id: (task.kind == "subagent").then(|| task.child_thread_id.clone()).flatten(),
+                child_thread_id: (task.kind == "subagent")
+                    .then(|| task.child_thread_id.clone().or(subagent_child_thread_id))
+                    .flatten(),
+                activity,
+                started_at,
+                updated_at_ms,
             }
         })
         .collect();

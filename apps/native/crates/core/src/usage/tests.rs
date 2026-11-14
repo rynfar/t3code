@@ -479,6 +479,11 @@ fn usage_limits_report_lists_the_selected_driver() {
     assert_eq!(limits::account_initials("theo@t3.gg"), "TT");
     assert_eq!(limits::account_hue("a"), 97);
     assert_eq!(limits::reset_credits_summary(2, None, now, false), "2 reset credits banked");
+    assert!(limits::UsageLimitsReport::is_command("/usage-limits"));
+    assert!(limits::UsageLimitsReport::is_command("  /Usage-Limits \n"));
+    assert!(!limits::UsageLimitsReport::is_command("/usage-limits extra"));
+    assert!(!limits::UsageLimitsReport::is_command("usage-limits"));
+    assert_eq!(report.accounts[0].summary_label(), "Codex");
 }
 
 fn projection(extra: Value) -> ThreadProjection {

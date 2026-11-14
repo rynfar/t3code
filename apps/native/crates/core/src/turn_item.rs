@@ -8,6 +8,13 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NativeItemRef {
+    #[serde(default)]
+    pub native_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeferredWork {
     pub cursor: String,
     pub item_count: u64,
@@ -30,6 +37,8 @@ pub struct TurnItem {
     pub provider_thread_id: Option<String>,
     #[serde(default)]
     pub provider_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_item_ref: Option<NativeItemRef>,
     #[serde(default)]
     pub tool_surface: Option<String>,
     #[serde(default)]

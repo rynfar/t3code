@@ -6,6 +6,9 @@
 //! next turn, the model on the turn itself.
 
 mod attachments;
+mod branch_mismatch;
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) use branch_mismatch::CheckoutStatusOverride;
 mod question_attachments;
 #[cfg(feature = "snapshot")]
 pub(crate) use question_attachments::QuestionCommandSpy;
@@ -24,7 +27,7 @@ pub(crate) mod prompt_links;
 mod queue;
 mod send;
 mod stash;
-pub(crate) use pending::banner_surface;
+pub(crate) use pending::{banner_surface, banner_surface_card};
 mod view;
 mod workspace;
 
@@ -39,13 +42,17 @@ use t3_core::model::ModelSelection;
 use t3_core::providers;
 use t3_core::requests::{self, DraftAnswer, PendingKey, PendingRequests};
 use t3_core::server_config::{InteractionMode, OptionDescriptor, RuntimeMode};
+use t3_core::settings::secrets::redacted_placeholder;
 use t3_core::traits::{self, OptionSelection};
+use t3_core::usage::{self, UsageProvider, limits as usage_limits};
 use t3_core::workflows;
 
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::provider_icon::ProviderMark;
 use crate::sidebar::controller::now_ms;
+use crate::theme::{Palette, hsla, palette};
+use crate::toast::{Toast, ToastKind};
 use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
@@ -198,6 +205,10 @@ pub struct Composer {
     /// The question banner takes focus for its digit shortcuts while the prompt cannot type.
     question_focus: FocusHandle,
     limit_recovery: Entity<crate::thread_view::LimitRecoveryBanner>,
+    usage_limits: Option<UsageLimitsPanel>,
+    checkout_vcs: Option<branch_mismatch::CheckoutWatcher>,
+    revealed_branch_mismatch_key: Option<String>,
+    restoring_branch_threads: HashSet<String>,
     /// A side chat's own thread, in the right panel; `None` follows the selection and draft.
     pub(super) fixed: Option<String>,
     /// The `@`, `/` and `$` menus.
@@ -391,6 +402,10 @@ impl Composer {
         let limit_recovery = cx.new(|cx| crate::thread_view::LimitRecoveryBanner::new(state.clone(), cx));
         let mut composer = Composer {
             limit_recovery,
+            usage_limits: None,
+            checkout_vcs: None,
+            revealed_branch_mismatch_key: None,
+            restoring_branch_threads: HashSet::new(),
             state,
             input,
             picker,
@@ -526,6 +541,8 @@ impl Composer {
         }
         if next == self.snapshot && !config_changed {
             if self.provider_target.connection != self.state.read(cx).connection_id() { self.sync_provider_target(cx); }
+            self.sync_checkout_vcs(cx);
+            self.sync_branch_mismatch(cx);
             if self.finish_prepared_reads(cx) || pruned { cx.notify(); }
             return;
         }
@@ -563,6 +580,9 @@ impl Composer {
         });
         self.snapshot = next;
         self.sync_provider_target(cx);
+        self.sync_usage_limits(cx);
+        self.sync_checkout_vcs(cx);
+        self.sync_branch_mismatch(cx);
         self.finish_prepared_reads(cx);
         #[cfg(feature = "snapshot")]
         self.attachment_fixture(cx);
@@ -734,6 +754,7 @@ impl Composer {
                     choices.model = Some(selection);
                 }
                 self.draft_changed(cx);
+                self.sync_usage_limits(cx);
             }
             PickerEvent::Options(selections) => {
                 self.set_options(selections, cx);
@@ -869,6 +890,7 @@ impl Composer {
         let text = self.prompt(cx);
         self.sync_citation_comment(&text, cx);
         self.sync_context_chips(&text, cx);
+        self.sync_branch_mismatch(cx);
         let has_text = !text.trim().is_empty();
         let answering = self.active_question();
         if let Some((request_id, question)) = &answering {
@@ -905,6 +927,453 @@ impl Composer {
             _ => None,
         }
     }
+
+    pub(super) fn has_non_prompt_content(&self, prompt: &str, staged: &[t3_core::composer::attachments::Attachment]) -> bool {
+        !staged.is_empty() || self.has_context_records(prompt)
+    }
+
+    pub(super) fn usage_limits_offered(&self, cx: &App) -> bool {
+        let resolved = self.resolve(cx);
+        let state = self.state.read(cx);
+        let Some(config) = state.server_config.config.as_ref() else { return false };
+        let Some(driver) = resolved.model.as_ref().and_then(|model| config.provider(&model.instance_id)).map(|provider| provider.driver.as_str()) else {
+            return false;
+        };
+        usage_limits::has_provider_usage_limits(driver, &config.providers, &config.usage_limit_sources)
+    }
+
+    pub(super) fn usage_limits_key(&self, cx: &App) -> Option<String> {
+        let resolved = self.resolve(cx);
+        let instance_id = resolved.model.as_ref().map(|model| model.instance_id.as_str())?;
+        if matches!(self.snapshot.target, Some(Target::Thread(_))) && !self.snapshot.loaded {
+            return None;
+        }
+        let target = self.snapshot.target.as_ref()?;
+        let target_key = drafts::key(target);
+        let state = self.state.read(cx);
+        let latest_run_id = match target {
+            Target::Thread(id) => state.thread_shell(id).and_then(|shell| shell.latest_run_id.as_deref()).unwrap_or(""),
+            Target::Draft(_) | Target::Question(_) => "",
+        };
+        let pending_id = self
+            .snapshot
+            .pending
+            .approvals
+            .first()
+            .map(|approval| approval.request_id.as_str())
+            .or_else(|| self.snapshot.pending.user_inputs.first().map(|input| input.request_id.as_str()))
+            .unwrap_or("");
+        Some(format!("{}:{target_key}:{instance_id}:{latest_run_id}:{pending_id}", self.snapshot.environment))
+    }
+
+    pub(super) fn can_intercept_usage_limits(&self, prompt: &str, cx: &App) -> bool {
+        self.usage_limits_offered(cx)
+            && self.usage_limits_key(cx).is_some()
+            && !self.has_non_prompt_content(prompt, &self.staged_attachments())
+    }
+
+    pub(super) fn sync_usage_limits(&mut self, cx: &App) {
+        let Some(panel) = &self.usage_limits else { return };
+        if self.usage_limits_key(cx).as_deref().is_some_and(|key| key != panel.key) {
+            self.usage_limits = None;
+        }
+    }
+
+    pub(super) fn open_usage_limits(&mut self, cx: &mut Context<Self>) -> bool {
+        let now_ms = crate::transcript::Clock::now().now_ms;
+        let opened = (|| {
+            let key = self.usage_limits_key(cx)?;
+            let target = self.snapshot.target.clone()?;
+            let instance_id = self.resolve(cx).model.map(|model| model.instance_id)?;
+            let state = self.state.read(cx);
+            let config = state.server_config.config.as_ref()?;
+            usage_limits::collect_provider_usage_limits(&instance_id, &config.providers, &config.usage_limit_sources, now_ms)?;
+            Some((key, target))
+        })();
+        if let Some((key, target)) = opened {
+            self.usage_limits = Some(UsageLimitsPanel {
+                key,
+                target,
+                now_ms,
+                revealed: HashSet::new(),
+                confirm_reset: None,
+                reset_busy: None,
+                reset_status: None,
+            });
+            cx.notify();
+            return true;
+        }
+        self.usage_limits = None;
+        self.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Info, "Usage limits are unavailable for this provider"), cx));
+        cx.notify();
+        false
+    }
+
+    pub(super) fn dismiss_usage_limits(&mut self, cx: &mut Context<Self>) {
+        self.usage_limits = None;
+        cx.notify();
+    }
+
+    fn clear_usage_limits_for(&mut self, target: &Target) {
+        if self.usage_limits.as_ref().is_some_and(|panel| &panel.target == target) {
+            self.usage_limits = None;
+        }
+    }
+
+    fn redeem_usage_limit_credit(&mut self, account_id: String, input: usage_limits::ResetCreditInput, cx: &mut Context<Self>) {
+        let can_manage = self
+            .state
+            .read(cx)
+            .client_handle()
+            .is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|session| session.grants(usage::PROVIDERS_MANAGE_SCOPE)));
+        if !can_manage {
+            return;
+        }
+        let Some(panel) = self.usage_limits.as_mut() else { return };
+        let panel_key = panel.key.clone();
+        panel.confirm_reset = None;
+        panel.reset_busy = Some(account_id.clone());
+        panel.reset_status = None;
+        let request = self.state.read(cx).rpc(usage::method::CONSUME_RESET_CREDIT, input.payload());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let text = match request.await {
+                Ok(reply) => usage_limits::reset_outcome_text(&reply),
+                Err(error) => {
+                    let message = error.to_string();
+                    if message.is_empty() { "Could not use the reset credit.".to_owned() } else { message }
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(panel) = this.usage_limits.as_mut().filter(|panel| panel.key == panel_key) {
+                    if panel.reset_busy.as_deref() == Some(account_id.as_str()) {
+                        panel.reset_busy = None;
+                    }
+                    panel.reset_status = Some((account_id, text));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn render_usage_account_summary(
+        &self,
+        account: &usage_limits::ReportAccount,
+        id: gpui::SharedString,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use gpui_component::h_flex;
+        let label = account.summary_label();
+        let revealed = self.usage_limits.as_ref().is_some_and(|panel| panel.revealed.contains(&label));
+        let label_el = if label.contains('@') {
+            let shown = if revealed { label.clone() } else { redacted_placeholder(&label) };
+            let key = label;
+            gpui::div()
+                .id(id)
+                .min_w_0()
+                .truncate()
+                .cursor_pointer()
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(if revealed { "Click to hide account" } else { "Click to reveal account" }).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(panel) = this.usage_limits.as_mut() {
+                        if !panel.revealed.remove(&key) {
+                            panel.revealed.insert(key.clone());
+                        }
+                        cx.notify();
+                    }
+                }))
+                .child(shown)
+                .into_any_element()
+        } else {
+            gpui::div().min_w_0().truncate().child(label).into_any_element()
+        };
+        h_flex()
+            .min_w_0()
+            .gap(gpui::px(4.))
+            .text_color(hsla(p.muted_foreground))
+            .child(label_el)
+            .children(account.plan.as_deref().map(|plan| gpui::div().flex_none().child(format!("· {plan}"))))
+            .into_any_element()
+    }
+
+    pub(super) fn render_usage_limits_banner(&self, detached: bool, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use gpui::{FontWeight, div, px, relative};
+        use gpui_component::{ActiveTheme, h_flex, v_flex};
+        let panel = self.usage_limits.as_ref()?;
+        let key = self.usage_limits_key(cx)?;
+        if panel.key != key {
+            return None;
+        }
+        let instance_id = self.resolve(cx).model.map(|model| model.instance_id)?;
+        let report = {
+            let state = self.state.read(cx);
+            let config = state.server_config.config.as_ref()?;
+            usage_limits::collect_provider_usage_limits(&instance_id, &config.providers, &config.usage_limit_sources, panel.now_ms)?
+        };
+        let p = palette(cx);
+        let card_bg = hsla(if cx.theme().is_dark() { p.surface_raised } else { p.card });
+        let clock = crate::transcript::Clock::now();
+        let ts_format = crate::settings::store::client(cx).timestamp_format();
+        let now = t3_core::timeline::parse_iso_ms(&report.created_at).unwrap_or(panel.now_ms);
+        let can_manage = self
+            .state
+            .read(cx)
+            .client_handle()
+            .is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|session| session.grants(usage::PROVIDERS_MANAGE_SCOPE)));
+        let summary = match report.accounts.as_slice() {
+            [single] => self.render_usage_account_summary(single, "usage-limits-summary-label".into(), p, cx),
+            accounts => div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(format!("{} accounts", accounts.len())).into_any_element(),
+        };
+        let header = h_flex()
+            .w_full()
+            .min_h(px(24.))
+            .gap(px(4.))
+            .child(div().flex_none().w(px(24.)).flex().justify_center().child(Icon::Gauge.render(px(12.), hsla(p.muted_foreground))))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .whitespace_nowrap()
+                    .child(div().flex_none().font_weight(FontWeight::MEDIUM).line_height(px(24.)).child("Usage limits"))
+                    .child(summary),
+            )
+            .child(crate::transcript::ghost_icon_button(
+                "usage-limits-dismiss",
+                Icon::X,
+                cx.listener(|this, _, _, cx| this.dismiss_usage_limits(cx)),
+                cx,
+            ));
+
+        let mut body = v_flex().gap(px(8.)).pt(px(4.)).pb(px(6.)).pl(px(28.)).pr(px(8.));
+        for (account_ix, account) in report.accounts.iter().enumerate() {
+            let mut block = v_flex().min_w_0().gap(px(4.));
+            if report.accounts.len() > 1 {
+                block = block.child(self.render_usage_account_summary(account, format!("usage-limits-account-{account_ix}").into(), p, cx));
+            }
+            if let Some(notice) = usage_limits::limits_notice(&account.limits) {
+                block = block.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(notice));
+            } else {
+                let bar_color = usage_limits::accent_rgba(account.accent_color.as_deref())
+                    .map(gpui::rgba)
+                    .map(gpui::Hsla::from)
+                    .unwrap_or_else(|| usage_bar_color(&account.driver, p));
+                let mut label_col = v_flex().w(px(144.)).flex_none().gap(px(2.));
+                let mut bar_col = v_flex().flex_1().min_w(px(48.)).gap(px(2.));
+                let mut meta_col = v_flex().flex_none().gap(px(2.));
+                for (win_ix, window) in account.limits.windows.iter().enumerate() {
+                    let remaining = usage_limits::remaining_percent(window);
+                    let pace = usage_limits::pace_of(window, now);
+                    let pace_left = usage_limits::pace_remaining_percent(window, now);
+                    let resets = usage_limits::format_resets_in(window, now);
+                    let reset_at = window
+                        .resets_at
+                        .as_deref()
+                        .map(|iso| t3_core::timeline::format_upcoming(iso, clock.now_ms, &clock.zone, ts_format, &crate::timestamp::SystemTimestampLocale))
+                        .filter(|s| !s.is_empty());
+                    let mut tip_lines = vec![match pace_left {
+                        Some(left) => format!("{remaining}% left · {left}% of the window left"),
+                        None => format!("{remaining}% left"),
+                    }];
+                    if pace_left.is_some() {
+                        tip_lines.push("The line is where even spending would be.".to_owned());
+                    }
+                    if let (Some(at), Some(resets_in)) = (reset_at.as_deref(), resets.as_deref()) {
+                        let suffix = resets_in.strip_prefix("resets ").or_else(|| resets_in.strip_prefix("Resets ")).unwrap_or(resets_in);
+                        tip_lines.push(format!("Resets {at} · {suffix}"));
+                    } else if let Some(resets_in) = resets.as_deref() {
+                        tip_lines.push(resets_in.to_owned());
+                    }
+                    let bar_tip: gpui::SharedString = tip_lines.join("\n").into();
+                    let pace_icon = pace.map(|pace| {
+                        let glyph = match pace {
+                            usage_limits::LimitPace::Ahead => Icon::TrendingUp,
+                            usage_limits::LimitPace::On => Icon::Gauge,
+                            usage_limits::LimitPace::Under => Icon::TrendingDown,
+                        };
+                        let label = gpui::SharedString::from(pace.label());
+                        div()
+                            .id(("usage-limits-pace", account_ix * 16 + win_ix))
+                            .flex_none()
+                            .child(glyph.render(px(12.), hsla(p.muted_foreground)))
+                            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+                    });
+                    label_col = label_col.child(
+                        h_flex()
+                            .h(px(24.))
+                            .items_center()
+                            .min_w_0()
+                            .gap(px(6.))
+                            .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(window.label.clone()))
+                            .child(div().ml_auto().flex_none().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(format!("{remaining}% left"))),
+                    );
+                    bar_col = bar_col.child(
+                        h_flex()
+                            .id(("usage-limits-bar", account_ix * 16 + win_ix))
+                            .h(px(24.))
+                            .items_center()
+                            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(bar_tip.clone()).build(window, cx))
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .h(px(14.))
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .w_full()
+                                            .h(px(6.))
+                                            .rounded_full()
+                                            .bg(hsla(p.muted))
+                                            .overflow_hidden()
+                                            .when(remaining > 0, |this| this.child(div().h_full().rounded_full().bg(bar_color).w(relative(remaining as f32 / 100.0)))),
+                                    )
+                                    .when_some(pace_left, |this, pace_left| {
+                                        this.child(
+                                            div().absolute().top_0().bottom_0().left(px(3.)).right(px(3.)).child(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .bottom_0()
+                                                    .left(relative(pace_left as f32 / 100.0))
+                                                    .ml(px(-3.))
+                                                    .w(px(6.))
+                                                    .flex()
+                                                    .justify_center()
+                                                    .bg(card_bg)
+                                                    .child(div().w(px(2.)).h_full().rounded_full().bg(hsla(p.foreground))),
+                                            ),
+                                        )
+                                    }),
+                            ),
+                    );
+                    meta_col = meta_col.child(
+                        h_flex()
+                            .h(px(24.))
+                            .items_center()
+                            .gap(px(6.))
+                            .text_color(hsla(p.muted_foreground))
+                            .whitespace_nowrap()
+                            .children(pace_icon)
+                            .children(resets.map(|text| div().child(text))),
+                    );
+                }
+                if !account.limits.windows.is_empty() {
+                    block = block.child(h_flex().w_full().min_w_0().items_start().gap(px(12.)).text_xs().child(label_col).child(bar_col).child(meta_col));
+                }
+            }
+            if let Some(external) = &account.limits.external_usage {
+                let url = external.url.clone();
+                block = block.child(h_flex().child(crate::transcript::ghost_text_button(
+                    ("usage-limits-manage", account_ix),
+                    "Manage usage",
+                    Some(Icon::ExternalLink),
+                    move |_, _, cx| cx.open_url(&url),
+                    cx,
+                )));
+            }
+            if let Some(credits) = &account.limits.reset_credits {
+                let status = panel.reset_status.as_ref().filter(|(id, _)| *id == account.id).map(|(_, msg)| msg.clone());
+                if credits.available_count > 0 || status.is_some() {
+                    let reset_input = account.reset_credit_input.clone().or_else(|| {
+                        account.instance_id.clone().map(|instance_id| usage_limits::ResetCreditInput::Instance { instance_id })
+                    });
+                    let account_id = account.id.clone();
+                    let busy = panel.reset_busy.as_deref() == Some(account.id.as_str());
+                    let confirming = panel.confirm_reset.as_deref() == Some(account.id.as_str());
+                    let mut credits_row = h_flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(usage_limits::reset_credits_summary(credits.available_count, credits.next_expires_at.as_deref(), now, false));
+                    if credits.available_count > 0
+                        && let Some(input) = reset_input
+                    {
+                        if confirming {
+                            let confirm_id = account_id.clone();
+                            credits_row = credits_row
+                                .child(
+                                    controls::Button::new(("usage-limits-confirm-reset", account_ix), controls::ButtonVariant::Default, controls::ButtonSize::Xs)
+                                        .label("Use credit")
+                                        .disabled(busy || !can_manage)
+                                        .on_click(cx.listener(move |this, _, _, cx| this.redeem_usage_limit_credit(confirm_id.clone(), input.clone(), cx))),
+                                )
+                                .child(
+                                    controls::Button::new(("usage-limits-cancel-reset", account_ix), controls::ButtonVariant::Ghost, controls::ButtonSize::Xs)
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(panel) = this.usage_limits.as_mut() {
+                                                panel.confirm_reset = None;
+                                                cx.notify();
+                                            }
+                                        })),
+                                );
+                        } else {
+                            let start_id = account_id.clone();
+                            credits_row = credits_row.child(
+                                controls::Button::new(("usage-limits-use-reset", account_ix), controls::ButtonVariant::Outline, controls::ButtonSize::Xs)
+                                    .label(if busy { "Using…" } else { "Use reset" })
+                                    .disabled(busy || !can_manage)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(panel) = this.usage_limits.as_mut() {
+                                            panel.confirm_reset = Some(start_id.clone());
+                                            cx.notify();
+                                        }
+                                    })),
+                            );
+                        }
+                    }
+                    if let Some(status) = status {
+                        credits_row = credits_row.child(div().text_color(hsla(p.foreground)).child(status));
+                    }
+                    block = block.child(credits_row);
+                }
+            }
+            body = body.child(block);
+        }
+        for notice in &report.notices {
+            body = body.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(notice.clone()));
+        }
+        Some(
+            banner_surface_card(false, detached, v_flex().child(header).child(div().id("usage-limits-scroll").max_h(px(240.)).overflow_y_scroll().child(body)), cx)
+                .id("usage-limits-banner")
+                .debug_selector(|| "usage-limits-banner".to_owned())
+                .into_any_element(),
+        )
+    }
+}
+
+struct UsageLimitsPanel {
+    key: String,
+    target: Target,
+    now_ms: i64,
+    revealed: HashSet<String>,
+    confirm_reset: Option<String>,
+    reset_busy: Option<String>,
+    reset_status: Option<(String, String)>,
+}
+
+fn usage_bar_color(driver: &str, p: Palette) -> gpui::Hsla {
+    UsageProvider::from_driver(driver).map_or(hsla(p.foreground), |provider| {
+        hsla(match provider {
+            UsageProvider::Codex => p.usage_codex,
+            UsageProvider::Claude => p.usage_claude,
+            UsageProvider::Grok => p.usage_grok,
+            UsageProvider::Cursor => p.usage_cursor,
+            UsageProvider::Opencode => p.usage_opencode,
+            UsageProvider::Antigravity => p.usage_antigravity,
+            UsageProvider::Pi => p.usage_pi,
+            UsageProvider::Muse => p.usage_muse,
+        })
+    })
 }
 
 fn rules_placeholder() -> &'static str {
@@ -1034,5 +1503,286 @@ mod stream_error_tests {
         composer.read_with(vcx, |composer, _| {
             assert_eq!(composer.snapshot.last_error, None);
         });
+    }
+
+    #[gpui::test]
+    fn usage_limits_command_opens_banner_and_clears_on_key_change(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, cx| {
+            let config = state.server_config.config.as_mut().unwrap();
+            config.providers = serde_json::from_value(serde_json::json!([
+                {
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "auth": { "status": "authenticated", "label": "Plus" },
+                    "models": [{ "slug": "m", "name": "GPT-5" }],
+                    "usageLimits": {
+                        "checkedAt": "2026-04-01T00:00:00.000Z",
+                        "windows": [{ "id": "session", "kind": "session", "label": "5h", "usedPercent": 25 }]
+                    },
+                    "slashCommands": [{ "name": "usage-limits", "description": "Show usage limits" }]
+                },
+                {
+                    "instanceId": "claudeAgent",
+                    "driver": "claudeAgent",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "auth": { "status": "authenticated" },
+                    "models": [{ "slug": "m", "name": "Sonnet" }]
+                }
+            ]))
+            .unwrap();
+            state.start_draft("checkout-a", cx);
+            cx.emit(AppEvent::ServerConfig);
+        });
+
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let banner = self.0.update(cx, |composer, cx| composer.render_usage_limits_banner(false, cx));
+                gpui::div().w(gpui::px(720.)).children(banner)
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("/usage-limits", window, cx);
+                composer.submit(t3_core::composer::SubmitIntent::Foreground, window, cx);
+                assert_eq!(composer.prompt(cx), "");
+                assert!(composer.usage_limits.is_some());
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("usage-limits-banner").is_some());
+
+        // Switching provider changes usageLimitsKey and closes the banner.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| composer.pick_banner_test_model("claudeAgent", window, cx));
+            window.draw(cx).clear();
+        });
+        composer.read_with(vcx, |composer, _| assert!(composer.usage_limits.is_none()));
+        assert!(vcx.debug_bounds("usage-limits-banner").is_none());
+
+        // Calling open_usage_limits on a provider without limits shows the unavailability toast.
+        vcx.update(|_, cx| {
+            composer.update(cx, |composer, cx| {
+                assert!(!composer.open_usage_limits(cx));
+            });
+        });
+        state.read_with(vcx, |state, _| {
+            assert_eq!(state.toasts.latest().map(|toast| toast.title.as_ref()), Some("Usage limits are unavailable for this provider"));
+        });
+
+        // Picking /usage-limits from the slash menu removes the trigger and opens the banner.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.pick_banner_test_model("codex", window, cx);
+                composer.set_prompt("/usage", window, cx);
+                composer.input.update(cx, |input, cx| input.set_selected_range(6..6, cx));
+                composer.on_prompt_change(cx);
+                let item = t3_core::composer::menu::MenuItem {
+                    id: "cmd:usage-limits".into(),
+                    label: "/usage-limits".into(),
+                    description: String::new(),
+                    action: t3_core::composer::menu::MenuAction::ProviderCommand { name: "usage-limits".into() },
+                };
+                composer.select_menu_item(item, window, cx);
+                assert_eq!(composer.prompt(cx), "");
+                assert!(composer.usage_limits.is_some());
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("usage-limits-banner").is_some());
+    }
+
+    #[gpui::test]
+    fn usage_limits_runs_when_setup_blocks_send_and_draft_banner_is_out_of_flow(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, cx| {
+            state.server_config.config = serde_json::from_value(serde_json::json!({
+                "environment": { "environmentId": "env-1", "label": "Local" },
+                "cwd": "/tmp",
+                "providers": [{
+                    "instanceId": "codex", "driver": "codex", "status": "ready", "enabled": true, "installed": true,
+                    "auth": { "status": "authenticated" },
+                    "usageLimits": {
+                        "checkedAt": "2026-11-02T09:00:00Z",
+                        "windows": [
+                            { "id": "five_hour", "kind": "session", "label": "5h", "usedPercent": 20, "windowDurationMins": 300, "resetsAt": "2026-11-02T14:00:00Z" },
+                            { "id": "weekly", "kind": "weekly", "label": "Weekly", "usedPercent": 80, "windowDurationMins": 10080, "resetsAt": "2026-11-09T09:00:00Z" }
+                        ]
+                    },
+                    "models": [{ "slug": "m", "name": "GPT-5" }]
+                }]
+            }))
+            .unwrap();
+            state.start_draft("checkout-a", cx);
+            cx.emit(AppEvent::ServerConfig);
+        });
+
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let draft_banner = self.0.update(cx, |composer, cx| composer.render_usage_limits_banner(true, cx));
+                gpui_component::v_flex()
+                    .w(gpui::px(720.))
+                    .h(gpui::px(600.))
+                    .justify_center()
+                    .child(
+                        gpui_component::v_flex()
+                            .relative()
+                            .w_full()
+                            .child(gpui::div().id("composer-card").debug_selector(|| "composer-card".to_owned()).h(gpui::px(96.)))
+                            .children(draft_banner.map(view::render_draft_usage_limits_overlay)),
+                    )
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+
+        vcx.update(|window, cx| window.draw(cx).clear());
+        let before_card = vcx.debug_bounds("composer-card").expect("draft composer card");
+
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.snapshot.setup_blocks_send = true;
+                composer.set_prompt("/usage-limits", window, cx);
+                composer.submit(t3_core::composer::SubmitIntent::Foreground, window, cx);
+                assert_eq!(composer.prompt(cx), "");
+                assert!(composer.usage_limits.is_some());
+            });
+            window.draw(cx).clear();
+        });
+        let after_card = vcx.debug_bounds("composer-card").expect("draft composer card after banner");
+        assert_eq!(before_card.origin.y, after_card.origin.y);
+        let overlay = vcx.debug_bounds("draft-usage-limits-overlay").expect("draft overlay");
+        assert!(overlay.origin.y >= after_card.bottom());
+        assert!(vcx.debug_bounds("usage-limits-banner").is_some());
+    }
+
+    #[gpui::test]
+    fn branch_mismatch_banner_reveals_with_content_stays_sticky_and_dismisses(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.update(|cx| {
+            let mut overrides = std::collections::HashMap::new();
+            overrides.insert(
+                "/repo".to_owned(),
+                t3_core::vcs::VcsStatus {
+                    local: t3_core::vcs::VcsLocalStatus { ref_name: Some("main".to_owned()), ..Default::default() },
+                    ..Default::default()
+                },
+            );
+            cx.set_global(CheckoutStatusOverride(overrides));
+        });
+        state.update(cx, |state, cx| {
+            state.shell.snapshot = serde_json::from_value(serde_json::json!({
+                "snapshotSequence": 1,
+                "projects": [{
+                    "id": "p1", "title": "P1", "workspaceRoot": "/repo", "scripts": [],
+                    "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+                }],
+                "threads": [
+                    {
+                        "id": "t1", "projectId": "p1", "title": "T1",
+                        "providerInstanceId": "codex",
+                        "modelSelection": { "instanceId": "codex", "model": "m" },
+                        "runtimeMode": "full-access", "interactionMode": "default",
+                        "status": "idle", "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                        "lineage": { "rootThreadId": "t1" },
+                        "branch": "feat/a"
+                    },
+                    {
+                        "id": "t2", "projectId": "p1", "title": "T2",
+                        "providerInstanceId": "codex",
+                        "modelSelection": { "instanceId": "codex", "model": "m" },
+                        "runtimeMode": "full-access", "interactionMode": "default",
+                        "status": "idle", "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                        "lineage": { "rootThreadId": "t2" },
+                        "branch": "main"
+                    }
+                ]
+            }))
+            .unwrap();
+            state.selected_thread = Some("t1".into());
+            cx.emit(AppEvent::Shell);
+            cx.emit(AppEvent::Selection);
+        });
+
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let banner = self.0.update(cx, |composer, cx| composer.render_branch_mismatch_banner(cx));
+                gpui::div().w(gpui::px(720.)).children(banner)
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
+
+        // Typing reveals the banner and clearing keeps it sticky on the same thread/mismatch key.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("hello", window, cx);
+                composer.on_prompt_change(cx);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_some());
+
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("", window, cx);
+                composer.on_prompt_change(cx);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_some());
+
+        // Switching to another thread and back with empty prompt clears the sticky reveal.
+        state.update(vcx, |state, cx| {
+            state.selected_thread = Some("t2".into());
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
+        state.update(vcx, |state, cx| {
+            state.selected_thread = Some("t1".into());
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
+
+        // Dismissing keeps the banner hidden even when typing again.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("again", window, cx);
+                composer.on_prompt_change(cx);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_some());
+        vcx.update(|_, cx| {
+            cx.update_default_global::<branch_mismatch::DismissedBranchMismatches, _>(|set, _| {
+                set.0.insert("t1:feat/a:main".into());
+            });
+            composer.update(cx, |composer, cx| composer.sync_branch_mismatch(cx));
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("branch-mismatch-banner").is_none());
     }
 }
