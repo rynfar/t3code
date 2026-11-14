@@ -15,11 +15,12 @@ use gpui::{
 use gpui_component::ActiveTheme;
 use serde_json::{Value, json};
 use t3_core::commands::{self, DispatchMode, method};
+use t3_core::html_render::routing::PageOrigin;
 use t3_core::mcp_apps::{Action, DEFAULT_HEIGHT, DownloadItem, Host, MAX_HEIGHT, Operation, TEARDOWN_TIMEOUT_MS};
 use t3_core::timeline::McpAppEntry;
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
-use crate::app_state::{AppState, uuid_v4};
+use crate::app_state::{AppEvent, AppState, uuid_v4};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
@@ -29,7 +30,22 @@ const MAX_PAGES: usize = 24;
 const MAX_VIEWS: usize = 6;
 const FULLSCREEN_BAR_HEIGHT: f32 = 40.;
 const TRANSPORT: &str = include_str!("mcp_app_transport.js");
-type Key = (String, String, String, String, gpui::EntityId);
+type Key = (String, String, String, String, String, gpui::EntityId);
+
+#[derive(Clone)]
+struct FrameOwner {
+    origin: PageOrigin,
+    embedded: bool,
+    view: gpui::WeakEntity<ThreadView>,
+}
+
+fn side_chat_visible(state: &AppState, thread_id: &str) -> bool {
+    state
+        .panel_thread()
+        .as_deref()
+        .and_then(|parent| state.panels.panels.active_surface(parent))
+        .is_some_and(|surface| surface.side_chat_thread() == Some(thread_id))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisplayMode {
@@ -99,21 +115,28 @@ pub fn fullscreen(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     Some(fullscreen.into_any_element())
 }
 
-pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, thread: Option<&str>, embedded: bool, cx: &mut Context<ThreadView>) -> AnyElement {
     let Some(frames) = cx.try_global::<Frames>() else {
         return div().into_any_element();
     };
-    let Some(environment) = frames.state.read(cx).environment().map(str::to_owned) else {
+    let state = frames.state.clone();
+    let Some(environment) = state.read(cx).environment().map(str::to_owned) else {
         return div().into_any_element();
     };
+    let conversation_thread = thread.unwrap_or(&entry.source_thread_id).to_owned();
+    let owner = PageOrigin::for_view(Some(&environment), Some(&conversation_thread), None).map(|origin| FrameOwner {
+        origin,
+        embedded,
+        view: cx.entity().downgrade(),
+    });
     let key = (
         environment.clone(),
+        conversation_thread.clone(),
         entry.source_thread_id.clone(),
         entry.source_item_id.clone(),
         entry.reference.attachment_id.clone(),
         cx.entity_id(),
     );
-    let state = frames.state.clone();
     let frame = if let Some((_, frame)) = frames.pages.get(&key) {
         frame.clone()
     } else {
@@ -121,7 +144,7 @@ pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>
         let Some(client) = state.read(cx).client_handle() else {
             return div().into_any_element();
         };
-        let frame = cx.new(|cx| McpFrame::new(environment, state, &client, entry, cx));
+        let frame = cx.new(|cx| McpFrame::new(environment, conversation_thread, owner.clone(), state, &client, entry, cx));
         cx.global_mut::<Frames>().pages.insert(key.clone(), (0, frame.clone()));
         frame
     };
@@ -151,6 +174,8 @@ pub fn frame_row(_: &str, entry: &Arc<McpAppEntry>, cx: &mut Context<ThreadView>
 
 struct McpFrame {
     environment: String,
+    thread_id: String,
+    owner: Option<FrameOwner>,
     connection: t3_client::mcp_apps::AppConnection,
     state: Entity<AppState>,
     runtime: tokio::runtime::Handle,
@@ -174,13 +199,32 @@ struct McpFrame {
     events: Option<Task<()>>,
     teardown_timer: Option<Task<()>>,
     _state_sub: Subscription,
+    _event_sub: Subscription,
 }
 
 impl McpFrame {
-    fn new(environment: String, state: Entity<AppState>, client: &t3_client::supervisor::ClientHandle, entry: Arc<McpAppEntry>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        environment: String,
+        thread_id: String,
+        owner: Option<FrameOwner>,
+        state: Entity<AppState>,
+        client: &t3_client::supervisor::ClientHandle,
+        entry: Arc<McpAppEntry>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let runtime = state.read(cx).runtime().clone();
         let state_sub = cx.observe(&state, |frame, _, cx| {
-            if frame.display_mode == DisplayMode::Fullscreen && frame.awaiting_user(cx) {
+            if frame.display_mode == DisplayMode::Fullscreen && !frame.fullscreen_still_valid(cx) {
+                frame.exit_fullscreen(cx);
+            }
+        });
+        let event_sub = cx.subscribe(&state, |frame, _, event, cx| {
+            if matches!(
+                event,
+                AppEvent::Phase | AppEvent::Shell | AppEvent::Selection | AppEvent::Thread | AppEvent::RightPanel | AppEvent::SideThread
+            ) && frame.display_mode == DisplayMode::Fullscreen
+                && !frame.fullscreen_still_valid(cx)
+            {
                 frame.exit_fullscreen(cx);
             }
         });
@@ -188,6 +232,8 @@ impl McpFrame {
         let context = host_context(DisplayMode::Inline, 0., None, None, cx);
         let mut frame = Self {
             environment,
+            thread_id,
+            owner,
             connection: t3_client::mcp_apps::AppConnection::new(client),
             state,
             runtime,
@@ -211,6 +257,7 @@ impl McpFrame {
             events: None,
             teardown_timer: None,
             _state_sub: state_sub,
+            _event_sub: event_sub,
         };
         frame.load(cx);
         frame.fetch_detail(cx);
@@ -221,18 +268,44 @@ impl McpFrame {
         frame
     }
 
-    fn conversation_thread_id(&self, cx: &App) -> String {
-        self.state.read(cx).selected_thread.clone().unwrap_or_else(|| self.entry.source_thread_id.clone())
+    fn conversation_thread_id(&self) -> &str {
+        &self.thread_id
     }
 
     fn awaiting_user(&self, cx: &App) -> bool {
-        let tid = self.conversation_thread_id(cx);
-        self.state
-            .read(cx)
-            .thread_state(&tid)
-            .projection
-            .as_ref()
-            .is_some_and(|projection| !t3_core::requests::pending_requests(projection).is_empty())
+        let state = self.state.read(cx);
+        let tid = self.conversation_thread_id();
+        state.thread_shell(tid).is_some_and(|shell| shell.pending_runtime_request.is_some())
+            || state
+                .thread_state(tid)
+                .projection
+                .as_ref()
+                .is_some_and(|projection| !t3_core::requests::pending_requests(projection).is_empty())
+    }
+
+    fn fullscreen_still_valid(&self, cx: &App) -> bool {
+        if self.display_mode != DisplayMode::Fullscreen || self.closed || self.awaiting_user(cx) {
+            return false;
+        }
+        let state = self.state.read(cx);
+        if state.environment() != Some(self.environment.as_str()) {
+            return false;
+        }
+        let Some(owner) = &self.owner else {
+            return true;
+        };
+        if owner.view.upgrade().is_none() {
+            return false;
+        }
+        let current_origin = PageOrigin::for_view(
+            state.environment(),
+            state.selected_thread.as_deref(),
+            owner.embedded.then_some(owner.origin.thread.as_str()),
+        );
+        if current_origin.as_ref() != Some(&owner.origin) {
+            return false;
+        }
+        !owner.embedded || side_chat_visible(state, &owner.origin.thread)
     }
 
     fn client(&self, cx: &App) -> Option<t3_client::supervisor::ClientHandle> {
@@ -389,12 +462,17 @@ impl McpFrame {
 
     fn exit_fullscreen(&mut self, cx: &mut Context<Self>) {
         if self.display_mode != DisplayMode::Fullscreen {
+            if let Some(view) = &self.view {
+                view.set_dismiss_on_escape(false);
+            }
             self.clear_global_fullscreen(cx.entity_id(), cx);
             return;
         }
         self.display_mode = DisplayMode::Inline;
         self.fullscreen_size = None;
         if let Some(view) = &self.view {
+            view.set_dismiss_on_escape(false);
+            view.release_focus();
             view.set_layer(Layer::Transcript);
         }
         let restore = if let Some(frames) = cx.try_global::<Frames>()
@@ -414,6 +492,12 @@ impl McpFrame {
         self.update_context(cx);
         cx.notify();
         cx.refresh_windows();
+    }
+
+    fn handle_escape(&mut self, cx: &mut Context<Self>) {
+        if self.display_mode == DisplayMode::Fullscreen {
+            self.exit_fullscreen(cx);
+        }
     }
 
     fn try_enter_fullscreen(&mut self, cx: &mut Context<Self>) -> bool {
@@ -436,11 +520,11 @@ impl McpFrame {
     fn enter_fullscreen_on_window(&mut self, window_handle: gpui::AnyWindowHandle, cx: &mut Context<Self>) -> bool {
         if let Some(view) = &self.view {
             view.set_layer(Layer::Modal);
+            view.set_dismiss_on_escape(true);
+            view.release_focus();
         }
         self.display_mode = DisplayMode::Fullscreen;
         let frame_entity = cx.entity();
-        let state = self.state.clone();
-        let environment = self.environment.clone();
         let restore = window_handle
             .update(cx, |_, window, cx| {
                 let viewport = window.viewport_size();
@@ -451,8 +535,6 @@ impl McpFrame {
             .flatten();
         let overlay = cx.new(|cx| McpFullscreen {
             frame: frame_entity,
-            state,
-            environment,
             focus: cx.focus_handle(),
             restore,
         });
@@ -475,7 +557,14 @@ impl McpFrame {
     }
 
     fn detach_host(&mut self, cx: &mut Context<Self>) {
-        self.clear_global_fullscreen(cx.entity_id(), cx);
+        if self.display_mode == DisplayMode::Fullscreen {
+            self.exit_fullscreen(cx);
+        } else {
+            if let Some(view) = &self.view {
+                view.set_dismiss_on_escape(false);
+            }
+            self.clear_global_fullscreen(cx.entity_id(), cx);
+        }
         if self.teardown_timer.is_some() {
             self.closed = true;
             cx.notify();
@@ -712,7 +801,7 @@ impl McpFrame {
                     self.complete_request(generation, token, Err("Messages are not available here.".into()), cx);
                     return;
                 }
-                let conv_id = self.conversation_thread_id(cx);
+                let conv_id = self.conversation_thread_id().to_owned();
                 let has_thread = {
                     let state = self.state.read(cx);
                     state.thread_shell(&conv_id).is_some() || state.thread_state(&conv_id).projection.is_some()
@@ -748,7 +837,7 @@ impl McpFrame {
                     return;
                 };
                 let target = self.target();
-                let conv_id = self.conversation_thread_id(cx);
+                let conv_id = self.conversation_thread_id().to_owned();
                 let job = self.runtime.spawn(async move {
                     t3_client::mcp_apps::update_model_context(&client, &target, &conv_id, content, structured_content).await
                 });
@@ -791,10 +880,6 @@ impl McpFrame {
                                     let _ = this.update(cx, |frame, cx| {
                                         frame.complete_request(generation, token, Ok(json!({ "isError": true })), cx);
                                     });
-                                    return;
-                                }
-                                Ok(Err(t3_client::mcp_apps::DownloadError::Failure(err))) => {
-                                    let _ = this.update(cx, |frame, cx| frame.complete_request(generation, token, Err(err), cx));
                                     return;
                                 }
                                 Err(err) => {
@@ -932,22 +1017,29 @@ impl McpFrame {
             allow_popups: false,
             content_security_policy: Some(self.entry.reference.content_security_policy()),
         };
-        let (events, mut received) = mpsc::unbounded();
+        let (events, received) = mpsc::unbounded();
         let view = WebView::new(page, Layer::Transcript, events, window, cx)?;
+        let escapes = view.watch_escape();
         self.view = Some(view.clone());
         self.install_host(cx);
         let generation = self.generation;
         cx.global_mut::<Frames>().views.push(Rc::downgrade(&view));
         self.events = Some(cx.spawn(async move |this, cx| {
-            while let Some(event) = received.next().await {
+            enum PumpEvent {
+                Web(WebEvent),
+                Escape,
+            }
+            let mut stream = futures::stream::select(received.map(PumpEvent::Web), escapes.map(|()| PumpEvent::Escape));
+            while let Some(event) = stream.next().await {
                 if this
                     .update(cx, |frame, cx| {
                         if frame.generation != generation {
                             return;
                         }
                         match event {
-                            WebEvent::Message(text) => frame.receive_message(generation, &text, cx),
-                            WebEvent::OpenUrl(_) => {}
+                            PumpEvent::Web(WebEvent::Message(text)) => frame.receive_message(generation, &text, cx),
+                            PumpEvent::Web(WebEvent::OpenUrl(_)) => {}
+                            PumpEvent::Escape => frame.handle_escape(cx),
                         }
                     })
                     .is_err()
@@ -1072,8 +1164,6 @@ impl Render for McpFrame {
 
 struct McpFullscreen {
     frame: Entity<McpFrame>,
-    state: Entity<AppState>,
-    environment: String,
     focus: FocusHandle,
     restore: Option<FocusHandle>,
 }
@@ -1086,11 +1176,7 @@ impl Focusable for McpFullscreen {
 
 impl McpFullscreen {
     fn is_valid(&self, cx: &App) -> bool {
-        let frame = self.frame.read(cx);
-        !frame.closed
-            && frame.display_mode == DisplayMode::Fullscreen
-            && !frame.awaiting_user(cx)
-            && self.state.read(cx).environment() == Some(self.environment.as_str())
+        self.frame.read(cx).fullscreen_still_valid(cx)
     }
 
     fn close(&self, _: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -1438,8 +1524,8 @@ mod tests {
 
         let (frame, other) = cx.update(|cx| {
             assert!(!is_fullscreen_open(cx));
-            let frame = cx.new(|cx| McpFrame::new(env.clone(), state.clone(), &client, test_entry("item-1"), cx));
-            let other = cx.new(|cx| McpFrame::new(env.clone(), state.clone(), &client, test_entry("item-2"), cx));
+            let frame = cx.new(|cx| McpFrame::new(env.clone(), "thread-1".into(), None, state.clone(), &client, test_entry("item-1"), cx));
+            let other = cx.new(|cx| McpFrame::new(env.clone(), "thread-1".into(), None, state.clone(), &client, test_entry("item-2"), cx));
             (frame, other)
         });
 
@@ -1537,7 +1623,7 @@ mod tests {
         let window = cx.open_window(size(px(800.), px(600.)), |_, cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
         let dialog_entity = window.entity(cx).unwrap();
 
-        let frame = cx.update(|cx| cx.new(|cx| McpFrame::new(env, state.clone(), &client, test_entry("item-dlg"), cx)));
+        let frame = cx.update(|cx| cx.new(|cx| McpFrame::new(env, "thread-1".into(), None, state.clone(), &client, test_entry("item-dlg"), cx)));
         let decisions = Rc::new(std::cell::RefCell::new(Vec::new()));
         let d1 = decisions.clone();
         let d2 = decisions.clone();
@@ -1582,5 +1668,244 @@ mod tests {
                 Ok(false),
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn side_chat_routing_and_shell_runtime_request_step_aside(cx: &mut gpui::TestAppContext) {
+        let (_runtime, state, client, env, _fixture) = setup_test_state(cx);
+        cx.update(|cx| {
+            state.update(cx, |s, cx| {
+                let mut shell = s.shell.clone();
+                shell.snapshot.as_mut().unwrap().threads = vec![
+                    serde_json::from_value(json!({
+                        "id": "main-1", "projectId": "checkout-a", "title": "Main",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"main-1"},
+                        "status": "idle", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+                    }))
+                    .unwrap(),
+                    serde_json::from_value(json!({
+                        "id": "side-1", "projectId": "checkout-a", "title": "Side",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                        "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"main-1","parentThreadId":"main-1"},
+                        "status": "idle", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+                    }))
+                    .unwrap(),
+                ];
+                s.install_active_environment(
+                    client.clone(),
+                    shell,
+                    s.server_config.clone(),
+                    t3_client::supervisor::ConnectionStatus::Connected,
+                    cx,
+                );
+                s.selected_thread = Some("main-1".into());
+                s.panels.panels = serde_json::from_value(json!({
+                    "threads": {
+                        "main-1": {
+                            "isOpen": true,
+                            "activeSurfaceId": "side-1",
+                            "surfaces": [
+                                { "id": "side-1", "kind": "side-chat", "threadId": "side-1" },
+                                { "id": "diff", "kind": "diff" }
+                            ]
+                        }
+                    }
+                }))
+                .unwrap();
+            });
+        });
+
+        let side_window = cx.open_window(size(px(900.), px(700.)), |window, cx| ThreadView::embedded(state.clone(), "side-1".into(), window, cx));
+        let side_view = side_window.entity(cx).unwrap();
+        let side_frame = cx.update(|cx| {
+            let owner = side_view.read(cx).html_page_origin(cx).map(|origin| FrameOwner {
+                origin,
+                embedded: true,
+                view: side_view.downgrade(),
+            });
+            cx.new(|cx| McpFrame::new(env, "side-1".into(), owner, state.clone(), &client, test_entry("item-side"), cx))
+        });
+
+        cx.update(|cx| {
+            assert_eq!(side_frame.read(cx).conversation_thread_id(), "side-1");
+            side_frame.update(cx, |f, cx| {
+                // Inline handle_escape is a no-op.
+                f.handle_escape(cx);
+                assert_eq!(f.display_mode, DisplayMode::Inline);
+                assert!(f.enter_fullscreen_on_window(side_window.into(), cx));
+                assert_eq!(f.display_mode, DisplayMode::Fullscreen);
+            });
+            assert!(is_fullscreen_open(cx));
+
+            // Escape exits fullscreen back to inline.
+            side_frame.update(cx, |f, cx| f.handle_escape(cx));
+            assert_eq!(side_frame.read(cx).display_mode, DisplayMode::Inline);
+            assert!(!is_fullscreen_open(cx));
+
+            // Re-enter fullscreen for request routing test.
+            side_frame.update(cx, |f, cx| assert!(f.enter_fullscreen_on_window(side_window.into(), cx)));
+            assert!(is_fullscreen_open(cx));
+
+            // Pending shell runtime request on parent `main-1` does NOT dismiss `side-1` fullscreen.
+            state.update(cx, |s, cx| {
+                s.shell.snapshot.as_mut().unwrap().threads[0].pending_runtime_request =
+                    Some(serde_json::from_value(json!({"id":"secret-main","kind":"secret"})).unwrap());
+                cx.emit(AppEvent::Shell);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(is_fullscreen_open(cx));
+            assert_eq!(side_frame.read(cx).display_mode, DisplayMode::Fullscreen);
+
+            // Shell-only pending_runtime_request (e.g. secret/link prompt) on `side-1` steps fullscreen aside.
+            state.update(cx, |s, cx| {
+                s.shell.snapshot.as_mut().unwrap().threads[1].pending_runtime_request =
+                    Some(serde_json::from_value(json!({"id":"secret-side","kind":"secret"})).unwrap());
+                cx.emit(AppEvent::Shell);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!is_fullscreen_open(cx));
+            assert_eq!(side_frame.read(cx).display_mode, DisplayMode::Inline);
+        });
+    }
+
+    #[gpui::test]
+    async fn fullscreen_exits_on_owner_thread_switch_and_side_chat_hide(cx: &mut gpui::TestAppContext) {
+        let (_runtime, state, client, env, _fixture) = setup_test_state(cx);
+        cx.update(|cx| {
+            state.update(cx, |s, _| {
+                s.selected_thread = Some("main-1".into());
+                s.panels.panels = serde_json::from_value(json!({
+                    "threads": {
+                        "main-1": {
+                            "isOpen": true,
+                            "activeSurfaceId": "side-1",
+                            "surfaces": [
+                                { "id": "side-1", "kind": "side-chat", "threadId": "side-1" },
+                                { "id": "diff", "kind": "diff" }
+                            ]
+                        }
+                    }
+                }))
+                .unwrap();
+            });
+        });
+
+        let main_window = cx.open_window(size(px(900.), px(700.)), |window, cx| ThreadView::new(state.clone(), window, cx));
+        let main_view = main_window.entity(cx).unwrap();
+        let main_frame = cx.update(|cx| {
+            let owner = main_view.read(cx).html_page_origin(cx).map(|origin| FrameOwner {
+                origin,
+                embedded: false,
+                view: main_view.downgrade(),
+            });
+            cx.new(|cx| McpFrame::new(env.clone(), "main-1".into(), owner, state.clone(), &client, test_entry("item-main"), cx))
+        });
+
+        cx.update(|cx| {
+            main_frame.update(cx, |f, cx| assert!(f.enter_fullscreen_on_window(main_window.into(), cx)));
+            assert!(is_fullscreen_open(cx));
+            state.update(cx, |s, cx| {
+                s.selected_thread = Some("main-2".into());
+                cx.emit(AppEvent::Selection);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!is_fullscreen_open(cx));
+            assert_eq!(main_frame.read(cx).display_mode, DisplayMode::Inline);
+        });
+
+        // Switch back to main-1 and test embedded side-chat fullscreen invalidation on tab switch & panel close.
+        let side_window = cx.open_window(size(px(900.), px(700.)), |window, cx| ThreadView::embedded(state.clone(), "side-1".into(), window, cx));
+        let side_view = side_window.entity(cx).unwrap();
+        let side_frame = cx.update(|cx| {
+            state.update(cx, |s, _| s.selected_thread = Some("main-1".into()));
+            let owner = side_view.read(cx).html_page_origin(cx).map(|origin| FrameOwner {
+                origin,
+                embedded: true,
+                view: side_view.downgrade(),
+            });
+            cx.new(|cx| McpFrame::new(env, "side-1".into(), owner, state.clone(), &client, test_entry("item-side-2"), cx))
+        });
+
+        cx.update(|cx| {
+            side_frame.update(cx, |f, cx| assert!(f.enter_fullscreen_on_window(side_window.into(), cx)));
+            assert!(is_fullscreen_open(cx));
+            state.update(cx, |s, cx| {
+                s.panels.panels = serde_json::from_value(json!({
+                    "threads": {
+                        "main-1": {
+                            "isOpen": true,
+                            "activeSurfaceId": "diff",
+                            "surfaces": [
+                                { "id": "side-1", "kind": "side-chat", "threadId": "side-1" },
+                                { "id": "diff", "kind": "diff" }
+                            ]
+                        }
+                    }
+                }))
+                .unwrap();
+                cx.emit(AppEvent::RightPanel);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!is_fullscreen_open(cx));
+            assert_eq!(side_frame.read(cx).display_mode, DisplayMode::Inline);
+
+            // Re-activate side-1, enter fullscreen, then close right panel -> fullscreen exits.
+            state.update(cx, |s, _| {
+                s.panels.panels = serde_json::from_value(json!({
+                    "threads": {
+                        "main-1": {
+                            "isOpen": true,
+                            "activeSurfaceId": "side-1",
+                            "surfaces": [
+                                { "id": "side-1", "kind": "side-chat", "threadId": "side-1" },
+                                { "id": "diff", "kind": "diff" }
+                            ]
+                        }
+                    }
+                }))
+                .unwrap();
+            });
+            side_frame.update(cx, |f, cx| assert!(f.enter_fullscreen_on_window(side_window.into(), cx)));
+            assert!(is_fullscreen_open(cx));
+            state.update(cx, |s, cx| {
+                s.panels.panels = serde_json::from_value(json!({
+                    "threads": {
+                        "main-1": {
+                            "isOpen": false,
+                            "activeSurfaceId": "side-1",
+                            "surfaces": [
+                                { "id": "side-1", "kind": "side-chat", "threadId": "side-1" },
+                                { "id": "diff", "kind": "diff" }
+                            ]
+                        }
+                    }
+                }))
+                .unwrap();
+                cx.emit(AppEvent::RightPanel);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(!is_fullscreen_open(cx));
+            assert_eq!(side_frame.read(cx).display_mode, DisplayMode::Inline);
+        });
     }
 }

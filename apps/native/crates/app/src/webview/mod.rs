@@ -118,6 +118,10 @@ impl NativeView {
     fn watch_hover(&self) -> UnboundedReceiver<bool> {
         futures::channel::mpsc::unbounded().1
     }
+    fn set_dismiss_on_escape(&self, _: bool) {}
+    fn watch_escape(&self) -> UnboundedReceiver<()> {
+        futures::channel::mpsc::unbounded().1
+    }
 }
 
 #[derive(PartialEq)]
@@ -203,6 +207,14 @@ impl WebView {
 
     pub fn watch_hover(&self) -> UnboundedReceiver<bool> {
         self.native.watch_hover()
+    }
+
+    pub fn set_dismiss_on_escape(&self, dismiss: bool) {
+        self.native.set_dismiss_on_escape(dismiss);
+    }
+
+    pub fn watch_escape(&self) -> UnboundedReceiver<()> {
+        self.native.watch_escape()
     }
 
     pub fn take_activation(&self) -> bool { self.native.take_activation() }

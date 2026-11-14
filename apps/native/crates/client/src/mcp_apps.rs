@@ -96,7 +96,6 @@ pub struct ResolvedDownload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadError {
     Refusal(String),
-    Failure(String),
 }
 
 pub async fn resolve_downloads(client: &ClientHandle, target: &Target, files: &[DownloadItem]) -> Result<Vec<ResolvedDownload>, DownloadError> {
@@ -105,7 +104,7 @@ pub async fn resolve_downloads(client: &ClientHandle, target: &Target, files: &[
         let (name, mime_type, bytes) = match file {
             DownloadItem::Embedded { name, mime_type, bytes } => (name.clone(), mime_type.clone(), bytes.clone()),
             DownloadItem::Link { name, uri, mime_type } => {
-                let response = read_resource(client, target, uri).await.map_err(DownloadError::Failure)?;
+                let response = read_resource(client, target, uri).await.map_err(DownloadError::Refusal)?;
                 let content = response
                     .get("contents")
                     .and_then(Value::as_array)
@@ -344,5 +343,19 @@ mod tests {
         }];
         let err = resolve_downloads(&client, &target, &oversized).await.unwrap_err();
         assert_eq!(err, DownloadError::Refusal("huge.bin is too large to save.".into()));
+
+        let failing = vec![DownloadItem::Link {
+            name: "missing.csv".into(),
+            uri: "ui://todos/missing".into(),
+            mime_type: None,
+        }];
+        let (c, t) = (client.clone(), target.clone());
+        let job = tokio::spawn(async move { resolve_downloads(&c, &t, &failing).await });
+        let req = socket.request("mcpApps.readResource").await;
+        socket
+            .send(json!({"_tag":"Exit","requestId":req["id"],"exit":{"_tag":"Failure","cause":[{"_tag":"Fail","error":{"message":"Resource unavailable"}}]}}))
+            .await;
+        let err = job.await.unwrap().unwrap_err();
+        assert_eq!(err, DownloadError::Refusal("Resource unavailable".into()));
     }
 }

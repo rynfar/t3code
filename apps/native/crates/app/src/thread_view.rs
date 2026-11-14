@@ -1066,6 +1066,7 @@ impl ThreadView {
         let env = RowEnv {
             state: &self.state,
             thread_id: self.thread_id.as_deref(),
+            embedded: self.fixed.is_some(),
             clock: self.clock,
             workspace_root: self.workspace_root.as_deref(),
             ui: &self.ui,
