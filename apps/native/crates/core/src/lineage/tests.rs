@@ -383,3 +383,65 @@ fn labels_and_stop_rules_follow_the_relationships_panel() {
     assert_eq!(app_owned.current(Some(&idle)), app_owned, "no newer run, no live run");
     assert!(!done(strong).can_stop(Some(&resumed)), "a provider task's own status decides");
 }
+
+#[test]
+fn effort_normalizes_legacy_ultracode_and_matches_resolved_slug_plus_formats_model_names() {
+    let model: crate::server_config::ProviderModel = serde_json::from_value(json!({
+        "slug": "claude-opus-4-7",
+        "name": "Claude Opus 4.7",
+        "isCustom": false,
+        "aliases": ["opus-latest"],
+        "capabilities": {"optionDescriptors": [
+            {"id": "ultracode", "label": "Ultracode", "type": "boolean"},
+            {"id": "effort", "label": "Effort", "type": "select", "options": [
+                {"id": "high", "label": "High"},
+                {"id": "xhigh", "label": "Extra High"}
+            ]}
+        ]}
+    }))
+    .expect("model");
+    let legacy_selection: crate::model::ModelSelection =
+        serde_json::from_value(json!({"instanceId": "claude", "model": "opus-latest", "options": [{"id": "effort", "value": "ultracode"}]})).expect("selection");
+    assert_eq!(effort_label(&legacy_selection, Some(&model), None).as_deref(), Some("Extra High"));
+
+    let empty_selection: crate::model::ModelSelection = serde_json::from_value(json!({"instanceId": "claude", "model": "opus-latest"})).expect("selection");
+    let reported_canonical: crate::model::ModelSelection =
+        serde_json::from_value(json!({"instanceId": "claude", "model": "claude-opus-4-7", "options": [{"id": "effort", "value": "ultracode"}]})).expect("reported");
+    assert_eq!(effort_label(&empty_selection, Some(&model), Some(&reported_canonical)).as_deref(), Some("Extra High"));
+
+    let models = vec![model];
+    assert_eq!(resolve_selectable_model("claudeAgent", "opus-latest", &models).map(|m| m.slug.as_str()), Some("claude-opus-4-7"));
+    assert_eq!(resolve_selectable_model("claudeAgent", "Claude Opus 4.7", &models).map(|m| m.slug.as_str()), Some("claude-opus-4-7"));
+    assert_eq!(format_model_slug_name("claude-opus-4-7"), "Claude Opus 4.7");
+    assert_eq!(format_model_slug_name("claude-sonnet-4-5-20250929"), "Claude Sonnet 4.5 20250929");
+    assert_eq!(format_model_slug_name("gpt-5.4-codex"), "GPT-5.4-Codex");
+    assert_eq!(format_model_slug_name("acme/custom-model"), "acme/custom-model");
+}
+
+#[test]
+fn relationship_title_lookup_filters_deleted_forks_after_settling_and_keeps_subagents() {
+    use std::collections::{HashMap, HashSet};
+    let row = |id: &str, kind| RelationshipRow {
+        thread_id: id.into(),
+        edge: RelationshipEdge { source: "me".into(), target: id.into(), kind, status: None },
+    };
+    let rows = vec![
+        row("fork-live", RelationshipKind::Fork),
+        row("fork-archived", RelationshipKind::Fork),
+        row("fork-deleted", RelationshipKind::Fork),
+        row("sub-untitled", RelationshipKind::Subagent),
+        row("sub-titled", RelationshipKind::Subagent),
+    ];
+    let listed = HashSet::from(["fork-live"]);
+    let subagents_with_titles = HashSet::from(["sub-titled"]);
+    assert_eq!(unlisted_title_ids(&rows, &listed, &subagents_with_titles), vec!["fork-archived", "fork-deleted", "sub-untitled"]);
+
+    let unlisted = HashSet::from(["fork-archived", "fork-deleted", "sub-untitled"]);
+    // Before getThreadTitles settles, keep unlisted rows.
+    assert!(rows.iter().all(|r| keep_relationship_row(r, &unlisted, None)));
+
+    // Once settled, deleted fork (omitted from response) is pruned while archived fork & subagent remain.
+    let resolved = HashMap::from([("fork-archived".to_owned(), "Fresh archived title".to_owned())]);
+    let kept: Vec<&str> = rows.iter().filter(|r| keep_relationship_row(r, &unlisted, Some(&resolved))).map(|r| r.thread_id.as_str()).collect();
+    assert_eq!(kept, vec!["fork-live", "fork-archived", "sub-untitled", "sub-titled"]);
+}

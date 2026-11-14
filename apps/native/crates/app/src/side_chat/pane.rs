@@ -166,7 +166,11 @@ impl SideChatPane {
 
     /// Confirms first when the user asked to (`confirmThreadDelete`), with the OS dialog the web uses.
     fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(title) = self.state.read(cx).thread_shell(&self.thread_id).map(|thread| thread.title.clone()) else { return };
+        let state = self.state.read(cx);
+        if !state.can_operate_threads() {
+            return;
+        }
+        let Some(title) = state.thread_shell(&self.thread_id).map(|thread| thread.title.clone()) else { return };
         let id = self.thread_id.clone();
         if !crate::settings::store::client(cx).confirm_thread_delete() {
             self.state.update(cx, |state, cx| state.delete_side_chat(&id, cx));
@@ -193,9 +197,10 @@ impl SideChatPane {
         let shell = state.thread_shell(&self.thread_id);
         let title = shell.map_or_else(|| "Side chat".to_owned(), |thread| thread.title.clone());
         let busy = state.side_threads.busy.contains(&self.thread_id);
+        let can_operate = state.can_operate_threads();
         let parent_active = state.selected_thread.as_deref().is_some_and(|parent| state.is_thread_running(parent));
         let merge_run = state.thread_state(&self.thread_id).projection.as_ref().and_then(|projection| latest_merge_back_run(&projection.runs));
-        let blocked = bring_back_blocked_reason(parent_active, merge_run);
+        let blocked = bring_back_blocked_reason(can_operate, parent_active, merge_run);
         let missing = shell.is_none();
         h_flex()
             .h(px(36.))
@@ -222,7 +227,7 @@ impl SideChatPane {
                 Button::new("side-chat-delete")
                     .size(Size::IconXs)
                     .icon(Icon::Trash2)
-                    .disabled(missing || busy)
+                    .disabled(!can_operate || missing || busy)
                     .tooltip("Delete side chat")
                     .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx))),
             )
@@ -337,6 +342,54 @@ mod tests {
         });
         let (_reopened, _rcx) = cx.add_window_view(|window, cx| SideChatPane::new(state.clone(), "side-t".into(), window, cx));
         assert!(fixture.take_commands().is_empty());
+    }
+
+    #[gpui::test]
+    async fn side_chat_pane_blocks_bring_back_and_delete_without_operate_scope(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (client, mut fixture) = t3_client::supervisor::ClientFixture::handle(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": [t3_core::auth::ORCHESTRATION_READ_SCOPE]
+            }))
+            .unwrap(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        state.update(cx, |state, cx| {
+            let mut shell = shell;
+            shell.snapshot.as_mut().unwrap().threads.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "side-ro", "projectId": "checkout-a", "title": "Readonly Side",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-02T00:00:00.000Z",
+                    "lastVisitedAt": "2026-04-02T00:00:00.000Z",
+                    "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                    "runtimeMode": "auto", "interactionMode": "default",
+                    "lineage": {"rootThreadId":"menu-thread","parentThreadId":"menu-thread","sideChat":true},
+                    "status": "idle", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+                }))
+                .unwrap(),
+            );
+            state.install_active_environment(client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("menu-thread", cx);
+        });
+        let _ = fixture.take_commands();
+        state.update(cx, |state, cx| {
+            let run: t3_core::thread::Run = serde_json::from_value(serde_json::json!({
+                "id": "run-1", "ordinal": 1, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId": "replay", "model": "replay"},
+                "userMessageId": "m0", "rootNodeId": null, "status": "completed",
+                "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": null,
+                "completedAt": "2026-04-01T00:00:02.000Z"
+            }))
+            .unwrap();
+            assert!(!state.can_operate_threads());
+            assert_eq!(bring_back_blocked_reason(state.can_operate_threads(), false, Some(&run)), Some("This connection cannot change threads."));
+            state.bring_back_side_chat("side-ro", cx);
+            state.delete_side_chat("side-ro", cx);
+        });
+        assert!(fixture.take_commands().is_empty(), "read-only connection must not dispatch bring-back or delete");
     }
 }
 

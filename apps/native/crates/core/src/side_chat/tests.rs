@@ -65,11 +65,12 @@ fn parent_of_reads_the_shell() {
 }
 
 #[test]
-fn bring_back_waits_for_an_idle_parent_and_a_finished_reply() {
+fn bring_back_waits_for_operate_permission_idle_parent_and_finished_reply() {
     let finished = run("completed", None);
-    assert_eq!(bring_back_blocked_reason(true, Some(&finished)), Some("Available when the main thread is idle."));
-    assert_eq!(bring_back_blocked_reason(false, None), Some("Available after a finished reply."));
-    assert_eq!(bring_back_blocked_reason(false, Some(&finished)), None);
+    assert_eq!(bring_back_blocked_reason(false, false, Some(&finished)), Some("This connection cannot change threads."));
+    assert_eq!(bring_back_blocked_reason(true, true, Some(&finished)), Some("Available when the main thread is idle."));
+    assert_eq!(bring_back_blocked_reason(true, false, None), Some("Available after a finished reply."));
+    assert_eq!(bring_back_blocked_reason(true, false, Some(&finished)), None);
 }
 
 #[test]

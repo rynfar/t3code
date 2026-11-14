@@ -486,6 +486,130 @@ impl NativeChildStep {
 
 const EFFORT_OPTION_IDS: [&str; 6] = ["reasoningEffort", "effort", "reasoning", "variant", "reasoning_effort", "thinking_level"];
 
+/// Ultracode was a Claude effort level before it became its own toggle; that level ran at `xhigh`.
+fn with_legacy_ultracode_effort(
+    descriptors: &[crate::server_config::OptionDescriptor],
+    mut selections: Vec<crate::traits::OptionSelection>,
+) -> Vec<crate::traits::OptionSelection> {
+    use crate::server_config::OptionDescriptor;
+    use crate::traits::{OptionSelection, OptionValue};
+    let has_toggle = descriptors.iter().any(|d| matches!(d, OptionDescriptor::Boolean(b) if b.id == "ultracode"));
+    let legacy = selections.iter().any(|s| s.id == "effort" && matches!(&s.value, OptionValue::Str(v) if v == "ultracode"));
+    if !has_toggle || !legacy {
+        return selections;
+    }
+    for selection in &mut selections {
+        if selection.id == "effort" && matches!(&selection.value, OptionValue::Str(v) if v == "ultracode") {
+            selection.value = OptionValue::Str("xhigh".to_owned());
+        }
+    }
+    if !selections.iter().any(|s| s.id == "ultracode") {
+        selections.push(OptionSelection { id: "ultracode".to_owned(), value: OptionValue::Bool(true) });
+    }
+    selections
+}
+
+/// `resolveSelectableModel` from `shared/src/model.ts`: direct slug, name, alias, or driver slug alias.
+pub fn resolve_selectable_model<'a>(
+    driver: &str,
+    value: &str,
+    models: &'a [crate::server_config::ProviderModel],
+) -> Option<&'a crate::server_config::ProviderModel> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(model) = models.iter().find(|model| model.slug == trimmed) {
+        return Some(model);
+    }
+    if let Some(model) = models.iter().find(|model| model.name.eq_ignore_ascii_case(trimmed)) {
+        return Some(model);
+    }
+    if let Some(model) = models.iter().find(|model| model.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(trimmed))) {
+        return Some(model);
+    }
+    let normalized = match (driver, trimmed) {
+        ("codex", "gpt-5-codex" | "5.4") => "gpt-5.4",
+        ("codex", "5.3" | "gpt-5.3") => "gpt-5.3-codex",
+        ("codex", "5.3-spark" | "gpt-5.3-spark") => "gpt-5.3-codex-spark",
+        ("cursor", "composer") => "composer-2",
+        ("cursor", "composer-1" | "composer-1.5") => "composer-1.5",
+        ("cursor", "opus-4.6-thinking" | "opus-4.6") => "claude-opus-4-6",
+        ("cursor", "sonnet-4.6-thinking" | "sonnet-4.6") => "claude-sonnet-4-6",
+        ("cursor", "opus-4.5-thinking" | "opus-4.5") => "claude-opus-4-5",
+        _ => return None,
+    };
+    models.iter().find(|model| model.slug == normalized)
+}
+
+/// `formatModelSlugName` from `shared/src/model.ts`.
+pub fn format_model_slug_name(slug: &str) -> String {
+    let separator = slug.rfind('/').map_or(0, |index| index + 1);
+    let (prefix, name) = slug.split_at(separator);
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("gpt-") && lower.as_bytes().get(4).is_some_and(u8::is_ascii_digit) {
+        let mut out = String::from(prefix);
+        out.push_str("GPT");
+        let mut chars = name[3..].chars();
+        while let Some(ch) = chars.next() {
+            out.push(ch);
+            if ch == '-'
+                && let Some(next) = chars.next()
+            {
+                for upper in next.to_uppercase() {
+                    out.push(upper);
+                }
+            }
+        }
+        return out;
+    }
+    let matches_family = ["claude-opus-", "claude-sonnet-", "claude-haiku-", "claude-fable-", "gemini-", "grok-", "composer-"]
+        .iter()
+        .any(|family| lower.starts_with(family) && lower.as_bytes().get(family.len()).is_some_and(u8::is_ascii_digit));
+    if !matches_family {
+        return slug.to_owned();
+    }
+    let normalized = collapse_claude_minor_version(name);
+    let formatted = normalized
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map(|first| first.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{prefix}{formatted}")
+}
+
+fn collapse_claude_minor_version(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("claude-") else { return name.to_owned() };
+    let Some(dash1) = rest.find('-') else { return name.to_owned() };
+    let family = &rest[..dash1];
+    if family.is_empty() || !family.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return name.to_owned();
+    }
+    let after_family = &rest[dash1 + 1..];
+    let major_len = after_family.bytes().take_while(u8::is_ascii_digit).count();
+    if major_len == 0 || after_family.as_bytes().get(major_len) != Some(&b'-') {
+        return name.to_owned();
+    }
+    let after_major = &after_family[major_len + 1..];
+    let minor_len = after_major.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=2).contains(&minor_len) {
+        return name.to_owned();
+    }
+    if !matches!(after_major.as_bytes().get(minor_len), None | Some(b'-') | Some(b'[')) {
+        return name.to_owned();
+    }
+    let dot_pos = "claude-".len() + dash1 + 1 + major_len;
+    let mut out = String::with_capacity(name.len());
+    out.push_str(&name[..dot_pos]);
+    out.push('.');
+    out.push_str(&name[dot_pos + 1..]);
+    out
+}
+
 /// `formatModelSelectionEffort`: the effort a subagent runs at, from the selection's explicit
 /// choice, else what the provider reported for the same model. A value the catalog lacks is
 /// not shown as its default (`getProviderOptionCurrentLabel`).
@@ -496,9 +620,14 @@ pub fn effort_label(
 ) -> Option<String> {
     use crate::server_config::OptionDescriptor;
     use crate::traits::{OptionValue, selections};
-    let descriptors = &model?.capabilities.as_ref()?.option_descriptors;
-    let explicit = selections(selection.options.as_ref());
-    let reported = reported.filter(|reported| reported.instance_id == selection.instance_id && reported.model == selection.model).map(|reported| selections(reported.options.as_ref()));
+    let resolved_model = model?;
+    let descriptors = &resolved_model.capabilities.as_ref()?.option_descriptors;
+    let explicit = with_legacy_ultracode_effort(descriptors, selections(selection.options.as_ref()));
+    let reported = reported
+        .filter(|reported| {
+            reported.instance_id == selection.instance_id && (reported.model == selection.model || reported.model == resolved_model.slug)
+        })
+        .map(|reported| with_legacy_ultracode_effort(descriptors, selections(reported.options.as_ref())));
     for id in EFFORT_OPTION_IDS {
         let Some(OptionDescriptor::Select(descriptor)) = descriptors.iter().find(|descriptor| descriptor.id() == id) else { continue };
         let chosen = explicit.iter().find(|option| option.id == id).map(|option| &option.value);

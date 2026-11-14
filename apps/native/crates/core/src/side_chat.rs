@@ -114,8 +114,10 @@ pub fn disabled_reason(parent: &Parent) -> Option<&'static str> {
 }
 
 /// `bringBackBlockedReason`: a pending merge-back would fail the main thread's queued message.
-pub fn bring_back_blocked_reason(parent_active: bool, merge_run: Option<&Run>) -> Option<&'static str> {
-    if parent_active {
+pub fn bring_back_blocked_reason(can_operate: bool, parent_active: bool, merge_run: Option<&Run>) -> Option<&'static str> {
+    if !can_operate {
+        Some("This connection cannot change threads.")
+    } else if parent_active {
         Some("Available when the main thread is idle.")
     } else if merge_run.is_none() {
         Some("Available after a finished reply.")

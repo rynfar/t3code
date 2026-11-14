@@ -41,7 +41,7 @@ struct Inputs {
     lineage: crate::lineage::Relationships,
 }
 
-fn inputs(state: &AppState) -> Option<Inputs> {
+fn inputs(state: &AppState, titles: &crate::lineage::ThreadTitlesFeed) -> Option<Inputs> {
     if let Some(thread) = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)) {
         let project = state.shell.project(&thread.project_id)?;
         return Some(Inputs {
@@ -52,7 +52,7 @@ fn inputs(state: &AppState) -> Option<Inputs> {
             project_root: project.workspace_root.clone(),
             scripts: project.scripts.clone(),
             no_runs_yet: thread.latest_run_id.is_none(),
-            lineage: crate::lineage::relationships(state, thread),
+            lineage: crate::lineage::relationships_with_titles(state, thread, Some(titles)),
         });
     }
     let project_id = state.draft_project.as_deref()?;
@@ -80,6 +80,7 @@ pub struct DetailsView {
     thread: Entity<ThreadView>,
     pub(super) servers: ServersFeed,
     pub(super) automations: AutomationsFeed,
+    lineage_titles: crate::lineage::ThreadTitlesFeed,
     lineage_shown: usize,
     inputs: Option<Inputs>,
     find_open: bool,
@@ -117,19 +118,21 @@ impl DetailsView {
                     this.lineage_shown = sections::LINEAGE_INITIAL;
                     this.servers.reset_pagination();
                     this.picker.update(cx, |picker, cx| picker.close(cx));
-                    this.inputs = inputs(state.read(cx));
+                    this.sync_lineage_titles(true, cx);
+                    this.inputs = inputs(state.read(cx), &this.lineage_titles);
                     this.find_open = state.read(cx).selected_thread.is_some() && this.thread.read(cx).is_find_open();
                     cx.notify();
                 }
                 // Lineage reads the open thread's subagents and runs as well as the shell.
-                AppEvent::Shell | AppEvent::Thread => {
-                    let next = inputs(state.read(cx));
+                AppEvent::Shell | AppEvent::Thread | AppEvent::Phase => {
+                    this.sync_lineage_titles(true, cx);
+                    let next = inputs(state.read(cx), &this.lineage_titles);
                     if next != this.inputs {
                         this.inputs = next;
                         cx.notify();
                     }
                 }
-                AppEvent::ServerConfig | AppEvent::Phase | AppEvent::RightPanel => cx.notify(),
+                AppEvent::ServerConfig | AppEvent::RightPanel => cx.notify(),
                 _ => {}
             }),
             cx.subscribe(&details, |_, _, _: &DetailsEvent, cx| cx.notify()),
@@ -174,7 +177,8 @@ impl DetailsView {
                 }
             }
         });
-        let initial = inputs(state.read(cx));
+        let lineage_titles = crate::lineage::ThreadTitlesFeed::new();
+        let initial = inputs(state.read(cx), &lineage_titles);
         DetailsView {
             state,
             details,
@@ -186,6 +190,7 @@ impl DetailsView {
             thread,
             servers: ServersFeed::new(),
             automations: AutomationsFeed::new(),
+            lineage_titles,
             lineage_shown: sections::LINEAGE_INITIAL,
             inputs: initial,
             find_open,
@@ -211,6 +216,23 @@ impl DetailsView {
     fn close_popover(&mut self, cx: &mut Context<Self>) {
         let Some(key) = panel_key(self.state.read(cx)) else { return };
         self.details.update(cx, |details, cx| details.close_popover(&key, cx));
+    }
+
+    fn sync_lineage_titles(&mut self, card_open: bool, cx: &mut Context<Self>) {
+        let show = card_open && {
+            let details = self.details.read(cx);
+            details.shows("lineage") || details.shows("sideChats")
+        };
+        self.lineage_titles.sync(
+            &self.state,
+            show,
+            |this| &mut this.lineage_titles,
+            |this, cx| {
+                this.inputs = inputs(this.state.read(cx), &this.lineage_titles);
+                cx.notify();
+            },
+            cx,
+        );
     }
 }
 
@@ -248,6 +270,7 @@ impl Render for DetailsView {
         let feed_active = layout.card_open && active_thread.is_some();
         self.servers.sync(&self.state, feed_active && show_servers, cx);
         self.automations.sync(&self.state, feed_active && show_automations, cx);
+        self.sync_lineage_titles(feed_active, cx);
 
         if !layout.card_open || self.inputs.is_none() {
             return div().into_any_element();
