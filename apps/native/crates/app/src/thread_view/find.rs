@@ -238,7 +238,7 @@ impl ThreadView {
                 }
                 let target = find.active_entry().map(str::to_owned);
                 if let Some(target) = target {
-                    view.reveal_entry(&target, cx);
+                    view.reveal_entry(&target, t3_core::timeline::anchor::ScrollSource::Find, cx);
                 }
                 cx.notify();
             });
@@ -254,7 +254,7 @@ impl ThreadView {
         if let Some(next) = step_locally(result, *index, delta) {
             let target = next.1.entry_id.clone();
             find.active = Some(next);
-            self.reveal_entry(&target, cx);
+            self.reveal_entry(&target, t3_core::timeline::anchor::ScrollSource::Find, cx);
             cx.notify();
             return;
         }
@@ -272,7 +272,7 @@ impl ThreadView {
             if let Some(find) = self.find.as_mut() {
                 find.pending_reveal = None;
             }
-            self.reveal_entry(&entry_id, cx);
+            self.reveal_entry(&entry_id, t3_core::timeline::anchor::ScrollSource::Find, cx);
         }
         let Some(find) = self.find.as_mut().filter(|find| !find.query.trim().is_empty() && find.refresh.is_none()) else { return };
         find.refresh = Some(cx.spawn(async move |this, cx| {
@@ -291,8 +291,9 @@ impl ThreadView {
 
     /// Opens whatever hides `entry_id` (turn fold, superseded attempt, tool group), scrolls its
     /// row into view, or pages history in when the entry is older than the loaded window.
-    pub(super) fn reveal_entry(&mut self, entry_id: &str, cx: &mut Context<Self>) {
+    pub(super) fn reveal_entry(&mut self, entry_id: &str, source: t3_core::timeline::anchor::ScrollSource, cx: &mut Context<Self>) {
         self.disclosure.cancel();
+        let mut expanded = false;
         for _ in 0..3 {
             if let Some(index) = self.rows.iter().position(|row| row_holds(row, entry_id)) {
                 let row = self.rows[index].clone();
@@ -301,6 +302,7 @@ impl ThreadView {
                         self.load_work_for_group(group_id, cx);
                     }
                     self.rederive(cx);
+                    expanded = true;
                     continue;
                 }
                 if let RowKind::Work { entries, expanded_group: true, .. } = &row.kind
@@ -309,7 +311,19 @@ impl ThreadView {
                 {
                     list.scroll_to_reveal_item(member);
                 }
+                self.smooth_scroll = None;
+                self.pending_restore = None;
+                self.pending_scroll_top = None;
+                self.list.set_tail_reservation(None);
                 self.list.scroll_to_reveal_item(self.header_count() + index);
+                if expanded {
+                    self.pending_scroll_source = None;
+                    let now = self.follow_now(cx);
+                    self.follow.on_user_navigation(source, false, now);
+                } else {
+                    self.pending_scroll_source = Some(source);
+                    self.on_observed_list_scroll(cx);
+                }
                 cx.notify();
                 return;
             }
@@ -335,6 +349,7 @@ impl ThreadView {
                 break;
             }
             self.rederive(cx);
+            expanded = true;
         }
         if self.history.as_ref().is_some_and(|history| history.has_more)
             && let Some(find) = self.find.as_mut()

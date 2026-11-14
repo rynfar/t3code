@@ -367,7 +367,7 @@ impl ThreadView {
                         );
                     });
                 }
-                self.reveal_entry(&citation.message_id, cx);
+                self.reveal_entry(&citation.message_id, t3_core::timeline::anchor::ScrollSource::Citation, cx);
             }
             HistoryAction::Failed(failure) => {
                 self.citation_ui.pending = None;

@@ -405,4 +405,92 @@ mod tests {
         assert_eq!(selection.text(source), "hello");
         assert_eq!(Selection::all(source).text(source), source);
     }
+
+    #[test]
+    fn group_selection_spans_across_paragraphs_forward_and_backward() {
+        let parts = ["First paragraph text", "Second paragraph reply"];
+        let forward = GroupSelection {
+            anchor: GroupPoint { part: 0, offset: 6 },
+            focus: GroupPoint { part: 1, offset: 6 },
+        };
+        assert_eq!(forward.range_for_part(0, parts[0].len()), Some(6..parts[0].len()));
+        assert_eq!(forward.range_for_part(1, parts[1].len()), Some(0..6));
+        assert_eq!(forward.extract_text(&parts, "\n\n"), "paragraph text\n\nSecond");
+
+        let backward = GroupSelection {
+            anchor: GroupPoint { part: 1, offset: 6 },
+            focus: GroupPoint { part: 0, offset: 6 },
+        };
+        assert_eq!(backward.range_for_part(0, parts[0].len()), Some(6..parts[0].len()));
+        assert_eq!(backward.range_for_part(1, parts[1].len()), Some(0..6));
+        assert_eq!(backward.extract_text(&parts, "\n\n"), "paragraph text\n\nSecond");
+
+        let single = GroupSelection {
+            anchor: GroupPoint { part: 1, offset: 7 },
+            focus: GroupPoint { part: 1, offset: 16 },
+        };
+        assert_eq!(single.range_for_part(0, parts[0].len()), None);
+        assert_eq!(single.range_for_part(1, parts[1].len()), Some(7..16));
+        assert_eq!(single.extract_text(&parts, "\n\n"), "paragraph");
+
+        let empty = GroupSelection {
+            anchor: GroupPoint { part: 0, offset: 3 },
+            focus: GroupPoint { part: 0, offset: 3 },
+        };
+        assert!(empty.is_empty());
+        assert_eq!(empty.extract_text(&parts, "\n\n"), "");
+    }
+}
+
+/// An endpoint inside a multi-paragraph selection group (such as the minimap hover preview).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GroupPoint {
+    pub part: usize,
+    pub offset: usize,
+}
+
+/// A contiguous selection spanning one or more ordered text parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupSelection {
+    pub anchor: GroupPoint,
+    pub focus: GroupPoint,
+}
+
+impl GroupSelection {
+    pub fn ordered(&self) -> (GroupPoint, GroupPoint) {
+        if self.anchor <= self.focus { (self.anchor, self.focus) } else { (self.focus, self.anchor) }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.focus
+    }
+
+    pub fn range_for_part(&self, part: usize, part_len: usize) -> Option<Range<usize>> {
+        if self.is_empty() {
+            return None;
+        }
+        let (start, end) = self.ordered();
+        if part < start.part || part > end.part {
+            return None;
+        }
+        let lo = if part == start.part { start.offset.min(part_len) } else { 0 };
+        let hi = if part == end.part { end.offset.min(part_len) } else { part_len };
+        (lo < hi).then_some(lo..hi)
+    }
+
+    pub fn extract_text(&self, parts: &[&str], separator: &str) -> String {
+        if self.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for (index, part) in parts.iter().enumerate() {
+            if let Some(range) = self.range_for_part(index, part.len()) {
+                if !out.is_empty() {
+                    out.push_str(separator);
+                }
+                out.push_str(&part[range]);
+            }
+        }
+        out
+    }
 }
