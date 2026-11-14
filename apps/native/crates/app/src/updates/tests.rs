@@ -1052,6 +1052,12 @@ async fn dialog_open_checks_provider_updates_across_connected_machines_and_clear
     assert_eq!(method_b, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
     assert_eq!(input_a, json!({ "refreshModels": true }));
     assert_eq!(input_b, json!({ "refreshModels": true }));
+    // Reopening / re-triggering while in flight must not dispatch a duplicate wave.
+    control.update(vcx, |ctrl, cx| ctrl.refresh_providers_for_dialog(cx));
+    vcx.run_until_parked();
+    control.read_with(vcx, |ctrl, cx| {
+        assert!(ctrl.dialog.read(cx).checking);
+    });
     let _ = reply_a.send(Ok(json!({ "providers": [] })));
     let _ = reply_b.send(Ok(json!({ "providers": [] })));
     let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
@@ -1074,6 +1080,16 @@ async fn dialog_open_checks_provider_updates_across_connected_machines_and_clear
     control.read_with(vcx, |ctrl, cx| {
         assert!(!ctrl.dialog.read(cx).checking);
     });
+    // After the in-flight wave settles, reopening dispatches a fresh wave (proving the earlier
+    // duplicate trigger did not queue an extra request on the fixtures).
+    control.update(vcx, |ctrl, cx| ctrl.refresh_providers_for_dialog(cx));
+    vcx.run_until_parked();
+    let (method_a2, _, reply_a2) = fixture_a.next_request().await;
+    let (method_b2, _, reply_b2) = fixture_b.next_request().await;
+    assert_eq!(method_a2, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
+    assert_eq!(method_b2, t3_core::settings::providers::SERVER_REFRESH_PROVIDERS);
+    let _ = reply_a2.send(Ok(json!({ "providers": [] })));
+    let _ = reply_b2.send(Ok(json!({ "providers": [] })));
 }
 
 #[gpui::test]
@@ -1139,4 +1155,84 @@ async fn retry_failed_skips_already_updated_server_in_fleet(cx: &mut TestAppCont
         assert!(ctrl.run.is_none());
         assert!(!ctrl.capsule_open);
     });
+}
+
+#[test]
+fn production_update_dialog_checking_frame() {
+    let Some(out) = std::env::var_os("T3_UPDATE_CAPTURE") else {
+        return;
+    };
+    let out = std::path::PathBuf::from(out);
+    std::fs::create_dir_all(&out).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut cx = HeadlessAppContext::with_platform(
+        gpui_platform::current_platform(true).text_system(),
+        Arc::new(crate::icons::Assets),
+        gpui_platform::current_headless_renderer,
+    );
+    let state = cx.update(|cx| {
+        cx.set_global(
+            serde_json::from_value::<crate::chatgpt_setup::Fixture>(json!({
+                "provider":{"instanceId":"replay","driver":"replay","enabled":true,"installed":true,"status":"ready"},
+                "auth":{"phase":"idle"},"install":{"phase":"idle"}
+            }))
+            .unwrap(),
+        );
+        crate::boot(runtime.handle().clone(), cx)
+    });
+    state.update(&mut cx, |state, _| state.stop_pump());
+    let mut harness = None;
+    let window = cx
+        .open_window(gpui::size(gpui::px(640.), gpui::px(420.)), |_window, cx| {
+            let outer = cx.focus_handle();
+            let control = cx.new(|cx| UpdateControl::new(state.clone(), cx));
+            let view = cx.new(|_| Harness { outer, control });
+            harness = Some(view.clone());
+            view
+        })
+        .unwrap();
+    let harness = harness.unwrap();
+    let plan = Plan {
+        servers: vec![t3_core::updates::ServerTarget {
+            environment_id: "local".into(),
+            label: "Studio Mac".into(),
+            target_version: "0.9.0".into(),
+            self_update: "npm".into(),
+        }],
+        providers: vec![t3_core::updates::ProviderTarget {
+            environment_id: "local".into(),
+            driver: "codex".into(),
+            instance_id: "codex".into(),
+        }],
+        rows: vec![t3_core::updates::Row {
+            environment_id: "local".into(),
+            label: "Studio Mac".into(),
+            app: Some("0.9.0".into()),
+            providers: vec!["Codex".into()],
+            skipped: None,
+        }],
+        restarts: vec![t3_core::updates::RestartingMachine {
+            environment_id: "local".into(),
+            continues_threads: true,
+        }],
+    };
+    cx.update_window(window.into(), |_, window, cx| {
+        let control = harness.read(cx).control.clone();
+        control.update(cx, |ctrl, cx| {
+            ctrl.dialog.update(cx, |dialog, cx| {
+                dialog.open(plan, true, window, cx);
+                dialog.set_checking(true, cx);
+            });
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.draw(cx).clear();
+    })
+    .unwrap();
+    cx.capture_screenshot(window.into())
+        .unwrap()
+        .save(out.join("update-dialog-checking.png"))
+        .unwrap();
 }

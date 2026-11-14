@@ -253,7 +253,7 @@ impl SidebarPane {
             .into_any_element()
     }
 
-    fn row_surface(&self, target: &RowTarget<'_>, row: &RowState, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn row_surface(&self, target: &RowTarget<'_>, is_repo: Option<bool>, row: &RowState, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let RowTarget { key, thread, section, .. } = *target;
         let project = target.project.map(str::to_owned);
         let active = row.active;
@@ -286,7 +286,7 @@ impl SidebarPane {
         let ring = BoxShadow { color: hsla(p.sidebar_border).opacity(0.7), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(1.), inset: true };
         let focus_ring = BoxShadow { color: hsla(p.ring), offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: true };
         let visual = key.map_or_else(|| crate::project_icon::ProjectVisual::for_project(state, &thread.project_id), |key| crate::project_icon::ProjectVisual::for_scoped_project(state, &t3_core::sidebar::grouping::ProjectRef { environment_id: key.environment_id.clone(), project_id: thread.project_id.clone() }));
-        let hover = HoverTarget { state: self.state.clone(), key: key.cloned(), thread_id: thread.id.clone(), project: project.clone(), favicon: visual.clone() };
+        let hover = HoverTarget { state: self.state.clone(), key: key.cloned(), thread_id: thread.id.clone(), project: project.clone(), favicon: visual.clone(), is_repo };
         let preview = (thread.title.clone(), project, visual);
         let pane = cx.entity().downgrade();
         div()
@@ -721,8 +721,17 @@ impl SidebarPane {
     }
 
     fn render_card(&mut self, target: RowTarget<'_>, active: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let RowTarget { key, thread, section, .. } = target;
-        let project = target.project.map(str::to_owned);
+        let RowTarget { key, thread: raw_thread, project: target_project, section } = target;
+        let is_repo = self.ensure_checkout_repo(key, raw_thread, cx);
+        let stripped;
+        let thread = if is_repo == Some(false) {
+            stripped = raw_thread.clone().without_removed_checkout(is_repo);
+            &stripped
+        } else {
+            raw_thread
+        };
+        let target = RowTarget { key, thread, project: target_project, section };
+        let project = target_project.map(str::to_owned);
         let p = palette(cx);
         let now = self.now;
         let extras = self.row_extras(key, thread, active, cx);
@@ -830,7 +839,7 @@ impl SidebarPane {
             .py(px(2.))
             .pb(px(3.))
             .child(
-                self.row_surface(&target, &state, window, cx).child(
+                self.row_surface(&target, is_repo, &state, window, cx).child(
                     div()
                         .when(has_meta, |this| this.h(px(CARD_CONTENT_HEIGHT)))
                         .px(px(10.))
@@ -881,7 +890,16 @@ impl SidebarPane {
     }
 
     pub(super) fn render_compact(&mut self, target: RowTarget<'_>, variant: CompactVariant, active: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let RowTarget { key, thread, section, .. } = target;
+        let RowTarget { key, thread: raw_thread, project: target_project, section } = target;
+        let is_repo = self.ensure_checkout_repo(key, raw_thread, cx);
+        let stripped;
+        let thread = if is_repo == Some(false) {
+            stripped = raw_thread.clone().without_removed_checkout(is_repo);
+            &stripped
+        } else {
+            raw_thread
+        };
+        let target = RowTarget { key, thread, project: target_project, section };
         let p = palette(cx);
         let now = self.now;
         let extras = self.row_extras(key, thread, active, cx);
@@ -998,7 +1016,7 @@ impl SidebarPane {
             .children(self.pin_indicator(key, thread, interactive_pin, cx))
             .when(!variant.multiline(), |this| this.children(self.render_terminal_button(key, thread, &extras.running, cx)))
             .child(right_slot);
-        let surface = self.row_surface(&target, &state, window, cx);
+        let surface = self.row_surface(&target, is_repo, &state, window, cx);
         let surface = if variant.multiline() {
             surface.child(
                 div()

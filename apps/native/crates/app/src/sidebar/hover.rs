@@ -46,6 +46,7 @@ pub(super) struct HoverTarget {
     pub(super) thread_id: String,
     pub(super) project: Option<String>,
     pub(super) favicon: ProjectVisual,
+    pub(super) is_repo: Option<bool>,
 }
 
 struct ModelLine {
@@ -63,8 +64,8 @@ struct PrLine {
     stack: Option<SharedString>,
 }
 
-/// Lets a running read go when the card closes.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+/// Lets a running read go when the card or watcher closes.
+pub(super) struct AbortOnDrop<T>(pub(super) tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
@@ -106,9 +107,11 @@ impl ThreadHoverCard {
     pub(super) fn new(target: &HoverTarget, cx: &mut Context<Self>) -> Self {
         let entity = target.state.clone();
         let state = entity.read(cx);
-        let Some(thread) = find_thread(state, target) else {
+        let Some(raw_thread) = find_thread(state, target) else {
             return Self::empty(target);
         };
+        let stripped = raw_thread.clone().without_removed_checkout(target.is_repo);
+        let thread = &stripped;
         let config = match &target.key {
             Some(key) => state.fleet.environment(&key.environment_id).and_then(|entry| entry.config.config.as_ref()),
             None => state.server_config.config.as_ref(),
@@ -203,23 +206,36 @@ impl ThreadHoverCard {
         }
     }
 
-    /// Reads the project checkout's branch once, for a local-mode thread that records one, from
-    /// the environment that owns the thread.
+    /// Reads the thread's checkout (worktree or project root) once, for a thread that records
+    /// a branch or worktree, from the environment that owns the thread.
     fn checkout(target: &HoverTarget, state: &AppState, thread: &SidebarThread, cx: &App) -> Option<Checkout> {
+        if target.is_repo == Some(false) {
+            return None;
+        }
         let root = match &target.key {
             Some(key) => state
                 .scoped_project(&t3_core::sidebar::grouping::ProjectRef { environment_id: key.environment_id.clone(), project_id: thread.project_id.clone() })
                 .map(|project| project.project.workspace_root.as_str()),
             None => state.shell.project(&thread.project_id).map(|project| project.workspace_root.as_str()),
         };
-        let cwd = model::checkout_to_compare(thread, root)?.to_owned();
         #[cfg(feature = "snapshot")]
         if state.sidebar.snapshot_fixture {
+            let cwd = model::checkout_to_compare(thread, root)?.to_owned();
             let current = cx.try_global::<crate::snapshot::CheckoutFixture>().and_then(|fixture| fixture.0.get(&cwd).cloned());
             return Some(Checkout::Known(model::branch_mismatch(thread, current.as_deref())));
         }
         #[cfg(not(feature = "snapshot"))]
         let _ = cx;
+        if thread.branch.as_deref().is_none_or(str::is_empty) && thread.worktree_path.as_deref().is_none_or(str::is_empty) {
+            return None;
+        }
+        let cwd = thread
+            .worktree_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .or_else(|| root.map(str::trim).filter(|path| !path.is_empty()))?
+            .to_owned();
         let client: std::pin::Pin<Box<dyn std::future::Future<Output = Option<t3_client::supervisor::ClientHandle>> + Send>> = match &target.key {
             None => {
                 let client = state.client_handle();
@@ -451,7 +467,7 @@ mod tests {
         });
         set_terminals(cx, "hover-thread", &["term-1", "term-2"]);
         let favicon = state.read_with(cx, |state, _| ProjectVisual::for_project(state, "checkout-a"));
-        let target = HoverTarget { state: state.clone(), key: None, thread_id: "hover-thread".into(), project: Some("Shared repo".into()), favicon };
+        let target = HoverTarget { state: state.clone(), key: None, thread_id: "hover-thread".into(), project: Some("Shared repo".into()), favicon, is_repo: None };
 
         let (card, vcx) = cx.add_window_view(|_, cx| ThreadHoverCard::new(&target, cx));
         let checkout = card.update(vcx, |card, _| card._checkout.take()).expect("local thread with a branch compares its checkout");
@@ -493,7 +509,7 @@ mod tests {
             state.shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(thread_json("hover-thread", "checkout-a", json!({"branch": "feature/hover"}))).unwrap()];
             state.rebuild_sidebar(cx);
         });
-        let target = HoverTarget { state: state.clone(), key: None, thread_id: "hover-thread".into(), project: None, favicon: ProjectVisual::default() };
+        let target = HoverTarget { state: state.clone(), key: None, thread_id: "hover-thread".into(), project: None, favicon: ProjectVisual::default(), is_repo: None };
         let card = cx.update(|cx| cx.new(|cx| ThreadHoverCard::new(&target, cx)));
         let (_, _, mut reply) = fixture.next_request().await;
         drop(card);
@@ -539,7 +555,7 @@ mod tests {
         fixture_local.take_commands();
 
         let key_b = ThreadKey { environment_id: "env-b".into(), thread_id: "shared-th".into() };
-        let target_b = HoverTarget { state: state.clone(), key: Some(key_b), thread_id: "shared-th".into(), project: Some("env-b".into()), favicon: ProjectVisual::default() };
+        let target_b = HoverTarget { state: state.clone(), key: Some(key_b), thread_id: "shared-th".into(), project: Some("env-b".into()), favicon: ProjectVisual::default(), is_repo: None };
         let (card_b, vcx) = cx.add_window_view(|_, cx| ThreadHoverCard::new(&target_b, cx));
         let checkout = card_b.update(vcx, |card, _| card._checkout.take()).expect("remote thread compares its own checkout");
         let (params, reply) = next_checkout_read(&mut fixture_b).await;
@@ -563,6 +579,41 @@ mod tests {
         card_a.read_with(vcx, |card, _| {
             assert_eq!(card.environment.as_ref().map(|(label, _)| label.as_ref()), Some("Laptop"));
             assert_eq!(card.terminals, 1);
+        });
+        state.update(vcx, |state, _| state.stop_pump());
+    }
+
+    #[gpui::test]
+    async fn worktree_hover_card_checks_worktree_checkout_and_clears_branch_when_removed(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, cx| {
+            state.shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(thread_json("wt-thread", "checkout-a", json!({
+                "branch": "feature/removed-wt",
+                "worktreePath": "/tmp/removed-worktree",
+            }))).unwrap()];
+            state.rebuild_sidebar(cx);
+        });
+        let target = HoverTarget {
+            state: state.clone(),
+            key: None,
+            thread_id: "wt-thread".into(),
+            project: Some("Shared repo".into()),
+            favicon: ProjectVisual::default(),
+            is_repo: None,
+        };
+        let (card, vcx) = cx.add_window_view(|_, cx| ThreadHoverCard::new(&target, cx));
+        let checkout = card.update(vcx, |card, _| card._checkout.take()).expect("worktree thread must verify checkout existence");
+        let (method, params, reply) = fixture.next_request().await;
+        assert_eq!(method, t3_core::vcs::method::VCS_REFRESH_STATUS);
+        assert_eq!(params, json!({"cwd": "/tmp/removed-worktree", "localOnly": true}));
+        reply.send(Ok(json!({"isRepo": false, "refName": null, "hasWorkingTreeChanges": false}))).unwrap();
+        checkout.await;
+        vcx.update(|window, cx| window.draw(cx).clear());
+        card.read_with(vcx, |card, _| {
+            assert_eq!(card.branch, None, "removed worktree checkout must clear branch on hover card");
+            assert!(!card.branch_mismatch);
         });
         state.update(vcx, |state, _| state.stop_pump());
     }

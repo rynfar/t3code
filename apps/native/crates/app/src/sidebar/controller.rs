@@ -1205,7 +1205,11 @@ impl AppState {
     }
 
     fn snapshot_thread(&self, thread_id: &str) -> Option<t3_core::sidebar::thread::SidebarThread> {
-        self.sidebar.model.thread(thread_id).cloned()
+        self.sidebar
+            .model
+            .thread(thread_id)
+            .cloned()
+            .or_else(|| self.thread_shell(thread_id).map(|shell| t3_core::sidebar::thread::present_thread(shell, None)))
     }
 
     pub fn settle_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
