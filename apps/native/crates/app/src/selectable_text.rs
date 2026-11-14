@@ -129,6 +129,11 @@ impl GroupState {
         self.granularity = None;
         self.sync_members(cx);
     }
+
+    fn reset(&mut self, cx: &mut App) {
+        self.clear_selection(cx);
+        self.parts.clear();
+    }
 }
 
 impl SelectionGroup {
@@ -142,6 +147,11 @@ impl SelectionGroup {
 
     pub fn clear(&self, cx: &mut App) {
         self.0.update(cx, |group, cx| group.clear_selection(cx));
+        clear_active_selection_if_group(&self.0, cx);
+    }
+
+    pub fn reset(&self, cx: &mut App) {
+        self.0.update(cx, |group, cx| group.reset(cx));
         clear_active_selection_if_group(&self.0, cx);
     }
 }
@@ -1079,6 +1089,7 @@ mod tests {
         cx.update(gpui_component::init);
         struct Preview {
             group: SelectionGroup,
+            show_assistant: bool,
         }
         impl Render for Preview {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -1087,12 +1098,15 @@ mod tests {
                     .flex()
                     .flex_col()
                     .child(SelectableText::new("group-p0", "User prompt text").selection_group(self.group.clone(), 0))
-                    .child(SelectableText::new("group-p1", "Assistant reply text").selection_group(self.group.clone(), 1))
+                    .children(self.show_assistant.then(|| {
+                        SelectableText::new("group-p1", "Assistant reply text").selection_group(self.group.clone(), 1)
+                    }))
             }
         }
         let group = cx.update(SelectionGroup::new);
         let preview_group = group.clone();
-        let window = cx.open_window(size(px(320.), px(160.)), |_, _| Preview { group: preview_group });
+        let window = cx.open_window(size(px(320.), px(160.)), |_, _| Preview { group: preview_group, show_assistant: true });
+        let root = window.root(cx).unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.update(|window, cx| window.draw(cx).clear());
         let (start, end) = group.0.read_with(visual, |g, _| {
@@ -1113,5 +1127,18 @@ mod tests {
         visual.simulate_mouse_down(point(px(310.), px(150.)), MouseButton::Left, Default::default());
         visual.simulate_mouse_up(point(px(310.), px(150.)), MouseButton::Left, Default::default());
         assert_eq!(visual.update(|_, cx| active_selected_text(cx)), None);
+
+        // Resetting when switching to a turn without assistant text drops stale part: 1.
+        visual.update(|window, cx| {
+            group.reset(cx);
+            root.update(cx, |preview, cx| {
+                preview.show_assistant = false;
+                cx.notify();
+            });
+            window.draw(cx).clear();
+            group.select_all(cx);
+        });
+        group.0.read_with(visual, |g, _| assert_eq!(g.parts.len(), 1));
+        assert_eq!(visual.update(|_, cx| active_selected_text(cx)).as_deref(), Some("User prompt text"));
     }
 }

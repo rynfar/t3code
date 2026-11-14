@@ -377,13 +377,8 @@ impl TimelineFollow {
     where
         F: Fn(&str) -> bool,
     {
-        if !self.hydrated {
-            for run in runs {
-                self.observed_run_ids.insert(run.run_id.to_owned());
-            }
-            self.hydrated = true;
-            return AnchorEffect::None;
-        }
+        let initial = !self.hydrated;
+        self.hydrated = true;
 
         let mut candidate: Option<NewTurnAnchor> = None;
         for run in runs {
@@ -398,6 +393,7 @@ impl TimelineFollow {
         if let Some(next) = candidate
             && self.phase == FollowPhase::Following
             && total_user_messages == 1
+            && (!initial || runs.len() == 1)
             && is_first_user_message(&next.user_message_id)
         {
             let user_message_id = next.user_message_id.clone();

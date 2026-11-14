@@ -505,10 +505,11 @@ impl ThreadView {
         let preview = active.map(|index| (index, self.minimap.preview(index)));
         let preview_open = preview.is_some();
         if let Some((index, ref data)) = preview {
-            if self.minimap.last_preview.as_ref().is_some_and(|(prev_ix, _)| *prev_ix != index)
-                && let Some(group) = &self.minimap.preview_selection
+            if self.minimap.last_preview.as_ref().is_some_and(|(prev_ix, prev_data)| {
+                *prev_ix != index || (prev_data.assistant_text.is_some() && data.assistant_text.is_none())
+            }) && let Some(group) = &self.minimap.preview_selection
             {
-                group.clear(cx);
+                group.reset(cx);
             }
             self.minimap.last_preview = Some((index, data.clone()));
             if self.minimap.preview_selection.is_none() {
@@ -526,8 +527,8 @@ impl ThreadView {
         if !preview_open && preview_progress == 0. {
             self.minimap.last_preview = None;
             self.minimap.preview_bounds.set(None);
-            if let Some(group) = &self.minimap.preview_selection {
-                group.clear(cx);
+            if let Some(group) = self.minimap.preview_selection.take() {
+                group.reset(cx);
             }
         }
         let rendered_preview = preview.or_else(|| (preview_progress > 0.).then(|| self.minimap.last_preview.clone()).flatten());

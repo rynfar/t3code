@@ -255,6 +255,17 @@ fn new_turn_anchor_only_anchors_first_user_message_and_releases_on_tool_or_settl
     let tool_started = [RunAnchorSnapshot { run_id: "r1", status: "running", user_message_id: "m1", has_tool_or_reasoning: true }];
     assert_eq!(fresh.observe_runs(&tool_started, 1, |id| id == "m1"), AnchorEffect::ReleaseAndScrollToEnd);
     assert_eq!(fresh.anchored_user_message_id(), None);
+
+    // Draft promotion: initial snapshot already includes the live first run and single user message.
+    let mut draft_promoted = TimelineFollow::default();
+    assert_eq!(
+        draft_promoted.observe_runs(&first_start, 1, |id| id == "m1"),
+        AnchorEffect::Anchor { user_message_id: "m1".to_owned() },
+    );
+
+    // Opening a populated multi-run thread does not anchor on initial hydration even if latest run is live.
+    let mut populated = TimelineFollow::default();
+    assert_eq!(populated.observe_runs(&followup, 1, |id| id == "m0"), AnchorEffect::None);
 }
 
 #[test]

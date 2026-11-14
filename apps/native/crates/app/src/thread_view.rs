@@ -85,13 +85,11 @@ pub struct ThreadView {
     follow: anchor::TimelineFollow,
     remembered_positions: anchor::RememberedPositions,
     pending_restore: Option<anchor::SavedThreadPosition>,
+    pending_scroll_top: Option<f32>,
     follow_epoch: Instant,
     scroll_to_end_task: Option<gpui::Task<()>>,
     smooth_scroll: Option<SmoothScroll>,
     pending_scroll_source: Option<anchor::ScrollSource>,
-    last_scroll_snapshot: Option<(usize, f32, usize)>,
-    last_row_count_seen: usize,
-    suppress_scroll_release: bool,
     working_timer: Option<Entity<WorkingTimer>>,
     find: Option<find::FindUi>,
     citation_ui: citations::CitationUi,
@@ -230,13 +228,11 @@ impl ThreadView {
             follow: anchor::TimelineFollow::default(),
             remembered_positions: anchor::RememberedPositions::default(),
             pending_restore: None,
+            pending_scroll_top: None,
             follow_epoch: cx.background_executor().now(),
             scroll_to_end_task: None,
             smooth_scroll: None,
             pending_scroll_source: None,
-            last_scroll_snapshot: None,
-            last_row_count_seen: 0,
-            suppress_scroll_release: false,
             working_timer: None,
             find: None,
             citation_ui: citations::CitationUi::new(cx),
@@ -293,6 +289,9 @@ impl ThreadView {
         if selected == self.thread_id && self.thread_state(state).is_merging_history() {
             return;
         }
+        if selected == self.thread_id && (self.pending_scroll_source.is_some() || self.list.is_scrollbar_dragging()) {
+            self.on_observed_list_scroll(cx);
+        }
         if selected != self.thread_id {
             if let Some(previous_id) = self.thread_id.take() && !self.rows.is_empty() {
                 let (distance, viewport) = disclosure_end_distance(&self.list);
@@ -317,9 +316,7 @@ impl ThreadView {
             self.smooth_scroll = None;
             self.scroll_to_end_task = None;
             self.pending_scroll_source = None;
-            self.last_scroll_snapshot = None;
-            self.last_row_count_seen = 0;
-            self.suppress_scroll_release = false;
+            self.pending_scroll_top = None;
             self.list.set_tail_reservation(None);
             self.follow.reset();
             self.dismiss_citation_selection(cx);
@@ -430,7 +427,7 @@ impl ThreadView {
                 let disclosure_follow = !paused && changed && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
                 let keep_end = (self.follow.is_following() && !paused && self.follow.anchored_user_message_id().is_none()) || disclosure_follow;
                 if keep_end {
-                    self.suppress_scroll_release = true;
+                    self.pending_scroll_source = None;
                     self.list.scroll_to_end();
                 } else {
                     self.keep_place(visible);
@@ -438,7 +435,6 @@ impl ThreadView {
             }
         }
         if changed { self.disclosure.changed(); }
-        self.last_row_count_seen = self.rows.len();
         let pending_work = self.sync_work_folds(cx);
         self.load_deferred_work(pending_work, cx);
         self.sync_revert_counts(cx);
@@ -833,11 +829,11 @@ impl ThreadView {
             Some(Anchor::At(top)) => {
                 self.anchor_gap.borrow_mut().take();
                 let top = anchor::include_preceding_rows(top, |ix| f32::from(self.list.offset_for_item(ix + 1) - self.list.offset_for_item(ix)));
-                self.suppress_scroll_release = true;
+                self.pending_scroll_source = None;
                 self.list.scroll_to(ListOffset { item_ix: top.item, offset_in_item: px(top.offset) });
             }
             Some(Anchor::Below { item, gap }) => {
-                self.suppress_scroll_release = true;
+                self.pending_scroll_source = None;
                 self.list.scroll_to(ListOffset { item_ix: item, offset_in_item: px(0.) });
                 let row = self.rows.get(item - self.header_count()).map(|row| row.id.clone());
                 *self.anchor_gap.borrow_mut() = row.map(|row| (row, gap));
@@ -1094,7 +1090,7 @@ impl ThreadView {
         }
         drop(lists);
         if follow {
-            self.suppress_scroll_release = true;
+            self.pending_scroll_source = None;
             self.list.scroll_to_end();
         } else {
             self.keep_place(visible);
@@ -1492,19 +1488,22 @@ impl ThreadView {
             self.pending_restore = Some(saved);
             return false;
         }
+        self.pending_scroll_source = None;
         if let Some(row_id) = saved.row_id.as_deref()
             && let Some(index) = self.rows.iter().position(|row| row.id == row_id)
         {
-            self.suppress_scroll_release = true;
+            self.pending_scroll_top = None;
             self.list.scroll_to(ListOffset { item_ix: self.header_count() + index, offset_in_item: px(saved.offset_within_row) });
             return true;
         }
-        if saved.scroll_top > 0. {
-            self.suppress_scroll_release = true;
-            self.list.set_offset_from_scrollbar(point(px(0.), px(-saved.scroll_top)));
+        if saved.row_id.is_none() || saved.scroll_top <= 0. {
+            self.pending_scroll_top = None;
+            self.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(saved.offset_within_row.max(0.)) });
             return true;
         }
-        false
+        self.pending_scroll_top = Some(saved.scroll_top);
+        self.list.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+        true
     }
 
     fn apply_new_turn_anchor(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1549,13 +1548,13 @@ impl ThreadView {
                 if self.list.tail_reservation_filled() {
                     self.list.set_tail_reservation(None);
                     self.follow.scroll_to_end();
-                    self.suppress_scroll_release = true;
+                    self.pending_scroll_source = None;
                     self.list.scroll_to_end();
                     return true;
                 }
                 if let Some(row_ix) = self.rows.iter().position(|row| matches!(&row.kind, RowKind::Message { message, .. } if message.id == user_message_id)) {
                     self.list.set_tail_reservation(Some((self.header_count() + row_ix, px(anchor::ANCHOR_TOP_OFFSET_PX))));
-                    self.suppress_scroll_release = true;
+                    self.pending_scroll_source = None;
                     self.list.scroll_to_end();
                     return true;
                 }
@@ -1564,7 +1563,7 @@ impl ThreadView {
             }
             anchor::AnchorEffect::ReleaseAndScrollToEnd => {
                 self.list.set_tail_reservation(None);
-                self.suppress_scroll_release = true;
+                self.pending_scroll_source = None;
                 self.list.scroll_to_end();
                 true
             }
@@ -1602,37 +1601,27 @@ impl ThreadView {
         if viewport <= 0. {
             return;
         }
-        let top = self.list.logical_scroll_top();
-        let snapshot = (top.item_ix, f32::from(top.offset_in_item), self.rows.len());
-        let prev = self.last_scroll_snapshot.replace(snapshot);
-        let changed = prev != Some(snapshot);
-        let same_row_count = prev.is_some_and(|(_, _, count)| count == self.rows.len());
         let source = self.pending_scroll_source.take();
         let at_end = anchor::at_end(distance, viewport);
         let now = self.follow_now(cx);
         let was_visible = self.follow.pill_state(self.find.is_some(), !self.rows.is_empty(), now).0;
 
-        if std::mem::take(&mut self.suppress_scroll_release) {
-            self.follow.on_passive_distance(at_end, now);
-            if self.follow.anchored_user_message_id().is_some() && self.list.tail_reservation_filled() {
-                self.list.set_tail_reservation(None);
-                self.follow.scroll_to_end();
-                self.suppress_scroll_release = true;
-                self.list.scroll_to_end();
-            }
-        } else if let Some(source) = source {
+        if let Some(source) = source {
             self.list.set_tail_reservation(None);
             self.follow.on_user_navigation(source, at_end, now);
         } else if self.list.is_scrollbar_dragging() {
             self.smooth_scroll = None;
             self.pending_restore = None;
+            self.pending_scroll_top = None;
             self.list.set_tail_reservation(None);
             self.follow.on_user_navigation(anchor::ScrollSource::Scrollbar, at_end, now);
-        } else if changed && same_row_count && (!self.follow.is_following() || !at_end) {
-            self.list.set_tail_reservation(None);
-            self.follow.on_user_navigation(anchor::ScrollSource::Wheel, at_end, now);
         } else {
             self.follow.on_passive_distance(at_end, now);
+            if self.follow.anchored_user_message_id().is_some() && self.list.tail_reservation_filled() {
+                self.list.set_tail_reservation(None);
+                self.follow.scroll_to_end();
+                self.list.scroll_to_end();
+            }
         }
 
         self.sync_scroll_to_end_pill(cx);
@@ -1696,7 +1685,7 @@ impl ThreadView {
 
         match anim.target {
             SmoothTarget::Bottom => {
-                self.suppress_scroll_release = true;
+                self.pending_scroll_source = Some(anchor::ScrollSource::EndKey);
                 if next_t >= 1. {
                     self.list.scroll_to_end();
                 } else {
@@ -1741,6 +1730,7 @@ impl ThreadView {
     pub(super) fn smooth_jump_to_item(&mut self, target: usize, view_offset: f32, source: anchor::ScrollSource, window: &mut Window, cx: &mut Context<Self>) {
         self.disclosure.cancel();
         self.pending_restore = None;
+        self.pending_scroll_top = None;
         self.list.set_tail_reservation(None);
         if cx.reduce_motion() {
             self.snap_to_item(target, view_offset, source, Some(window), cx);
@@ -1755,6 +1745,7 @@ impl ThreadView {
         }
         self.disclosure.cancel();
         self.pending_restore = None;
+        self.pending_scroll_top = None;
         self.list.set_tail_reservation(None);
         if cx.reduce_motion() {
             self.pending_scroll_source = Some(source);
@@ -1778,13 +1769,31 @@ impl ThreadView {
         self.start_smooth_scroll(SmoothTarget::Delta { remaining: delta }, source, cx);
     }
 
+    fn pointer_in_scrollable_group_list(&self, position: gpui::Point<gpui::Pixels>) -> bool {
+        self.group_lists.borrow().values().any(|list| {
+            list.viewport_bounds().contains(&position) && f32::from(list.max_offset_for_scrollbar().y) > 0.
+        })
+    }
+
+    fn wheel_should_track(&self, delta: f32) -> bool {
+        if delta > 0. {
+            f32::from(self.list.max_offset_for_scrollbar().y) > 0.
+        } else {
+            !self.follow.is_following()
+        }
+    }
+
     pub(super) fn forward_wheel_with_follow(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) -> bool {
         let delta = f32::from(event.delta.pixel_delta(px(20.)).y);
         if event.modifiers.control || delta == 0. {
             return false;
         }
+        if !self.wheel_should_track(delta) {
+            return false;
+        }
         self.disclosure.cancel();
         self.pending_restore = None;
+        self.pending_scroll_top = None;
         self.list.set_tail_reservation(None);
         if t3_core::timeline::minimap::is_discrete_wheel(matches!(event.delta, gpui::ScrollDelta::Lines(_)), delta) {
             self.smooth_scroll_by(delta, anchor::ScrollSource::Wheel, cx);
@@ -1801,12 +1810,13 @@ impl ThreadView {
     pub fn scroll_to_end_from_pill(&mut self, cx: &mut Context<Self>) {
         self.disclosure.cancel();
         self.pending_restore = None;
+        self.pending_scroll_top = None;
         self.list.set_tail_reservation(None);
         self.follow.scroll_to_end();
         self.sync_scroll_to_end_pill(cx);
         if cx.reduce_motion() {
             self.smooth_scroll = None;
-            self.suppress_scroll_release = true;
+            self.pending_scroll_source = Some(anchor::ScrollSource::EndKey);
             self.list.scroll_to_end();
             self.on_observed_list_scroll(cx);
             cx.notify();
@@ -1825,13 +1835,32 @@ impl ThreadView {
         }
         let viewport = f32::from(self.list.viewport_bounds().size.height).max(200.);
         let page = (viewport - 48.).max(120.);
+        let content_scrolls_up = f32::from(self.list.max_offset_for_scrollbar().y) > 0.;
+        let (distance, list_viewport) = disclosure_end_distance(&self.list);
+        let away_from_end = !anchor::at_end(distance, list_viewport);
+        let mut scroll_down = |amount: f32| {
+            if away_from_end || self.follow.anchored_user_message_id().is_some() || (!self.follow.is_following() && distance > 0.) {
+                self.smooth_scroll_by(-amount, anchor::ScrollSource::Keyboard, cx);
+            } else if distance > 0. {
+                self.pending_scroll_source = Some(anchor::ScrollSource::EndKey);
+                self.list.scroll_to_end();
+                self.on_observed_list_scroll(cx);
+                cx.notify();
+            }
+        };
         match event.keystroke.key.as_str() {
-            "up" if !m.shift => self.smooth_scroll_by(40., anchor::ScrollSource::Keyboard, cx),
-            "down" if !m.shift => self.smooth_scroll_by(-40., anchor::ScrollSource::Keyboard, cx),
-            "pageup" if !m.shift => self.smooth_scroll_by(page, anchor::ScrollSource::Keyboard, cx),
-            "pagedown" if !m.shift => self.smooth_scroll_by(-page, anchor::ScrollSource::Keyboard, cx),
-            "space" => self.smooth_scroll_by(if m.shift { page } else { -page }, anchor::ScrollSource::Keyboard, cx),
-            "home" if !m.shift => self.smooth_jump_to_item(0, 0., anchor::ScrollSource::Keyboard, window, cx),
+            "up" if !m.shift => if content_scrolls_up { self.smooth_scroll_by(40., anchor::ScrollSource::Keyboard, cx); },
+            "down" if !m.shift => scroll_down(40.),
+            "pageup" if !m.shift => if content_scrolls_up { self.smooth_scroll_by(page, anchor::ScrollSource::Keyboard, cx); },
+            "pagedown" if !m.shift => scroll_down(page),
+            "space" => {
+                if m.shift {
+                    if content_scrolls_up { self.smooth_scroll_by(page, anchor::ScrollSource::Keyboard, cx); }
+                } else {
+                    scroll_down(page);
+                }
+            }
+            "home" if !m.shift => if content_scrolls_up { self.smooth_jump_to_item(0, 0., anchor::ScrollSource::Keyboard, window, cx); },
             "end" if !m.shift => self.scroll_to_end_from_pill(cx),
             _ => return false,
         }
@@ -1926,16 +1955,23 @@ impl Render for ThreadView {
         let banners = self.render_banners(cx);
         let scroll_to_end = self.render_scroll_to_end_pill(cx);
         let minimap = self.minimap_layer.clone().cached(gpui::StyleRefinement::default().absolute().inset_0());
+        if self.pending_scroll_top.is_some() {
+            cx.on_next_frame(window, |view, _, cx| {
+                if let Some(scroll_top) = view.pending_scroll_top.take() {
+                    view.pending_scroll_source = None;
+                    view.list.set_offset_from_scrollbar(point(px(0.), px(-scroll_top)));
+                    cx.notify();
+                }
+            });
+        }
         if let Some(generation) = self.disclosure.generation() {
             // Match the web's two-frame disclosure settle; newer layouts invalidate this ticket.
             cx.on_next_frame(window, move |_, window, cx| {
                 cx.on_next_frame(window, move |view, _, cx| {
                     if !view.is_follow_paused(cx) {
-                        view.suppress_scroll_release = true;
+                        view.pending_scroll_source = None;
                         if settle_disclosure(&view.list, &mut view.disclosure, generation) {
                             cx.notify();
-                        } else {
-                            view.suppress_scroll_release = false;
                         }
                     }
                 });
@@ -1960,15 +1996,22 @@ impl Render for ThreadView {
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| {
                 this.smooth_scroll = None;
                 this.pending_restore = None;
+                this.pending_scroll_top = None;
                 this.dismiss_citation_selection(cx);
                 if !this.citation_ui.selection_focus.contains_focused(window, cx) {
                     window.focus(&this.citation_ui.selection_focus, cx);
                 }
             }))
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                let delta = f32::from(event.delta.pixel_delta(px(20.)).y);
+                if event.modifiers.control || delta == 0. || this.pointer_in_scrollable_group_list(event.position) || !this.wheel_should_track(delta) {
+                    return;
+                }
                 this.smooth_scroll = None;
                 this.pending_restore = None;
+                this.pending_scroll_top = None;
                 this.disclosure.cancel();
+                this.list.set_tail_reservation(None);
                 this.pending_scroll_source = Some(anchor::ScrollSource::Wheel);
                 this.dismiss_citation_selection(cx);
             }))
@@ -3117,7 +3160,7 @@ mod tests {
                 "status": "running", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
             }))
             .unwrap()];
-            state.install_active_environment(read_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
             state.select_thread("t1", cx);
             let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
                 "kind": "snapshot",
@@ -3370,7 +3413,7 @@ mod tests {
                 }))
                 .unwrap(),
             ];
-            state.install_active_environment(read_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
             state.select_thread("t1", cx);
             let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap_t1).unwrap();
             state.thread.apply(parsed);
@@ -3393,11 +3436,26 @@ mod tests {
             });
         });
 
-        // Keyboard PageUp releases follow and smooth-scrolls upward; pill waits 150ms before appearing.
+        // Downward keys and downward wheel while Following at bottom must NOT release follow.
         vcx.update(|window, cx| {
             let focus = view.read(cx).citation_ui.selection_focus.clone();
             window.focus(&focus, cx);
         });
+        for key in ["down", "pagedown", "space"] {
+            vcx.simulate_keystrokes(key);
+            vcx.run_until_parked();
+            view.read_with(vcx, |view, _| assert!(view.follow.is_following(), "{key} at bottom must not release follow"));
+        }
+        vcx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(400.), px(300.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| assert!(view.follow.is_following(), "downward wheel at bottom must not release follow"));
+
+        // Keyboard PageUp releases follow immediately (no stale suppress_scroll_release) and smooth-scrolls upward.
         vcx.simulate_keystrokes("pageup");
         vcx.background_executor.advance_clock(Duration::from_millis(80));
         vcx.run_until_parked();
@@ -3454,6 +3512,57 @@ mod tests {
                 assert!(!view.follow.pill_state(false, true, now).0);
             });
         });
+
+        // Find and Citation reveals release follow and clear smooth scroll.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| view.reveal_entry("t1-m0", anchor::ScrollSource::Find, cx));
+        });
+        view.read_with(vcx, |view, _| assert!(!view.follow.is_following(), "Find reveal must release follow"));
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.scroll_to_end_from_pill(cx)));
+        vcx.background_executor.advance_clock(Duration::from_millis(180));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| view.reveal_entry("t1-m0", anchor::ScrollSource::Citation, cx));
+        });
+        view.read_with(vcx, |view, _| assert!(!view.follow.is_following(), "Citation reveal must release follow"));
+        vcx.update(|_, cx| view.update(cx, |view, cx| view.scroll_to_end_from_pill(cx)));
+        vcx.background_executor.advance_clock(Duration::from_millis(180));
+        vcx.run_until_parked();
+
+        // Home onto the "Load earlier turns" header (row_id == None, scroll_top == 0.) restores top after thread switch.
+        let snap_t1_more = snap_t1.replacen("\"hasMoreHistory\":false", "\"hasMoreHistory\":true", 1);
+        state.update(vcx, |state, cx| {
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap_t1_more).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("home");
+        vcx.background_executor.advance_clock(Duration::from_millis(180));
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.header_count(), 1);
+            assert_eq!(view.list.logical_scroll_top().item_ix, 0);
+            assert!(!view.follow.is_following());
+        });
+        state.update(vcx, |state, cx| {
+            state.select_thread("t2", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap_t2).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.run_until_parked();
+        state.update(vcx, |state, cx| {
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap_t1_more).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(!view.follow.is_following());
+            assert_eq!(view.list.logical_scroll_top().item_ix, 0, "must restore Home on header instead of jumping to bottom");
+        });
     }
 
     #[cfg(feature = "snapshot")]
@@ -3484,7 +3593,7 @@ mod tests {
                 "status": "idle", "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0
             }))
             .unwrap()];
-            state.install_active_environment(read_client, shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
             state.select_thread("t1", cx);
             let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&empty_snap).unwrap();
             state.thread.apply(parsed);
@@ -3552,6 +3661,42 @@ mod tests {
         view.read_with(vcx, |view, _| {
             assert_eq!(view.follow.anchored_user_message_id(), None);
             assert!(view.follow.is_following());
+        });
+
+        // Draft promotion: opening directly on an initial snapshot that already contains the live first run.
+        state.update(vcx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "t3", "projectId": "checkout-a", "title": "T3",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "lastVisitedAt": null, "providerInstanceId": "replay",
+                    "modelSelection": {"instanceId":"replay","model":"replay"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t3"},
+                    "status": "running", "hasActionableProposedPlan": false, "itemCount": 1, "visibleItemCount": 1
+                }))
+                .unwrap(),
+            );
+            let draft_snap = test_snapshot_json(
+                "t3",
+                serde_json::json!([{
+                    "id": "r3", "ordinal": 1, "providerInstanceId": "replay",
+                    "modelSelection": {"instanceId": "replay", "model": "replay"},
+                    "userMessageId": "t3-m1", "rootNodeId": null, "status": "running",
+                    "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+                    "completedAt": null
+                }]),
+                vec![test_user_item("t3", 0, "t3-m1", "Draft prompt")],
+            );
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t3", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&draft_snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Selection);
+        });
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.follow.anchored_user_message_id(), Some("t3-m1"));
         });
     }
 }
