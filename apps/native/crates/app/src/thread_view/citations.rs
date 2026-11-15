@@ -129,7 +129,6 @@ impl ThreadView {
         let x = f32::from(active.position.x).clamp(8., (f32::from(bounds.width) - 368.).max(8.));
         let y = (f32::from(active.position.y) + 12.).clamp(8., (f32::from(bounds.height) - 220.).max(8.));
         let copy_text = active.citation.text.clone();
-        let copy_state = active.state.clone();
         let go_citation = active.citation.clone();
         let go_state = active.state.clone();
         let comment = active.citation.comment.clone().filter(|c| !c.trim().is_empty());
@@ -223,9 +222,6 @@ impl ThreadView {
                                         Some(Icon::Copy),
                                         move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
-                                            copy_state.update(cx, |app, cx| {
-                                                app.show_toast(Toast::new(ToastKind::Success, "Copied quote"), cx);
-                                            });
                                             close_sent_citation_popover(cx);
                                         },
                                         cx,

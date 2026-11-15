@@ -54,11 +54,8 @@ pub use directives::{
     render_codex_directives_for_copy, split_codex_assistant_segments,
 };
 pub use plan::{
-    ActiveProposedPlan, DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES, PlanFollowUpSubmission,
-    build_collapsed_proposed_plan_preview_markdown, build_plan_implementation_prompt,
-    build_plan_implementation_thread_title, build_proposed_plan_markdown_filename,
-    find_active_proposed_plan, normalize_plan_markdown_for_export, proposed_plan_title,
-    resolve_plan_follow_up_submission, should_show_plan_follow_up_prompt,
+    DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES, build_collapsed_proposed_plan_preview_markdown,
+    build_proposed_plan_markdown_filename, normalize_plan_markdown_for_export, proposed_plan_title,
 };
 pub use requests::{
     ExistingPeerLink, HandoffEndpoint, LINK_ACCESS_LEVELS, LinkRequestDisplay, LinkTone,
@@ -79,11 +76,11 @@ pub use inspector::{
 };
 pub use entries::{EntriesCache, derive_entries, item_type_name, update_entries};
 pub use presentation::{
-    SummaryKind, ToolGroupAction, ViewedImageAsset, WorkIcon, format_workspace_relative_path, live_thought_line, live_work_entry_label,
-    resolve_viewed_image_asset, skill_args, summary_icon, summarize_tool_group, thread_read_label_prefix, thread_read_target_id,
-    thread_read_target_title, tool_group_action, tool_surface_icon, work_entry_display_indicates_tool_failure, work_entry_display_label,
-    work_entry_icon, work_entry_is_visible_in_group, work_entry_read_output, work_entry_viewed_image, work_entry_viewed_image_path,
-    work_log_entry_is_tool_like,
+    SummaryKind, ToolGroupAction, ViewedImageAsset, WorkIcon, cap_thought_preview, format_workspace_relative_path, live_thought_line,
+    live_work_entry_label, resolve_viewed_image_asset, skill_args, summary_icon, summarize_tool_group, thread_read_label_prefix,
+    thread_read_target_id, thread_read_target_title, tool_group_action, tool_surface_icon, work_entries_viewed_image_paths,
+    work_entry_display_indicates_tool_failure, work_entry_display_label, work_entry_icon, work_entry_is_visible_in_group,
+    work_entry_read_output, work_entry_viewed_image, work_entry_viewed_image_path, work_log_entry_is_tool_like,
 };
 pub use changed_files::{
     ChangedFileRow, DiffStat, TreeNode, changed_file_rows, changed_file_tree, changed_files_label, directory_paths, has_directories, hidden_files_label,
@@ -192,6 +189,7 @@ pub struct MessageMeta {
     pub creation_source: Option<String>,
     pub scheduled_task_id: Option<String>,
     pub sender_thread_id: Option<String>,
+    pub linked_sender: Option<crate::turn_item::LinkedSender>,
     pub idle_compaction: Option<String>,
     pub guest_name: Option<String>,
     pub guest_text: Option<String>,
@@ -208,6 +206,7 @@ pub struct ChatMessage {
     pub text: Arc<str>,
     pub run_id: Option<String>,
     pub streaming: bool,
+    pub phase: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub meta: MessageMeta,
@@ -257,6 +256,13 @@ pub struct McpAppEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SentMessageEntry {
+    pub run_id: Option<String>,
+    pub text: Arc<str>,
+    pub item: Arc<TurnItem>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
     Message(Arc<ChatMessage>),
     ProposedPlan(Arc<ProposedPlan>),
@@ -266,6 +272,7 @@ pub enum EntryKind {
         visibility: crate::thread::Visibility,
     },
     HtmlRender(Arc<HtmlRenderEntry>),
+    SentMessage(Arc<SentMessageEntry>),
     McpApp(Arc<McpAppEntry>),
 }
 
@@ -314,6 +321,10 @@ pub enum RowKind {
         group_id: Option<String>,
         expanded: bool,
         label: Option<String>,
+        live_answer_preview: Option<String>,
+    },
+    ViewedImages {
+        paths: Vec<String>,
     },
     WorkToggle {
         run_id: Option<String>,
@@ -348,6 +359,7 @@ pub enum RowKind {
     Message {
         message: Arc<ChatMessage>,
         show_assistant_meta: bool,
+        suppress_empty_response: bool,
         show_copy: bool,
         copy_streaming: bool,
         grouped_with_next: bool,
@@ -372,6 +384,7 @@ pub enum RowKind {
         embedded: bool,
     },
     HtmlRender(Arc<HtmlRenderEntry>),
+    SentMessage(Arc<SentMessageEntry>),
     McpApp(Arc<McpAppEntry>),
 }
 
@@ -410,9 +423,9 @@ pub fn rows_equal(a: &TimelineRow, b: &TimelineRow) -> bool {
                 }
         }
         (
-            RowKind::Message { message: ma, show_assistant_meta: a1, show_copy: a2, copy_streaming: a3, grouped_with_next: a4, grouped_with_previous: a5, continues_steer: a6 },
-            RowKind::Message { message: mb, show_assistant_meta: b1, show_copy: b2, copy_streaming: b3, grouped_with_next: b4, grouped_with_previous: b5, continues_steer: b6 },
-        ) => Arc::ptr_eq(ma, mb) && (a1, a2, a3, a4, a5, a6) == (b1, b2, b3, b4, b5, b6),
+            RowKind::Message { message: ma, show_assistant_meta: a1, suppress_empty_response: a7, show_copy: a2, copy_streaming: a3, grouped_with_next: a4, grouped_with_previous: a5, continues_steer: a6 },
+            RowKind::Message { message: mb, show_assistant_meta: b1, suppress_empty_response: b7, show_copy: b2, copy_streaming: b3, grouped_with_next: b4, grouped_with_previous: b5, continues_steer: b6 },
+        ) => Arc::ptr_eq(ma, mb) && (a1, a2, a3, a4, a5, a6, a7) == (b1, b2, b3, b4, b5, b6, b7),
         (
             RowKind::AssistantMeta { message: ma, show_copy: a1, copy_streaming: a2 },
             RowKind::AssistantMeta { message: mb, show_copy: b1, copy_streaming: b2 },
@@ -427,6 +440,7 @@ pub fn rows_equal(a: &TimelineRow, b: &TimelineRow) -> bool {
         (RowKind::WorktreeSetup { snapshot: sa, embedded: ea }, RowKind::WorktreeSetup { snapshot: sb, embedded: eb }) => Arc::ptr_eq(sa, sb) && ea == eb,
         (RowKind::McpApp(a), RowKind::McpApp(b)) => Arc::ptr_eq(a, b),
         (RowKind::HtmlRender(a), RowKind::HtmlRender(b)) => a.reference == b.reference,
+        (RowKind::SentMessage(a), RowKind::SentMessage(b)) => Arc::ptr_eq(a, b),
         (
             RowKind::WorkToggle { run_id: ra, group_id: ga, entries: ea, hidden_count: ha, expanded: xa, summary: sa, summary_kind: ka, tool_surface: ta, has_failure: fa },
             RowKind::WorkToggle { run_id: rb, group_id: gb, entries: eb, hidden_count: hb, expanded: xb, summary: sb, summary_kind: kb, tool_surface: tb, has_failure: fb },

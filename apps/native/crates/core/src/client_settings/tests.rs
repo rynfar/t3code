@@ -260,3 +260,24 @@ fn math_rendering_enabled_defaults_to_false_and_toggles() {
     assert!(doc.math_rendering_enabled());
     assert_eq!(doc.entries()["mathRenderingEnabled"], serde_json::Value::Bool(true));
 }
+
+#[test]
+fn tool_call_visibility_defaults_round_trips_and_tolerates_unknown_values() {
+    use super::ToolCallVisibility;
+    let mut doc = ClientSettingsDoc::default();
+    assert_eq!(doc.tool_call_visibility(), ToolCallVisibility::ShowAll);
+    for (mode, wire) in [
+        (ToolCallVisibility::HideSuccessful, "hideSuccessful"),
+        (ToolCallVisibility::HideAll, "hideAll"),
+        (ToolCallVisibility::Zen, "zen"),
+        (ToolCallVisibility::ShowAll, "showAll"),
+    ] {
+        assert!(!doc.apply_change(&ClientSettingChange::ToolCallVisibility(mode)).is_empty());
+        assert!(doc.apply_change(&ClientSettingChange::ToolCallVisibility(mode)).is_empty());
+        assert_eq!(doc.tool_call_visibility(), mode);
+        assert_eq!(doc.entries()["toolCallVisibility"], serde_json::json!(wire));
+    }
+    let unknown = ClientSettingsDoc::from_json(r#"{"toolCallVisibility":"future","futureSetting":7}"#);
+    assert_eq!(unknown.tool_call_visibility(), ToolCallVisibility::ShowAll);
+    assert_eq!(unknown.entries()["futureSetting"], 7);
+}

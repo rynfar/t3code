@@ -357,7 +357,7 @@ pub fn turn_item_has_detail(item: &TurnItem) -> bool {
         TurnItemKind::ApprovalRequest { prompt, .. } => present(prompt),
         TurnItemKind::UserInputRequest { questions, .. } => !questions.is_empty(),
         TurnItemKind::Notification { detail, .. } => present(detail),
-        TurnItemKind::SystemNotice { message } => !js_trim(message).is_empty(),
+        TurnItemKind::SystemNotice { message, .. } => !js_trim(message).is_empty(),
         TurnItemKind::Error { failure, .. } => !js_trim(&failure.message).is_empty(),
         TurnItemKind::ProposedPlan { markdown, .. } => !js_trim(markdown).is_empty(),
         TurnItemKind::TodoList { steps, .. } => !steps.is_empty(),

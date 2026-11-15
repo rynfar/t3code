@@ -129,7 +129,7 @@ pub(super) fn breaks_group(entry: &WorkLogEntry) -> bool {
     (entry.item_type == Some("error") && entry.status == Some(ToolStatus::Failed))
         || entry.tone == Tone::Error
         || entry.source_activity == Some(SourceActivity::RuntimeError)
-        || matches!(entry.item_type, Some("system_notice" | "notification"))
+        || matches!(entry.item_type, Some("system_notice" | "notification" | "todo_list"))
         || entry.question_answer.is_some()
 }
 
@@ -197,11 +197,18 @@ pub(super) struct SupersededFold {
     pub(super) hidden: HashSet<String>,
 }
 
-/// `completeSupersededReplyEntryIds`: an interrupted stream can still be `completed`, so only an
-/// attempt's last output, finished before the steer superseded it, proves the reply complete.
+/// `retainedAssistantReplyEntryIds`: an explicit `final_answer` phase (even if superseded by
+/// steering) or the attempt's last completed unphased output finished before the steer superseded it.
 pub(super) fn complete_superseded_reply_ids(entries: &[Arc<TimelineEntry>]) -> HashSet<String> {
+    let mut retained: HashSet<String> = HashSet::new();
     let mut last_by_attempt: HashMap<&str, &TimelineEntry> = HashMap::new();
     for entry in entries {
+        if let Some(message) = entry.message()
+            && message.role == Role::Assistant
+            && message.phase.as_deref() == Some("final_answer")
+        {
+            retained.insert(entry.id.clone());
+        }
         let Some(attempt) = entry.attempt.as_ref().filter(|a| a.status == "superseded") else { continue };
         let output = match &entry.kind {
             EntryKind::Message(message) => message.role == Role::Assistant,
@@ -212,19 +219,24 @@ pub(super) fn complete_superseded_reply_ids(entries: &[Arc<TimelineEntry>]) -> H
             last_by_attempt.insert(attempt.id.as_str(), entry);
         }
     }
-    last_by_attempt
-        .into_values()
-        .filter(|entry| {
-            let (Some(message), Some(superseded_at)) = (entry.message(), entry.attempt.as_ref().and_then(|a| a.completed_at.as_deref())) else {
-                return false;
-            };
-            let Some(item) = message.item.as_ref().filter(|item| matches!(item.kind, TurnItemKind::AssistantMessage { .. })) else { return false };
-            !message.streaming
-                && item.status == "completed"
-                && item.completed_at.as_deref().and_then(parse_iso_ms).zip(parse_iso_ms(superseded_at)).is_some_and(|(done, cut)| done < cut)
-        })
-        .map(|entry| entry.id.clone())
-        .collect()
+    retained.extend(
+        last_by_attempt
+            .into_values()
+            .filter(|entry| {
+                let (Some(message), Some(superseded_at)) = (entry.message(), entry.attempt.as_ref().and_then(|a| a.completed_at.as_deref())) else {
+                    return false;
+                };
+                if message.phase.is_some() {
+                    return false;
+                }
+                let Some(item) = message.item.as_ref().filter(|item| matches!(item.kind, TurnItemKind::AssistantMessage { .. })) else { return false };
+                !message.streaming
+                    && item.status == "completed"
+                    && item.completed_at.as_deref().and_then(parse_iso_ms).zip(parse_iso_ms(superseded_at)).is_some_and(|(done, cut)| done < cut)
+            })
+            .map(|entry| entry.id.clone()),
+    );
+    retained
 }
 
 pub(super) fn superseded_attempt_folds(
@@ -246,7 +258,7 @@ pub(super) fn superseded_attempt_folds(
             || complete_attempts.contains(attempt.id.as_str())
             || is_user(entry)
             || entry.event().is_some_and(|item| matches!(item.kind, TurnItemKind::Handoff { .. }))
-            || matches!(entry.kind, EntryKind::HtmlRender(_) | EntryKind::McpApp(_))
+            || matches!(entry.kind, EntryKind::HtmlRender(_) | EntryKind::SentMessage(_) | EntryKind::McpApp(_))
             || is_persistent_resource(entry)
             || live_subagents.contains(&entry.id)
             || entry.work().is_some_and(|w| w.item_type == Some("system_notice"))
@@ -382,6 +394,8 @@ pub(super) fn turn_folds(entries: &[Arc<TimelineEntry>], input: &FoldInput) -> H
             continue;
         }
         let terminal_index = group.terminal.and_then(|t| group.entries.iter().position(|e| e.id == t.id)).unwrap_or(group.entries.len());
+        // Folded dividers lose their place in the turn, so only the latest stays visible.
+        let visible_compaction_index = group.entries.iter().rposition(|e| is_compaction(e));
         let mut hidden: HashSet<String> = HashSet::new();
         for (index, entry) in group.entries.iter().enumerate() {
             if group.terminal.is_some_and(|t| t.id == entry.id) {
@@ -394,7 +408,11 @@ pub(super) fn turn_folds(entries: &[Arc<TimelineEntry>], input: &FoldInput) -> H
             if !compaction && index > terminal_index && !foldable_trailing {
                 continue;
             }
-            if compaction || is_persistent_resource(entry) || live_subagents.contains(&entry.id) || complete_replies.contains(&entry.id) {
+            if (compaction && Some(index) == visible_compaction_index)
+                || is_persistent_resource(entry)
+                || live_subagents.contains(&entry.id)
+                || complete_replies.contains(&entry.id)
+            {
                 continue;
             }
             if entry.work().is_some_and(|w| w.item_type == Some("notification") || w.question_answer.is_some()) {

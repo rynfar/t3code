@@ -260,13 +260,14 @@ fn elapsed_label(item: &TurnItem, now_ms: i64) -> Option<String> {
 pub(super) struct SubagentLiveElapsed {
     pub(super) item_id: SharedString,
     pub(super) started_at: String,
+    pub(super) env_id: Option<String>,
 }
 
 impl RenderOnce for SubagentLiveElapsed {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let timer = window
             .use_keyed_state(SharedString::from(format!("subagent-timer:{}", self.item_id)), cx, |_, cx| {
-                cx.new(|cx| WorkingTimer::new(self.started_at, TimerKind::Elapsed, cx))
+                cx.new(|cx| WorkingTimer::new(self.started_at, self.env_id, TimerKind::Elapsed, cx))
             })
             .read(cx)
             .clone();
@@ -349,7 +350,8 @@ fn subagent_row(item: &Arc<TurnItem>, marks: &[(String, ProviderMark)], env: &Ro
     let elapsed_view = if item.is_running()
         && let Some(started_at) = item.started_at.clone()
     {
-        Some(SubagentLiveElapsed { item_id: SharedString::from(item.id.clone()), started_at }.into_any_element())
+        let env_id = env.state.read(cx).environment().map(str::to_owned);
+        Some(SubagentLiveElapsed { item_id: SharedString::from(item.id.clone()), started_at, env_id }.into_any_element())
     } else {
         elapsed_label(item, env.clock.now_ms).map(|elapsed| div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(elapsed).into_any_element())
     };
@@ -1859,7 +1861,7 @@ mod tests {
                     };
                     gpui::div()
                         .size_full()
-                        .child(crate::transcript::work::thinking_row("t1", Some("g1"), Some("Starting Codex…"), cx))
+                        .child(crate::transcript::work::thinking_row("t1", Some("g1"), Some("Starting Codex…"), None, cx))
                         .child(subagent_row(&item, &[], &env, cx))
                         .into_any_element()
                 })

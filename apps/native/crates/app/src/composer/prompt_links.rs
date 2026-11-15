@@ -96,7 +96,7 @@ pub(crate) struct SnapshotClipboard(pub Option<String>);
 #[cfg(feature = "snapshot")]
 impl gpui::Global for SnapshotClipboard {}
 
-pub(crate) fn copy(state: &gpui::Entity<crate::app_state::AppState>, link: String, cx: &mut App) {
+pub(crate) fn copy(_state: &gpui::Entity<crate::app_state::AppState>, link: String, cx: &mut App) {
     // Snapshot copy actions must never touch the user's clipboard.
     #[cfg(feature = "snapshot")]
     if crate::webview::is_offscreen() {
@@ -105,7 +105,6 @@ pub(crate) fn copy(state: &gpui::Entity<crate::app_state::AppState>, link: Strin
     if !crate::webview::is_offscreen() {
         cx.write_to_clipboard(ClipboardItem::new_string(link));
     }
-    state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Success, "Prompt link copied"), cx));
 }
 pub(crate) fn warn(state: &gpui::Entity<crate::app_state::AppState>, prompt: &LinkedPrompt, cx: &mut App) {
     let n = prompt.hidden_characters;

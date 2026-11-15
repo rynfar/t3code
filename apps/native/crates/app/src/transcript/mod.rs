@@ -137,19 +137,34 @@ fn bottom_space(row: &TimelineRow) -> f32 {
         RowKind::TurnFold { .. } | RowKind::Working { .. } => 6.,
         RowKind::Message { grouped_with_next: true, .. } => 4.,
         RowKind::Message { message, show_assistant_meta: false, .. } if message.role == Role::Assistant => 8.,
-        RowKind::Event { .. } | RowKind::AttemptFold { .. } | RowKind::WorktreeSetup { .. } | RowKind::HtmlRender(_) | RowKind::McpApp(_) => 8.,
+        RowKind::Event { .. }
+        | RowKind::AttemptFold { .. }
+        | RowKind::WorktreeSetup { .. }
+        | RowKind::HtmlRender(_)
+        | RowKind::McpApp(_)
+        | RowKind::SentMessage(_)
+        | RowKind::ViewedImages { .. } => 8.,
         _ => 16.,
     }
 }
 
-pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn render_row(
+    row: &Arc<TimelineRow>,
+    env: &RowEnv,
+    markdown: &mut MarkdownStore,
+    window: &mut gpui::Window,
+    cx: &mut Context<ThreadView>,
+) -> AnyElement {
     let id = row.id.as_str();
     let content = match &row.kind {
         RowKind::Work { .. } => work::work_section(row, env, markdown, cx),
         RowKind::WorkLive { .. } => work::live_row(row, env, cx),
         // `ThinkingTimelineRow` keeps its slot blank while the worktree is prepared.
         RowKind::Thinking { .. } if env.setup.view.preparing => worktree_setup::empty_work_row(id),
-        RowKind::Thinking { group_id, label, .. } => work::thinking_row(id, group_id.as_deref(), label.as_deref(), cx),
+        RowKind::Thinking { group_id, label, live_answer_preview, .. } => {
+            work::thinking_row(id, group_id.as_deref(), label.as_deref(), live_answer_preview.as_deref(), cx)
+        }
+        RowKind::ViewedImages { paths } => work::viewed_images_row(id, paths, env, cx),
         RowKind::WorkToggle { .. } => work::group_header(row, env, cx),
         RowKind::Working { compacting } => {
             let chip = worktree_setup::background_chip(env, cx);
@@ -163,8 +178,9 @@ pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownS
         RowKind::ContextCompaction { label, tokens, title, failed, failure, .. } => {
             notices::compaction_row(label, tokens.as_ref(), title.as_deref(), *failed, failure.as_deref(), cx)
         }
-        RowKind::Message { message, .. } if message.role == Role::User => messages::user_row(row, env, markdown, cx),
+        RowKind::Message { message, .. } if message.role == Role::User => messages::user_row(row, env, markdown, window, cx),
         RowKind::Message { .. } => messages::assistant_row(row, env, markdown, cx),
+        RowKind::SentMessage(entry) => messages::sent_message_row(id, entry, env, markdown, cx),
         RowKind::AssistantMeta { message, show_copy, copy_streaming } => messages::assistant_meta_row(message, *show_copy, *copy_streaming, env, cx),
         RowKind::Event { item, visibility, subagents, resource_summary } => notices::event_row(id, item, *visibility, subagents, *resource_summary, env, cx),
         RowKind::ProposedPlan(plan) => messages::plan_card(id, plan, env, markdown, cx),

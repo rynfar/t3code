@@ -17,11 +17,11 @@ use t3_core::media::{AssetResource, MediaPlacement, MediaSource};
 use t3_core::timeline::{
     Attribution, ChatMessage, CodexArtifactTemplate, CodexAssistantSegment,
     DEFAULT_COLLAPSED_PLAN_PREVIEW_LINES, EDIT_FROM_HERE, FORK_LABEL, ProposedPlan, RowKind,
-    TimelineRow, build_collapsed_proposed_plan_preview_markdown,
+    SentMessageEntry, TimelineRow, build_collapsed_proposed_plan_preview_markdown,
     build_proposed_plan_markdown_filename, can_fork, codex_artifact_template_presentation_label,
     format_duration, is_workflow_script_message, normalize_plan_markdown_for_export,
     partition_user_attachments, proposed_plan_title, render_codex_directives_for_copy,
-    resolve_model_switch_change, resolve_user_message_presentation, should_collapse_user_message,
+    resolve_model_switch_change, resolve_user_message_presentation,
     split_codex_assistant_segments, strip_displayed_plan_markdown, user_message_file_label,
 };
 
@@ -37,7 +37,14 @@ use crate::theme::{hsla, palette};
 use crate::thread_view::ThreadView;
 use crate::toast::{Toast, ToastKind};
 
-const COLLAPSED_HEIGHT: f32 = 176.;
+const USER_FOLD_THRESHOLD_REM: f32 = 22.;
+const USER_COLLAPSED_HEIGHT_REM: f32 = 11.;
+
+#[derive(Clone, Copy)]
+struct UserFoldState {
+    tall: bool,
+    rem_px: f32,
+}
 
 /// Single newlines are line breaks in a user message (`lineBreaks`), so they become hard breaks.
 fn with_line_breaks(text: &str) -> String {
@@ -221,6 +228,7 @@ fn workflow_member_row(
             SubagentLiveElapsed {
                 item_id: SharedString::from(format!("wf:{id_prefix}:{}", member.index)),
                 started_at,
+                env_id: state.read(cx).environment().map(str::to_owned),
             }
             .into_any_element(),
         )
@@ -455,6 +463,8 @@ struct CollapsibleAttributionCard {
     preview: String,
     surface: gpui::Hsla,
     source_thread_id: Option<String>,
+    linked_sender_env_id: Option<String>,
+    can_open_sender: bool,
     state: Entity<AppState>,
     media_above: Option<AnyElement>,
     bubble: Option<AnyElement>,
@@ -471,6 +481,7 @@ impl RenderOnce for CollapsibleAttributionCard {
         let icon = if self.is_automation { Icon::CalendarClock } else { Icon::MessagesSquare };
         let app_state = self.state.clone();
         let source_thread_id = self.source_thread_id.clone();
+        let linked_sender_env_id = self.linked_sender_env_id.clone();
         let scheduled_task_id = self.scheduled_task_id.clone();
         let open_action = if self.is_automation {
             Some(ghost_text_button(
@@ -487,7 +498,7 @@ impl RenderOnce for CollapsibleAttributionCard {
                 },
                 cx,
             ))
-        } else {
+        } else if self.can_open_sender {
             source_thread_id.map(|thread_id| {
                 ghost_text_button(
                     SharedString::from(format!("open-agent-thread:{}", self.id)),
@@ -495,11 +506,30 @@ impl RenderOnce for CollapsibleAttributionCard {
                     Some(Icon::ExternalLink),
                     move |_, _, cx| {
                         cx.stop_propagation();
-                        app_state.update(cx, |s, cx| s.open_related_thread(&thread_id, cx));
+                        app_state.update(cx, |s, cx| {
+                            if let Some(env_id) = linked_sender_env_id.as_deref()
+                                && s.environment() != Some(env_id)
+                                && s.environments.active.as_deref() != Some(env_id)
+                            {
+                                if let Some(owner) = s
+                                    .fleet
+                                    .environments
+                                    .iter()
+                                    .find(|e| e.summary.owner.saved_id == env_id || e.summary.owner.canonical_id.as_deref() == Some(env_id))
+                                    .map(|e| e.summary.owner.clone())
+                                {
+                                    s.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Thread(thread_id.clone()), cx);
+                                }
+                            } else {
+                                s.open_related_thread(&thread_id, cx);
+                            }
+                        });
                     },
                     cx,
                 )
             })
+        } else {
+            None
         };
         v_flex()
             .group(ROW_GROUP)
@@ -755,7 +785,13 @@ fn action_context(env: &RowEnv, cx: &Context<ThreadView>) -> super::markdown::li
     }
 }
 
-pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn user_row(
+    row: &TimelineRow,
+    env: &RowEnv,
+    markdown: &mut MarkdownStore,
+    window: &mut Window,
+    cx: &mut Context<ThreadView>,
+) -> AnyElement {
     let RowKind::Message { message, grouped_with_next, grouped_with_previous, continues_steer, .. } = &row.kind else {
         return div().into_any_element();
     };
@@ -791,7 +827,13 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
         .collect();
     let context_chips = super::context::chips(message, &presentation, &presented_citations.citations, records, &excluded_attachment_ids, env, cx);
     let display_text = presented_citations.display_text.as_str();
-    let collapsible = should_collapse_user_message(display_text);
+    let rem_px = f32::from(window.rem_size());
+    let fold_threshold = USER_FOLD_THRESHOLD_REM * rem_px;
+    let collapsed_height = USER_COLLAPSED_HEIGHT_REM * rem_px;
+    let fold_state = window.use_keyed_state(SharedString::from(format!("user-tall:{id}")), cx, |_, _| UserFoldState { tall: false, rem_px });
+    let current_fold = *fold_state.read(cx);
+    let rem_changed = (current_fold.rem_px - rem_px).abs() > 0.5;
+    let collapsible = current_fold.tall && !rem_changed;
     let expanded = env.ui.expanded_messages.contains(id);
     let collapsed = collapsible && !expanded;
     let surface = hsla(if attribution == Some(Attribution::Guest) { p.guest_surface } else { p.message_surface });
@@ -962,11 +1004,43 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
             .children(bubble_files)
             .children(bubble_audios)
             .children(body.map(|body| {
+                let fold_measure = fold_state.clone();
+                let measure_body = !collapsed;
                 div()
                     .relative()
                     .min_w_0()
-                    .when(collapsed, |this| this.max_h(px(COLLAPSED_HEIGHT)).overflow_hidden())
-                    .child(body)
+                    .when(collapsed, |this| this.max_h(px(collapsed_height)).overflow_hidden())
+                    .child(
+                        div()
+                            .relative()
+                            .min_w_0()
+                            .child(body)
+                            .when(measure_body, |this| {
+                                this.child(
+                                    gpui::canvas(
+                                        move |bounds, _, cx| {
+                                            let next_tall = f32::from(bounds.size.height) >= fold_threshold;
+                                            let prev = *fold_measure.read(cx);
+                                            if prev.tall != next_tall || (prev.rem_px - rem_px).abs() > 0.5 {
+                                                let state = fold_measure.clone();
+                                                cx.defer(move |cx| {
+                                                    state.update(cx, |s, cx| {
+                                                        if s.tall != next_tall || (s.rem_px - rem_px).abs() > 0.5 {
+                                                            s.tall = next_tall;
+                                                            s.rem_px = rem_px;
+                                                            cx.notify();
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                        },
+                                        |_, _, _, _| {},
+                                    )
+                                    .absolute()
+                                    .inset_0(),
+                                )
+                            }),
+                    )
                     .when(collapsed, |this| {
                         this.child(
                             div()
@@ -994,11 +1068,40 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
 
     if matches!(attribution, Some(Attribution::Automation | Attribution::Agent)) {
         let is_automation = attribution == Some(Attribution::Automation);
+        let linked_sender = message.meta.linked_sender.as_ref();
+        let source_thread_id = linked_sender
+            .map(|s| s.thread_id.clone())
+            .or_else(|| message.meta.sender_thread_id.clone());
+        let linked_sender_env_id = linked_sender.map(|s| s.environment_id.clone());
+        let app_read = env.state.read(cx);
+        let sender_title = if linked_sender.is_none() {
+            source_thread_id
+                .as_deref()
+                .and_then(|thread_id| app_read.thread_shell(thread_id))
+                .map(|shell| shell.title.trim().to_owned())
+                .filter(|title| !title.is_empty())
+        } else {
+            None
+        };
         let label = if is_automation {
             "Automation".to_owned()
         } else {
-            message.meta.guest_name.clone().unwrap_or_else(|| "Agent".to_owned())
+            sender_title
+                .or_else(|| linked_sender.map(|s| s.title.trim().to_owned()).filter(|title| !title.is_empty()))
+                .or_else(|| message.meta.guest_name.clone())
+                .unwrap_or_else(|| "Agent".to_owned())
         };
+        let can_open_sender = source_thread_id.is_some()
+            && app_read.can_read_threads()
+            && linked_sender_env_id.as_deref().is_none_or(|env_id| {
+                app_read.environment() == Some(env_id)
+                    || app_read.environments.active.as_deref() == Some(env_id)
+                    || app_read.fleet.environments.iter().any(|entry| {
+                        (entry.summary.owner.saved_id == env_id
+                            || entry.summary.owner.canonical_id.as_deref() == Some(env_id))
+                            && app_read.scoped_ready(&entry.summary.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                    })
+            });
         let preview = first_line_preview(display_text);
         return v_flex()
             .w_full()
@@ -1011,7 +1114,9 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
                 label,
                 preview,
                 surface,
-                source_thread_id: message.meta.sender_thread_id.clone(),
+                source_thread_id,
+                linked_sender_env_id,
+                can_open_sender,
                 state: env.state.clone(),
                 media_above: media_above.map(|media| h_flex().max_w(relative(0.8)).justify_end().child(media).into_any_element()),
                 bubble: standalone_cards.or(bubble),
@@ -1037,14 +1142,26 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
                     this.child(div().mr(px(4.)).text_size(px(11.)).text_color(hsla(p.guest_foreground)).child(name))
                 })
                 .when(message.is_steer() && !continues_steer, |this| {
+                    let unread = item_status == Some("pending");
+                    let intent = message.meta.input_intent.as_deref();
+                    let label = if unread { "Steer · waiting to be read" } else { "Steer" };
+                    let tip = if unread {
+                        "Waiting for the agent to read this. It reads steers between steps, after a running command finishes."
+                    } else if intent == Some("promoted_queued_to_steer") {
+                        "Originally queued, then promoted to steer the active turn"
+                    } else {
+                        "Steered the active turn"
+                    };
                     this.child(
                         h_flex()
+                            .id(SharedString::from(format!("steer-badge:{id}")))
                             .mr(px(4.))
                             .gap(px(4.))
                             .text_xs()
                             .text_color(hsla(p.muted_foreground))
                             .child(Icon::Redo2.render(px(12.), hsla(p.muted_foreground)))
-                            .child("Steer"),
+                            .child(label)
+                            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip).build(window, cx)),
                     )
                 })
                 .children(media_above.map(|media| h_flex().max_w(relative(0.8)).justify_end().child(media)))
@@ -1053,6 +1170,106 @@ pub fn user_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, c
                 .child(actions),
         )
         .into_any_element()
+}
+
+/// Subagents that reported into the prompt/notifications immediately preceding `item_id`
+/// (`readResponseSubagents` in `state/entities.ts`).
+fn read_response_subagents(app: &AppState, thread_id: &str, item_id: &str) -> Vec<(String, String, Option<String>)> {
+    let Some(projection) = app.thread_state(thread_id).projection.as_ref() else {
+        return Vec::new();
+    };
+    let items = &projection.visible_turn_items;
+    let is_input = |idx: usize| {
+        items.get(idx).is_some_and(|p| {
+            matches!(p.item.kind, t3_core::turn_item::TurnItemKind::UserMessage { .. } | t3_core::turn_item::TurnItemKind::Notification { .. })
+        })
+    };
+    let Some(pos) = items.iter().position(|p| p.item.id == item_id) else {
+        return Vec::new();
+    };
+    let mut index = pos as isize - 1;
+    while index >= 0 && !is_input(index as usize) {
+        index -= 1;
+    }
+
+    let mut by_task: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
+    let mut local: HashMap<String, (String, Option<String>, Option<String>)> = HashMap::new();
+    let mut remember = |task_id: &str, child_thread_id: Option<&str>, remote: Option<&Value>, title: Option<&str>| {
+        if let Some(child_id) = child_thread_id {
+            let entry = (child_id.to_owned(), None, title.map(str::to_owned));
+            by_task.insert(task_id.to_owned(), entry.clone());
+            local.insert(child_id.to_owned(), entry);
+        } else if let Some(remote) = remote
+            && let (Some(child_id), Some(env_id)) = (
+                remote.get("threadId").and_then(Value::as_str),
+                remote.get("environmentId").and_then(Value::as_str),
+            )
+        {
+            let remote_title = title
+                .or_else(|| remote.get("title").and_then(Value::as_str))
+                .map(str::to_owned);
+            by_task.insert(task_id.to_owned(), (child_id.to_owned(), Some(env_id.to_owned()), remote_title));
+        }
+    };
+    for p in items {
+        if let t3_core::turn_item::TurnItemKind::Subagent { subagent_id, child_thread_id, remote_child, .. } = &p.item.kind {
+            remember(subagent_id, child_thread_id.as_deref(), remote_child.as_ref(), None);
+        }
+    }
+    for sub in subagents_of(projection) {
+        remember(&sub.id, sub.child_thread_id.as_deref(), sub.remote_child.as_ref(), sub.title.as_deref());
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    let mut push = |entry: Option<(String, Option<String>, Option<String>)>| {
+        if let Some((tid, eid, title)) = entry {
+            let key = format!("{}:{tid}", eid.as_deref().unwrap_or(""));
+            if seen.insert(key) {
+                ordered.push((tid, eid, title));
+            }
+        }
+    };
+
+    while index >= 0 && is_input(index as usize) {
+        match &items[index as usize].item.kind {
+            t3_core::turn_item::TurnItemKind::Notification { source, .. } => {
+                if let Some(child_id) = source.get("childThreadId").and_then(Value::as_str) {
+                    push(local.get(child_id).cloned().or_else(|| Some((child_id.to_owned(), None, None))));
+                }
+                if let Some(task_ids) = source.get("taskIds").and_then(Value::as_array) {
+                    for task_id in task_ids.iter().filter_map(Value::as_str) {
+                        push(by_task.get(task_id).cloned());
+                    }
+                }
+            }
+            t3_core::turn_item::TurnItemKind::UserMessage { sender_thread_id, .. } => {
+                if let Some(sender) = sender_thread_id.as_deref() {
+                    push(local.get(sender).cloned());
+                }
+            }
+            _ => {}
+        }
+        index -= 1;
+    }
+
+    ordered
+        .into_iter()
+        .map(|(tid, eid, title)| {
+            let resolved_title = title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    app.thread_shell(&tid)
+                        .map(|shell| shell.title.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| "Agent".to_owned());
+            (tid, resolved_title, eid)
+        })
+        .collect()
 }
 
 /// `AssistantForkButton`: on a completed assistant message whose provider can fork.
@@ -1064,10 +1281,80 @@ fn fork_button(message: &ChatMessage, env: &RowEnv, cx: &mut Context<ThreadView>
     Some(tooltip_icon_button(id, Icon::GitFork, FORK_LABEL, busy, cx.listener(move |view, _, _, cx| view.fork_from_run(&source, &run_id, cx)), cx))
 }
 
-fn assistant_meta(message: &ChatMessage, show_copy: bool, copy_streaming: bool, always: bool, fork: Option<AnyElement>, clock: &Clock, cx: &App) -> AnyElement {
+/// `AssistantReplyButton`: starts a reply banner against the opening of a completed assistant response.
+fn reply_button(message: &ChatMessage, env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<AnyElement> {
+    if message.streaming || message.text.trim().is_empty() {
+        return None;
+    }
+    let thread_id = env.thread_id?.to_owned();
+    let item_id = message.item.as_ref()?.id.clone();
+    let message_id = message.id.clone();
+    let raw_text = message.text.clone();
+    let state = env.state.clone();
+    let id = SharedString::from(format!("reply:{message_id}"));
+    Some(tooltip_icon_button(
+        id,
+        Icon::Reply,
+        "Reply to this response",
+        false,
+        move |_, _, cx| {
+            let app_read = state.read(cx);
+            let env_id = app_read
+                .environment()
+                .or(app_read.environments.active.as_deref())
+                .unwrap_or_default()
+                .to_owned();
+            let trimmed_start = raw_text.len() - raw_text.trim_start().len();
+            let trimmed = raw_text.trim();
+            let opening = t3_core::assistant_citations::take_units(trimmed, 300, false);
+            let range = trimmed_start..(trimmed_start + opening.len());
+            let Some(citation) = t3_core::assistant_citations::Citation::from_selection(
+                env_id,
+                thread_id.clone(),
+                message_id.clone(),
+                &raw_text,
+                range,
+            ) else {
+                return;
+            };
+            let subagents = read_response_subagents(app_read, &thread_id, &item_id);
+            let record = t3_core::composer::records::response_record(&citation, &item_id, &subagents);
+            let _ = app_read;
+            state.update(cx, |app, cx| {
+                app.composer_reply = Some((thread_id.clone(), record));
+                cx.emit(crate::app_state::AppEvent::ComposerReply);
+            });
+        },
+        cx,
+    ))
+}
+
+fn assistant_status_badge(status: &str, cx: &App) -> AnyElement {
+    let p = palette(cx);
+    div()
+        .rounded_full()
+        .border_1()
+        .border_color(hsla(p.border).opacity(0.7))
+        .px(px(6.))
+        .py(px(2.))
+        .text_size(px(10.))
+        .text_color(hsla(p.muted_foreground))
+        .child(status.to_owned())
+        .into_any_element()
+}
+
+fn assistant_meta(
+    message: &ChatMessage,
+    show_copy: bool,
+    always: bool,
+    fork: Option<AnyElement>,
+    reply: Option<AnyElement>,
+    clock: &Clock,
+    cx: &App,
+) -> AnyElement {
     let p = palette(cx);
     let status = message.item.as_ref().map(|item| item.status.clone()).filter(|status| status != "completed");
-    let copy = (show_copy && !copy_streaming && !message.text.trim().is_empty()).then(|| {
+    let copy = (show_copy && !message.text.trim().is_empty()).then(|| {
         let text = render_codex_directives_for_copy(&message.text);
         CopyButton::new(SharedString::from(format!("copy-assistant:{}", message.id)), "Copy message", move |_, cx| {
             crate::composer::clipboard::write(text.clone(), String::new(), cx);
@@ -1077,19 +1364,10 @@ fn assistant_meta(message: &ChatMessage, show_copy: bool, copy_streaming: bool, 
         .gap(px(8.))
         .text_xs()
         .when(!always, |this| this.invisible().group_hover(ROW_GROUP, |style| style.visible()))
-        .children(status.map(|status| {
-            div()
-                .rounded_full()
-                .border_1()
-                .border_color(hsla(p.border).opacity(0.7))
-                .px(px(6.))
-                .py(px(2.))
-                .text_size(px(10.))
-                .text_color(hsla(p.muted_foreground))
-                .child(status)
-        }))
+        .children(status.map(|status| assistant_status_badge(&status, cx)))
         .children(copy)
         .children(fork)
+        .children(reply)
         .when(!message.streaming, |this| this.child(div().text_color(hsla(p.muted_foreground)).child(clock.format(&message.updated_at, cx))))
         .into_any_element()
 }
@@ -1139,11 +1417,16 @@ fn render_artifact_template_card(
 }
 
 pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownStore, cx: &mut Context<ThreadView>) -> AnyElement {
-    let RowKind::Message { message, show_assistant_meta, show_copy, copy_streaming, .. } = &row.kind else {
+    let RowKind::Message { message, show_assistant_meta, show_copy, copy_streaming, suppress_empty_response, .. } = &row.kind else {
         return div().into_any_element();
     };
-    let (id, show_meta, show_copy, copy_streaming) = (row.id.as_str(), *show_assistant_meta, *show_copy, *copy_streaming);
-    let text: Arc<str> = if message.text.is_empty() && !message.streaming { Arc::from("(empty response)") } else { message.text.clone() };
+    let (id, show_meta, show_copy, copy_streaming, suppress_empty_response) =
+        (row.id.as_str(), *show_assistant_meta, *show_copy, *copy_streaming, *suppress_empty_response);
+    let text: Arc<str> = if message.text.is_empty() && !message.streaming && !suppress_empty_response {
+        Arc::from("(empty response)")
+    } else {
+        message.text.clone()
+    };
     let action_ctx = action_context(env, cx);
     let segments = split_codex_assistant_segments(&text);
     let body = if segments.len() == 1
@@ -1204,16 +1487,49 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
         .py(px(2.))
         .child(body)
         .children(env.turn_diffs.get(&message.id).and_then(|summary| super::changed_files::changed_files_card(&message.id, summary, env, cx)))
+        .when(!show_meta && message.item.as_ref().is_some_and(|i| i.status == "interrupted"), |this| {
+            this.child(div().mt(px(6.)).child(assistant_status_badge("interrupted", cx)))
+        })
         .when(show_meta, |this| {
             let fork = fork_button(message, env, cx);
-            this.child(div().mt(px(6.)).child(assistant_meta(message, show_copy, copy_streaming, false, fork, &env.clock, cx)))
+            let reply = reply_button(message, env, cx);
+            this.child(div().mt(px(6.)).child(assistant_meta(message, show_copy && !copy_streaming, false, fork, reply, &env.clock, cx)))
         })
         .into_any_element()
 }
 
 pub fn assistant_meta_row(message: &Arc<ChatMessage>, show_copy: bool, copy_streaming: bool, env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
     let fork = fork_button(message, env, cx);
-    div().px(px(4.)).mt(px(2.)).child(assistant_meta(message, show_copy, copy_streaming, true, fork, &env.clock, cx)).into_any_element()
+    let reply = reply_button(message, env, cx);
+    div().px(px(4.)).mt(px(2.)).child(assistant_meta(message, show_copy && !copy_streaming, true, fork, reply, &env.clock, cx)).into_any_element()
+}
+
+/// `SentMessageTimelineRow`: text an agent sent with `send_to_user`, shown under `T3 Code`.
+pub fn sent_message_row(
+    id: &str,
+    entry: &SentMessageEntry,
+    env: &RowEnv,
+    markdown: &mut MarkdownStore,
+    cx: &mut Context<ThreadView>,
+) -> AnyElement {
+    let p = palette(cx);
+    let action_ctx = action_context(env, cx);
+    let state = markdown.state_in_context(&format!("sent-message:{id}"), &entry.text, Some(action_ctx), cx);
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .px(px(4.))
+        .py(px(2.))
+        .gap(px(4.))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hsla(p.muted_foreground))
+                .child("T3 Code"),
+        )
+        .child(prose(&state, cx))
+        .into_any_element()
 }
 
 #[derive(Default)]
@@ -1626,5 +1942,124 @@ mod tests {
         assert_eq!(format_epoch_elapsed(Some(1_000), Some(66_500), None).as_deref(), Some("1m 5s"));
         assert_eq!(format_epoch_elapsed(None, None, Some(400)).as_deref(), Some("1s"));
         assert_eq!(format_epoch_elapsed(None, None, None), None);
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn user_height_fold_interrupted_assistant_and_sent_message_rows_render(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        struct RowHost {
+            view: Entity<ThreadView>,
+            short_user: t3_core::timeline::TimelineRow,
+            tall_user: t3_core::timeline::TimelineRow,
+            assistant: t3_core::timeline::TimelineRow,
+            sent: t3_core::timeline::SentMessageEntry,
+        }
+        impl gpui::Render for RowHost {
+            fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                let short_user = self.short_user.clone();
+                let tall_user = self.tall_user.clone();
+                let assistant = self.assistant.clone();
+                let sent = self.sent.clone();
+                self.view.update(cx, |view, cx| {
+                    view.with_env(|env, markdown| {
+                        v_flex()
+                            .size_full()
+                            .child(user_row(&short_user, env, markdown, window, cx))
+                            .child(user_row(&tall_user, env, markdown, window, cx))
+                            .child(assistant_row(&assistant, env, markdown, cx))
+                            .child(sent_message_row("sent-1", &sent, env, markdown, cx))
+                            .into_any_element()
+                    })
+                })
+            }
+        }
+        let make_user = |id: &str, text: String| t3_core::timeline::TimelineRow {
+            id: id.to_owned(),
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+            continues_work_log: false,
+            kind: t3_core::timeline::RowKind::Message {
+                message: Arc::new(t3_core::timeline::ChatMessage {
+                    id: id.to_owned(),
+                    role: t3_core::timeline::Role::User,
+                    text: Arc::from(text),
+                    run_id: None,
+                    streaming: false,
+                    phase: None,
+                    created_at: "2026-01-01T00:00:00Z".into(),
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    meta: t3_core::timeline::MessageMeta::default(),
+                    item: None,
+                }),
+                show_assistant_meta: false,
+                suppress_empty_response: false,
+                show_copy: true,
+                copy_streaming: false,
+                grouped_with_next: false,
+                grouped_with_previous: false,
+                continues_steer: false,
+            },
+        };
+        let interrupted_item = Arc::new(
+            serde_json::from_value::<t3_core::turn_item::TurnItem>(serde_json::json!({
+                "id": "asst-item-1",
+                "type": "assistant_message",
+                "status": "interrupted",
+                "messageId": "m-asst-1",
+                "text": "",
+                "streaming": false
+            }))
+            .unwrap(),
+        );
+        let assistant = t3_core::timeline::TimelineRow {
+            id: "asst-1".into(),
+            created_at: Some("2026-01-01T00:00:01Z".into()),
+            continues_work_log: false,
+            kind: t3_core::timeline::RowKind::Message {
+                message: Arc::new(t3_core::timeline::ChatMessage {
+                    id: "asst-1".into(),
+                    role: t3_core::timeline::Role::Assistant,
+                    text: Arc::from(""),
+                    run_id: Some("turn-1".into()),
+                    streaming: false,
+                    phase: Some("final_answer".into()),
+                    created_at: "2026-01-01T00:00:01Z".into(),
+                    updated_at: "2026-01-01T00:00:01Z".into(),
+                    meta: t3_core::timeline::MessageMeta::default(),
+                    item: Some(interrupted_item.clone()),
+                }),
+                show_assistant_meta: false,
+                suppress_empty_response: true,
+                show_copy: true,
+                copy_streaming: false,
+                grouped_with_next: false,
+                grouped_with_previous: false,
+                continues_steer: false,
+            },
+        };
+        let sent = t3_core::timeline::SentMessageEntry {
+            run_id: Some("turn-1".into()),
+            text: Arc::from("Delivered to user"),
+            item: interrupted_item,
+        };
+        let (_host, vcx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| crate::thread_view::ThreadView::new(state.clone(), window, cx));
+            RowHost {
+                view,
+                short_user: make_user("u-short", "short message".into()),
+                tall_user: make_user("u-tall", "line of prompt\n".repeat(40)),
+                assistant,
+                sent,
+            }
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            window.draw(cx).clear();
+        });
     }
 }

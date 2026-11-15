@@ -164,6 +164,7 @@ icons! {
     RadioTower => "icons/lucide/radio-tower.svg",
     Redo2 => "icons/lucide/redo-2.svg",
     RefreshCw => "icons/lucide/refresh-cw.svg",
+    Reply => "icons/lucide/reply.svg",
     RotateCcw => "icons/lucide/rotate-ccw.svg",
     QrCode => "icons/lucide/qr-code.svg",
     Rows3 => "icons/lucide/rows-3.svg",

@@ -193,7 +193,7 @@ impl InlineBudget {
             TurnItemKind::ApprovalRequest { prompt, .. } => self.text(prompt.as_deref()),
             TurnItemKind::UserInputRequest { questions, .. } => questions.iter().all(|question| self.value(question)),
             TurnItemKind::Notification { detail, .. } => self.text(detail.as_deref()),
-            TurnItemKind::SystemNotice { message } => self.spend(message.len()),
+            TurnItemKind::SystemNotice { message, .. } => self.spend(message.len()),
             TurnItemKind::Error { failure, .. } => self.spend(failure.message.len()),
             TurnItemKind::TodoList { steps, .. } => steps.iter().all(|step| self.spend(step.text.len() + 2)),
             _ => true,

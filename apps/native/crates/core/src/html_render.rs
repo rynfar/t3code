@@ -365,3 +365,21 @@ pub fn from_tool_item(tool_name: Option<&str>, output: Option<&Value>) -> Option
     }
     read_reference(data?.get("htmlRender")?)
 }
+
+/// `sentMessageFromToolItem` for a completed `dynamic_tool` item: the message `send_to_user`
+/// (or OpenCode Code Mode `execute`) showed the user.
+pub fn sent_message_from_tool_item(tool_name: Option<&str>, output: Option<&Value>) -> Option<String> {
+    const SEND_TO_USER_MAX_LENGTH: usize = 4_000;
+    let name = tool_name?;
+    if name != "execute" && !is_t3_mcp_tool(name, "send_to_user") {
+        return None;
+    }
+    let mut budget = Budget { bytes: MAX_PARSED_BYTES, nodes: MAX_ENVELOPE_NODES, exceeded: false };
+    let (data, failed) = read_result(output.unwrap_or(&Value::Null), &mut budget, 0);
+    if failed || budget.exceeded {
+        return None;
+    }
+    let data = data?;
+    let sent = data.get("sentMessage")?.as_str()?;
+    (!sent.trim().is_empty() && sent.encode_utf16().count() <= SEND_TO_USER_MAX_LENGTH).then(|| sent.to_owned())
+}

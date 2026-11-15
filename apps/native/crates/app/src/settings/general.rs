@@ -5,7 +5,7 @@
 use gpui::{App, Context, Entity, IntoElement, SharedString};
 use t3_core::client_settings::{
     ClientSettingChange, ClientSettingsDoc, NOTIFICATION_MODES, ProjectGroupingMode, ProjectSortOrder, QuitConfirmationMode,
-    TimestampFormat, notification_mode_value, project_grouping_from_toggle,
+    TimestampFormat, ToolCallVisibility, notification_mode_value, project_grouping_from_toggle,
 };
 use t3_core::composer::{FollowUpBehavior, SendShortcut};
 
@@ -273,7 +273,40 @@ impl SettingsView {
             ],
             cx,
         );
-        vec![Block::new(&["composer", "send-shortcut"], composer_section), Block::new(&["follow-ups", "follow-up-behavior"], follow_ups)]
+        let visibility = self.doc(cx).tool_call_visibility();
+        let visibility_state = state.clone();
+        let activity = section(
+            "Activity",
+            vec![
+                Row::new("tool-call-visibility", "Tool calls in chat")
+                    .description("Hide the commands, edits, and searches agents run. Hide successful keeps failures. Zen shows only final answers. Approvals, questions, and errors always show.")
+                    .highlighted(self.is_target("tool-call-visibility"))
+                    .reset(
+                        visibility != ToolCallVisibility::default(),
+                        reset(state, ClientSettingChange::ToolCallVisibility(ToolCallVisibility::default())),
+                    )
+                    .control(
+                        Select::new(
+                            "tool-call-visibility-select",
+                            literal_options(ToolCallVisibility::ALL, ToolCallVisibility::as_str, ToolCallVisibility::label),
+                        )
+                        .selected(visibility.as_str())
+                        .width(160.)
+                        .on_change(move |value, _, cx| {
+                            if let Some(mode) = ToolCallVisibility::parse(&value) {
+                                store::update_client(&visibility_state, ClientSettingChange::ToolCallVisibility(mode), cx);
+                            }
+                        }),
+                    )
+                    .into_any_element(),
+            ],
+            cx,
+        );
+        vec![
+            Block::new(&["composer", "send-shortcut"], composer_section),
+            Block::new(&["follow-ups", "follow-up-behavior"], follow_ups),
+            Block::new(&["activity", "tool-call-visibility"], activity),
+        ]
     }
 
     pub(super) fn labs(&mut self, cx: &mut Context<Self>) -> Vec<Block> {

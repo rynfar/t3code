@@ -292,7 +292,11 @@ function longThread(turns: number, work: number, options: { agentOnly?: boolean 
       );
     }
     items.push(
-      turnItem("assistant", `turn-${turn}-reply`, ordinal++, { runId, text: `Reply ${turn}` }),
+      turnItem("assistant", `turn-${turn}-reply`, ordinal++, {
+        runId,
+        text: `Reply ${turn}`,
+        rich: turn % 5 === 0,
+      }),
     );
   }
   return fullProjection(items, runs);

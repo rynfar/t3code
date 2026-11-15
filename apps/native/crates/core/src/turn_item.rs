@@ -23,6 +23,14 @@ pub struct DeferredWork {
     pub last_ordinal: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedSender {
+    pub environment_id: String,
+    pub thread_id: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnItem {
@@ -156,6 +164,8 @@ pub enum TurnItemKind {
         #[serde(default)]
         sender_thread_id: Option<String>,
         #[serde(default)]
+        linked_sender: Option<LinkedSender>,
+        #[serde(default)]
         created_by: Option<String>,
         #[serde(default)]
         creation_source: Option<String>,
@@ -172,6 +182,8 @@ pub enum TurnItemKind {
         message_id: String,
         text: String,
         streaming: bool,
+        #[serde(default)]
+        phase: Option<String>,
         #[serde(default)]
         attachments: Option<Vec<Value>>,
     },
@@ -266,6 +278,8 @@ pub enum TurnItemKind {
     },
     SystemNotice {
         message: String,
+        #[serde(default)]
+        level: Option<String>,
     },
     Error {
         failure: ProviderFailure,

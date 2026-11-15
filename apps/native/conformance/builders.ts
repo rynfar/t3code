@@ -75,6 +75,7 @@ export function turnItem(
         messageId: `message-${id}`,
         text,
         streaming: false,
+        ...(options.rich ? { phase: "final_answer" } : {}),
       } as Item;
     case "user":
     case "queued":
@@ -91,6 +92,11 @@ export function turnItem(
           ? {
               scheduledTaskId: "scheduled-1",
               senderThreadId: "thread-sender",
+              linkedSender: {
+                environmentId: "env-sender",
+                threadId: "thread-sender",
+                title: "Linked agent",
+              },
               idleCompaction: "onReturn",
               modelSwitch: { from: MODEL, to: { ...MODEL, model: "gpt-5.5" } },
               workflowScript: true,

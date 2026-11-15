@@ -37,6 +37,7 @@ pub(super) struct ContextChips {
     pub(super) records: HashMap<Target, Vec<std::sync::Arc<serde_json::Value>>>,
     parsed: std::cell::RefCell<super::imports::PresentationCache>,
     pub(super) reviews: HashMap<Target, Vec<ReviewComment>>,
+    pub(super) reply_to: HashMap<Target, serde_json::Value>,
     /// The chip whose details popover is open, by context id.
     open: Option<String>,
     dismissed: Option<Instant>,
@@ -90,6 +91,54 @@ impl Composer {
 
     pub(super) fn take_reviews(&mut self, target: &Target, prompt: &str) -> Vec<ReviewComment> {
         self.context.reviews.get_mut(target).map(|held| rules::take_for_send(held, prompt)).unwrap_or_default()
+    }
+
+    pub(super) fn reply_to_for(&self, target: &Target) -> Option<&serde_json::Value> {
+        self.context.reply_to.get(target)
+    }
+
+    pub(super) fn current_reply_to(&self) -> Option<&serde_json::Value> {
+        self.snapshot.target.as_ref().and_then(|target| self.reply_to_for(target))
+    }
+
+    pub(super) fn seed_reply_to(&mut self, target: &Target, record: Option<serde_json::Value>) {
+        match record {
+            Some(record) if t3_core::composer::records::response_citation(&record).is_some() => {
+                self.context.reply_to.insert(target.clone(), record);
+            }
+            _ => {
+                self.context.reply_to.remove(target);
+            }
+        }
+    }
+
+    pub(super) fn take_reply_to(&mut self, target: &Target) -> Option<serde_json::Value> {
+        self.context.reply_to.remove(target)
+    }
+
+    pub(crate) fn reply_to_response(&mut self, record: serde_json::Value, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.snapshot.pending.user_inputs.is_empty() || self.snapshot.target.is_none() {
+            return false;
+        }
+        let Some(target) = self.snapshot.target.clone() else {
+            return false;
+        };
+        if t3_core::composer::records::response_citation(&record).is_none() {
+            return false;
+        }
+        self.seed_reply_to(&target, Some(record));
+        self.draft_changed(cx);
+        self.focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    pub(super) fn clear_reply_to(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.snapshot.target.clone() else { return };
+        if self.context.reply_to.remove(&target).is_some() {
+            self.draft_changed(cx);
+            cx.notify();
+        }
     }
 
     pub(super) fn add_review_comment(&mut self, comment: ReviewComment, window: &mut Window, cx: &mut Context<Self>) {

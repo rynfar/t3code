@@ -588,7 +588,7 @@ fn derive_blocks(wire: &TurnItem, fetch: &Fetch, mode: Mode, workspace_root: Opt
         TurnItemKind::ApprovalRequest { prompt, .. } => structured(prompt.as_deref()).into_iter().collect(),
         TurnItemKind::UserInputRequest { questions, .. } => structured(Some(&questions_text(questions))).into_iter().collect(),
         TurnItemKind::Notification { detail, .. } => structured(detail.as_deref()).into_iter().collect(),
-        TurnItemKind::SystemNotice { message } => structured(Some(message)).into_iter().collect(),
+        TurnItemKind::SystemNotice { message, .. } => structured(Some(message)).into_iter().collect(),
         TurnItemKind::Error { failure, .. } => structured(Some(&failure.message)).into_iter().collect(),
         TurnItemKind::TodoList { steps, .. } => structured(Some(&todo_text(steps))).into_iter().collect(),
         _ => Vec::new(),

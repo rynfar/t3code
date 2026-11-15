@@ -340,9 +340,10 @@ impl AppState {
         cx.emit(AppEvent::Thread);
     }
 
-    fn show_side_chat_tab(&mut self, parent: &str, side_chat: &str, cx: &mut Context<Self>) {
+    pub(crate) fn show_side_chat_tab(&mut self, parent: &str, side_chat: &str, cx: &mut Context<Self>) {
         if self.panels.panels.open(parent, Surface::side_chat(side_chat)) {
             self.save_panels(cx);
+            cx.emit(AppEvent::RightPanel);
         }
     }
 

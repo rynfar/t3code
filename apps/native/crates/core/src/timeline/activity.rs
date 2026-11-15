@@ -148,6 +148,9 @@ pub fn user_message_attribution(message: &ChatMessage) -> Option<Attribution> {
     if scheduled_task_id_from_message(message).is_some() || has_legacy_automation_prefix(&message.text) {
         return Some(Attribution::Automation);
     }
+    if message.meta.linked_sender.is_some() {
+        return Some(Attribution::Agent);
+    }
     match (message.meta.created_by.as_deref(), message.meta.creation_source.as_deref()) {
         (Some("agent"), Some("server")) => Some(Attribution::T3Code),
         (Some("agent"), _) => Some(Attribution::Agent),
@@ -532,6 +535,7 @@ mod tests {
             text: Arc::from(text),
             run_id: None,
             streaming: false,
+            phase: None,
             created_at: String::new(),
             updated_at: String::new(),
             meta,

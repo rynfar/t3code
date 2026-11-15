@@ -216,9 +216,11 @@ pub(super) fn projected_work_entry(row: &ProjectedTurnItem) -> WorkLogEntry {
             entry.label = title.unwrap_or_else(|| "Checkpoint captured".into());
             entry.changed_files = files.iter().map(|f| f.path.clone()).collect();
         }
-        TurnItemKind::SystemNotice { message } => {
+        TurnItemKind::SystemNotice { message, level } => {
             entry.label = message.clone();
-            entry.source_activity = Some(SourceActivity::RuntimeWarning);
+            if level.as_deref() != Some("info") {
+                entry.source_activity = Some(SourceActivity::RuntimeWarning);
+            }
         }
         TurnItemKind::Error { failure, retry } => {
             let (label, detail) = provider_error_presentation(item);
@@ -283,9 +285,9 @@ fn is_standalone(kind: &TurnItemKind) -> bool {
 }
 
 fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
-    let (id, role, text, streaming, meta) = match &item.kind {
+    let (id, role, text, streaming, phase, meta) = match &item.kind {
         TurnItemKind::UserMessage {
-            message_id, text, input_intent, model_switch, scheduled_task_id, sender_thread_id, created_by, creation_source, idle_compaction, workflow_script, fresh_context, context, ..
+            message_id, text, input_intent, model_switch, scheduled_task_id, sender_thread_id, linked_sender, created_by, creation_source, idle_compaction, workflow_script, fresh_context, context, ..
         } => {
             let guest = context.as_ref().and_then(|c| c.get("guest"));
             let meta = MessageMeta {
@@ -294,6 +296,7 @@ fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
                 creation_source: creation_source.clone(),
                 scheduled_task_id: scheduled_task_id.clone(),
                 sender_thread_id: sender_thread_id.clone(),
+                linked_sender: linked_sender.clone(),
                 idle_compaction: idle_compaction.clone(),
                 guest_name: guest.and_then(|g| g.get("name")).and_then(Value::as_str).map(str::to_owned),
                 guest_text: guest.and_then(|g| g.get("text")).and_then(Value::as_str).map(str::to_owned),
@@ -301,10 +304,10 @@ fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
                 workflow_script: *workflow_script,
                 fresh_context: *fresh_context,
             };
-            (message_id, Role::User, text, false, meta)
+            (message_id, Role::User, text, false, None, meta)
         }
-        TurnItemKind::AssistantMessage { message_id, text, streaming, .. } => {
-            (message_id, Role::Assistant, text, *streaming, MessageMeta::default())
+        TurnItemKind::AssistantMessage { message_id, text, streaming, phase, .. } => {
+            (message_id, Role::Assistant, text, *streaming, phase.clone(), MessageMeta::default())
         }
         _ => return None,
     };
@@ -314,6 +317,7 @@ fn chat_message(item: &Arc<TurnItem>) -> Option<ChatMessage> {
         text: Arc::from(text.as_str()),
         run_id: item.run_id.clone(),
         streaming,
+        phase,
         created_at: created_at(item),
         updated_at: item.updated_at.clone(),
         meta,
@@ -413,6 +417,8 @@ fn build_entry(row: &ProjectedTurnItem, lookups: &Lookups, plans: &[Entity]) -> 
         }))
     } else if let Some(reference) = html_render_reference(item) {
         EntryKind::HtmlRender(Arc::new(HtmlRenderEntry { run_id: item.run_id.clone(), reference, item: item.clone() }))
+    } else if let Some(sent_text) = sent_message_text(item) {
+        EntryKind::SentMessage(Arc::new(super::SentMessageEntry { run_id: item.run_id.clone(), text: Arc::from(sent_text), item: item.clone() }))
     } else if let crate::turn_item::TurnItemKind::DynamicTool { tool_name, output, .. } = &item.kind
         && let Some(reference) = crate::mcp_apps::from_tool_item(tool_name.as_deref(), output.as_ref())
     {
@@ -435,6 +441,7 @@ fn entry_item(entry: &TimelineEntry) -> Option<&Arc<TurnItem>> {
         EntryKind::Work(work) => work.item.as_ref(),
         EntryKind::Event { item, .. } => Some(item),
         EntryKind::HtmlRender(render) => Some(&render.item),
+        EntryKind::SentMessage(sent) => Some(&sent.item),
         EntryKind::McpApp(app) => Some(&app.item),
         EntryKind::ProposedPlan(_) => None,
     }
@@ -447,6 +454,15 @@ fn html_render_reference(item: &TurnItem) -> Option<crate::html_render::HtmlRend
         return None;
     }
     crate::html_render::from_tool_item(tool_name.as_deref(), output.as_ref())
+}
+
+/// A completed `send_to_user` call's text (`sentMessageFromToolItem`).
+fn sent_message_text(item: &TurnItem) -> Option<String> {
+    let TurnItemKind::DynamicTool { tool_name, output, .. } = &item.kind else { return None };
+    if item.status != "completed" {
+        return None;
+    }
+    crate::html_render::sent_message_from_tool_item(tool_name.as_deref(), output.as_ref())
 }
 
 /// An item that changed in place maps to the same single entry, unless it takes part in

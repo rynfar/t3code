@@ -28,7 +28,7 @@ impl Render for TimelineRows {
 
 impl ThreadView {
     fn render_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        self.clock = Clock::now();
+        self.clock = Clock::now_for(self.state.read(cx).environment());
         self.window_height = f32::from(window.viewport_size().height);
         self.markdown.begin_frame();
         self.media.update(cx, |media, cx| media.begin_frame(window, cx));
@@ -44,7 +44,7 @@ impl ThreadView {
         crate::media::set_scope(scope, cx);
         let transcript = list(
             self.list.clone(),
-            cx.processor(|this, ix: usize, _window, cx| {
+            cx.processor(|this, ix: usize, window, cx| {
                 let offset = this.header_count();
                 if ix < offset {
                     let content = match &this.history {
@@ -56,7 +56,7 @@ impl ThreadView {
                 let Some(row) = this.rows.get(ix - offset).cloned() else {
                     return lane(this.render_footer(cx), ix == 0, crate::theme::chat_max_width(cx), this.gutter());
                 };
-                let content = this.with_env(|env, markdown| render_row(&row, env, markdown, cx));
+                let content = this.with_env(|env, markdown| render_row(&row, env, markdown, window, cx));
                 let lane = lane(content, ix == 0, crate::theme::chat_max_width(cx), this.gutter());
                 if this.anchor_gap.borrow().as_ref().is_none_or(|(id, _)| *id != row.id) {
                     return lane;

@@ -15,6 +15,7 @@ fn message(id: &str, role: Role, text: &str, run: Option<&str>, created: &str, u
             text: Arc::from(text),
             run_id: run.map(str::to_owned),
             streaming: false,
+            phase: None,
             created_at: created.into(),
             updated_at: updated.into(),
             meta: MessageMeta { input_intent: (role == Role::User).then(|| "turn_start".into()), ..MessageMeta::default() },
@@ -57,6 +58,8 @@ impl Input {
             expanded_attempt_ids: &none,
             expanded_work_group_ids: &self.groups,
             worktree_setup: self.setup.as_ref(),
+            tool_call_visibility: Default::default(),
+            revealed_message_id: None,
         };
         derive_rows(&input, &mut RowsCache::default()).iter().map(|row| (**row).clone()).collect()
     }
@@ -133,6 +136,7 @@ fn a_running_responses_terminal_reply_has_no_meta_until_it_settles() {
         assert_eq!(reply.kind, RowKind::Message {
             message: entries[0].message().expect("assistant message").clone(),
             show_assistant_meta: false,
+            suppress_empty_response: false,
             show_copy: false,
             copy_streaming: true,
             grouped_with_next: false,
@@ -339,7 +343,15 @@ fn the_showcase_fixture_folds_into_prompt_fold_and_answer() {
             _ => None,
         })
         .collect();
-    assert_eq!(labels, vec!["Received 1 update and read 1 file", "Changed 1 file and ran 1 command"]);
+    assert_eq!(
+        labels,
+        vec![
+            "The user wants a short tour. I will read the manifest, add a small helper, run the tests, and then summarize with some markdown.",
+            "Tasks 3/3",
+            "Read /workspace/app/package.json",
+            "Changed 1 file and ran 1 command",
+        ]
+    );
 }
 
 #[test]
@@ -456,6 +468,8 @@ fn a_streamed_token_patches_rows_like_a_full_derive() {
             expanded_attempt_ids: &none,
             expanded_work_group_ids: &input.groups,
             worktree_setup: None,
+            tool_call_visibility: Default::default(),
+            revealed_message_id: None,
         };
         derive_rows(&rows_input, cache).iter().map(|row| (**row).clone()).collect::<Vec<_>>()
     };
@@ -508,7 +522,7 @@ fn incremental_derives_match_a_fresh_derive_at_every_streamed_frame() {
         let activity = derive_activity(projection);
         let derive = |entries_cache: &mut EntriesCache, rows_cache: &mut RowsCache| {
             let entries = derive_entries(entries_cache, &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
-            let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: None };
+            let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: None, tool_call_visibility: Default::default(), revealed_message_id: None };
             derive_rows(&input, rows_cache).iter().map(|row| row_summary(row)).collect::<Vec<_>>()
         };
         let incremental = derive(&mut entries_cache, &mut rows_cache);
@@ -847,7 +861,7 @@ fn a_streamed_token_replaces_only_its_own_row() {
     let none = HashSet::new();
     let mut cache = RowsCache::default();
     let mut derive = |entries: &[Arc<TimelineEntry>]| {
-        derive_rows(&RowsInput { entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: None }, &mut cache)
+        derive_rows(&RowsInput { entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: None, tool_call_visibility: Default::default(), revealed_message_id: None }, &mut cache)
     };
     let first = derive(&[prompt.clone(), streaming("Hel")]);
     let second = derive(&[prompt, streaming("Hello")]);
@@ -1581,7 +1595,7 @@ fn a_new_setup_snapshot_rederives_rows_a_streamed_token_would_patch() {
     let (none, activity) = (HashSet::new(), ThreadActivity::default());
     let mut cache = RowsCache::default();
     let mut derive = |snapshot: &Arc<crate::worktree_setup::Snapshot>| {
-        let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: Some(snapshot) };
+        let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &none, expanded_attempt_ids: &none, expanded_work_group_ids: &none, worktree_setup: Some(snapshot), tool_call_visibility: Default::default(), revealed_message_id: None };
         derive_rows(&input, &mut cache)
     };
     let (first, second) = (setup(1), setup(2));
@@ -1969,7 +1983,7 @@ fn inherited_event_visibility_survives_entries_to_rows_projection() {
     ];
     let entries = derive_entries(&mut EntriesCache::default(), &projection.visible_turn_items, &projection.attempts, &projection.nodes, &projection.plans);
     let activity = derive_activity(&projection);
-    let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None };
+    let input = RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None, tool_call_visibility: Default::default(), revealed_message_id: None };
     let rows = derive_rows(&input, &mut RowsCache::default());
     let visibilities: Vec<_> = rows
         .iter()
@@ -2242,7 +2256,7 @@ fn suppresses_redundant_usage_limit_error_pause_notice_and_provider_message() {
     assert!(activity.usage_limit_notice.is_some());
     let entries = derive_entries(&mut EntriesCache::default(), &projection.visible_turn_items, &[], &[], &[]);
     let rows = derive_rows(
-        &RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None },
+        &RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None, tool_call_visibility: Default::default(), revealed_message_id: None },
         &mut RowsCache::default(),
     );
     let rendered_ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
@@ -2254,12 +2268,13 @@ fn suppresses_redundant_usage_limit_error_pause_notice_and_provider_message() {
         message_id: "m-limit".into(),
         text: "Partial answer before rate limit".into(),
         streaming: false,
+        phase: None,
         attachments: None,
     };
     non_limit.visible_turn_items[1].item = non_limit.turn_items[1].clone();
     let entries2 = derive_entries(&mut EntriesCache::default(), &non_limit.visible_turn_items, &[], &[], &[]);
     let rows2 = derive_rows(
-        &RowsInput { entries: &entries2, activity: &derive_activity(&non_limit), expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None },
+        &RowsInput { entries: &entries2, activity: &derive_activity(&non_limit), expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None, tool_call_visibility: Default::default(), revealed_message_id: None },
         &mut RowsCache::default(),
     );
     assert_eq!(rows2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["m-user", "m-limit"]);
@@ -2301,4 +2316,337 @@ fn derives_pi_extension_statuses_and_limit_recovery_snooze_ownership() {
     let sidebar = crate::sidebar::thread::present_thread(&shell, None);
     assert!(matches!(status_line_for(&sidebar, false, now), Some(StatusLine::Snoozed { .. })));
     assert!(status_line_for(&sidebar, true, now).is_none());
+}
+
+fn turn_item_with_kind(id: &str, run_id: Option<&str>, status: &str, kind: crate::turn_item::TurnItemKind) -> Arc<crate::turn_item::TurnItem> {
+    Arc::new(crate::turn_item::TurnItem {
+        id: id.into(),
+        thread_id: "thread-1".into(),
+        run_id: run_id.map(str::to_owned),
+        node_id: None,
+        parent_item_id: None,
+        provider_thread_id: None,
+        provider_turn_id: None,
+        native_item_ref: None,
+        tool_surface: None,
+        tool_source: None,
+        ordinal: 1,
+        status: status.into(),
+        title: None,
+        started_at: Some("2026-01-01T00:00:00Z".into()),
+        completed_at: Some("2026-01-01T00:00:05Z".into()),
+        updated_at: "2026-01-01T00:00:05Z".into(),
+        text_omitted: false,
+        files_omitted: false,
+        prompt_omitted: false,
+        result_omitted: false,
+        deferred_work: None,
+        kind,
+    })
+}
+
+#[test]
+fn tool_call_visibility_modes_and_zen_live_preview_behave_as_upstream() {
+    use crate::client_settings::ToolCallVisibility;
+
+    let mut work_ok = work("ok-entry", "turn-1", "2026-01-01T00:00:02Z", |w| {
+        w.item_type = Some("command_execution");
+        w.status = Some(ToolStatus::Completed);
+        w.command = Some("echo ok".into());
+    });
+    let work_fail = work("fail-entry", "turn-1", "2026-01-01T00:00:04Z", |w| {
+        w.item_type = Some("command_execution");
+        w.status = Some(ToolStatus::Failed);
+        w.command = Some("false".into());
+    });
+    let _ = &mut work_ok;
+    let entries = vec![
+        message("user-1", Role::User, "Run", None, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        work_ok,
+        work_fail,
+        message("assistant-1", Role::Assistant, "Halfway", Some("turn-1"), "2026-01-01T00:00:06Z", "2026-01-01T00:00:07Z"),
+    ];
+    let mut act = running("turn-1");
+    act.is_working = false;
+    act.running_run_id = None;
+    act.latest_run = Some(LatestRun {
+        run_id: "turn-1".into(),
+        status: "completed".into(),
+        started_at: Some("2026-01-01T00:00:00Z".into()),
+        completed_at: Some("2026-01-01T00:00:10Z".into()),
+        turn_ended: true,
+        provider_starting_label: None,
+    });
+    let none = HashSet::new();
+    let derive = |vis: ToolCallVisibility, revealed: Option<&str>, expanded: &HashSet<String>, activity: &ThreadActivity| {
+        let input = RowsInput {
+            entries: &entries,
+            activity,
+            expanded_run_ids: expanded,
+            expanded_attempt_ids: &none,
+            expanded_work_group_ids: &none,
+            worktree_setup: None,
+            tool_call_visibility: vis,
+            revealed_message_id: revealed,
+        };
+        derive_rows(&input, &mut RowsCache::default())
+    };
+
+    // HideSuccessful strips successful tool row when run is expanded, keeping failed tool row.
+    let expanded_run = HashSet::from(["turn-1".to_string()]);
+    let hide_ok = derive(ToolCallVisibility::HideSuccessful, None, &expanded_run, &act);
+    assert!(hide_ok.iter().any(|r| r.id == "fail-entry"));
+    assert!(!hide_ok.iter().any(|r| r.id == "ok-entry"));
+
+    // HideAll collapses settled non-terminal work even without failed entries? Here fail-entry exists,
+    // wait: HideAll hides work entries & turn-fold rows unless revealed.
+    let hide_all = derive(ToolCallVisibility::HideAll, None, &none, &act);
+    assert!(!hide_all.iter().any(|r| r.id == "turn-fold:turn-1"));
+    assert!(hide_all.iter().any(|r| r.id == "assistant-1-entry"));
+
+    // Zen while running attaches live_answer_preview to Thinking and suppresses streaming Message rows.
+    let mut streaming_entries = vec![
+        message("user-1", Role::User, "Run", None, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        Arc::new(TimelineEntry {
+            id: "stream-msg-entry".into(),
+            created_at: "2026-01-01T00:00:05Z".into(),
+            attempt: None,
+            kind: EntryKind::Message(Arc::new(ChatMessage {
+                id: "stream-msg".into(),
+                role: Role::Assistant,
+                text: Arc::from("Drafting answer"),
+                run_id: Some("turn-2".into()),
+                streaming: true,
+                phase: None,
+                created_at: "2026-01-01T00:00:05Z".into(),
+                updated_at: "2026-01-01T00:00:06Z".into(),
+                meta: MessageMeta::default(),
+                item: None,
+            })),
+        }),
+    ];
+    let live_act = running("turn-2");
+    let zen_live = derive_rows(
+        &RowsInput {
+            entries: &streaming_entries,
+            activity: &live_act,
+            expanded_run_ids: &none,
+            expanded_attempt_ids: &none,
+            expanded_work_group_ids: &none,
+            worktree_setup: None,
+            tool_call_visibility: ToolCallVisibility::Zen,
+            revealed_message_id: None,
+        },
+        &mut RowsCache::default(),
+    );
+    assert!(!zen_live.iter().any(|r| matches!(r.kind, RowKind::Message { .. } if r.id == "stream-msg-entry")));
+    assert!(zen_live.iter().any(|r| matches!(
+        &r.kind,
+        RowKind::Thinking { live_answer_preview: Some(preview), .. } if preview == "Drafting answer"
+    )));
+
+    // Zen reveals final settled message when find/revealed_message_id targets a hidden commentary message.
+    streaming_entries.push(message("final-2", Role::Assistant, "Final", Some("turn-2"), "2026-01-01T00:00:08Z", "2026-01-01T00:00:09Z"));
+    let done_act = ThreadActivity {
+        latest_run: Some(LatestRun {
+            run_id: "turn-2".into(),
+            status: "completed".into(),
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            completed_at: Some("2026-01-01T00:00:09Z".into()),
+            turn_ended: true,
+            provider_starting_label: None,
+        }),
+        ..Default::default()
+    };
+    let revealed = derive_rows(
+        &RowsInput {
+            entries: &streaming_entries,
+            activity: &done_act,
+            expanded_run_ids: &none,
+            expanded_attempt_ids: &none,
+            expanded_work_group_ids: &none,
+            worktree_setup: None,
+            tool_call_visibility: ToolCallVisibility::HideAll,
+            revealed_message_id: Some("stream-msg"),
+        },
+        &mut RowsCache::default(),
+    );
+    assert!(revealed.iter().any(|r| r.id == "stream-msg-entry"));
+}
+
+#[test]
+fn final_answer_phase_sent_message_todo_list_latest_compaction_viewed_images_and_suppress_empty() {
+    // 1. final_answer phase stays unfolded even when commentary follows, and sent_message stays unfolded.
+    let mut final_msg = message("a-final", Role::Assistant, "Main answer", Some("turn-1"), "2026-01-01T00:00:02Z", "2026-01-01T00:00:03Z");
+    if let EntryKind::Message(ref mut msg) = Arc::make_mut(&mut final_msg).kind {
+        Arc::make_mut(msg).phase = Some("final_answer".into());
+    }
+    let send_item = turn_item_with_kind(
+        "send-1",
+        Some("turn-1"),
+        "completed",
+        crate::turn_item::TurnItemKind::DynamicTool {
+            tool_name: Some("send_to_user".into()),
+            input: Value::Null,
+            output: Some(serde_json::json!({ "sentMessage": "Hello from tool" })),
+            viewed_image_path: None,
+            output_omitted: false,
+        },
+    );
+    let sent_text = crate::html_render::sent_message_from_tool_item(
+        Some("send_to_user"),
+        Some(&serde_json::json!({ "sentMessage": "Hello from tool" })),
+    )
+    .expect("sent message text");
+    let sent_entry = Arc::new(TimelineEntry {
+        id: "send-1-entry".into(),
+        created_at: "2026-01-01T00:00:04Z".into(),
+        attempt: None,
+        kind: EntryKind::SentMessage(Arc::new(SentMessageEntry {
+            run_id: Some("turn-1".into()),
+            text: Arc::from(sent_text),
+            item: send_item,
+        })),
+    });
+
+    let entries = vec![
+        message("user-1", Role::User, "Go", None, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        final_msg,
+        sent_entry,
+        message("a-later", Role::Assistant, "Wrap up", Some("turn-1"), "2026-01-01T00:00:05Z", "2026-01-01T00:00:06Z"),
+    ];
+    let rows = Input::idle().rows(&entries);
+    assert!(rows.iter().any(|r| r.id == "a-final-entry"));
+    assert!(rows.iter().any(|r| matches!(&r.kind, RowKind::SentMessage(s) if s.text.as_ref() == "Hello from tool")));
+    assert!(rows.iter().any(|r| r.id == "a-later-entry"));
+
+    // 2. Only the latest compaction divider stays visible in turn_folds.
+    let c1 = Arc::new(TimelineEntry {
+        id: "comp-1-entry".into(),
+        created_at: "2026-01-01T00:00:01Z".into(),
+        attempt: None,
+        kind: EntryKind::Work(Arc::new(WorkLogEntry {
+            id: "comp-1".into(),
+            created_at: "2026-01-01T00:00:01Z".into(),
+            run_id: Some("turn-1".into()),
+            label: "Compacted".into(),
+            tone: Tone::Info,
+            source_activity: Some(SourceActivity::Compaction),
+            item_type: Some("compaction"),
+            ..WorkLogEntry::default()
+        })),
+    });
+    let w_turn = work("w-turn-entry", "turn-1", "2026-01-01T00:00:02Z", |w| {
+        w.status = Some(ToolStatus::Completed);
+        w.label = "Read file".into();
+    });
+    let c2 = Arc::new(TimelineEntry {
+        id: "comp-2-entry".into(),
+        created_at: "2026-01-01T00:00:03Z".into(),
+        attempt: None,
+        kind: EntryKind::Work(Arc::new(WorkLogEntry {
+            id: "comp-2".into(),
+            created_at: "2026-01-01T00:00:03Z".into(),
+            run_id: Some("turn-1".into()),
+            label: "Compacted again".into(),
+            tone: Tone::Info,
+            source_activity: Some(SourceActivity::Compaction),
+            item_type: Some("compaction"),
+            ..WorkLogEntry::default()
+        })),
+    });
+    let a_turn = message("a-turn", Role::Assistant, "Done", Some("turn-1"), "2026-01-01T00:00:04Z", "2026-01-01T00:00:04Z");
+    let comp_rows = Input::idle().rows(&[c1, w_turn, c2, a_turn]);
+    assert!(!comp_rows.iter().any(|r| r.id == "comp-1-entry"));
+    assert!(comp_rows.iter().any(|r| r.id == "comp-2-entry"));
+
+    // 3. todo_list is excluded from work-group collapse, while viewed-images emits RowKind::ViewedImages.
+    let todo = work("todo-1-entry", "turn-1", "2026-01-01T00:00:02Z", |w| {
+        w.item_type = Some("todo_list");
+        w.status = Some(ToolStatus::Completed);
+        w.label = "Todos".into();
+    });
+    let img = work("img-1-entry", "turn-1", "2026-01-01T00:00:03Z", |w| {
+        w.item_type = Some("image_view");
+        w.status = Some(ToolStatus::Completed);
+        w.viewed_image_path = Some("shots/ui.png".into());
+    });
+    let w_extra = work("cmd-2-entry", "turn-1", "2026-01-01T00:00:04Z", |w| {
+        w.item_type = Some("command_execution");
+        w.status = Some(ToolStatus::Completed);
+    });
+    let mut input = Input::idle();
+    input.runs.insert("turn-1".into());
+    let group_rows = input.rows(&[todo, img, w_extra]);
+    assert!(group_rows.iter().any(|r| r.id == "todo-1-entry"));
+    assert!(group_rows.iter().any(|r| matches!(
+        &r.kind,
+        RowKind::ViewedImages { paths } if paths == &vec!["shots/ui.png".to_string()]
+    )));
+
+    // 4. HtmlRender entry in a turn suppresses empty response on that turn's assistant message.
+    let html = Arc::new(TimelineEntry {
+        id: "html-1-entry".into(),
+        created_at: "2026-01-01T00:00:01Z".into(),
+        attempt: None,
+        kind: EntryKind::HtmlRender(Arc::new(HtmlRenderEntry {
+            run_id: Some("turn-html".into()),
+            reference: crate::html_render::HtmlRenderReference {
+                attachment_id: "att-1".into(),
+                title: "Chart".into(),
+                height: 240,
+                heights: Vec::new(),
+            },
+            item: turn_item_with_kind("html-1", Some("turn-html"), "completed", crate::turn_item::TurnItemKind::Unknown),
+        })),
+    });
+    let empty_reply = message("empty-1", Role::Assistant, "", Some("turn-html"), "2026-01-01T00:00:03Z", "2026-01-01T00:00:03Z");
+    let html_rows = Input::idle().rows(&[html, empty_reply]);
+    assert!(html_rows.iter().any(|r| matches!(
+        &r.kind,
+        RowKind::Message { message, suppress_empty_response: true, .. } if message.id == "empty-1"
+    )));
+}
+
+#[test]
+fn reasoning_preview_cap_info_notice_linked_sender_and_context_stripping() {
+    // 1. cap_thought_preview preserves UTF-8 boundaries and honors 2_048 char / 8_192 source caps.
+    let long_thought = "é".repeat(3_000);
+    let capped = cap_thought_preview(&long_thought);
+    assert!(capped.chars().count() <= 2_048);
+
+    // 2. SystemNotice with level = "info" maps to WorkIcon::Zap without runtime warning tone.
+    let info_notice = work("notice-info-entry", "turn-1", "2026-01-01T00:00:01Z", |w| {
+        w.item_type = Some("system_notice");
+        w.tone = Tone::Info;
+        w.item = Some(turn_item_with_kind(
+            "notice-info",
+            Some("turn-1"),
+            "completed",
+            crate::turn_item::TurnItemKind::SystemNotice {
+                message: "Connected".into(),
+                level: Some("info".into()),
+            },
+        ));
+    });
+    let EntryKind::Work(w) = &info_notice.kind else { panic!("work") };
+    assert!(matches!(presentation::work_entry_icon(w), presentation::WorkIcon::Zap));
+
+    // 3. linked_sender gives UserMessage Agent attribution.
+    let mut linked_msg = message("user-linked", Role::User, "Ping", None, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z");
+    if let EntryKind::Message(ref mut msg) = Arc::make_mut(&mut linked_msg).kind {
+        Arc::make_mut(msg).meta.linked_sender = Some(crate::turn_item::LinkedSender {
+            environment_id: "env-2".into(),
+            thread_id: "thread-2".into(),
+            title: "Worker".into(),
+        });
+    }
+    let EntryKind::Message(msg_ref) = &linked_msg.kind else { panic!("msg") };
+    assert_eq!(activity::user_message_attribution(msg_ref), Some(activity::Attribution::Agent));
+
+    // 4. <t3_context> XML is stripped from question_answer_text.
+    let ans = user_input::question_answer_text(&serde_json::json!(
+        "[File: main.rs; ref=ctx-1]\n\n<t3_context version=\"1\">\n<context kind=\"file\" id=\"ctx-1\">src</context>\n</t3_context>\nYes please"
+    ));
+    assert_eq!(ans, "[File: main.rs]\nYes please");
 }

@@ -217,7 +217,7 @@ impl ThreadView {
         }
         let can_operate_thread = state.read(cx).can_operate_threads();
         ThreadView {
-            state,
+            state: state.clone(),
             list: ListState::new(0, ListAlignment::Bottom, px(600.)),
             rows: Vec::new(),
             entries_cache: EntriesCache::default(),
@@ -266,7 +266,7 @@ impl ThreadView {
             turn_diff_source: None,
             banners: status::Banners::default(),
             local_error: None,
-            clock: Clock::now(),
+            clock: Clock::now_for(state.read(cx).environment()),
             window_height: 0.,
             measured_typography: TranscriptTypography::of(_window, cx),
             rewind: rewind::RewindUi::default(),
@@ -859,6 +859,11 @@ impl ThreadView {
     }
 
     fn rederive_rows(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut tool_call_visibility = crate::settings::store::client(cx).tool_call_visibility();
+        if tool_call_visibility == t3_core::client_settings::ToolCallVisibility::Zen && self.find.is_some() {
+            tool_call_visibility = t3_core::client_settings::ToolCallVisibility::HideAll;
+        }
+        let revealed_message_id = self.find.as_ref().and_then(|find| find.active_entry());
         let input = RowsInput {
             entries: self.entries_cache.entries(),
             activity: &self.activity,
@@ -866,6 +871,8 @@ impl ThreadView {
             expanded_attempt_ids: &self.ui.expanded_attempts,
             expanded_work_group_ids: &self.ui.expanded_groups,
             worktree_setup: self.setup_env.view.visible.as_ref(),
+            tool_call_visibility,
+            revealed_message_id,
         };
         let next = derive_rows(&input, &mut self.rows_cache);
         self.sync_timer(&next, cx);
@@ -895,14 +902,15 @@ impl ThreadView {
     /// up; besides it only a running setup stage ticks (`sync_setup`).
     fn sync_timer(&mut self, rows: &[Arc<TimelineRow>], cx: &mut Context<Self>) {
         let preparing = self.setup_env.view.preparing;
+        let env_id = self.state.read(cx).environment().map(str::to_owned);
         let working = rows.iter().filter(|_| !preparing).find_map(|row| match (&row.kind, &row.created_at) {
             (RowKind::Working { compacting }, Some(started)) => Some((started.clone(), *compacting)),
             _ => None,
         });
         let working = working.map(|(started, compacting)| (started, if compacting { TimerKind::Compacting } else { TimerKind::Working }));
         match working {
-            Some((started, kind)) if self.working_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&started, kind)) => {}
-            Some((started, kind)) => self.working_timer = Some(cx.new(|cx| WorkingTimer::new(started, kind, cx))),
+            Some((started, kind)) if self.working_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&started, env_id.as_deref(), kind)) => {}
+            Some((started, kind)) => self.working_timer = Some(cx.new(|cx| WorkingTimer::new(started, env_id, kind, cx))),
             None => self.working_timer = None,
         }
     }
@@ -1587,10 +1595,11 @@ impl ThreadView {
         // Only a running stage ticks, and only while setup runs: a settled card never repaints.
         let starts = self.setup_env.live_starts();
         self.setup_env.timers.retain(|started_at, _| starts.contains(started_at));
+        let env_id = self.state.read(cx).environment().map(str::to_owned);
         for started_at in starts {
             if let std::collections::hash_map::Entry::Vacant(slot) = self.setup_env.timers.entry(started_at) {
                 let started_at = slot.key().clone();
-                slot.insert(cx.new(|cx| WorkingTimer::new(started_at, TimerKind::SetupStage, cx)));
+                slot.insert(cx.new(|cx| WorkingTimer::new(started_at, env_id.clone(), TimerKind::SetupStage, cx)));
             }
         }
         true

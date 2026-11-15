@@ -130,6 +130,9 @@ impl ThreadView {
             }
             return;
         }
+        if crate::settings::store::client(cx).tool_call_visibility() == t3_core::client_settings::ToolCallVisibility::Zen {
+            self.rederive_rows(cx);
+        }
         cx.notify();
     }
 
@@ -160,6 +163,9 @@ impl ThreadView {
         if !query.trim().is_empty() {
             self.request_find(cx);
         }
+        if crate::settings::store::client(cx).tool_call_visibility() == t3_core::client_settings::ToolCallVisibility::Zen {
+            self.rederive_rows(cx);
+        }
         cx.notify();
     }
 
@@ -178,6 +184,9 @@ impl ThreadView {
 
     pub fn close_find(&mut self, cx: &mut Context<Self>) {
         if self.find.take().is_some() {
+            if crate::settings::store::client(cx).tool_call_visibility() == t3_core::client_settings::ToolCallVisibility::Zen {
+                self.rederive_rows(cx);
+            }
             cx.notify();
         }
     }
@@ -293,6 +302,9 @@ impl ThreadView {
     /// row into view, or pages history in when the entry is older than the loaded window.
     pub(super) fn reveal_entry(&mut self, entry_id: &str, source: t3_core::timeline::anchor::ScrollSource, cx: &mut Context<Self>) {
         self.disclosure.cancel();
+        if self.find.is_some() {
+            self.rederive(cx);
+        }
         let mut expanded = false;
         for _ in 0..3 {
             if let Some(index) = self.rows.iter().position(|row| row_holds(row, entry_id)) {

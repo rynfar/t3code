@@ -1,29 +1,9 @@
-//! Proposed-plan text, follow-up, export, and actionability rules.
+//! Proposed-plan text and export helpers.
 //! Ports `apps/web/src/proposedPlan.ts`, `packages/shared/src/proposedPlanText.ts`,
 //! and the proposed-plan helpers in `apps/web/src/session-logic.ts`.
 
-use crate::server_config::InteractionMode;
 use crate::thread::ThreadProjection;
 use crate::timeline::activity::{plan_title, strip_displayed_plan_markdown as strip_plan_markdown_body};
-use crate::turn_item::TurnItemKind;
-
-pub const PLAN_IMPLEMENTATION_PROMPT_PREFIX: &str = "PLEASE IMPLEMENT THIS PLAN:\n";
-
-/// A proposed plan eligible for follow-up actions in the composer (`LatestProposedPlanState`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveProposedPlan {
-    pub id: String,
-    pub run_id: Option<String>,
-    pub markdown: String,
-    pub title: Option<String>,
-}
-
-/// Follow-up message computed from the current composer draft and ready proposed plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanFollowUpSubmission {
-    pub text: String,
-    pub interaction_mode: InteractionMode,
-}
 
 /// Extract the first markdown heading from `plan_markdown` (`proposedPlanTitle`).
 pub fn proposed_plan_title(plan_markdown: &str) -> Option<String> {
@@ -112,120 +92,6 @@ pub fn normalize_plan_markdown_for_export(plan_markdown: &str) -> String {
     format!("{}\n", plan_markdown.trim_end())
 }
 
-/// Implementation prompt sent when clicking `Implement` (`buildPlanImplementationPrompt`).
-pub fn build_plan_implementation_prompt(plan_markdown: &str) -> String {
-    format!("{PLAN_IMPLEMENTATION_PROMPT_PREFIX}{}", plan_markdown.trim())
-}
-
-/// Decide text and interaction mode for a plan-mode follow-up (`resolvePlanFollowUpSubmission`).
-pub fn resolve_plan_follow_up_submission(draft_text: &str, plan_markdown: &str) -> PlanFollowUpSubmission {
-    let trimmed = draft_text.trim();
-    if !trimmed.is_empty() {
-        return PlanFollowUpSubmission { text: trimmed.to_owned(), interaction_mode: InteractionMode::Plan };
-    }
-    PlanFollowUpSubmission { text: build_plan_implementation_prompt(plan_markdown), interaction_mode: InteractionMode::Default }
-}
-
-/// Title used when implementing a plan in a new thread (`buildPlanImplementationThreadTitle`).
-pub fn build_plan_implementation_thread_title(plan_markdown: &str) -> String {
-    match proposed_plan_title(plan_markdown) {
-        Some(title) => format!("Implement {title}"),
-        None => "Implement plan".to_owned(),
-    }
-}
-
-fn plan_item_time<'a>(projection: &'a ThreadProjection, plan_id: &str, run_id: Option<&str>) -> &'a str {
-    if let Some(item) = projection.turn_items.iter().rev().find(|candidate| match &candidate.kind {
-        TurnItemKind::ProposedPlan { plan_id: id, .. } | TurnItemKind::TodoList { plan_id: id, .. } => id == plan_id,
-        _ => false,
-    }) {
-        return item.updated_at.as_str();
-    }
-    if let Some(run) = run_id.and_then(|id| projection.runs.iter().find(|r| r.id == id)) {
-        return run.completed_at.as_deref().or(run.started_at.as_deref()).unwrap_or(run.requested_at.as_str());
-    }
-    projection.thread.created_at.as_str()
-}
-
-/// Find the latest actionable proposed plan on a settled projection (`findLatestProposedPlan` +
-/// `hasActionableProposedPlan` in `session-logic.ts`).
-pub fn find_active_proposed_plan(projection: &ThreadProjection) -> Option<ActiveProposedPlan> {
-    let latest_run = projection.runs.last()?;
-    let settled = matches!(latest_run.status.as_str(), "completed" | "cancelled" | "interrupted" | "failed");
-    if !settled {
-        return None;
-    }
-    let latest_run_id = latest_run.id.as_str();
-    let proposed: Vec<_> = projection
-        .plans
-        .iter()
-        .filter(|plan| plan.value.get("kind").and_then(|v| v.as_str()) == Some("proposed_plan"))
-        .collect();
-    let latest_run_plans: Vec<_> = proposed
-        .iter()
-        .copied()
-        .filter(|plan| plan.value.get("runId").and_then(|v| v.as_str()) == Some(latest_run_id))
-        .collect();
-    let mut candidates = if latest_run_plans.is_empty() { proposed } else { latest_run_plans };
-    candidates.sort_by(|left, right| {
-        let left_run = left.value.get("runId").and_then(|v| v.as_str());
-        let right_run = right.value.get("runId").and_then(|v| v.as_str());
-        plan_item_time(projection, &left.id, left_run)
-            .cmp(plan_item_time(projection, &right.id, right_run))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    if let Some(plan) = candidates.pop() {
-        let status = plan.value.get("status").and_then(|v| v.as_str()).unwrap_or("active");
-        if status != "active" {
-            return None;
-        }
-        let streaming = projection.turn_items.iter().rev().any(|item| {
-            matches!(&item.kind, TurnItemKind::ProposedPlan { plan_id, streaming: true, .. } if plan_id == &plan.id)
-        });
-        let markdown = plan.value.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
-        if streaming || markdown.trim().is_empty() {
-            return None;
-        }
-        return Some(ActiveProposedPlan {
-            id: plan.id.clone(),
-            run_id: plan.value.get("runId").and_then(|v| v.as_str()).map(str::to_owned),
-            markdown: markdown.to_owned(),
-            title: proposed_plan_title(markdown),
-        });
-    }
-    let item = projection.turn_items.iter().rev().find(|item| {
-        matches!(item.kind, TurnItemKind::ProposedPlan { streaming: false, .. })
-            && item.run_id.as_deref() == Some(latest_run_id)
-    })?;
-    let TurnItemKind::ProposedPlan { plan_id, markdown, streaming } = &item.kind else {
-        return None;
-    };
-    if *streaming || markdown.trim().is_empty() {
-        return None;
-    }
-    Some(ActiveProposedPlan {
-        id: plan_id.clone(),
-        run_id: item.run_id.clone(),
-        markdown: markdown.clone(),
-        title: proposed_plan_title(markdown),
-    })
-}
-
-/// Whether the composer should display the plan follow-up banner and Implement/Refine actions.
-pub fn should_show_plan_follow_up_prompt(
-    pending_user_input_count: usize,
-    interaction_mode: InteractionMode,
-    running: bool,
-    active_plan: Option<&ActiveProposedPlan>,
-    has_composer_attachments: bool,
-) -> bool {
-    pending_user_input_count == 0
-        && interaction_mode == InteractionMode::Plan
-        && !running
-        && active_plan.is_some()
-        && !has_composer_attachments
-}
-
 /// Whether the thread currently has a resumable interrupted/usage-limited run (without a
 /// pending runtime request blocking continuation), else a held queued run
 /// (`canResumeThread`).
@@ -279,113 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn follow_up_submission_matches_proposed_plan_spec() {
-        let context_draft = "Consider this [PR #42](t3-context://v1/review-comment/pr-42)";
-        assert_eq!(
-            resolve_plan_follow_up_submission(context_draft, "# Plan"),
-            PlanFollowUpSubmission { text: context_draft.to_owned(), interaction_mode: InteractionMode::Plan }
-        );
-        assert_eq!(
-            resolve_plan_follow_up_submission("   ", "## Ship it\n\n- step 1\n"),
-            PlanFollowUpSubmission {
-                text: "PLEASE IMPLEMENT THIS PLAN:\n## Ship it\n\n- step 1".to_owned(),
-                interaction_mode: InteractionMode::Default,
-            }
-        );
-    }
-
-    #[test]
-    fn filename_and_thread_title_sanitize_headings() {
+    fn filename_and_export_sanitize_headings() {
         let md = "# Refactor: Transcript / Messages (Wave 1C)\n\nBody";
         assert_eq!(build_proposed_plan_markdown_filename(md), "refactor-transcript-messages-wave-1c.md");
         assert_eq!(build_proposed_plan_markdown_filename("# It's Bob's v1.2 plan!"), "its-bobs-v12-plan.md");
-        assert_eq!(build_plan_implementation_thread_title(md), "Implement Refactor: Transcript / Messages (Wave 1C)");
-        assert_eq!(build_plan_implementation_thread_title("plain body"), "Implement plan");
         assert_eq!(normalize_plan_markdown_for_export("# Hi\n\n  "), "# Hi\n");
-    }
-
-    #[test]
-    fn find_active_proposed_plan_falls_back_across_earlier_settled_runs() {
-        let mut projection: ThreadProjection = serde_json::from_value(serde_json::json!({
-            "thread": {
-                "id": "th-1",
-                "projectId": "pr-1",
-                "title": "Plan thread",
-                "providerInstanceId": "codex-1",
-                "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
-                "runtimeMode": "full-access",
-                "interactionMode": "plan",
-                "branch": null,
-                "worktreePath": null,
-                "lineage": {
-                    "parentThreadId": null,
-                    "relationshipToParent": null,
-                    "rootThreadId": "th-1"
-                },
-                "createdAt": "2026-01-01T00:00:00Z",
-                "updatedAt": "2026-01-01T00:03:00Z",
-                "archivedAt": null
-            },
-            "runs": [
-                {
-                    "id": "run-1",
-                    "ordinal": 1,
-                    "providerInstanceId": "codex-1",
-                    "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
-                    "userMessageId": "msg-1",
-                    "rootNodeId": null,
-                    "status": "completed",
-                    "requestedAt": "2026-01-01T00:00:00Z",
-                    "startedAt": "2026-01-01T00:00:01Z",
-                    "completedAt": "2026-01-01T00:01:00Z"
-                },
-                {
-                    "id": "run-2",
-                    "ordinal": 2,
-                    "providerInstanceId": "codex-1",
-                    "modelSelection": { "instanceId": "codex-1", "model": "gpt-5" },
-                    "userMessageId": "msg-2",
-                    "rootNodeId": null,
-                    "status": "completed",
-                    "requestedAt": "2026-01-01T00:02:00Z",
-                    "startedAt": "2026-01-01T00:02:01Z",
-                    "completedAt": "2026-01-01T00:03:00Z"
-                }
-            ],
-            "attempts": [],
-            "nodes": [],
-            "subagents": [],
-            "providerSessions": [],
-            "providerThreads": [],
-            "providerTurns": [],
-            "runtimeRequests": [],
-            "messages": [],
-            "plans": [
-                {
-                    "id": "plan-1",
-                    "kind": "proposed_plan",
-                    "runId": "run-1",
-                    "status": "active",
-                    "markdown": "# Ship It\n\n- Step 1"
-                }
-            ],
-            "turnItems": [],
-            "checkpointScopes": [],
-            "checkpoints": [],
-            "contextHandoffs": [],
-            "contextTransfers": [],
-            "visibleTurnItems": [],
-            "updatedAt": "2026-01-01T00:03:00Z"
-        }))
-        .expect("valid projection");
-
-        let found = find_active_proposed_plan(&projection).expect("earlier run active plan");
-        assert_eq!(found.id, "plan-1");
-        assert_eq!(found.run_id.as_deref(), Some("run-1"));
-        assert_eq!(found.title.as_deref(), Some("Ship It"));
-
-        projection.plans[0].value["status"] = serde_json::json!("implemented");
-        assert!(find_active_proposed_plan(&projection).is_none());
     }
 
     #[test]

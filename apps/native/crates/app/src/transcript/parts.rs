@@ -22,8 +22,13 @@ pub struct Clock {
 
 impl Clock {
     pub fn now() -> Self {
-        let now = chrono::Local::now();
-        Clock { now_ms: now.timestamp_millis(), zone: crate::timestamp::viewer_zone() }
+        Self::now_for(None)
+    }
+
+    pub fn now_for(environment_id: Option<&str>) -> Self {
+        let now_ms = chrono::Local::now().timestamp_millis();
+        let now_ms = environment_id.map_or(now_ms, |id| t3_core::clock::to_server_clock(id, now_ms));
+        Clock { now_ms, zone: crate::timestamp::viewer_zone() }
     }
 
     pub fn format(&self, iso: &str, cx: &App) -> String {
