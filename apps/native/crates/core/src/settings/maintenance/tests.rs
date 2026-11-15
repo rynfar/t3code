@@ -220,6 +220,14 @@ fn retention_draft_defers_save_until_enter_or_edited_blur() {
     assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
     draft.mark_edited();
     assert_eq!(draft.commit(None, "9000", 1, false), RetentionCommit::Save(3650));
+    // Re-committing while the initial save is still in flight does not double-save,
+    // while failing the save reverts to Closed so the switch turns Off and retries cleanly.
+    assert_eq!(draft.commit(None, "9000", 1, true), RetentionCommit::Restore(3650));
+    assert!(draft.fail_submit());
+    assert!(!draft.is_on(None));
+    assert!(!draft.fail_submit());
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    assert_eq!(draft.commit(None, "9000", 1, true), RetentionCommit::Save(3650));
 }
 
 /// Two switches flipped before the first save answers: the second is built from the settings the

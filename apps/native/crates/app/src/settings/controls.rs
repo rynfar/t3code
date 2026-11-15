@@ -564,7 +564,7 @@ impl RenderOnce for Select {
             .on_key_down(on_key)
             .children(trigger_content)
             .children(trigger_icon.map(|glyph| icon(glyph, 14., hsla(p.icon_muted).opacity(0.8))))
-            .child(div().flex_1().min_w_0().truncate().child(trigger_label))
+            .when(!trigger_label.is_empty(), |this| this.child(div().flex_1().min_w_0().truncate().child(trigger_label)))
             .child(icon(Icon::ChevronDown, 14., hsla(p.foreground).opacity(0.7)));
 
         let popup = open.then(|| {

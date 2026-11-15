@@ -741,6 +741,14 @@ impl RetentionDraft {
             *self = Self::Closed;
         }
     }
+
+    pub fn fail_submit(&mut self) -> bool {
+        if matches!(self, Self::Submitting(_)) {
+            *self = Self::Closed;
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -99,6 +99,12 @@ pub fn validate_field(driver: &str, key: &str, value: &Value) -> bool {
     let Some(field) = FIELDS.get(driver).and_then(|fields| fields.iter().find(|f| f.key == key)) else {
         return false;
     };
+    if field.accepts_secret_reference
+        && let Some(obj) = value.as_object()
+    {
+        return obj.get("provider").and_then(Value::as_str).is_some_and(|p| !p.trim().is_empty())
+            && obj.get("reference").and_then(Value::as_str).is_some_and(valid_reference);
+    }
     let Some(text) = value.as_str() else { return false };
     if !field.options.is_empty() && !text.is_empty() {
         return field.options.iter().any(|(v, _)| v == text);
@@ -850,5 +856,26 @@ mod tests {
                 { "name": "PLAIN_VAR", "value": "plain", "sensitive": false }
             ]))
         );
+    }
+
+    #[test]
+    fn secret_reference_config_fields_validate_and_clear() {
+        let base = ProviderInstanceConfig {
+            driver: "antigravity".into(),
+            enabled: Some(true),
+            display_name: None,
+            accent_color: None,
+            config: None,
+            environment: None,
+        };
+        let secret = json!({ "provider": "op-main", "reference": "op://Dev/Gemini/api-key" });
+        assert!(validate_field("antigravity", "apiKey", &secret));
+        assert!(!validate_field("antigravity", "apiKey", &json!({ "provider": "", "reference": "op://Dev/Gemini/api-key" })));
+        assert!(!validate_field("antigravity", "apiKey", &json!({ "provider": "op-main", "reference": " " })));
+        assert!(!validate_field("antigravity", "authMethod", &secret));
+        let with_ref = with_field(&base, "apiKey", secret.clone());
+        assert_eq!(with_ref.config.as_ref().unwrap()["apiKey"], secret);
+        let cleared = with_field(&with_ref, "apiKey", json!(""));
+        assert!(cleared.config.is_none());
     }
 }

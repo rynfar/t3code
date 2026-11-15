@@ -356,27 +356,27 @@ pub fn secret_provider_uses(settings: &ServerSettings, provider_id: &str) -> Vec
     if let Some(sources) = settings.usage_limit_sources.as_object() {
         for (id, source) in sources {
             let owner = non_empty_str(source, "label").or_else(|| non_empty_str(source, "url")).unwrap_or(id);
-            push_object_field_uses(&mut out, &format!("usage-limit:{id}"), owner, source, &[("managementKey", "Management key")], provider_id);
+            push_object_field_uses(&mut out, &format!("usage-limit:{id}"), owner, source, &[("managementKey", "Management Key")], provider_id);
         }
     }
     if let Some(generators) = settings.text_generators.as_object() {
         for (id, generator) in generators {
             let owner = non_empty_str(generator, "label").or_else(|| non_empty_str(generator, "baseUrl")).unwrap_or(id);
-            push_object_field_uses(&mut out, &format!("text-generator:{id}"), owner, generator, &[("apiKey", "Api key")], provider_id);
+            push_object_field_uses(&mut out, &format!("text-generator:{id}"), owner, generator, &[("apiKey", "Api Key")], provider_id);
         }
     }
     if let Some(hosts) = settings.eas_device_hosts.as_array() {
         for host in hosts {
             let id = non_empty_str(host, "id").unwrap_or("");
             let owner = non_empty_str(host, "label").unwrap_or(id);
-            push_object_field_uses(&mut out, &format!("eas:{id}"), owner, host, &[("accessToken", "Access token")], provider_id);
+            push_object_field_uses(&mut out, &format!("eas:{id}"), owner, host, &[("accessToken", "Access Token")], provider_id);
         }
     }
     if let Some(hosts) = settings.simlock_device_hosts.as_array() {
         for host in hosts {
             let id = non_empty_str(host, "id").unwrap_or("");
             let owner = non_empty_str(host, "label").unwrap_or(id);
-            push_object_field_uses(&mut out, &format!("simlock:{id}"), owner, host, &[("agentToken", "Agent token")], provider_id);
+            push_object_field_uses(&mut out, &format!("simlock:{id}"), owner, host, &[("agentToken", "Agent Token")], provider_id);
         }
     }
     for (provider, label) in [("openai", "OpenAI"), ("xai", "Grok Voice Transcribe"), ("openrouter", "OpenRouter")] {

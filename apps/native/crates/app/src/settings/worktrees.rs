@@ -5,7 +5,7 @@
 //! are left out as the web leaves them out.
 
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -229,7 +229,11 @@ impl SettingsView {
         match self.worktrees.retention_drafts[idx].commit(saved, &text, field.minimum(), explicit) {
             RetentionCommit::Save(days) => {
                 input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
-                self.save_worktree(field.change(Some(days)), cx);
+                self.save_retention_setting(
+                    field.change(Some(days)).into_server(),
+                    move |this| this.worktrees.retention_drafts[idx].fail_submit(),
+                    cx,
+                );
                 cx.notify();
             }
             RetentionCommit::Restore(days) => {
@@ -307,40 +311,36 @@ impl SettingsView {
                     this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Off"))
                 }
             })
-            .child({
-                let view = cx.entity().downgrade();
-                div()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, _| {
-                            window.prevent_default();
-                            this.worktrees.retention_switch_pressed[idx] = true;
-                        }),
-                    )
-                    .child(Switch::new(id, on).on_change(move |next, window, cx| {
-                        let _ = view.update(cx, |this, cx| {
-                            this.worktrees.retention_switch_pressed[idx] = false;
-                            let saved = this.thread_settings(cx).and_then(|config| field.saved(config));
-                            match this.worktrees.retention_drafts[idx].toggle(saved, next) {
-                                RetentionToggle::OpenDraft(days) => {
-                                    this.worktrees.retention_input(field).update(cx, |input, cx| {
-                                        input.set_value(days.to_string(), window, cx);
-                                        input.focus(window, cx);
-                                    });
-                                    cx.notify();
-                                }
-                                RetentionToggle::SaveOff => {
-                                    this.save_worktree(field.change(None), cx);
-                                    cx.notify();
-                                }
-                                RetentionToggle::DiscardDraft => {
-                                    cx.notify();
-                                }
-                                RetentionToggle::Noop => {}
-                            }
-                        });
-                    }))
-            })
+            .child(self.retention_switch(
+                id,
+                on,
+                move |this, pressed| this.worktrees.retention_switch_pressed[idx] = pressed,
+                move |this, next, window, cx| {
+                    let saved = this.thread_settings(cx).and_then(|config| field.saved(config));
+                    match this.worktrees.retention_drafts[idx].toggle(saved, next) {
+                        RetentionToggle::OpenDraft(days) => {
+                            this.worktrees.retention_input(field).update(cx, |input, cx| {
+                                input.set_value(days.to_string(), window, cx);
+                                input.focus(window, cx);
+                            });
+                            cx.notify();
+                        }
+                        RetentionToggle::SaveOff => {
+                            this.save_retention_setting(
+                                field.change(None).into_server(),
+                                move |this| this.worktrees.retention_drafts[idx].fail_submit(),
+                                cx,
+                            );
+                            cx.notify();
+                        }
+                        RetentionToggle::DiscardDraft => {
+                            cx.notify();
+                        }
+                        RetentionToggle::Noop => {}
+                    }
+                },
+                cx,
+            ))
     }
 
     fn worktree_switch(&self, id: &'static str, checked: bool, change: impl Fn(bool) -> WorktreeChange + 'static) -> Switch {

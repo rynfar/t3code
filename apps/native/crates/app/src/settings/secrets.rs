@@ -261,6 +261,9 @@ impl SettingsView {
                 div().into_any_element()
             } else {
                 v_flex()
+                    .id("secret-provider-remove-uses")
+                    .max_h(r(192.))
+                    .overflow_y_scroll()
                     .gap(r(4.))
                     .px(r(12.))
                     .py(r(8.))

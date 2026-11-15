@@ -31,6 +31,9 @@ use t3_core::{
 struct FieldInput {
     key: String,
     placeholder: String,
+    masked: bool,
+    last_saved: Option<Value>,
+    source: form::SecretSourceDraft,
     input: Entity<InputState>,
     _subscription: Subscription,
 }
@@ -222,6 +225,9 @@ impl SettingsView {
             self.provider_form_mut().fields.push(FieldInput {
                 key: field.key.clone(),
                 placeholder: field.placeholder.clone(),
+                masked: field.secret,
+                last_saved: None,
+                source: form::SecretSourceDraft::default(),
                 input,
                 _subscription: subscription,
             });
@@ -235,23 +241,50 @@ impl SettingsView {
                 .as_ref()
                 .and_then(|fields| fields.iter().find(|(f, _)| f.key == input.key))
                 .map_or_else(|| form::field_value(&instance, &input.key), |(_, value)| json!(value));
-            let saved = saved_value.as_str().unwrap_or("");
-            let value = if field.secret { "" } else { saved };
-            let placeholder = if field.secret && !saved.is_empty() {
-                "Stored secret, enter a new value to replace"
-            } else if field.secret {
-                "Not set"
+            if input.last_saved.as_ref() == Some(&saved_value) {
+                continue;
+            }
+            input.last_saved = Some(saved_value.clone());
+            let (value, placeholder, masked): (String, String, bool) = if field.accepts_secret_reference {
+                let row = json!({ "value": saved_value });
+                let stored = input.source.provider(&row).is_none();
+                let value = if stored && field.secret { "" } else { input.source.input_value(&row) }.to_owned();
+                let masked = stored && field.secret;
+                let placeholder = if !stored {
+                    "op://vault/item/field"
+                } else if field.secret && saved_value.as_str().is_some_and(|s| !s.is_empty()) {
+                    "Stored secret, enter a new value to replace"
+                } else if field.secret {
+                    "Not set"
+                } else {
+                    &field.placeholder
+                };
+                (value, placeholder.to_owned(), masked)
             } else {
-                &field.placeholder
+                let saved = saved_value.as_str().unwrap_or("");
+                let value = if field.secret { "" } else { saved }.to_owned();
+                let placeholder = if field.secret && !saved.is_empty() {
+                    "Stored secret, enter a new value to replace"
+                } else if field.secret {
+                    "Not set"
+                } else {
+                    &field.placeholder
+                };
+                (value, placeholder.to_owned(), field.secret)
             };
-            let changed = input.placeholder != placeholder;
-            input.placeholder = placeholder.into();
-            if changed || input.input.read(cx).value().as_ref() != value {
+            let placeholder_changed = input.placeholder != placeholder;
+            let mask_changed = input.masked != masked;
+            input.placeholder = placeholder.clone();
+            input.masked = masked;
+            if placeholder_changed || mask_changed || input.input.read(cx).value().as_ref() != value {
                 input.input.update(cx, |input, cx| {
                     if input.value().as_ref() != value {
                         input.set_value(value, window, cx);
                     }
-                    if changed {
+                    if mask_changed {
+                        input.set_masked(masked, window, cx);
+                    }
+                    if placeholder_changed {
                         input.set_placeholder(placeholder, window, cx);
                     }
                 });
@@ -377,32 +410,71 @@ impl SettingsView {
         {
             return;
         }
-        let Some(input) = self.provider_form().fields.iter().find(|f| f.key == key).map(|f| f.input.clone()) else {
-            return;
+        let (input, text) = {
+            let Some(field) = self.provider_form().fields.iter().find(|f| f.key == key) else {
+                return;
+            };
+            (field.input.clone(), field.input.read(cx).value().to_string())
         };
-        let text = input.read(cx).value().to_string();
-        let secret = form::fields(&instance.driver, instance.config.as_ref())
-            .iter()
-            .any(|f| f.key == key && f.secret);
-        if secret && text.is_empty() {
-            return;
-        }
-        let value = json!(text);
-        if value.as_str().unwrap_or_default()
-            == form::field_value(&instance, key)
-                .as_str()
-                .unwrap_or_default()
-        {
-            return;
-        }
-        if !form::validate_field(&instance.driver, key, &value) {
-            self.provider_form_mut().error = Some("Compact after 100,000 to 1,000,000 tokens. Leave empty to use Claude's default.".into());
-            cx.notify();
-            return;
-        }
+        let meta = form::fields(&instance.driver, instance.config.as_ref()).into_iter().find(|f| f.key == key);
+        let secret = meta.as_ref().is_some_and(|f| f.secret);
+        let accepts_secret_ref = meta.as_ref().is_some_and(|f| f.accepts_secret_reference);
+        let saved = form::field_value(&instance, key);
+        let active_provider = accepts_secret_ref.then(|| {
+            let row = json!({ "value": saved });
+            self.provider_form()
+                .fields
+                .iter()
+                .find(|f| f.key == key)
+                .and_then(|f| f.source.provider(&row).map(str::to_owned))
+        }).flatten();
+        let one_password = active_provider.as_deref().is_some_and(|source| self.is_one_password_provider(source, cx));
+        let mut clear_masked_input = false;
+        let value = if active_provider.is_some() {
+            let mut row = json!({ "value": saved });
+            let Some(field) = self.provider_form_mut().fields.iter_mut().find(|f| f.key == key) else {
+                return;
+            };
+            match field.source.commit(&mut row, &text, one_password) {
+                Ok(false) => return,
+                Err(error) => {
+                    self.provider_form_mut().error = Some(error.into());
+                    cx.notify();
+                    return;
+                }
+                Ok(true) => {
+                    if field.source.provider(&row).is_none() {
+                        field.masked = secret;
+                        input.update(cx, |input, cx| {
+                            input.set_masked(secret, window, cx);
+                            input.set_placeholder(if secret { "Not set" } else { "" }, window, cx);
+                        });
+                    }
+                    if row["value"] == saved {
+                        return;
+                    }
+                    row["value"].clone()
+                }
+            }
+        } else {
+            if secret && text.is_empty() {
+                return;
+            }
+            let value = json!(text);
+            if value.as_str().unwrap_or_default() == saved.as_str().unwrap_or_default() {
+                return;
+            }
+            if !form::validate_field(&instance.driver, key, &value) {
+                self.provider_form_mut().error = Some("Compact after 100,000 to 1,000,000 tokens. Leave empty to use Claude's default.".into());
+                cx.notify();
+                return;
+            }
+            clear_masked_input = secret;
+            value
+        };
         self.provider_form_mut().error = None;
         self.update_instance(&id, model::InstanceEdit::ConfigField { key: key.into(), value }, cx);
-        if secret {
+        if clear_masked_input {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
     }
@@ -664,26 +736,108 @@ impl SettingsView {
                     })
                     .into_any_element()
                 } else {
-                    let Some(input) = self.provider_form().fields.iter().find(|f| f.key == key).map(|f| f.input.clone()) else {
+                    let Some(field_input) = self.provider_form().fields.iter().find(|f| f.key == key) else {
                         continue;
                     };
-                    let clear_key = key.clone();
-                    let secret_check = field.accepts_secret_reference.then(|| {
-                        let provider = saved.get("provider").and_then(Value::as_str)?;
-                        let reference = saved.get("reference").and_then(Value::as_str)?;
-                        self.secret_check_button(SharedString::from(format!("secret-check-config-{key}")).into(), provider, reference, disabled, cx)
+                    let input = field_input.input.clone();
+                    let row = json!({ "value": saved });
+                    let active_provider = field_input.source.provider(&row).map(str::to_owned);
+                    let current_text = input.read(cx).value().to_string();
+                    let source = field.accepts_secret_reference.then(|| {
+                        let driver = instance.driver.clone();
+                        let source_key = key.clone();
+                        let source_id = id.clone();
+                        let field_placeholder = field.placeholder.clone();
+                        let field_secret = field.secret;
+                        self.secret_source_select(
+                            SharedString::from(format!("provider-config-source-{key}")).into(),
+                            active_provider.as_deref(),
+                            disabled,
+                            move |next_provider, this, window, cx| {
+                                if this.form_denial(&driver, &format!("config.{source_key}"), cx).is_some() {
+                                    return;
+                                }
+                                let Some(saved_now) = this.current_form_instance(cx).map(|inst| form::field_value(&inst, &source_key)) else {
+                                    return;
+                                };
+                                let mut row = json!({ "value": saved_now });
+                                let Some(fi) = this.provider_form_mut().fields.iter_mut().find(|f| f.key == source_key) else {
+                                    return;
+                                };
+                                let stored = next_provider.is_none();
+                                let changed = fi.source.select(&mut row, next_provider);
+                                let value = if stored && field_secret { "" } else { fi.source.input_value(&row) }.to_owned();
+                                let masked = stored && field_secret;
+                                let placeholder = if !stored {
+                                    "op://vault/item/field"
+                                } else if field_secret {
+                                    "Not set"
+                                } else {
+                                    &field_placeholder
+                                }
+                                .to_owned();
+                                fi.masked = masked;
+                                fi.placeholder = placeholder.clone();
+                                fi.input.update(cx, |input, cx| {
+                                    input.set_value(value, window, cx);
+                                    input.set_masked(masked, window, cx);
+                                    input.set_placeholder(placeholder, window, cx);
+                                });
+                                this.provider_form_mut().error = None;
+                                if changed {
+                                    this.update_instance(
+                                        &source_id,
+                                        model::InstanceEdit::ConfigField {
+                                            key: source_key.clone(),
+                                            value: json!(""),
+                                        },
+                                        cx,
+                                    );
+                                }
+                                cx.notify();
+                            },
+                            cx,
+                        )
                     }).flatten();
+                    let secret_check = field
+                        .accepts_secret_reference
+                        .then(|| {
+                            let provider = saved.get("provider").and_then(Value::as_str)?;
+                            let reference = saved.get("reference").and_then(Value::as_str)?;
+                            (active_provider.as_deref() == Some(provider) && current_text == reference)
+                                .then(|| self.secret_check_button(SharedString::from(format!("secret-check-config-{key}")).into(), provider, reference, disabled, cx))
+                                .flatten()
+                        })
+                        .flatten();
+                    let configured = saved.is_object() || saved.as_str().is_some_and(|v| !v.is_empty());
+                    let has_source = source.is_some();
+                    let clear_key = key.clone();
+                    let clear_secret = field.secret;
+                    let clear_placeholder = field.placeholder.clone();
                     h_flex()
-                        .gap(r(8.))
-                        .child(div().w(r(224.)).child(Input::new(&input).small().disabled(disabled)))
+                        .gap(r(6.))
+                        .children(source)
+                        .child(div().w(r(if has_source { 208. } else { 224. })).child(Input::new(&input).small().disabled(disabled)))
                         .children(secret_check)
-                        .when(field.secret && saved.as_str().is_some_and(|v| !v.is_empty()), |el| {
+                        .when((field.secret || field.accepts_secret_reference) && configured, |el| {
                             el.child(
                                 Button::new(SharedString::from(format!("clear-config-{key}")), ButtonVariant::GhostMuted, ButtonSize::IconSm)
                                     .icon(Icon::X)
                                     .tooltip(format!("Clear {}", field.label))
                                     .disabled(disabled)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if let Some(fi) = this.provider_form_mut().fields.iter_mut().find(|f| f.key == clear_key) {
+                                            fi.source = form::SecretSourceDraft::default();
+                                            fi.masked = clear_secret;
+                                            let placeholder = if clear_secret { "Not set" } else { clear_placeholder.as_str() }.to_owned();
+                                            fi.placeholder = placeholder.clone();
+                                            fi.input.update(cx, |input, cx| {
+                                                input.set_value("", window, cx);
+                                                input.set_masked(clear_secret, window, cx);
+                                                input.set_placeholder(placeholder, window, cx);
+                                            });
+                                        }
+                                        this.provider_form_mut().error = None;
                                         this.update_instance(
                                             &id,
                                             model::InstanceEdit::ConfigField {
@@ -691,7 +845,7 @@ impl SettingsView {
                                                 value: json!(""),
                                             },
                                             cx,
-                                        )
+                                        );
                                     })),
                             )
                         })
@@ -814,13 +968,25 @@ impl SettingsView {
         sections
     }
 
-    fn variable_source(&self, index: usize, driver: &str, disabled: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let v = &self.provider_form().variables[index];
-        if !form::variable_sensitive(driver, &v.raw) {
-            return None;
-        }
-        let app = self.state.read(cx);
-        let config = app.server_config.config.as_ref()?;
+    fn is_one_password_provider(&self, source: &str, cx: &App) -> bool {
+        self.state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|c| c.settings.secret_providers.get(source))
+            .is_some_and(|p| p.kind == secrets::ONE_PASSWORD)
+    }
+
+    fn secret_source_select(
+        &self,
+        id: ElementId,
+        current: Option<&str>,
+        disabled: bool,
+        on_select: impl Fn(Option<String>, &mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let config = self.state.read(cx).server_config.config.as_ref()?;
         let mut sources = if config.secret_references {
             config
                 .settings
@@ -828,65 +994,92 @@ impl SettingsView {
                 .0
                 .iter()
                 .filter(|p| !matches!(t3_core::settings::secrets::classify(p), t3_core::settings::secrets::Classified::Unsupported))
-                .map(|p| (p.id.clone(), p.label.clone()))
+                .map(|p| (p.id.clone(), p.label.clone(), p.kind == secrets::ONE_PASSWORD))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        if sources.is_empty() && v.source.provider(&v.raw).is_none() {
+        if sources.is_empty() && current.is_none() {
             return None;
         }
-        if let Some(source) = v.source.provider(&v.raw)
-            && !sources.iter().any(|(id, _)| id == source)
+        if let Some(source) = current
+            && !sources.iter().any(|(id, _, _)| id == source)
         {
-            sources.push((source.to_owned(), source.to_owned()));
+            sources.push((source.to_owned(), source.to_owned(), false));
         }
-        let options = std::iter::once(SelectOption::new("__stored__", "Value"))
-            .chain(sources.into_iter().map(|(id, label)| SelectOption::new(id, label)))
-            .collect();
-        let source = v.source.provider(&v.raw).unwrap_or("__stored__").to_owned();
+        let selected = current.unwrap_or("__stored__").to_owned();
         if disabled {
-            return Some(div().text_xs().opacity(0.5).child(source).into_any_element());
+            let label = sources
+                .iter()
+                .find(|(id, _, _)| id == &selected)
+                .map_or_else(|| if current.is_none() { "Value".to_owned() } else { selected.clone() }, |(_, label, _)| label.clone());
+            return Some(div().text_xs().opacity(0.5).child(label).into_any_element());
         }
-        let id = v.id;
-        let driver = driver.to_owned();
+        let options = std::iter::once(SelectOption::new("__stored__", "Value").icon(Icon::FileText))
+            .chain(sources.into_iter().map(|(id, label, one_password)| {
+                SelectOption::new(id, label).icon(if one_password { Icon::OnePassword } else { Icon::KeyRound })
+            }))
+            .collect();
         let view = cx.entity().downgrade();
         Some(
-            Select::new(("provider-env-source", id), options)
-                .selected(source)
-                .width(128.)
+            Select::new(id, options)
+                .selected(selected)
+                .label("")
+                .popup_width(192.)
                 .on_change(move |source, window, cx| {
                     let _ = view.update(cx, |this, cx| {
-                        let name = this.provider_form().variables.iter().find(|v| v.id == id).and_then(|v| v.raw["name"].as_str()).unwrap_or("");
-                        if this.form_denial(&driver, &format!("environment.{name}"), cx).is_some() { return; }
-                        let Some(v) = this.provider_form_mut().variables.iter_mut().find(|v| v.id == id) else {
-                            return;
-                        };
-                        let stored = source.as_ref() == "__stored__";
-                        let changed = v.source.select(&mut v.raw, (!stored).then(|| source.to_string()));
-                        let value = v.source.input_value(&v.raw);
-                        v.value.update(cx, |input, cx| {
-                            input.set_value(value, window, cx);
-                            input.set_masked(stored && form::variable_sensitive(&driver, &v.raw), window, cx);
-                            input.set_placeholder(
-                                if stored && v.raw["valueRedacted"] == true {
-                                    "Stored secret, enter a new value to replace"
-                                } else if stored {
-                                    "value"
-                                } else {
-                                    "op://vault/item/field"
-                                },
-                                window,
-                                cx,
-                            );
-                        });
-                        if changed {
-                            this.publish_variables(cx);
-                        }
-                        cx.notify();
+                        let next = (source.as_ref() != "__stored__").then(|| source.to_string());
+                        on_select(next, this, window, cx);
                     });
                 })
                 .into_any_element(),
+        )
+    }
+
+    fn variable_source(&self, index: usize, driver: &str, disabled: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let v = &self.provider_form().variables[index];
+        if !form::variable_sensitive(driver, &v.raw) {
+            return None;
+        }
+        let id = v.id;
+        let driver = driver.to_owned();
+        let current = v.source.provider(&v.raw).map(str::to_owned);
+        self.secret_source_select(
+            ("provider-env-source", id).into(),
+            current.as_deref(),
+            disabled,
+            move |next_provider, this, window, cx| {
+                let name = this.provider_form().variables.iter().find(|v| v.id == id).and_then(|v| v.raw["name"].as_str()).unwrap_or("");
+                if this.form_denial(&driver, &format!("environment.{name}"), cx).is_some() {
+                    return;
+                }
+                let Some(v) = this.provider_form_mut().variables.iter_mut().find(|v| v.id == id) else {
+                    return;
+                };
+                let stored = next_provider.is_none();
+                let changed = v.source.select(&mut v.raw, next_provider);
+                let value = v.source.input_value(&v.raw);
+                v.value.update(cx, |input, cx| {
+                    input.set_value(value, window, cx);
+                    input.set_masked(stored && form::variable_sensitive(&driver, &v.raw), window, cx);
+                    input.set_placeholder(
+                        if stored && v.raw["valueRedacted"] == true {
+                            "Stored secret, enter a new value to replace"
+                        } else if stored {
+                            "value"
+                        } else {
+                            "op://vault/item/field"
+                        },
+                        window,
+                        cx,
+                    );
+                });
+                if changed {
+                    this.publish_variables(cx);
+                }
+                cx.notify();
+            },
+            cx,
         )
     }
 
@@ -1002,10 +1195,11 @@ impl SettingsView {
             }));
         if dedicated {
             let configured = redacted || reference || v.raw["value"].as_str().is_some_and(|s| !s.is_empty());
+            let has_source = source.is_some();
             return h_flex()
-                .gap(r(8.))
+                .gap(r(6.))
                 .children(source)
-                .child(div().w(r(224.)).child(value))
+                .child(div().w(r(if has_source { 208. } else { 224. })).child(value))
                 .children(check_button)
                 .children(configured.then_some(remove))
                 .children(denial.map(|reason| div().text_xs().text_color(hsla(palette(cx).muted_foreground)).child(reason)))
@@ -1113,11 +1307,20 @@ mod secret_check_tests {
                                         { "name": "CURSOR_API_KEY", "value": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/OpenAI/api-key" }, "sensitive": true },
                                         { "name": "CUSTOM_SECRET", "value": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/Custom/token" }, "sensitive": true }
                                     ]
+                                },
+                                "antigravity": {
+                                    "driver": "antigravity",
+                                    "enabled": true,
+                                    "displayName": "Antigravity Main",
+                                    "config": {
+                                        "apiKey": { "provider": "op-main", "reference": "op://Dev/Gemini/api-key" }
+                                    }
                                 }
                             }
                         },
                         "providers": [
-                            { "instanceId": "cursor", "driver": "cursor", "enabled": true, "installed": true, "status": "ready" }
+                            { "instanceId": "cursor", "driver": "cursor", "enabled": true, "installed": true, "status": "ready" },
+                            { "instanceId": "antigravity", "driver": "antigravity", "enabled": true, "installed": true, "status": "ready" }
                         ]
                     }))
                     .unwrap(),
@@ -1189,6 +1392,50 @@ mod secret_check_tests {
             std::fs::create_dir_all(&out).unwrap();
             cx.capture_screenshot(window.into()).unwrap().save(out.join("providers-secret-check.png")).unwrap();
         }
+
+        // Config fields with acceptsSecretReference=true (e.g. antigravity.apiKey) load saved
+        // references unmasked, check them, reject invalid 1Password refs, and commit new refs.
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.providers.selected = Some("antigravity".into());
+                view.provider_form_mut().runtime_open = true;
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let api_key = view.provider_form().fields.iter().find(|f| f.key == "apiKey").expect("antigravity apiKey field synced");
+                assert!(!api_key.masked, "saved secret reference config field must stay unmasked");
+                assert_eq!(api_key.input.read(cx).value().as_ref(), "op://Dev/Gemini/api-key");
+                api_key.input.update(cx, |input, cx| input.set_value("not-a-1p-ref", window, cx));
+                view.commit_config_field("apiKey", window, cx);
+                assert!(view.provider_form().error.is_some(), "invalid 1Password reference must surface error");
+            });
+        })
+        .unwrap();
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.updateSettings"));
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let api_key = view.provider_form().fields.iter().find(|f| f.key == "apiKey").expect("apiKey field");
+                api_key.input.update(cx, |input, cx| input.set_value("op://Dev/Gemini/next-key", window, cx));
+                view.commit_config_field("apiKey", window, cx);
+                assert!(view.provider_form().error.is_none());
+            });
+        })
+        .unwrap();
+        drive(&mut cx);
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.updateSettings").expect("updateSettings sent for apiKey secret ref");
+        assert_eq!(payload["providerInstanceMutation"]["instanceId"], json!("antigravity"));
+        assert_eq!(
+            payload["providerInstanceMutation"]["instance"]["config"]["apiKey"],
+            json!({ "provider": "op-main", "reference": "op://Dev/Gemini/next-key" })
+        );
+        let _ = reply.send(Ok(json!({})));
+        drive(&mut cx);
 
         // Missing settings:write / legacy orchestration:operate blocks checking.
         fixture.grants.send(Some(crate::context_menu::project_filter_tests::session(false))).unwrap();
