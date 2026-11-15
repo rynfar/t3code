@@ -568,6 +568,7 @@ impl Render for VideoPlayer {
             VideoUrlState::Unavailable(msg) => Some(msg.to_string()),
             _ => None,
         }) {
+            let missing_file_access = err == t3_core::media::MISSING_FILE_ACCESS_MESSAGE;
             v_flex()
                 .size_full()
                 .items_center()
@@ -580,25 +581,27 @@ impl Render for VideoPlayer {
                 .child(
                     h_flex()
                         .gap(px(8.))
-                        .child(
-                            h_flex()
-                                .id(retry_btn_id)
-                                .cursor_pointer()
-                                .gap(px(4.))
-                                .px(px(10.))
-                                .py(px(5.))
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(hsla(p.border))
-                                .bg(hsla(p.secondary))
-                                .text_xs()
-                                .text_color(hsla(p.foreground))
-                                .child(Icon::RefreshCw.render(px(12.), hsla(p.foreground)))
-                                .child("Retry")
-                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
-                        )
-                        .when(can_open, |row| {
+                        .when(!missing_file_access, |row| {
+                            row.child(
+                                h_flex()
+                                    .id(retry_btn_id)
+                                    .cursor_pointer()
+                                    .gap(px(4.))
+                                    .px(px(10.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(hsla(p.border))
+                                    .bg(hsla(p.secondary))
+                                    .text_xs()
+                                    .text_color(hsla(p.foreground))
+                                    .child(Icon::RefreshCw.render(px(12.), hsla(p.foreground)))
+                                    .child("Retry")
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                            )
+                        })
+                        .when(can_open && !missing_file_access, |row| {
                             row.child(
                                 h_flex()
                                     .id(SharedString::from(format!("video-err-open-{}", cx.entity_id().as_u64())))

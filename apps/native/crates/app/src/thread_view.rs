@@ -992,11 +992,39 @@ impl ThreadView {
         cx.notify();
     }
 
-    /// Public hook for disclosure panels (`command_output`, `inspector`) to request scrolling an
-    /// expanded row out from behind the bottom edge once its content is ready (used by #384).
-    #[allow(dead_code)]
-    pub fn reveal_disclosure_for_entry(&mut self, row_id: &str, entry_id: &str, ready: bool, cx: &mut Context<Self>) {
-        self.begin_disclosure_reveal(row_id, Some(entry_id), None, ready, cx);
+    /// Ordered `cd` working directories visited by shell commands before `source_key` (newest first,
+    /// mirroring `agentDirectories` in `MessagesTimeline.tsx`, `pingdotgg/t3code#36364`).
+    pub fn agent_working_directories_for_key(&self, source_key: Option<&str>) -> Vec<String> {
+        let entries = self.entries_cache.entries();
+        let end_index = source_key
+            .and_then(|key| {
+                let rest = key
+                    .strip_prefix("assistant:")
+                    .or_else(|| key.strip_prefix("user:"))
+                    .or_else(|| key.strip_prefix("plan:"))?;
+                let id = rest.split(':').next().unwrap_or(rest);
+                entries.iter().position(|entry| match &entry.kind {
+                    t3_core::timeline::EntryKind::Message(message) => message.id == id,
+                    t3_core::timeline::EntryKind::ProposedPlan(plan) => plan.id == id,
+                    _ => false,
+                })
+            })
+            .unwrap_or(entries.len());
+
+        let mut commands: Vec<&str> = Vec::new();
+        for timeline_entry in entries[..end_index].iter().rev() {
+            let t3_core::timeline::EntryKind::Work(entry) = &timeline_entry.kind else {
+                continue;
+            };
+            if let Some(cmd) = entry.raw_command.as_deref().or(entry.command.as_deref()) {
+                commands.push(cmd);
+            } else if let Some(item) = entry.item.as_ref()
+                && let t3_core::turn_item::TurnItemKind::CommandExecution { input, .. } = &item.kind
+            {
+                commands.push(input.as_str());
+            }
+        }
+        t3_core::markdown::links::agent_working_directories_from_commands(commands)
     }
 
     /// Marks an entry's pending disclosure reveal ready after initial async output/detail loads.
@@ -1146,8 +1174,15 @@ impl ThreadView {
             self.load_deferred_work(anchors, cx);
             if let Some(entry) = self.find_entry(key) {
                 self.fetch_detail(&entry, cx);
-                if entry.item.as_ref().is_some_and(|item| matches!(self.details.get(&item.id), Some(Detail::Loading { .. }))) {
-                    pending_async = true;
+                if let Some(item) = entry.item.as_ref() {
+                    let (loading, loaded) = match self.details.get(&item.id) {
+                        Some(Detail::Loading { .. }) => (true, None),
+                        Some(Detail::Loaded { item, .. }) => (false, Some(&**item)),
+                        _ => (false, None),
+                    };
+                    if loading || !t3_core::command_output::item_within_inline_budget(item, loaded, 16 * 1024) {
+                        pending_async = true;
+                    }
                 }
             }
         }
@@ -1198,7 +1233,7 @@ impl ThreadView {
             let pump = cx.spawn(async move |this, cx| {
                 while status.changed().await.is_ok() {
                     let next = status.borrow_and_update().clone();
-                    let ready = next.output.is_some() || next.error.is_some();
+                    let ready = !matches!(next.panel(), t3_core::command_output::Panel::Loading);
                     let updated = this.update(cx, |view, cx| {
                         let Some(slot) = view.command_outputs.get_mut(&key) else { return };
                         if slot.update(next) {
@@ -2236,7 +2271,7 @@ impl Render for ThreadView {
                             })),
                     ),
             )
-            .child(minimap).children(banners).children(find_bar).children(scroll_to_end).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+            .child(minimap).children(banners).children(find_bar).children(scroll_to_end).children(self.render_citation_toolbar(window, cx)).children(crate::transcript::markdown::links::render_model_mention_popover(cx.entity().entity_id(), window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }
 
@@ -4235,6 +4270,97 @@ mod tests {
         });
         view.read_with(vcx, |view, _| {
             assert!(view.pending_disclosure_reveal.is_none(), "caller-sourced smooth_scroll_by must clear pending_disclosure_reveal");
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn agent_working_directories_prefers_latest_cd_before_source_key(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let cmd = |pos: usize, id: &str, command: &str| {
+            serde_json::json!({
+                "position": pos,
+                "visibility": "local",
+                "sourceThreadId": "t1",
+                "sourceItemId": id,
+                "item": {
+                    "id": id,
+                    "threadId": "t1",
+                    "runId": "r1",
+                    "nodeId": null,
+                    "parentItemId": null,
+                    "ordinal": pos + 1,
+                    "type": "command_execution",
+                    "status": "completed",
+                    "title": null,
+                    "startedAt": null,
+                    "completedAt": "2026-04-01T00:00:02.000Z",
+                    "updatedAt": "2026-04-01T00:00:02.000Z",
+                    "input": command,
+                    "output": "ok"
+                }
+            })
+        };
+        let items = vec![
+            test_user_item("t1", 0, "m-u-0", "Prompt"),
+            cmd(1, "cmd-1", "cd /repo/first && ls"),
+            cmd(2, "cmd-2", "cd /repo/latest && pwd"),
+            test_assistant_item("t1", 3, "m-a-0", "r1", "Reply 1"),
+            cmd(4, "cmd-3", "cd /repo/after && pwd"),
+            test_assistant_item("t1", 5, "m-a-1", "r1", "Reply 2"),
+        ];
+        let runs_json = serde_json::json!([{
+            "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+            "modelSelection": {"instanceId": "replay", "model": "replay"},
+            "userMessageId": "m-u-0", "rootNodeId": null, "status": "completed",
+            "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+            "completedAt": "2026-04-01T00:00:03.000Z"
+        }]);
+        let snap = test_snapshot_json("t1", runs_json, items);
+        state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 6, "visibleItemCount": 6
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _| {
+            assert_eq!(
+                view.agent_working_directories_for_key(Some("assistant:m-a-0")),
+                vec!["/repo/latest".to_owned(), "/repo/first".to_owned()]
+            );
+            assert_eq!(
+                view.agent_working_directories_for_key(Some("assistant:m-a-1")),
+                vec!["/repo/after".to_owned(), "/repo/latest".to_owned(), "/repo/first".to_owned()]
+            );
         });
     }
 }

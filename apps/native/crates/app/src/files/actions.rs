@@ -6,7 +6,6 @@ use gpui::{ClipboardItem, Context};
 use t3_core::files::{absolute_path, clipboard_path, composer_file_link, file_surface_path};
 
 use crate::app_state::AppState;
-use crate::toast::{Toast, ToastKind};
 
 /// Where the open thread's files live (`RightPanelFileProps`): its worktree, else its project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +56,6 @@ impl AppState {
     /// "Copy mention".
     pub fn copy_file_mention(&mut self, path: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(composer_file_link(path)));
-        self.show_toast(Toast::new(ToastKind::Success, "Mention copied").description(path.to_owned()), cx);
     }
 
     /// "Add to chat": queued for the composer like the file picker's mentions.
@@ -70,7 +68,6 @@ impl AppState {
     pub fn copy_file_path(&mut self, relative_path: &str, cx: &mut Context<Self>) {
         let cwd = self.file_workspace().map(|workspace| workspace.cwd).unwrap_or_default();
         let path = clipboard_path(relative_path, &absolute_path(relative_path, &cwd));
-        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-        self.show_toast(Toast::new(ToastKind::Success, "Path copied").description(path), cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(path));
     }
 }

@@ -2,6 +2,8 @@
 //! `TimelinePendingApprovalRow.tsx`, laid out per design system §7.7; an open tool row shows the
 //! inspector (`inspector.rs`).
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListSizingBehavior, ListState, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, list, prelude::FluentBuilder, px};
@@ -22,7 +24,8 @@ use t3_core::turn_item::{TurnItem, TurnItemKind};
 use super::command_output;
 use super::inspector::{Fetch, ItemInspector, Mode, plain_body, question_history};
 use super::markdown::{MarkdownStore, prose};
-use super::media::tool_output_image;
+use super::media::{tool_output_image, tool_output_image_gallery_items};
+use crate::media::ViewerItem;
 use super::notices::{SubagentLiveElapsed, plain_detail, provider_marks, subagent_avatar};
 use super::parts::{InlineTone, chevron, focusable, icon_slot, inline_button, inline_button_with, outline_button, timestamp, work_line, work_row_frame};
 use super::{Detail, RowEnv};
@@ -255,6 +258,35 @@ fn thread_read_target(entry: &WorkLogEntry, preview: &str, env: &RowEnv, cx: &Ap
     Some((prefix, target_id, title))
 }
 
+type ViewedGallery = Arc<Vec<(String, ViewerItem)>>;
+
+thread_local! {
+    static GROUP_GALLERY: RefCell<Option<ViewedGallery>> = const { RefCell::new(None) };
+}
+
+struct GroupGalleryGuard(Option<ViewedGallery>);
+
+impl Drop for GroupGalleryGuard {
+    fn drop(&mut self) {
+        GROUP_GALLERY.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
+}
+
+fn collect_group_viewed_gallery(
+    members: &[Arc<WorkLogEntry>],
+    thread_id: Option<&str>,
+    workspace_root: Option<&str>,
+) -> Vec<(String, ViewerItem)> {
+    members
+        .iter()
+        .filter(|entry| entry.item_type != Some("reasoning"))
+        .filter_map(|entry| {
+            let viewed = work_entry_viewed_image(entry, thread_id, workspace_root)?;
+            Some((entry.id.clone(), ViewerItem::image(viewed.source, viewed.alt)))
+        })
+        .collect()
+}
+
 /// The open group's members in their own virtualized list (`ExpandedWorkGroupEntries`, a
 /// LegendList on the web): `min(288px, 50% of the window)` tall, plus room for members the user
 /// opened, so only the rows in view are built. A group of thoughts is the reasoning trace,
@@ -276,11 +308,16 @@ fn group_list(id: &str, members: Vec<Arc<WorkLogEntry>>, env: &RowEnv, cx: &mut 
         }
         state.clone()
     };
+    let gallery = Arc::new(collect_group_viewed_gallery(&members, env.thread_id, env.workspace_root));
     let members = Arc::new(members);
     let list = list(
         state,
         cx.processor(move |view: &mut ThreadView, ix: usize, _window, cx| match members.get(ix) {
-            Some(entry) => view.render_group_member(entry, cx),
+            Some(entry) => {
+                let prev = GROUP_GALLERY.with(|cell| cell.borrow_mut().replace(gallery.clone()));
+                let _guard = GroupGalleryGuard(prev);
+                view.render_group_member(entry, cx)
+            }
             None => div().into_any_element(),
         }),
     )
@@ -490,6 +527,31 @@ fn entry_row(
         );
     } else if expanded {
         if let Some(viewed) = viewed_image {
+            let group_gallery = grouped.then(|| {
+                GROUP_GALLERY.with(|cell| {
+                    let guard = cell.borrow();
+                    let list = guard.as_ref()?;
+                    let index = list.iter().position(|(id, _)| id == &entry.id)?;
+                    let items: Vec<ViewerItem> = list.iter().map(|(_, item)| item.clone()).collect();
+                    Some((items, index))
+                })
+            }).flatten();
+            let media_el = if let Some((items, index)) = group_gallery {
+                tool_output_image_gallery_items(
+                    SharedString::from(format!("work-viewed:{}", entry.id)),
+                    items,
+                    index,
+                    &viewed.alt,
+                    cx,
+                )
+            } else {
+                tool_output_image(
+                    SharedString::from(format!("work-viewed:{}", entry.id)),
+                    viewed.source,
+                    &viewed.alt,
+                    cx,
+                )
+            };
             frame = frame.child(
                 div()
                     .id(SharedString::from(format!("work-media:{}", entry.id)))
@@ -497,7 +559,7 @@ fn entry_row(
                     .mt(rem(4.))
                     .mb(rem(6.))
                     .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(tool_output_image(SharedString::from(format!("work-viewed:{}", entry.id)), viewed.source, &viewed.alt, cx)),
+                    .child(media_el),
             );
         }
         if let Some(body) = entry_body(entry, env.workspace_root) {
@@ -521,11 +583,25 @@ fn expanded_body(entry: &WorkLogEntry, body: EntryBody, env: &RowEnv, cx: &mut C
             .w_full()
             .min_w_0()
             .children(text.map(|text| plain_body(&entry.id, &text, cx)))
-            .when(fetches, |this| this.child(ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::OutputOnly, cx.entity_id())))
+            .when(fetches, |this| {
+                let weak_view = cx.weak_entity();
+                let ready_id = entry.id.clone();
+                this.child(
+                    ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::OutputOnly, cx.entity_id())
+                        .on_initial_output_ready(Rc::new(move |cx| {
+                            let _ = weak_view.update(cx, |view, cx| view.mark_disclosure_content_ready(&ready_id, cx));
+                        })),
+                )
+            })
             .into_any_element(),
         EntryBody::Inspector => {
-            let mut inspector =
-                ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::Full, cx.entity_id()).workspace_root(env.workspace_root);
+            let weak_view = cx.weak_entity();
+            let ready_id = entry.id.clone();
+            let mut inspector = ItemInspector::new(&entry.id, item.clone(), fetch_state(entry, &item, env), Mode::Full, cx.entity_id())
+                .workspace_root(env.workspace_root)
+                .on_initial_output_ready(Rc::new(move |cx| {
+                    let _ = weak_view.update(cx, |view, cx| view.mark_disclosure_content_ready(&ready_id, cx));
+                }));
             // The server streams the output, live and then final, in place of the item's own.
             if let Some(outputs) = env.command_outputs
                 && matches!(item.kind, TurnItemKind::CommandExecution { .. })
@@ -851,4 +927,44 @@ pub fn group_header(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView
             cx,
         ))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use t3_core::turn_item::TurnItem;
+
+    use super::*;
+
+    fn work_entry(id: &str, item_type: &'static str, viewed_path: Option<&str>, input: serde_json::Value) -> Arc<WorkLogEntry> {
+        let item: TurnItem = serde_json::from_value(json!({
+            "id": id,
+            "type": item_type,
+            "status": "completed",
+            "title": "Viewed image",
+            "input": input,
+        }))
+        .unwrap();
+        let mut entry = WorkLogEntry::default();
+        entry.id = id.into();
+        entry.created_at = "2026-01-01T00:00:00Z".into();
+        entry.label = "Viewed image".into();
+        entry.item_type = Some(item_type);
+        entry.viewed_image_path = viewed_path.map(str::to_owned);
+        entry.item = Some(Arc::new(item));
+        Arc::new(entry)
+    }
+
+    #[test]
+    fn collect_viewed_gallery_preserves_order_and_skips_non_images() {
+        let members = vec![
+            work_entry("e1", "file_read", Some("a.png"), json!({ "path": "a.png" })),
+            work_entry("e2", "command_execution", None, json!("ls")),
+            work_entry("e3", "file_read", Some("b.png"), json!({ "path": "b.png" })),
+        ];
+        let gallery = collect_group_viewed_gallery(&members, Some("thr-1"), Some("/repo"));
+        assert_eq!(gallery.len(), 2);
+        assert_eq!(gallery[0].0, "e1");
+        assert_eq!(gallery[1].0, "e3");
+    }
 }

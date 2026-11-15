@@ -250,19 +250,19 @@ mod tests {
         assert!(matches!(state.prepare_fetch(0.), AssetFetch::Ready(_)));
     }
     #[test]
-    fn mounted_refresh_shares_mints_and_remounts_only_after_five_minutes() {
+    fn mounted_refresh_shares_mints_and_remounts_only_after_thirty_minutes() {
         let mut state = RevisionedAssetUrl::new(None, false);
         assert!(state.read(None));
         state.settle(Ok(minted(0, Some("same"), 7_200_000.)), 0.);
-        assert!(!state.refresh(300_000., true, false));
-        assert!(!state.refresh(299_999., true, true));
-        assert!(state.refresh(300_000., true, true));
-        assert!(!state.refresh(300_000., true, true));
-        state.settle(Ok(minted(1, Some("same"), 7_200_000.)), 300_000.);
+        assert!(!state.refresh(1_800_000., true, false));
+        assert!(!state.refresh(1_799_999., true, true));
+        assert!(state.refresh(1_800_000., true, true));
+        assert!(!state.refresh(1_800_000., true, true));
+        state.settle(Ok(minted(1, Some("same"), 7_200_000.)), 1_800_000.);
         assert_eq!(url(&state), "/a/0");
-        assert!(!state.refresh(2_100_000., false, false));
-        assert!(state.refresh(2_100_000., false, true));
-        assert!(!state.refresh(2_100_000., false, true));
+        assert!(!state.refresh(3_600_000., false, false));
+        assert!(state.refresh(3_600_000., false, true));
+        assert!(!state.refresh(3_600_000., false, true));
     }
 
     #[test]

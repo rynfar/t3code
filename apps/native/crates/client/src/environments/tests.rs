@@ -1061,3 +1061,65 @@ async fn server_config_snapshot_records_server_clock_offset() {
     assert!(shifted_saved > base_ms + 1_000_000, "saved env id should reflect future serverTime");
     assert_eq!(shifted_canonical, shifted_saved);
 }
+
+#[tokio::test]
+async fn fetch_thread_link_metadata_routes_to_metadata_rpc_or_legacy_titles_rpc() {
+    let mut server = FakeServer::start().await;
+    let (handle, _events) = crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut socket = server.connection().await;
+    let config = socket.request(method::SUBSCRIBE_SERVER_CONFIG).await;
+    socket.chunk(&config, json!([{"type":"snapshot","config":{}}])).await;
+
+    let meta_task = tokio::spawn({
+        let handle = handle.clone();
+        let ids = vec!["thr-1".to_owned(), "thr-2".to_owned()];
+        async move { super::fetch_thread_link_metadata(&handle, &ids, true).await }
+    });
+    let req = socket.request(t3_core::markdown::links::GET_THREAD_LINK_METADATA).await;
+    assert_eq!(req["payload"], json!({ "threadIds": ["thr-1", "thr-2"] }));
+    socket
+        .send(json!({
+            "_tag": "Exit",
+            "requestId": req["id"],
+            "exit": {
+                "_tag": "Success",
+                "value": {
+                    "entries": [
+                        { "threadId": "thr-1", "title": "Auth flow", "projectId": "proj-a" }
+                    ]
+                }
+            }
+        }))
+        .await;
+    let resolved = meta_task.await.unwrap().unwrap();
+    assert_eq!(
+        resolved.get("thr-1"),
+        Some(&t3_core::markdown::links::ThreadLinkMetadata {
+            title: "Auth flow".into(),
+            project_id: Some("proj-a".into()),
+        })
+    );
+
+    let legacy_task = tokio::spawn({
+        let handle = handle.clone();
+        let ids = vec!["thr-2".to_owned()];
+        async move { super::fetch_thread_link_metadata(&handle, &ids, false).await }
+    });
+    let req2 = socket.request(t3_core::markdown::links::GET_THREAD_TITLES).await;
+    assert_eq!(req2["payload"], json!({ "threadIds": ["thr-2"] }));
+    socket
+        .send(json!({
+            "_tag": "Exit",
+            "requestId": req2["id"],
+            "exit": { "_tag": "Success", "value": { "titles": { "thr-2": "Legacy title" } } }
+        }))
+        .await;
+    let resolved2 = legacy_task.await.unwrap().unwrap();
+    assert_eq!(
+        resolved2.get("thr-2"),
+        Some(&t3_core::markdown::links::ThreadLinkMetadata {
+            title: "Legacy title".into(),
+            project_id: None,
+        })
+    );
+}

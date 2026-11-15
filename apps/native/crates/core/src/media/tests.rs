@@ -59,8 +59,16 @@ fn resolves_media_sources_to_assets_or_direct_urls() {
     let resolved = resolve_media_source("shots/a.png", Some("t1"), Some("/repo"), true).unwrap();
     assert_eq!(resolved.kind, MediaKind::Image);
     assert_eq!(resolved.name, "a.png");
-    assert_eq!(resolved.source, Some(MediaSource::Asset(AssetResource::MediaFile { thread_id: "t1".into(), path: "/repo/shots/a.png".into() })));
+    let expected = AssetResource::RemoteMediaFile { thread_id: "t1".into(), path: "/repo/shots/a.png".into() };
+    assert_eq!(resolved.source, Some(MediaSource::Asset(expected.clone())));
+    assert_eq!(expected.to_json()["hostOnly"], json!(true));
+    assert!(expected.requires_filesystem_read());
+    assert!(!AssetResource::Attachment { attachment_id: "a".into() }.requires_filesystem_read());
     assert_eq!(resolve_media_source("/tmp/a.png", None, None, true).unwrap().source, None);
+    assert_eq!(
+        resolve_media_source("/tmp/a.png", Some("t1"), Some("/repo"), true).unwrap().source,
+        Some(MediaSource::Asset(AssetResource::MediaFile { thread_id: "t1".into(), path: "/tmp/a.png".into() }))
+    );
     assert_eq!(resolve_media_source("//cdn.dev/a.png", None, None, true).unwrap().source, Some(MediaSource::Direct("https://cdn.dev/a.png".into())));
     assert_eq!(resolve_media_source("https://x.dev/clip.mp4", None, None, true).unwrap().kind, MediaKind::Video);
     assert_eq!(resolve_media_source("https://x.dev/song.mp3", None, None, true), None);
@@ -96,6 +104,9 @@ fn decodes_data_urls_and_asset_results() {
         AssetResource::Attachment { attachment_id: "x".into() }.create_url_request(),
         json!({ "resource": { "_tag": "attachment", "attachmentId": "x" } })
     );
+    assert_eq!(markdown_image_copy("Shot", "/work/my shot.png", None), "![Shot](</work/my shot.png>)");
+    assert_eq!(markdown_image_copy("Shot", "/work/a(1)<b>\\c.png", Some("say \"hi\"")), "![Shot](</work/a(1)\\<b\\>\\\\c.png> \"say \\\"hi\\\"\")");
+    assert_eq!(markdown_image_copy("Shot", "/work/plain.png", None), "![Shot](/work/plain.png)");
 }
 
 #[test]
