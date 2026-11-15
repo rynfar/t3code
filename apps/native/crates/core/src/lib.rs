@@ -57,6 +57,7 @@ pub mod traits;
 pub mod turn_item;
 pub mod usage;
 pub mod vcs;
+pub mod voice_input;
 pub mod wire;
 pub mod workflows;
 pub mod workspace;
