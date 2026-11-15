@@ -206,7 +206,7 @@ impl Composer {
         let mut draft = self.drafts.store.get(&drafts::key(&target)).cloned().unwrap_or_default();
         draft.updated_at = crate::sidebar::controller::now_ms();
         draft.workspace = Some(DraftWorkspace { destination: Some(scope.destination), branch: None, environment_id: scope.environment, project_root: scope.root, mode, previous });
-        self.drafts.store.set(&drafts::key(&target), draft);
+        self.mutate_drafts(cx, |store| store.set(&drafts::key(&target), draft));
         self.schedule_draft_save(&target, cx);
         self.workspace.open = false;
         self.error = None;
@@ -375,7 +375,7 @@ impl Composer {
         self.record_draft(&target, cx);
         let mut draft = self.drafts.store.get(&drafts::key(&target)).cloned().unwrap_or_default();
         draft.workspace = Some(choice);
-        self.drafts.store.set(&drafts::key(&target), draft);
+        self.mutate_drafts(cx, |store| store.set(&drafts::key(&target), draft));
         self.schedule_draft_save(&target, cx);
         self.sync_workspace(false, cx);
         self.sync_menu(true, cx);

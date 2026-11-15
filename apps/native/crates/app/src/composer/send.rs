@@ -639,7 +639,7 @@ impl Composer {
         let shown = self.state.read(cx).environment() == taken.environment.as_deref() && self.snapshot.target.as_ref() == Some(target);
         let live = self.current_draft(target, cx);
         let text = taken.draft.restored_prompt();
-        if self.drafts.store.restore(&super::drafts::key(target), taken.draft, &live) {
+        if self.mutate_drafts(cx, |store| store.restore(&super::drafts::key(target), taken.draft, &live)) {
             self.restore_attachments(target, taken.attachments);
             self.restore_threads(target, taken.threads);
             self.seed_records(target, taken.records);
@@ -675,7 +675,7 @@ impl Composer {
             if concurrent_edit {
                 expected.prompt = "concurrent edit in original target".into();
                 expected.attachments[0].id = "concurrent-attachment".into();
-                self.drafts.store.set(&super::drafts::key(&original), expected.clone());
+                self.mutate_drafts(cx, |store| store.set(&super::drafts::key(&original), expected.clone()));
             }
             self.finish_launch(SubmitIntent::Foreground, (Err(error.into()), None), taken, window, cx);
             let recovered = self.drafts.store.get(&super::drafts::key(&original)).ok_or("failed send lost original draft")?;

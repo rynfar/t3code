@@ -13,7 +13,7 @@ use t3_client::supervisor::ConnectionStatus;
 use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::managed_policy::{Capability, capability_denial};
 use t3_core::settings::scheduled_tasks::{RunStatus, ScheduledTask, decode_list, id_payload, method, set_enabled_payload};
-use t3_core::thread_details::{automation_schedule_line, tasks_for_thread};
+use t3_core::thread_details::{automation_schedule_line_in, tasks_for_thread};
 
 use super::controls::{hover_fill, section_with_action};
 use super::view::DetailsView;
@@ -41,6 +41,7 @@ fn once_label(ms: i64) -> String {
 pub(super) struct AutomationsFeed {
     connection: Option<u64>,
     tasks: Vec<ScheduledTask>,
+    time_zone: Option<String>,
     error: Option<String>,
     busy_task: Option<String>,
     feed: Option<(Abort, Task<()>)>,
@@ -48,7 +49,7 @@ pub(super) struct AutomationsFeed {
 
 impl AutomationsFeed {
     pub fn new() -> Self {
-        AutomationsFeed { connection: None, tasks: Vec::new(), error: None, busy_task: None, feed: None }
+        AutomationsFeed { connection: None, tasks: Vec::new(), time_zone: None, error: None, busy_task: None, feed: None }
     }
 
     pub fn count_for(&self, thread_id: &str) -> usize {
@@ -65,6 +66,7 @@ impl AutomationsFeed {
             if self.feed.take().is_some() {
                 self.connection = None;
                 self.tasks.clear();
+                self.time_zone = None;
                 self.error = None;
                 self.busy_task = None;
             }
@@ -76,11 +78,12 @@ impl AutomationsFeed {
         self.feed = None;
         self.connection = connection;
         self.tasks.clear();
+        self.time_zone = None;
         self.error = None;
         self.busy_task = None;
 
         let Some(client) = app.client_handle() else { return };
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<Vec<ScheduledTask>, String>>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<(Vec<ScheduledTask>, Option<String>), String>>();
         let driver = app.runtime().spawn(async move {
             let mut attempt = 0u32;
             loop {
@@ -91,8 +94,9 @@ impl AutomationsFeed {
                             match item {
                                 Ok(value) => {
                                     attempt = 0;
+                                    let time_zone = value.get("timeZone").and_then(serde_json::Value::as_str).map(str::to_owned);
                                     if let Some(tasks) = decode_list(&value)
-                                        && tx.send(Ok(tasks)).is_err()
+                                        && tx.send(Ok((tasks, time_zone))).is_err()
                                     {
                                         return;
                                     }
@@ -127,9 +131,10 @@ impl AutomationsFeed {
                 }
                 let applied = this.update(cx, |view, cx| {
                     match update {
-                        Ok(tasks) => {
-                            if view.automations.tasks != tasks || view.automations.error.is_some() {
+                        Ok((tasks, time_zone)) => {
+                            if view.automations.tasks != tasks || view.automations.time_zone != time_zone || view.automations.error.is_some() {
                                 view.automations.tasks = tasks;
+                                view.automations.time_zone = time_zone;
                                 view.automations.error = None;
                                 cx.notify();
                             }
@@ -201,7 +206,7 @@ impl AutomationsFeed {
             .into_iter()
             .map(|task| {
                 let title = if task.title.trim().is_empty() { task.prompt.as_str() } else { task.title.as_str() }.to_owned();
-                let subtitle = automation_schedule_line(task, once_label, now);
+                let subtitle = automation_schedule_line_in(task, once_label, self.time_zone.as_deref(), now);
                 let dot_color = match task.last_run_status {
                     RunStatus::Running => hsla(p.info),
                     RunStatus::Succeeded => hsla(p.success),

@@ -168,7 +168,7 @@ fn terminal_run_status(status: &str) -> bool {
 
 fn shell_runtime(thread: &ThreadShell) -> Option<RuntimeSummary> {
     let park_at_idle = background_work_holds_completion(&thread.pending_background_tasks) && thread.status != "failed";
-    if thread.latest_run_id.is_none() && thread.active_provider_thread_id.is_none() && !park_at_idle {
+    if thread.latest_run_id.is_none() && !park_at_idle {
         return None;
     }
     let status = if park_at_idle {

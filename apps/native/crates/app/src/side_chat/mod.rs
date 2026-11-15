@@ -30,6 +30,8 @@ struct Starting {
     parent: String,
     target: String,
     prompt: Option<String>,
+    runtime_mode: t3_core::server_config::RuntimeMode,
+    model_selection: Option<t3_core::model::ModelSelection>,
     _timeout: Task<()>,
 }
 
@@ -222,6 +224,15 @@ impl AppState {
             self.show_toast(Toast::new(ToastKind::Warning, "Side chat unavailable").description(reason), cx);
             return false;
         }
+        let Some(parent_thread) = self.thread_shell(&parent).cloned() else { return false };
+        let (choice_model, choice_runtime) = crate::composer::thread_choices(&parent, cx);
+        let (runtime_mode, model_selection) = side_chat::resolve_parent_settings(
+            self.server_config.config.as_ref(),
+            &parent_thread,
+            choice_model.as_ref(),
+            choice_runtime,
+            self.client_settings.plan_mode_enabled,
+        );
         let target = uuid_v4();
         let prompt = prompt.map(|text| text.trim().to_owned()).filter(|text| !text.is_empty());
         let command = side_chat::fork_command(&uuid_v4(), &parent, &target);
@@ -235,7 +246,7 @@ impl AppState {
                 }
             });
         });
-        self.side_threads.starting = Some(Starting { parent, target: target.clone(), prompt, _timeout: timeout });
+        self.side_threads.starting = Some(Starting { parent, target: target.clone(), prompt, runtime_mode, model_selection, _timeout: timeout });
         self.dispatch_then(command, None, cx, move |state, ok, cx| {
             if !ok && state.side_threads.starting.as_ref().is_some_and(|starting| starting.target == target) {
                 state.side_threads.starting = None;
@@ -256,14 +267,41 @@ impl AppState {
             self.fail_side_chat_start(&target, "The side chat is no longer available.", cx);
             return;
         }
-        if self.shell.thread(&target).is_none() {
+        let Some(side_chat_mode) = self.shell.thread(&target).map(|thread| thread.runtime_mode.clone()) else {
+            return;
+        };
+        let Some(Starting { parent, target, prompt, runtime_mode, model_selection, .. }) = self.side_threads.starting.take() else { return };
+        if t3_core::server_config::RuntimeMode::parse(&side_chat_mode) != Some(runtime_mode) {
+            let mode_command = t3_core::commands::set_runtime_mode(&uuid_v4(), &target, runtime_mode);
+            let environment = self.environments.active.clone();
+            self.dispatch_then(mode_command, None, cx, move |state, ok, cx| {
+                if state.environments.active != environment {
+                    return;
+                }
+                if ok {
+                    state.finish_side_chat_start(parent, target, prompt, runtime_mode, model_selection, cx);
+                } else {
+                    state.fail_side_chat_start(&target, "Could not set the side chat's permission mode.", cx);
+                }
+            });
             return;
         }
-        let Some(Starting { parent, target, prompt, .. }) = self.side_threads.starting.take() else { return };
+        self.finish_side_chat_start(parent, target, prompt, runtime_mode, model_selection, cx);
+    }
+
+    fn finish_side_chat_start(
+        &mut self,
+        parent: String,
+        target: String,
+        prompt: Option<String>,
+        runtime_mode: t3_core::server_config::RuntimeMode,
+        model_selection: Option<t3_core::model::ModelSelection>,
+        cx: &mut Context<Self>,
+    ) {
         // Send before showing the tab: closing a tab whose side chat has no run deletes it.
         match prompt {
             Some(text) => {
-                let command = side_chat::first_message_command(&uuid_v4(), &target, &uuid_v4(), &text);
+                let command = side_chat::first_message_command(&uuid_v4(), &target, &uuid_v4(), &text, Some(runtime_mode), model_selection.as_ref());
                 let environment = self.environments.active.clone();
                 self.dispatch_then(command, None, cx, move |state, ok, cx| {
                     if state.environments.active != environment {
@@ -276,7 +314,16 @@ impl AppState {
                     }
                 });
             }
-            None => self.show_side_chat_tab(&parent, &target, cx),
+            None => {
+                if let Some(selection) = model_selection {
+                    let seed_target = target.clone();
+                    cx.spawn(async move |_, cx| {
+                        cx.update(|cx| crate::composer::drafts::seed_side_chat_model_selection(&seed_target, selection, cx));
+                    })
+                    .detach();
+                }
+                self.show_side_chat_tab(&parent, &target, cx);
+            }
         }
     }
 
@@ -354,11 +401,65 @@ impl AppState {
         let id = side_chat.to_owned();
         self.dispatch_then(side_chat::delete_command(&uuid_v4(), side_chat, false), Some("Could not delete the side chat"), cx, move |state, ok, cx| {
             state.side_threads.busy.retain(|busy| *busy != id);
-            if ok && state.panels.panels.close_surface(&parent, &Surface::side_chat(&id).id) {
-                state.save_panels(cx);
+            if ok {
+                state.clear_deleted_thread_drafts_later(vec![id.clone()], cx);
+                if state.panels.panels.close_surface(&parent, &Surface::side_chat(&id).id) {
+                    state.save_panels(cx);
+                }
             }
             cx.emit(AppEvent::SideThread);
         });
+    }
+
+    pub(crate) fn collect_side_chats_for_deleted_thread(&self, thread_id: &str, out: &mut Vec<String>) {
+        if !out.iter().any(|existing| existing == thread_id) {
+            out.push(thread_id.to_owned());
+        }
+        if let Some(snapshot) = &self.shell.snapshot {
+            for thread in &snapshot.threads {
+                if side_chat::is_side_chat_of(thread, thread_id) && !out.iter().any(|existing| existing == &thread.id) {
+                    out.push(thread.id.clone());
+                }
+            }
+        }
+        for (id, thread_state) in &self.side_threads.threads {
+            let is_child = thread_state.projection.as_ref().is_some_and(|p| {
+                p.thread.lineage.side_chat == Some(true)
+                    && p.thread.lineage.parent_thread_id.as_deref() == Some(thread_id)
+            });
+            if is_child && !out.iter().any(|existing| existing == id) {
+                out.push(id.clone());
+            }
+        }
+    }
+
+    pub(crate) fn fetch_family_side_chats(&self, thread_id: &str) -> Option<impl std::future::Future<Output = Vec<String>> + 'static> {
+        let enabled = self.server_config.config.as_ref().is_some_and(|config| config.shell_thread_families);
+        if !enabled {
+            return None;
+        }
+        let rpc = self.rpc(t3_core::families::GET_THREAD_FAMILY, t3_core::families::family_request(thread_id));
+        let parent_id = thread_id.to_owned();
+        Some(async move {
+            let Ok(raw) = rpc.await else { return Vec::new() };
+            let Ok(family) = serde_json::from_value::<t3_core::families::FamilyRead>(raw) else { return Vec::new() };
+            family
+                .threads
+                .into_iter()
+                .filter(|entry| entry.lineage.side_chat == Some(true) && entry.lineage.parent_thread_id.as_deref() == Some(parent_id.as_str()))
+                .map(|entry| entry.id)
+                .collect()
+        })
+    }
+
+    pub(crate) fn clear_deleted_thread_drafts_later(&self, thread_ids: Vec<String>, cx: &mut Context<Self>) {
+        if thread_ids.is_empty() {
+            return;
+        }
+        cx.spawn(async move |_, cx| {
+            cx.update(|cx| crate::composer::drafts::clear_deleted_thread_drafts(&thread_ids, cx));
+        })
+        .detach();
     }
 
     /// Closing side chat tabs drops the empty ones: the server keeps a side chat with a run or
@@ -612,6 +713,15 @@ mod history_tests {
         state.update(cx, |state, cx| {
             let mut config = state.server_config.config.clone().unwrap_or_default();
             config.environment.capabilities.side_chats = Some(true);
+            config.providers = serde_json::from_value(serde_json::json!([{
+                "instanceId": "replay",
+                "driver": "replay",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "models": [{"slug": "replay-custom", "name": "Replay Custom"}]
+            }]))
+            .unwrap();
             state.server_config.config = Some(config);
             state.select_thread("menu-thread", cx);
             assert!(state.open_side_chat(Some("Quick check".into()), cx));
@@ -641,5 +751,295 @@ mod history_tests {
         assert_eq!(cleanup["threadId"], target);
         assert_eq!(cleanup["onlyIfUnused"], true);
         reply.send(Ok(serde_json::json!({"sequence": 2}))).unwrap();
+    }
+
+    #[gpui::test]
+    async fn side_chat_start_syncs_parent_settings_and_deletion_clears_drafts(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        let side_target = state.update(cx, |state, cx| {
+            let mut config = state.server_config.config.clone().unwrap_or_default();
+            config.environment.capabilities.side_chats = Some(true);
+            config.settings.provider_instances = serde_json::from_value(serde_json::json!({
+                "replay": { "driver": "replay", "enabled": true }
+            }))
+            .unwrap();
+            config.providers = serde_json::from_value(serde_json::json!([{
+                "instanceId": "replay",
+                "driver": "replay",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "models": [{"slug": "replay-custom", "name": "Replay Custom"}]
+            }]))
+            .unwrap();
+            state.server_config.config = Some(config);
+            if let Some(shell) = state.shell.snapshot.as_mut()
+                && let Some(thread) = shell.threads.iter_mut().find(|t| t.id == "menu-thread")
+            {
+                thread.runtime_mode = "approval-required".into();
+                thread.model_selection = t3_core::model::ModelSelection {
+                    instance_id: "replay".into(),
+                    model: "replay-custom".into(),
+                    options: None,
+                };
+            }
+            state.select_thread("menu-thread", cx);
+            assert!(state.open_side_chat(Some("Inspect diff".into()), cx));
+            state.side_threads.starting.as_ref().map(|s| s.target.clone()).unwrap()
+        });
+
+        loop {
+            let (method, cmd, reply) = fixture.next_request().await;
+            assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+            reply.send(Ok(serde_json::json!({"sequence": 1}))).unwrap();
+            if cmd["type"] == "thread.fork" {
+                break;
+            }
+        }
+
+        state.update(cx, |state, cx| {
+            let mut shell = serde_json::to_value(state.thread_shell("menu-thread").unwrap()).unwrap();
+            shell["id"] = serde_json::json!(side_target);
+            shell["runtimeMode"] = serde_json::json!("full-access");
+            shell["lineage"] = serde_json::json!({
+                "parentThreadId": "menu-thread",
+                "relationshipToParent": null,
+                "rootThreadId": "menu-thread",
+                "sideChat": true
+            });
+            state.shell.snapshot.as_mut().unwrap().threads.push(serde_json::from_value(shell).unwrap());
+            state.sync_side_threads(cx);
+        });
+
+        let mut saw_runtime_mode = false;
+        let mut first_msg = None;
+        for _ in 0..2 {
+            let (method, cmd, reply) = fixture.next_request().await;
+            assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+            reply.send(Ok(serde_json::json!({"sequence": 2}))).unwrap();
+            match cmd["type"].as_str() {
+                Some("thread.runtime-mode.set") => {
+                    assert_eq!(cmd["runtimeMode"], "approval-required");
+                    saw_runtime_mode = true;
+                }
+                Some("message.dispatch") => first_msg = Some(cmd),
+                other => panic!("unexpected command {other:?}"),
+            }
+        }
+        assert!(saw_runtime_mode);
+        let first_msg = first_msg.expect("first message dispatched");
+        assert_eq!(first_msg["runtimeMode"], "approval-required");
+        assert_eq!(first_msg["modelSelection"]["model"], "replay-custom");
+
+        // Deleting the parent clears drafts on both the parent thread and its side chat.
+        struct ComposerHost(gpui::Entity<crate::composer::Composer>);
+        impl gpui::Render for ComposerHost {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            use gpui::AppContext as _;
+            ComposerHost(cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx)))
+        });
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        vcx.update(|_, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_thread_draft_fixture("menu-thread", "parent draft", None, 10, cx);
+                composer.set_thread_draft_fixture(&side_target, "side draft", None, 11, cx);
+            });
+            state.update(cx, |state, cx| {
+                state.apply_batch(
+                    vec![t3_client::supervisor::ClientEvent::Shell(t3_core::shell::ShellStreamItem::ThreadRemoved {
+                        sequence: 3,
+                        thread_id: "menu-thread".into(),
+                    })],
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let composer = composer.read(cx);
+            assert!(!composer.has_thread_draft("menu-thread"));
+            assert!(!composer.has_thread_draft(&side_target));
+        });
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn embedded_and_main_composers_share_draft_store_without_overwriting(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        state.update(cx, |state, cx| {
+            let mut side = serde_json::to_value(state.thread_shell("menu-thread").unwrap()).unwrap();
+            side["id"] = serde_json::json!("side-shared-1");
+            side["lineage"] = serde_json::json!({
+                "parentThreadId": "menu-thread",
+                "rootThreadId": "menu-thread",
+                "sideChat": true
+            });
+            state.shell.snapshot.as_mut().unwrap().threads.push(serde_json::from_value(side).unwrap());
+            state.select_thread("menu-thread", cx);
+        });
+        let (main_composer, vcx) = cx.add_window_view(|window, cx| crate::composer::Composer::new(state.clone(), window, cx));
+        let embedded_composer = vcx.update(|window, cx| {
+            use gpui::AppContext as _;
+            cx.new(|cx| crate::composer::Composer::embedded(state.clone(), "side-shared-1".into(), window, cx))
+        });
+        vcx.update(|window, cx| {
+            main_composer.update(cx, |composer, cx| composer.set_test_prompt("main thread draft", window, cx));
+            embedded_composer.update(cx, |composer, cx| composer.set_test_prompt("side chat draft", window, cx));
+        });
+        vcx.background_executor
+            .advance_clock(std::time::Duration::from_millis(t3_core::composer::drafts::PERSIST_DEBOUNCE_MS + 50));
+        vcx.run_until_parked();
+        runtime
+            .block_on(runtime.spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new())))
+            .expect("draft writer barrier task")
+            .expect("drafts committed");
+
+        vcx.update(|_, cx| {
+            let main = main_composer.read(cx);
+            assert!(main.has_thread_draft("menu-thread"));
+            assert!(main.has_thread_draft("side-shared-1"));
+            let embedded = embedded_composer.read(cx);
+            assert!(embedded.has_thread_draft("menu-thread"));
+            assert!(embedded.has_thread_draft("side-shared-1"));
+        });
+        let persisted = t3_core::composer::drafts::DraftStore::from_value(
+            t3_client::store::load_ui_state(t3_core::composer::drafts::STORE_NAME).as_ref(),
+        );
+        assert_eq!(persisted.get("thread:menu-thread").map(|d| d.prompt.as_str()), Some("main thread draft"));
+        assert_eq!(persisted.get("thread:side-shared-1").map(|d| d.prompt.as_str()), Some("side chat draft"));
+
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn delete_thread_fetches_family_to_clear_omitted_side_chat_drafts(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        state.update(cx, |state, _| {
+            let mut config = state.server_config.config.clone().unwrap_or_default();
+            config.shell_thread_families = true;
+            state.server_config.config = Some(config);
+        });
+        struct ComposerHost(gpui::Entity<crate::composer::Composer>);
+        impl gpui::Render for ComposerHost {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            use gpui::AppContext as _;
+            ComposerHost(cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx)))
+        });
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        let (cleared_tx, cleared_rx) = tokio::sync::oneshot::channel();
+        let mut cleared_tx = Some(cleared_tx);
+        let _cleared = vcx.update(|_, cx| {
+            cx.subscribe(&composer, move |composer, _: &crate::composer::drafts::ThreadDraftsChanged, cx| {
+                let c = composer.read(cx);
+                if !c.has_thread_draft("menu-thread") && !c.has_thread_draft("omitted-side-1")
+                    && let Some(tx) = cleared_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        vcx.update(|_, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_thread_draft_fixture("menu-thread", "parent draft", None, 10, cx);
+                composer.set_thread_draft_fixture("omitted-side-1", "omitted side draft", None, 11, cx);
+            });
+            state.update(cx, |state, cx| state.delete_thread("menu-thread", cx));
+        });
+
+        let (method, params, reply) = loop {
+            let (method, params, reply) = fixture.next_request().await;
+            if method == t3_core::families::GET_THREAD_FAMILY {
+                break (method, params, reply);
+            }
+            let _ = reply.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(method, t3_core::families::GET_THREAD_FAMILY);
+        assert_eq!(params["threadId"], "menu-thread");
+        let omitted_shell = state.read_with(vcx, |state, _| {
+            let mut shell = serde_json::to_value(state.thread_shell("menu-thread").unwrap()).unwrap();
+            shell["id"] = serde_json::json!("omitted-side-1");
+            shell["lineage"] = serde_json::json!({
+                "parentThreadId": "menu-thread",
+                "relationshipToParent": null,
+                "rootThreadId": "menu-thread",
+                "sideChat": true
+            });
+            shell
+        });
+        reply
+            .send(Ok(serde_json::json!({
+                "snapshotSequence": 4,
+                "threads": [omitted_shell]
+            })))
+            .unwrap();
+
+        let (method, cmd, reply) = loop {
+            let (method, cmd, reply) = fixture.next_request().await;
+            if method == t3_core::commands::method::DISPATCH_COMMAND {
+                break (method, cmd, reply);
+            }
+            let _ = reply.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(cmd["type"], "thread.delete");
+        assert_eq!(cmd["threadId"], "menu-thread");
+        reply.send(Ok(serde_json::json!({"sequence": 5}))).unwrap();
+
+        cleared_rx.await.unwrap();
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let composer = composer.read(cx);
+            assert!(!composer.has_thread_draft("menu-thread"));
+            assert!(!composer.has_thread_draft("omitted-side-1"));
+        });
+
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

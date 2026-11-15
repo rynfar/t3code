@@ -149,7 +149,7 @@ pub fn render_row(row: &Arc<TimelineRow>, env: &RowEnv, markdown: &mut MarkdownS
         RowKind::WorkLive { .. } => work::live_row(row, env, cx),
         // `ThinkingTimelineRow` keeps its slot blank while the worktree is prepared.
         RowKind::Thinking { .. } if env.setup.view.preparing => worktree_setup::empty_work_row(id),
-        RowKind::Thinking { group_id, .. } => work::thinking_row(id, group_id.as_deref(), cx),
+        RowKind::Thinking { group_id, label, .. } => work::thinking_row(id, group_id.as_deref(), label.as_deref(), cx),
         RowKind::WorkToggle { .. } => work::group_header(row, env, cx),
         RowKind::Working { compacting } => {
             let chip = worktree_setup::background_chip(env, cx);

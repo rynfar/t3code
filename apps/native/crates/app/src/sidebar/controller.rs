@@ -1529,6 +1529,36 @@ impl AppState {
         ) else {
             return then(self, false, cx);
         };
+        if let Some(fetch) = self.fetch_family_side_chats(&id) {
+            let connection = self.connection_id();
+            let target = deletion.target.clone();
+            cx.spawn(async move |this, cx| {
+                let extra = fetch.await;
+                let _ = this.update(cx, |state, cx| {
+                    if state.connection_id() != connection || !target.same_scope(&state.delete_target()) {
+                        state.finish_deletion(reply, false, cx);
+                        return;
+                    }
+                    state.dispatch_delete_stopped(id, reply, extra, failure_title, cx, then);
+                });
+            })
+            .detach();
+            return;
+        }
+        self.dispatch_delete_stopped(id, reply, Vec::new(), failure_title, cx, then);
+    }
+
+    fn dispatch_delete_stopped(
+        &mut self,
+        id: String,
+        reply: DeletionReply,
+        extra_side_chats: Vec<String>,
+        failure_title: &'static str,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
+    ) {
+        let mut doomed_draft_threads = extra_side_chats;
+        self.collect_side_chats_for_deleted_thread(&id, &mut doomed_draft_threads);
         self.dispatch_then(
             actions::delete(&uuid(), &id),
             Some(failure_title),
@@ -1536,6 +1566,9 @@ impl AppState {
             move |state, ok, cx| {
                 let same_scope = reply.target.same_scope(&state.delete_target());
                 let route = state.finish_deletion(reply, ok, cx);
+                if ok {
+                    state.clear_deleted_thread_drafts_later(doomed_draft_threads, cx);
+                }
                 if !same_scope {
                     return;
                 }
@@ -2950,7 +2983,7 @@ mod deletion_tests {
             let (state, mut fixture, events) = scoped_delete_fixture(cx,&runtime).await;
             let keys = ["menu-thread","sibling"].map(|id| t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture",id));
             let mut thread = state.read_with(cx, |state, _| state.shell.thread("menu-thread").unwrap().clone());
-            thread.active_provider_thread_id = Some("running-provider".into());
+            thread.latest_run_id = Some("running-run".into());
             let (sent, running) = tokio::sync::oneshot::channel(); let mut sent = Some(sent);
             let _running = state.update(cx, |_, cx| cx.subscribe(&state, move |state, _, event, _| {
                 if *event == AppEvent::Shell && state.scoped_thread(&t3_core::sidebar::tag_filter::ThreadKey::new("bulk-fixture","menu-thread")).is_some_and(|row| row.thread.runtime.is_some()) {

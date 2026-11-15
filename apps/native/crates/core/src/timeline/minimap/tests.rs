@@ -101,6 +101,8 @@ fn rail_geometry_follows_the_web() {
     assert_eq!(rail_height(2, 500.), 8.);
     assert_eq!(rail_height(101, 500.), 500.);
     assert_eq!(rail_height(5, -40.), 0.);
+    assert_eq!(max_rail_height(1000., 1.), 764.);
+    assert_eq!(max_rail_height(200., 1.), MIN_MAX_HEIGHT);
     assert_eq!((top_percent(0, 5), top_percent(2, 5), top_percent(9, 5), top_percent(0, 1)), (0., 50., 100., 0.));
     let pointer = |count, y| index_from_pointer(count, 100., 40., y);
     assert_eq!([pointer(5, 90.), pointer(5, 104.9), pointer(5, 105.), pointer(5, 130.), pointer(5, 200.)], [Some(0), Some(0), Some(1), Some(3), Some(4)]);
@@ -207,10 +209,9 @@ fn keyboard_focus_and_navigation_match_the_web_rail() {
 }
 
 #[test]
-fn preview_hangs_from_the_first_and_last_strips_and_centres_between() {
-    assert_eq!(preview_offset(0, 6, 104.), 0.);
-    assert_eq!(preview_offset(3, 6, 104.), -52.);
-    assert_eq!(preview_offset(5, 6, 104.), -104.);
+fn preview_is_always_centered_vertically() {
+    assert_eq!(preview_offset(104.), -52.);
+    assert_eq!(preview_offset(0.), 0.);
 }
 
 #[test]

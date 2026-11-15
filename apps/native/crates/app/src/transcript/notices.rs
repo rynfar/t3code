@@ -299,6 +299,24 @@ pub(super) fn subagent_avatar(provider_instance_id: Option<&str>, marks: &[(Stri
 }
 
 /// `SubagentTimelineLink`: avatar, title, latest progress or result, status and elapsed time.
+pub(super) fn subagent_tooltip_text(
+    title: &str,
+    status: &str,
+    remote_label: Option<&str>,
+    result: Option<&str>,
+    progress: Option<&str>,
+) -> String {
+    let status_text = status_label(status);
+    let header = match remote_label {
+        Some(remote) => format!("{title} ({status_text} · {remote})"),
+        None => format!("{title} ({status_text})"),
+    };
+    match t3_core::lineage::subagent_detail_preview(status, result, progress) {
+        Some(preview) => format!("{header}\n{preview}"),
+        None => header,
+    }
+}
+
 fn subagent_row(item: &Arc<TurnItem>, marks: &[(String, ProviderMark)], env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
     let p = palette(cx);
     let TurnItemKind::Subagent { child_thread_id, provider_instance_id, remote_child, progress, result, .. } = &item.kind else {
@@ -317,6 +335,8 @@ fn subagent_row(item: &Arc<TurnItem>, marks: &[(String, ProviderMark)], env: &Ro
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|label| format!("on {label}"));
+    let title = subagent_title(item);
+    let tooltip = subagent_tooltip_text(&title, &item.status, remote_label.as_deref(), result.as_deref(), progress.as_deref());
     let failed = item.status == "failed";
     let status = status_label(&item.status);
     let dot = match item.status.as_str() {
@@ -341,6 +361,7 @@ fn subagent_row(item: &Arc<TurnItem>, marks: &[(String, ProviderMark)], env: &Ro
         .px(px(8.))
         .py(px(6.))
         .rounded(px(6.))
+        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx))
         .child(
             div()
                 .relative()
@@ -362,7 +383,7 @@ fn subagent_row(item: &Arc<TurnItem>, marks: &[(String, ProviderMark)], env: &Ro
                     h_flex()
                         .min_w_0()
                         .gap(px(6.))
-                        .child(div().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(subagent_title(item)))
+                        .child(div().min_w_0().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(title))
                         .when_some(remote_label, |this, remote| {
                             this.child(div().flex_none().text_size(px(10.)).text_color(hsla(p.muted_foreground)).child(remote))
                         }),
@@ -1767,5 +1788,100 @@ mod tests {
             t3_core::lineage::summarize_subagent_statuses(["completed", "failed", "idle"]),
             "1 done · 1 failed · 1 idle"
         );
+    }
+
+    #[test]
+    fn subagent_tooltip_text_uses_subagent_detail_preview() {
+        let long_result = "x".repeat(300);
+        let completed = subagent_tooltip_text("Research", "completed", Some("Remote"), Some(&long_result), Some("Still working"));
+        assert!(completed.starts_with("Research (Completed · Remote)\n"));
+        assert!(completed.ends_with('…'));
+        assert!(!completed.contains("Still working"));
+
+        let running = subagent_tooltip_text("Worker", "running", None, Some("Done"), Some("Scanning files"));
+        assert_eq!(running, "Worker (Running)\nScanning files");
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn thinking_row_and_subagent_row_render_custom_label_and_tooltip_preview(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        struct RowHost {
+            view: Entity<ThreadView>,
+            state: Entity<AppState>,
+            item: Arc<TurnItem>,
+        }
+        impl gpui::Render for RowHost {
+            fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                let state = self.state.clone();
+                let item = self.item.clone();
+                self.view.update(cx, |_, cx| {
+                    let ui = crate::transcript::TranscriptUi::default();
+                    let details = std::collections::HashMap::new();
+                    let group_lists = std::cell::RefCell::new(std::collections::HashMap::new());
+                    let turn_diffs = std::collections::HashMap::new();
+                    let fork_support = std::collections::HashMap::new();
+                    let forking = std::collections::HashSet::new();
+                    let revert_counts = std::collections::HashMap::new();
+                    let approval_errors = std::collections::HashMap::new();
+                    let setup = crate::transcript::SetupEnv::default();
+                    let env = crate::transcript::RowEnv {
+                        thread_id: Some("t1"),
+                        embedded: false,
+                        state: &state,
+                        clock: crate::transcript::Clock::now(),
+                        workspace_root: None,
+                        ui: &ui,
+                        approvals: &[],
+                        responding_approvals: &forking,
+                        open_approval_menu: None,
+                        open_approval_override: None,
+                        approval_errors: &approval_errors,
+                        can_operate_thread: false,
+                        rewinding: false,
+                        window_height: 600.,
+                        details: &details,
+                        group_lists: &group_lists,
+                        working_timer: None,
+                        find_target: None,
+                        turn_diffs: &turn_diffs,
+                        fork_support: &fork_support,
+                        forking: &forking,
+                        revert_counts: &revert_counts,
+                        rewind_disabled: false,
+                        command_outputs: None,
+                        setup: &setup,
+                    };
+                    gpui::div()
+                        .size_full()
+                        .child(crate::transcript::work::thinking_row("t1", Some("g1"), Some("Starting Codex…"), cx))
+                        .child(subagent_row(&item, &[], &env, cx))
+                        .into_any_element()
+                })
+            }
+        }
+        let item = Arc::new(serde_json::from_value::<TurnItem>(serde_json::json!({
+            "id": "sub-1",
+            "type": "subagent",
+            "subagentId": "subagent-1",
+            "status": "completed",
+            "title": "Inspect lineage",
+            "startedAt": "2026-01-01T00:00:00Z",
+            "completedAt": "2026-01-01T00:00:02Z",
+            "result": "x".repeat(290),
+            "childThreadId": "thread-child",
+        })).unwrap());
+        let (_host, vcx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| crate::thread_view::ThreadView::new(state.clone(), window, cx));
+            RowHost { view, state: state.clone(), item }
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
     }
 }
