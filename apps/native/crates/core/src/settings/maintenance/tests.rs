@@ -200,12 +200,12 @@ fn retention_draft_defers_save_until_enter_or_edited_blur() {
     assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
     assert!(draft.is_on(None));
     // Blur without edits or Enter discards without saving.
-    assert_eq!(draft.commit(None, "8", 1, false), RetentionCommit::Discarded);
+    assert_eq!(draft.commit(None, "8", 1, false, 1), RetentionCommit::Discarded);
     assert!(!draft.is_on(None));
 
     // Re-open draft and press Enter explicitly -> commits default 8.
     assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
-    assert_eq!(draft.commit(None, "8", 1, true), RetentionCommit::Save(8));
+    assert_eq!(draft.commit(None, "8", 1, true, 2), RetentionCommit::Save(8));
     assert!(draft.is_on(None));
     // Turning off while save is in flight dispatches SaveOff.
     assert_eq!(draft.toggle(None, false), RetentionToggle::SaveOff);
@@ -219,15 +219,34 @@ fn retention_draft_defers_save_until_enter_or_edited_blur() {
 
     assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
     draft.mark_edited();
-    assert_eq!(draft.commit(None, "9000", 1, false), RetentionCommit::Save(3650));
+    assert_eq!(draft.commit(None, "9000", 1, false, 3), RetentionCommit::Save(3650));
     // Re-committing while the initial save is still in flight does not double-save,
-    // while failing the save reverts to Closed so the switch turns Off and retries cleanly.
-    assert_eq!(draft.commit(None, "9000", 1, true), RetentionCommit::Restore(3650));
-    assert!(draft.fail_submit());
+    // while failing the active save reverts to Closed so the switch turns Off and retries cleanly.
+    assert_eq!(draft.commit(None, "9000", 1, true, 4), RetentionCommit::Restore(3650));
+    assert!(draft.fail_submit(3));
     assert!(!draft.is_on(None));
-    assert!(!draft.fail_submit());
+    assert!(!draft.fail_submit(3));
+
+    // Committing a newer age before an older save settles keeps the newer pending submission on old failure.
     assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
-    assert_eq!(draft.commit(None, "9000", 1, true), RetentionCommit::Save(3650));
+    draft.mark_edited();
+    assert_eq!(draft.commit(None, "30", 1, true, 5), RetentionCommit::Save(30));
+    assert_eq!(draft.commit(None, "60", 1, true, 6), RetentionCommit::Save(60));
+    assert!(!draft.fail_submit(5), "stale older failure must not drop newer pending 60-day save");
+    assert_eq!(draft, RetentionDraft::Submitting { days: 60, seq: 6 });
+    assert!(draft.is_on(None));
+    assert!(draft.fail_submit(6), "active 60-day failure reverts switch Off");
+    assert!(!draft.is_on(None));
+
+    // Toggling Off then re-committing the same day count gets a fresh seq so the stale save cannot revert it.
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    assert_eq!(draft.commit(None, "30", 1, true, 7), RetentionCommit::Save(30));
+    assert_eq!(draft.toggle(None, false), RetentionToggle::SaveOff);
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    assert_eq!(draft.commit(None, "30", 1, true, 8), RetentionCommit::Save(30));
+    assert!(!draft.fail_submit(7));
+    assert!(draft.is_on(None));
+    assert!(draft.fail_submit(8));
 }
 
 /// Two switches flipped before the first save answers: the second is built from the settings the

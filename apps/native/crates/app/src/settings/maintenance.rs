@@ -70,6 +70,7 @@ pub(crate) struct MaintenanceState {
     logs_days: Entity<InputState>,
     retention_drafts: [RetentionDraft; 2],
     retention_switch_pressed: [bool; 2],
+    retention_seq: u64,
     intervals: [Entity<InputState>; 4],
     last_run: LastRun,
     report_stream: Option<(u64, Stream)>,
@@ -126,6 +127,7 @@ impl MaintenanceState {
             logs_days,
             retention_drafts: [RetentionDraft::Closed; 2],
             retention_switch_pressed: [false; 2],
+            retention_seq: 0,
             intervals,
             last_run: LastRun::Loading,
             report_stream: None,
@@ -313,12 +315,14 @@ impl SettingsView {
         let input = self.maintenance.input(field).clone();
         let text = input.read(cx).value().to_string();
         let idx = field.index();
-        match self.maintenance.retention_drafts[idx].commit(saved, &text, 1, explicit) {
+        let next_seq = self.maintenance.retention_seq.wrapping_add(1);
+        match self.maintenance.retention_drafts[idx].commit(saved, &text, 1, explicit, next_seq) {
             RetentionCommit::Save(days) => {
+                self.maintenance.retention_seq = next_seq;
                 input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
                 self.save_retention_setting(
                     ServerSettingChange::Prepared(field.change(Some(days)).payload()),
-                    move |this| this.maintenance.retention_drafts[idx].fail_submit(),
+                    move |this| this.maintenance.retention_drafts[idx].fail_submit(next_seq),
                     cx,
                 );
                 cx.notify();
@@ -666,11 +670,7 @@ impl SettingsView {
                             cx.notify();
                         }
                         RetentionToggle::SaveOff => {
-                            this.save_retention_setting(
-                                ServerSettingChange::Prepared(field.change(None).payload()),
-                                move |this| this.maintenance.retention_drafts[idx].fail_submit(),
-                                cx,
-                            );
+                            store::update_server(&this.state, ServerSettingChange::Prepared(field.change(None).payload()), cx);
                             cx.notify();
                         }
                         RetentionToggle::DiscardDraft => {

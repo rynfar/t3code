@@ -89,6 +89,18 @@ impl FormState {
             .collect()
     }
 }
+fn config_field_placeholder<'a>(stored: bool, secret: bool, saved_value: &Value, default_placeholder: &'a str) -> &'a str {
+    if !stored {
+        "op://vault/item/field"
+    } else if secret && saved_value.as_str().is_some_and(|value| !value.is_empty()) {
+        "Stored secret, enter a new value to replace"
+    } else if secret {
+        "Not set"
+    } else {
+        default_placeholder
+    }
+}
+
 impl SettingsView {
     fn form_event_current(&self, generation: usize, cx: &App) -> bool {
         self.provider_form().generation == generation && self.current_form_instance(cx).is_some()
@@ -214,12 +226,21 @@ impl SettingsView {
                 continue;
             }
             let key = field.key.clone();
+            let accepts_secret_reference = field.accepts_secret_reference;
             let input = cx.new(|cx| InputState::new(window, cx).placeholder(field.placeholder.clone()).masked(field.secret));
             let generation = self.provider_form().generation;
             let subscription = cx.subscribe_in(&input, window, move |this, source, event: &InputEvent, window, cx| {
                 if !this.form_event_current(generation, cx) || !this.provider_form().fields.iter().any(|field| field.key == key && &field.input == source) { return; }
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                     this.commit_config_field(&key, window, cx);
+                } else if accepts_secret_reference
+                    && matches!(event, InputEvent::Change)
+                    && this.current_form_instance(cx).is_some_and(|inst| {
+                        let row = json!({ "value": form::field_value(&inst, &key) });
+                        this.provider_form().fields.iter().any(|f| f.key == key && f.source.provider(&row).is_some())
+                    })
+                {
+                    cx.notify();
                 }
             });
             self.provider_form_mut().fields.push(FieldInput {
@@ -250,15 +271,7 @@ impl SettingsView {
                 let stored = input.source.provider(&row).is_none();
                 let value = if stored && field.secret { "" } else { input.source.input_value(&row) }.to_owned();
                 let masked = stored && field.secret;
-                let placeholder = if !stored {
-                    "op://vault/item/field"
-                } else if field.secret && saved_value.as_str().is_some_and(|s| !s.is_empty()) {
-                    "Stored secret, enter a new value to replace"
-                } else if field.secret {
-                    "Not set"
-                } else {
-                    &field.placeholder
-                };
+                let placeholder = config_field_placeholder(stored, field.secret, &saved_value, &field.placeholder);
                 (value, placeholder.to_owned(), masked)
             } else {
                 let saved = saved_value.as_str().unwrap_or("");
@@ -444,10 +457,13 @@ impl SettingsView {
                 }
                 Ok(true) => {
                     if field.source.provider(&row).is_none() {
+                        let default_placeholder = meta.as_ref().map_or("", |f| f.placeholder.as_str());
+                        let placeholder = config_field_placeholder(true, secret, &row["value"], default_placeholder).to_owned();
                         field.masked = secret;
+                        field.placeholder = placeholder.clone();
                         input.update(cx, |input, cx| {
                             input.set_masked(secret, window, cx);
-                            input.set_placeholder(if secret { "Not set" } else { "" }, window, cx);
+                            input.set_placeholder(placeholder, window, cx);
                         });
                     }
                     if row["value"] == saved {
@@ -744,57 +760,14 @@ impl SettingsView {
                     let active_provider = field_input.source.provider(&row).map(str::to_owned);
                     let current_text = input.read(cx).value().to_string();
                     let source = field.accepts_secret_reference.then(|| {
-                        let driver = instance.driver.clone();
                         let source_key = key.clone();
                         let source_id = id.clone();
-                        let field_placeholder = field.placeholder.clone();
-                        let field_secret = field.secret;
                         self.secret_source_select(
                             SharedString::from(format!("provider-config-source-{key}")).into(),
                             active_provider.as_deref(),
                             disabled,
                             move |next_provider, this, window, cx| {
-                                if this.form_denial(&driver, &format!("config.{source_key}"), cx).is_some() {
-                                    return;
-                                }
-                                let Some(saved_now) = this.current_form_instance(cx).map(|inst| form::field_value(&inst, &source_key)) else {
-                                    return;
-                                };
-                                let mut row = json!({ "value": saved_now });
-                                let Some(fi) = this.provider_form_mut().fields.iter_mut().find(|f| f.key == source_key) else {
-                                    return;
-                                };
-                                let stored = next_provider.is_none();
-                                let changed = fi.source.select(&mut row, next_provider);
-                                let value = if stored && field_secret { "" } else { fi.source.input_value(&row) }.to_owned();
-                                let masked = stored && field_secret;
-                                let placeholder = if !stored {
-                                    "op://vault/item/field"
-                                } else if field_secret {
-                                    "Not set"
-                                } else {
-                                    &field_placeholder
-                                }
-                                .to_owned();
-                                fi.masked = masked;
-                                fi.placeholder = placeholder.clone();
-                                fi.input.update(cx, |input, cx| {
-                                    input.set_value(value, window, cx);
-                                    input.set_masked(masked, window, cx);
-                                    input.set_placeholder(placeholder, window, cx);
-                                });
-                                this.provider_form_mut().error = None;
-                                if changed {
-                                    this.update_instance(
-                                        &source_id,
-                                        model::InstanceEdit::ConfigField {
-                                            key: source_key.clone(),
-                                            value: json!(""),
-                                        },
-                                        cx,
-                                    );
-                                }
-                                cx.notify();
+                                this.select_config_secret_source(&source_id, &source_key, next_provider, window, cx);
                             },
                             cx,
                         )
@@ -1083,6 +1056,53 @@ impl SettingsView {
         )
     }
 
+    fn select_config_secret_source(&mut self, instance_id: &str, key: &str, next_provider: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(instance) = self.current_form_instance(cx) else {
+            return;
+        };
+        if self.form_denial(&instance.driver, &format!("config.{key}"), cx).is_some() {
+            return;
+        }
+        let Some(meta) = form::fields(&instance.driver, instance.config.as_ref()).into_iter().find(|field| field.key == key) else {
+            return;
+        };
+        let saved_now = form::field_value(&instance, key);
+        let mut row = json!({ "value": saved_now });
+        let Some(fi) = self.provider_form_mut().fields.iter_mut().find(|f| f.key == key) else {
+            return;
+        };
+        let stored = next_provider.is_none();
+        let changed = fi.source.select(&mut row, next_provider);
+        let value = if stored && meta.secret { "" } else { fi.source.input_value(&row) }.to_owned();
+        let masked = stored && meta.secret;
+        let placeholder = config_field_placeholder(
+            stored,
+            meta.secret,
+            if changed { &Value::Null } else { &saved_now },
+            &meta.placeholder,
+        )
+        .to_owned();
+        fi.masked = masked;
+        fi.placeholder = placeholder.clone();
+        fi.input.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+            input.set_masked(masked, window, cx);
+            input.set_placeholder(placeholder, window, cx);
+        });
+        self.provider_form_mut().error = None;
+        if changed {
+            self.update_instance(
+                instance_id,
+                model::InstanceEdit::ConfigField {
+                    key: key.to_owned(),
+                    value: json!(""),
+                },
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
     fn check_secret_source(&mut self, provider: String, reference: String, cx: &mut Context<Self>) {
         if self.state.read(cx).server_config.config.as_ref().is_none_or(|c| c.environment.capabilities.secret_source_check != Some(true))
             || !self.may(SETTINGS_WRITE_SCOPE, cx)
@@ -1144,13 +1164,22 @@ impl SettingsView {
         };
         let provider = provider.to_owned();
         let reference = reference.to_owned();
+        let debug_id = match &button_id {
+            ElementId::Name(name) => Some(name.to_string()),
+            _ => None,
+        };
         Some(
-            Button::new(button_id, ButtonVariant::GhostMuted, ButtonSize::IconMicro)
-                .icon(glyph)
-                .icon_color(color)
-                .tooltip(description)
-                .disabled(disabled || !can_check || checking)
-                .on_click(cx.listener(move |this, _, _, cx| this.check_secret_source(provider.clone(), reference.clone(), cx)))
+            div()
+                .flex_none()
+                .when_some(debug_id, |el, id| el.debug_selector(move || id.clone()))
+                .child(
+                    Button::new(button_id, ButtonVariant::GhostMuted, ButtonSize::IconMicro)
+                        .icon(glyph)
+                        .icon_color(color)
+                        .tooltip(description)
+                        .disabled(disabled || !can_check || checking)
+                        .on_click(cx.listener(move |this, _, _, cx| this.check_secret_source(provider.clone(), reference.clone(), cx))),
+                )
                 .into_any_element(),
         )
     }
@@ -1483,5 +1512,115 @@ mod secret_check_tests {
         drop(fixture);
         drop(runtime);
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn config_secret_check_hides_on_uncommitted_change_and_keeps_stored_placeholder(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.executor().allow_parking();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "settings:write", "providers:manage", "environment:maintain"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": { "environmentId": "fixture-env", "label": "Studio Mac", "capabilities": { "secretProviderSettings": true, "secretSourceCheck": true } },
+                        "secretProviderSettings": true,
+                        "secretReferences": true,
+                        "settings": {
+                            "secretProviders": {
+                                "op-main": { "kind": "one_password", "label": "Work 1Password", "config": { "account": "ops.1password.com" } }
+                            },
+                            "providerInstances": {
+                                "antigravity": {
+                                    "driver": "antigravity",
+                                    "enabled": true,
+                                    "displayName": "Antigravity Main",
+                                    "config": { "apiKey": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/Gemini/api-key" } }
+                                },
+                                "opencode": {
+                                    "driver": "opencode",
+                                    "enabled": true,
+                                    "displayName": "OpenCode Main",
+                                    "config": { "serverPassword": "stored-password" }
+                                }
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx.open_window(size(px(1280.), px(900.)), |_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| super::super::super::open(Section::Providers, cx));
+        vcx.run_until_parked();
+        let view = vcx.read(|cx| cx.global::<super::super::super::Host>().view.clone().expect("settings view open"));
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.providers.selected = Some("antigravity".into());
+                view.provider_form_mut().runtime_open = true;
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("secret-check-config-apiKey").is_some(), "saved config reference renders check button");
+
+        // Uncommitted edit hides secret-check-config-apiKey immediately on InputEvent::Change without Blur/Enter.
+        vcx.update(|window, cx| {
+            let input = view.read(cx).provider_form().fields.iter().find(|f| f.key == "apiKey").unwrap().input.clone();
+            input.update(cx, |input, cx| input.set_value("op://Dev/Gemini/unsaved", window, cx));
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("secret-check-config-apiKey").is_none(), "uncommitted config reference edit must hide check button immediately");
+
+        // Reverting back to the committed reference restores secret-check-config-apiKey without Blur/Enter.
+        vcx.update(|window, cx| {
+            let input = view.read(cx).provider_form().fields.iter().find(|f| f.key == "apiKey").unwrap().input.clone();
+            input.update(cx, |input, cx| input.set_value("op://Dev/Gemini/api-key", window, cx));
+        });
+        vcx.run_until_parked();
+        assert!(vcx.debug_bounds("secret-check-config-apiKey").is_some(), "reverting uncommitted edit restores check button");
+
+        // Switching stored secret -> 1Password -> Value restores the stored-secret placeholder.
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.providers.selected = Some("opencode".into());
+                view.provider_form_mut().runtime_open = true;
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+            view.update(cx, |view, cx| {
+                view.select_config_secret_source("opencode", "serverPassword", Some("op-main".to_owned()), window, cx);
+                assert_eq!(
+                    view.provider_form().fields.iter().find(|f| f.key == "serverPassword").unwrap().placeholder,
+                    "op://vault/item/field"
+                );
+                view.select_config_secret_source("opencode", "serverPassword", None, window, cx);
+                assert_eq!(
+                    view.provider_form().fields.iter().find(|f| f.key == "serverPassword").unwrap().placeholder,
+                    "Stored secret, enter a new value to replace"
+                );
+            });
+        });
+        vcx.run_until_parked();
+        state.update(&mut vcx, |state, _| state.stop_pump());
     }
 }

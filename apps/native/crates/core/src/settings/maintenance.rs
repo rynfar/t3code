@@ -658,8 +658,8 @@ pub enum RetentionDraft {
     Untouched,
     /// Draft was edited while `value == None`.
     Edited,
-    /// Save is in flight after committing from Off.
-    Submitting(u32),
+    /// Save is in flight after committing from Off, keyed by monotonic submission sequence.
+    Submitting { days: u32, seq: u64 },
 }
 
 impl RetentionDraft {
@@ -675,7 +675,7 @@ impl RetentionDraft {
             }
             return RetentionToggle::Noop;
         }
-        let had_save = saved.is_some() || matches!(self, Self::Submitting(_));
+        let had_save = saved.is_some() || matches!(self, Self::Submitting { .. });
         *self = Self::Closed;
         if had_save { RetentionToggle::SaveOff } else { RetentionToggle::DiscardDraft }
     }
@@ -694,9 +694,10 @@ impl RetentionDraft {
         false
     }
 
-    /// Commits on Enter (`explicit == true`) or Blur (`explicit == false`). Returns `Some(days)`
-    /// when a server save should be dispatched, or `None` when the draft was discarded/unchanged.
-    pub fn commit(&mut self, saved: Option<u32>, text: &str, minimum: u32, explicit: bool) -> RetentionCommit {
+    /// Commits on Enter (`explicit == true`) or Blur (`explicit == false`). Returns `Save(days)`
+    /// when a server save should be dispatched, recording `seq` when enabling from Off so only a
+    /// failure for that exact submission can revert the switch back to `Closed`.
+    pub fn commit(&mut self, saved: Option<u32>, text: &str, minimum: u32, explicit: bool, seq: u64) -> RetentionCommit {
         if saved.is_none() {
             match *self {
                 Self::Closed => return RetentionCommit::Unchanged,
@@ -704,20 +705,20 @@ impl RetentionDraft {
                     *self = Self::Closed;
                     return RetentionCommit::Discarded;
                 }
-                Self::Untouched | Self::Edited | Self::Submitting(_) => {
+                Self::Untouched | Self::Edited | Self::Submitting { .. } => {
                     let parsed = text.trim().parse::<f64>().ok().filter(|days| days.is_finite());
                     let Some(raw) = parsed else {
-                        if let Self::Submitting(days) = *self {
+                        if let Self::Submitting { days, .. } = *self {
                             return RetentionCommit::Restore(days);
                         }
                         *self = Self::Closed;
                         return RetentionCommit::Discarded;
                     };
                     let days = crate::settings::worktrees::clamp_retention(raw, minimum);
-                    if matches!(self, Self::Submitting(prev) if *prev == days) {
+                    if matches!(self, Self::Submitting { days: prev, .. } if *prev == days) {
                         return RetentionCommit::Restore(days);
                     }
-                    *self = Self::Submitting(days);
+                    *self = Self::Submitting { days, seq };
                     return RetentionCommit::Save(days);
                 }
             }
@@ -742,8 +743,9 @@ impl RetentionDraft {
         }
     }
 
-    pub fn fail_submit(&mut self) -> bool {
-        if matches!(self, Self::Submitting(_)) {
+    /// Reverts back to `Closed` only if `seq` is still the active pending initial submission.
+    pub fn fail_submit(&mut self, seq: u64) -> bool {
+        if matches!(self, Self::Submitting { seq: current, .. } if *current == seq) {
             *self = Self::Closed;
             return true;
         }

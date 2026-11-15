@@ -65,6 +65,7 @@ pub(crate) struct WorktreesState {
     pub(crate) settled_days: Entity<InputState>,
     retention_drafts: [RetentionDraft; 2],
     retention_switch_pressed: [bool; 2],
+    retention_seq: u64,
     creation_advanced: bool,
     cleanup_advanced: bool,
     _subscriptions: Vec<Subscription>,
@@ -121,6 +122,7 @@ impl WorktreesState {
             settled_days,
             retention_drafts: [RetentionDraft::Closed; 2],
             retention_switch_pressed: [false; 2],
+            retention_seq: 0,
             creation_advanced: false,
             cleanup_advanced: false,
             _subscriptions: subscriptions,
@@ -226,12 +228,14 @@ impl SettingsView {
         let Some(saved) = self.thread_settings(cx).map(|config| field.saved(config)) else { return };
         let text = input.read(cx).value().to_string();
         let idx = field.index();
-        match self.worktrees.retention_drafts[idx].commit(saved, &text, field.minimum(), explicit) {
+        let next_seq = self.worktrees.retention_seq.wrapping_add(1);
+        match self.worktrees.retention_drafts[idx].commit(saved, &text, field.minimum(), explicit, next_seq) {
             RetentionCommit::Save(days) => {
+                self.worktrees.retention_seq = next_seq;
                 input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
                 self.save_retention_setting(
                     field.change(Some(days)).into_server(),
-                    move |this| this.worktrees.retention_drafts[idx].fail_submit(),
+                    move |this| this.worktrees.retention_drafts[idx].fail_submit(next_seq),
                     cx,
                 );
                 cx.notify();
@@ -326,11 +330,7 @@ impl SettingsView {
                             cx.notify();
                         }
                         RetentionToggle::SaveOff => {
-                            this.save_retention_setting(
-                                field.change(None).into_server(),
-                                move |this| this.worktrees.retention_drafts[idx].fail_submit(),
-                                cx,
-                            );
+                            store::update_server(&this.state, field.change(None).into_server(), cx);
                             cx.notify();
                         }
                         RetentionToggle::DiscardDraft => {
