@@ -14,7 +14,10 @@ use gpui::{
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, TextViewState, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 pub use t3_core::markdown::code::CodeFenceMetaMap;
-use t3_core::markdown::alerts_details::{AlertKind, DetailsBlock, GithubAlert, parse_details_fence, parse_github_alert};
+use t3_core::markdown::alerts_details::{
+    AlertKind, CustomOrderedList, DetailsBlock, GithubAlert, parse_custom_ordered_list,
+    parse_details_fence, parse_github_alert,
+};
 use t3_core::markdown::code::{is_code_fence_closed, is_math_language, is_mermaid_language};
 use t3_core::markdown::math::render_tex_unicode;
 use t3_core::markdown::mermaid::render_mermaid_svg;
@@ -24,11 +27,11 @@ use super::links::MarkdownActionContext;
 use crate::icons::Icon;
 use crate::selectable_text::{SelectableText, SelectableTextHandle};
 use crate::theme::{hsla, palette};
-use crate::toast::{Toast, ToastKind};
 use crate::transcript::{media, parts};
 
 pub const ALERT_NODE: &str = "t3-alert";
 pub const DETAILS_NODE: &str = "t3-details-block";
+pub const ORDERED_LIST_NODE: &str = "t3-ordered-list";
 pub const MATH_NODE: &str = "t3-math-block";
 pub const MERMAID_NODE: &str = "t3-mermaid-block";
 pub const TABLE_NODE: &str = "t3-table-block";
@@ -36,6 +39,11 @@ pub const TABLE_NODE: &str = "t3-table-block";
 #[derive(Clone)]
 pub enum NestedSelection {
     Markdown(Entity<TextViewState>),
+    Alert {
+        entity: Entity<TextViewState>,
+        plain_body: String,
+        clipboard_markdown: String,
+    },
     Selectable {
         handle: SelectableTextHandle,
         rendered: String,
@@ -52,6 +60,14 @@ pub type SharedMathEnabled = Arc<AtomicBool>;
 struct AlertNodeData {
     key: String,
     alert: GithubAlert,
+    plain_body: String,
+    clipboard_markdown: String,
+}
+
+#[derive(Clone)]
+struct OrderedListNodeData {
+    key: String,
+    list: CustomOrderedList,
 }
 
 #[derive(Clone)]
@@ -114,16 +130,25 @@ struct MermaidUiState {
     error: Option<String>,
 }
 
-/// Attaches custom rich-markdown parsers and renderers onto `base` (preserving existing media hooks).
-pub(super) fn attach_rich_extensions_with_media(
+pub(super) fn attach_rich_extensions_with_media_options(
     base: MarkdownExtensions,
     action_ctx: SharedActionContext,
     nested_views: NestedViews,
     code_meta: SharedCodeMeta,
     math_enabled: SharedMathEnabled,
     media: RichMarkdownMedia,
+    keep_ordered_list_numbers: bool,
 ) -> MarkdownExtensions {
-    attach_extensions_inner(base, action_ctx, nested_views, code_meta, math_enabled, Some(media), true)
+    attach_extensions_inner(
+        base,
+        action_ctx,
+        nested_views,
+        code_meta,
+        math_enabled,
+        Some(media),
+        true,
+        keep_ordered_list_numbers,
+    )
 }
 
 fn child_media_base(media: Option<&RichMarkdownMedia>, body: &str) -> MarkdownExtensions {
@@ -137,6 +162,7 @@ fn child_media_base(media: Option<&RichMarkdownMedia>, body: &str) -> MarkdownEx
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach_extensions_inner(
     base: MarkdownExtensions,
     action_ctx: SharedActionContext,
@@ -145,6 +171,7 @@ fn attach_extensions_inner(
     math_enabled: SharedMathEnabled,
     media: Option<RichMarkdownMedia>,
     intercept_tables: bool,
+    keep_ordered_list_numbers: bool,
 ) -> MarkdownExtensions {
     let ctx_for_child = action_ctx.clone();
     let nested_for_child = nested_views.clone();
@@ -153,7 +180,13 @@ fn attach_extensions_inner(
     let math_for_child = math_enabled;
 
     let with_parsers = base.block_parser(move |node, context| {
-        parse_rich_block(node, context, intercept_tables, math_for_parser.load(Ordering::Relaxed))
+        parse_rich_block(
+            node,
+            context,
+            intercept_tables,
+            keep_ordered_list_numbers,
+            math_for_parser.load(Ordering::Relaxed),
+        )
     });
 
     let ctx_alert = ctx_for_child.clone();
@@ -167,6 +200,12 @@ fn attach_extensions_inner(
     let meta_details = meta_for_child.clone();
     let math_details = math_for_child.clone();
     let media_details = media.clone();
+
+    let ctx_list = ctx_for_child.clone();
+    let nested_list = nested_for_child.clone();
+    let meta_list = meta_for_child.clone();
+    let math_list = math_for_child.clone();
+    let media_list = media.clone();
 
     let nested_math = nested_for_child.clone();
 
@@ -190,6 +229,11 @@ fn attach_extensions_inner(
             let env = RichBlockEnv { action_ctx: &ctx_details, nested_views: &nested_details, code_meta: &meta_details, math_enabled: &math_details, media: media_details.as_ref() };
             render_details_block(data, env, window, cx)
         })
+        .block_renderer(ORDERED_LIST_NODE, move |node, window, cx| {
+            let Some(data) = node.data::<OrderedListNodeData>() else { return div().into_any_element() };
+            let env = RichBlockEnv { action_ctx: &ctx_list, nested_views: &nested_list, code_meta: &meta_list, math_enabled: &math_list, media: media_list.as_ref() };
+            render_ordered_list_block(data, env, window, cx)
+        })
         .block_renderer(MATH_NODE, move |node, window, cx| {
             let Some(data) = node.data::<MathNodeData>() else { return div().into_any_element() };
             render_math_block(data, &nested_math, window, cx)
@@ -205,11 +249,30 @@ fn attach_extensions_inner(
         })
 }
 
-fn parse_rich_block(node: &mdast::Node, context: &MarkdownParseContext<'_>, intercept_tables: bool, math_enabled: bool) -> Option<MarkdownNode> {
+fn alert_plain_body(bq: &mdast::Blockquote) -> String {
+    let raw = mdast::Node::Blockquote(bq.clone()).to_string();
+    let trimmed = raw.trim();
+    if let Some(after_close) = trimmed.strip_prefix("[!")
+        && let Some(end) = after_close.find(']')
+    {
+        return after_close[end + 1..].trim().to_owned();
+    }
+    trimmed.to_owned()
+}
+
+fn parse_rich_block(
+    node: &mdast::Node,
+    context: &MarkdownParseContext<'_>,
+    intercept_tables: bool,
+    keep_ordered_list_numbers: bool,
+    math_enabled: bool,
+) -> Option<MarkdownNode> {
     let key = node_key(node);
     match node {
         mdast::Node::Blockquote(bq) => {
             let alert = parse_github_alert(bq, context.source())?;
+            let plain_body = alert_plain_body(bq);
+            let clipboard_markdown = alert.clipboard_markdown();
             let raw = context.node_source(node).unwrap_or(&alert.body_markdown).to_owned();
             let plain = if alert.body_markdown.is_empty() {
                 alert.title.to_owned()
@@ -217,7 +280,33 @@ fn parse_rich_block(node: &mdast::Node, context: &MarkdownParseContext<'_>, inte
                 format!("{}\n{}", alert.title, alert.body_markdown)
             };
             Some(
-                MarkdownNode::new(ALERT_NODE, AlertNodeData { key, alert })
+                MarkdownNode::new(
+                    ALERT_NODE,
+                    AlertNodeData {
+                        key,
+                        alert,
+                        plain_body,
+                        clipboard_markdown,
+                    },
+                )
+                .text(plain)
+                .markdown(raw),
+            )
+        }
+        mdast::Node::List(list) if keep_ordered_list_numbers && list.ordered => {
+            let parsed = parse_custom_ordered_list(list, context.source())?;
+            let raw = context
+                .node_source(node)
+                .map(str::to_owned)
+                .unwrap_or_else(|| parsed.raw_markdown.clone());
+            let plain = parsed
+                .items
+                .iter()
+                .map(|item| format!("{}. {}", item.number, item.body_markdown))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(
+                MarkdownNode::new(ORDERED_LIST_NODE, OrderedListNodeData { key, list: parsed })
                     .text(plain)
                     .markdown(raw),
             )
@@ -298,6 +387,11 @@ fn node_key(node: &mdast::Node) -> String {
             c.meta.hash(&mut hasher);
             c.value.hash(&mut hasher);
         }
+        mdast::Node::List(l) => {
+            "list".hash(&mut hasher);
+            l.position.as_ref().map(|p| p.start.offset).hash(&mut hasher);
+            l.children.len().hash(&mut hasher);
+        }
         _ => {}
     }
     format!("md-block-{:x}", hasher.finish())
@@ -321,6 +415,7 @@ fn render_alert_block(
     let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
     let p = palette(cx);
     let (accent, icon) = match data.alert.kind {
+        AlertKind::Insight => (p.info, Icon::Star),
         AlertKind::Note => (p.info, Icon::Info),
         AlertKind::Tip => (p.success, Icon::Sparkles),
         AlertKind::Important => (p.primary, Icon::CircleAlert),
@@ -341,7 +436,14 @@ fn render_alert_block(
         }
         s.entity.clone()
     });
-    nested_views.lock().unwrap().insert(data.key.clone(), NestedSelection::Markdown(entity.clone()));
+    nested_views.lock().unwrap().insert(
+        data.key.clone(),
+        NestedSelection::Alert {
+            entity: entity.clone(),
+            plain_body: data.plain_body.clone(),
+            clipboard_markdown: data.clipboard_markdown.clone(),
+        },
+    );
 
     let child_ext = attach_extensions_inner(
         child_media_base(media, &body),
@@ -351,6 +453,7 @@ fn render_alert_block(
         math_enabled.clone(),
         media.cloned(),
         true,
+        false,
     );
     let view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
@@ -359,6 +462,7 @@ fn render_alert_block(
         cx,
     );
 
+    let copy_markdown = data.clipboard_markdown.clone();
     v_flex()
         .w_full()
         .min_w_0()
@@ -372,19 +476,97 @@ fn render_alert_block(
         .gap(px(6.))
         .child(
             h_flex()
-                .gap(px(6.))
+                .w_full()
+                .justify_between()
                 .items_center()
-                .child(icon.render(px(14.), hsla(accent)))
                 .child(
-                    div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(hsla(accent))
-                        .child(data.alert.title),
-                ),
+                    h_flex()
+                        .gap(px(6.))
+                        .items_center()
+                        .child(icon.render(px(14.), hsla(accent)))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(accent))
+                                .child(data.alert.title),
+                        ),
+                )
+                .child(parts::ghost_icon_button(
+                    SharedString::from(format!("alert-copy:{}", data.key)),
+                    Icon::Copy,
+                    move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_markdown.clone()));
+                    },
+                    cx,
+                )),
         )
         .when(!data.alert.body_markdown.is_empty(), |this| this.child(view))
         .into_any_element()
+}
+
+fn render_ordered_list_block(
+    data: &OrderedListNodeData,
+    env: RichBlockEnv<'_>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let p = palette(cx);
+    let rows: Vec<AnyElement> = data
+        .list
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let item_key = format!("ol:{}:{}", data.key, index);
+            let body = item.body_markdown.clone();
+            let state = window.use_keyed_state(SharedString::from(item_key.clone()), cx, |_, cx| ChildTextState {
+                last_body: body.clone(),
+                entity: cx.new(|cx| TextViewState::markdown(&body, cx).selectable(true)),
+            });
+            let entity = state.update(cx, |s, cx| {
+                if s.last_body != body {
+                    s.last_body = body.clone();
+                    s.entity.update(cx, |tv, cx| tv.set_text(&body, cx));
+                }
+                s.entity.clone()
+            });
+            nested_views.lock().unwrap().insert(item_key, NestedSelection::Markdown(entity.clone()));
+            let child_ext = attach_extensions_inner(
+                child_media_base(media, &body),
+                action_ctx.clone(),
+                nested_views.clone(),
+                code_meta.clone(),
+                math_enabled.clone(),
+                media.cloned(),
+                true,
+                true,
+            );
+            let view = super::style_markdown_internal(
+                TextView::new(&entity).markdown_extensions(child_ext),
+                action_ctx.lock().unwrap().clone(),
+                code_meta.clone(),
+                cx,
+            );
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .items_start()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w(px(22.))
+                        .text_right()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(format!("{}.", item.number)),
+                )
+                .child(div().flex_1().min_w_0().child(view))
+                .into_any_element()
+        })
+        .collect();
+    v_flex().w_full().min_w_0().gap(px(4.)).children(rows).into_any_element()
 }
 
 fn render_details_block(
@@ -424,6 +606,7 @@ fn render_details_block(
         math_enabled.clone(),
         media.cloned(),
         true,
+        false,
     );
     let body_view = super::style_markdown_internal(
         TextView::new(&entity).markdown_extensions(child_ext),
@@ -806,6 +989,7 @@ fn render_table_block(
             math_enabled.clone(),
             media.cloned(),
             false,
+            false,
         );
         super::style_markdown_internal(
             TextView::new(&entity).markdown_extensions(child_ext),
@@ -818,8 +1002,6 @@ fn render_table_block(
 
     let md_copy = data.data.to_markdown();
     let csv_copy = data.data.to_csv();
-    let ctx_md = action_ctx.lock().unwrap().as_ref().map(|c| c.state.clone());
-    let ctx_csv = ctx_md.clone();
 
     v_flex()
         .w_full()
@@ -835,9 +1017,6 @@ fn render_table_block(
                     Some(Icon::Copy),
                     move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(md_copy.clone()));
-                        if let Some(app) = &ctx_md {
-                            app.update(cx, |a, cx| a.show_toast(Toast::new(ToastKind::Success, "Copied table as Markdown"), cx));
-                        }
                     },
                     cx,
                 ))
@@ -847,9 +1026,6 @@ fn render_table_block(
                     Some(Icon::Copy),
                     move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(csv_copy.clone()));
-                        if let Some(app) = &ctx_csv {
-                            app.update(cx, |a, cx| a.show_toast(Toast::new(ToastKind::Success, "Copied table as CSV"), cx));
-                        }
                     },
                     cx,
                 )),
@@ -909,6 +1085,7 @@ fn render_media_table_grid(
                 code_meta.clone(),
                 math_enabled.clone(),
                 media.cloned(),
+                false,
                 false,
             );
             let cell_view = super::style_markdown_internal(

@@ -10,7 +10,7 @@ use gpui::{
     AnyElement, App, FontStyle, FontWeight, HighlightStyle, InteractiveElement, IntoElement, ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement,
     StrikethroughStyle, Styled, Task, UnderlineStyle, div, prelude::FluentBuilder, px,
 };
-use gpui_component::{ActiveTheme, v_flex};
+use gpui_component::ActiveTheme;
 use t3_client::command_output::CommandOutputStream;
 use t3_core::command_output::{CommandOutput, CommandOutputStatus, LOADING, NO_OUTPUT, Panel, TRUNCATED};
 use t3_core::terminal_output::{DARK_PALETTE, LIGHT_PALETTE, Rgb, SpanStyle, terminal_output_display};
@@ -132,6 +132,9 @@ pub fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> Opti
         .max_h(rem(320.))
         .overflow_y_scroll()
         .track_scroll(&slot.scroll)
+        .when(output.truncated, |this| {
+            this.child(div().mb(px(4.)).text_size(px(11.)).italic().text_color(hsla(palette(cx).muted_foreground)).child(TRUNCATED))
+        })
         .child(
             mono_frame(cx)
                 .text_color(hsla(palette(cx).muted_foreground))
@@ -142,16 +145,7 @@ pub fn panel(entry_id: &str, slot: Option<&CommandOutputSlot>, cx: &App) -> Opti
                         .autoscroll(&slot.scroll),
                 ),
         );
-    Some(
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .when(output.truncated, |this| {
-                this.child(div().mb(px(4.)).text_size(px(11.)).italic().text_color(hsla(palette(cx).muted_foreground)).child(TRUNCATED))
-            })
-            .child(scroller)
-            .into_any_element(),
-    )
+    Some(scroller.into_any_element())
 }
 
 /// `ShellCommandBlock.tsx` and `HighlightedTokens.tsx`, shared by streamed command rows and

@@ -15,7 +15,7 @@ mod view;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use gpui::{Action, App, AppContext, Context, Entity, EventEmitter, Global, Window, actions};
+use gpui::{Action, App, AppContext, Context, Entity, EventEmitter, Global, Task, Window, actions};
 use serde::{Deserialize, Serialize};
 use t3_client::store;
 use t3_core::project_scripts::{ProjectScript, preferred_script, resolve_project_scripts};
@@ -96,6 +96,8 @@ pub struct Details {
     presentation: Presentation,
     /// A press outside closes the popover just before the toggle's click would reopen it.
     popover_closed_at: Option<Instant>,
+    remote_capable_editors: Option<Vec<String>>,
+    remote_editor_probe: Option<Task<()>>,
 }
 
 impl EventEmitter<DetailsEvent> for Details {}
@@ -137,7 +139,38 @@ impl Details {
             last_editor: persisted.last_editor,
             presentation: Presentation::Inline,
             popover_closed_at: None,
+            remote_capable_editors: None,
+            remote_editor_probe: None,
         }
+    }
+
+    pub(crate) fn start_remote_editor_probe(&mut self, cx: &mut Context<Self>) {
+        if self.remote_editor_probe.is_some() || self.remote_capable_editors.is_some() {
+            return;
+        }
+        let background = cx.background_executor().clone();
+        self.remote_editor_probe = Some(cx.spawn(async move |this, cx| {
+            let probed = background.spawn(async { t3_core::thread_details::probe_remote_capable_editors() }).await;
+            let _ = this.update(cx, |details, cx| {
+                details.remote_editor_probe = None;
+                if !probed.is_empty() && details.remote_capable_editors.is_none() {
+                    details.remote_capable_editors = Some(probed);
+                    cx.emit(DetailsEvent::Changed);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    pub fn remote_capable_editors(&self) -> Vec<String> {
+        self.remote_capable_editors
+            .clone()
+            .unwrap_or_else(|| t3_core::thread_details::REMOTE_FALLBACK_EDITORS.iter().map(|id| (*id).to_owned()).collect())
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn set_remote_capable_editors(&mut self, editors: Option<Vec<String>>) {
+        self.remote_capable_editors = editors;
     }
 
     pub fn shows(&self, id: &str) -> bool {
@@ -231,9 +264,35 @@ impl Details {
         self.git.update(cx, |git, cx| git.run_script(script, cx));
     }
 
-    pub fn open_in_editor(&mut self, editor: &str, cx: &mut Context<Self>) {
-        self.set_last_editor(editor, cx);
-        self.git.update(cx, |git, cx| git.open_in_editor(editor, cx));
+    pub fn open_in_editor(&mut self, state: &Entity<AppState>, editor: &str, cx: &mut Context<Self>) {
+        use t3_core::thread_details::{RemoteOpenState, build_remote_open_url};
+
+        let remote_state = state.read(cx).active_remote_open_state();
+        match remote_state {
+            RemoteOpenState::RemoteUnavailable => {}
+            RemoteOpenState::RemoteLinks(host) => {
+                let cwd = self.git.read(cx).target.as_ref().map(|target| target.cwd.clone()).or_else(|| {
+                    let app = state.read(cx);
+                    match app.selected_thread.as_deref().and_then(|id| app.thread_shell(id)) {
+                        Some(thread) => thread.worktree_path.clone().or_else(|| app.shell.project(&thread.project_id).map(|p| p.workspace_root.clone())),
+                        None => app.draft_project.as_deref().and_then(|id| app.shell.project(id).map(|p| p.workspace_root.clone())),
+                    }
+                });
+                let Some(cwd) = cwd else { return };
+                let Some(url) = build_remote_open_url(editor, &host, &cwd, false) else { return };
+                self.set_last_editor(editor, cx);
+                cx.open_url(&url);
+                let label = vcs::editor_label(editor, cfg!(target_os = "macos"));
+                state.update(cx, |state, cx| state.announce(format!("Opened in {label}"), None, cx));
+            }
+            RemoteOpenState::LocalExec => {
+                if !self.git.read(cx).can_operate_thread() {
+                    return;
+                }
+                self.set_last_editor(editor, cx);
+                self.git.update(cx, |git, cx| git.open_in_editor(editor, cx));
+            }
+        }
     }
 }
 
@@ -340,6 +399,7 @@ pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<Details> {
     let git = crate::git::init(state.clone(), cx);
     let details = cx.new(|_| Details::new(git));
     cx.set_global(DetailsGlobal(details.clone()));
+    details.update(cx, |details, cx| details.start_remote_editor_probe(cx));
     let toggle = (state.clone(), details.clone());
     cx.on_action(move |_: &ToggleThreadPanel, cx| {
         let Some(key) = panel_key(toggle.0.read(cx)) else { return };
@@ -354,10 +414,32 @@ pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<Details> {
     });
     let favorite = (state, details.clone());
     cx.on_action(move |_: &OpenFavoriteEditor, cx| {
-        let available = favorite.0.read(cx).server_config.config.as_ref().map(|config| config.available_editors.clone()).unwrap_or_default();
-        let editor = favorite.1.read(cx).preferred_editor(&available);
+        let app = favorite.0.read(cx);
+        let project_id = app
+            .selected_thread
+            .as_deref()
+            .and_then(|id| app.thread_shell(id))
+            .map(|thread| thread.project_id.as_str())
+            .or(app.draft_project.as_deref());
+        let has_active_project = project_id.and_then(|id| app.shell.project(id)).is_some();
+        if !app.should_show_open_in_picker(has_active_project) {
+            return;
+        }
+        let available = app.active_open_in_config().map(|config| config.available_editors.clone()).unwrap_or_default();
+        let remote_state = app.active_remote_open_state();
+        let can_open = match remote_state {
+            t3_core::thread_details::RemoteOpenState::RemoteUnavailable => false,
+            t3_core::thread_details::RemoteOpenState::RemoteLinks(_) => true,
+            t3_core::thread_details::RemoteOpenState::LocalExec => favorite.1.read(cx).git.read(cx).can_operate_thread(),
+        };
+        if !can_open {
+            return;
+        }
+        let effective = t3_core::thread_details::effective_open_in_editors(&remote_state, &available, &favorite.1.read(cx).remote_capable_editors());
+        let editor = favorite.1.read(cx).preferred_editor(&effective);
         if let Some(editor) = editor {
-            favorite.1.update(cx, |details, cx| details.open_in_editor(editor, cx));
+            let state = favorite.0.clone();
+            favorite.1.update(cx, |details, cx| details.open_in_editor(&state, editor, cx));
         }
     });
     details

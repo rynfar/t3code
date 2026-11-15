@@ -291,6 +291,7 @@ impl Render for DetailsView {
             let git = self.git.read(cx);
             let thread = app.selected_thread.as_deref().and_then(|id| app.thread_shell(id));
             let project_id = thread.map(|t| t.project_id.as_str()).or(app.draft_project.as_deref());
+            let has_active_project = project_id.and_then(|id| app.shell.project(id)).is_some();
             let has_git_cwd = app.server_config.config.is_some()
                 && project_id
                     .and_then(|id| app.shell.project(id).map(|p| (id, p)))
@@ -301,7 +302,7 @@ impl Render for DetailsView {
             let rel = self.inputs.as_ref().map(|i| &i.lineage);
             DensityInputs {
                 environment: details.shows("environment"),
-                open_in: details.shows("openIn"),
+                open_in: details.shows("openIn") && app.should_show_open_in_picker(has_active_project),
                 scripts: details.shows("scripts") && has_scripts,
                 branch: details.shows("branch") && is_repo,
                 pr_row: details.shows("branch") && if is_repo { git.status.as_ref().and_then(|s| s.remote.pr.as_ref()).is_some() } else { has_linked_pr },

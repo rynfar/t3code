@@ -6,7 +6,7 @@ use markdown::mdast;
 
 use super::links;
 
-/// GitHub Alert variants (`packages/shared/src/markdownGithubAlerts.ts`).
+/// GitHub Alert variants (`packages/shared/src/markdownGithubAlerts.ts`) and Claude Insight blocks (`#22239`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertKind {
     Note,
@@ -14,6 +14,7 @@ pub enum AlertKind {
     Important,
     Warning,
     Caution,
+    Insight,
 }
 
 impl AlertKind {
@@ -24,6 +25,18 @@ impl AlertKind {
             Self::Important => "Important",
             Self::Warning => "Warning",
             Self::Caution => "Caution",
+            Self::Insight => "Insight",
+        }
+    }
+
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Note => "NOTE",
+            Self::Tip => "TIP",
+            Self::Important => "IMPORTANT",
+            Self::Warning => "WARNING",
+            Self::Caution => "CAUTION",
+            Self::Insight => "INSIGHT",
         }
     }
 
@@ -34,6 +47,7 @@ impl AlertKind {
             "IMPORTANT" => Some(Self::Important),
             "WARNING" => Some(Self::Warning),
             "CAUTION" => Some(Self::Caution),
+            "INSIGHT" => Some(Self::Insight),
             _ => None,
         }
     }
@@ -45,6 +59,37 @@ pub struct GithubAlert {
     pub kind: AlertKind,
     pub title: &'static str,
     pub body_markdown: String,
+}
+
+impl GithubAlert {
+    /// Clipboard Markdown representation (`markdown-clipboard.ts` `#35932`).
+    pub fn clipboard_markdown(&self) -> String {
+        let body = self.body_markdown.trim();
+        if self.kind == AlertKind::Insight {
+            let body_part = if body.is_empty() { String::new() } else { format!("{body}\n") };
+            return format!("★ Insight {}\n{}{}", "─".repeat(37), body_part, "─".repeat(49));
+        }
+        let marker = format!("[!{}]", self.kind.marker());
+        let content = if body.is_empty() { marker } else { format!("{marker}\n{body}") };
+        content
+            .lines()
+            .map(|line| if line.is_empty() { ">".to_owned() } else { format!("> {line}") })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Ordered list whose written item numbers differ from sequential 1-based numbering (`#33820`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomOrderedListItem {
+    pub number: u64,
+    pub body_markdown: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomOrderedList {
+    pub items: Vec<CustomOrderedListItem>,
+    pub raw_markdown: String,
 }
 
 /// Parsed `<details>` disclosure block encoded via preprocessor fence or raw HTML.
@@ -176,6 +221,225 @@ pub fn parse_details_fence(lang: Option<&str>, meta: Option<&str>, code: &str) -
         summary,
         body_markdown: code.trim().to_owned(),
     })
+}
+
+/// Rewrites `★ Insight ───...` assistant callout blocks into `> [!INSIGHT]` alert quotes while
+/// ignoring lines inside fenced/indented code, blockquotes, lists, and HTML blocks.
+pub fn preprocess_assistant_insights(source: &str) -> String {
+    if !source.contains("★ Insight") {
+        return source.to_owned();
+    }
+    let mut protected_ranges: Vec<(usize, usize, bool)> = Vec::new();
+    if let Ok(mdast::Node::Root(root)) = markdown::to_mdast(source, &markdown::ParseOptions::gfm()) {
+        fn inspect(node: &mdast::Node, out: &mut Vec<(usize, usize, bool)>) {
+            if let Some(pos) = node.position() {
+                let is_multiline_inline_code = matches!(node, mdast::Node::InlineCode(_))
+                    && pos.start.line != pos.end.line;
+                let code = matches!(node, mdast::Node::Code(_) | mdast::Node::Html(_)) || is_multiline_inline_code;
+                if code || matches!(node, mdast::Node::List(_) | mdast::Node::Blockquote(_)) {
+                    out.push((pos.start.offset, pos.end.offset, code));
+                }
+            }
+            if let Some(children) = node.children() {
+                for child in children {
+                    inspect(child, out);
+                }
+            }
+        }
+        for child in &root.children {
+            inspect(child, &mut protected_ranges);
+        }
+    }
+
+    let mut out = String::with_capacity(source.len() + 32);
+    let mut changed = false;
+    let mut indent: Option<&str> = None;
+    let mut offset = 0usize;
+
+    let lines = split_lines_preserve_endings(source);
+    for line in lines {
+        let line_len = line.len();
+        let value = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[value.len()..];
+        let blocked = protected_ranges.iter().any(|&(start, end, is_code)| {
+            offset >= start && offset < end && (indent.is_none() || is_code)
+        });
+
+        let mut output_handled = false;
+        if indent.is_none() && !blocked
+            && let Some(ind) = match_insight_opening(value)
+        {
+            indent = Some(ind);
+            changed = true;
+            out.push_str("> [!INSIGHT]");
+            out.push_str(ending);
+            output_handled = true;
+        } else if let Some(active_indent) = indent
+            && !blocked
+            && match_insight_closing(value).is_some_and(|c| c == active_indent)
+        {
+            indent = None;
+            changed = true;
+            out.push_str(ending);
+            output_handled = true;
+        } else if indent.is_some() {
+            changed = true;
+            if value.is_empty() {
+                out.push('>');
+            } else {
+                out.push_str("> ");
+                out.push_str(value);
+            }
+            out.push_str(ending);
+            output_handled = true;
+        }
+
+        if !output_handled {
+            out.push_str(line);
+        }
+        offset += line_len;
+    }
+
+    if changed { out } else { source.to_owned() }
+}
+
+fn split_lines_preserve_endings(source: &str) -> Vec<&str> {
+    let bytes = source.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' || (bytes[i] == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
+            lines.push(&source[start..=i]);
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if start < bytes.len() {
+        lines.push(&source[start..]);
+    }
+    lines
+}
+
+fn match_insight_opening(line: &str) -> Option<&str> {
+    let leading = line.bytes().take_while(|&b| b == b' ').count();
+    if leading > 3 {
+        return None;
+    }
+    let indent = &line[..leading];
+    let mut rest = &line[leading..];
+    let has_backtick = if let Some(after) = rest.strip_prefix('`') {
+        rest = after;
+        true
+    } else {
+        false
+    };
+    let rest = rest.strip_prefix("★ Insight")?;
+    let ws_count = rest.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+    if ws_count == 0 {
+        return None;
+    }
+    let mut after_ws = &rest[ws_count..];
+    let dash_count = after_ws.chars().take_while(|&c| c == '─').count();
+    if dash_count < 3 {
+        return None;
+    }
+    after_ws = &after_ws[dash_count * '─'.len_utf8()..];
+    if has_backtick {
+        after_ws = after_ws.strip_prefix('`')?;
+    }
+    after_ws.chars().all(|c| c == ' ' || c == '\t').then_some(indent)
+}
+
+fn match_insight_closing(line: &str) -> Option<&str> {
+    let leading = line.bytes().take_while(|&b| b == b' ').count();
+    if leading > 3 {
+        return None;
+    }
+    let indent = &line[..leading];
+    let mut rest = &line[leading..];
+    let has_backtick = if let Some(after) = rest.strip_prefix('`') {
+        rest = after;
+        true
+    } else {
+        false
+    };
+    let dash_count = rest.chars().take_while(|&c| c == '─').count();
+    if dash_count < 3 {
+        return None;
+    }
+    let mut after_dashes = &rest[dash_count * '─'.len_utf8()..];
+    if has_backtick {
+        after_dashes = after_dashes.strip_prefix('`')?;
+    }
+    after_dashes.chars().all(|c| c == ' ' || c == '\t').then_some(indent)
+}
+
+/// Extracts written item numbers for an ordered list so sent user messages keep non-sequential
+/// markers like `3. First` / `5. Second` (`markdownOrderedListNumbers.ts`).
+pub fn parse_custom_ordered_list(list: &mdast::List, raw_source: &str) -> Option<CustomOrderedList> {
+    if !list.ordered {
+        return None;
+    }
+    let list_pos = list.position.as_ref()?;
+    let raw_markdown = raw_source.get(list_pos.start.offset..list_pos.end.offset)?.to_owned();
+    let start = list.start.unwrap_or(1) as u64;
+    let mut expected = start;
+    let mut diverges = start != 1;
+    let mut items = Vec::with_capacity(list.children.len());
+
+    for child in &list.children {
+        let mdast::Node::ListItem(item) = child else { return None };
+        let pos = item.position.as_ref()?;
+        let slice = raw_source.get(pos.start.offset..pos.end.offset)?;
+        let (written, marker_len) = parse_written_list_marker(slice);
+        let number = written.unwrap_or(expected);
+        if number != expected {
+            diverges = true;
+        }
+        expected = number + 1;
+        let body = if written.is_some() {
+            dedent_list_item_body(&slice[marker_len..], marker_len)
+        } else {
+            item.children.iter().map(collect_plain_markdownish).collect::<Vec<_>>().join("\n\n")
+        };
+        items.push(CustomOrderedListItem { number, body_markdown: body.trim().to_owned() });
+    }
+
+    diverges.then_some(CustomOrderedList { items, raw_markdown })
+}
+
+fn parse_written_list_marker(slice: &str) -> (Option<u64>, usize) {
+    let ws = slice.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+    let digits_len = slice[ws..].bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len == 0 || digits_len > 9 {
+        return (None, 0);
+    }
+    let after = slice.as_bytes().get(ws + digits_len).copied();
+    if !matches!(after, Some(b'.' | b')')) {
+        return (None, 0);
+    }
+    let Ok(num) = slice[ws..ws + digits_len].parse::<u64>() else {
+        return (None, 0);
+    };
+    let mut marker_len = ws + digits_len + 1;
+    while matches!(slice.as_bytes().get(marker_len), Some(b' ' | b'\t')) {
+        marker_len += 1;
+    }
+    (Some(num), marker_len)
+}
+
+fn dedent_list_item_body(rest: &str, indent: usize) -> String {
+    let mut lines = rest.lines();
+    let Some(first) = lines.next() else { return String::new() };
+    let mut out = vec![first.to_owned()];
+    for line in lines {
+        let strip = line.bytes().take(indent).take_while(|&b| b == b' ').count();
+        out.push(line[strip..].to_owned());
+    }
+    out.join("\n")
 }
 
 /// Rewrites `<picture>`, `<img>`, `<video>`, media-bearing `<a>`/`<h1..h6>`/`<table>`, and `<details>`
@@ -1075,9 +1339,54 @@ mod tests {
             let raw = format!("> [!{marker}]\n> Useful detail with `code`.\n>\n> Second line.");
             let parsed = parse_github_alert_markdown(&raw).expect("alert");
             assert_eq!(parsed.kind, expected);
-            assert_eq!(parsed.body_markdown, "Useful detail with `code`.\n\nSecond line.");
+        assert_eq!(parsed.body_markdown, "Useful detail with `code`.\n\nSecond line.");
         }
+        let insight = parse_github_alert_markdown("> [!INSIGHT]\n> Focus on `src/lib.rs`.").expect("insight");
+        assert_eq!(insight.kind, AlertKind::Insight);
+        assert_eq!(insight.title, "Insight");
+        assert_eq!(
+            insight.clipboard_markdown(),
+            format!("★ Insight {}\nFocus on `src/lib.rs`.\n{}", "─".repeat(37), "─".repeat(49))
+        );
+        let note = parse_github_alert_markdown("> [!NOTE]\n> Keep me.").expect("note");
+        assert_eq!(note.clipboard_markdown(), "> [!NOTE]\n> Keep me.");
         assert!(parse_github_alert_markdown("> Normal quote").is_none());
+    }
+
+    #[test]
+    fn rewrites_assistant_insights_and_preserves_code_quotes_and_lists() {
+        let closed = "Intro\n\n`★ Insight ──────────────────`\nFirst line.\n\nSecond line.\n`────────────────────────────`\n\nAfter";
+        let out = preprocess_assistant_insights(closed);
+        assert!(out.contains("> [!INSIGHT]\n> First line.\n>\n> Second line.\n\n\nAfter"), "out:\n{out}");
+
+        let streaming = "★ Insight ───\nPartial";
+        assert_eq!(preprocess_assistant_insights(streaming), "> [!INSIGHT]\n> Partial");
+
+        let protected = "```text\n★ Insight ───\nInside code\n───\n```\n\n> ★ Insight ───\n> Inside quote\n> ───";
+        assert_eq!(preprocess_assistant_insights(protected), protected);
+    }
+
+    #[test]
+    fn parses_custom_ordered_lists_and_px_dimensions() {
+        let src = "3. Question three\n5. Question five\n";
+        let mdast::Node::Root(root) = markdown::to_mdast(src, &markdown::ParseOptions::gfm()).unwrap() else { panic!() };
+        let mdast::Node::List(list) = &root.children[0] else { panic!() };
+        let parsed = parse_custom_ordered_list(list, src).expect("custom ordered list");
+        assert_eq!(parsed.items.len(), 2);
+        assert_eq!(parsed.items[0].number, 3);
+        assert_eq!(parsed.items[0].body_markdown, "Question three");
+        assert_eq!(parsed.items[1].number, 5);
+        assert_eq!(parsed.items[1].body_markdown, "Question five");
+        assert_eq!(parsed.raw_markdown, src.trim_end());
+
+        let seq = "1. One\n2. Two\n";
+        let mdast::Node::Root(seq_root) = markdown::to_mdast(seq, &markdown::ParseOptions::gfm()).unwrap() else { panic!() };
+        let mdast::Node::List(seq_list) = &seq_root.children[0] else { panic!() };
+        assert!(parse_custom_ordered_list(seq_list, seq).is_none());
+
+        let img_md = "<img src=\"a.png\" width=\"14px\" height=\"7px\">";
+        let img_out = preprocess_markdown_for_display(img_md, true, None);
+        assert!(img_out.contains("w=14") && img_out.contains("h=7"), "{img_out}");
     }
 
     #[test]

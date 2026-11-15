@@ -83,7 +83,7 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingBackgroundTask {
     #[serde(default)]
@@ -93,7 +93,15 @@ pub struct PendingBackgroundTask {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
     pub child_thread_id: Option<String>,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub source_thread_id: Option<String>,
+    #[serde(default)]
+    pub native_item_id: Option<String>,
     #[serde(default)]
     pub awaited: Option<bool>,
 }

@@ -47,9 +47,16 @@ pub struct BackgroundItem {
     pub task_id: String,
     pub kind: String,
     pub label: String,
+    /// Title shown inside `BackgroundWorkDetails`.
+    pub details_title: String,
     /// The label is a command line, drawn in mono.
     pub command: bool,
+    pub command_text: Option<String>,
     pub child_thread_id: Option<String>,
+    pub item_id: Option<String>,
+    pub item_running: bool,
+    pub source_thread_id: Option<String>,
+    pub awaited: bool,
     pub activity: Option<String>,
     pub started_at: Option<String>,
     pub updated_at_ms: i64,
@@ -150,7 +157,13 @@ fn background_work_with_items<T: std::borrow::Borrow<TurnItem>>(tasks: &[Pending
                 _ => text.to_owned(),
             });
             let label = label.filter(|label| !label.is_empty());
-            let item = turn_items.iter().map(std::borrow::Borrow::borrow).rev().find(|candidate| item_task_key(candidate) == task.task_id);
+            let item = match task.item_id.as_deref() {
+                Some(item_id) => turn_items.iter().map(std::borrow::Borrow::borrow).rev().find(|candidate| candidate.id == item_id),
+                None => {
+                    let target_id = task.native_item_id.as_deref().unwrap_or(task.task_id.as_str());
+                    turn_items.iter().map(std::borrow::Borrow::borrow).rev().find(|candidate| item_task_key(candidate) == target_id)
+                }
+            };
             let subagent = item.filter(|candidate| matches!(candidate.kind, TurnItemKind::Subagent { .. }));
             let (activity, subagent_child_thread_id) = match subagent.map(|candidate| &candidate.kind) {
                 Some(TurnItemKind::Subagent { child_thread_id, progress, .. }) => {
@@ -162,21 +175,44 @@ fn background_work_with_items<T: std::borrow::Borrow<TurnItem>>(tasks: &[Pending
                 }
                 _ => (None, None),
             };
+            let command_text = task.command.clone().or_else(|| match item.map(|candidate| &candidate.kind) {
+                Some(TurnItemKind::CommandExecution { input, .. }) => Some(input.clone()),
+                _ => None,
+            });
+            let details_title = if let Some(desc) = description.filter(|text| Some(*text) != command_text.as_deref().map(str::trim)) {
+                desc.to_owned()
+            } else if command_text.is_some() {
+                "Command".to_owned()
+            } else {
+                task.kind.replace('_', " ")
+            };
             let command = match item.map(|candidate| &candidate.kind) {
                 Some(TurnItemKind::CommandExecution { input, .. }) => label.as_deref().is_some_and(|text| command_display_text(input) == text),
                 Some(_) => false,
                 None => command_kind && label.is_some(),
             };
+            let item_id = task
+                .item_id
+                .clone()
+                .or_else(|| item.filter(|candidate| matches!(candidate.kind, TurnItemKind::CommandExecution { .. })).map(|candidate| candidate.id.clone()));
+            let item_running = item.is_some_and(|candidate| candidate.status == "running");
+            let source_thread_id = task.source_thread_id.clone().or_else(|| item.map(|candidate| candidate.thread_id.clone()));
             let started_at = item.and_then(|candidate| candidate.started_at.as_deref()).filter(|s| !s.is_empty()).map(str::to_owned);
             let updated_at_ms = subagent.and_then(|candidate| parse_iso_ms(&candidate.updated_at)).unwrap_or(0);
             BackgroundItem {
                 task_id: task.task_id.clone(),
                 kind: task.kind.clone(),
                 command,
+                details_title,
+                command_text,
                 label: label.unwrap_or_else(|| singular.to_owned()),
                 child_thread_id: (task.kind == "subagent")
                     .then(|| task.child_thread_id.clone().or(subagent_child_thread_id))
                     .flatten(),
+                item_id,
+                item_running,
+                source_thread_id,
+                awaited: task.awaited == Some(true),
                 activity,
                 started_at,
                 updated_at_ms,

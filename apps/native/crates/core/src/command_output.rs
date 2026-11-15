@@ -136,6 +136,77 @@ pub fn error_message(message: &str) -> String {
     if message.trim().is_empty() { "The environment request failed.".to_owned() } else { message.to_owned() }
 }
 
+/// Byte budget walk used by UI inspectors to decide synchronous vs background derive (`INLINE_BUDGET`).
+struct InlineBudget(usize);
+
+impl InlineBudget {
+    fn spend(&mut self, bytes: usize) -> bool {
+        match self.0.checked_sub(bytes) {
+            Some(left) => {
+                self.0 = left;
+                true
+            }
+            None => {
+                self.0 = 0;
+                false
+            }
+        }
+    }
+
+    fn text(&mut self, text: Option<&str>) -> bool {
+        self.spend(text.map_or(0, str::len))
+    }
+
+    fn value(&mut self, value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => self.spend(text.len()),
+            serde_json::Value::Array(items) => items.iter().all(|item| self.spend(1) && self.value(item)),
+            serde_json::Value::Object(object) => object.iter().all(|(key, item)| self.spend(key.len()) && self.value(item)),
+            _ => self.spend(8),
+        }
+    }
+
+    fn values(&mut self, values: Option<&Vec<serde_json::Value>>) -> bool {
+        values.into_iter().flatten().all(|value| self.value(value))
+    }
+
+    fn item(&mut self, item: &crate::turn_item::TurnItem) -> bool {
+        use crate::turn_item::TurnItemKind;
+        match &item.kind {
+            TurnItemKind::Reasoning { text, .. } => self.spend(text.len()),
+            TurnItemKind::CommandExecution { input, output, .. } => self.spend(input.len()) && self.text(output.as_deref()),
+            TurnItemKind::DynamicTool { tool_name, input, output, .. } => {
+                self.text(tool_name.as_deref()) && self.value(input) && output.as_ref().is_none_or(|output| self.value(output))
+            }
+            TurnItemKind::FileChange { file_name, diff_str, changes, .. } => {
+                self.spend(file_name.len())
+                    && self.text(diff_str.as_deref())
+                    && changes.iter().flatten().all(|change| {
+                        let parts = [Some(change.operation.as_str()), Some(change.path.as_str()), change.old_path.as_deref(), change.file_type.as_deref(), change.mime_type.as_deref()];
+                        parts.into_iter().all(|part| self.text(part))
+                    })
+            }
+            TurnItemKind::FileSearch { pattern, results } => self.text(pattern.as_deref()) && self.values(results.as_ref()),
+            TurnItemKind::WebSearch { patterns, results } => {
+                patterns.iter().flatten().all(|pattern| self.spend(pattern.len() + 1)) && self.values(results.as_ref())
+            }
+            TurnItemKind::ApprovalRequest { prompt, .. } => self.text(prompt.as_deref()),
+            TurnItemKind::UserInputRequest { questions, .. } => questions.iter().all(|question| self.value(question)),
+            TurnItemKind::Notification { detail, .. } => self.text(detail.as_deref()),
+            TurnItemKind::SystemNotice { message } => self.spend(message.len()),
+            TurnItemKind::Error { failure, .. } => self.spend(failure.message.len()),
+            TurnItemKind::TodoList { steps, .. } => steps.iter().all(|step| self.spend(step.text.len() + 2)),
+            _ => true,
+        }
+    }
+}
+
+/// Returns whether an inspector item (and optional loaded fetched detail) fits within `inline_budget`.
+pub fn item_within_inline_budget(item: &crate::turn_item::TurnItem, loaded: Option<&crate::turn_item::TurnItem>, inline_budget: usize) -> bool {
+    let mut budget = InlineBudget(inline_budget);
+    budget.item(item) && loaded.is_none_or(|detail| budget.item(detail))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

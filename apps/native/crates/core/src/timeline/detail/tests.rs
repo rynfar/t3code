@@ -82,6 +82,28 @@ fn tool_output_reads_content_blocks_and_pretty_prints_json() {
     assert_eq!(turn_item_output_text(&viewed), None, "a viewed image shows as the preview");
     let omitted = item(json!({ "type": "dynamic_tool", "toolName": "x", "input": {}, "output": "kept", "outputOmitted": true }));
     assert_eq!(turn_item_output_text(&omitted), None);
+
+    let mcp_structured = tool(json!({
+        "t3McpApp": { "resourceUri": "ui://demo" },
+        "result": {
+            "content": [{ "type": "text", "text": "fallback" }],
+            "structuredContent": { "count": 2 }
+        }
+    }));
+    assert_eq!(turn_item_output_text(&mcp_structured).as_deref(), Some("{\n  \"count\": 2\n}"));
+    assert!(turn_item_output_images(&mcp_structured).is_empty());
+
+    let mcp_images = tool(json!({
+        "t3McpApp": { "resourceUri": "ui://demo" },
+        "result": {
+            "content": [
+                { "type": "text", "text": "Rendered" },
+                { "type": "image", "mimeType": "image/png" }
+            ],
+            "structuredContent": {}
+        }
+    }));
+    assert_eq!(turn_item_output_text(&mcp_images).as_deref(), Some("Rendered\n[image]"));
 }
 
 #[test]

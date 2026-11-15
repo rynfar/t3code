@@ -91,7 +91,7 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
         }
         let label = if store.initializing { "Initializing..." } else { "Initialize Git" };
         let git = git.clone();
-        return Some(Row::new("git-init", label).icon(Icon::GitBranchPlus).disabled(store.initializing).on_click(move |_, _, cx| git.update(cx, |git, cx| git.init_repo(cx))).into_any_element());
+        return Some(Row::new("git-init", label).icon(Icon::GitBranchPlus).tooltip(label).disabled(store.initializing).on_click(move |_, _, cx| git.update(cx, |git, cx| git.init_repo(cx))).into_any_element());
     }
     let has_primary_remote = status.is_some_and(|status| status.local.has_primary_remote);
     let is_default_ref = status.is_some_and(|status| status.local.is_default_ref);
@@ -134,7 +134,7 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
         Some(reason) => Row::new("git-quick-action", quick.label.clone()).icon(icon).disabled(true).tooltip(reason),
         None => {
             let (git, dialogs) = (git.clone(), dialogs.clone());
-            Row::new("git-quick-action", quick.label.clone()).icon(icon).on_click(move |_, window, cx| run_quick_action(&quick, &git, &dialogs, window, cx))
+            Row::new("git-quick-action", quick.label.clone()).icon(icon).tooltip(quick.label.clone()).on_click(move |_, window, cx| run_quick_action(&quick, &git, &dialogs, window, cx))
         }
     };
     Some(split_row("git-actions", primary, menu, cx).into_any_element())

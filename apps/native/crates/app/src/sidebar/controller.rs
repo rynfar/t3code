@@ -175,6 +175,8 @@ pub struct SidebarController {
     visit: Option<VisitTracker>,
     visit_target: Option<VisitTarget>,
     visit_revision: u64,
+    pub(crate) visit_session_generation: u64,
+    visit_last_connection: Option<(u64, u64)>,
     pending_palette_visit: Option<(OpenEnvironment, String, Ms, Ms)>,
     pub(crate) local_visits: LocalVisitWatermarks,
     pub(crate) local_visits_loaded: bool,
@@ -263,17 +265,15 @@ impl SidebarController {
             return VisitDecision::Skip;
         };
         if self.visit_target.as_ref().is_none_or(|current| {
-            current.environment != environment
-                || current.thread != id
-                || current.connection != connection
+            current.environment != environment || current.thread != id
         }) {
             let opened = history.claim(&environment, id, now);
-            let mut tracker = VisitTracker::new(id, opened);
+            let mut tracker = VisitTracker::new_at(id, opened, self.visit_session_generation);
             if let Some((p_env, p_id, p_visited_at, p_now)) = self.pending_palette_visit.take()
                 && p_env == environment
                 && p_id == id
             {
-                tracker.mark_dispatched(p_visited_at, p_now);
+                tracker.mark_dispatched_at(p_visited_at, p_now, self.visit_session_generation);
             }
             self.visit = Some(tracker);
             self.visit_target = Some(VisitTarget {
@@ -282,9 +282,12 @@ impl SidebarController {
                 connection,
                 mount: history.next_mount(),
             });
+        } else if let Some(current) = self.visit_target.as_mut() {
+            current.connection = connection;
         }
+        let generation = self.visit_session_generation;
         shell.map_or(VisitDecision::Skip, |shell| {
-            self.visit.as_mut().unwrap().on_shell(shell, now)
+            self.visit.as_mut().unwrap().on_shell_at(shell, now, generation)
         })
     }
 
@@ -299,7 +302,7 @@ impl SidebarController {
             current.environment == environment && current.thread == thread_id
         }) && let Some(tracker) = self.visit.as_mut()
         {
-            tracker.mark_dispatched(visited_at, now);
+            tracker.mark_dispatched_at(visited_at, now, self.visit_session_generation);
             return;
         }
         self.pending_palette_visit = Some((environment, thread_id.to_owned(), visited_at, now));
@@ -331,8 +334,9 @@ impl SidebarController {
         }
         self.visit_timer = None;
         self.visit_revision += 1;
+        let generation = self.visit_session_generation;
         self.visit.as_mut().map_or(VisitDecision::Skip, |tracker| {
-            tracker.fire(timer.visited_at, now)
+            tracker.fire_at(timer.visited_at, now, generation)
         })
     }
 }
@@ -1117,7 +1121,22 @@ impl AppState {
         })
     }
 
+    pub(crate) fn sync_visit_session_generation(&mut self, force_bump: bool) {
+        let current = connected(&self.phase)
+            .then(|| Some((self.connection_id()?, *self.client_handle()?.connection_generation().borrow())))
+            .flatten();
+        if let Some(current) = current {
+            if force_bump || self.sidebar.visit_last_connection != Some(current) {
+                self.sidebar.visit_session_generation += 1;
+                self.sidebar.visit_last_connection = Some(current);
+            }
+        } else {
+            self.sidebar.visit_last_connection = None;
+        }
+    }
+
     pub(crate) fn track_visit(&mut self, cx: &mut Context<Self>) {
+        self.sync_visit_session_generation(false);
         let id = self.selected_thread.clone();
         let now = now_ms();
         let environment = self.visit_environment();
@@ -1185,8 +1204,41 @@ impl AppState {
             }
             return;
         }
+        let mount = self
+            .sidebar
+            .visit_target
+            .as_ref()
+            .filter(|target| target.thread == thread_id)
+            .map(|target| target.mount);
+        let client = connected(&self.phase).then(|| self.client_handle()).flatten();
+        let Some(client) = client else {
+            if let Some(mount) = mount
+                && self.sidebar.visit_target.as_ref().is_some_and(|target| target.mount == mount)
+                && let Some(tracker) = self.sidebar.visit.as_mut()
+            {
+                tracker.fail(visited_at, opened);
+            }
+            return;
+        };
         let command = actions::visit_with(&uuid(), thread_id, visited_at, opened, search_query);
-        self.dispatch_then(command, None, cx, |_, _, _| {});
+        let task = self.runtime().spawn(client.dispatch(command));
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or(Err(RpcError::Closed));
+            let _ = this.update(cx, |state, cx| {
+                if let Some(mount) = mount
+                    && state.sidebar.visit_target.as_ref().is_some_and(|target| target.mount == mount)
+                {
+                    if result.is_ok() {
+                        if let Some(tracker) = state.sidebar.visit.as_mut() {
+                            tracker.accept(visited_at);
+                        }
+                    } else if state.sidebar.visit.as_mut().is_some_and(|tracker| tracker.fail(visited_at, opened)) {
+                        state.track_visit(cx);
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// Dispatches a command; on failure shows `failure_title` (when given) as an error toast.
@@ -2559,6 +2611,35 @@ mod visit_tests {
         assert_eq!(
             sidebar.fire_visit(&current, Some(&env), Some(1), Some("a"), 11_001),
             VisitDecision::Skip
+        );
+    }
+
+    #[test]
+    fn reconnect_preserves_visit_tracker_and_retries_failed_open() {
+        let mut sidebar = SidebarController { visit_session_generation: 1, ..Default::default() };
+        let mut history = OpenHistory::default();
+        let env = history.environment(Some("saved-a"), None).unwrap();
+        let shell = VisitedShell {
+            updated_at: 100,
+            last_visited_at: Some(50),
+            completed_at: None,
+            woke_at: None,
+        };
+        assert_eq!(
+            sidebar.visit_decision(&mut history, Some((env.clone(), Some(1), "a")), Some(shell), 1_000),
+            VisitDecision::Now { visited_at: 100, opened: true }
+        );
+        assert!(sidebar.visit.as_mut().unwrap().fail(100, true));
+        // Even if connection ID changes on reconnect for the same environment/thread, tracker survives
+        // and same session generation waits until generation advances.
+        assert_eq!(
+            sidebar.visit_decision(&mut history, Some((env.clone(), Some(2), "a")), Some(shell), 2_000),
+            VisitDecision::Skip
+        );
+        sidebar.visit_session_generation = 2;
+        assert_eq!(
+            sidebar.visit_decision(&mut history, Some((env, Some(2), "a")), Some(shell), 12_000),
+            VisitDecision::Now { visited_at: 100, opened: true }
         );
     }
 

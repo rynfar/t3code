@@ -246,6 +246,21 @@ impl MediaViewer {
         super::dimensions(&self.items.get(self.index)?.source, cx)
     }
 
+    fn apply_scroll_wheel(&mut self, event: &ScrollWheelEvent, natural: (u32, u32), window: &Window, cx: &mut Context<Self>) {
+        let delta = event.delta.pixel_delta(px(16.));
+        if event.modifiers.control {
+            let factor = (f32::from(delta.y) * 0.01).exp();
+            self.zoom_to(self.zoom * factor, Some(event.position), natural, window, cx);
+            return;
+        }
+        if self.zoom > 1. {
+            self.pan -= delta;
+            let frame = self.frame(natural, window);
+            self.clamp_pan(&frame);
+            cx.notify();
+        }
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let kind = self.items.get(self.index).map_or(MediaKind::Image, |item| item.kind);
         let natural = if kind == MediaKind::Image { self.natural(cx) } else { None };
@@ -440,9 +455,7 @@ impl MediaViewer {
                             this.zoom_to(next, Some(event.position), natural, window, cx);
                         }))
                         .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, window, cx| {
-                            let delta = f32::from(event.delta.pixel_delta(px(16.)).y);
-                            let factor = (delta * if event.modifiers.control { 0.01 } else { 0.002 }).exp();
-                            this.zoom_to(this.zoom * factor, Some(event.position), natural, window, cx);
+                            this.apply_scroll_wheel(event, natural, window, cx);
                             cx.stop_propagation();
                         }))
                         .child(img(image).absolute().left(-self.pan.x).top(-self.pan.y).w(px(frame.width)).h(px(frame.height)))
@@ -620,6 +633,36 @@ mod tests {
                 assert!(!v.is_open());
                 assert!(v.scope.is_none());
                 assert!(cx.try_global::<FullscreenViewer>().and_then(|g| g.0.as_ref()).is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn wheel_zooms_only_with_control_and_plain_wheel_pans(cx: &mut gpui::TestAppContext) {
+        let (viewer, cx) = cx.add_window_view(|_, cx| MediaViewer::new(cx));
+        let natural = (2000, 1200);
+        cx.update(|window, cx| {
+            viewer.update(cx, |v, cx| {
+                v.open(vec![ViewerItem::image(MediaSource::Direct("data:image/png;base64,iVBORw0KGgo=".into()), "big.png")], 0, window, cx);
+                let plain = ScrollWheelEvent {
+                    delta: gpui::ScrollDelta::Pixels(point(px(-20.), px(-40.))),
+                    modifiers: gpui::Modifiers::none(),
+                    ..Default::default()
+                };
+                v.apply_scroll_wheel(&plain, natural, window, cx);
+                assert!((v.zoom - 1.).abs() < f32::EPSILON, "plain wheel must not zoom");
+
+                let pinch = ScrollWheelEvent {
+                    delta: gpui::ScrollDelta::Pixels(point(px(0.), px(60.))),
+                    modifiers: gpui::Modifiers { control: true, ..Default::default() },
+                    ..Default::default()
+                };
+                v.apply_scroll_wheel(&pinch, natural, window, cx);
+                assert!(v.zoom > 1.2, "ctrl/pinch wheel should zoom");
+
+                let before_pan = v.pan;
+                v.apply_scroll_wheel(&plain, natural, window, cx);
+                assert!(v.pan.x > before_pan.x || v.pan.y > before_pan.y, "plain wheel while zoomed should pan");
             });
         });
     }

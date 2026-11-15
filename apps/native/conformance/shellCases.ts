@@ -284,7 +284,16 @@ export function shellCases() {
                 description: "Explore the repo",
                 childThreadId: "thread-child",
               },
-              { taskId: "task-2", kind: "command", description: "npm run dev", awaited: true },
+              {
+                taskId: "task-2",
+                kind: "command",
+                description: "npm run dev",
+                command: "npm run dev",
+                itemId: "item-cmd-2",
+                nativeItemId: "native-cmd-2",
+                sourceThreadId: thread.id,
+                awaited: true,
+              },
             ],
             goal: { objective: "Ship the sidebar", status: "active" },
             limitRecovery: {

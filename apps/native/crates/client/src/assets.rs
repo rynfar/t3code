@@ -50,8 +50,21 @@ pub async fn fetch_media(client: &ClientHandle, source: &MediaSource) -> Result<
     }
 }
 
+/// True when `resource` requires `filesystem:read` and the connected session lacks it (`#24637`).
+pub fn missing_file_access(client: &ClientHandle, resource: &AssetResource) -> bool {
+    resource.requires_filesystem_read()
+        && client
+            .session_state()
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| !session.grants(t3_core::media::FILESYSTEM_READ_SCOPE))
+}
+
 /// The mint and fetch are separate so an unchanged file keeps its already decoded image.
 pub async fn mint_media_url(client: &ClientHandle, resource: &AssetResource) -> Result<AssetUrl, String> {
+    if missing_file_access(client, resource) {
+        return Err(t3_core::media::MISSING_FILE_ACCESS_MESSAGE.to_owned());
+    }
     let minted = client.request(t3_core::media::CREATE_ASSET_URL, resource.create_url_request()).await.map_err(|error| {
         tracing::debug!(%error, "assets.createUrl failed");
         UNAVAILABLE.to_owned()
@@ -67,6 +80,9 @@ pub async fn mint_media_url_with_fallback(
     resource: &AssetResource,
     local: impl std::future::Future<Output = Option<ClientHandle>>,
 ) -> Result<AssetUrl, String> {
+    if missing_file_access(client, resource) {
+        return Err(t3_core::media::MISSING_FILE_ACCESS_MESSAGE.to_owned());
+    }
     let result = client.request(t3_core::media::CREATE_ASSET_URL, resource.create_url_request()).await;
     let error = match result {
         Ok(value) => return decode_asset_url(&value),
@@ -201,5 +217,37 @@ mod tests {
             .await;
         let fallen_back = mint_fail.await.unwrap().unwrap();
         assert_eq!(fallen_back.relative_url, fallback);
+    }
+
+    #[tokio::test]
+    async fn blocks_file_backed_assets_when_session_lacks_filesystem_read_and_never_falls_back_for_host_only() {
+        use crate::supervisor;
+        use crate::test_server::FakeServer;
+        use serde_json::json;
+        use t3_core::media::{AssetResource, MISSING_FILE_ACCESS_MESSAGE};
+
+        let mut server = FakeServer::start().await;
+        let (handle, _events) = supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+        let mut socket = server.connection().await;
+        let config = socket.request(t3_core::commands::method::SUBSCRIBE_SERVER_CONFIG).await;
+        socket.chunk(&config, json!([{"type":"snapshot","config":{}}])).await;
+        let mut grants = handle.session_state();
+        while grants.borrow().is_none() {
+            grants.changed().await.unwrap();
+        }
+
+        let media = AssetResource::MediaFile {
+            thread_id: "thr-1".into(),
+            path: "/Volumes/repo/shot.png".into(),
+        };
+        let err = super::mint_media_url_with_fallback(&handle, &media, async { None }).await.unwrap_err();
+        assert_eq!(err, MISSING_FILE_ACCESS_MESSAGE);
+
+        let remote_only = AssetResource::RemoteMediaFile {
+            thread_id: "thr-1".into(),
+            path: "shot.png".into(),
+        };
+        let err2 = super::mint_media_url(&handle, &remote_only).await.unwrap_err();
+        assert_eq!(err2, MISSING_FILE_ACCESS_MESSAGE);
     }
 }

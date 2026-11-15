@@ -6,7 +6,9 @@
 pub mod blocks;
 pub mod links;
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,10 +16,12 @@ use gpui::prelude::FluentBuilder;
 use gpui::{App, AppContext, ClipboardItem, Entity, EntityId, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, Subscription, Task, div, px, rems};
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::{ActiveTheme, h_flex};
-use t3_core::markdown::{DisplayMarkdownOptions, prepare_display_markdown_with_raw_html};
+use t3_core::markdown::mentions::{collect_composer_model_mentions, link_model_mentions};
+use t3_core::markdown::{DisplayMarkdownOptions, prepare_display_markdown_for_surface};
 
 use self::blocks::{
-    CodeFenceMetaMap, NestedSelection, NestedViews, RichMarkdownMedia, SharedActionContext, SharedCodeMeta, SharedMathEnabled, attach_rich_extensions_with_media,
+    CodeFenceMetaMap, NestedSelection, NestedViews, RichMarkdownMedia, SharedActionContext, SharedCodeMeta, SharedMathEnabled,
+    attach_rich_extensions_with_media_options,
 };
 use self::links::MarkdownActionContext;
 use crate::icons::Icon;
@@ -29,11 +33,13 @@ const SOFT_LIMIT: usize = 48;
 const KEEP_FRAMES: u64 = 2;
 
 struct Cached {
+    source_key: Arc<str>,
     text: Arc<str>,
     prepared: Arc<str>,
     is_dark: bool,
     cwd: Option<String>,
     math_enabled: bool,
+    mentions_hash: u64,
     math_enabled_flag: SharedMathEnabled,
     state: Entity<TextViewState>,
     drawn: u64,
@@ -108,6 +114,7 @@ pub struct MarkdownState {
     nested_views: NestedViews,
     action_ctx: SharedActionContext,
     code_meta: SharedCodeMeta,
+    source_key: Option<Arc<str>>,
 }
 
 impl MarkdownState {
@@ -129,6 +136,15 @@ impl MarkdownState {
                 NestedSelection::Markdown(child) => {
                     let selected = child.read(cx).selected_text();
                     if !selected.trim().is_empty() && selected == quote {
+                        return Some(selected);
+                    }
+                }
+                NestedSelection::Alert { entity, plain_body, clipboard_markdown } => {
+                    let selected = entity.read(cx).selected_text();
+                    if !selected.trim().is_empty() && selected == quote {
+                        if selected.trim() == plain_body.trim() && !clipboard_markdown.trim().is_empty() {
+                            return Some(clipboard_markdown.clone());
+                        }
                         return Some(selected);
                     }
                 }
@@ -156,6 +172,7 @@ impl MarkdownState {
         for child in children {
             match child {
                 NestedSelection::Markdown(child) => child.update(cx, |state, cx| state.clear_selection(cx)),
+                NestedSelection::Alert { entity, .. } => entity.update(cx, |state, cx| state.clear_selection(cx)),
                 NestedSelection::Selectable { handle, .. } => handle.clear_selection(cx),
             }
         }
@@ -187,8 +204,186 @@ impl From<&Entity<TextViewState>> for MarkdownState {
             nested_views: Default::default(),
             action_ctx: Default::default(),
             code_meta: Default::default(),
+            source_key: None,
         }
     }
+}
+
+fn model_mention_display_label(instance_id: &str, model: &str, providers: Option<&[t3_core::server_config::ServerProvider]>) -> Option<String> {
+    let provider = providers?.iter().find(|p| p.instance_id == instance_id)?;
+    let option = provider
+        .models
+        .iter()
+        .find(|m| m.slug == model)
+        .or_else(|| provider.models.iter().find(|m| m.slug.eq_ignore_ascii_case(model)))?;
+    let name = option.short_name.as_deref().filter(|s| !s.is_empty()).unwrap_or(&option.name);
+    Some(format!("@{name}"))
+}
+
+fn find_markdown_link_spans(text: &str) -> Vec<(usize, usize, usize, usize, usize, usize)> {
+    // Returns (full_start, full_end, label_start, label_end, url_start, url_end)
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'[' && (i == 0 || bytes[i - 1] != b'!') {
+            let label_start = i + 1;
+            let mut j = label_start;
+            while j < bytes.len() && bytes[j] != b']' && bytes[j] != b'\n' && bytes[j] != b'\r' {
+                j += 1;
+            }
+            if j + 1 < bytes.len() && bytes[j] == b']' && bytes[j + 1] == b'(' {
+                let label_end = j;
+                let url_start = j + 2;
+                let mut k = url_start;
+                let mut depth = 1usize;
+                while k < bytes.len() && depth > 0 && bytes[k] != b'\n' && bytes[k] != b'\r' {
+                    match bytes[k] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if depth == 0 {
+                    out.push((i, k + 1, label_start, label_end, url_start, k));
+                    i = k + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn rewrite_thread_links_and_prefetch(text: &str, action_ctx: Option<&MarkdownActionContext>, cx: &mut App) -> (Option<String>, u64) {
+    if !text.contains("t3-thread://") && !text.contains("app.t3.codes") {
+        return (None, 0);
+    }
+    let Some(ctx) = action_ctx else {
+        return (None, 0);
+    };
+    let spans = find_markdown_link_spans(text);
+    if spans.is_empty() {
+        return (None, 0);
+    }
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut missing_ids: Vec<String> = Vec::new();
+    let mut hasher = DefaultHasher::new();
+
+    {
+        let app = ctx.state.read(cx);
+        let meta_global = cx.try_global::<links::ThreadLinkMetadataGlobal>();
+        let active_canonical = app.server_config.config.as_ref().map(|c| c.environment.environment_id.as_str());
+        let active_saved = app.environments.active.as_deref();
+
+        for (full_start, full_end, label_start, label_end, url_start, url_end) in spans {
+            let label = &text[label_start..label_end];
+            let url = &text[url_start..url_end];
+            let Some(target) = t3_core::markdown::links::parse_thread_link(url.trim()) else {
+                continue;
+            };
+            target.thread_id.hash(&mut hasher);
+            let title = app
+                .thread_shell(&target.thread_id)
+                .map(|t| t.title.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    meta_global
+                        .and_then(|g| g.by_thread_id.get(&target.thread_id))
+                        .map(|m| m.title.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                });
+            let is_active_env = target.environment_id.as_deref().is_none_or(|env_id| {
+                active_canonical == Some(env_id)
+                    || active_saved == Some(env_id)
+                    || app
+                        .scoped_environment(env_id)
+                        .is_some_and(|entry| app.scoped_ready(&entry.summary.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE))
+            });
+            title.hash(&mut hasher);
+            is_active_env.hash(&mut hasher);
+
+            if let Some(resolved_title) = title {
+                if label.is_empty() || label == url || label.eq_ignore_ascii_case("Thread") {
+                    replacements.push((full_start, full_end, format!("[{resolved_title}]({url})")));
+                }
+            } else if !is_active_env {
+                if label.is_empty() || label == url {
+                    let fallback = t3_core::markdown::links::unknown_thread_link_label(false);
+                    replacements.push((full_start, full_end, format!("[{fallback}]({url})")));
+                }
+            } else if meta_global.is_none_or(|g| !g.by_thread_id.contains_key(&target.thread_id))
+                && !missing_ids.contains(&target.thread_id)
+            {
+                missing_ids.push(target.thread_id);
+            }
+        }
+    }
+
+    if !missing_ids.is_empty() {
+        links::prefetch_thread_link_metadata(&ctx.state, ctx.owner, missing_ids, cx);
+    }
+
+    if replacements.is_empty() {
+        return (None, hasher.finish());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end, replacement) in replacements {
+        out.push_str(&text[cursor..start]);
+        out.push_str(&replacement);
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    (Some(out), hasher.finish())
+}
+
+fn prepare_surface_markdown(
+    key: &str,
+    text: &str,
+    action_ctx: Option<&MarkdownActionContext>,
+    options: DisplayMarkdownOptions<'_>,
+    cx: &mut App,
+) -> (Arc<str>, u64) {
+    let parse_raw_html = !key.starts_with("user:");
+    let render_insights = key.starts_with("assistant:");
+    let rewrite_mentions = key.starts_with("user:") || key.starts_with("assistant:");
+
+    let (with_mentions, mentions_hash) = if rewrite_mentions {
+        let occurrences = collect_composer_model_mentions(text);
+        if occurrences.is_empty() {
+            (None, 0)
+        } else {
+            let providers = action_ctx
+                .and_then(|c| c.state.read(cx).server_config.config.as_ref())
+                .map(|cfg| cfg.providers.as_slice());
+            let mut hasher = DefaultHasher::new();
+            for occ in &occurrences {
+                occ.instance_id.hash(&mut hasher);
+                occ.model.hash(&mut hasher);
+                model_mention_display_label(occ.instance_id, occ.model, providers).hash(&mut hasher);
+            }
+            let hash = hasher.finish();
+            let linked = link_model_mentions(text, |instance_id, model| {
+                model_mention_display_label(instance_id, model, providers)
+            });
+            (Some(linked), hash)
+        }
+    } else {
+        (None, 0)
+    };
+    let after_mentions = with_mentions.as_deref().unwrap_or(text);
+    let (with_threads, threads_hash) = rewrite_thread_links_and_prefetch(after_mentions, action_ctx, cx);
+    let effective = with_threads.as_deref().unwrap_or(after_mentions);
+    let prepared = Arc::from(prepare_display_markdown_for_surface(effective, options, parse_raw_html, render_insights));
+    (prepared, mentions_hash ^ threads_hash.rotate_left(17))
 }
 
 fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
@@ -271,24 +466,39 @@ impl MarkdownStore {
         let cwd = action_ctx.as_ref().and_then(|c| c.cwd.clone());
         let math_enabled = crate::settings::client_settings(cx).math_rendering_enabled();
         let parse_raw_html = !key.starts_with("user:");
+        let keep_ordered_list_numbers = key.starts_with("user:");
 
         if let Some(cached) = self.states.get_mut(key) {
             cached.drawn = self.frame;
+            let (prepared_next, next_mentions_hash) = {
+                let text_changed = !Arc::ptr_eq(&cached.text, text) && *cached.text != **text;
+                let env_changed = cached.is_dark != is_dark || cached.cwd != cwd || cached.math_enabled != math_enabled;
+                if text_changed || env_changed || text.contains("model:") || text.contains("t3-thread://") || text.contains("app.t3.codes") {
+                    let (prepared, mentions_hash) = prepare_surface_markdown(
+                        key,
+                        text,
+                        action_ctx.as_ref(),
+                        DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled },
+                        cx,
+                    );
+                    if text_changed || env_changed || cached.mentions_hash != mentions_hash {
+                        (Some(prepared), mentions_hash)
+                    } else {
+                        (None, cached.mentions_hash)
+                    }
+                } else {
+                    (None, cached.mentions_hash)
+                }
+            };
             *cached.action_ctx.lock().unwrap() = action_ctx;
             *cached.media_scope.lock().unwrap() = media_scope;
-            let text_changed = !Arc::ptr_eq(&cached.text, text) && *cached.text != **text;
-            let env_changed = cached.is_dark != is_dark || cached.cwd != cwd || cached.math_enabled != math_enabled;
-            if text_changed || env_changed {
+            if let Some(prepared) = prepared_next {
                 let previous_prepared = cached.prepared.clone();
-                let prepared: Arc<str> = Arc::from(prepare_display_markdown_with_raw_html(
-                    text,
-                    DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled },
-                    parse_raw_html,
-                ));
                 cached.text = text.clone();
                 cached.is_dark = is_dark;
                 cached.cwd = cwd;
                 cached.math_enabled = math_enabled;
+                cached.mentions_hash = next_mentions_hash;
                 cached.math_enabled_flag.store(math_enabled, Ordering::Relaxed);
                 cached.media |= has_media_syntax(&prepared, parse_raw_html);
                 if *cached.prepared != *prepared {
@@ -328,14 +538,18 @@ impl MarkdownStore {
                 nested_views: cached.nested_views.clone(),
                 action_ctx: cached.action_ctx.clone(),
                 code_meta: cached.code_meta.clone(),
+                source_key: Some(cached.source_key.clone()),
             };
         }
 
-        let prepared: Arc<str> = Arc::from(prepare_display_markdown_with_raw_html(
+        let source_key: Arc<str> = Arc::from(key);
+        let (prepared, mentions_hash) = prepare_surface_markdown(
+            key,
             text,
+            action_ctx.as_ref(),
             DisplayMarkdownOptions { is_dark, cwd: cwd.as_deref(), math_enabled },
-            parse_raw_html,
-        ));
+            cx,
+        );
         let media = has_media_syntax(&prepared, parse_raw_html);
         let state = cx.new(|cx| TextViewState::markdown(if media { "" } else { &prepared }, cx).selectable(true));
         let owner = self.owner;
@@ -361,23 +575,26 @@ impl MarkdownStore {
             scope: scope_source,
             selections: selections.clone(),
         };
-        let extensions = attach_rich_extensions_with_media(
+        let extensions = attach_rich_extensions_with_media_options(
             media_ext,
             shared_ctx.clone(),
             nested_views.clone(),
             code_meta.clone(),
             math_enabled_flag.clone(),
             rich_media,
+            keep_ordered_list_numbers,
         );
         let updates = media.then(|| MediaUpdates::new(&state, document.clone(), Arc::from(""), prepared.clone(), cx));
         self.states.insert(
             key.to_owned(),
             Cached {
+                source_key: source_key.clone(),
                 text: text.clone(),
                 prepared,
                 is_dark,
                 cwd,
                 math_enabled,
+                mentions_hash,
                 math_enabled_flag,
                 state: state.clone(),
                 drawn: self.frame,
@@ -403,6 +620,7 @@ impl MarkdownStore {
             nested_views,
             action_ctx: shared_ctx,
             code_meta,
+            source_key: Some(source_key),
         }
     }
 
@@ -474,17 +692,27 @@ pub fn markdown_view(state: impl Into<MarkdownState>, cx: &App) -> TextView {
         view
     };
     let action_ctx = state.action_ctx.lock().unwrap().clone();
-    style_markdown_internal(view, action_ctx, state.code_meta, cx)
+    style_markdown_with_source(view, action_ctx, state.code_meta, state.source_key, cx)
 }
 
 pub fn style_markdown(view: TextView, cx: &App) -> TextView {
-    style_markdown_internal(view, None, Default::default(), cx)
+    style_markdown_with_source(view, None, Default::default(), None, cx)
 }
 
 pub(crate) fn style_markdown_internal(
     view: TextView,
     action_ctx: Option<MarkdownActionContext>,
     code_meta: SharedCodeMeta,
+    cx: &App,
+) -> TextView {
+    style_markdown_with_source(view, action_ctx, code_meta, None, cx)
+}
+
+fn style_markdown_with_source(
+    view: TextView,
+    action_ctx: Option<MarkdownActionContext>,
+    code_meta: SharedCodeMeta,
+    source_key: Option<Arc<str>>,
     cx: &App,
 ) -> TextView {
     let link_ctx = action_ctx.clone();
@@ -508,7 +736,6 @@ pub(crate) fn style_markdown_internal(
             let run_ctx = action_ctx.clone();
             let run_code = code.to_string();
             let copy_code = t3_core::markdown::normalize_clipboard_text(&code);
-            let copy_app = action_ctx.as_ref().map(|c| c.state.clone());
             h_flex()
                 .gap(px(4.))
                 .items_center()
@@ -543,17 +770,12 @@ pub(crate) fn style_markdown_internal(
                     Icon::Copy,
                     move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(copy_code.clone()));
-                        if let Some(app) = &copy_app {
-                            app.update(cx, |a, cx| {
-                                a.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Success, "Copied code"), cx);
-                            });
-                        }
                     },
                     cx,
                 ))
         })
         .on_link_click(move |url: &SharedString, event, window, cx| {
-            links::handle_markdown_link_click(url, event, link_ctx.as_ref(), window, cx);
+            links::handle_markdown_link_click_for_source(url, event, link_ctx.as_ref(), source_key.as_deref(), window, cx);
         })
 }
 
@@ -592,6 +814,7 @@ mod context_tests {
             nested_views: Default::default(),
             action_ctx: Default::default(),
             code_meta: Default::default(),
+            source_key: None,
         };
         child.update(cx, |child, cx| child.select_all(cx));
         let cite = |state: &MarkdownState, source: &str, quote: &str, cx: &App| {
@@ -659,6 +882,7 @@ mod context_tests {
                 nested_views: Default::default(),
                 action_ctx: Default::default(),
                 code_meta: Default::default(),
+                source_key: None,
             };
             cx.update(|cx| {
                 let mut participants: Vec<_> = children.iter().map(|child| child.read(cx).selected_text()).collect();
@@ -719,6 +943,7 @@ mod context_tests {
             nested_views,
             action_ctx: Default::default(),
             code_meta: Default::default(),
+            source_key: None,
         };
         nested.update(cx, |view, cx| view.select_all(cx));
         cx.update(|cx| {
@@ -768,6 +993,7 @@ mod context_tests {
             nested_views: math_views,
             action_ctx: Default::default(),
             code_meta: Default::default(),
+            source_key: None,
         };
         cx.update(|cx| math_handle.select_all(cx));
         cx.update(|cx| {
@@ -812,6 +1038,7 @@ mod context_tests {
             nested_views: mermaid_views,
             action_ctx: Default::default(),
             code_meta: Default::default(),
+            source_key: None,
         };
         cx.update(|cx| mermaid_handle.select_all(cx));
         cx.update(|cx| {
@@ -910,6 +1137,7 @@ mod context_tests {
             nested_views,
             action_ctx: Default::default(),
             code_meta: Default::default(),
+            source_key: None,
         };
         nested.update(cx, |view, cx| view.select_all(cx));
         cx.update(|cx| {
@@ -981,6 +1209,150 @@ mod context_tests {
             assert_eq!(reused.entity.entity_id(), assistant_state.entity.entity_id());
             let guard = store.states.get("assistant:m2").unwrap().media_scope.lock().unwrap();
             assert_eq!(guard.as_ref().and_then(|s| s.source_control_media_repository.as_deref()), Some("org/other"));
+        });
+    }
+
+    #[gpui::test]
+    fn assistant_insight_callout_preserves_clipboard_markdown_on_full_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+        });
+
+        let mut store = MarkdownStore::new(EntityId::from(1u64));
+        let raw_insight = "`★ Insight ─────────────────────────────────────`\nKey finding here.\n`─────────────────────────────────────────────────`";
+        let assistant_src: Arc<str> = raw_insight.into();
+        let user_src: Arc<str> = raw_insight.into();
+
+        cx.update(|cx| {
+            let _user_state = store.state_in_context("user:u-ins", &user_src, None, cx);
+            assert!(!store.states.get("user:u-ins").unwrap().prepared.contains("[!INSIGHT]"));
+
+            let _assistant_state = store.state_in_context("assistant:a-ins", &assistant_src, None, cx);
+            assert!(store.states.get("assistant:a-ins").unwrap().prepared.contains("[!INSIGHT]"));
+        });
+
+        let parent = cx.update(|cx| cx.new(|cx| TextViewState::markdown("", cx)));
+        let alert_body = cx.update(|cx| cx.new(|cx| TextViewState::markdown("Key finding here.", cx)));
+        cx.run_until_parked();
+        let nested_views = NestedViews::default();
+        nested_views.lock().unwrap().insert(
+            "alert:0".into(),
+            NestedSelection::Alert {
+                entity: alert_body.clone(),
+                plain_body: "Key finding here.".into(),
+                clipboard_markdown: raw_insight.into(),
+            },
+        );
+        let state = MarkdownState {
+            entity: parent,
+            media: false,
+            rich: true,
+            extensions: None,
+            selections: Default::default(),
+            document: None,
+            nested_views,
+            action_ctx: Default::default(),
+            code_meta: Default::default(),
+            source_key: None,
+        };
+        alert_body.update(cx, |view, cx| view.select_all(cx));
+        cx.update(|cx| {
+            let quote = alert_body.read(cx).selected_text();
+            let copied = state.selection_text(raw_insight, &quote, cx).expect("alert selection must resolve");
+            assert_eq!(copied, raw_insight);
+        });
+    }
+
+    #[gpui::test]
+    fn model_mentions_link_when_server_config_loads(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let app_state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx))
+        });
+
+        let mut store = MarkdownStore::new(EntityId::from(1u64));
+        let src: Arc<str> = "Ask model:claude/claude-sonnet-4 to review.".into();
+        let ctx = MarkdownActionContext {
+            state: app_state.clone(),
+            owner: EntityId::from(1u64),
+            cwd: None,
+            thread_id: None,
+            thread_view: None,
+        };
+
+        cx.update(|cx| {
+            let _ = store.state_in_context("user:m-mention", &src, Some(ctx.clone()), cx);
+            assert!(
+                !store.states.get("user:m-mention").unwrap().prepared.contains("t3-model://"),
+                "unloaded config keeps raw mention token"
+            );
+
+            let cfg: t3_core::server_config::ServerConfig = serde_json::from_value(serde_json::json!({
+                "providers": [{
+                    "instanceId": "claude",
+                    "driver": "claudeAgent",
+                    "displayName": "Claude Code",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "models": [{
+                        "slug": "claude-sonnet-4",
+                        "name": "Claude Sonnet 4",
+                        "shortName": "Sonnet 4"
+                    }]
+                }]
+            }))
+            .expect("valid ServerConfig");
+            app_state.update(cx, |app, _| {
+                app.server_config.config = Some(cfg);
+            });
+
+            store.begin_frame();
+            let _ = store.state_in_context("user:m-mention", &src, Some(ctx), cx);
+            let prepared = &store.states.get("user:m-mention").unwrap().prepared;
+            assert!(prepared.contains("[@Sonnet 4](t3-model://claude/claude-sonnet-4)"), "got: {prepared}");
+        });
+    }
+
+    #[gpui::test]
+    fn thread_links_resolve_cached_metadata_and_unreachable_machine_fallback(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let app_state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| crate::app_state::AppState::new(runtime.handle().clone(), cx))
+        });
+
+        let mut store = MarkdownStore::new(EntityId::from(1u64));
+        let src: Arc<str> = "See [](t3-thread://v1/thr-unloaded) and [](t3-thread://v1/env-offline/thr-remote).".into();
+        let ctx = MarkdownActionContext {
+            state: app_state,
+            owner: EntityId::from(1u64),
+            cwd: None,
+            thread_id: None,
+            thread_view: None,
+        };
+
+        cx.update(|cx| {
+            let mut global = links::ThreadLinkMetadataGlobal::default();
+            global.by_thread_id.insert(
+                "thr-unloaded".into(),
+                t3_core::markdown::links::ThreadLinkMetadata {
+                    title: "Fix diff viewer scroll".into(),
+                    project_id: Some("p-1".into()),
+                },
+            );
+            cx.set_global(global);
+            let _ = store.state_in_context("assistant:a-threads", &src, Some(ctx), cx);
+            let prepared = &store.states.get("assistant:a-threads").unwrap().prepared;
+            assert!(prepared.contains("[Fix diff viewer scroll](t3-thread://v1/thr-unloaded)"), "got: {prepared}");
+            assert!(prepared.contains("[Thread on another machine](t3-thread://v1/env-offline/thr-remote)"), "got: {prepared}");
         });
     }
 }

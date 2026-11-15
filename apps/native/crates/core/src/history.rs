@@ -99,6 +99,19 @@ struct RawPage {
     has_more_history: bool,
 }
 
+/// Steers join a running turn; every other user message opens one, and every notification acts
+/// as a response boundary (`threads.ts` `startsTurn`).
+fn starts_turn(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("notification") => true,
+        Some("user_message") => !matches!(
+            item.get("inputIntent").and_then(Value::as_str),
+            Some("steer" | "promoted_queued_to_steer")
+        ),
+        _ => false,
+    }
+}
+
 /// Decodes a page response, expanding its ID table (records sit at the top level).
 pub fn decode_history_page(mut value: Value) -> Result<HistoryPage, serde_json::Error> {
     if let Some(ids) = wire::take_id_table(&mut value)
@@ -107,10 +120,7 @@ pub fn decode_history_page(mut value: Value) -> Result<HistoryPage, serde_json::
         wire::expand_record_ids(container, &ids);
     }
     let has_user_turn = value.get("items").and_then(Value::as_array).is_some_and(|rows| {
-        rows.iter().filter_map(|row| row.get("item")).any(|item| {
-            item.get("type").and_then(Value::as_str) == Some("user_message")
-                && item.get("createdBy").and_then(Value::as_str) == Some("user")
-        })
+        rows.iter().filter_map(|row| row.get("item")).any(starts_turn)
     });
     let raw: RawPage = serde_json::from_value(value)?;
     Ok(HistoryPage {

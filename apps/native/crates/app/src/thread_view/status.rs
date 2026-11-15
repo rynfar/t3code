@@ -3,20 +3,25 @@
 //! after the last row (`ThreadNow.tsx`, `ThreadStatusLine.tsx`, `ThreadActivityBanners.tsx`): a
 //! Stop with its elapsed time, the goal, then Snoozed, Settled or Woke from snooze.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use gpui::{AnyElement, ClipboardItem, Context, Entity, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, Task, div, prelude::*, px};
+use gpui::{
+    AnyElement, App, BoxShadow, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, Render, SharedString, Styled, Task, Window, anchored, deferred, div, point, prelude::*, px,
+};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_client::supervisor::ConnectionStatus;
+use t3_core::command_output::{CommandOutputStatus, LOADING, NO_OUTPUT, Panel, TRUNCATED};
 use t3_core::commands::{self, DispatchMode, method};
 use t3_core::timeline::{
-    BackgroundWork, CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, ChildInputs, FORCE_STOP_THREAD, GoalLine, ProviderBanner, RunStop, StatusLine, ThreadError,
-    background_work, child_inputs, error_banner_message, error_can_expand, force_stop_notice, force_stop_request, goal_line, provider_banner, run_stop, status_line,
-    thread_error, timeline_thread_error,
+    BackgroundItem, BackgroundWork, CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, ChildInputs, FORCE_STOP_THREAD, GoalLine, ProviderBanner,
+    RunStop, StatusLine, ThreadError, background_work, child_inputs, error_banner_message, error_can_expand, force_stop_notice, force_stop_request,
+    goal_line, limit_recovery_owns_snooze, presented_latest_run, provider_banner, run_stop, status_line_for, thread_error, timeline_thread_error,
 };
 
 use super::ThreadView;
-use crate::app_state::uuid_v4;
+use crate::app_state::{AppState, Phase, uuid_v4};
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::glass;
 use crate::icons::{Icon, ProviderLogo, provider_logo};
@@ -33,6 +38,9 @@ struct FooterLines {
     children: Option<ChildInputs>,
     /// Background commands and subagents left running after the turn.
     background: Option<BackgroundWork>,
+    /// True when the active run or connection prevents background Stop.
+    run_is_live: bool,
+    can_operate: bool,
     /// Loading or resubscribing detail ("Loading messages..." / "Syncing messages...").
     syncing: Option<&'static str>,
     goal: Option<GoalLine>,
@@ -67,6 +75,7 @@ pub struct ThreadFooter {
     force_stopping: bool,
     /// The background tasks a Stop was sent for, until they change or the retry window passes.
     background_stop: Option<(Vec<String>, std::time::Instant)>,
+    background_details: Option<Entity<BackgroundWorkDialog>>,
     /// When the thread was first seen unsynchronized, for the sync line's delay.
     unsynced_since: Option<std::time::Instant>,
     /// Expanded notice row id when the user clicked a truncated footer description.
@@ -81,12 +90,12 @@ struct BannerLines {
     error: Option<ThreadError>,
 }
 
-/// The banner lane and what was dismissed. Dismissed errors last the session, as on the web.
+/// The banner lane and what was dismissed. Dismissed errors and provider statuses last the
+/// session across thread switches (`ProviderStatusBanner.tsx` `dismissedProviderBannerKeysRef`).
 #[derive(Default)]
 pub struct Banners {
     lines: BannerLines,
     dismissed_errors: HashSet<String>,
-    dismissed_provider: Option<String>,
     error_expanded: bool,
     refresh: t3_core::providers::StatusRefresh,
     can_refresh: bool,
@@ -94,9 +103,16 @@ pub struct Banners {
     target: Option<crate::composer::ProviderTarget>,
     environment: String,
     composer: Option<gpui::Subscription>,
+    app_subscription: Option<gpui::Subscription>,
 }
 
 impl ThreadView {
+    pub(crate) fn dismiss_provider(&mut self, key: &str, cx: &mut Context<Self>) {
+        let environment = self.banners.environment.clone();
+        self.state.update(cx, |state, cx| state.dismiss_provider_banner(&environment, key, cx));
+        self.sync_banners(cx);
+    }
+
     pub(super) fn sync_status(&mut self, cx: &mut Context<Self>) {
         self.watch_banner_grants(cx);
         self.sync_banners(cx);
@@ -168,12 +184,19 @@ impl ThreadView {
     }
 
     fn sync_banners(&mut self, cx: &mut Context<Self>) {
+        if self.banners.app_subscription.is_none() {
+            let state = self.state.clone();
+            self.banners.app_subscription = Some(cx.subscribe(&state, |this, _, event, cx| {
+                if matches!(event, crate::app_state::AppEvent::BannerDismissed) {
+                    this.sync_banners(cx);
+                }
+            }));
+        }
         let state = self.state.read(cx);
         let was_pending = self.banners.refresh.pending();
         let environment = crate::composer::ProviderTarget::environment(state);
         if environment != self.banners.environment {
             self.banners.environment = environment.clone();
-            self.banners.dismissed_provider = None;
             self.banners.refresh.reset();
         }
         let mut next = BannerLines::default();
@@ -189,12 +212,12 @@ impl ThreadView {
             && target.environment == environment
             && target.thread == self.thread_id
         {
-            next.provider = target.instance.as_ref().and_then(|id| state.server_config.config.as_ref()?.provider(id)).and_then(provider_banner);
-        }
-        match &next.provider {
-            None => self.banners.dismissed_provider = None,
-            Some(banner) if self.banners.dismissed_provider.as_deref() == Some(banner.key.as_str()) => next.provider = None,
-            Some(_) => {}
+            next.provider = target
+                .instance
+                .as_ref()
+                .and_then(|id| state.server_config.config.as_ref()?.provider(id))
+                .and_then(provider_banner)
+                .filter(|banner| !state.is_provider_banner_dismissed(&environment, &banner.key));
         }
         self.banners.refresh.set_target(state.connection_id(), self.thread_id.as_deref(), next.provider.as_ref().map(|banner| banner.instance_id.as_str()));
         if next == self.banners.lines {
@@ -247,6 +270,18 @@ impl ThreadView {
         let thread = self.thread_state(state);
         let turn_items = thread.projection.as_ref().map(|projection| projection.turn_items.as_slice());
         let shell = self.thread_id.as_deref().and_then(|id| state.thread_shell(id));
+        let run_is_live = (working && shell.is_some_and(|shell| shell.status != "waiting"))
+            || matches!(state.phase, Phase::Online(ConnectionStatus::Connecting));
+        let can_operate = crate::context_menu::ThreadMenuOwner::can_operate(state);
+        let limit_recovery_holds_snooze = thread
+            .projection
+            .as_ref()
+            .zip(shell)
+            .zip(thread.projection.as_ref().and_then(thread_error).filter(|error| error.limit_blocked()))
+            .is_some_and(|((projection, shell), error)| {
+                let run_id = presented_latest_run(projection).map(|run| run.id.as_str());
+                limit_recovery_owns_snooze(run_id, error.reset_at.as_deref(), shell.limit_recovery.as_ref(), shell.snoozed_until.as_deref())
+            });
         let next = FooterLines {
             unmatched_approvals: self.unmatched_pending_approvals(),
             stop: thread.projection.as_ref().and_then(|projection| run_stop(projection, background)),
@@ -255,10 +290,25 @@ impl ThreadView {
                 Some(items) => BackgroundWork::with_items(&shell.pending_background_tasks, items),
                 None => background_work(&shell.pending_background_tasks),
             }),
+            run_is_live,
+            can_operate,
             syncing,
             goal: shell.and_then(|shell| shell.goal.as_ref()).and_then(|goal| goal_line(goal, working)),
-            status: self.thread_id.as_deref().and_then(|id| state.sidebar.model.thread(id)).filter(|_| config_loaded).and_then(|thread| status_line(thread, now)),
+            status: self
+                .thread_id
+                .as_deref()
+                .and_then(|id| state.sidebar.model.thread(id))
+                .filter(|_| config_loaded)
+                .and_then(|thread| status_line_for(thread, limit_recovery_holds_snooze, now)),
         };
+        if let Some(dialog) = self.footer.background_details.clone() {
+            let items = next.background.as_ref().map(|work| work.items.clone()).unwrap_or_default();
+            if items.is_empty() {
+                self.footer.background_details = None;
+            } else {
+                dialog.update(cx, |dialog, cx| dialog.sync_items(items, cx));
+            }
+        }
         let task_ids: Vec<String> = next.background.iter().flat_map(|work| work.items.iter().map(|item| item.task_id.clone())).collect();
         if self.footer.background_stop.as_ref().is_some_and(|(ids, at)| *ids != task_ids || at.elapsed() >= BACKGROUND_STOP_RETRY) {
             self.footer.background_stop = None;
@@ -483,6 +533,15 @@ impl ThreadView {
             let mono = cx.theme().mono_font_family.clone();
             let icon = if background.all_commands() { Icon::Terminal } else { Icon::CircleDashed };
             let stopping = self.footer.background_stop.is_some();
+            let stop_disabled = stopping || self.footer.lines.run_is_live || !self.footer.lines.can_operate;
+            let details = inline_button(
+                "background-details",
+                "Details",
+                InlineTone::Muted,
+                false,
+                cx.listener(|view, _, window, cx| view.open_background_details(window, cx)),
+                cx,
+            );
             let open = background.only_child_thread().map(|thread_id| {
                 let id = thread_id.to_owned();
                 inline_button("background-open", "Open", InlineTone::Muted, false, cx.listener(move |view, _, _, cx| view.open_thread(&id, cx)), cx)
@@ -491,7 +550,7 @@ impl ThreadView {
                 "background-stop",
                 if stopping { "Stopping..." } else { "Stop" },
                 InlineTone::Default,
-                stopping,
+                stop_disabled,
                 cx.listener(|view, _, _, cx| view.stop_background_work(cx)),
                 cx,
             );
@@ -527,7 +586,7 @@ impl ThreadView {
                 line()
                     .child(div().flex_none().child(icon.render(px(14.), muted)))
                     .child(body)
-                    .child(actions().children(self.footer.background_timer.clone()).children(open).child(stop))
+                    .child(actions().children(self.footer.background_timer.clone()).child(details).children(open).child(stop))
                     .into_any_element(),
             )
         });
@@ -600,7 +659,22 @@ impl ThreadView {
                     .into_any_element(),
             );
         }
-        v_flex().w_full().children(lines).into_any_element()
+        v_flex().w_full().children(lines).children(self.footer.background_details.clone()).into_any_element()
+    }
+
+    fn open_background_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(thread_id), Some(background)) = (self.thread_id.clone(), self.footer.lines.background.as_ref()) else {
+            return;
+        };
+        let items = background.items.clone();
+        let dialog = cx.new(|cx| BackgroundWorkDialog::new(self.state.clone(), thread_id, items, window, cx));
+        cx.subscribe(&dialog, |this, _, _: &BackgroundWorkDismissed, cx| {
+            this.footer.background_details = None;
+            cx.notify();
+        })
+        .detach();
+        self.footer.background_details = Some(dialog);
+        cx.notify();
     }
 
     /// `useForceStopThread`: kills the agent that ignored Stop on `run_id`, then says what is left.
@@ -710,8 +784,7 @@ impl ThreadView {
                 "dismiss-provider-status",
                 Icon::X,
                 cx.listener(move |view, _, _, cx| {
-                    view.banners.dismissed_provider = Some(key.clone());
-                    view.sync_banners(cx);
+                    view.dismiss_provider(&key, cx);
                 }),
                 cx,
             );
@@ -825,6 +898,270 @@ fn alert(warning: bool, icon: AlertIcon, title: Option<String>, body: Vec<AnyEle
                 ),
         )
         .into_any_element()
+}
+
+pub(super) struct BackgroundWorkDismissed;
+
+struct BackgroundOutputSlot {
+    thread_id: String,
+    item_id: String,
+    connection: Option<u64>,
+    status: CommandOutputStatus,
+    _stream: t3_client::command_output::CommandOutputStream,
+    _pump: Task<()>,
+}
+
+/// Modal details dialog for background commands and subagents (`BackgroundWorkDetails.tsx`).
+pub(super) struct BackgroundWorkDialog {
+    state: Entity<AppState>,
+    thread_id: String,
+    items: Vec<BackgroundItem>,
+    outputs: HashMap<String, BackgroundOutputSlot>,
+    focus: FocusHandle,
+}
+
+impl EventEmitter<BackgroundWorkDismissed> for BackgroundWorkDialog {}
+
+impl BackgroundWorkDialog {
+    pub fn new(state: Entity<AppState>, thread_id: String, items: Vec<BackgroundItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        let mut dialog = BackgroundWorkDialog { state, thread_id, items, outputs: HashMap::new(), focus };
+        dialog.sync_outputs(cx);
+        dialog
+    }
+
+    pub fn sync_items(&mut self, items: Vec<BackgroundItem>, cx: &mut Context<Self>) {
+        self.items = items;
+        self.sync_outputs(cx);
+        cx.notify();
+    }
+
+    fn sync_outputs(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let streams_output = state
+            .server_config
+            .config
+            .as_ref()
+            .is_some_and(|config| config.environment.capabilities.command_output_streaming == Some(true));
+        if !streams_output {
+            self.outputs.clear();
+            return;
+        }
+        let (Some(client), connection) = (state.client_handle(), state.connection_id()) else {
+            self.outputs.clear();
+            return;
+        };
+        let wanted: HashMap<String, String> = self
+            .items
+            .iter()
+            .filter(|item| item.item_running)
+            .filter_map(|item| {
+                let item_id = item.item_id.clone()?;
+                let thread_id = item.source_thread_id.clone().unwrap_or_else(|| self.thread_id.clone());
+                Some((item_id, thread_id))
+            })
+            .collect();
+        self.outputs.retain(|id, slot| {
+            wanted.get(id).is_some_and(|thread_id| slot.thread_id == *thread_id && slot.connection == connection)
+        });
+        let runtime = state.runtime().clone();
+        for (item_id, thread_id) in wanted {
+            if self.outputs.contains_key(&item_id) {
+                continue;
+            }
+            let stream = t3_client::command_output::subscribe(&runtime, client.clone(), &thread_id, &item_id);
+            let mut rx = stream.status.clone();
+            let key = item_id.clone();
+            let pump = cx.spawn(async move |this, cx| {
+                let initial = rx.borrow_and_update().clone();
+                if this
+                    .update(cx, |dialog, cx| {
+                        if let Some(slot) = dialog.outputs.get_mut(&key) {
+                            slot.status = initial;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                while rx.changed().await.is_ok() {
+                    let next = rx.borrow_and_update().clone();
+                    if this
+                        .update(cx, |dialog, cx| {
+                            if let Some(slot) = dialog.outputs.get_mut(&key) {
+                                slot.status = next;
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            self.outputs.insert(
+                item_id.clone(),
+                BackgroundOutputSlot { thread_id, item_id, connection, status: CommandOutputStatus::default(), _stream: stream, _pump: pump },
+            );
+        }
+    }
+
+    fn render_output(slot: &BackgroundOutputSlot, cx: &App) -> Option<AnyElement> {
+        let p = palette(cx);
+        let mono = cx.theme().mono_font_family.clone();
+        let text = match slot.status.panel() {
+            Panel::Output(output) => {
+                if output.truncated {
+                    format!("{TRUNCATED}\n{}", output.text)
+                } else {
+                    output.text.to_string()
+                }
+            }
+            Panel::Empty => NO_OUTPUT.to_owned(),
+            Panel::Failed(error) => error.to_owned(),
+            Panel::Loading => LOADING.to_owned(),
+            Panel::Waiting => return None,
+        };
+        Some(
+            div()
+                .id(SharedString::from(format!("background-output-{}", slot.item_id)))
+                .max_h(px(192.))
+                .overflow_y_scroll()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(hsla(p.border))
+                .bg(hsla(p.muted).opacity(0.2))
+                .p(px(12.))
+                .font_family(mono)
+                .text_xs()
+                .text_color(hsla(p.foreground))
+                .child(text)
+                .into_any_element(),
+        )
+    }
+}
+
+impl Render for BackgroundWorkDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let muted = hsla(p.muted_foreground);
+        let mono = cx.theme().mono_font_family.clone();
+        let sections: Vec<AnyElement> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let status_label = if item.awaited { "Waiting" } else { "Running" };
+                let command = item.command_text.as_ref().map(|cmd| {
+                    div()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(hsla(p.border))
+                        .bg(hsla(p.muted).opacity(0.2))
+                        .p(px(12.))
+                        .font_family(mono.clone())
+                        .text_xs()
+                        .text_color(hsla(p.foreground))
+                        .child(cmd.clone())
+                        .into_any_element()
+                });
+                let output = item
+                    .item_id
+                    .as_deref()
+                    .filter(|_| item.item_running)
+                    .and_then(|id| self.outputs.get(id))
+                    .and_then(|slot| Self::render_output(slot, cx));
+                let open = (item.kind == "subagent")
+                    .then(|| item.child_thread_id.clone())
+                    .flatten()
+                    .map(|child_id| {
+                        inline_button(
+                            SharedString::from(format!("background-details-open-{index}")),
+                            "Open thread",
+                            InlineTone::Default,
+                            false,
+                            cx.listener(move |dialog, _, _, cx| {
+                                cx.emit(BackgroundWorkDismissed);
+                                dialog.state.update(cx, |state, cx| state.select_thread(&child_id, cx));
+                            }),
+                            cx,
+                        )
+                    });
+                v_flex()
+                    .min_w_0()
+                    .gap(px(8.))
+                    .child(
+                        h_flex()
+                            .items_baseline()
+                            .justify_between()
+                            .gap(px(12.))
+                            .child(div().min_w_0().font_weight(FontWeight::MEDIUM).text_sm().text_color(hsla(p.foreground)).child(item.details_title.clone()))
+                            .child(div().flex_none().text_xs().text_color(muted).child(status_label)),
+                    )
+                    .children(command)
+                    .children(output)
+                    .children(open)
+                    .into_any_element()
+            })
+            .collect();
+        let viewport = window.viewport_size();
+        let dark = cx.theme().is_dark();
+        deferred(
+            anchored().position(point(px(0.), px(0.))).child(
+                div()
+                    .id("background-work-backdrop")
+                    .w(viewport.width)
+                    .h(viewport.height)
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(px(16.))
+                    .bg(hsla(p.dialog_backdrop))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.emit(BackgroundWorkDismissed)))
+                    .child(
+                        v_flex()
+                            .id("background-work-dialog")
+                            .debug_selector(|| "background-work-dialog".to_owned())
+                            .track_focus(&self.focus)
+                            .on_key_down(cx.listener(|_, event: &KeyDownEvent, _, cx| {
+                                if event.keystroke.key == "escape" {
+                                    cx.stop_propagation();
+                                    cx.emit(BackgroundWorkDismissed);
+                                }
+                            }))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .w_full()
+                            .max_w(px(672.))
+                            .max_h(viewport.height - px(32.))
+                            .relative()
+                            .rounded(px(16.))
+                            .child(glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+                            .shadow(vec![BoxShadow {
+                                color: gpui::black().opacity(if dark { 0.9 } else { 0.65 }),
+                                offset: point(px(0.), px(24.)),
+                                blur_radius: px(64.),
+                                spread_radius: px(-24.),
+                                inset: false,
+                            }])
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .p(px(24.))
+                                    .pb(px(12.))
+                                    .child(div().text_xl().line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child("Background work"))
+                                    .child(ghost_icon_button("background-work-close", Icon::X, cx.listener(|_, _, _, cx| cx.emit(BackgroundWorkDismissed)), cx)),
+                            )
+                            .child(v_flex().id("background-work-panel").flex_1().min_h_0().overflow_y_scroll().px(px(24.)).pt(px(4.)).pb(px(24.)).gap(px(20.)).children(sections)),
+                    ),
+            ),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
 }
 
 impl ThreadView {
@@ -990,14 +1327,22 @@ mod selected_provider_tests {
         state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers[1].message=Some("B updated".into());cx.emit(AppEvent::ServerConfig);});
         side_view.read_with(cx, |view,_| assert_eq!(view.banners.lines.provider.as_ref().unwrap().message,"B updated"));
         side_view.update(cx, |view,cx| {
-            view.banners.dismissed_provider=Some(view.banners.lines.provider.as_ref().unwrap().key.clone());
-            view.sync_banners(cx);
+            let key = view.banners.lines.provider.as_ref().unwrap().key.clone();
+            view.dismiss_provider(&key, cx);
         });
         assert_eq!(shown(&side_view,cx),None);
+        cx.update_window(main.into(), |_,window,cx| composer.update(cx, |composer,cx| composer.pick_banner_test_model("claudeAgent",window,cx))).unwrap();
+        assert_eq!(shown(&view,cx),None,"session-wide dismissal shares across ThreadViews");
+        cx.update_window(main.into(), |_,window,cx| composer.update(cx, |composer,cx| composer.pick_banner_test_model("codex",window,cx))).unwrap();
         cx.update_window(side.into(), |_,window,cx| side_composer.update(cx, |composer,cx| composer.pick_banner_test_model("codex",window,cx))).unwrap();
         assert_eq!(shown(&side_view,cx).as_deref(),Some("codex"));
         cx.update_window(side.into(), |_,window,cx| side_composer.update(cx, |composer,cx| composer.pick_banner_test_model("claudeAgent",window,cx))).unwrap();
         assert_eq!(shown(&side_view,cx),None,"returning to the same dismissed key stays dismissed");
+        // Dismissal persists across thread switches and brief absence of any warning banner.
+        state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers[1].status="ready".into();cx.emit(AppEvent::ServerConfig);});
+        assert_eq!(shown(&side_view,cx),None);
+        state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers[1].status="warning".into();cx.emit(AppEvent::ServerConfig);});
+        assert_eq!(shown(&side_view,cx),None,"dismissed provider banner stays hidden even after returning from ready");
         state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers[1].message=Some("B new key".into());cx.emit(AppEvent::ServerConfig);});
         assert_eq!(shown(&side_view,cx).as_deref(),Some("claudeAgent"));
         let notifications=std::rc::Rc::new(std::cell::Cell::new(0));
@@ -1035,5 +1380,180 @@ mod selected_provider_tests {
         state.update(cx, |state,cx| {state.server_config.config.as_mut().unwrap().providers.clear();cx.emit(AppEvent::ServerConfig);});
         assert_eq!(shown(&view,cx),None);
         assert_eq!(shown(&side_view,cx),None);
+    }
+
+    struct CaptureStage {
+        limit_banner: Entity<crate::thread_view::limit_recovery::LimitRecoveryBanner>,
+        thread_view: Entity<ThreadView>,
+    }
+
+    impl Render for CaptureStage {
+        fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let p = palette(cx);
+            let footer = self.thread_view.update(cx, |view, cx| view.render_footer(cx));
+            let banners = self.thread_view.update(cx, |view, cx| view.render_banners(cx));
+            v_flex()
+                .size_full()
+                .bg(hsla(p.background))
+                .p(px(24.))
+                .gap(px(12.))
+                .justify_between()
+                .child(v_flex().w_full().gap(px(8.)).children(banners).child(self.limit_banner.clone()))
+                .child(div().w_full().child(footer))
+        }
+    }
+
+    #[test]
+    fn background_work_dialog_snooze_ownership_and_snapshot_capture() {
+        let mut cx = gpui::HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            std::sync::Arc::new(crate::icons::Assets),
+            gpui_platform::current_headless_renderer,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = cx.update(|cx| {
+            let state = crate::boot(runtime.handle().clone(), cx);
+            state.update(cx, |state, cx| {
+                state.selected_thread = Some("main".into());
+                state.server_config.config = Some(serde_json::from_value(json!({
+                    "environment": { "environmentId": "env-1", "label": "Local" },
+                    "providers": []
+                })).unwrap());
+                let thread = json!({
+                    "id": "main", "projectId": "p", "title": "Main", "providerInstanceId": "pi",
+                    "modelSelection": { "instanceId": "pi", "model": "claude-sonnet" },
+                    "runtimeMode": "full-access", "interactionMode": "default",
+                    "lineage": { "rootThreadId": "main" },
+                    "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                    "snoozedAt": "2026-01-01T00:00:10Z",
+                    "snoozedUntil": "2099-01-01T06:00:00Z",
+                    "activeProviderThreadId": "pt-pi"
+                });
+                let mut shell_thread = thread.clone();
+                shell_thread["tags"] = json!([]);
+                shell_thread["status"] = json!("error");
+                shell_thread["hasActionableProposedPlan"] = json!(false);
+                shell_thread["itemCount"] = json!(1);
+                shell_thread["visibleItemCount"] = json!(1);
+                shell_thread["latestRunId"] = json!("r1");
+                shell_thread["latestRunCompletedAt"] = json!("2026-01-01T00:00:01Z");
+                shell_thread["limitRecovery"] = json!({
+                    "runId": "r1",
+                    "resetAt": "2099-01-01T05:00:00Z",
+                    "autoResume": true,
+                    "snooze": true
+                });
+                shell_thread["pendingBackgroundTasks"] = json!([{
+                    "taskId": "bg-1",
+                    "kind": "command",
+                    "description": "cargo test -p t3-core",
+                    "command": "cargo test -p t3-core --lib",
+                    "itemId": "cmd-1",
+                    "nativeItemId": "native-cmd-1",
+                    "sourceThreadId": "main"
+                }]);
+                state.shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                    threads: vec![serde_json::from_value(shell_thread).unwrap()],
+                    ..Default::default()
+                });
+                state.thread.projection = Some(serde_json::from_value(json!({
+                    "thread": thread,
+                    "runs": [{
+                        "id": "r1", "ordinal": 1, "providerInstanceId": "pi",
+                        "modelSelection": { "instanceId": "pi", "model": "claude-sonnet" },
+                        "userMessageId": "u1", "rootNodeId": "root", "status": "failed",
+                        "requestedAt": "2026-01-01T00:00:00Z", "startedAt": "2026-01-01T00:00:00Z",
+                        "completedAt": "2026-01-01T00:00:01Z"
+                    }],
+                    "attempts": [], "nodes": [], "subagents": [],
+                    "providerSessions": [{
+                        "id": "ps-pi", "providerInstanceId": "pi", "status": "running",
+                        "extensionStatuses": [{ "key": "watch", "text": "Watching workspace" }]
+                    }],
+                    "providerThreads": [{ "id": "pt-pi", "providerInstanceId": "pi", "providerSessionId": "ps-pi" }],
+                    "providerTurns": [], "runtimeRequests": [], "messages": [], "plans": [],
+                    "turnItems": [
+                        {
+                            "id": "e1", "threadId": "main", "runId": "r1", "nodeId": "root",
+                            "parentItemId": null, "ordinal": 1, "status": "failed",
+                            "title": null, "startedAt": "2026-01-01T00:00:00Z", "completedAt": null,
+                            "updatedAt": "2026-01-01T00:00:00Z", "type": "error",
+                            "failure": {
+                                "class": "usage_limit",
+                                "message": "Usage limit reached",
+                                "resetAt": "2099-01-01T05:00:00Z",
+                                "retryable": null
+                            }
+                        },
+                        {
+                            "id": "cmd-1", "threadId": "main", "runId": "r1", "nodeId": "root",
+                            "parentItemId": null, "ordinal": 2, "status": "running",
+                            "title": "Running cargo test", "startedAt": "2026-01-01T00:00:00Z",
+                            "completedAt": null, "updatedAt": "2026-01-01T00:00:00Z",
+                            "type": "command_execution", "input": "cargo test -p t3-core --lib",
+                            "nativeItemRef": { "provider": "pi", "itemId": "native-cmd-1" }
+                        }
+                    ],
+                    "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [],
+                    "contextTransfers": [], "visibleTurnItems": [], "updatedAt": ""
+                })).unwrap());
+                cx.emit(AppEvent::Shell);
+                cx.emit(AppEvent::Thread);
+            });
+            state
+        });
+        let mut stage_view = None;
+        let window = cx.open_window(size(px(820.), px(640.)), |window, cx| {
+            let thread_view = cx.new(|cx| ThreadView::new(state.clone(), window, cx));
+            thread_view.update(cx, |view, cx| view.sync(cx));
+            let limit_banner = cx.new(|cx| crate::thread_view::limit_recovery::LimitRecoveryBanner::new(state.clone(), cx));
+            let stage = cx.new(|_| CaptureStage { limit_banner, thread_view });
+            stage_view = Some(stage.clone());
+            stage
+        }).unwrap();
+        let stage = stage_view.unwrap();
+        let draw = |cx: &mut gpui::HeadlessAppContext, name: Option<&str>| {
+            cx.run_until_parked();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            }).unwrap();
+            if let (Some(name), Some(out)) = (name, std::env::var_os("T3_CAPTURE_381")) {
+                let out = std::path::PathBuf::from(out);
+                std::fs::create_dir_all(&out).unwrap();
+                cx.capture_screenshot(window.into()).unwrap().save(out.join(name)).unwrap();
+            }
+        };
+        draw(&mut cx, Some("banners-limit-pi.png"));
+
+        // LimitRecovery owns snooze -> duplicate StatusLine::Snoozed is suppressed while background line shows.
+        stage.read_with(&cx, |stage, cx| {
+            let view = stage.thread_view.read(cx);
+            assert_eq!(view.footer.lines.status, None, "limit recovery must suppress duplicate StatusLine::Snoozed");
+            let bg = view.footer.lines.background.as_ref().expect("background work must render");
+            assert_eq!(bg.items[0].item_id.as_deref(), Some("cmd-1"));
+            assert!(!view.footer.lines.run_is_live);
+        });
+
+        // Open BackgroundWorkDialog and verify it opens cleanly and captures screenshot.
+        cx.update_window(window.into(), |_, window, cx| {
+            stage.update(cx, |stage, cx| {
+                stage.thread_view.update(cx, |view, cx| view.open_background_details(window, cx));
+            });
+        }).unwrap();
+        draw(&mut cx, Some("background-work-dialog.png"));
+        stage.read_with(&cx, |stage, cx| {
+            assert!(stage.thread_view.read(cx).footer.background_details.is_some());
+        });
+
+        // Setting status to Running sets run_is_live=true; clearing snooze ownership checks live state cleanly.
+        state.update(&mut cx, |state, cx| {
+            state.shell.snapshot.as_mut().unwrap().threads[0].status = "running".into();
+            cx.emit(AppEvent::Shell);
+        });
+        draw(&mut cx, None);
+        stage.read_with(&cx, |stage, cx| {
+            assert!(stage.thread_view.read(cx).footer.lines.run_is_live);
+        });
     }
 }

@@ -514,6 +514,9 @@ mod tests {
     fn video_url_resolves_direct_and_source_control_fallback(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
         let cache = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
             let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
             super::super::cache(&state, cx)
         });
