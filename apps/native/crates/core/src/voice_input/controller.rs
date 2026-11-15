@@ -391,6 +391,7 @@ pub enum VoiceControllerEffect {
     AbortPostProcessing { operation_token: u64 },
     FinishTranscription { operation_token: u64, uri: Option<String> },
     StartPostProcessing { operation_token: u64, transcript: String, draft: VoiceDraftSnapshot },
+    ReadyToCommit { operation_token: u64 },
     CommitDraft { text: String, selection: VoiceSelection },
     DeleteRecording(String),
     ReportPostProcessingError(String),
@@ -412,6 +413,7 @@ pub struct VoiceInputControllerMachine {
     operation_token: u64,
     retry_failed_recording: bool,
     has_transcriber: bool,
+    enable_post_processing: bool,
     captured_draft: Option<VoiceDraftSnapshot>,
     recording_uri: Option<String>,
     owned_recording_uris: BTreeSet<String>,
@@ -420,6 +422,8 @@ pub struct VoiceInputControllerMachine {
     locale: String,
     uses_streaming: bool,
     has_live_start: bool,
+    live_transcription_started: bool,
+    live_transcription_in_flight: bool,
     live_text: Option<String>,
     skip_post_processing_requested: bool,
     pending_raw_transcript: Option<String>,
@@ -433,6 +437,7 @@ impl VoiceInputControllerMachine {
             operation_token: 0,
             retry_failed_recording,
             has_transcriber,
+            enable_post_processing: false,
             captured_draft: None,
             recording_uri: None,
             owned_recording_uris: BTreeSet::new(),
@@ -441,6 +446,8 @@ impl VoiceInputControllerMachine {
             locale: "auto".to_owned(),
             uses_streaming: false,
             has_live_start: false,
+            live_transcription_started: false,
+            live_transcription_in_flight: false,
             live_text: None,
             skip_post_processing_requested: false,
             pending_raw_transcript: None,
@@ -450,6 +457,10 @@ impl VoiceInputControllerMachine {
 
     pub fn set_has_transcriber(&mut self, has_transcriber: bool) {
         self.has_transcriber = has_transcriber;
+    }
+
+    pub fn set_enable_post_processing(&mut self, enabled: bool) {
+        self.enable_post_processing = enabled;
     }
 
     pub const fn state(&self) -> &VoiceInputState {
@@ -585,6 +596,8 @@ impl VoiceInputControllerMachine {
                 if self.has_live_start
                     && let Some(u) = uri
                 {
+                    self.live_transcription_started = true;
+                    self.live_transcription_in_flight = true;
                     effects.push(VoiceControllerEffect::StartLiveTranscription { uri: u, operation_token });
                 }
                 effects.push(VoiceControllerEffect::StartRecorder {
@@ -614,16 +627,39 @@ impl VoiceInputControllerMachine {
         if !self.is_current(operation_token) {
             return effects;
         }
+        self.live_transcription_in_flight = false;
         match result {
-            Ok(text) => {
-                self.live_text = text;
-            }
-            Err(err) => {
-                if self.state.phase == VoiceInputPhase::Recording {
+            Ok(text) => match self.state.phase {
+                VoiceInputPhase::Recording => {
+                    self.live_text = text;
+                }
+                VoiceInputPhase::Transcribing => {
+                    if let Some(live) = text {
+                        self.complete_transcription_step(
+                            operation_token,
+                            live,
+                            self.enable_post_processing,
+                            &mut effects,
+                        );
+                    } else {
+                        effects.push(VoiceControllerEffect::FinishTranscription {
+                            operation_token,
+                            uri: self.recording_uri.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            },
+            Err(err) => match self.state.phase {
+                VoiceInputPhase::Recording => {
                     let msg = err.transcription_message().to_owned();
                     self.discard_recording(Some(&msg), &mut effects);
                 }
-            }
+                VoiceInputPhase::Transcribing => {
+                    self.fail_transcription_error(err, false, &mut effects);
+                }
+                _ => {}
+            },
         }
         effects
     }
@@ -706,42 +742,13 @@ impl VoiceInputControllerMachine {
         let transcript = match result {
             Ok(text) => text,
             Err(err) => {
-                if self.retry_failed_recording
-                    && !self.has_live_start
-                    && !self.uses_streaming
-                    && let (Some(uri), Some(draft)) = (&self.recording_uri, &self.captured_draft)
-                {
-                    self.retry_recording = Some(RetryRecording {
-                        uri: uri.clone(),
-                        owner_key: draft.owner_key.clone(),
-                        locale: self.locale.clone(),
-                        uses_streaming: self.uses_streaming,
-                    });
-                }
-                let msg = err.transcription_message().to_owned();
-                self.set_error(&msg, Some(VoiceErrorAction::Retry), &mut effects);
-                self.finishing = false;
-                self.release_resources(&mut effects);
+                let allow_retry = !self.live_transcription_started && !self.uses_streaming;
+                self.fail_transcription_error(err, allow_retry, &mut effects);
                 return effects;
             }
         };
 
-        if enable_post_processing
-            && !transcript.trim().is_empty()
-            && let Some(draft) = self.captured_draft.clone()
-        {
-            self.skip_post_processing_requested = false;
-            self.pending_raw_transcript = Some(transcript.clone());
-            self.set_state(VoiceInputState::post_processing(), &mut effects);
-            effects.push(VoiceControllerEffect::StartPostProcessing {
-                operation_token,
-                transcript,
-                draft,
-            });
-            return effects;
-        }
-
-        self.pending_raw_transcript = Some(transcript);
+        self.complete_transcription_step(operation_token, transcript, enable_post_processing, &mut effects);
         effects
     }
 
@@ -776,6 +783,7 @@ impl VoiceInputControllerMachine {
                 }
             }
         }
+        effects.push(VoiceControllerEffect::ReadyToCommit { operation_token });
         effects
     }
 
@@ -880,13 +888,62 @@ impl VoiceInputControllerMachine {
             return;
         }
         if let Some(live) = self.live_text.take() {
-            self.pending_raw_transcript = Some(live);
-        } else {
+            self.complete_transcription_step(token, live, self.enable_post_processing, effects);
+        } else if !self.live_transcription_in_flight {
             effects.push(VoiceControllerEffect::FinishTranscription {
                 operation_token: token,
                 uri: self.recording_uri.clone(),
             });
         }
+    }
+
+    fn complete_transcription_step(
+        &mut self,
+        operation_token: u64,
+        transcript: String,
+        enable_post_processing: bool,
+        effects: &mut Vec<VoiceControllerEffect>,
+    ) {
+        if enable_post_processing
+            && !transcript.trim().is_empty()
+            && let Some(draft) = self.captured_draft.clone()
+        {
+            self.skip_post_processing_requested = false;
+            self.pending_raw_transcript = Some(transcript.clone());
+            self.set_state(VoiceInputState::post_processing(), effects);
+            effects.push(VoiceControllerEffect::StartPostProcessing {
+                operation_token,
+                transcript,
+                draft,
+            });
+            return;
+        }
+
+        self.pending_raw_transcript = Some(transcript);
+        effects.push(VoiceControllerEffect::ReadyToCommit { operation_token });
+    }
+
+    fn fail_transcription_error(
+        &mut self,
+        err: VoiceTranscriptionError,
+        allow_retry_recording: bool,
+        effects: &mut Vec<VoiceControllerEffect>,
+    ) {
+        if self.retry_failed_recording
+            && allow_retry_recording
+            && let (Some(uri), Some(draft)) = (&self.recording_uri, &self.captured_draft)
+        {
+            self.retry_recording = Some(RetryRecording {
+                uri: uri.clone(),
+                owner_key: draft.owner_key.clone(),
+                locale: self.locale.clone(),
+                uses_streaming: self.uses_streaming,
+            });
+        }
+        let msg = err.transcription_message().to_owned();
+        self.set_error(&msg, Some(VoiceErrorAction::Retry), effects);
+        self.finishing = false;
+        self.release_resources(effects);
     }
 
     fn discard_recording(&mut self, error: Option<&str>, effects: &mut Vec<VoiceControllerEffect>) {
@@ -914,6 +971,10 @@ impl VoiceInputControllerMachine {
         self.recording_uri = None;
         self.delete_owned_recordings(effects);
         self.captured_draft = None;
+        self.has_live_start = false;
+        self.uses_streaming = false;
+        self.live_transcription_started = false;
+        self.live_transcription_in_flight = false;
         self.live_text = None;
         self.pending_raw_transcript = None;
         self.skip_post_processing_requested = false;

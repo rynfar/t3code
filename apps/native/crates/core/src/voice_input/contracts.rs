@@ -155,7 +155,11 @@ pub fn validate_cloud_speech_model_id(id: &str) -> bool {
     if !(3..=160).contains(&utf16_len) {
         return false;
     }
-    if id.len() >= "openrouter/".len() && id[..11].eq_ignore_ascii_case("openrouter/") {
+    if id
+        .as_bytes()
+        .get(..11)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"openrouter/"))
+    {
         return false;
     }
     CLOUD_MODEL_ID_RE.is_match(id)
@@ -411,9 +415,18 @@ pub enum EnvironmentSpeechModelState {
     Installed,
 }
 
+/// Distinguishes an absent optional field (`None`) from an explicit `null` (`Some(None)`).
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeechBenchmarkTimes {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub cpu: Option<Option<f64>>,
     pub accelerated: Option<f64>,
 }
@@ -436,7 +449,7 @@ pub struct SpeechBenchmark {
 struct SpeechBenchmarkWire {
     accuracy: std::collections::BTreeMap<String, SpeechBenchmarkAccuracyEntry>,
     seconds_per_30s: SpeechBenchmarkSecondsWire,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     cpu_seconds_per_30s: Option<Option<f64>>,
 }
 

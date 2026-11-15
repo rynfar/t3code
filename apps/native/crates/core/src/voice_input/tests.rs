@@ -353,7 +353,7 @@ fn controller_deletes_retained_audio_when_cancelled_and_handles_skip_post_proces
     let skip_effects = ctrl.skip_post_processing();
     assert!(skip_effects.contains(&VoiceControllerEffect::AbortPostProcessing { operation_token: tok2 }));
     let pp_err = ctrl.on_post_processing_finished(tok2, Err("aborted".into()));
-    assert!(pp_err.is_empty());
+    assert_eq!(pp_err, vec![VoiceControllerEffect::ReadyToCommit { operation_token: tok2 }]);
     let committed = ctrl.finalize_commit(tok2, Some(&initial));
     assert!(committed.contains(&VoiceControllerEffect::CommitDraft {
         text: "hello new text".into(),
@@ -380,6 +380,118 @@ fn controller_permission_denied_and_background_and_owner_change() {
     assert!(bg.iter().any(|e| matches!(e, VoiceControllerEffect::AbortOperation { .. })));
     assert_eq!(prep.state().phase, VoiceInputPhase::Error);
     assert!(prep.state().error.as_deref().unwrap().contains("background"));
+}
+
+fn start_live_recording(
+    enable_post_processing: bool,
+    draft_snap: &VoiceDraftSnapshot,
+) -> (VoiceInputControllerMachine, u64) {
+    let mut ctrl = VoiceInputControllerMachine::new(true, true);
+    ctrl.set_enable_post_processing(enable_post_processing);
+    ctrl.start(Some(draft_snap.clone()));
+    let tok = ctrl.operation_token();
+    ctrl.on_permission(tok, true, true);
+    ctrl.on_transcriber_prepared(tok, Ok(("en-US".into(), true, true)));
+    let rec_effects = ctrl.on_recorder_prepared(
+        tok,
+        Ok(Some("file:///live.m4a".into())),
+        Some(draft_snap.clone()),
+        false,
+    );
+    assert!(rec_effects.contains(&VoiceControllerEffect::StartLiveTranscription {
+        uri: "file:///live.m4a".into(),
+        operation_token: tok,
+    }));
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Recording);
+    (ctrl, tok)
+}
+
+#[test]
+fn controller_live_transcription_cached_and_in_flight_and_errors() {
+    let initial = default_draft();
+
+    // 1. Live transcript cached before stop(), post-processing disabled -> emits ReadyToCommit.
+    let (mut ctrl, tok) = start_live_recording(false, &initial);
+    ctrl.on_live_transcription_result(tok, Ok(Some("cached live".into())));
+    let stop_effects = ctrl.stop();
+    assert!(!stop_effects.iter().any(|e| matches!(e, VoiceControllerEffect::FinishTranscription { .. })));
+    assert!(stop_effects.contains(&VoiceControllerEffect::ReadyToCommit { operation_token: tok }));
+    let commit_effects = ctrl.finalize_commit(tok, Some(&initial));
+    assert!(commit_effects.contains(&VoiceControllerEffect::CommitDraft {
+        text: "hello cached live".into(),
+        selection: VoiceSelection { start: 17, end: 17 },
+    }));
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Idle);
+
+    // 2. Live transcript cached before stop(), post-processing enabled -> transitions to PostProcessing.
+    let (mut ctrl, tok) = start_live_recording(true, &initial);
+    ctrl.on_live_transcription_result(tok, Ok(Some("raw live".into())));
+    let stop_effects = ctrl.stop();
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::PostProcessing);
+    assert!(stop_effects.contains(&VoiceControllerEffect::StartPostProcessing {
+        operation_token: tok,
+        transcript: "raw live".into(),
+        draft: initial.clone(),
+    }));
+    let pp_effects = ctrl.on_post_processing_finished(tok, Ok("cleaned live".into()));
+    assert!(pp_effects.contains(&VoiceControllerEffect::ReadyToCommit { operation_token: tok }));
+    let commit_effects = ctrl.finalize_commit(tok, Some(&initial));
+    assert!(commit_effects.contains(&VoiceControllerEffect::CommitDraft {
+        text: "hello cleaned live".into(),
+        selection: VoiceSelection { start: 18, end: 18 },
+    }));
+
+    // 3. Live transcript settles during Transcribing (after stop()); and Ok(None) falls back to FinishTranscription.
+    let (mut ctrl, tok) = start_live_recording(true, &initial);
+    let stop_effects = ctrl.stop();
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Transcribing);
+    assert!(!stop_effects.iter().any(|e| matches!(
+        e,
+        VoiceControllerEffect::FinishTranscription { .. }
+            | VoiceControllerEffect::ReadyToCommit { .. }
+            | VoiceControllerEffect::StartPostProcessing { .. }
+    )));
+    let settled = ctrl.on_live_transcription_result(tok, Ok(Some("late live".into())));
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::PostProcessing);
+    assert!(settled.contains(&VoiceControllerEffect::StartPostProcessing {
+        operation_token: tok,
+        transcript: "late live".into(),
+        draft: initial.clone(),
+    }));
+
+    let (mut ctrl, tok) = start_live_recording(false, &initial);
+    ctrl.stop();
+    let fallback = ctrl.on_live_transcription_result(tok, Ok(None));
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Transcribing);
+    assert!(fallback.contains(&VoiceControllerEffect::FinishTranscription {
+        operation_token: tok,
+        uri: Some("file:///live.m4a".into()),
+    }));
+
+    // 4. Live error before stop() (Recording) and after stop() (Transcribing).
+    let (mut ctrl, tok) = start_live_recording(false, &initial);
+    let err = VoiceTranscriptionError::new(
+        VoiceTranscriptionErrorCode::TranscriptionFailed,
+        "live dropped early",
+    );
+    let early_err = ctrl.on_live_transcription_result(tok, Err(err));
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Error);
+    assert_eq!(ctrl.state().error.as_deref(), Some("live dropped early"));
+    assert!(early_err.contains(&VoiceControllerEffect::AbortOperation { operation_token: tok }));
+    assert!(early_err.contains(&VoiceControllerEffect::DeleteRecording("file:///live.m4a".into())));
+
+    let (mut ctrl, tok) = start_live_recording(false, &initial);
+    ctrl.stop();
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Transcribing);
+    let err_late = VoiceTranscriptionError::new(
+        VoiceTranscriptionErrorCode::TranscriptionFailed,
+        "live failed while transcribing",
+    );
+    let late_err = ctrl.on_live_transcription_result(tok, Err(err_late));
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Error);
+    assert_eq!(ctrl.state().error.as_deref(), Some("live failed while transcribing"));
+    assert_eq!(ctrl.state().error_action, Some(VoiceErrorAction::Retry));
+    assert!(late_err.contains(&VoiceControllerEffect::DeleteRecording("file:///live.m4a".into())));
 }
 
 // --- pcmWorklet.test.ts parity ---
@@ -543,6 +655,37 @@ fn speech_status_wire_fallback_and_benchmark_wire_formats() {
     .unwrap();
     assert_eq!(bench_scalar.seconds_per_30s.accelerated, Some(1.5));
     assert_eq!(bench_scalar.seconds_per_30s.cpu, Some(Some(4.2)));
+
+    // Missing vs explicit null distinguishes legacy servers (None) from unmeasured current catalogs (Some(None)).
+    let bench_missing_cpu: SpeechBenchmark = serde_json::from_value(serde_json::json!({
+        "accuracy": { "en": { "grade": "A", "errorPercent": 2.1 } },
+        "secondsPer30s": 1.5
+    }))
+    .unwrap();
+    assert_eq!(bench_missing_cpu.seconds_per_30s.cpu, None);
+
+    let bench_null_cpu: SpeechBenchmark = serde_json::from_value(serde_json::json!({
+        "accuracy": { "en": { "grade": "A", "errorPercent": 2.1 } },
+        "secondsPer30s": 1.5,
+        "cpuSecondsPer30s": null
+    }))
+    .unwrap();
+    assert_eq!(bench_null_cpu.seconds_per_30s.cpu, Some(None));
+
+    let times_missing: SpeechBenchmarkTimes =
+        serde_json::from_value(serde_json::json!({ "accelerated": 1.2 })).unwrap();
+    assert_eq!(times_missing.cpu, None);
+
+    let times_null: SpeechBenchmarkTimes =
+        serde_json::from_value(serde_json::json!({ "cpu": null, "accelerated": 1.2 })).unwrap();
+    assert_eq!(times_null.cpu, Some(None));
+
+    // Multi-byte UTF-8 model IDs must never panic on byte index 11.
+    assert!(!validate_cloud_speech_model_id("éééééé"));
+    assert!(!validate_cloud_speech_model_id("éééééé/model"));
+    assert!(!validate_cloud_speech_model_id("openrouteré/a"));
+    assert!(!validate_cloud_speech_model_id("OpenRouter/whisper-1"));
+    assert!(validate_cloud_speech_model_id("openai/whisper-1"));
 }
 
 #[test]
