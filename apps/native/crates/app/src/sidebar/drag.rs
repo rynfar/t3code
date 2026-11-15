@@ -107,6 +107,7 @@ impl SidebarPane {
     /// The drag constructor ran: the list shows its drop markers.
     pub(super) fn begin_drag(&mut self, thread_id: &str, key: Option<&t3_core::sidebar::tag_filter::ThreadKey>, preview: Entity<ThreadDragPreview>, cx: &mut Context<Self>) {
         // Set pane drag before controller updates emit AppEvent::Shell so sync_list_rows sees an active drag for #293 scroll preservation.
+        self.hover.dismiss(cx);
         self.drag = Some(PaneDrag { preview: Some(preview), ..Default::default() });
         self.state.update(cx, |state, cx| match key { Some(key) => state.start_scoped_thread_drag(key, cx), None => state.start_thread_drag(thread_id, cx) });
         let started = {
@@ -302,6 +303,7 @@ impl SidebarPane {
         preview: Entity<ProjectDragPreview>,
         cx: &mut Context<Self>,
     ) {
+        self.hover.dismiss(cx);
         self.project_drag = Some(PaneProjectDrag { group_key, at: None, preview: Some(preview) });
         cx.notify();
     }
@@ -395,6 +397,7 @@ pub(super) struct PaneSweep {
 
 impl SidebarPane {
     pub(super) fn begin_sweep(&mut self, dragged: &DraggedSweep, cx: &mut Context<Self>) {
+        self.hover.dismiss(cx);
         let origin = dragged.key.clone().map_or_else(|| PaneSweepKey::Local(dragged.id.clone()), PaneSweepKey::Scoped);
         self.sweep = Some(PaneSweep {
             action: dragged.action,

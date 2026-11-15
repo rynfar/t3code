@@ -270,6 +270,8 @@ impl SidebarPane {
         let menu_key = key.cloned();
         let row_id = SharedString::from(format!("thread-row-{:?}-{}", key, thread.id));
         let debug_row_id = row_id.clone();
+        let hover_bounds_id = row_id.clone();
+        let hover_row_id = row_id.clone();
         let focus_key = ElementId::Name(row_id.clone());
         let row_focus = crate::settings::controls::focus_handle(&focus_key, window, cx);
         #[cfg(all(test, feature = "snapshot"))]
@@ -311,7 +313,11 @@ impl SidebarPane {
                 })
             })
             .when(dragging, |this| this.opacity(0.5))
-            .when(self.drag.is_none() && self.sweep.is_none() && !self.menu_open, |this| this.tooltip(super::hover::tooltip(hover)))
+            .child(self.hover.record_row_bounds(hover_bounds_id, cx.entity_id()))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.hover.on_hover(this.hover_suppressed(), hover_row_id.clone(), hover.clone(), *hovered, cx);
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.hover.dismiss(cx)))
             .when(draggable, |this| {
                 this.on_drag(DraggedThread { id: thread.id.clone(), key: key.cloned() }, move |dragged, _, _, cx| {
                     let preview = cx.new(|_| ThreadDragPreview::new(preview.0.clone(), preview.1.clone(), preview.2.clone()));
@@ -391,6 +397,7 @@ impl SidebarPane {
                 }
             }))
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                this.hover.dismiss(cx);
                 let modifiers = event.modifiers();
                 if event.click_count() > 1 && !modifiers.shift && !modifiers.platform && !modifiers.control && !modifiers.alt {
                     let allowed = can_operate_thread(this.state.read(cx), clicked_key.as_ref())
@@ -407,6 +414,7 @@ impl SidebarPane {
                 });
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                this.hover.dismiss(cx);
                 if let Some(key) = &menu_key {
                     let selected = this.state.read(cx).sidebar.fleet_selection.contains(key);
                     this.menu.update(cx, |menu, cx| if selected { menu.open_for_selection(event.position, window, cx); } else { menu.open_for_scoped_thread(key, event.position, window, cx); });

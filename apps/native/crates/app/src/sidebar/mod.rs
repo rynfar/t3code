@@ -131,6 +131,7 @@ pub struct SidebarPane {
     folder_multiline: bool,
     /// A thread or project menu is open; rows show no hover card over it.
     menu_open: bool,
+    hover: hover::SidebarHoverState,
     snooze_grant_watch: Option<((u64, u64), Task<()>)>,
     snooze_access: bool,
     checkout_repos: std::collections::HashMap<CheckoutRepoKey, CheckoutRepoEntry>,
@@ -383,6 +384,7 @@ impl SidebarPane {
                 InputEvent::Change => {
                     let query = input.read(cx).value().to_string();
                     this.search.set_query(query, &this.state, cx);
+                    this.hover.sync_search(this.search.query());
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => this.open_search_result(window, cx),
@@ -403,6 +405,9 @@ impl SidebarPane {
                 let open = menu.read(cx).is_open();
                 if open != this.menu_open {
                     this.menu_open = open;
+                    if open {
+                        this.hover.dismiss(cx);
+                    }
                     cx.notify();
                 }
             }),
@@ -517,6 +522,7 @@ impl SidebarPane {
             row_focuses: std::cell::RefCell::new(std::collections::HashMap::new()),
             folder_multiline: crate::settings::store::client(cx).boring_sidebar_multiline_rows(),
             menu_open: false,
+            hover: Default::default(),
             snooze_grant_watch: None,
             snooze_access: false,
             checkout_repos: std::collections::HashMap::new(),
@@ -814,7 +820,16 @@ impl SidebarPane {
         }));
     }
 
+    pub(super) fn hover_suppressed(&self) -> bool {
+        self.drag.is_some()
+            || self.project_drag.is_some()
+            || self.sweep.is_some()
+            || self.menu_open
+            || self.rename.is_some()
+    }
+
     fn start_scoped_rename(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, window: &mut Window, cx: &mut Context<Self>) {
+        self.hover.dismiss(cx);
         let Some(owner) = crate::context_menu::ThreadMenuOwner::capture_scoped(self.state.read(cx), key) else { return; };
         if !owner.allows(self.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) { return; }
         let Some(original_title) = self.state.read(cx).scoped_thread(key).map(|row| row.thread.title.clone()) else { return; };
@@ -856,6 +871,7 @@ impl SidebarPane {
     }
 
     fn start_rename_from_menu(&mut self, thread_id: &str, previous_focus: Option<gpui::FocusHandle>, window: &mut Window, cx: &mut Context<Self>) {
+        self.hover.dismiss(cx);
         let Some(original_title) = self.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
         let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self.state.read(cx), thread_id) else { return };
         let previous_focus = previous_focus.or_else(|| window.focused(cx));
@@ -903,6 +919,7 @@ impl SidebarPane {
 
     /// A selected row opens the bulk menu (`handleThreadContextMenu`).
     pub fn open_menu(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.hover.dismiss(cx);
         if self.state.read(cx).sidebar.selection.contains(thread_id) {
             self.menu.update(cx, |menu, cx| menu.open_for_selection(position, window, cx));
         } else {
@@ -911,12 +928,14 @@ impl SidebarPane {
     }
 
     pub fn open_snooze_menu(&mut self, thread_id: &str, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.hover.dismiss(cx);
         self.menu.update(cx, |menu, cx| menu.open_snooze(thread_id, position, window, cx));
     }
 
     fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.search.set_query(String::new(), &self.state, cx);
+        self.hover.sync_search(self.search.query());
         cx.notify();
     }
 
@@ -1496,6 +1515,11 @@ impl Render for SidebarPane {
         let notices = self
             .updates
             .update(cx, |updates, cx| updates.render_notices(window, cx));
+        let search_query = self.search.query().to_owned();
+        self.hover.sync_search(&search_query);
+        let suppressed = self.hover_suppressed();
+        let active_list = if self.search.is_active() { self.search.list().clone() } else { self.list.clone() };
+        let hover_overlay = self.hover.overlay(suppressed, &active_list);
         div()
             .id("sidebar-folder-drop")
             .debug_selector(|| "sidebar-folder-drop".into())
@@ -1504,6 +1528,11 @@ impl Render for SidebarPane {
             .flex()
             .flex_col()
             .bg(hsla(p.sidebar))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                if this.hover.is_active() {
+                    cx.notify();
+                }
+            }))
             .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style)
             .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
                 let active = event.bounds.contains(&event.event.position)
@@ -1528,12 +1557,15 @@ impl Render for SidebarPane {
                 this.finish_sweep(false, cx);
                 this.finish_project_drag(false, cx);
             }))
+            .child(self.hover.begin_frame_probe())
             .child(self.render_header(cx))
             .child(self.render_search(cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            .child(self.hover.end_frame_probe(cx.entity().downgrade(), active_list))
             .children(notices)
             .child(self.render_footer(window, cx))
             .children(self.render_project_filter(cx))
+            .children(hover_overlay)
             .when(self.folder_drop_active, |this| {
                 this.child(
                     div()
