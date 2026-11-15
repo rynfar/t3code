@@ -6,6 +6,8 @@
 //! row (`ThreadActivityBanners.tsx`, `useThreadLifecycle.tsx`): Stop, goal, and lifecycle status
 //! (`presentRunStop`, `presentProviderGoal` in `client-runtime/src/state/threadExecution.ts`).
 
+use std::collections::HashSet;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -18,7 +20,7 @@ use crate::shell::ThreadShell;
 use crate::sidebar::settled::{effective_snoozed, is_woke_unseen, snooze_wake_label, woke_at};
 use crate::sidebar::thread::SidebarThread;
 use crate::thread::{Run, ThreadProjection};
-use crate::turn_item::{ProviderFailure, TurnItemKind};
+use crate::turn_item::{ProviderFailure, TurnItem, TurnItemKind};
 
 pub const CHATGPT_USAGE_LIMIT_CODE: &str = "subscription_sharing_usage_limit_exceeded";
 pub const CHATGPT_WORKSPACE_USAGE_LIMIT_CODE: &str = "subscription_sharing_workplace_individual_usage_limit_exceeded";
@@ -57,19 +59,23 @@ fn latest_matching_run<'a>(projection: &'a ThreadProjection, statuses: &[&str]) 
     projection.runs.iter().filter(|run| statuses.contains(&run.status.as_str())).max_by_key(|run| run.ordinal)
 }
 
-/// `latestRootProviderFailure`.
-fn latest_root_provider_failure<'a>(run: Option<&Run>, projection: &'a ThreadProjection) -> Option<&'a ProviderFailure> {
+/// `latestRootProviderFailure`, returning both the matching turn item and its failure body.
+fn latest_root_provider_failure_item<'a>(run: Option<&Run>, projection: &'a ThreadProjection) -> Option<(&'a TurnItem, &'a ProviderFailure)> {
     let run = run.filter(|run| run.status == "failed")?;
     projection
         .turn_items
         .iter()
         .filter(|item| item.status == "failed" && item.run_id.as_deref() == Some(run.id.as_str()) && item.node_id == run.root_node_id)
         .filter_map(|item| match &item.kind {
-            TurnItemKind::Error { failure, .. } => Some((item, failure)),
+            TurnItemKind::Error { failure, .. } => Some((item.as_ref(), failure)),
             _ => None,
         })
         .max_by(|(a, _), (b, _)| (parse_iso_ms(&a.updated_at), a.ordinal, a.id.as_str()).cmp(&(parse_iso_ms(&b.updated_at), b.ordinal, b.id.as_str())))
-        .map(|(_, failure)| failure)
+}
+
+/// `latestRootProviderFailure`.
+fn latest_root_provider_failure<'a>(run: Option<&Run>, projection: &'a ThreadProjection) -> Option<&'a ProviderFailure> {
+    latest_root_provider_failure_item(run, projection).map(|(_, failure)| failure)
 }
 
 fn session_error(projection: &ThreadProjection) -> Option<&str> {
@@ -171,15 +177,157 @@ pub fn error_can_expand(full: &str, collapsed: &str) -> bool {
     collapsed != full || full.chars().count() > 180 || full.contains('\n')
 }
 
+/// `UsageLimitNoticeRows`: timeline item IDs that repeat the latest usage-limit notice while the
+/// recovery banner shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageLimitNoticeRows {
+    pub item_ids: HashSet<String>,
+    pub provider_notice_item_id: Option<String>,
+    pub provider_notice_message_id: Option<String>,
+}
+
+fn is_12h_clock(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    let Some(rest) = lower.strip_suffix("am").or_else(|| lower.strip_suffix("pm")) else {
+        return false;
+    };
+    let hour = match rest.split_once(':') {
+        Some((h, m)) => {
+            if m.len() != 2 || !m.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            let Ok(min) = m.parse::<u8>() else { return false };
+            if min >= 60 {
+                return false;
+            }
+            h
+        }
+        None => rest,
+    };
+    matches!(hour.parse::<u8>(), Ok(1..=12)) && !hour.starts_with('0')
+}
+
+fn is_zone_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.split('/').all(|seg| {
+            !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-'))
+        })
+}
+
+/// Matches Claude Code's limit notices such as `"You've hit your 5-hour limit · resets 7:10am"`.
+pub fn is_provider_limit_notice(text: &str) -> bool {
+    let trimmed = text.trim();
+    let body = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    let lower = body.to_ascii_lowercase();
+    let rest = if let Some(after) = lower
+        .strip_prefix("you've hit your ")
+        .or_else(|| lower.strip_prefix("you’ve hit your "))
+    {
+        let after_kind = after
+            .strip_prefix("5-hour ")
+            .or_else(|| after.strip_prefix("session "))
+            .or_else(|| after.strip_prefix("weekly "))
+            .or_else(|| after.strip_prefix("usage "))
+            .unwrap_or(after);
+        after_kind.strip_prefix("limit")
+    } else if let Some(after) = lower
+        .strip_prefix("you're out of extra usage")
+        .or_else(|| lower.strip_prefix("you’re out of extra usage"))
+    {
+        Some(after)
+    } else {
+        lower.strip_prefix("claude ai usage limit reached")
+    };
+    let Some(suffix) = rest else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(after_resets) = suffix.strip_prefix(" · resets ") else {
+        return false;
+    };
+    match after_resets.split_once(" (") {
+        Some((clock, zone_with_paren)) => {
+            let Some(zone) = zone_with_paren.strip_suffix(')') else {
+                return false;
+            };
+            is_12h_clock(clock) && is_zone_token(zone)
+        }
+        None => is_12h_clock(after_resets),
+    }
+}
+
+/// `deriveUsageLimitNoticeRows`: suppresses redundant usage-limit errors, Claude pause notices, and
+/// matching assistant limit messages for the active usage-limited run.
+pub fn derive_usage_limit_notice_rows(projection: &ThreadProjection) -> Option<UsageLimitNoticeRows> {
+    let error = thread_error(projection)?;
+    if !error.runtime_failed || error.class.as_deref() != Some("usage_limit") {
+        return None;
+    }
+    let run = presented_latest_run(projection)?;
+    let (latest_failure_item, _) = latest_root_provider_failure_item(Some(run), projection)?;
+    let mut item_ids = HashSet::new();
+    let mut failed_provider_turn_id: Option<&str> = None;
+    for item in &projection.turn_items {
+        if item.run_id.as_deref() != Some(run.id.as_str()) {
+            continue;
+        }
+        if item.status == "failed"
+            && item.node_id == run.root_node_id
+            && let TurnItemKind::Error { failure, .. } = &item.kind
+            && failure.class == "usage_limit"
+        {
+            item_ids.insert(item.id.clone());
+            if item.id == latest_failure_item.id {
+                failed_provider_turn_id = item.provider_turn_id.as_deref();
+            }
+        }
+    }
+    let mut provider_notice: Option<&TurnItem> = None;
+    if let Some(turn_id) = failed_provider_turn_id {
+        let prefix = format!("usage-limit:{turn_id}:");
+        for item in &projection.turn_items {
+            if item.run_id.as_deref() != Some(run.id.as_str()) || item.provider_turn_id.as_deref() != Some(turn_id) {
+                continue;
+            }
+            if matches!(item.kind, TurnItemKind::SystemNotice { .. })
+                && item.node_id == run.root_node_id
+                && item.parent_item_id.is_none()
+                && item.native_item_ref.as_ref().is_some_and(|r| r.driver.as_deref() == Some("claudeAgent") && r.native_id.starts_with(&prefix))
+            {
+                item_ids.insert(item.id.clone());
+            }
+            if matches!(item.kind, TurnItemKind::AssistantMessage { .. })
+                && item.parent_item_id.is_none()
+                && provider_notice.is_none_or(|prev| item.ordinal > prev.ordinal)
+            {
+                provider_notice = Some(item.as_ref());
+            }
+        }
+    }
+    let provider_notice_message_id = provider_notice.and_then(|item| match &item.kind {
+        TurnItemKind::AssistantMessage { message_id, .. } => Some(message_id.clone()),
+        _ => None,
+    });
+    Some(UsageLimitNoticeRows {
+        item_ids,
+        provider_notice_item_id: provider_notice.map(|item| item.id.clone()),
+        provider_notice_message_id,
+    })
+}
+
 /// `usageLimitRecoveryBannerItem` over the composer while the latest run is blocked on a limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitRecovery {
     pub run_id: String,
     pub error_code: Option<String>,
     pub reset_at: Option<String>,
-    /// Resume and snooze are offered only when the reset is after the stop.
+    pub snoozed_until: Option<String>,
+    /// Resume and snooze are offered only when the reset is after the stop and thread is active.
     pub can_schedule: bool,
     pub scheduled: bool,
+    pub resumes: bool,
     pub snoozed: bool,
     pub reset_passed: bool,
 }
@@ -207,8 +355,16 @@ impl LimitRecovery {
         if self.workspace_limit() {
             return "You've reached your workspace's limit for using your ChatGPT plan in other apps.".to_owned();
         }
-        match self.reset_at.as_deref().filter(|reset| !reset.is_empty()).map(|reset| format_upcoming(reset, now_ms, zone, format, locale)) {
-            Some(reset) => format!("Resets {reset}"),
+        let display_at = if self.resumes {
+            match (self.reset_at.as_deref().and_then(parse_iso_ms), self.snoozed_until.as_deref().and_then(parse_iso_ms)) {
+                (Some(reset), Some(snoozed)) if snoozed > reset => self.snoozed_until.as_deref(),
+                _ => self.reset_at.as_deref(),
+            }
+        } else {
+            self.reset_at.as_deref()
+        };
+        match display_at.filter(|reset| !reset.is_empty()).map(|reset| format_upcoming(reset, now_ms, zone, format, locale)) {
+            Some(reset) => format!("{} {reset}", if self.resumes { "Resumes" } else { "Resets" }),
             None => "Reset time unavailable; retry manually".to_owned(),
         }
     }
@@ -241,22 +397,48 @@ fn meta_update(command_id: &str, thread_id: &str, limit_recovery: Value) -> Valu
     json!({ "type": "thread.metadata.update", "commandId": command_id, "threadId": thread_id, "limitRecovery": limit_recovery })
 }
 
+/// Whether the usage-limit recovery banner holds the thread's snooze (`limitRecoveryOwnsSnooze`).
+pub fn limit_recovery_owns_snooze(
+    run_id: Option<&str>,
+    reset_at: Option<&str>,
+    recovery: Option<&crate::shell::LimitRecovery>,
+    snoozed_until: Option<&str>,
+) -> bool {
+    let Some(recovery) = recovery.filter(|r| r.snooze == Some(true)) else {
+        return false;
+    };
+    let (Some(run_id), Some(reset_at), Some(snoozed_ms), Some(reset_ms)) =
+        (run_id, reset_at, snoozed_until.and_then(parse_iso_ms), reset_at.and_then(parse_iso_ms))
+    else {
+        return false;
+    };
+    recovery.run_id == run_id && recovery.reset_at == reset_at && snoozed_ms == reset_ms
+}
+
 pub fn limit_recovery(error: Option<&ThreadError>, shell: &ThreadShell, now_ms: i64) -> Option<LimitRecovery> {
+    limit_recovery_with(error, shell, false, now_ms)
+}
+
+pub fn limit_recovery_with(error: Option<&ThreadError>, shell: &ThreadShell, request_pending: bool, now_ms: i64) -> Option<LimitRecovery> {
     let error = error.filter(|error| error.limit_blocked())?;
     let run_id = shell.latest_run_id.clone()?;
     let reset_at = error.reset_at.clone();
     let stopped_at = shell.latest_run_completed_at.clone().flatten().unwrap_or_else(|| shell.updated_at.clone());
     let reset_ms = reset_at.as_deref().and_then(parse_iso_ms);
-    let can_schedule = reset_ms.zip(parse_iso_ms(&stopped_at)).is_some_and(|(reset, stopped)| reset > stopped);
+    let can_schedule = !shell.is_settled() && !request_pending && reset_ms.zip(parse_iso_ms(&stopped_at)).is_some_and(|(reset, stopped)| reset > stopped);
     let recovery = shell.limit_recovery.as_ref().filter(|recovery| recovery.run_id == run_id && Some(recovery.reset_at.as_str()) == reset_at.as_deref());
+    let scheduled = recovery.is_some_and(|recovery| recovery.auto_resume);
+    let resumes = can_schedule && scheduled;
     let reset_passed = reset_ms.is_some_and(|reset| reset <= now_ms);
-    let snoozed_until = shell.snoozed_until.as_deref().and_then(parse_iso_ms);
+    let snoozed = limit_recovery_owns_snooze(Some(&run_id), reset_at.as_deref(), shell.limit_recovery.as_ref(), shell.snoozed_until.as_deref()) && !reset_passed;
     Some(LimitRecovery {
-        scheduled: recovery.is_some_and(|recovery| recovery.auto_resume),
-        snoozed: recovery.is_some_and(|recovery| recovery.snooze == Some(true)) && reset_ms.is_some() && snoozed_until == reset_ms && !reset_passed,
+        scheduled,
+        resumes,
+        snoozed,
         run_id,
         error_code: error.code.clone(),
         reset_at,
+        snoozed_until: shell.snoozed_until.clone(),
         can_schedule,
         reset_passed,
     })
@@ -421,7 +603,11 @@ impl StatusLine {
 }
 
 pub fn status_line(thread: &SidebarThread, now: i64) -> Option<StatusLine> {
-    if effective_snoozed(thread, now) {
+    status_line_for(thread, false, now)
+}
+
+pub fn status_line_for(thread: &SidebarThread, limit_recovery_holds_snooze: bool, now: i64) -> Option<StatusLine> {
+    if effective_snoozed(thread, now) && !limit_recovery_holds_snooze {
         let wake = thread.snoozed_until.map(|until| snooze_wake_label(until, now)).filter(|wake| wake != "now");
         return Some(StatusLine::Snoozed { label: wake.map_or_else(|| "Snoozed".to_owned(), |wake| format!("Snoozed, {wake} left")) });
     }
@@ -432,6 +618,57 @@ pub fn status_line(thread: &SidebarThread, now: i64) -> Option<StatusLine> {
     let woke = woke_at(thread, now)?;
     let completed = thread.latest_run.as_ref().and_then(|run| run.completed_at);
     is_woke_unseen(Some(woke), false, thread.last_visited_at, completed).then_some(StatusLine::Woke { woke_at: woke })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionStatus {
+    pub key: String,
+    pub text: String,
+}
+
+/// Only the selected provider's current session can supply transient extension status
+/// (`deriveProviderExtensionStatuses`).
+pub fn derive_provider_extension_statuses(projection: Option<&ThreadProjection>) -> Vec<ExtensionStatus> {
+    let Some(projection) = projection else {
+        return Vec::new();
+    };
+    let instance_id = projection.thread.model_selection.instance_id.as_str();
+    let active_thread = projection
+        .thread
+        .active_provider_thread_id
+        .as_deref()
+        .and_then(|id| projection.provider_threads.iter().find(|thread| thread.id == id));
+    if let Some(active) = active_thread
+        && active.value.get("providerInstanceId").and_then(Value::as_str) != Some(instance_id)
+    {
+        return Vec::new();
+    }
+    let active_session_id = active_thread.and_then(|thread| thread.value.get("providerSessionId").and_then(Value::as_str));
+    let session = projection.provider_sessions.iter().rev().find(|session| {
+        session.value.get("providerInstanceId").and_then(Value::as_str) == Some(instance_id)
+            && active_session_id.is_none_or(|id| session.id == id)
+    });
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    if session.value.get("status").and_then(Value::as_str) == Some("stopped") {
+        return Vec::new();
+    }
+    session
+        .value
+        .get("extensionStatuses")
+        .and_then(|value| serde_json::from_value::<Vec<ExtensionStatus>>(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// `extensionStatusBannerItem` (`ThreadActivityBanners.tsx`).
+pub fn extension_status_banner_text(statuses: &[ExtensionStatus]) -> Option<String> {
+    if statuses.is_empty() {
+        return None;
+    }
+    let joined: Vec<&str> = statuses.iter().map(|status| status.text.as_str()).collect();
+    Some(format!("Pi · {}", joined.join(" · ")))
 }
 
 /// `ProviderStatusBanner`: availability and compatibility notices for the thread's provider.

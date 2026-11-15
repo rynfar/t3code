@@ -42,6 +42,8 @@ pub enum AppEvent {
     Selection,
     Thread,
     ServerConfig,
+    /// A provider status banner was dismissed for this session.
+    BannerDismissed,
     /// Only `thread.history_control()` changed: loading, error, or more history.
     History,
     /// Toasts and the Undo notice.
@@ -178,6 +180,7 @@ pub struct AppState {
     #[cfg(feature = "snapshot")]
     snapshot_frozen: bool,
     pub(crate) notification_route: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    pub(crate) dismissed_provider_banners: std::collections::HashSet<String>,
     _ssh_quit: Option<Subscription>,
 }
 
@@ -285,6 +288,7 @@ impl AppState {
             #[cfg(feature = "snapshot")]
             snapshot_frozen: false,
             notification_route: None,
+            dismissed_provider_banners: Default::default(),
             _ssh_quit: None,
         };
         // Quitting stops the tunnels this app started, by the PIDs it spawned.
@@ -630,6 +634,9 @@ impl AppState {
 
     fn sync_shell_views(&mut self, shell_changed: bool, sidebar_changed: bool, resynchronized: bool, cx: &mut Context<Self>) {
         if sidebar_changed || resynchronized { self.observe_background_announcements(cx); }
+        if resynchronized {
+            self.sync_visit_session_generation(true);
+        }
         if shell_changed {
             self.sync_omitted_rows(cx);
             self.sync_side_threads(cx);
@@ -640,6 +647,8 @@ impl AppState {
             }
             cx.emit(AppEvent::Shell);
             self.restore_shell_selection(cx);
+        } else if resynchronized {
+            self.track_visit(cx);
         }
     }
 
@@ -694,12 +703,16 @@ impl AppState {
     pub(crate) fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
         if self.phase != phase {
             self.phase = phase;
+            self.sync_visit_session_generation(false);
             self.sync_notification_state(cx);
             cx.emit(AppEvent::Phase);
             // Connection state places threads on the Working shelf.
             if self.shell.snapshot.is_some() {
                 self.rebuild_sidebar(cx);
                 cx.emit(AppEvent::Shell);
+            }
+            if matches!(self.phase, Phase::Online(ConnectionStatus::Connected)) {
+                self.track_visit(cx);
             }
         }
     }
@@ -1174,6 +1187,107 @@ impl AppState {
             StopTarget::Run(run_id) => Some(commands::interrupt_run(&uuid_v4(), thread_id, &run_id)),
             StopTarget::Nothing => None,
         }
+    }
+
+    fn provider_banner_dismissal_key(environment: &str, key: &str) -> String {
+        format!("{environment}\u{0}{key}")
+    }
+
+    pub(crate) fn is_provider_banner_dismissed(&self, environment: &str, key: &str) -> bool {
+        self.dismissed_provider_banners.contains(&Self::provider_banner_dismissal_key(environment, key))
+    }
+
+    pub(crate) fn dismiss_provider_banner(&mut self, environment: &str, key: &str, cx: &mut Context<Self>) {
+        if self.dismissed_provider_banners.insert(Self::provider_banner_dismissal_key(environment, key)) {
+            cx.emit(AppEvent::BannerDismissed);
+        }
+    }
+
+    /// Environment ID of the local host daemon when discovered or previously saved.
+    pub fn host_environment_id(&self) -> Option<&str> {
+        self.connect
+            .local_server
+            .as_ref()
+            .and_then(|server| server.environment_id())
+            .or_else(|| self.environments.environments.iter().find(|env| env.local).and_then(|env| env.environment_id.as_deref()))
+    }
+
+    /// Primary environment ID (`primaryEnvironment?.environmentId`), falling back to the active
+    /// server config only when no saved environments exist (single-server / test fixtures).
+    pub fn primary_environment_id(&self) -> Option<&str> {
+        self.local_saved_environment()
+            .and_then(|env| env.environment_id.as_deref())
+            .or_else(|| {
+                let mut local = self.environments.environments.iter().filter(|env| env.local);
+                let first = local.next()?;
+                local.next().is_none().then_some(first.environment_id.as_deref()).flatten()
+            })
+            .or_else(|| {
+                self.environments
+                    .environments
+                    .is_empty()
+                    .then(|| self.active_open_in_config().map(|c| c.environment.environment_id.as_str()).filter(|id| !id.is_empty()))
+                    .flatten()
+            })
+    }
+
+    pub fn active_open_in_config(&self) -> Option<&t3_core::server_config::ServerConfig> {
+        self.server_config.config.as_ref().or_else(|| {
+            self.environments
+                .active
+                .as_deref()
+                .and_then(|id| self.scoped_environment(id))
+                .and_then(|entry| entry.config.config.as_ref())
+        })
+    }
+
+    fn active_open_in_environment_id(&self) -> Option<&str> {
+        self.active_environment()
+            .and_then(|env| env.environment_id.as_deref())
+            .or_else(|| self.active_open_in_config().map(|c| c.environment.environment_id.as_str()).filter(|id| !id.is_empty()))
+    }
+
+    /// Resolves whether the active environment opens editors via RPC (`LocalExec`), remote SSH
+    /// links (`RemoteLinks`), or has no remote route (`RemoteUnavailable`).
+    pub fn active_remote_open_state(&self) -> t3_core::thread_details::RemoteOpenState {
+        let active_env = self.active_environment();
+        let active_environment_id = self.active_open_in_environment_id();
+        let ssh_target = active_env.and_then(|env| env.ssh.as_ref()).map(|ssh| {
+            let alias = if ssh.alias.is_empty() { ssh.hostname.as_str() } else { ssh.alias.as_str() };
+            (alias, ssh.username.as_deref())
+        });
+        let remote_targets: Vec<t3_core::thread_details::RemoteOpenHost> = self
+            .active_open_in_config()
+            .map(|c| c.remote_open_targets.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|target| {
+                let host = target.host.trim();
+                (!host.is_empty()).then(|| t3_core::thread_details::RemoteOpenHost {
+                    host: host.to_owned(),
+                    username: target.username.as_deref().map(str::trim).filter(|u| !u.is_empty()).map(str::to_owned),
+                })
+            })
+            .collect();
+        t3_core::thread_details::resolve_remote_open_state(&t3_core::thread_details::RemoteOpenInput {
+            active_environment_id,
+            host_environment_id: self.host_environment_id(),
+            is_local_saved: active_env.is_some_and(|env| env.local),
+            http_base: active_env.map(|env| env.http_base.as_str()),
+            ssh_target,
+            remote_open_targets: &remote_targets,
+        })
+    }
+
+    pub fn should_show_open_in_picker(&self, has_active_project: bool) -> bool {
+        let remote_state = self.active_remote_open_state();
+        t3_core::thread_details::should_show_open_in_picker(
+            has_active_project,
+            self.active_open_in_environment_id(),
+            self.primary_environment_id(),
+            self.host_environment_id(),
+            &remote_state,
+        )
     }
 
     /// One unary RPC, run and decoded on the network runtime so large replies never parse on the

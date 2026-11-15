@@ -5,9 +5,12 @@
 use std::time::Duration;
 
 use gpui::{ClipboardItem, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled, Subscription, Task, Window, div, px};
-use gpui_component::h_flex;
+use gpui_component::{h_flex, v_flex};
 use t3_core::commands::method;
-use t3_core::timeline::{CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, LimitRecovery, limit_recovery, thread_error};
+use t3_core::timeline::{
+    CHATGPT_USAGE_URL, CHATGPT_WORKSPACE_ADMIN_REQUEST, ExtensionStatus, LimitRecovery, derive_provider_extension_statuses,
+    extension_status_banner_text, limit_recovery_with, thread_error,
+};
 
 use crate::app_state::{AppEvent, AppState, uuid_v4};
 use crate::composer::banner_surface;
@@ -20,6 +23,7 @@ pub struct LimitRecoveryBanner {
     state: Entity<AppState>,
     thread_id: Option<String>,
     recovery: Option<LimitRecovery>,
+    extension_statuses: Vec<ExtensionStatus>,
     pending: bool,
     _deadline: Option<Task<()>>,
     _subscription: Subscription,
@@ -38,7 +42,15 @@ impl LimitRecoveryBanner {
                 this.sync(cx);
             }
         });
-        let mut banner = LimitRecoveryBanner { state, thread_id: None, recovery: None, pending: false, _deadline: None, _subscription: subscription };
+        let mut banner = LimitRecoveryBanner {
+            state,
+            thread_id: None,
+            recovery: None,
+            extension_statuses: Vec::new(),
+            pending: false,
+            _deadline: None,
+            _subscription: subscription,
+        };
         banner.sync(cx);
         banner
     }
@@ -47,13 +59,17 @@ impl LimitRecoveryBanner {
         let state = self.state.read(cx);
         let now = chrono::Utc::now().timestamp_millis();
         let thread_id = state.selected_thread.clone();
-        let next = state
+        let projection = state
             .thread
             .projection
             .as_ref()
-            .filter(|projection| thread_id.as_deref() == Some(projection.thread.id.as_str()))
-            .and_then(|projection| limit_recovery(thread_error(projection).as_ref(), state.thread_shell(&projection.thread.id)?, now));
-        if thread_id == self.thread_id && next == self.recovery {
+            .filter(|projection| thread_id.as_deref() == Some(projection.thread.id.as_str()));
+        let request_pending = projection.is_some_and(|p| !t3_core::requests::pending_requests(p).is_empty());
+        let next = projection.and_then(|projection| {
+            limit_recovery_with(thread_error(projection).as_ref(), state.thread_shell(&projection.thread.id)?, request_pending, now)
+        });
+        let next_statuses = derive_provider_extension_statuses(projection);
+        if thread_id == self.thread_id && next == self.recovery && next_statuses == self.extension_statuses {
             return;
         }
         // The web keys the actions by run and reset, so a new limit starts with nothing in flight.
@@ -69,6 +85,7 @@ impl LimitRecoveryBanner {
         });
         self.thread_id = thread_id;
         self.recovery = next;
+        self.extension_statuses = next_statuses;
         cx.notify();
     }
 
@@ -116,74 +133,98 @@ impl LimitRecoveryBanner {
 
 impl Render for LimitRecoveryBanner {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(recovery) = self.recovery.clone() else { return div().into_any_element() };
-        let p = palette(cx);
-        let clock = Clock::now();
-        let pending = self.pending;
-        let has_actions = recovery.can_schedule || recovery.chatgpt_limit();
-        let actions = has_actions.then(|| {
-            let mut row = h_flex().flex_none().ml_auto().gap(px(4.));
-            if recovery.can_schedule {
-                let resume = match (pending, recovery.scheduled) {
-                    (true, _) => "Saving...",
-                    (false, true) => "Cancel auto-resume",
-                    (false, false) => "Resume at reset",
-                };
-                let snooze = match (pending, recovery.snoozed) {
-                    (true, _) => "Saving...",
-                    (false, true) => "Wake now",
-                    (false, false) => "Snooze until reset",
-                };
-                row = row
-                    .child(ghost_button("limit-resume", resume, pending, cx.listener(|this, _, _, cx| this.toggle(Action::Resume, cx)), cx))
-                    .child(ghost_button(
-                        "limit-snooze",
-                        snooze,
-                        pending || (!recovery.snoozed && recovery.reset_passed),
-                        cx.listener(|this, _, _, cx| this.toggle(Action::Snooze, cx)),
+        let ext_banner = extension_status_banner_text(&self.extension_statuses).map(|text| {
+            let p = palette(cx);
+            let content = h_flex()
+                .w_full()
+                .min_h(px(24.))
+                .gap(px(4.))
+                .child(div().flex_none().w(px(24.)).flex().justify_center().text_color(hsla(p.muted_foreground)).child("▸"))
+                .child(div().min_w_0().flex_1().truncate().text_color(hsla(p.foreground)).child(text));
+            banner_surface(false, content, cx)
+                .id("pi-extension-status")
+                .debug_selector(|| "pi-extension-status".to_owned())
+                .into_any_element()
+        });
+        let limit_banner = self.recovery.clone().map(|recovery| {
+            let p = palette(cx);
+            let clock = Clock::now();
+            let pending = self.pending;
+            let has_actions = recovery.can_schedule || recovery.chatgpt_limit();
+            let actions = has_actions.then(|| {
+                let mut row = h_flex().flex_none().ml_auto().gap(px(4.));
+                if recovery.can_schedule {
+                    let resume = match (pending, recovery.scheduled) {
+                        (true, _) => "Saving...",
+                        (false, true) => "Cancel auto-resume",
+                        (false, false) => "Resume at reset",
+                    };
+                    let snooze = match (pending, recovery.snoozed) {
+                        (true, _) => "Saving...",
+                        (false, true) => "Wake now",
+                        (false, false) => "Snooze until reset",
+                    };
+                    row = row
+                        .child(ghost_button("limit-resume", resume, pending, cx.listener(|this, _, _, cx| this.toggle(Action::Resume, cx)), cx))
+                        .child(ghost_button(
+                            "limit-snooze",
+                            snooze,
+                            pending || (!recovery.snoozed && recovery.reset_passed),
+                            cx.listener(|this, _, _, cx| this.toggle(Action::Snooze, cx)),
+                            cx,
+                        ));
+                }
+                if recovery.workspace_limit() {
+                    row = row.child(ghost_button(
+                        "limit-copy-admin",
+                        "Copy request for admin",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(CHATGPT_WORKSPACE_ADMIN_REQUEST.to_owned()));
+                            let toast = Toast::new(ToastKind::Success, "Request copied").description("Send it to your workspace admin.");
+                            this.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                        }),
                         cx,
                     ));
-            }
-            if recovery.workspace_limit() {
-                row = row.child(ghost_button(
-                    "limit-copy-admin",
-                    "Copy request for admin",
-                    false,
-                    cx.listener(|this, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(CHATGPT_WORKSPACE_ADMIN_REQUEST.to_owned()));
-                        let toast = Toast::new(ToastKind::Success, "Request copied").description("Send it to your workspace admin.");
-                        this.state.update(cx, |state, cx| state.show_toast(toast, cx));
-                    }),
-                    cx,
-                ));
-            } else if recovery.chatgpt_limit() {
-                row = row.child(ghost_text_button("limit-manage-usage", "Manage usage", Some(Icon::ExternalLink), |_, _, cx| cx.open_url(CHATGPT_USAGE_URL), cx));
-            }
-            row
+                } else if recovery.chatgpt_limit() {
+                    row = row.child(ghost_text_button("limit-manage-usage", "Manage usage", Some(Icon::ExternalLink), |_, _, cx| cx.open_url(CHATGPT_USAGE_URL), cx));
+                }
+                row
+            });
+            let lead_icon = match (recovery.chatgpt_limit(), provider_logo("codex")) {
+                (true, Some(ProviderLogo::Mono(path))) => gpui::svg().path(path).size(px(12.)).text_color(hsla(p.foreground)).into_any_element(),
+                _ => Icon::Gauge.render(px(12.), hsla(p.muted_foreground)).into_any_element(),
+            };
+            let content = h_flex()
+                .w_full()
+                .min_h(px(24.))
+                .gap(px(4.))
+                .child(div().flex_none().w(px(24.)).flex().justify_center().child(lead_icon))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(4.))
+                        .whitespace_nowrap()
+                        .child(div().flex_none().font_weight(gpui::FontWeight::MEDIUM).line_height(px(24.)).child(recovery.title()))
+                        .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(recovery.description(
+                            clock.now_ms,
+                            &clock.zone,
+                            crate::settings::store::client(cx).timestamp_format(),
+                            &crate::timestamp::SystemTimestampLocale,
+                        ))),
+                )
+                .children(actions);
+            banner_surface(true, content, cx)
+                .id("limit-recovery-banner")
+                .debug_selector(|| "limit-recovery-banner".to_owned())
+                .into_any_element()
         });
-        let lead_icon = match (recovery.chatgpt_limit(), provider_logo("codex")) {
-            (true, Some(ProviderLogo::Mono(path))) => gpui::svg().path(path).size(px(12.)).text_color(hsla(p.foreground)).into_any_element(),
-            _ => Icon::Gauge.render(px(12.), hsla(p.muted_foreground)).into_any_element(),
-        };
-        let content = h_flex()
-            .w_full()
-            .min_h(px(24.))
-            .gap(px(4.))
-            .child(div().flex_none().w(px(24.)).flex().justify_center().child(lead_icon))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(4.))
-                    .whitespace_nowrap()
-                    .child(div().flex_none().font_weight(gpui::FontWeight::MEDIUM).line_height(px(24.)).child(recovery.title()))
-                    .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child(recovery.description(clock.now_ms, &clock.zone, crate::settings::store::client(cx).timestamp_format(), &crate::timestamp::SystemTimestampLocale))),
-            )
-            .children(actions);
-        banner_surface(true, content, cx)
-            .id("limit-recovery-banner")
-            .debug_selector(|| "limit-recovery-banner".to_owned())
-            .into_any_element()
+        match (limit_banner, ext_banner) {
+            (None, None) => div().into_any_element(),
+            (Some(banner), None) | (None, Some(banner)) => banner,
+            (Some(limit), Some(ext)) => v_flex().w_full().gap(px(6.)).child(limit).child(ext).into_any_element(),
+        }
     }
 }
 
@@ -263,6 +304,36 @@ mod tests {
         host.read_with(vcx, |host, cx| {
             let rec = host.0.read(cx).recovery.as_ref().unwrap();
             assert!(rec.workspace_limit());
+        });
+
+        // Extension status banner renders Pi statuses from active running session and clears when stopped.
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                let projection = state.thread.projection.as_mut().unwrap();
+                projection.thread.model_selection.instance_id = "pi".into();
+                projection.thread.active_provider_thread_id = Some("pt-pi".into());
+                projection.provider_threads.push(t3_core::thread::Entity {
+                    id: "pt-pi".into(),
+                    value: json!({ "id": "pt-pi", "providerInstanceId": "pi", "providerSessionId": "ps-pi" }),
+                });
+                projection.provider_sessions.push(t3_core::thread::Entity {
+                    id: "ps-pi".into(),
+                    value: json!({
+                        "id": "ps-pi", "providerInstanceId": "pi", "status": "running",
+                        "extensionStatuses": [{ "key": "watch", "text": "Watching workspace" }]
+                    }),
+                });
+                cx.emit(AppEvent::Thread);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("pi-extension-status").is_some());
+        host.read_with(vcx, |host, cx| {
+            assert_eq!(
+                t3_core::timeline::extension_status_banner_text(&host.0.read(cx).extension_statuses).as_deref(),
+                Some("Pi · Watching workspace")
+            );
         });
     }
 }

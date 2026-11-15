@@ -780,6 +780,14 @@ impl<'de> Deserialize<'de> for ProviderInstances {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RemoteOpenTarget {
+    pub kind: String,
+    pub host: String,
+    pub username: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
@@ -810,6 +818,9 @@ pub struct ServerConfig {
     pub shell_older_settled: bool,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub available_editors: Vec<String>,
+    /// Advertised remote open targets (e.g. Tailscale, mDNS, SSH) from `ServerConfig.remoteOpenTargets`.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub remote_open_targets: Vec<RemoteOpenTarget>,
     /// Sent only to clients that opt in with `usageLimitSources`; empty means none.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub usage_limit_sources: Vec<UsageLimitSource>,

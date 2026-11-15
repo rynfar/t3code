@@ -291,3 +291,39 @@ fn pending_question_from_completed_run_stays_actionable_and_pages_back_while_rol
     assert_eq!(rolled_back.apply_history_page(&cursor, older), HistoryStep::Done);
     assert_eq!(visible(&rolled_back), ["recent"]);
 }
+
+#[test]
+fn decode_history_page_treats_notification_and_non_steer_messages_as_turn_starts() {
+    let page_for = |item: Value| {
+        decode_history_page(json!({
+            "snapshotSequence": 1,
+            "items": [{ "position": 0, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": "boundary", "item": item }],
+            "nextCursor": "0",
+            "hasMoreHistory": true
+        }))
+        .unwrap()
+        .has_user_turn
+    };
+    let message = |input_intent: Option<&str>, created_by: &str| {
+        let mut obj = json!({
+            "id": "boundary", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+            "ordinal": 2, "status": "completed", "title": null, "startedAt": T, "completedAt": T, "updatedAt": T,
+            "type": "user_message", "messageId": "boundary", "createdBy": created_by, "creationSource": "mcp",
+            "text": "Run every check", "attachments": []
+        });
+        if let Some(intent) = input_intent {
+            obj["inputIntent"] = json!(intent);
+        }
+        obj
+    };
+    assert!(page_for(message(Some("turn_start"), "agent")));
+    assert!(page_for(message(None, "user")));
+    assert!(!page_for(message(Some("steer"), "user")));
+    assert!(!page_for(message(Some("promoted_queued_to_steer"), "user")));
+    assert!(page_for(json!({
+        "id": "boundary", "threadId": "t1", "runId": "r1", "nodeId": null, "parentItemId": null,
+        "ordinal": 2, "status": "completed", "title": null, "startedAt": T, "completedAt": T, "updatedAt": T,
+        "type": "notification", "source": { "kind": "delegated_task", "taskIds": [] },
+        "outcome": "completed", "summary": "Checks finished"
+    })));
+}

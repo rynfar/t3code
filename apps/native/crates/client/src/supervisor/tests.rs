@@ -536,20 +536,32 @@ async fn thread_stream_keeps_syncing_after_stream_defect_and_protocol_defect() {
         .await;
     assert_eq!(next_thread_sequence(&mut events).await, Some(7));
 
-    // 2. Connection-wide Defect drops the socket, reconnects, and resumes at afterSequence: 7.
+    // 2. Malformed/undecodable frame must back off and resubscribe at afterSequence: 7 without advancing sequence.
+    first.chunk(&sub2, json!([{"kind": "event", "sequence": 99, "event": "not-an-object"}])).await;
+    let sub_after_decode = first.request(method::SUBSCRIBE_THREAD).await;
+    assert_eq!(sub_after_decode["payload"]["afterSequence"], 7);
+    first
+        .chunk(
+            &sub_after_decode,
+            json!([{"kind": "event", "sequence": 8, "event": {"id": "e8", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}]),
+        )
+        .await;
+    assert_eq!(next_thread_sequence(&mut events).await, Some(8));
+
+    // 3. Connection-wide Defect drops the socket, reconnects, and resumes at afterSequence: 8.
     first.send(json!({"_tag": "Defect", "defect": "socket defect"})).await;
     let mut second = server.connection().await;
     answer_config(&mut second, None).await;
     let _shell2 = second.request(method::SUBSCRIBE_SHELL).await;
     let sub3 = second.request(method::SUBSCRIBE_THREAD).await;
-    assert_eq!(sub3["payload"]["afterSequence"], 7);
+    assert_eq!(sub3["payload"]["afterSequence"], 8);
     second
         .chunk(
             &sub3,
-            json!([{"kind": "event", "sequence": 8, "event": {"id": "e8", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}]),
+            json!([{"kind": "event", "sequence": 9, "event": {"id": "e9", "threadId": "t1", "occurredAt": T, "type": "brand.new", "payload": {}}}]),
         )
         .await;
-    assert_eq!(next_thread_sequence(&mut events).await, Some(8));
+    assert_eq!(next_thread_sequence(&mut events).await, Some(9));
 }
 
 #[tokio::test]

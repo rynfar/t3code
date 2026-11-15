@@ -81,6 +81,7 @@ fn running(run: &str) -> ThreadActivity {
         runless_work_active: false,
         active_turn_started_at: Some("2026-01-01T00:00:00Z".into()),
         pending_approval_ids: HashSet::new(),
+        usage_limit_notice: None,
     }
 }
 
@@ -1036,8 +1037,29 @@ fn a_usage_limited_run_stays_latest_behind_unstarted_runs() {
         "limitRecovery": { "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true, "snooze": true },
     }));
     let recovery = limit_recovery(Some(&error), &scheduled, now).expect("recovery");
-    assert!(recovery.scheduled && recovery.snoozed);
+    assert!(recovery.scheduled && recovery.resumes && recovery.snoozed);
+    assert_eq!(
+        recovery.description(now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }),
+        "Resumes 5:00 AM"
+    );
     assert_eq!(recovery.toggle_snooze("c", "t", now).expect("wake")["limitRecovery"]["snooze"], false);
+    let later_snooze = status_shell(serde_json::json!({
+        "snoozedUntil": "2026-01-01T06:00:00.000Z",
+        "limitRecovery": { "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true, "snooze": false },
+    }));
+    let later_recovery = limit_recovery(Some(&error), &later_snooze, now).expect("recovery");
+    assert!(!later_recovery.snoozed && later_recovery.resumes);
+    assert_eq!(
+        later_recovery.description(now, &crate::sidebar::time::FixedZone(0), crate::client_settings::TimestampFormat::TwelveHour, &TimestampEnglish { british: false }),
+        "Resumes 6:00 AM"
+    );
+    assert!(!limit_recovery_with(Some(&error), &scheduled, true, now).expect("pending").can_schedule);
+    let settled = status_shell(serde_json::json!({
+        "settledOverride": "settled",
+        "limitRecovery": { "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": true, "snooze": true },
+    }));
+    let settled_recovery = limit_recovery(Some(&error), &settled, now).expect("settled");
+    assert!(!settled_recovery.can_schedule && !settled_recovery.resumes);
     let after = limit_recovery(Some(&error), &scheduled, parse_iso_ms("2026-01-01T05:00:00Z").expect("reset")).expect("recovery");
     assert!(!after.snoozed && after.reset_passed && after.deadline().is_none());
 
@@ -1350,6 +1372,7 @@ fn background_task(task_id: &str, kind: &str, description: Option<&str>, awaited
         description: description.map(str::to_owned),
         child_thread_id: (kind == "subagent").then(|| format!("child-{task_id}")),
         awaited,
+        ..Default::default()
     }
 }
 
@@ -1392,14 +1415,36 @@ fn background_work_titles_follow_present_pending_background_work() {
     let single = BackgroundWork::with_items(&[background_task("s1", "subagent", Some("Explore"), None)], &items).unwrap();
     assert_eq!(single.only_started_at(), Some("2026-01-01T00:00:10Z"));
     assert_eq!(single.description().as_deref(), Some("Scanning auth files"));
-    let fallback = BackgroundWork::with_items(&[crate::shell::PendingBackgroundTask { task_id: "turn-s2".into(), kind: "subagent".into(), description: Some("Tester".into()), child_thread_id: None, awaited: Some(true) }], &items).unwrap();
+    let fallback = BackgroundWork::with_items(&[crate::shell::PendingBackgroundTask { task_id: "turn-s2".into(), kind: "subagent".into(), description: Some("Tester".into()), child_thread_id: None, awaited: Some(true), ..Default::default() }], &items).unwrap();
     assert_eq!(fallback.only_child_thread(), Some("fallback-child"));
     let multi = BackgroundWork::with_items(&[
         background_task("s1", "subagent", Some("Explore"), None),
-        crate::shell::PendingBackgroundTask { task_id: "turn-s2".into(), kind: "subagent".into(), description: Some("Tester".into()), child_thread_id: None, awaited: Some(true) },
+        crate::shell::PendingBackgroundTask { task_id: "turn-s2".into(), kind: "subagent".into(), description: Some("Tester".into()), child_thread_id: None, awaited: Some(true), ..Default::default() },
     ], &items).unwrap();
     assert_eq!(multi.only_started_at(), None);
     assert_eq!(multi.description().as_deref(), Some("Tester: Running tests"));
+
+    let cmd_items: Vec<crate::turn_item::TurnItem> = serde_json::from_value(serde_json::json!([
+        {
+            "id": "cmd-item-1", "threadId": "t-child", "runId": "run-1", "nodeId": "root", "ordinal": 1, "status": "running",
+            "title": null, "startedAt": "2026-01-01T00:00:05Z", "completedAt": null, "updatedAt": "2026-01-01T00:00:05Z",
+            "nativeItemRef": { "nativeId": "native-cmd-1" },
+            "type": "command_execution", "input": "sleep 5 && echo hi"
+        }
+    ])).unwrap();
+    let native_lookup = BackgroundWork::with_items(&[crate::shell::PendingBackgroundTask {
+        task_id: "claude-tool-id".into(),
+        native_item_id: Some("native-cmd-1".into()),
+        kind: "command".into(),
+        description: Some("sleep 5 && echo hi".into()),
+        source_thread_id: Some("t-child".into()),
+        ..Default::default()
+    }], &cmd_items).unwrap();
+    assert_eq!(native_lookup.items[0].item_id.as_deref(), Some("cmd-item-1"));
+    assert_eq!(native_lookup.items[0].details_title, "Command");
+    assert_eq!(native_lookup.items[0].command_text.as_deref(), Some("sleep 5 && echo hi"));
+    assert_eq!(native_lookup.items[0].source_thread_id.as_deref(), Some("t-child"));
+    assert!(native_lookup.items[0].item_running);
 }
 
 #[test]
@@ -2147,4 +2192,113 @@ fn activity_and_thinking_label_provider_starting_and_foreground_subagents() {
         input.rows(&entries_with_later_work).last().map(|r| &r.kind),
         Some(RowKind::Thinking { label: None, .. })
     ));
+}
+
+#[test]
+fn suppresses_redundant_usage_limit_error_pause_notice_and_provider_message() {
+    let mut projection = projection_with(
+        serde_json::json!([status_run("run-1", 1, "failed", true)]),
+        serde_json::json!([
+            {
+                "id": "msg-user", "threadId": "t", "runId": "run-1", "nodeId": "root", "parentItemId": null,
+                "ordinal": 1, "status": "completed", "title": null, "startedAt": "2026-01-01T00:00:00Z", "completedAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                "type": "user_message", "messageId": "m-user", "text": "Hello", "inputIntent": "turn_start", "attachments": []
+            },
+            {
+                "id": "msg-limit", "threadId": "t", "runId": "run-1", "nodeId": "root", "parentItemId": null,
+                "ordinal": 2, "status": "completed", "title": null, "startedAt": "2026-01-01T00:00:01Z", "completedAt": "2026-01-01T00:00:01Z", "updatedAt": "2026-01-01T00:00:01Z",
+                "providerTurnId": "pt-1",
+                "type": "assistant_message", "messageId": "m-limit", "text": "You've hit your 5-hour limit · resets 7:10am (America/New_York).", "streaming": false
+            },
+            {
+                "id": "pause-notice", "threadId": "t", "runId": "run-1", "nodeId": "root", "parentItemId": null,
+                "ordinal": 3, "status": "completed", "title": null, "startedAt": "2026-01-01T00:00:02Z", "completedAt": "2026-01-01T00:00:02Z", "updatedAt": "2026-01-01T00:00:02Z",
+                "providerTurnId": "pt-1",
+                "nativeItemRef": { "nativeId": "usage-limit:pt-1:1", "driver": "claudeAgent" },
+                "type": "system_notice", "kind": "warning", "message": "Paused on usage limit"
+            },
+            {
+                "id": "err-limit", "threadId": "t", "runId": "run-1", "nodeId": "root", "parentItemId": null,
+                "ordinal": 4, "status": "failed", "title": null, "startedAt": "2026-01-01T00:00:03Z", "completedAt": "2026-01-01T00:00:03Z", "updatedAt": "2026-01-01T00:00:03Z",
+                "providerTurnId": "pt-1",
+                "type": "error", "failure": { "class": "usage_limit", "message": "Usage limit", "code": "subscription_sharing_usage_limit_exceeded", "resetAt": "2026-01-01T05:00:00Z", "retryable": null }
+            }
+        ]),
+        serde_json::json!([]),
+    );
+    projection.visible_turn_items = projection
+        .turn_items
+        .iter()
+        .enumerate()
+        .map(|(position, item)| crate::thread::ProjectedTurnItem {
+            position,
+            visibility: crate::thread::Visibility::Local,
+            source_thread_id: "t".into(),
+            source_item_id: item.id.clone(),
+            item: item.clone(),
+        })
+        .collect();
+    let activity = derive_activity(&projection);
+    assert!(activity.usage_limit_notice.is_some());
+    let entries = derive_entries(&mut EntriesCache::default(), &projection.visible_turn_items, &[], &[], &[]);
+    let rows = derive_rows(
+        &RowsInput { entries: &entries, activity: &activity, expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None },
+        &mut RowsCache::default(),
+    );
+    let rendered_ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(rendered_ids, vec!["m-user"]);
+
+    // Non-limit assistant text stays visible even when selected as latest assistant message in the turn.
+    let mut non_limit = projection.clone();
+    std::sync::Arc::make_mut(&mut non_limit.turn_items[1]).kind = crate::turn_item::TurnItemKind::AssistantMessage {
+        message_id: "m-limit".into(),
+        text: "Partial answer before rate limit".into(),
+        streaming: false,
+        attachments: None,
+    };
+    non_limit.visible_turn_items[1].item = non_limit.turn_items[1].clone();
+    let entries2 = derive_entries(&mut EntriesCache::default(), &non_limit.visible_turn_items, &[], &[], &[]);
+    let rows2 = derive_rows(
+        &RowsInput { entries: &entries2, activity: &derive_activity(&non_limit), expanded_run_ids: &HashSet::new(), expanded_attempt_ids: &HashSet::new(), expanded_work_group_ids: &HashSet::new(), worktree_setup: None },
+        &mut RowsCache::default(),
+    );
+    assert_eq!(rows2.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["m-user", "m-limit"]);
+}
+
+#[test]
+fn derives_pi_extension_statuses_and_limit_recovery_snooze_ownership() {
+    let mut projection = projection_with(serde_json::json!([]), serde_json::json!([]), serde_json::json!([]));
+    projection.thread.model_selection.instance_id = "pi".into();
+    projection.thread.active_provider_thread_id = Some("pt-1".into());
+    projection.provider_threads.push(crate::thread::Entity {
+        id: "pt-1".into(),
+        value: serde_json::json!({ "id": "pt-1", "providerInstanceId": "pi", "providerSessionId": "ps-1" }),
+    });
+    projection.provider_sessions.push(crate::thread::Entity {
+        id: "ps-1".into(),
+        value: serde_json::json!({
+            "id": "ps-1", "providerInstanceId": "pi", "status": "running",
+            "extensionStatuses": [
+                { "key": "ext-a", "text": "Connected" },
+                { "key": "ext-b", "text": "Watching 3 files" }
+            ]
+        }),
+    });
+    let statuses = derive_provider_extension_statuses(Some(&projection));
+    assert_eq!(extension_status_banner_text(&statuses).as_deref(), Some("Pi · Connected · Watching 3 files"));
+    // Stopped session clears transient statuses.
+    projection.provider_sessions[0].value["status"] = serde_json::json!("stopped");
+    assert!(derive_provider_extension_statuses(Some(&projection)).is_empty());
+
+    // Limit recovery owning snooze hides the separate Snoozed status line.
+    let shell = status_shell(serde_json::json!({
+        "snoozedAt": "2026-01-01T00:00:10Z",
+        "snoozedUntil": "2026-01-01T05:00:00Z",
+        "limitRecovery": { "runId": "run-1", "resetAt": "2026-01-01T05:00:00Z", "autoResume": false, "snooze": true },
+    }));
+    let now = parse_iso_ms("2026-01-01T01:00:00Z").unwrap();
+    assert!(limit_recovery_owns_snooze(Some("run-1"), Some("2026-01-01T05:00:00Z"), shell.limit_recovery.as_ref(), shell.snoozed_until.as_deref()));
+    let sidebar = crate::sidebar::thread::present_thread(&shell, None);
+    assert!(matches!(status_line_for(&sidebar, false, now), Some(StatusLine::Snoozed { .. })));
+    assert!(status_line_for(&sidebar, true, now).is_none());
 }

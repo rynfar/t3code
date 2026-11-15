@@ -172,6 +172,30 @@ fn without_subagent_delegation_rows(entries: Vec<Arc<TimelineEntry>>) -> Vec<Arc
         .collect()
 }
 
+/// Suppresses redundant usage-limit failure, pause notices, and provider limit messages while
+/// the recovery banner presents the state (`withoutUsageLimitNoticeRows`).
+fn without_usage_limit_notice_rows(
+    entries: Vec<Arc<TimelineEntry>>,
+    notice: Option<&super::status::UsageLimitNoticeRows>,
+) -> Vec<Arc<TimelineEntry>> {
+    let Some(notice) = notice else {
+        return entries;
+    };
+    let hidden = |entry: &Arc<TimelineEntry>| {
+        notice.item_ids.contains(&entry.id)
+            || ((notice.provider_notice_item_id.as_deref() == Some(entry.id.as_str())
+                || notice.provider_notice_message_id.as_deref() == Some(entry.id.as_str()))
+                && entry.message().is_some_and(|message| {
+                    message.role == Role::Assistant && super::status::is_provider_limit_notice(message.text.trim())
+                }))
+    };
+    if entries.iter().any(hidden) {
+        entries.into_iter().filter(|entry| !hidden(entry)).collect()
+    } else {
+        entries
+    }
+}
+
 fn row(id: impl Into<String>, created_at: Option<String>, kind: RowKind) -> TimelineRow {
     TimelineRow { id: id.into(), created_at, continues_work_log: false, kind }
 }
@@ -257,7 +281,7 @@ fn fold_setup(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity) -> Fold
 /// The fold hiding each entry, so find can open it: `timelineTurnFoldRunIdsByEntryId`, plus the
 /// superseded-attempt folds (entry id to attempt id).
 pub fn fold_membership(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity) -> (HashMap<String, String>, HashMap<String, String>) {
-    let entries = without_subagent_delegation_rows(entries.to_vec());
+    let entries = without_usage_limit_notice_rows(without_subagent_delegation_rows(entries.to_vec()), activity.usage_limit_notice.as_ref());
     let setup = fold_setup(&entries, activity);
     let mut runs = HashMap::new();
     for fold in setup.folds.values() {
@@ -275,7 +299,10 @@ pub fn fold_membership(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity
 }
 
 fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow> {
-    let entries = without_subagent_delegation_rows(settle_superseded_reasoning(input.entries, cache));
+    let entries = without_usage_limit_notice_rows(
+        without_subagent_delegation_rows(settle_superseded_reasoning(input.entries, cache)),
+        input.activity.usage_limit_notice.as_ref(),
+    );
     let entries = entries.as_slice();
     let activity = input.activity;
     let pending = &activity.pending_approval_ids;
@@ -909,6 +936,7 @@ mod tests {
             pending_approval_ids: HashSet::new(),
             runless_work_active: false,
             running_run_id: None,
+            usage_limit_notice: None,
         }
     }
 

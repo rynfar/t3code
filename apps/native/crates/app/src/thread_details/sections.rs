@@ -10,7 +10,9 @@ use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 use t3_core::lineage::{AgentTiming, PhaseState, WorkflowMember, relationship_status_label, subagent_display_title};
 use t3_core::project_scripts::{ProjectScript, ScriptIcon, command_for_project_script, menu_label};
-use t3_core::thread_details::{CardDensity, item_visible_at_density};
+use t3_core::thread_details::{
+    CardDensity, RemoteOpenState, effective_open_in_editors, item_visible_at_density, open_in_unavailable_reason,
+};
 use t3_core::vcs::{self, editor_label, editor_options};
 
 use super::controls::{MenuTrigger, ROW_WIDTH, Row, menu_icon, menu_shortcut, section, section_with_action, section_with_options, split_row};
@@ -88,22 +90,44 @@ fn environment_row(ctx: &Ctx, worktree: Option<&str>, project_root: &str, cx: &A
 /// `OpenInPicker` in panel mode: opens the checkout in the preferred editor; the chevron picks
 /// another (the shortcut is `editor.openFavorite`).
 fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
-    let available = ctx.state.read(cx).server_config.config.as_ref().map(|config| config.available_editors.clone()).unwrap_or_default();
+    let app = ctx.state.read(cx);
+    let active_config = app.active_open_in_config();
+    let available = active_config.map(|config| config.available_editors.clone()).unwrap_or_default();
+    let env_label = active_config
+        .map(|config| config.environment.label.trim().to_owned())
+        .filter(|label| !label.is_empty())
+        .or_else(|| app.active_environment().map(|env| env.label.clone()))
+        .unwrap_or_else(|| "this machine".to_owned());
+    let remote_state = app.active_remote_open_state();
     let can_operate = ctx.git.read(cx).can_operate_thread();
-    let preferred = ctx.details.read(cx).preferred_editor(&available);
+    let is_host_editor_denied = matches!(remote_state, RemoteOpenState::LocalExec) && !can_operate;
+    let can_open_editor = !matches!(remote_state, RemoteOpenState::RemoteUnavailable) && !is_host_editor_denied;
+    let remote_capable = ctx.details.read(cx).remote_capable_editors();
+    let effective = effective_open_in_editors(&remote_state, &available, &remote_capable);
+    let unavailable_reason = open_in_unavailable_reason(&remote_state, effective.len(), &env_label);
+    let preferred = ctx.details.read(cx).preferred_editor(&effective);
     let mac = cfg!(target_os = "macos");
     let label = format!("Open in {}", preferred.map_or("editor", |id| editor_label(id, mac)));
+    let tooltip = unavailable_reason.clone().unwrap_or_else(|| label.clone());
     let details = ctx.details.clone();
-    let primary = Row::new("details-open-in", label).icon(Icon::SquareArrowOutUpRight).disabled(preferred.is_none() || !can_operate).on_click(move |_, _, cx| {
-        if let Some(editor) = preferred {
-            details.update(cx, |details, cx| details.open_in_editor(editor, cx));
-        }
-    });
+    let state = ctx.state.clone();
+    let primary = Row::new("details-open-in", label)
+        .icon(Icon::SquareArrowOutUpRight)
+        .tooltip(tooltip)
+        .disabled(preferred.is_none() || !can_open_editor)
+        .on_click(move |_, _, cx| {
+            if let Some(editor) = preferred {
+                details.update(cx, |details, cx| details.open_in_editor(&state, editor, cx));
+            }
+        });
     let details = ctx.details.clone();
     let shortcut = crate::keymap::label("editor.openFavorite", cx);
-    let trigger = MenuTrigger::new("details-open-in-menu", "Choose editor").disabled(!can_operate).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
-        let options = editor_options(&available);
+    let trigger = MenuTrigger::new("details-open-in-menu", "Choose editor").disabled(is_host_editor_denied).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
         let mut menu = menu.min_w(px(ROW_WIDTH));
+        if let Some(reason) = unavailable_reason.clone() {
+            return menu.item(PopupMenuItem::new(reason).disabled(true));
+        }
+        let options = editor_options(&effective);
         if options.is_empty() {
             return menu.item(PopupMenuItem::new("No installed editors found").disabled(true));
         }
@@ -114,7 +138,7 @@ fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
                 (true, Some(shortcut)) => PopupMenuItem::element(move |_, cx| h_flex().w_full().gap(px(8.)).child(div().flex_1().child(label)).child(menu_shortcut(shortcut.clone(), cx))),
                 _ => PopupMenuItem::new(label),
             };
-            menu = menu.item(item.on_click(move |_, _, cx| details.update(cx, |details, cx| details.set_last_editor(id, cx))));
+            menu = menu.item(item.disabled(!can_open_editor).on_click(move |_, _, cx| details.update(cx, |details, cx| details.set_last_editor(id, cx))));
         }
         menu
     });
@@ -158,7 +182,7 @@ fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
                 .tooltip(format!("Run {}", script.name))
                 .on_click(move |_, _, cx| run_script(&details, &project_id, &script, cx))
         }
-        None => Row::new("details-scripts", "Actions").icon(Icon::Wrench).disabled(!can_operate),
+        None => Row::new("details-scripts", "Actions").icon(Icon::Wrench).tooltip("Script actions").disabled(!can_operate),
     };
     Some(split_row("details-scripts", primary_row, menu, cx).into_any_element())
 }
@@ -177,7 +201,7 @@ pub fn workspace(ctx: &Ctx, density: CardDensity, cx: &App) -> Option<AnyElement
     let details = ctx.details.read(cx);
     let rows: Vec<AnyElement> = [
         (details.shows("environment") && item_visible_at_density("environment", density)).then(|| environment_row(ctx, worktree, &project_root, cx)),
-        (details.shows("openIn") && item_visible_at_density("openIn", density)).then(|| open_in_row(ctx, cx)),
+        (details.shows("openIn") && item_visible_at_density("openIn", density) && app.should_show_open_in_picker(true)).then(|| open_in_row(ctx, cx)),
         (details.shows("scripts") && item_visible_at_density("scripts", density)).then(|| scripts_row(ctx, cx)).flatten(),
     ]
     .into_iter()
@@ -828,5 +852,122 @@ mod tests {
         });
         vcx.update(|window, cx| window.draw(cx).clear());
         assert!(vcx.debug_bounds("git-init").is_none(), "pending server config must not offer Initialize Git");
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn open_in_row_checks_host_environment_and_remote_unavailable_menu(cx: &mut TestAppContext) {
+        const SCRATCH_ROOT: &str = "/home/user/.t3/scratch";
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.set_global(
+                serde_json::from_value::<crate::chatgpt_setup::Fixture>(json!({
+                    "provider": {"instanceId":"codex","driver":"codex","enabled":true,"installed":true,"status":"ready"},
+                    "auth":{"phase":"idle"},"install":{"phase":"idle"}
+                }))
+                .unwrap(),
+            );
+        });
+        let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        let git = cx.new(|cx| GitStore::new(state.clone(), cx));
+        let details = cx.new(|_| super::super::Details::new(git.clone()));
+        state.update(cx, |state, cx| {
+            state.phase = Phase::Online(ConnectionStatus::Connected);
+            apply_config(state, SCRATCH_ROOT);
+            let config = state.server_config.config.as_mut().unwrap();
+            config.environment.environment_id = "env-remote".into();
+            config.environment.label = "Test host".into();
+            config.available_editors = vec!["cursor".into()];
+            state.environments = t3_client::store::SavedEnvironments {
+                active: Some("saved-remote".into()),
+                environments: vec![t3_client::store::SavedEnvironment {
+                    id: "saved-remote".into(),
+                    environment_id: Some("env-remote".into()),
+                    label: "Test host".into(),
+                    disabled: false,
+                    http_base: "https://remote.tailnet.ts.net".into(),
+                    access_token: Some("tok".into()),
+                    server_version: None,
+                    local: false,
+                    ssh: Some(t3_core::ssh::SshTarget { alias: "sol".into(), hostname: "sol".into(), username: None, port: None }),
+                }],
+            };
+            seed_shell(state, SCRATCH_ROOT, cx);
+            state.selected_thread = Some("t-plain".into());
+        });
+        details.update(cx, |details, _| details.set_remote_capable_editors(Some(Vec::new())));
+        struct WorkspaceHost {
+            ctx: Ctx,
+        }
+        impl Render for WorkspaceHost {
+            fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                v_flex().w(px(300.)).children(workspace(&self.ctx, CardDensity::Full, cx))
+            }
+        }
+        let window = cx.add_window(|window, cx| {
+            let dialogs = cx.new(|cx| GitDialogs::new(git.clone(), window, cx));
+            let picker = cx.new(|cx| BranchPicker::new(git.clone(), window, cx));
+            WorkspaceHost {
+                ctx: Ctx { row_menu_claim: Rc::new(Cell::new(false)), state: state.clone(), details: details.clone(), git: git.clone(), dialogs, picker },
+            }
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear());
+        let trigger = vcx.debug_bounds("details-open-in-menu").expect("open-in menu trigger should render");
+        vcx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        // Now verify host_environment_id match switches back to LocalExec with server's `cursor`.
+        state.update(&mut vcx, |state, _| {
+            state.connect.local_server = None;
+            state.environments.environments.push(t3_client::store::SavedEnvironment {
+                id: "saved-host".into(),
+                environment_id: Some("env-remote".into()),
+                label: "Local".into(),
+                disabled: false,
+                http_base: "http://127.0.0.1:3773".into(),
+                access_token: Some("tok".into()),
+                server_version: None,
+                local: true,
+                ssh: None,
+            });
+        });
+        assert_eq!(state.read_with(&vcx, |state, _| state.active_remote_open_state()), RemoteOpenState::LocalExec);
+        assert!(state.read_with(&vcx, |state, _| state.should_show_open_in_picker(true)));
+
+        // Non-SSH connection with advertised `ServerConfig.remoteOpenTargets` resolves to RemoteLinks.
+        state.update(&mut vcx, |state, _| {
+            state.environments.environments[0].ssh = None;
+            state.environments.environments[1].environment_id = Some("env-other-host".into());
+            state.server_config.config.as_mut().unwrap().remote_open_targets = vec![t3_core::server_config::RemoteOpenTarget {
+                kind: "tailscale".into(),
+                host: "box.tailnet.ts.net".into(),
+                username: Some("alice".into()),
+            }];
+        });
+        assert_eq!(
+            state.read_with(&vcx, |state, _| state.active_remote_open_state()),
+            RemoteOpenState::RemoteLinks(t3_core::thread_details::RemoteOpenHost {
+                host: "box.tailnet.ts.net".into(),
+                username: Some("alice".into()),
+            })
+        );
+
+        // Port-forwarded non-local loopback environment != primary/host hides the OpenInPicker row.
+        state.update(&mut vcx, |state, _| {
+            state.environments.environments[0].http_base = "http://127.0.0.1:4777".into();
+            state.server_config.config.as_mut().unwrap().remote_open_targets.clear();
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert_eq!(state.read_with(&vcx, |state, _| state.active_remote_open_state()), RemoteOpenState::LocalExec);
+        assert!(!state.read_with(&vcx, |state, _| state.should_show_open_in_picker(true)));
+        assert!(vcx.debug_bounds("details-open-in").is_none());
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
     }
 }

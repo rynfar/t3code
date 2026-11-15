@@ -497,7 +497,13 @@ enum SessionEnd {
     Dropped,
 }
 
-type ThreadFrame = (String, Option<Result<Value, RpcError>>);
+enum ThreadDelivery {
+    Item(Box<ThreadStreamItem>),
+    DecodeError(String),
+    RpcError(RpcError),
+}
+
+type ThreadFrame = (String, ThreadDelivery);
 
 async fn run_session(
     session: &Session,
@@ -547,20 +553,20 @@ async fn run_session(
                 None => server_config = None,
             },
             frame = thread_rx.recv() => {
-                let Some((thread_id, value)) = frame else { continue };
+                let Some((thread_id, delivery)) = frame else { continue };
                 if !resume.threads.contains_key(&thread_id) { continue }
-                match value {
-                    Some(Ok(value)) => match decode_thread_stream_item(value) {
-                        Ok(item) => {
-                            if let Some(sequence) = thread_sequence(&item) {
-                                resume.threads.insert(thread_id.clone(), Some(sequence));
-                            }
-                            let _ = events.send(ClientEvent::Thread { thread_id, item: Box::new(item) }).await;
+                match delivery {
+                    ThreadDelivery::Item(item) => {
+                        if let Some(sequence) = thread_sequence(&item) {
+                            resume.threads.insert(thread_id.clone(), Some(sequence));
                         }
-                        Err(error) => report(events, &format!("thread {thread_id}"), error.to_string()).await,
-                    },
-                    Some(Err(RpcError::Closed)) | None => {}
-                    Some(Err(error)) => report(events, &format!("thread {thread_id}"), error.to_string()).await,
+                        let _ = events.send(ClientEvent::Thread { thread_id, item }).await;
+                    }
+                    ThreadDelivery::DecodeError(message) => {
+                        report(events, &format!("thread {thread_id}"), message).await;
+                    }
+                    ThreadDelivery::RpcError(RpcError::Closed) => {}
+                    ThreadDelivery::RpcError(error) => report(events, &format!("thread {thread_id}"), error.to_string()).await,
                 }
             }
             command = commands.recv() => match command {
@@ -764,7 +770,7 @@ fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx:
                 Err(RpcError::Closed) => return,
                 Err(error) => {
                     let stop = is_thread_auth_failure(&error);
-                    if tx.send((thread_id.clone(), Some(Err(error)))).await.is_err() || stop {
+                    if tx.send((thread_id.clone(), ThreadDelivery::RpcError(error))).await.is_err() || stop {
                         return;
                     }
                     tokio::time::sleep(next_thread_retry(THREAD_RETRY_BASE, retry_attempt)).await;
@@ -773,20 +779,30 @@ fn forward_thread(session: &Session, thread_id: &str, sequence: Option<u64>, tx:
                 }
             };
             while let Some(value) = stream.receiver.recv().await {
-                if let Ok(item) = &value {
-                    retry_attempt = 0;
-                    sequence = item.get("snapshotSequence").or_else(|| item.get("sequence")).and_then(Value::as_u64).or(sequence);
-                }
-                let stop = match &value {
-                    Err(error) => matches!(error, RpcError::Closed) || is_thread_auth_failure(error),
-                    Ok(_) => false,
-                };
-                let failed = value.is_err();
-                if tx.send((thread_id.clone(), Some(value))).await.is_err() || stop {
-                    return;
-                }
-                if failed {
-                    break;
+                match value {
+                    Ok(raw) => match decode_thread_stream_item(raw) {
+                        Ok(item) => {
+                            retry_attempt = 0;
+                            sequence = thread_sequence(&item).or(sequence);
+                            if tx.send((thread_id.clone(), ThreadDelivery::Item(Box::new(item)))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            if tx.send((thread_id.clone(), ThreadDelivery::DecodeError(error.to_string()))).await.is_err() {
+                                return;
+                            }
+                            break;
+                        }
+                    },
+                    Err(RpcError::Closed) => return,
+                    Err(error) => {
+                        let stop = is_thread_auth_failure(&error);
+                        if tx.send((thread_id.clone(), ThreadDelivery::RpcError(error))).await.is_err() || stop {
+                            return;
+                        }
+                        break;
+                    }
                 }
             }
             tokio::time::sleep(next_thread_retry(THREAD_RETRY_BASE, retry_attempt)).await;

@@ -299,6 +299,7 @@ impl Render for ChatHeader {
                             .flex_none()
                             .invisible()
                             .group_hover("chat-header-title", |style| style.visible())
+                            .tooltip(|window, cx| Tooltip::new("Thread actions").build(window, cx))
                             .child(Icon::ChevronDown.sized(px(14.)).text_color(hsla(p.muted_foreground)))
                             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
