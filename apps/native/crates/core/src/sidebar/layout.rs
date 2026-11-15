@@ -4,6 +4,12 @@
 
 /// `THREAD_SIDEBAR_WIDTH_STORAGE_KEY`: the persisted width's file in the native home.
 pub const STORAGE_KEY: &str = "chat_thread_sidebar_width";
+/// `chat_thread_sidebar_open` (`AppSidebarLayout.tsx`): persisted collapsed state (`false` = collapsed).
+pub const OPEN_STORAGE_KEY: &str = "chat_thread_sidebar_open";
+
+pub fn initial_collapsed(stored_open: Option<bool>) -> bool {
+    stored_open == Some(false)
+}
 pub const DEFAULT_WIDTH: f32 = 16. * 16.;
 pub const MIN_WIDTH: f32 = 13. * 16.;
 /// `THREAD_MAIN_CONTENT_MIN_WIDTH`: a resize never squeezes the thread below this.

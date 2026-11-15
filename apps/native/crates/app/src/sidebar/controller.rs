@@ -460,8 +460,21 @@ impl AppState {
             .as_ref()
             .and_then(|(snapshot, _)| snapshot.as_ref())
             .or(self.shell.snapshot.as_ref());
+        if self.fleet.environments.is_empty() && !self.sidebar.history.launching_threads().is_empty() {
+            self.sidebar.history.retain_launching(|id| {
+                snapshot_ref
+                    .and_then(|snapshot| snapshot.threads.iter().find(|t| t.id == id))
+                    .or_else(|| overlay_extras.iter().copied().find(|t| t.id == id))
+                    .is_none_or(|t| {
+                        t.latest_run_id.is_none()
+                            && t.active_run_id.is_none()
+                            && t.archived_at.is_none()
+                            && t.deleted_at.is_none()
+                    })
+            });
+        }
         let build_model = |snapshot, tracker: &mut _, dragging| {
-            SidebarModel::build(
+            SidebarModel::build_with_launching(
                 &ModelInput {
                     snapshot,
                     config_loaded: self.server_config.config.is_some(),
@@ -476,6 +489,7 @@ impl AppState {
                     dragging,
                 },
                 tracker,
+                Some(self.sidebar.history.launching_threads()),
             )
         };
         let mut model = match snapshot_ref {
@@ -572,13 +586,28 @@ impl AppState {
             owner, older, frontier: self.sidebar.owner_omitted.get(*owner).and_then(|omitted| omitted.pages.listing_frontier(Some(older))),
         }).collect();
         let extras = self.sidebar.owner_extra_threads.iter().map(|(owner, threads)| t3_core::sidebar::fleet::ScopedExtraThreads { owner, threads }).collect::<Vec<_>>();
+        if !self.sidebar.history.launching_threads().is_empty() {
+            self.sidebar.history.retain_launching(|id| {
+                environments
+                    .iter()
+                    .flat_map(|env| env.threads.iter())
+                    .chain(extras.iter().flat_map(|extra| extra.threads.iter()))
+                    .find(|row| row.thread.id == id)
+                    .is_none_or(|row| {
+                        row.thread.latest_run.is_none()
+                            && row.thread.runtime.is_none()
+                            && !row.thread.archived
+                            && !row.thread.deleted
+                    })
+            });
+        }
         let build_fleet = |fleet_state: &mut _, dragging| {
-            t3_core::sidebar::fleet::ScopedSidebarModel::build_presented(&t3_core::sidebar::fleet::ScopedSidebarInput {
+            t3_core::sidebar::fleet::ScopedSidebarModel::build_presented_with_launching(&t3_core::sidebar::fleet::ScopedSidebarInput {
                 environments: &environments, groups: &groups, preferences: &self.project_preferences,
                 settings: &self.sidebar.settings, shelves: &self.sidebar.shelves, selected: selected.as_ref(), hidden: &hidden,
                 older: &older, extra_threads: &extras, now, folder_mode: crate::settings::store::client(cx).boring_sidebar_enabled(),
                 dragging,
-            }, fleet_state)
+            }, fleet_state, self.sidebar.history.launching_threads())
         };
         let mut model = build_fleet(&mut self.sidebar.fleet_state, self.sidebar.fleet_drag.as_ref().map(|(_, section)| *section));
         let mut cancelled_fleet_drag = false;
@@ -987,6 +1016,7 @@ impl AppState {
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar.collapsed = !self.sidebar.collapsed;
+        t3_client::store::save_ui_state(t3_core::sidebar::layout::OPEN_STORAGE_KEY, &(!self.sidebar.collapsed));
         cx.emit(AppEvent::Selection);
     }
 
@@ -1344,7 +1374,11 @@ impl AppState {
             .threads
             .iter()
             .chain(extras.iter().copied())
-            .filter(|thread| thread.archived_at.is_none() && thread.deleted_at.is_none())
+            .filter(|thread| {
+                thread.archived_at.is_none()
+                    && thread.deleted_at.is_none()
+                    && thread.lineage.is_listed()
+            })
             .map(|thread| {
                 t3_core::sidebar::thread::present_thread(thread, requests.get(&thread.id).copied())
             })
@@ -1366,6 +1400,7 @@ impl AppState {
                 thread.project_id == project
                     && thread.deleted_at.is_none()
                     && thread.archived_at.is_none()
+                    && thread.lineage.is_listed()
             })
         });
         target.route(&self.delete_target(), id, ok, fallback)
@@ -1633,13 +1668,56 @@ impl AppState {
     }
 
     pub fn rename_thread(&mut self, thread_id: &str, title: &str, cx: &mut Context<Self>) {
-        let Some(original) = self.snapshot_thread(thread_id).map(|thread| thread.title) else { return };
+        self.rename_thread_with_original(thread_id, title, None, cx);
+    }
+
+    pub fn rename_thread_with_original(&mut self, thread_id: &str, title: &str, original_title: Option<&str>, cx: &mut Context<Self>) {
+        let Some(original) = original_title
+            .map(str::to_owned)
+            .or_else(|| self.snapshot_thread(thread_id).map(|thread| thread.title))
+        else {
+            return;
+        };
         match actions::resolve_rename(title, &original) {
             RenameOutcome::Empty => self.show_toast(Toast::new(ToastKind::Warning, "Thread title cannot be empty"), cx),
             RenameOutcome::Unchanged => {}
             RenameOutcome::Rename(title) => {
                 self.dispatch_then(actions::rename(&uuid(), thread_id, &title), Some("Failed to rename thread"), cx, |_, _, _| {});
             }
+        }
+    }
+
+    /// Adds folders dropped on the sidebar as projects (`SidebarFolderDrop`).
+    /// Non-directory files show guidance unless a thread row already claimed them.
+    pub(crate) fn drop_folders_on_sidebar(&mut self, paths: &[std::path::PathBuf], claimed_by_row: bool, cx: &mut Context<Self>) {
+        let mut folders = Vec::new();
+        let mut has_files = false;
+        for path in paths {
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                has_files = true;
+            }
+        }
+        if !folders.is_empty() {
+            if !connected(&self.phase) {
+                self.show_toast(
+                    Toast::new(ToastKind::Error, "This computer's server is not connected yet")
+                        .description("Try again when it connects."),
+                    cx,
+                );
+            } else {
+                for folder in folders {
+                    self.add_project(&folder.to_string_lossy(), cx);
+                }
+            }
+        }
+        if has_files && !claimed_by_row {
+            self.show_toast(
+                Toast::new(ToastKind::Info, "Only folders can be added as projects")
+                    .description("Drop files on a thread to attach them."),
+                cx,
+            );
         }
     }
 

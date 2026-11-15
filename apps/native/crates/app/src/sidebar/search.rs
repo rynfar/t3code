@@ -787,16 +787,44 @@ impl SidebarPane {
                         this.bg(hsla(p.sidebar_row_active)).when(active && light, |this| this.shadow(vec![ring]))
                     })
                     .when(!active && !highlighted, |this| this.hover(|style| style.bg(hsla(p.sidebar_row_hover))))
-                    .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
-                        style.bg(hsla(p.primary).opacity(0.08))
+                    .drag_over::<gpui::ExternalPaths>(move |style, paths, _, _| {
+                        if paths.paths().iter().any(|path| !path.is_dir()) {
+                            style.bg(hsla(p.primary).opacity(0.08))
+                        } else {
+                            style
+                        }
                     })
+                    .on_drag_move(cx.listener(move |this, event: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                        if event.bounds.contains(&event.event.position) && event.drag(cx).paths().iter().any(|path| !path.is_dir()) {
+                            if this.folder_drop_active {
+                                this.folder_drop_active = false;
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        }
+                    }))
                     .on_drop(cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
-                        let key = drop_id.clone();
-                        let files = paths.paths().to_vec();
-                        this.state.update(cx, |state, cx| {
-                            state.drop_files_on_sidebar_thread(key, files, cx);
-                        });
+                        this.folder_drop_active = false;
+                        let files: Vec<_> = paths.paths().iter().filter(|path| !path.is_dir()).cloned().collect();
+                        let claimed = !files.is_empty();
+                        let has_folders = paths.paths().iter().any(|path| path.is_dir());
+                        if !claimed && !has_folders {
+                            return;
+                        }
+                        if claimed {
+                            let key = drop_id.clone();
+                            this.state.update(cx, |state, cx| {
+                                state.drop_files_on_sidebar_thread(key, files, cx);
+                            });
+                        }
+                        if has_folders {
+                            this.state.update(cx, |state, cx| {
+                                state.drop_folders_on_sidebar(paths.paths(), claimed, cx);
+                            });
+                        }
                         this.clear_search(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
                     }))
                     .on_mouse_move(cx.listener(move |this, _, _, cx| {
                         if this.search.highlighted != index {

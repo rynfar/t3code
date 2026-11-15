@@ -22,6 +22,7 @@ fn row(project_id: &str, draft: &Draft) -> DraftRow {
         cursor = reference.end;
     }
     preview.push_str(&draft.prompt[cursor..]);
+    let preview = crate::assistant_citations::to_plain_text(&preview);
     let preview = preview.trim().split('\n').next().unwrap_or_default().to_owned();
     let preview = if preview.is_empty() {
         let count = draft.attachments.len() + draft.terminals.len() + draft.pending_attachment_count;
@@ -115,31 +116,39 @@ mod tests {
         store.set(&new_thread_key("empty"), Draft { runtime_mode: Some(crate::server_config::RuntimeMode::Auto), ..Default::default() });
         store.set(&new_thread_key("p1"), draft("first\nsecond line", 2));
         store.set(&new_thread_key("p2"), draft("see [Other](t3-context://v1/thread/thread_t2)", 3));
+        store.set(
+            &new_thread_key("p3"),
+            draft(
+                "[Assistant quote](t3-citation://v1/env/thread/message?suffix=&prefix=&end=11&start=0&text=hello%20world) review this",
+                4,
+            ),
+        );
         let pending = Draft { pending_attachment_count: 1, updated_at: 1, ..Default::default() };
         assert_eq!(row("upload", &pending).preview, "1 attachment");
         assert_eq!(row("upload", &Draft { pending_attachment_count: 2, ..pending }).preview, "2 attachments");
         let mut rows = DraftRows::default();
         rows.update(&store, Some("empty"), None);
-        assert_eq!(rows.rows.iter().map(|r| r.project_id.as_str()).collect::<Vec<_>>(), ["p2", "p1"]);
-        assert_eq!(rows.rows[0].preview, "see Other");
+        assert_eq!(rows.rows.iter().map(|r| r.project_id.as_str()).collect::<Vec<_>>(), ["p3", "p2", "p1"]);
+        assert_eq!(rows.rows[0].preview, "hello world review this");
+        assert_eq!(rows.rows[1].preview, "see Other");
         rows.update(&store, Some("p1"), None);
-        assert_eq!(rows.rows[1].preview, "first");
+        assert_eq!(rows.rows[2].preview, "first");
         store.set(&new_thread_key("p1"), draft("changed", 9));
         let rows_ptr = rows.rows.as_ptr();
-        let preview_ptr = rows.rows[1].preview.as_ptr();
+        let preview_ptr = rows.rows[2].preview.as_ptr();
         assert!(!rows.update_draft(&store, "p1", None));
         assert_eq!(rows.rows.as_ptr(), rows_ptr, "a frozen active edit must not rebuild the row vector");
-        assert_eq!(rows.rows[1].preview.as_ptr(), preview_ptr, "a frozen preview must not be rebuilt");
-        assert_eq!(rows.rows[1].preview, "first");
+        assert_eq!(rows.rows[2].preview.as_ptr(), preview_ptr, "a frozen preview must not be rebuilt");
+        assert_eq!(rows.rows[2].preview, "first");
         store.remove(&new_thread_key("p1"));
         assert!(rows.update_draft(&store, "p1", None));
-        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows.len(), 2);
         store.set(&new_thread_key("p1"), draft("changed", 2));
         assert!(rows.update_draft(&store, "p1", None));
-        assert_eq!(rows.rows[1].preview, "first", "Undo restores the frozen preview");
+        assert_eq!(rows.rows[2].preview, "first", "Undo restores the frozen preview");
         store.set(&new_thread_key("p2"), draft("inactive edit", 10));
         assert!(rows.update_draft(&store, "p2", None));
-        assert_eq!(rows.rows[0].preview, "inactive edit");
+        assert_eq!(rows.rows[1].preview, "inactive edit");
         assert!(!rows.update_draft(&store, "p2", None));
         rows.update(&store, None, Some(&HashSet::from(["p1".into()])));
         assert_eq!(rows.rows.len(), 1);
@@ -147,6 +156,6 @@ mod tests {
         assert_eq!(rows.rows[0].created_at, 2);
         store.remove(&new_thread_key("p1"));
         rows.update(&store, None, None);
-        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows.len(), 2);
     }
 }

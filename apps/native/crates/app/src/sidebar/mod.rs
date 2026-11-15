@@ -125,6 +125,7 @@ pub struct SidebarPane {
     drag: Option<drag::PaneDrag>,
     project_drag: Option<drag::PaneProjectDrag>,
     sweep: Option<drag::PaneSweep>,
+    pub(super) folder_drop_active: bool,
     #[cfg(all(test, feature = "snapshot"))]
     row_focuses: std::cell::RefCell<std::collections::HashMap<gpui::SharedString, gpui::FocusHandle>>,
     folder_multiline: bool,
@@ -511,6 +512,7 @@ impl SidebarPane {
             drag: None,
             project_drag: None,
             sweep: None,
+            folder_drop_active: false,
             #[cfg(all(test, feature = "snapshot"))]
             row_focuses: std::cell::RefCell::new(std::collections::HashMap::new()),
             folder_multiline: crate::settings::store::client(cx).boring_sidebar_multiline_rows(),
@@ -520,6 +522,11 @@ impl SidebarPane {
             checkout_repos: std::collections::HashMap::new(),
             _subscriptions: subscriptions,
         };
+        if let Some(open) = t3_client::store::load_ui_state(t3_core::sidebar::layout::OPEN_STORAGE_KEY).and_then(|v| v.as_bool()) {
+            pane.state.update(cx, |state, _| {
+                state.sidebar.collapsed = t3_core::sidebar::layout::initial_collapsed(Some(open));
+            });
+        }
         #[cfg(feature = "snapshot")]
         crate::snapshot::register_sidebar_pane(cx.entity().downgrade(), cx);
         pane.sync_rows(cx);
@@ -810,8 +817,8 @@ impl SidebarPane {
     fn start_scoped_rename(&mut self, key: &t3_core::sidebar::tag_filter::ThreadKey, window: &mut Window, cx: &mut Context<Self>) {
         let Some(owner) = crate::context_menu::ThreadMenuOwner::capture_scoped(self.state.read(cx), key) else { return; };
         if !owner.allows(self.state.read(cx), &t3_core::thread_actions::ThreadAction::Rename) { return; }
-        let Some(title) = self.state.read(cx).scoped_thread(key).map(|row| row.thread.title.clone()) else { return; };
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        let Some(original_title) = self.state.read(cx).scoped_thread(key).map(|row| row.thread.title.clone()) else { return; };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(original_title.clone()));
         let input_key = key.clone();
         let previous = window.focused(cx);
         self.rename_previous_focus = previous.clone();
@@ -822,7 +829,15 @@ impl SidebarPane {
                 this.rename_key = None;
                 this.state.update(cx, |state, cx| {
                     if owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename) {
-                        state.run_scoped_command(owner.clone(), t3_core::thread_actions::rename(&controller::uuid(), &owner.thread, title.trim()), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE, "Failed to rename thread", cx);
+                        match t3_core::thread_actions::resolve_rename(&title, &original_title) {
+                            t3_core::thread_actions::RenameOutcome::Empty => {
+                                state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Warning, "Thread title cannot be empty"), cx);
+                            }
+                            t3_core::thread_actions::RenameOutcome::Unchanged => {}
+                            t3_core::thread_actions::RenameOutcome::Rename(next_title) => {
+                                state.run_scoped_command(owner.clone(), t3_core::thread_actions::rename(&controller::uuid(), &owner.thread, &next_title), t3_core::auth::ORCHESTRATION_OPERATE_SCOPE, "Failed to rename thread", cx);
+                            }
+                        }
                     }
                 });
                 if input.read(cx).focus_handle(cx).is_focused(window) && let Some(focus) = &previous { window.focus(focus, cx); }
@@ -841,18 +856,22 @@ impl SidebarPane {
     }
 
     fn start_rename_from_menu(&mut self, thread_id: &str, previous_focus: Option<gpui::FocusHandle>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(title) = self.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
+        let Some(original_title) = self.state.read(cx).sidebar.model.thread(thread_id).map(|t| t.title.clone()) else { return };
         let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self.state.read(cx), thread_id) else { return };
         let previous_focus = previous_focus.or_else(|| window.focused(cx));
         self.rename_previous_focus = previous_focus.clone();
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(original_title.clone()));
         let id = thread_id.to_owned();
         let subscription = cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { .. } | InputEvent::Blur => {
                 let title = input.read(cx).value().to_string();
                 if this.rename.as_ref().is_some_and(|(renaming, _)| *renaming == id) {
                     this.rename = None;
-                    this.state.update(cx, |state, cx| { if owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename) { state.rename_thread(&id, &title, cx); } });
+                    this.state.update(cx, |state, cx| {
+                        if owner.allows(state, &t3_core::thread_actions::ThreadAction::Rename) {
+                            state.rename_thread_with_original(&id, &title, Some(&original_title), cx);
+                        }
+                    });
                     if input.read(cx).focus_handle(cx).is_focused(window) && let Some(focus) = &previous_focus { window.focus(focus, cx); }
                     cx.notify();
                 }
@@ -1132,14 +1151,21 @@ impl SidebarPane {
     }
 
     /// The empty list copy, naming the filtered projects when a filter applies.
-    fn empty_message(&self, synchronized: bool, cx: &Context<Self>) -> String {
+    /// Returns `(message, has_scoped_filter)`.
+    fn empty_state_copy(&self, synchronized: bool, settled_count: usize, cx: &Context<Self>) -> (String, bool) {
         let state = self.state.read(cx);
         if !synchronized {
-            return "Loading…".to_owned();
+            return ("Loading…".to_owned(), false);
         }
+        let format_scoped = |label: Option<&str>| match label {
+            Some(name) if settled_count > 0 => format!("No active threads in {name}"),
+            Some(name) => format!("No threads in {name} yet"),
+            None if settled_count > 0 => "No active threads in these projects".to_owned(),
+            None => "No threads in these projects yet".to_owned(),
+        };
         if !state.fleet.environments.is_empty() {
             if state.sidebar.grouping_projects.is_empty() {
-                return "No projects yet".to_owned();
+                return ("No projects yet".to_owned(), false);
             }
             let groups = t3_core::sidebar::grouping::pickable_scoped_project_groups(
                 &state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx),
@@ -1147,16 +1173,16 @@ impl SidebarPane {
             let keys = state.scoped_project_scope(&groups);
             let scoped: Vec<_> = groups.iter().filter(|group| keys.contains(&group.key)).collect();
             return match scoped.as_slice() {
-                [] => "No threads yet".to_owned(),
-                [group] => format!("No threads in {} yet", group.label),
-                _ => "No threads in these projects yet".to_owned(),
+                [] => ("No threads yet".to_owned(), false),
+                [group] => (format_scoped(Some(&group.label)), true),
+                _ => (format_scoped(None), true),
             };
         }
         if state.shell.snapshot.as_ref().is_some_and(|snapshot| snapshot.projects.is_empty()) {
-            return "No projects yet".to_owned();
+            return ("No projects yet".to_owned(), false);
         }
         if state.sidebar.project_scope.is_none() {
-            return "No threads yet".to_owned();
+            return ("No threads yet".to_owned(), false);
         }
         let scoped: Vec<_> = self
             .project_groups(cx)
@@ -1164,10 +1190,15 @@ impl SidebarPane {
             .filter(|group| state.sidebar.project_filter_scope.is_selected(group))
             .collect();
         match scoped.as_slice() {
-            [] => "No threads yet".to_owned(),
-            [group] => format!("No threads in {} yet", group.label),
-            _ => "No threads in these projects yet".to_owned(),
+            [] => ("No threads yet".to_owned(), false),
+            [group] => (format_scoped(Some(&group.label)), true),
+            _ => (format_scoped(None), true),
         }
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn empty_message(&self, synchronized: bool, cx: &Context<Self>) -> String {
+        self.empty_state_copy(synchronized, 0, cx).0
     }
 
     /// `SidebarChromeFooter`: a row of 32px utility buttons (Settings, Pull requests, Usage), or
@@ -1334,22 +1365,39 @@ impl Render for SidebarPane {
             self.folder_multiline = multiline;
             self.list.remeasure();
         }
-        let (synchronized, no_projects) = {
+        if self.folder_drop_active && !cx.has_active_drag() {
+            self.folder_drop_active = false;
+        }
+        let (synchronized, no_projects, active_count, settled_count) = {
             let state = self.state.read(cx);
             if state.fleet.environments.is_empty() {
                 let sync = state.shell.synchronized;
-                (sync, sync && state.shell.snapshot.as_ref().is_some_and(|snapshot| snapshot.projects.is_empty()))
+                let part = &state.sidebar.model.partition;
+                let active = part.pinned.len() + part.active.len() + part.working.len() + part.snoozed.len();
+                (
+                    sync,
+                    sync && state.shell.snapshot.as_ref().is_some_and(|snapshot| snapshot.projects.is_empty()),
+                    active,
+                    state.sidebar.model.settled_count,
+                )
             } else {
                 let sync = state.fleet.environments.iter().any(|entry| entry.summary.synchronized);
-                (sync, sync && state.sidebar.grouping_projects.is_empty())
+                let part = &state.sidebar.fleet.partition;
+                let active = part.pinned.len() + part.active.len() + part.working.len() + part.snoozed.len();
+                (sync, sync && state.sidebar.grouping_projects.is_empty(), active, state.sidebar.fleet.settled_count)
             }
         };
+        let folder_mode = crate::settings::store::client(cx).boring_sidebar_enabled();
+        let (empty_text, has_scoped_filter) = self.empty_state_copy(synchronized, settled_count, cx);
+        let show_empty_notice = !self.search.is_active()
+            && self.drafts.rows.is_empty()
+            && (self.row_keys.is_empty() || (!folder_mode && active_count == 0 && (settled_count == 0 || has_scoped_filter)));
         self.live_rendered = false;
         let p = palette(cx);
-        let body = if self.search.is_active() {
-            self.render_search_results(cx).into_any_element()
-        } else if self.row_keys.is_empty() {
+        let empty_notice = || {
             div()
+                .id("sidebar-empty-state")
+                .debug_selector(|| "sidebar-empty-state".into())
                 .px(px(8.))
                 .py(px(24.))
                 .flex()
@@ -1358,7 +1406,7 @@ impl Render for SidebarPane {
                 .gap(px(10.))
                 .text_xs()
                 .text_color(hsla(p.muted_foreground).opacity(0.6))
-                .child(self.empty_message(synchronized, cx))
+                .child(empty_text.clone())
                 .when(no_projects, |this| {
                     this.child(
                         div()
@@ -1382,9 +1430,42 @@ impl Render for SidebarPane {
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx)),
                     )
                 })
-                .into_any_element()
+                .when(has_scoped_filter && !no_projects, |this| {
+                    this.child(
+                        div()
+                            .id("empty-show-all-projects")
+                            .debug_selector(|| "empty-show-all-projects".into())
+                            .h(px(28.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(hsla(p.sidebar_border))
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.sidebar_muted_foreground))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(hsla(p.sidebar_row_hover)).text_color(hsla(p.sidebar_foreground)))
+                            .child("Show all projects")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    if state.fleet.environments.is_empty() {
+                                        state.set_project_scope(Default::default(), cx);
+                                    } else {
+                                        state.set_scoped_project_scope(Vec::new(), cx);
+                                    }
+                                });
+                            })),
+                    )
+                })
+        };
+        let body = if self.search.is_active() {
+            self.render_search_results(cx).into_any_element()
+        } else if self.row_keys.is_empty() {
+            empty_notice().into_any_element()
         } else {
-            div()
+            let thread_list = div()
                 .id("sidebar-thread-list")
                 .flex_1()
                 .min_h_0()
@@ -1398,17 +1479,45 @@ impl Render for SidebarPane {
                 )
                 .on_drop(cx.listener(|this, _: &drag::DraggedThread, _, cx| this.finish_drag(true, cx)))
                 .on_drop(cx.listener(|this, _: &drag::DraggedSweep, _, cx| this.finish_sweep(true, cx)))
-                .on_drop(cx.listener(|this, _: &drag::DraggedProject, _, cx| this.finish_project_drag(true, cx)))
-                .into_any_element()
+                .on_drop(cx.listener(|this, _: &drag::DraggedProject, _, cx| this.finish_project_drag(true, cx)));
+            if show_empty_notice {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(empty_notice())
+                    .child(thread_list)
+                    .into_any_element()
+            } else {
+                thread_list.into_any_element()
+            }
         };
         let notices = self
             .updates
             .update(cx, |updates, cx| updates.render_notices(window, cx));
         div()
+            .id("sidebar-folder-drop")
+            .debug_selector(|| "sidebar-folder-drop".into())
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(hsla(p.sidebar))
+            .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style)
+            .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                let active = event.bounds.contains(&event.event.position)
+                    && event.drag(cx).paths().iter().any(|path| path.is_dir());
+                if this.folder_drop_active != active {
+                    this.folder_drop_active = active;
+                    cx.notify();
+                }
+            }))
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                this.folder_drop_active = false;
+                this.state.update(cx, |state, cx| state.drop_folders_on_sidebar(paths.paths(), false, cx));
+                cx.notify();
+            }))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.finish_drag(false, cx);
                 this.finish_sweep(false, cx);
@@ -1425,6 +1534,29 @@ impl Render for SidebarPane {
             .children(notices)
             .child(self.render_footer(window, cx))
             .children(self.render_project_filter(cx))
+            .when(self.folder_drop_active, |this| {
+                this.child(
+                    div()
+                        .id("sidebar-folder-drop-overlay")
+                        .debug_selector(|| "sidebar-folder-drop-overlay".into())
+                        .absolute()
+                        .inset(px(6.))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.))
+                        .px(px(16.))
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(hsla(p.primary).opacity(0.7))
+                        .bg(hsla(p.sidebar).opacity(0.9))
+                        .text_sm()
+                        .text_color(hsla(p.sidebar_foreground))
+                        .child(Icon::FolderPlus.sized(px(20.)).text_color(hsla(p.sidebar_muted_foreground)))
+                        .child("Drop folders to add projects"),
+                )
+            })
     }
 }
 
@@ -4068,5 +4200,249 @@ mod sb_380_tests {
             assert_eq!(toast.title.as_ref(), "Failed to regenerate 1 of 2 thread titles");
         });
         state.update(cx, |s, _| s.stop_pump());
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod sb_379_tests {
+    use super::*;
+    use crate::context_menu::project_filter_tests::install_state;
+    use gpui::{AppContext, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    use serde_json::json;
+    use t3_core::sidebar::Section;
+    use t3_core::sidebar::grouping::{ProjectScope, build_project_groups};
+    use t3_core::sidebar::history::NavEntry;
+    use t3_core::sidebar::layout::OPEN_STORAGE_KEY;
+
+    #[gpui::test]
+    async fn sb_379_scoped_empty_rename_launch_settings_highlight_and_collapse_persist(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        // Ensure any leftover persisted collapse preference starts cleared.
+        t3_client::store::save_ui_state(OPEN_STORAGE_KEY, &serde_json::Value::Null);
+        let _ = runtime
+            .spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new()))
+            .await;
+
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |s, cx| {
+                let snap = s.shell.snapshot.as_mut().unwrap();
+                snap.projects = vec![
+                    serde_json::from_value(json!({
+                        "id": "checkout-a",
+                        "title": "Alpha",
+                        "workspaceRoot": "/tmp/alpha",
+                        "createdAt": "2026-01-01T00:00:00.000Z",
+                        "updatedAt": "2026-01-01T00:00:00.000Z"
+                    }))
+                    .unwrap(),
+                    serde_json::from_value(json!({
+                        "id": "checkout-b",
+                        "title": "Beta",
+                        "workspaceRoot": "/tmp/beta",
+                        "createdAt": "2026-01-01T00:00:00.000Z",
+                        "updatedAt": "2026-01-01T00:00:00.000Z"
+                    }))
+                    .unwrap(),
+                ];
+                let make = |id: &str, project: &str, title: &str, settled: bool| -> t3_core::shell::ThreadShell {
+                    serde_json::from_value(json!({
+                        "id": id,
+                        "projectId": project,
+                        "title": title,
+                        "createdAt": "2026-01-02T00:00:00Z",
+                        "updatedAt": "2026-01-02T00:00:00Z",
+                        "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "runtimeMode": "auto",
+                        "interactionMode": "default",
+                        "lineage": {"rootThreadId": id},
+                        "status": "idle",
+                        "latestRunId": null,
+                        "activeRunId": null,
+                        "hasActionableProposedPlan": false,
+                        "itemCount": 0,
+                        "visibleItemCount": 0,
+                        "settledOverride": settled.then_some("settled"),
+                        "settledAt": settled.then_some("2026-01-02T00:00:00Z")
+                    }))
+                    .unwrap()
+                };
+                snap.threads = vec![
+                    make("act-a", "checkout-a", "Original Title", false),
+                    make("set-b", "checkout-b", "Settled Beta", true),
+                ];
+                s.selected_thread = Some("act-a".into());
+                s.sync_omitted_rows(cx);
+                s.rebuild_sidebar(cx);
+            });
+            (state, fixture)
+        });
+
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            super::sb_sections_pane_tests::CachedPaneHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| { window.draw(cx).clear(); });
+        let _ = fixture.take_commands();
+
+        // 1. Scoped empty notice shows even when settledCount > 0, and "Show all projects" clears scope (#35426).
+        state.update(vcx, |s, cx| {
+            let env_id = s.server_config.config.as_ref().unwrap().environment.environment_id.clone();
+            let groups = build_project_groups(&env_id, &s.shell.snapshot.as_ref().unwrap().projects, &s.sidebar.settings.grouping);
+            let beta = groups.iter().find(|g| g.label == "Beta").unwrap();
+            let mut scope = ProjectScope::default();
+            scope.toggle(beta, &groups, true);
+            s.set_project_scope(scope, cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| { window.draw(cx).clear(); });
+        let (copy, has_scope) = pane.update(vcx, |p, cx| {
+            let settled = p.state.read(cx).sidebar.model.settled_count;
+            p.empty_state_copy(true, settled, cx)
+        });
+        assert!(has_scope);
+        assert_eq!(copy, "No active threads in Beta");
+        assert!(vcx.debug_bounds("sidebar-empty-state").is_some(), "scoped empty notice must render above Settled shelf");
+        let show_all_pos = vcx.debug_bounds("empty-show-all-projects").expect("Show all projects button must render").center();
+        vcx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: show_all_pos, modifiers: Modifiers::default(), click_count: 1, first_mouse: false });
+        vcx.simulate_event(MouseUpEvent { button: MouseButton::Left, position: show_all_pos, modifiers: Modifiers::default(), click_count: 1 });
+        vcx.run_until_parked();
+        assert!(state.read_with(vcx, |s, _| s.sidebar.project_scope.is_none()), "clicking Show all projects must clear project scope");
+
+        // 2. Untouched inline rename preserves incoming server title (#35174), while edited rename commits.
+        let _ = fixture.take_commands();
+        vcx.update(|window, cx| {
+            pane.update(cx, |p, cx| p.start_rename("act-a", window, cx));
+            state.update(cx, |s, cx| {
+                s.shell.snapshot.as_mut().unwrap().threads[0].title = "Server Generated Title".into();
+                s.rebuild_sidebar(cx);
+            });
+            let rename_input = pane.read(cx).rename.as_ref().unwrap().1.clone();
+            rename_input.update(cx, |_input, cx| {
+                cx.emit(gpui_component::input::InputEvent::PressEnter { secondary: false, shift: false });
+            });
+            // Park focus off <Input> before TestWindow::draw renders (macOS window_handle is unimplemented on TestWindow).
+            let popup_focus = pane.read(cx).project_filter_focus.clone();
+            window.focus(&popup_focus, cx);
+        });
+        vcx.run_until_parked();
+        let commands = fixture.take_commands();
+        assert!(
+            !commands.contains(&t3_core::commands::method::DISPATCH_COMMAND),
+            "untouched inline rename must not overwrite incoming server title; got {commands:?}"
+        );
+        assert_eq!(
+            state.read_with(vcx, |s, _| s.shell.thread("act-a").unwrap().title.clone()),
+            "Server Generated Title"
+        );
+
+        vcx.update(|window, cx| {
+            pane.update(cx, |p, cx| p.start_rename("act-a", window, cx));
+            let rename_input2 = pane.read(cx).rename.as_ref().unwrap().1.clone();
+            rename_input2.update(cx, |input, cx| {
+                input.set_value("Edited Title", window, cx);
+                cx.emit(gpui_component::input::InputEvent::PressEnter { secondary: false, shift: false });
+            });
+            // Park focus off <Input> before TestWindow::draw renders (macOS window_handle is unimplemented on TestWindow).
+            let popup_focus = pane.read(cx).project_filter_focus.clone();
+            window.focus(&popup_focus, cx);
+        });
+        vcx.run_until_parked();
+        let (mut fixture, rename_params) = runtime
+            .spawn(async move {
+                let rename_params = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let (method, params, reply) = fixture.next_request().await;
+                        if method == t3_core::commands::method::DISPATCH_COMMAND
+                            && params["type"] == "thread.metadata.update"
+                        {
+                            let _ = reply.send(Ok(json!({ "sequence": 2 })));
+                            return params;
+                        }
+                        let _ = reply.send(Ok(json!({})));
+                    }
+                })
+                .await
+                .expect("timed out waiting for thread.metadata.update rename command");
+                (fixture, rename_params)
+            })
+            .await
+            .unwrap();
+        let _ = &mut fixture;
+        assert_eq!(rename_params["title"], "Edited Title");
+        vcx.run_until_parked();
+
+        // 3. One-step draft-to-Working launch (#33783).
+        state.update(vcx, |s, cx| {
+            s.sidebar.history.replace_draft();
+            s.sidebar.history.visit(NavEntry::Thread("act-a".into()));
+            s.rebuild_sidebar(cx);
+            assert_eq!(s.sidebar.model.section_of("act-a"), Some(Section::Working));
+            let t = &mut s.shell.snapshot.as_mut().unwrap().threads[0];
+            t.status = "running".into();
+            t.latest_run_id = Some("run-1".into());
+            t.active_run_id = Some("run-1".into());
+            s.rebuild_sidebar(cx);
+            assert!(s.sidebar.history.launching_threads().is_empty());
+            assert_eq!(s.sidebar.model.section_of("act-a"), Some(Section::Working));
+        });
+
+        // 4. Active thread remains selected/highlighted when opening Settings (#28703).
+        state.update(vcx, |s, _| s.selected_thread = Some("act-a".into()));
+        vcx.update(|_, cx| crate::settings::open(t3_core::settings::search::Section::General, cx));
+        vcx.run_until_parked();
+        assert_eq!(state.read_with(vcx, |s, _| s.selected_thread.as_deref() == Some("act-a")), true);
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| { window.draw(cx).clear(); });
+        assert!(vcx.debug_bounds("thread-row-None-act-a").is_some());
+
+        // 5. Collapsed sidebar state persists across relaunch (#24202).
+        state.update(vcx, |s, cx| {
+            assert!(!s.sidebar.collapsed);
+            s.toggle_sidebar(cx);
+            assert!(s.sidebar.collapsed);
+        });
+        let _ = runtime
+            .spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new()))
+            .await;
+        assert_eq!(
+            t3_client::store::load_ui_state(OPEN_STORAGE_KEY).and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        state.update(vcx, |s, _| s.sidebar.collapsed = false);
+        let _reloaded = vcx.update(|window, cx| {
+            let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            cx.new(|cx| SidebarPane::new(state.clone(), composer, menu, confirm, snooze, window, cx))
+        });
+        assert!(
+            state.read_with(vcx, |s, _| s.sidebar.collapsed),
+            "fresh SidebarPane must hydrate collapsed state from persisted OPEN_STORAGE_KEY"
+        );
+
+        // Clean up persisted UI state so other tests stay unaffected.
+        t3_client::store::save_ui_state(OPEN_STORAGE_KEY, &serde_json::Value::Null);
+        let _ = runtime
+            .spawn_blocking(|| t3_client::store::commit_client_settings(serde_json::Map::new()))
+            .await;
+        state.update(vcx, |s, _| s.stop_pump());
     }
 }

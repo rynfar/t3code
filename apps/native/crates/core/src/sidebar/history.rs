@@ -3,6 +3,8 @@
 //! entry, opening one after going back drops the forward entries, and entries whose thread or
 //! project is gone are skipped.
 
+use std::collections::HashSet;
+
 const HISTORY_LIMIT: usize = 100;
 
 /// A page Back and Forward return to: a thread, or a draft in a project (the draft route, which
@@ -17,11 +19,18 @@ pub enum NavEntry {
 pub struct NavHistory {
     entries: Vec<NavEntry>,
     index: usize,
+    replacing_draft: bool,
+    launched_from_draft: HashSet<String>,
 }
 
 impl NavHistory {
     /// Records an opened page. Reopening the current entry (a back or forward step) is a no-op.
     pub fn visit(&mut self, entry: NavEntry) {
+        if std::mem::take(&mut self.replacing_draft)
+            && let NavEntry::Thread(ref id) = entry
+        {
+            self.launched_from_draft.insert(id.clone());
+        }
         if self.entries.get(self.index) == Some(&entry) {
             return;
         }
@@ -38,9 +47,18 @@ impl NavHistory {
     /// A draft that launched its thread gives way to it, as the web replaces the draft route.
     pub fn replace_draft(&mut self) {
         if matches!(self.entries.get(self.index), Some(NavEntry::Draft(_))) {
+            self.replacing_draft = true;
             self.entries.truncate(self.index);
             self.index = self.index.saturating_sub(1);
         }
+    }
+
+    pub fn launching_threads(&self) -> &HashSet<String> {
+        &self.launched_from_draft
+    }
+
+    pub fn retain_launching(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.launched_from_draft.retain(|id| keep(id));
     }
 
     fn step(&self, back: bool, exists: &impl Fn(&NavEntry) -> bool) -> Option<usize> {
@@ -114,6 +132,9 @@ mod tests {
         // A launched draft is replaced by its thread.
         history.replace_draft();
         history.visit(thread("b"));
+        assert!(history.launching_threads().contains("b"));
+        history.retain_launching(|id| id != "b");
+        assert!(history.launching_threads().is_empty());
         assert_eq!(history.go(true, all), Some(&thread("a")));
         assert_eq!(history.go(false, all), Some(&thread("b")));
         assert!(!history.can_go(false, all));

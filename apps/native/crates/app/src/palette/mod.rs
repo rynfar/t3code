@@ -139,15 +139,19 @@ fn scoped_project_items(entries: &[crate::new_thread::ProjectPickerEntry]) -> (
         let group = &entry.group;
         let target = &entry.target;
         let target_ref = target.project.reference();
-        let description = format!("{} · {}", target.project.environment_label, target.project.project.workspace_root);
-        for (prefix, title, draft) in [("scoped-project", group.label.clone(), false), ("scoped-new-thread", format!("New thread in {}", group.label), true)] {
+        let base_description = format!("{} · {}", target.project.environment_label, target.project.project.workspace_root);
+        let new_thread_description = if entry.is_preferred { format!("Current · {base_description}") } else { base_description.clone() };
+        for (prefix, title, draft, description) in [
+            ("scoped-project", group.label.clone(), false, base_description),
+            ("scoped-new-thread", format!("New thread in {}", group.label), true, new_thread_description),
+        ] {
             let value = format!("{prefix}:{}", group.key);
             let mut search_terms = vec![group.label.clone(), target.project.project.workspace_root.clone(), target.project.environment_label.clone()];
             for member in &group.members {
                 search_terms.extend([member.project.project.title.clone(), member.project.project.workspace_root.clone()]);
                 if !draft { search_terms.push(member.project.environment_label.clone()); }
             }
-            items.push(CommandPaletteItem { value:value.clone(),title,description:Some(description.clone()),search_terms,..Default::default() });
+            items.push(CommandPaletteItem { value:value.clone(),title,description:Some(description),search_terms,..Default::default() });
             actions.insert(value, (group.clone(),target_ref.clone(),draft));
         }
     }
@@ -445,7 +449,18 @@ impl CommandPalette {
         let eligible = state.fleet.environments.iter().filter(|entry| state.scoped_ready(&entry.summary.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE))
             .map(|entry| entry.summary.owner.saved_id.clone()).collect();
         let project_thread_items = if state.fleet.environments.is_empty() {
-            build_project_action_items(&projects, "new-thread-in", |_| Vec::new(), None)
+            let mut single_items = build_project_action_items(&projects, "new-thread-in", |_| Vec::new(), None);
+            if let Some(current_id) = crate::new_thread::default_project(state)
+                && let Some(pos) = single_items.iter().position(|item| item.value == format!("new-thread-in:{ENVIRONMENT}:{current_id}"))
+            {
+                let mut current = single_items.remove(pos);
+                current.description = Some(match current.description {
+                    Some(desc) if !desc.is_empty() => format!("Current · {desc}"),
+                    _ => "Current".to_owned(),
+                });
+                single_items.insert(0, current);
+            }
+            single_items
         } else {
             scoped_project_thread_items(&self.projects, &self.scoped_project_actions, preferred.as_ref(), primary, actual_context, &eligible)
         };
@@ -979,17 +994,22 @@ mod scoped_project_tests {
     }
 
     #[test]
-    fn scoped_project_picker_promotes_only_exact_unpinned_context() {
+    fn scoped_project_picker_promotes_current_project_ahead_of_pinned() {
         let groups = groups();
         let original = groups.iter().map(|group| group.key.clone()).collect::<Vec<_>>();
         let pinned = groups.iter().find(|group| group.pinned).unwrap().key.clone();
         let alpha = groups.iter().find(|group| group.member_refs.contains(&ProjectRef { environment_id:"a".into(), project_id:"same".into() })).unwrap().key.clone();
         let beta = groups.iter().find(|group| group.member_refs.contains(&ProjectRef { environment_id:"b".into(), project_id:"same".into() })).unwrap().key.clone();
-        for (saved, order) in [("b", vec![pinned.clone(), beta, alpha]), ("p", original.clone()), ("missing", original.clone())] {
+        for (saved, order) in [("b", vec![beta.clone(), pinned.clone(), alpha]), ("p", original.clone()), ("missing", original.clone())] {
             let preferred = ProjectRef { environment_id: saved.into(), project_id:"same".into() };
             let entries = crate::new_thread::picker_entries(groups.clone(), Some(&preferred));
             assert_eq!(entries.iter().map(|entry| entry.group.key.clone()).collect::<Vec<_>>(), order, "context {saved}");
-            if let Some(entry) = entries.iter().find(|entry| entry.is_preferred) { assert_eq!(entry.target.project.reference(), preferred); }
+            if let Some(entry) = entries.iter().find(|entry| entry.is_preferred) {
+                assert_eq!(entry.target.project.reference(), preferred);
+                let (items, _) = scoped_project_items(&entries);
+                let new_thread_item = items.iter().find(|item| item.value == format!("scoped-new-thread:{}", entry.group.key)).unwrap();
+                assert!(new_thread_item.description.as_deref().is_some_and(|desc| desc.starts_with("Current · ")));
+            }
         }
         assert_eq!(groups.iter().map(|group| group.key.clone()).collect::<Vec<_>>(), original);
     }
@@ -1020,13 +1040,13 @@ mod scoped_project_tests {
     #[test]
     fn scoped_project_palette_offers_one_existing_scratch_target_in_context_order() {
         for (saved, primary, context, ready, expected, index) in [
-            ("scratch-b", Some("scratch-a"), Some("scratch-b"), vec!["scratch-b"], Some("scratch-b"), 1),
-            ("scratch-b", None, None, vec!["scratch-a", "scratch-b"], None, 1),
-            ("scratch-b", Some("scratch-a"), Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-a"), 1),
-            ("scratch-b", None, Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-b"), 1),
+            ("scratch-b", Some("scratch-a"), Some("scratch-b"), vec!["scratch-b"], Some("scratch-b"), 0),
+            ("scratch-b", None, None, vec!["scratch-a", "scratch-b"], None, 0),
+            ("scratch-b", Some("scratch-a"), Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-a"), 0),
+            ("scratch-b", None, Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-b"), 0),
             ("b", None, Some("b"), vec!["scratch-a", "scratch-b"], None, 2),
             ("b", Some("scratch-a"), Some("b"), vec!["scratch-a", "scratch-b"], Some("scratch-a"), 2),
-            ("scratch-b", Some("missing"), Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-b"), 1),
+            ("scratch-b", Some("missing"), Some("scratch-b"), vec!["scratch-a", "scratch-b"], Some("scratch-b"), 0),
         ] {
             let preferred = ProjectRef { environment_id:saved.into(),project_id:"same".into() };
             let entries = crate::new_thread::picker_entries(scratch_groups(), Some(&preferred));

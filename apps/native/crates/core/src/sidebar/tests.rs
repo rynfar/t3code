@@ -1193,6 +1193,13 @@ fn deletion_fallback_stays_in_project_and_skips_parked_threads() {
             },
             false,
         ),
+        (
+            SidebarThread {
+                listed: false,
+                ..base("parked")
+            },
+            false,
+        ),
     ] {
         let threads = vec![candidate, base("deleted")];
         let select = |at| {
@@ -1211,7 +1218,7 @@ fn deletion_fallback_stays_in_project_and_skips_parked_threads() {
             threads[0]
         );
         // The instant comes from deletion, not the last sidebar rebuild.
-        if threads[0].project_id == "p1" && !threads[0].is_settled() {
+        if threads[0].project_id == "p1" && threads[0].listed && !threads[0].is_settled() {
             assert_eq!(select(future), Some("parked"));
         }
     }
@@ -1909,4 +1916,54 @@ fn idle_active_provider_thread_id_does_not_fabricate_shell_runtime() {
         None,
     );
     assert_eq!(holding.runtime.as_ref().map(|r| r.status.as_str()), Some("idle"));
+}
+
+#[test]
+fn build_with_launching_places_draft_launched_thread_in_working() {
+    let snap = snapshot(vec![wire_thread("draft-launch", json!({
+        "latestRunId": null,
+        "updatedAt": NOW,
+    }))]);
+    let mut tracker = InboxReturnTracker::default();
+    let launching = HashSet::from(["draft-launch".to_owned()]);
+    let model = SidebarModel::build_with_launching(
+        &ModelInput {
+            snapshot: &snap,
+            config_loaded: true,
+            extra_threads: &[],
+            older_settled: None,
+            settings: &SidebarSettings::default(),
+            shelves: &ShelfState::default(),
+            selected_thread_id: Some("draft-launch"),
+            project_scope: None,
+            hidden_thread_ids: None,
+            now: iso(NOW),
+            dragging: None,
+        },
+        &mut tracker,
+        Some(&launching),
+    );
+    assert_eq!(model.partition.working, vec![0]);
+    assert!(model.partition.active.is_empty());
+    assert_eq!(model.threads[0].runtime.as_ref().map(|r| r.status.as_str()), Some("preparing"));
+}
+
+#[test]
+fn updated_at_sort_prefers_latest_user_authored_message_at() {
+    let mut thread = SidebarThread {
+        created_at: Some(10),
+        updated_at: Some(20),
+        latest_user_message_at: Some(99),
+        latest_user_authored_message_at: Some(Some(50)),
+        ..base("t1")
+    };
+    assert_eq!(thread_sort_timestamp(&thread, ThreadSortOrder::UpdatedAt), Some(50));
+
+    // Explicit `null` `latestUserAuthoredMessageAt` does not let non-authored messages bump UpdatedAt.
+    thread.latest_user_authored_message_at = Some(None);
+    assert_eq!(thread_sort_timestamp(&thread, ThreadSortOrder::UpdatedAt), Some(10));
+
+    // Older servers omitting `latestUserAuthoredMessageAt` still fall back to `latestUserMessageAt`.
+    thread.latest_user_authored_message_at = None;
+    assert_eq!(thread_sort_timestamp(&thread, ThreadSortOrder::UpdatedAt), Some(99));
 }

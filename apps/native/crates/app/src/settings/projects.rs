@@ -191,7 +191,13 @@ impl SettingsView {
         let Some(shown) = self.shown_project(cx) else { return };
         let value = self.projects.name.read(cx).value().to_string();
         let titles: Vec<&str> = shown.members.iter().map(|member| member.title.as_str()).collect();
-        match model::rename(&titles, &value, was_edited) {
+        let outcome = match model::rename(&titles, &value, was_edited) {
+            Rename::Unchanged if was_edited && shown.members.iter().any(|member| member.has_custom_title != Some(true)) => {
+                Rename::Save(value.trim().to_owned())
+            }
+            other => other,
+        };
+        match outcome {
             Rename::Empty => store::show_error("Project title cannot be empty", cx),
             Rename::Unchanged => {}
             Rename::Save(title) => self.update_project_group(&shown.targets, ProjectUpdate { title: Some(title), ..Default::default() }, "Failed to rename project", cx),

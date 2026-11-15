@@ -146,13 +146,12 @@ fn unique_non_empty<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Vec<&'
 }
 
 /// `deriveProjectGroupLabel`.
-pub fn group_label(representative: &ProjectShell, members: &[&ProjectShell]) -> String {
+pub fn group_label(group_key: &str, representative: &ProjectShell, members: &[&ProjectShell]) -> String {
     let titles = unique_non_empty(members.iter().map(|member| Some(member.title.as_str())));
     let display_names = unique_non_empty(members.iter().map(|member| identity(member).and_then(grouping_display_name_of)));
     let repository_names = unique_non_empty(members.iter().map(|member| identity(member).and_then(|identity| text(identity, "name"))));
     if let [title] = titles.as_slice()
-        && !display_names.contains(title)
-        && !repository_names.contains(title)
+        && (members.iter().any(|member| member.has_custom_title == Some(true)) || (!display_names.contains(title) && !repository_names.contains(title)))
     {
         return (*title).to_owned();
     }
@@ -161,6 +160,12 @@ pub fn group_label(representative: &ProjectShell, members: &[&ProjectShell]) -> 
     }
     if let [name] = repository_names.as_slice() {
         return (*name).to_owned();
+    }
+    if let Some(rep_identity) = identity(representative)
+        && grouping_key_of(rep_identity) == Some(group_key)
+        && let Some(name) = grouping_display_name_of(rep_identity).or_else(|| text(rep_identity, "name"))
+    {
+        return name.to_owned();
     }
     representative.title.clone()
 }
@@ -273,7 +278,7 @@ pub fn build_project_groups(environment_id: &str, projects: &[ProjectShell], set
         .filter_map(|(key, members)| {
             let representative = *members.first()?;
             Some(ProjectGroup {
-                label: if members.len() > 1 { group_label(representative, &members) } else { representative.title.clone() },
+                label: if members.len() > 1 { group_label(&key, representative, &members) } else { representative.title.clone() },
                 representative_id: representative.id.clone(),
                 member_project_ids: refs.remove(&key).unwrap_or_default(),
                 pinned: members.iter().any(|member| member.pinned_at.is_some()),
@@ -491,7 +496,7 @@ pub fn build_scoped_project_groups(input: &GroupInput<'_>) -> Vec<ScopedProjectG
         group.representative = representative.reference();
         let display = group.members.iter().find(|member| member.physical_key == representative.physical_key()).unwrap();
         group.label = if group.is_scratch { "No project".into() } else if group.members.len() > 1 {
-            group_label(&display.project.project, &group.members.iter().map(|member| &member.project.project).collect::<Vec<_>>())
+            group_label(&group.key, &display.project.project, &group.members.iter().map(|member| &member.project.project).collect::<Vec<_>>())
         } else { display.project.project.title.clone() };
     }
     if input.consumer == GroupConsumer::Settings {
@@ -1078,5 +1083,49 @@ mod tests {
             .collect();
         assert_eq!(regular_keys, vec![k_beta, k_alpha.clone(), k_gamma]);
         assert!(next_order.len() >= 6, "multi-member beta keys stay intact without splitting");
+    }
+
+    #[test]
+    fn group_label_preserves_explicit_custom_repo_name_and_uses_repo_name_fallback_for_whole_repo() {
+        let mut custom_a = project("t3code", "/worktrees/a");
+        custom_a.title = "t3code".into();
+        custom_a.has_custom_title = Some(true);
+        custom_a.repository_identity = Some(json!({
+            "canonicalKey": "github.com/pingdotgg/t3code",
+            "displayName": "pingdotgg/t3code",
+            "name": "t3code",
+            "rootPath": "/worktrees/a",
+        }));
+        let mut custom_b = project("t3code", "/worktrees/b");
+        custom_b.title = "t3code".into();
+        custom_b.has_custom_title = None;
+        custom_b.repository_identity = custom_a.repository_identity.clone();
+        assert_eq!(group_label("github.com/pingdotgg/t3code", &custom_a, &[&custom_a, &custom_b]), "t3code");
+
+        // Without hasCustomTitle, shared repository name falls back to canonical displayName when present.
+        custom_a.has_custom_title = None;
+        assert_eq!(group_label("github.com/pingdotgg/t3code", &custom_a, &[&custom_a, &custom_b]), "pingdotgg/t3code");
+
+        // Whole-repo group whose members have distinct folder/repo casings falls back to representative repo displayName/name.
+        let mut folder_a = project("MyRepo-wt", "/wt/a");
+        folder_a.title = "MyRepo-wt".into();
+        folder_a.repository_identity = Some(json!({
+            "canonicalKey": "github.com/acme/repo",
+            "displayName": "Acme/Repo",
+            "name": "Repo",
+            "rootPath": "/wt/a",
+        }));
+        let mut folder_b = project("repo-main", "/wt/b");
+        folder_b.title = "repo-main".into();
+        folder_b.repository_identity = Some(json!({
+            "canonicalKey": "github.com/acme/repo",
+            "displayName": "acme/repo",
+            "name": "repo",
+            "rootPath": "/wt/b",
+        }));
+        assert_eq!(group_label("github.com/acme/repo", &folder_a, &[&folder_a, &folder_b]), "Acme/Repo");
+
+        // Subfolder group keeps representative title when displayNames/repo names disagree.
+        assert_eq!(group_label("github.com/acme/repo::apps/web", &folder_a, &[&folder_a, &folder_b]), "MyRepo-wt");
     }
 }

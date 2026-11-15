@@ -321,15 +321,43 @@ impl SidebarPane {
                     preview
                 })
             })
-            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
-                style.bg(hsla(p.primary).opacity(0.08))
+            .drag_over::<gpui::ExternalPaths>(move |style, paths, _, _| {
+                if paths.paths().iter().any(|path| !path.is_dir()) {
+                    style.bg(hsla(p.primary).opacity(0.08))
+                } else {
+                    style
+                }
             })
+            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                if event.bounds.contains(&event.event.position) && event.drag(cx).paths().iter().any(|path| !path.is_dir()) {
+                    if this.folder_drop_active {
+                        this.folder_drop_active = false;
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }
+            }))
             .on_drop(cx.listener(move |this, paths: &gpui::ExternalPaths, _, cx| {
-                let key = drop_key.clone().unwrap_or_else(|| t3_core::sidebar::tag_filter::ThreadKey::new("", &drop_id));
-                let files = paths.paths().to_vec();
-                this.state.update(cx, |state, cx| {
-                    state.drop_files_on_sidebar_thread(key, files, cx);
-                });
+                this.folder_drop_active = false;
+                let files: Vec<_> = paths.paths().iter().filter(|path| !path.is_dir()).cloned().collect();
+                let claimed = !files.is_empty();
+                let has_folders = paths.paths().iter().any(|path| path.is_dir());
+                if !claimed && !has_folders {
+                    return;
+                }
+                if claimed {
+                    let key = drop_key.clone().unwrap_or_else(|| t3_core::sidebar::tag_filter::ThreadKey::new("", &drop_id));
+                    this.state.update(cx, |state, cx| {
+                        state.drop_files_on_sidebar_thread(key, files, cx);
+                    });
+                }
+                if has_folders {
+                    this.state.update(cx, |state, cx| {
+                        state.drop_folders_on_sidebar(paths.paths(), claimed, cx);
+                    });
+                }
+                cx.stop_propagation();
+                cx.notify();
             }))
             .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
                 if !key_focus.is_focused(window) {

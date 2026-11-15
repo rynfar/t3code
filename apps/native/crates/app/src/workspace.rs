@@ -122,7 +122,12 @@ impl Workspace {
         let star_root = focus_observer.read(cx).root.clone();
         let star_focus = cx.new(|cx| crate::github_star_prompt::FocusObserver::new(state.clone(), &star_root, window, cx));
         let viewport = f32::from(window.viewport_size().width);
-        state.update(cx, |state, cx| state.set_sidebar_viewport(viewport, cx));
+        state.update(cx, |state, cx| {
+            state.sidebar.collapsed = layout::initial_collapsed(
+                t3_client::store::load_ui_state(layout::OPEN_STORAGE_KEY).and_then(|value| value.as_bool()),
+            );
+            state.set_sidebar_viewport(viewport, cx);
+        });
         let subscriptions = vec![
             cx.subscribe(&state, |_, state, event: &AppEvent, cx| {
                 // Navigating from the sheet closes it, as the web's thread and project rows do.
