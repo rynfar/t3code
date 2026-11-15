@@ -122,6 +122,7 @@ impl Composer {
             self.seed_mentions(&target, draft.thread_contexts());
             self.seed_terminals(&target, draft.terminals.clone());
         self.seed_reviews(&target, draft.review_comments.clone());
+            self.seed_reply_to(&target, draft.reply_to.clone());
             self.publish_review_comments(&target, &draft.prompt, cx);
             self.seed_attachments(&target, draft.attachments.iter().map(SavedAttachment::restore).collect());
         }
@@ -156,6 +157,7 @@ impl Composer {
             threads: Draft::saved_threads(self.mentions(target), &prompt),
             terminals: Draft::saved_terminals(self.terminals_for(target), &prompt),
             review_comments: t3_core::composer::review::referenced(&prompt, self.reviews_for(target)).into_iter().cloned().collect(),
+            reply_to: self.reply_to_for(target).cloned(),
             attachments: self.staged_for(target).iter().filter_map(|staged| SavedAttachment::of(&staged.attachment)).collect(),
             prompt,
             model_selection: choices.model,
@@ -288,6 +290,7 @@ impl Composer {
         }
         let attachments = self.take_draft_attachments(target);
         self.clear_mentions(target);
+        self.take_reply_to(target);
         if self.snapshot.target.as_ref() == Some(target) { self.set_prompt("", window, cx); }
         cx.notify();
         Some(DiscardedDraft { draft, attachments })
@@ -315,6 +318,7 @@ impl Composer {
         self.seed_mentions(target, draft.thread_contexts());
         self.seed_terminals(target, draft.terminals.clone());
         self.seed_reviews(target, draft.review_comments.clone());
+        self.seed_reply_to(target, draft.reply_to.clone());
         self.restore_draft_attachments(target, attachments, cx);
         if self.snapshot.target.as_ref() == Some(target) { self.set_prompt(&draft.restored_prompt(), window, cx); }
         self.schedule_draft_save(target, cx);
@@ -414,6 +418,7 @@ impl Composer {
             self.clear_mentions(&target);
             self.context.records.remove(&target);
             self.context.reviews.remove(&target);
+            self.context.reply_to.remove(&target);
             self.clear_terminals(&target);
         }
         if changed {

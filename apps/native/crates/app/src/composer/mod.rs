@@ -121,8 +121,6 @@ struct Snapshot {
     setup_blocks_send: bool,
     /// The run is being prepared, so a send queues behind it (`sendQueuesBehindSetup`).
     setup_queues: bool,
-    /// Latest actionable proposed plan on a settled run (`findLatestProposedPlan`).
-    active_proposed_plan: Option<t3_core::timeline::plan::ActiveProposedPlan>,
     /// Whether the thread currently offers a resume primary action (`resumableRunId !== null || hasHeldQueuedRuns`).
     can_resume: bool,
     last_error: Option<String>,
@@ -176,7 +174,6 @@ pub struct Composer {
     picker: Entity<ModelPicker>,
     picker_open: bool,
     permissions_open: bool,
-    plan_menu_open: bool,
     choices: HashMap<Target, Choices>,
     /// The model and mode a new draft starts from: what the thread before it ran.
     carry: (Option<ModelSelection>, Option<InteractionMode>),
@@ -382,6 +379,20 @@ impl Composer {
                 {
                     this.add_citation(citation, window, cx);
                 }
+                if *event == AppEvent::ComposerReply
+                    && let Some(thread_id) = this.thread_id()
+                    && this.state.read(cx).composer_reply.as_ref().is_some_and(|(id, _)| *id == thread_id)
+                    && let Some((_, reply)) = this.state.update(cx, |state, _| state.composer_reply.take())
+                    && !this.reply_to_response(reply, window, cx)
+                {
+                    this.state.update(cx, |state, cx| {
+                        state.show_toast(
+                            crate::toast::Toast::new(crate::toast::ToastKind::Warning, "The composer is not ready")
+                                .description("Try replying after the connection or pending input is resolved.".to_owned()),
+                            cx,
+                        );
+                    });
+                }
                 if *event == AppEvent::ComposerRestore {
                     this.restore_prompt(window, cx);
                 }
@@ -390,7 +401,6 @@ impl Composer {
                         let _ = this.cancel_pending_send();
                         this.picker_open = false;
                         this.permissions_open = false;
-                        this.plan_menu_open = false;
                         this.workspace.open = false;
                         this.close_stash_menu(cx);
                         let _ = this.close_context_details(cx);
@@ -437,7 +447,6 @@ impl Composer {
             picker,
             picker_open: false,
             permissions_open: false,
-            plan_menu_open: false,
             choices: HashMap::new(),
             carry: (None, None),
             snapshot: Snapshot::default(),
@@ -534,27 +543,10 @@ impl Composer {
             pending_key,
             pending,
             queue: projection.map(t3_core::composer::queue::queue_state).unwrap_or_default(),
-            active_proposed_plan: projection.and_then(t3_core::timeline::plan::find_active_proposed_plan),
             can_resume: projection.is_some_and(t3_core::timeline::plan::can_resume_thread),
             last_error,
             target,
         }
-    }
-
-    pub(super) fn active_plan_follow_up(&self, cx: &App) -> Option<&t3_core::timeline::plan::ActiveProposedPlan> {
-        let resolved = self.resolve(cx);
-        let target = self.snapshot.target.as_ref();
-        let has_attachments = target.is_some_and(|t| !self.staged_for(t).is_empty());
-        let plan = self.snapshot.active_proposed_plan.as_ref();
-        t3_core::timeline::plan::should_show_plan_follow_up_prompt(
-            self.snapshot.pending.user_inputs.len(),
-            resolved.interaction_mode,
-            self.snapshot.running,
-            plan,
-            has_attachments,
-        )
-        .then_some(plan)
-        .flatten()
     }
 
     /// Re-reads app state. Notifies only when something the composer shows changed.
@@ -960,7 +952,7 @@ impl Composer {
     }
 
     pub(super) fn has_non_prompt_content(&self, prompt: &str, staged: &[t3_core::composer::attachments::Attachment]) -> bool {
-        !staged.is_empty() || self.has_context_records(prompt)
+        !staged.is_empty() || self.has_context_records(prompt) || self.current_reply_to().is_some()
     }
 
     pub(super) fn usage_limits_offered(&self, cx: &App) -> bool {

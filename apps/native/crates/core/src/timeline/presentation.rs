@@ -3,7 +3,8 @@
 //! the label helpers of `MessagesTimeline.logic.ts` and icons from
 //! `apps/web/src/components/chat/TimelineWorkEntryRow.logic.ts`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -17,6 +18,7 @@ use super::tool_activity::{
     tool_output_indicates_failure,
 };
 use super::{SourceActivity, Tone, ToolStatus, WorkLogEntry};
+use crate::client_settings::ToolCallVisibility;
 use crate::media::{AssetResource, MarkdownImageSource, MediaKind, MediaSource, classify_markdown_image_source, resolve_media_source};
 use crate::turn_item::TurnItemKind;
 
@@ -592,8 +594,19 @@ pub fn work_entry_read_output(entry: &WorkLogEntry, workspace_root: Option<&str>
     (!paths.is_empty()).then(|| paths.join("\n"))
 }
 
+pub const THOUGHT_PREVIEW_SOURCE_MAX_LENGTH: usize = 8_192;
+pub const THOUGHT_PREVIEW_MAX_LENGTH: usize = 2_048;
+
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Cap a reasoning/thought preview linearly in UTF-16 code units without splitting scalar pairs
+/// (`THOUGHT_PREVIEW_SOURCE_MAX_LENGTH` / `THOUGHT_PREVIEW_MAX_LENGTH`).
+pub fn cap_thought_preview(text: &str) -> String {
+    let source = crate::assistant_citations::take_units(text, THOUGHT_PREVIEW_SOURCE_MAX_LENGTH, false);
+    let collapsed = collapse_whitespace(&source);
+    crate::assistant_citations::take_units(&collapsed, THOUGHT_PREVIEW_MAX_LENGTH, false)
 }
 
 /// `workEntryDisplayLabel`.
@@ -602,7 +615,7 @@ pub fn work_entry_display_label(entry: &WorkLogEntry, workspace_root: Option<&st
         return entry.label.clone();
     }
     if entry.item_type == Some("reasoning") || entry.tone == Tone::Thinking {
-        let thought = entry.detail.as_deref().map(collapse_whitespace).unwrap_or_default();
+        let thought = entry.detail.as_deref().map(cap_thought_preview).unwrap_or_default();
         return if thought.is_empty() { entry.label.clone() } else { thought };
     }
     if let Some(pres) = resolve_work_entry_tool_presentation(entry, None) {
@@ -657,7 +670,7 @@ pub fn work_entry_display_label(entry: &WorkLogEntry, workspace_root: Option<&st
 /// `singleToolCallLabel`.
 pub fn single_tool_call_label(entry: &WorkLogEntry) -> String {
     if entry.item_type == Some("reasoning") {
-        let thought = entry.detail.as_deref().map(collapse_whitespace).unwrap_or_default();
+        let thought = entry.detail.as_deref().map(cap_thought_preview).unwrap_or_default();
         return if thought.is_empty() { "Thought".into() } else { thought };
     }
     if let Some((tool_name, input)) = dynamic_tool(entry)
@@ -683,7 +696,7 @@ fn live_status(status: Option<ToolStatus>, present: bool) -> ToolStatus {
 pub fn live_work_entry_label(entry: &WorkLogEntry, workspace_root: Option<&str>, active: bool) -> String {
     let status = live_status(entry.status, active);
     if entry.item_type == Some("reasoning") {
-        let thought = entry.detail.as_deref().map(collapse_whitespace).unwrap_or_default();
+        let thought = entry.detail.as_deref().map(cap_thought_preview).unwrap_or_default();
         if !thought.is_empty() {
             return thought;
         }
@@ -715,8 +728,26 @@ pub fn work_entry_is_visible_in_group(entry: &WorkLogEntry, expanded_group: bool
         || !work_entry_indicates_tool_neutral_status(entry)
 }
 
+/// `workEntryHiddenByToolCallVisibility`.
+pub fn work_entry_hidden_by_tool_call_visibility(entry: &WorkLogEntry, visibility: ToolCallVisibility) -> bool {
+    if visibility == ToolCallVisibility::ShowAll
+        || !matches!(
+            entry.item_type,
+            Some("command_execution" | "file_change" | "file_search" | "web_search" | "dynamic_tool")
+        )
+    {
+        return false;
+    }
+    if visibility != ToolCallVisibility::HideSuccessful {
+        return true;
+    }
+    entry.status == Some(ToolStatus::Completed) && !work_entry_display_indicates_tool_failure(entry)
+}
+
 /// `liveThoughtLine`: the first bolded heading, or the first sentence, as plain text.
 pub fn live_thought_line(markdown: &str) -> String {
+    let bounded = crate::assistant_citations::take_units(markdown, THOUGHT_PREVIEW_SOURCE_MAX_LENGTH, false);
+    let markdown = bounded.as_str();
     let first_line = markdown.trim_start_matches([' ', '\t']).lines().next().unwrap_or_default();
     let heading = first_line
         .strip_prefix("**")
@@ -725,7 +756,7 @@ pub fn live_thought_line(markdown: &str) -> String {
         .map(|(inner, _)| inner);
     let text = collapse_whitespace(&strip_inline_markdown(heading.unwrap_or(markdown)));
     if heading.is_some() {
-        return text;
+        return crate::assistant_citations::take_units(&text, THOUGHT_PREVIEW_MAX_LENGTH, false);
     }
     let chars: Vec<char> = text.chars().collect();
     for (index, c) in chars.iter().enumerate() {
@@ -735,11 +766,12 @@ pub fn live_thought_line(markdown: &str) -> String {
                 end += 1;
             }
             if chars.get(end).is_some_and(|c| c.is_whitespace()) {
-                return chars[..end].iter().collect();
+                let sentence: String = chars[..end].iter().collect();
+                return crate::assistant_citations::take_units(&sentence, THOUGHT_PREVIEW_MAX_LENGTH, false);
             }
         }
     }
-    text
+    crate::assistant_citations::take_units(&text, THOUGHT_PREVIEW_MAX_LENGTH, false)
 }
 
 fn strip_inline_markdown(text: &str) -> String {
@@ -884,6 +916,16 @@ pub fn work_entry_icon(entry: &WorkLogEntry) -> WorkIcon {
             _ => WorkIcon::Zap,
         };
     }
+    if entry.item_type == Some("system_notice") {
+        return if matches!(
+            entry.item.as_ref().map(|i| &i.kind),
+            Some(TurnItemKind::SystemNotice { level: Some(level), .. }) if level == "info"
+        ) {
+            WorkIcon::Zap
+        } else {
+            WorkIcon::CircleAlert
+        };
+    }
     if matches!(entry.item_type, Some("user_input_request" | "approval_request")) {
         return WorkIcon::MessageCircle;
     }
@@ -941,6 +983,21 @@ pub fn work_entry_viewed_image_path(entry: &WorkLogEntry) -> Option<String> {
         return Some(detail.to_owned());
     }
     None
+}
+
+/// Distinct workspace image paths opened across a tool group, in viewing order
+/// (`workEntriesViewedImagePaths`).
+pub fn work_entries_viewed_image_paths(entries: &[Arc<WorkLogEntry>]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for entry in entries {
+        if let Some(path) = work_entry_viewed_image_path(entry)
+            && seen.insert(path.clone())
+        {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

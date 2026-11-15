@@ -592,7 +592,7 @@ fn tool_call_content_without_a_diff_is_kept_out_of_the_patch() {
             recorded_files: 0,
         }
     );
-    assert_eq!(tool_call_diff(&crate::turn_item::TurnItemKind::SystemNotice { message: "x".into() }), None);
+    assert_eq!(tool_call_diff(&crate::turn_item::TurnItemKind::SystemNotice { message: "x".into(), level: None }), None);
 }
 
 #[test]

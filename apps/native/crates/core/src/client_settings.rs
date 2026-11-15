@@ -60,6 +60,15 @@ literal_enum!(
 );
 
 literal_enum!(
+    ToolCallVisibility {
+        ShowAll => "showAll": "Show all",
+        HideSuccessful => "hideSuccessful": "Hide successful",
+        HideAll => "hideAll": "Hide all",
+        Zen => "zen": "Zen",
+    } default ShowAll
+);
+
+literal_enum!(
     BrowserLinkTarget {
         System => "system": "Your default browser",
         App => "app": "T3 Code",
@@ -219,6 +228,7 @@ pub enum ClientSettingChange {
     ConfirmQuit(QuitConfirmationMode),
     TimestampFormat(TimestampFormat),
     ChatWidth(ChatWidth),
+    ToolCallVisibility(ToolCallVisibility),
     InterfaceFontSize(u32),
     FontSize(FontRole, u32),
     FontFamily(FontRole, String),
@@ -288,6 +298,7 @@ impl ClientSettingChange {
             ClientSettingChange::ConfirmQuit(mode) => ("confirmQuit", text(mode.as_str())),
             ClientSettingChange::TimestampFormat(format) => ("timestampFormat", text(format.as_str())),
             ClientSettingChange::ChatWidth(width) => ("chatWidth", text(width.as_str())),
+            ClientSettingChange::ToolCallVisibility(visibility) => ("toolCallVisibility", text(visibility.as_str())),
             ClientSettingChange::InterfaceFontSize(size) => {
                 ("fontSizeInterface", Value::from((*size).clamp(MIN_INTERFACE_FONT_SIZE, MAX_INTERFACE_FONT_SIZE)))
             }
@@ -559,6 +570,10 @@ impl ClientSettingsDoc {
 
     pub fn chat_width(&self) -> ChatWidth {
         self.literal("chatWidth", ChatWidth::parse)
+    }
+
+    pub fn tool_call_visibility(&self) -> ToolCallVisibility {
+        self.literal("toolCallVisibility", ToolCallVisibility::parse)
     }
 
     /// `InterfaceFontSize`: an integer from 12 to 20; anything else is the default.

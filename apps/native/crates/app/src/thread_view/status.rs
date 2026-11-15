@@ -317,23 +317,24 @@ impl ThreadView {
             return;
         }
         let was_shown = self.footer.lines.is_shown();
+        let env_id = self.state.read(cx).environment().map(str::to_owned);
         self.footer.stop_timer = match &next.stop {
-            Some(stop) if self.footer.stop_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&stop.requested_at, TimerKind::Elapsed)) => {
+            Some(stop) if self.footer.stop_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&stop.requested_at, env_id.as_deref(), TimerKind::Elapsed)) => {
                 self.footer.stop_timer.take()
             }
             Some(stop) => {
                 let started = stop.requested_at.clone();
-                Some(cx.new(|cx| WorkingTimer::new(started, TimerKind::Elapsed, cx)))
+                Some(cx.new(|cx| WorkingTimer::new(started, env_id.clone(), TimerKind::Elapsed, cx)))
             }
             None => None,
         };
         self.footer.background_timer = match next.background.as_ref().and_then(BackgroundWork::only_started_at) {
-            Some(started) if self.footer.background_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(started, TimerKind::Elapsed)) => {
+            Some(started) if self.footer.background_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(started, env_id.as_deref(), TimerKind::Elapsed)) => {
                 self.footer.background_timer.take()
             }
             Some(started) => {
                 let started = started.to_owned();
-                Some(cx.new(|cx| WorkingTimer::new(started, TimerKind::Elapsed, cx)))
+                Some(cx.new(|cx| WorkingTimer::new(started, env_id, TimerKind::Elapsed, cx)))
             }
             None => None,
         };

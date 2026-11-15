@@ -140,7 +140,9 @@ fn apply_client(
         })
         .flatten();
     let grouping_override = matches!(&change, ClientSettingChange::ProjectGroupingOverride { .. }).then(|| prefs.doc.clone());
+    let before_visibility = prefs.doc.tool_call_visibility();
     let patch = prefs.doc.apply_change(&change);
+    let after_visibility = prefs.doc.tool_call_visibility();
     if patch.is_empty() && !(persist && grouping_override.is_some()) {
         return;
     }
@@ -178,6 +180,9 @@ fn apply_client(
         ) {
             crate::notifications::prepare_sounds(state.client_settings.notification_mode);
             state.observe_notifications(cx);
+        }
+        if after_visibility != before_visibility {
+            cx.emit(AppEvent::Thread);
         }
         if matches!(
             change,

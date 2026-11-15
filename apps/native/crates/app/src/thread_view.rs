@@ -217,7 +217,7 @@ impl ThreadView {
         }
         let can_operate_thread = state.read(cx).can_operate_threads();
         ThreadView {
-            state,
+            state: state.clone(),
             list: ListState::new(0, ListAlignment::Bottom, px(600.)),
             rows: Vec::new(),
             entries_cache: EntriesCache::default(),
@@ -266,7 +266,7 @@ impl ThreadView {
             turn_diff_source: None,
             banners: status::Banners::default(),
             local_error: None,
-            clock: Clock::now(),
+            clock: Clock::now_for(state.read(cx).environment()),
             window_height: 0.,
             measured_typography: TranscriptTypography::of(_window, cx),
             rewind: rewind::RewindUi::default(),
@@ -859,6 +859,15 @@ impl ThreadView {
     }
 
     fn rederive_rows(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut tool_call_visibility = crate::settings::store::client(cx).tool_call_visibility();
+        if tool_call_visibility == t3_core::client_settings::ToolCallVisibility::Zen && self.find.is_some() {
+            tool_call_visibility = t3_core::client_settings::ToolCallVisibility::HideAll;
+        }
+        let revealed_message_id = self
+            .find
+            .as_ref()
+            .and_then(|find| find.active_entry())
+            .or(self.citation_ui.highlighted.as_deref());
         let input = RowsInput {
             entries: self.entries_cache.entries(),
             activity: &self.activity,
@@ -866,6 +875,8 @@ impl ThreadView {
             expanded_attempt_ids: &self.ui.expanded_attempts,
             expanded_work_group_ids: &self.ui.expanded_groups,
             worktree_setup: self.setup_env.view.visible.as_ref(),
+            tool_call_visibility,
+            revealed_message_id,
         };
         let next = derive_rows(&input, &mut self.rows_cache);
         self.sync_timer(&next, cx);
@@ -895,14 +906,15 @@ impl ThreadView {
     /// up; besides it only a running setup stage ticks (`sync_setup`).
     fn sync_timer(&mut self, rows: &[Arc<TimelineRow>], cx: &mut Context<Self>) {
         let preparing = self.setup_env.view.preparing;
+        let env_id = self.state.read(cx).environment().map(str::to_owned);
         let working = rows.iter().filter(|_| !preparing).find_map(|row| match (&row.kind, &row.created_at) {
             (RowKind::Working { compacting }, Some(started)) => Some((started.clone(), *compacting)),
             _ => None,
         });
         let working = working.map(|(started, compacting)| (started, if compacting { TimerKind::Compacting } else { TimerKind::Working }));
         match working {
-            Some((started, kind)) if self.working_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&started, kind)) => {}
-            Some((started, kind)) => self.working_timer = Some(cx.new(|cx| WorkingTimer::new(started, kind, cx))),
+            Some((started, kind)) if self.working_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&started, env_id.as_deref(), kind)) => {}
+            Some((started, kind)) => self.working_timer = Some(cx.new(|cx| WorkingTimer::new(started, env_id, kind, cx))),
             None => self.working_timer = None,
         }
     }
@@ -1587,10 +1599,11 @@ impl ThreadView {
         // Only a running stage ticks, and only while setup runs: a settled card never repaints.
         let starts = self.setup_env.live_starts();
         self.setup_env.timers.retain(|started_at, _| starts.contains(started_at));
+        let env_id = self.state.read(cx).environment().map(str::to_owned);
         for started_at in starts {
             if let std::collections::hash_map::Entry::Vacant(slot) = self.setup_env.timers.entry(started_at) {
                 let started_at = slot.key().clone();
-                slot.insert(cx.new(|cx| WorkingTimer::new(started_at, TimerKind::SetupStage, cx)));
+                slot.insert(cx.new(|cx| WorkingTimer::new(started_at, env_id.clone(), TimerKind::SetupStage, cx)));
             }
         }
         true
@@ -4361,6 +4374,133 @@ mod tests {
                 view.agent_working_directories_for_key(Some("assistant:m-a-1")),
                 vec!["/repo/after".to_owned(), "/repo/latest".to_owned(), "/repo/first".to_owned()]
             );
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn zen_citation_jump_reveals_and_dismiss_re_hides_hidden_commentary_message(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let assistant_item = |pos: usize, id: &str, text: &str, phase: Option<&str>| {
+            serde_json::json!({
+                "position": pos,
+                "visibility": "local",
+                "sourceThreadId": "t1",
+                "sourceItemId": id,
+                "item": {
+                    "id": id,
+                    "threadId": "t1",
+                    "runId": "r1",
+                    "nodeId": null,
+                    "parentItemId": null,
+                    "ordinal": pos + 1,
+                    "type": "assistant_message",
+                    "status": "completed",
+                    "title": null,
+                    "startedAt": null,
+                    "completedAt": format!("2026-04-01T00:00:0{}.500Z", pos + 1),
+                    "updatedAt": format!("2026-04-01T00:00:0{}.500Z", pos + 1),
+                    "messageId": id,
+                    "text": text,
+                    "streaming": false,
+                    "phase": phase
+                }
+            })
+        };
+        let items = vec![
+            test_user_item("t1", 0, "m-u-0", "Prompt"),
+            assistant_item(1, "m-a-mid", "Intermediate commentary", None),
+            assistant_item(2, "m-a-final", "Final answer", Some("final_answer")),
+        ];
+        let runs_json = serde_json::json!([{
+            "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+            "modelSelection": {"instanceId": "replay", "model": "replay"},
+            "userMessageId": "m-u-0", "rootNodeId": null, "status": "completed",
+            "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+            "completedAt": "2026-04-01T00:00:04.000Z"
+        }]);
+        let snap = test_snapshot_json("t1", runs_json, items);
+        cx.update(|cx| {
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::ToolCallVisibility(t3_core::client_settings::ToolCallVisibility::Zen),
+                cx,
+            );
+        });
+        let env_id = state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 3, "visibleItemCount": 3
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+            state.primary_environment_id().unwrap_or("local").to_owned()
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+
+        let has_message = |view: &ThreadView, id: &str| {
+            view.rows.iter().any(|row| matches!(&row.kind, t3_core::timeline::RowKind::Message { message, .. } if message.id == id))
+        };
+
+        view.read_with(vcx, |view, _| {
+            assert!(!has_message(view, "m-a-mid"), "Zen mode must hide commentary before citation jump");
+            assert!(has_message(view, "m-a-final"), "Zen mode must keep final_answer visible");
+        });
+
+        state.update(vcx, |state, _| {
+            state.citation_source = Some(t3_core::assistant_citations::Citation {
+                version: 1,
+                environment_id: env_id,
+                thread_id: "t1".into(),
+                message_id: "m-a-mid".into(),
+                text: "Intermediate commentary".into(),
+                start: 0,
+                end: 23,
+                prefix: String::new(),
+                suffix: String::new(),
+                comment: None,
+            });
+        });
+        view.update(vcx, |view, cx| view.advance_citation_source(cx));
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.citation_ui.highlighted.as_deref(), Some("m-a-mid"));
+            assert!(has_message(view, "m-a-mid"), "Citation jump in Zen mode must reveal the hidden commentary message");
+        });
+
+        view.update(vcx, |view, cx| view.dismiss_citation_selection(cx));
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.citation_ui.highlighted, None);
+            assert!(!has_message(view, "m-a-mid"), "Dismissing citation highlight must re-hide the Zen commentary message");
         });
     }
 }

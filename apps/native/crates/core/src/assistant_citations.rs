@@ -199,7 +199,7 @@ pub fn insert_citation(prompt: &str, selected: Range<usize>, selection_reversed:
      CommentAnchor { link, inserted_spaces: Some(InsertedSpaces { before, after }) })
 }
 
-fn take_units(text: &str, limit: usize, tail: bool) -> String {
+pub fn take_units(text: &str, limit: usize, tail: bool) -> String {
     let mut units = 0;
     let chars: Vec<char> = if tail { text.chars().rev().collect() } else { text.chars().collect() };
     let mut kept = Vec::new();

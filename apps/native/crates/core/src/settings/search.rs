@@ -233,6 +233,7 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("response-streaming", "Response streaming", Threads, &["output token paragraph buffered wait turn legacy"]),
         SearchItem::new("send-shortcut", "Send shortcut", Chat, &["enter return command ctrl multiline prompt new line composer"]),
         SearchItem::new("follow-up-behavior", "Follow-up behavior", Chat, &["queue steer running turn send default behavior composer"]),
+        SearchItem::new("tool-call-visibility", "Tool calls in chat", Chat, &["activity work log tool calls show all hide successful hide all zen"]),
         SearchItem::new("provider-update-checks", "Provider update checks", Maintenance, &["installed cli versions newer available codex claude cursor grok fx kiro opencode"]),
         SearchItem::new("continue-threads-after-server-update", "Continue threads after restarts", Maintenance, &["resume running active interrupted work restart reboot machine crash desktop update automatically"]),
         SearchItem::new("background-activity", "Background activity", Maintenance, &["balanced performance battery saver advanced git fetch provider health refresh host power monitor idle policy"]),

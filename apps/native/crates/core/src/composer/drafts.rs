@@ -95,6 +95,7 @@ pub struct Draft {
     pub review_comments: Vec<super::review::ReviewComment>,
     pub attachments: Vec<SavedAttachment>,
     pub context_records: Vec<std::sync::Arc<Value>>,
+    pub reply_to: Option<Value>,
     #[serde(skip)]
     pub pending_attachment_count: usize,
     pub updated_at: i64,
@@ -103,7 +104,7 @@ pub struct Draft {
 
 impl Draft {
     pub fn has_user_content(&self) -> bool {
-        !self.prompt.trim().is_empty() || !self.attachments.is_empty() || !self.terminals.is_empty() || !self.review_comments.is_empty() || self.pending_attachment_count > 0
+        !self.prompt.trim().is_empty() || !self.attachments.is_empty() || !self.terminals.is_empty() || !self.review_comments.is_empty() || self.reply_to.is_some() || self.pending_attachment_count > 0
     }
 
     /// Nothing worth keeping: `composerDraftHasUserContent` plus the choices.
@@ -113,6 +114,7 @@ impl Draft {
             && self.pending_attachment_count == 0
             && self.terminals.is_empty()
             && self.review_comments.is_empty()
+            && self.reply_to.is_none()
             && self.workspace.is_none()
             && self.model_selection.is_none()
             && self.runtime_mode.is_none()

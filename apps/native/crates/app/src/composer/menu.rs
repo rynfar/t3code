@@ -507,7 +507,12 @@ impl Composer {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
         let base = t3_core::composer::attachments::message_context_with_reviews(text, threads, self.current_terminals(), self.current_reviews(), attachments);
         let mut records = base.and_then(|value| value["records"].as_array().cloned()).unwrap_or_default();
-        if let Some(target) = &self.snapshot.target { records.extend(self.records_for(target).iter().map(|r|(**r).clone())); }
+        if let Some(target) = &self.snapshot.target {
+            records.extend(self.records_for(target).iter().map(|r| (**r).clone()));
+            if let Some(reply) = self.reply_to_for(target) {
+                records.push(reply.clone());
+            }
+        }
         t3_core::composer::records::message_context(text, &records)
     }
 

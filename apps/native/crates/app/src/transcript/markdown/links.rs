@@ -895,7 +895,16 @@ pub fn navigate_to_citation_source(citation: Citation, state: &Entity<AppState>,
             || app.environments.active.as_deref() == Some(citation.environment_id.as_str());
         if same_env {
             app.citation_source = Some(citation.clone());
-            if app.selected_thread.as_deref() != Some(citation.thread_id.as_str()) {
+            if let Some(parent) = app
+                .thread_shell(&citation.thread_id)
+                .filter(|thread| thread.lineage.side_chat == Some(true))
+                .and_then(|thread| thread.lineage.parent_thread_id.clone())
+            {
+                if app.selected_thread.as_deref() != Some(parent.as_str()) {
+                    app.select_thread(&parent, cx);
+                }
+                app.show_side_chat_tab(&parent, &citation.thread_id, cx);
+            } else if app.selected_thread.as_deref() != Some(citation.thread_id.as_str()) {
                 if app.thread_shell(&citation.thread_id).is_some() {
                     app.select_thread(&citation.thread_id, cx);
                 } else {

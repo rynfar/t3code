@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use super::activity::{ThreadActivity, user_message_attribution};
 use super::presentation::{
-    single_tool_call_label, summarize_tool_group, tool_group_action, tool_group_summary_kind, work_entry_display_indicates_tool_failure,
+    live_thought_line, single_tool_call_label, summarize_tool_group, tool_group_action, tool_group_summary_kind,
+    work_entries_viewed_image_paths, work_entry_display_indicates_tool_failure, work_entry_hidden_by_tool_call_visibility,
     work_entry_indicates_tool_success, work_entry_is_visible_in_group, work_log_entry_is_tool_like, ToolGroupAction,
 };
 use super::compaction::{Compaction, claude_resume_compaction_age, compacting_label, compaction_title};
@@ -17,6 +18,7 @@ use super::folds::{
 };
 use super::presentation::compaction_tokens;
 use super::{ChatMessage, EntryKind, Role, RowKind, SourceActivity, TimelineEntry, TimelineRow, Tone, ToolStatus, WorkLogEntry, rows_equal};
+use crate::client_settings::ToolCallVisibility;
 use crate::turn_item::{TurnItem, TurnItemKind};
 use crate::worktree_setup::{self, Phase, Snapshot};
 
@@ -32,6 +34,8 @@ pub struct RowsInput<'a> {
     pub expanded_work_group_ids: &'a HashSet<String>,
     /// The setup card's snapshot, as `resolveVisibleWorktreeSetup` picks it.
     pub worktree_setup: Option<&'a Arc<Snapshot>>,
+    pub tool_call_visibility: ToolCallVisibility,
+    pub revealed_message_id: Option<&'a str>,
 }
 
 /// Keeps settled copies of superseded "Thinking" entries stable across derives, as the web's
@@ -47,6 +51,8 @@ struct Previous {
     activity: ThreadActivity,
     expanded: [HashSet<String>; 3],
     worktree_setup: Option<Arc<Snapshot>>,
+    tool_call_visibility: ToolCallVisibility,
+    revealed_message_id: Option<String>,
     rows: Vec<Arc<TimelineRow>>,
 }
 
@@ -60,6 +66,10 @@ fn patch_streaming_rows(input: &RowsInput, previous: &mut Previous) -> bool {
         || *input.expanded_attempt_ids != previous.expanded[1]
         || *input.expanded_work_group_ids != previous.expanded[2]
         || !same_setup(input.worktree_setup, previous.worktree_setup.as_ref())
+        || input.tool_call_visibility != previous.tool_call_visibility
+        || input.revealed_message_id != previous.revealed_message_id.as_deref()
+        || (input.tool_call_visibility == ToolCallVisibility::Zen
+            && previous.rows.iter().any(|row| matches!(row.kind, RowKind::Thinking { .. })))
     {
         return false;
     }
@@ -204,6 +214,128 @@ fn expanded_group_row(group_id: &str, created_at: &str, entries: Vec<Arc<WorkLog
     row(format!("{group_id}:details"), Some(created_at.to_owned()), RowKind::Work { entries, expanded_group: true, display_label: None })
 }
 
+fn viewed_images_row(group_id: &str, created_at: &str, entries: &[Arc<WorkLogEntry>]) -> Option<TimelineRow> {
+    let paths = work_entries_viewed_image_paths(entries);
+    (!paths.is_empty()).then(|| row(format!("{group_id}:viewed-images"), Some(created_at.to_owned()), RowKind::ViewedImages { paths }))
+}
+
+fn entry_run_id(entry: &TimelineEntry) -> Option<&str> {
+    match &entry.kind {
+        EntryKind::Message(message) if message.role == Role::Assistant => message.run_id.as_deref(),
+        EntryKind::ProposedPlan(plan) => plan.run_id.as_deref(),
+        EntryKind::HtmlRender(render) => render.run_id.as_deref(),
+        EntryKind::SentMessage(sent) => sent.run_id.as_deref(),
+        EntryKind::McpApp(app) => app.run_id.as_deref(),
+        EntryKind::Work(work) => work.run_id.as_deref(),
+        _ => None,
+    }
+}
+
+fn work_shown_as_final_answer_only(entry: &TimelineEntry, pending: &HashSet<String>) -> bool {
+    match &entry.kind {
+        EntryKind::Event { item, .. } => !is_subagent(item),
+        EntryKind::Work(work) => {
+            is_pending_approval(work, pending)
+                || work.question_answer.is_some()
+                || work.source_activity == Some(SourceActivity::Compaction)
+                || starts_response(entry)
+                || work.tone == Tone::Error
+                || work.source_activity == Some(SourceActivity::RuntimeError)
+                || (work.item_type == Some("error") && work.status != Some(ToolStatus::Completed))
+        }
+        EntryKind::Message(_) | EntryKind::ProposedPlan(_) | EntryKind::HtmlRender(_) | EntryKind::SentMessage(_) | EntryKind::McpApp(_) => true,
+    }
+}
+
+fn derive_in_flight_steer_answer_ids(entries: &[Arc<TimelineEntry>]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let mut awaiting_reply = false;
+    let mut candidate: Option<&str> = None;
+    for entry in entries {
+        if entry.work().is_some_and(|w| w.item_type == Some("reasoning")) {
+            continue;
+        }
+        let reply = entry.message().filter(|m| m.role == Role::Assistant);
+        if let (Some(id), Some(_)) = (candidate, reply) {
+            ids.insert(id.to_owned());
+        }
+        candidate = None;
+        if entry.message().is_some_and(|m| m.role == Role::User && m.is_steer()) {
+            awaiting_reply = true;
+        } else if entry.message().is_some_and(|m| m.role == Role::User) {
+            awaiting_reply = false;
+        } else if let Some(reply) = reply
+            && awaiting_reply
+        {
+            candidate = Some(reply.id.as_str());
+            awaiting_reply = false;
+        }
+    }
+    ids
+}
+
+/// Latest live thought/text line in the current response segment (`liveAnswerPreview`).
+pub fn live_answer_preview(entries: &[Arc<TimelineEntry>]) -> Option<String> {
+    let boundary = entries.iter().rposition(|e| starts_response(e));
+    let start = boundary.map_or(0, |i| i + 1);
+    for entry in entries[start.min(entries.len())..].iter().rev() {
+        let text = match &entry.kind {
+            EntryKind::Message(message) if message.role == Role::Assistant => message.text.as_ref(),
+            EntryKind::Work(work) if work.item_type == Some("reasoning") => work.detail.as_deref().unwrap_or_default(),
+            _ => "",
+        };
+        let line = live_thought_line(text);
+        if !line.is_empty() {
+            return Some(line);
+        }
+    }
+    None
+}
+
+fn apply_tool_call_visibility(
+    entries: Vec<Arc<TimelineEntry>>,
+    visibility: ToolCallVisibility,
+    revealed_message_id: Option<&str>,
+    activity: &ThreadActivity,
+) -> Vec<Arc<TimelineEntry>> {
+    match visibility {
+        ToolCallVisibility::ShowAll => entries,
+        ToolCallVisibility::HideSuccessful | ToolCallVisibility::HideAll => entries
+            .into_iter()
+            .filter(|entry| entry.work().is_none_or(|w| !work_entry_hidden_by_tool_call_visibility(w, visibility)))
+            .collect(),
+        ToolCallVisibility::Zen => {
+            let answering = activity.is_working && !activity.latest_run.as_ref().is_some_and(|r| r.turn_ended);
+            let answering_run_id = if answering { unsettled_run_id(activity) } else { None };
+            let answering_from = if answering {
+                entries.iter().rposition(|e| starts_response(e)).map_or(0, |i| i + 1)
+            } else {
+                entries.len()
+            };
+            let terminal_ids = terminal_assistant_ids(&entries);
+            let steer_answer_ids = derive_in_flight_steer_answer_ids(&entries);
+            let retained_reply_ids = complete_superseded_reply_ids(&entries);
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(index, entry)| {
+                    let Some(message) = entry.message() else {
+                        return work_shown_as_final_answer_only(entry, &activity.pending_approval_ids);
+                    };
+                    message.role != Role::Assistant
+                        || revealed_message_id == Some(message.id.as_str())
+                        || steer_answer_ids.contains(&message.id)
+                        || retained_reply_ids.contains(&entry.id)
+                        || (terminal_ids.contains(&message.id)
+                            && *index < answering_from
+                            && answering_run_id.as_deref().is_none_or(|run| message.run_id.as_deref() != Some(run)))
+                })
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        }
+    }
+}
+
 /// `deriveMessagesTimelineRows`. Unchanged rows keep their `Arc` across derives
 /// (`computeStableMessagesTimelineRows`), so a view can diff them by pointer.
 pub fn derive_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<Arc<TimelineRow>> {
@@ -227,6 +359,8 @@ pub fn derive_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<Arc<Timeline
         activity: input.activity.clone(),
         expanded: [input.expanded_run_ids.clone(), input.expanded_attempt_ids.clone(), input.expanded_work_group_ids.clone()],
         worktree_setup: input.worktree_setup.cloned(),
+        tool_call_visibility: input.tool_call_visibility,
+        revealed_message_id: input.revealed_message_id.map(str::to_owned),
         rows: rows.clone(),
     });
     rows
@@ -299,15 +433,38 @@ pub fn fold_membership(entries: &[Arc<TimelineEntry>], activity: &ThreadActivity
 }
 
 fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow> {
-    let entries = without_usage_limit_notice_rows(
-        without_subagent_delegation_rows(settle_superseded_reasoning(input.entries, cache)),
-        input.activity.usage_limit_notice.as_ref(),
-    );
-    let entries = entries.as_slice();
+    let settled = settle_superseded_reasoning(input.entries, cache);
+    let raw_entries = without_usage_limit_notice_rows(settled, input.activity.usage_limit_notice.as_ref());
     let activity = input.activity;
+    let visible_entries = apply_tool_call_visibility(
+        without_subagent_delegation_rows(raw_entries.clone()),
+        input.tool_call_visibility,
+        input.revealed_message_id,
+        activity,
+    );
+    let entries = visible_entries.as_slice();
+    let mut embedded_result_run_ids: HashSet<String> = HashSet::new();
+    for entry in entries {
+        match &entry.kind {
+            EntryKind::HtmlRender(render) => {
+                if let Some(run_id) = &render.run_id {
+                    embedded_result_run_ids.insert(run_id.clone());
+                }
+            }
+            EntryKind::McpApp(app) => {
+                if let Some(run_id) = &app.run_id {
+                    embedded_result_run_ids.insert(run_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
     let pending = &activity.pending_approval_ids;
     let is_working = activity.is_working;
-    let FoldSetup { unsettled, terminal_ids, itemized, superseded, active_runs, runless, folds } = fold_setup(entries, activity);
+    let FoldSetup { unsettled, terminal_ids, itemized, superseded, active_runs, runless, mut folds } = fold_setup(entries, activity);
+    if input.tool_call_visibility == ToolCallVisibility::Zen {
+        folds.clear();
+    }
 
     let mut collapsed: HashSet<String> = HashSet::new();
     let mut collapsed_members: HashSet<String> = HashSet::new();
@@ -346,7 +503,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             let Some(work) = entry.work() else { break };
             if work.tone == Tone::Error
                 || work.source_activity == Some(SourceActivity::RuntimeError)
-                || matches!(work.item_type, Some("system_notice" | "notification"))
+                || matches!(work.item_type, Some("system_notice" | "notification" | "todo_list"))
                 || work.question_answer.is_some()
                 || is_pending_approval(work, pending)
                 || !run_is_active(work.run_id.as_deref())
@@ -410,7 +567,15 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
 
     let mut rows: Vec<TimelineRow> = Vec::new();
     let mut has_activity_row = false;
+    let ended_run_id = activity.latest_run.as_ref().filter(|run| run.turn_ended).map(|run| run.run_id.as_str());
+    let zen_answer_landed = input.tool_call_visibility == ToolCallVisibility::Zen
+        && ended_run_id.is_some_and(|ended| {
+            entries.iter().rposition(|e| entry_run_id(e) == Some(ended)).is_some_and(|i| i >= header_index)
+        });
     let working_row = || {
+        if zen_answer_landed {
+            return None;
+        }
         compaction.working_row().map(|compacting| {
             let started = compaction
                 .resume_started_at()
@@ -434,6 +599,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
                 if *expanded {
                     rows.push(expanded_group_row(group_id, live.created_at.as_deref().unwrap_or_default(), group.clone()));
                 }
+                rows.extend(viewed_images_row(group_id, live.created_at.as_deref().unwrap_or_default(), group));
             }
         }
         if entry.event().is_some_and(|item| {
@@ -550,6 +716,7 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             EntryKind::ProposedPlan(plan) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::ProposedPlan(plan.clone()))),
             EntryKind::McpApp(app) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::McpApp(app.clone()))),
             EntryKind::HtmlRender(render) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::HtmlRender(render.clone()))),
+            EntryKind::SentMessage(sent) => rows.push(row(entry.id.clone(), Some(entry.created_at.clone()), RowKind::SentMessage(sent.clone()))),
             EntryKind::Event { item, visibility } => {
                 if let Some(previous) = rows.last_mut()
                     && let RowKind::Event { item: previous_item, subagents, .. } = &mut previous.kind
@@ -597,12 +764,15 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
                 }
                 let in_progress = message.role == Role::Assistant && run_is_active(message.run_id.as_deref());
                 let show_meta = message.role == Role::Assistant && terminal_ids.contains(&message.id) && !in_progress;
+                let suppress_empty_response = message.role == Role::Assistant
+                    && message.run_id.as_deref().is_some_and(|run| embedded_result_run_ids.contains(run));
                 rows.push(row(
                     entry.id.clone(),
                     Some(entry.created_at.clone()),
                     RowKind::Message {
                         message: message.clone(),
                         show_assistant_meta: show_meta,
+                        suppress_empty_response,
                         show_copy: show_meta,
                         copy_streaming: message.streaming || in_progress,
                         grouped_with_next: false,
@@ -632,23 +802,28 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             Some(anchor) => {
                 let group_id = work_group_id(&anchor.id);
                 let expanded = input.expanded_work_group_ids.contains(&group_id);
+                let work_entries: Vec<Arc<WorkLogEntry>> = visible_active.iter().filter_map(|e| e.work().cloned()).collect();
                 rows.push(row(
                     LIVE_ACTIVITY_ROW_ID,
                     activity.active_turn_started_at.clone(),
-                    RowKind::Thinking { group_id: Some(group_id.clone()), expanded, label: None },
+                    RowKind::Thinking { group_id: Some(group_id.clone()), expanded, label: None, live_answer_preview: None },
                 ));
                 if expanded {
-                    rows.push(expanded_group_row(&group_id, &anchor.created_at, visible_active.iter().filter_map(|e| e.work().cloned()).collect()));
+                    rows.push(expanded_group_row(&group_id, &anchor.created_at, work_entries.clone()));
                 }
+                rows.extend(viewed_images_row(&group_id, &anchor.created_at, &work_entries));
             }
             None => {
-                let waiting_on = unsettled.as_deref().map_or(0, |run_id| running_subagents_at_run_tail(entries, run_id));
+                let waiting_on = unsettled.as_deref().map_or(0, |run_id| running_subagents_at_run_tail(&raw_entries, run_id));
                 let waiting_label = (waiting_on > 0).then(|| crate::lineage::waiting_on_subagents_label(waiting_on));
                 let label = provider_starting.or(waiting_label);
+                let answer_preview = (input.tool_call_visibility == ToolCallVisibility::Zen)
+                    .then(|| live_answer_preview(&raw_entries))
+                    .flatten();
                 rows.push(row(
                     LIVE_ACTIVITY_ROW_ID,
                     activity.active_turn_started_at.clone(),
-                    RowKind::Thinking { group_id: None, expanded: false, label },
+                    RowKind::Thinking { group_id: None, expanded: false, label, live_answer_preview: answer_preview },
                 ));
             }
         }
@@ -721,43 +896,44 @@ fn push_work_group(
         ));
         *has_activity_row = true;
         if expanded {
-            rows.push(expanded_group_row(&group_id, &entry.created_at, visible));
+            rows.push(expanded_group_row(&group_id, &entry.created_at, visible.clone()));
         }
-        return;
+    } else {
+        let refs: Vec<&WorkLogEntry> = visible.iter().map(|w| w.as_ref()).collect();
+        if let [single] = refs.as_slice()
+            && work_log_entry_is_tool_like(single)
+        {
+            let label = if tool_group_action(single) == ToolGroupAction::Edit { summarize_tool_group(&refs).0 } else { single_tool_call_label(single) };
+            rows.push(row(entry.id.clone(), created_at, RowKind::Work { entries: visible.clone(), expanded_group: false, display_label: Some(label) }));
+        } else {
+            let summary_kind = tool_group_summary_kind(&refs);
+            let tool_surface = refs.iter().rev().find_map(|w| w.tool_surface.clone());
+            let has_failure = refs.iter().rev().find(|w| work_log_entry_is_tool_like(w)).is_some_and(|w| work_entry_display_indicates_tool_failure(w));
+            let summary = match refs.as_slice() {
+                [single] if !work_log_entry_is_tool_like(single) => single.label.clone(),
+                _ => summarize_tool_group(&refs).0,
+            };
+            rows.push(row(
+                format!("work-toggle:{}", entry.id),
+                created_at,
+                RowKind::WorkToggle {
+                    run_id: refs.first().and_then(|w| w.run_id.clone()),
+                    group_id: group_id.clone(),
+                    entries: visible.clone(),
+                    hidden_count: refs.len(),
+                    expanded,
+                    summary,
+                    summary_kind,
+                    tool_surface,
+                    has_failure,
+                },
+            ));
+            if expanded {
+                rows.push(expanded_group_row(&group_id, &entry.created_at, visible.clone()));
+            }
+        }
     }
-    let refs: Vec<&WorkLogEntry> = visible.iter().map(|w| w.as_ref()).collect();
-    if let [single] = refs.as_slice()
-        && work_log_entry_is_tool_like(single)
-    {
-        let label = if tool_group_action(single) == ToolGroupAction::Edit { summarize_tool_group(&refs).0 } else { single_tool_call_label(single) };
-        rows.push(row(entry.id.clone(), created_at, RowKind::Work { entries: visible, expanded_group: false, display_label: Some(label) }));
-        return;
-    }
-    let summary_kind = tool_group_summary_kind(&refs);
-    let tool_surface = refs.iter().rev().find_map(|w| w.tool_surface.clone());
-    let has_failure = refs.iter().rev().find(|w| work_log_entry_is_tool_like(w)).is_some_and(|w| work_entry_display_indicates_tool_failure(w));
-    let summary = match refs.as_slice() {
-        [single] if !work_log_entry_is_tool_like(single) => single.label.clone(),
-        _ => summarize_tool_group(&refs).0,
-    };
-    rows.push(row(
-        format!("work-toggle:{}", entry.id),
-        created_at,
-        RowKind::WorkToggle {
-            run_id: refs.first().and_then(|w| w.run_id.clone()),
-            group_id: group_id.clone(),
-            entries: visible.clone(),
-            hidden_count: refs.len(),
-            expanded,
-            summary,
-            summary_kind,
-            tool_surface,
-            has_failure,
-        },
-    ));
-    if expanded {
-        rows.push(expanded_group_row(&group_id, &entry.created_at, visible));
-    }
+    rows.extend(viewed_images_row(&group_id, &entry.created_at, &visible));
 }
 
 fn attach_created_thread_summaries(rows: Vec<TimelineRow>, entries: &[Arc<TimelineEntry>], collapsed_members: &HashSet<String>) -> Vec<TimelineRow> {
@@ -996,7 +1172,7 @@ mod tests {
         let act = activity(false, Some(run("r1", "completed")), None);
         let empty = HashSet::new();
         let rows = derive_rows(
-            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &empty, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None },
+            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &empty, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None, tool_call_visibility: ToolCallVisibility::default(), revealed_message_id: None },
             &mut RowsCache::default(),
         );
         assert!(rows.iter().all(|r| r.id != "q-resume"), "answered resume question should fold into compaction");
@@ -1016,7 +1192,7 @@ mod tests {
         let act = activity(true, Some(run("r1", "running")), Some("2026-11-01T00:00:00.000Z"));
         let empty = HashSet::new();
         let rows = derive_rows(
-            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &empty, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None },
+            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &empty, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None, tool_call_visibility: ToolCallVisibility::default(), revealed_message_id: None },
             &mut RowsCache::default(),
         );
         assert!(rows.iter().all(|r| !matches!(r.kind, RowKind::ContextCompaction { .. })));
@@ -1072,7 +1248,7 @@ mod tests {
         let empty = HashSet::new();
         let expanded_runs = HashSet::from(["r1".to_owned()]);
         let rows = derive_rows(
-            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &expanded_runs, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None },
+            &RowsInput { entries: &entries, activity: &act, expanded_run_ids: &expanded_runs, expanded_attempt_ids: &empty, expanded_work_group_ids: &empty, worktree_setup: None, tool_call_visibility: ToolCallVisibility::default(), revealed_message_id: None },
             &mut RowsCache::default(),
         );
         let work_ids: Vec<&str> = rows.iter().flat_map(|r| match &r.kind {

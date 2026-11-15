@@ -55,7 +55,10 @@ impl Composer {
         }
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("Add an optional comment...").submit_on_enter(true));
         input.update(cx, |input, cx| {
-            input.set_value(anchor.link.citation.comment.as_deref().unwrap_or_default(), window, cx);
+            let text = anchor.link.citation.comment.as_deref().unwrap_or_default();
+            let end = text.len();
+            input.set_value(text, window, cx);
+            input.set_selected_range(end..end, cx);
             input.focus(window, cx);
         });
         let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {

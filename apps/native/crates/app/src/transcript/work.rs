@@ -184,8 +184,9 @@ fn subagent_notification_link(entry: &WorkLogEntry, env: &RowEnv, cx: &mut Conte
     let right_time = if !resumed {
         Some(timestamp(&env.clock, &entry.created_at, false, cx))
     } else if active {
+        let env_id = env.state.read(cx).environment().map(str::to_owned);
         agent.started_at.clone().map(|started_at| {
-            SubagentLiveElapsed { item_id: SharedString::from(format!("notif:{}", entry.id)), started_at }.into_any_element()
+            SubagentLiveElapsed { item_id: SharedString::from(format!("notif:{}", entry.id)), started_at, env_id }.into_any_element()
         })
     } else {
         agent
@@ -460,8 +461,8 @@ fn entry_row(
     if failed && !severe {
         trailing.push(Icon::WorkX.render(rem(12.).to_pixels(cx.theme().font_size), hsla(p.tool_error_icon).opacity(0.4)).into_any_element());
     }
-    trailing.push(timestamp(&env.clock, &entry.created_at, false, cx));
     trailing.push(chevron(expanded, can_expand, cx));
+    trailing.push(timestamp(&env.clock, &entry.created_at, false, cx));
     let heading = if let Some((prefix, target_id, title)) = thread_read {
         h_flex()
             .min_w_0()
@@ -894,9 +895,15 @@ pub fn live_row(row: &TimelineRow, env: &RowEnv, cx: &mut Context<ThreadView>) -
 }
 
 /// `ThinkingTimelineRow`.
-pub fn thinking_row(id: &str, group_id: Option<&str>, label: Option<&str>, cx: &mut Context<ThreadView>) -> AnyElement {
+pub fn thinking_row(
+    id: &str,
+    group_id: Option<&str>,
+    label: Option<&str>,
+    live_answer_preview: Option<&str>,
+    cx: &mut Context<ThreadView>,
+) -> AnyElement {
     let p = palette(cx);
-    let label = label.unwrap_or("Thinking").to_owned();
+    let label = label.or(live_answer_preview).unwrap_or("Thinking").to_owned();
     let activity = live_activity(div().text_color(hsla(p.secondary_label)).child(label).into_any_element(), Icon::WorkBrain, false, cx);
     let frame = work_row_frame(SharedString::from(format!("thinking:{id}")), false).child(activity);
     match group_id {
@@ -906,6 +913,39 @@ pub fn thinking_row(id: &str, group_id: Option<&str>, label: Option<&str>, cx: &
         }
         None => frame.into_any_element(),
     }
+}
+
+/// `ViewedImagesTimelineRow`: workspace images viewed inside a collapsed tool group.
+pub fn viewed_images_row(id: &str, paths: &[String], env: &RowEnv, cx: &mut Context<ThreadView>) -> AnyElement {
+    let Some(thread_id) = env.thread_id.filter(|id| !id.trim().is_empty()) else {
+        return div().into_any_element();
+    };
+    let items: Vec<ViewerItem> = paths
+        .iter()
+        .filter_map(|path| {
+            let viewed = t3_core::timeline::resolve_viewed_image_asset(path, thread_id, env.workspace_root)?;
+            Some(ViewerItem::image(viewed.source, viewed.alt))
+        })
+        .collect();
+    if items.is_empty() {
+        return div().into_any_element();
+    }
+    h_flex()
+        .id(SharedString::from(format!("viewed-images:{id}")))
+        .flex_wrap()
+        .items_start()
+        .gap(px(8.))
+        .px(px(2.))
+        .children(items.iter().enumerate().map(|(index, viewed)| {
+            tool_output_image_gallery_items(
+                SharedString::from(format!("viewed-images:{id}:{index}")),
+                items.clone(),
+                index,
+                &viewed.name,
+                cx,
+            )
+        }))
+        .into_any_element()
 }
 
 /// `WorkGroupToggleTimelineRow`: the "N tool calls" summary that opens the group.

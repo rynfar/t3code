@@ -102,10 +102,15 @@ impl ThreadView {
 
     pub(super) fn dismiss_citation_selection(&mut self, cx: &mut Context<Self>) {
         close_sent_citation_popover(cx);
-        if self.citation_ui.selection.take().is_some() || self.citation_ui.highlighted.take().is_some() {
+        let selection = self.citation_ui.selection.take().is_some();
+        let highlighted = self.citation_ui.highlighted.take().is_some();
+        let pending = self.citation_ui.pending.take().is_some();
+        if highlighted {
+            self.rederive(cx);
+        }
+        if selection || highlighted || pending {
             cx.notify();
         }
-        self.citation_ui.pending = None;
     }
 
     pub(super) fn render_citation_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -129,7 +134,6 @@ impl ThreadView {
         let x = f32::from(active.position.x).clamp(8., (f32::from(bounds.width) - 368.).max(8.));
         let y = (f32::from(active.position.y) + 12.).clamp(8., (f32::from(bounds.height) - 220.).max(8.));
         let copy_text = active.citation.text.clone();
-        let copy_state = active.state.clone();
         let go_citation = active.citation.clone();
         let go_state = active.state.clone();
         let comment = active.citation.comment.clone().filter(|c| !c.trim().is_empty());
@@ -223,9 +227,6 @@ impl ThreadView {
                                         Some(Icon::Copy),
                                         move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
-                                            copy_state.update(cx, |app, cx| {
-                                                app.show_toast(Toast::new(ToastKind::Success, "Copied quote"), cx);
-                                            });
                                             close_sent_citation_popover(cx);
                                         },
                                         cx,

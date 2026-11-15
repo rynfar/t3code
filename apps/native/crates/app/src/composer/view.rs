@@ -31,7 +31,7 @@ const REOPEN_GUARD: Duration = Duration::from_millis(300);
 
 impl Composer {
     /// `ChatComposer` placeholders, most specific first.
-    fn placeholder(&self, cx: &App) -> &'static str {
+    fn placeholder(&self, _cx: &App) -> &'static str {
         if let Some(approval) = self.snapshot.pending.approvals.first() {
             return if approval.supports_feedback {
                 "Send feedback to decline this request"
@@ -45,9 +45,6 @@ impl Composer {
             } else {
                 "Choose an option above"
             };
-        }
-        if self.active_plan_follow_up(cx).is_some() {
-            return "Add feedback to refine the plan, or leave this blank to implement it";
         }
         DEFAULT_PLACEHOLDER
     }
@@ -215,14 +212,10 @@ impl Composer {
                 )
                 .into_any_element();
         }
-        let has_text = self.has_text || !self.staged().is_empty();
+        let has_text = self.has_text || !self.staged().is_empty() || self.current_reply_to().is_some();
         let editing_queued = self.editing_queued().is_some();
         if running && !has_text && !editing_queued {
             return stop().into_any_element();
-        }
-        if !running && !editing_queued && self.active_plan_follow_up(cx).is_some() && (self.has_text || !self.snapshot.can_resume) {
-            let disabled = self.sending || self.is_rewinding(cx) || resolved.model.is_none() || self.snapshot.setup_blocks_send;
-            return self.render_plan_primary(self.has_text, disabled, cx);
         }
         let attachment_block = t3_core::composer::attachments::send_block_reason(&self.staged_attachments());
         let settings = self.state.read(cx).client_settings;
@@ -366,7 +359,7 @@ impl Render for Composer {
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))), |this| this.children(self.render_usage_limits_banner(false, cx)))
                 .when_some(question, |this, input| this.child(self.render_question(&input, cx)))
                 .when(self.active_input().is_none(), |this| {
-                    this.children(self.active_plan_follow_up(cx).map(|plan| self.render_plan_follow_up_banner(plan, cx)))
+                    this.children(self.render_reply_banner(cx))
                 })
                 .children(self.render_stash_badge(cx))
                 .children(self.render_stash_menu(cx))

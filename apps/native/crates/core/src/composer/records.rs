@@ -14,6 +14,51 @@ pub fn environment_record(environment_id: &str, label: &str) -> Value {
     json!({"version":1,"kind":"environment","contextId":kind_scoped_context_id("environment", environment_id),"label":sanitize_context_label(label,"environment"),"environmentId":environment_id})
 }
 
+/// `responseContextRecord`: one record per assistant response (`RESPONSE_LABEL_MAX_CHARS = 64`).
+pub fn response_record(
+    citation: &crate::assistant_citations::Citation,
+    item_id: &str,
+    subagents: &[(String, String, Option<String>)],
+) -> Value {
+    let preview = crate::assistant_citations::take_units(&citation.text, 64, false);
+    let label = sanitize_context_label(&preview, "response");
+    let mut record = json!({
+        "version": 1,
+        "kind": "response",
+        "contextId": kind_scoped_context_id("response", &citation.message_id),
+        "label": label,
+        "citation": citation,
+        "itemId": item_id,
+    });
+    if !subagents.is_empty() {
+        let items: Vec<Value> = subagents
+            .iter()
+            .take(20)
+            .map(|(thread_id, title, env_id)| {
+                let mut item = json!({
+                    "threadId": thread_id,
+                    "title": sanitize_context_label(title, "response"),
+                });
+                if let Some(env) = env_id.as_deref().filter(|s| !s.is_empty()) {
+                    item["environmentId"] = json!(env);
+                }
+                item
+            })
+            .collect();
+        record["subagents"] = Value::Array(items);
+    }
+    record
+}
+
+pub fn response_citation(record: &Value) -> Option<crate::assistant_citations::Citation> {
+    if field(record, "kind") != "response" {
+        return None;
+    }
+    serde_json::from_value::<crate::assistant_citations::Citation>(record.get("citation")?.clone())
+        .ok()
+        .filter(crate::assistant_citations::Citation::valid)
+}
+
 pub fn field<'a>(record: &'a Value, key: &str) -> &'a str {
     record.get(key).and_then(Value::as_str).unwrap_or_default()
 }
@@ -163,6 +208,7 @@ fn valid_record(record: &Value) -> bool {
             "thread" => {
                 !field(record, "threadId").is_empty() && !field(record, "environmentId").is_empty()
             }
+            "response" => !field(record, "itemId").is_empty() && response_citation(record).is_some(),
             "environment" => !field(record, "environmentId").is_empty(),
             "terminal" => {
                 ["terminalId", "terminalLabel", "text"]

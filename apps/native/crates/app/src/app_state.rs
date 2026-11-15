@@ -62,6 +62,8 @@ pub enum AppEvent {
     Rewind,
     /// A terminal selection is waiting for the composer (`take_terminal_context`).
     ComposerTerminalContext,
+    /// A response reply record is waiting for the composer.
+    ComposerReply,
     ComposerReviewComment,
     ReviewComments,
     RemoveReviewComment,
@@ -163,6 +165,7 @@ pub struct AppState {
     remove_review_comment: Option<(String, String)>,
     composer_review_comment: Option<(String, t3_core::composer::review::ReviewComment)>,
     pub composer_citation: Option<t3_core::assistant_citations::Citation>,
+    pub composer_reply: Option<(String, serde_json::Value)>,
     pub citation_source: Option<t3_core::assistant_citations::Citation>,
     pending_thread_find: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::timeline::PendingThreadFind)>,
     pending_composer_file_drop: Option<(t3_core::sidebar::tag_filter::ThreadKey, Vec<std::path::PathBuf>)>,
@@ -274,6 +277,7 @@ impl AppState {
             remove_review_comment: None,
             composer_review_comment: None,
             composer_citation: None,
+            composer_reply: None,
             citation_source: None,
             pending_thread_find: None,
             pending_composer_file_drop: None,
@@ -369,6 +373,7 @@ impl AppState {
         self.composer_mentions.clear();
         self.composer_terminal_context = None;
         self.composer_citation = None;
+        self.composer_reply = None;
         self.composer_review_comment = None;
         self.review_comments.clear();
         self.remove_review_comment = None;
@@ -731,7 +736,9 @@ impl AppState {
             self.pending_composer_file_drop = None;
         }
         if self.citation_source.as_ref().is_some_and(|citation| {
-            citation.thread_id != thread_id
+            let matches_thread = citation.thread_id == thread_id
+                || self.thread_shell(&citation.thread_id).is_some_and(|thread| t3_core::side_chat::is_side_chat_of(thread, thread_id));
+            !matches_thread
                 || (!citation.environment_id.is_empty()
                     && self.environment() != Some(citation.environment_id.as_str())
                     && self.environments.active.as_deref() != Some(citation.environment_id.as_str()))
