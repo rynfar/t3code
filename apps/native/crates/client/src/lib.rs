@@ -30,6 +30,7 @@ pub mod chatgpt;
 pub mod theme_import;
 
 pub mod vcs;
+pub mod voice;
 
 pub mod environments;
 pub mod open_vsx;
