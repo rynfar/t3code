@@ -42,6 +42,17 @@ pub fn fields(driver: &str, config: Option<&Value>) -> Vec<Field> {
         .collect()
 }
 
+/// Keys and labels of a driver's schema fields that accept a `SecretReference`.
+pub fn secret_reference_fields(driver: &str) -> Vec<(&'static str, &'static str)> {
+    FIELDS
+        .get(driver)
+        .into_iter()
+        .flatten()
+        .filter(|f| f.accepts_secret_reference)
+        .map(|f| (f.key.as_str(), f.label.as_str()))
+        .collect()
+}
+
 pub fn managed_runtime(
     instance: &ProviderInstanceConfig,
     provider: Option<&crate::server_config::ServerProvider>,

@@ -28,10 +28,17 @@ struct SecretDialog {
     focus: FocusHandle,
 }
 
+struct RemoveSecretDialog {
+    id: String,
+    label: String,
+    focus: FocusHandle,
+}
+
 pub(crate) struct SecretsState {
     name: Entity<InputState>,
     account: Entity<InputState>,
     dialog: Option<SecretDialog>,
+    remove_dialog: Option<RemoveSecretDialog>,
     /// Providers whose account is shown in the clear.
     revealed: HashSet<String>,
     _subscriptions: Vec<Subscription>,
@@ -50,7 +57,7 @@ impl SecretsState {
             cx.subscribe_in(&name, window, move |this, _, event: &InputEvent, _, cx| on_event(this, event, cx)),
             cx.subscribe_in(&account, window, move |this, _, event: &InputEvent, _, cx| on_event(this, event, cx)),
         ];
-        SecretsState { name, account, dialog: None, revealed: HashSet::new(), _subscriptions: subscriptions }
+        SecretsState { name, account, dialog: None, remove_dialog: None, revealed: HashSet::new(), _subscriptions: subscriptions }
     }
 
     pub(super) fn inputs(&self) -> impl Iterator<Item = &Entity<InputState>> {
@@ -59,7 +66,7 @@ impl SecretsState {
 
     /// Escape closes the dialog before it closes settings (`SettingsView::on_close`).
     pub(super) fn dismiss(&mut self) -> bool {
-        self.dialog.take().is_some()
+        self.dialog.take().is_some() | self.remove_dialog.take().is_some()
     }
 }
 
@@ -86,6 +93,7 @@ impl SettingsView {
             input.focus(window, cx);
         });
         self.secrets.account.update(cx, |input, cx| input.set_value(draft.account, window, cx));
+        self.secrets.remove_dialog = None;
         self.secrets.dialog = Some(SecretDialog { target, submitted: false, focus: cx.focus_handle() });
         cx.notify();
     }
@@ -118,26 +126,32 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// `RemoveSecretProviderButton`: asks first; the secrets themselves are untouched.
-    fn request_remove_secret_provider(&mut self, id: String, label: &str, cx: &mut Context<Self>) {
-        let (title, description) = secrets::remove_confirmation(label);
-        let state = self.state.clone();
-        crate::dialog::ask(
-            title,
-            description,
-            "Remove provider",
-            move |_, cx| {
-                store::update_server(&state, ServerSettingChange::Prepared(secrets::remove_payload(&id)), cx);
-            },
-            cx,
-        );
+    /// `RemoveSecretProviderButton`: asks first, listing settings reading from it; secrets stay untouched.
+    fn request_remove_secret_provider(&mut self, id: String, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        self.secrets.dialog = None;
+        self.secrets.remove_dialog = Some(RemoveSecretDialog { id, label: label.to_owned(), focus });
+        cx.notify();
+    }
+
+    fn confirm_remove_secret_provider(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self.secrets.remove_dialog.take() else {
+            return;
+        };
+        store::update_server(&self.state, ServerSettingChange::Prepared(secrets::remove_payload(&dialog.id)), cx);
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 
     pub(super) fn secrets_page(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
-        // The web stops rendering an edit whose provider another client removed.
+        // The web stops rendering an edit/remove whose provider another client removed.
         let providers = self.thread_settings(cx).map(|config| config.settings.secret_providers.clone()).unwrap_or_default();
         if self.secrets.dialog.as_ref().is_some_and(|dialog| !dialog.target.is_open_in(&providers)) {
             self.secrets.dialog = None;
+        }
+        if self.secrets.remove_dialog.as_ref().is_some_and(|dialog| providers.get(&dialog.id).is_none()) {
+            self.secrets.remove_dialog = None;
         }
         let p = palette(cx);
         let environment = self.environment_label(cx);
@@ -182,7 +196,7 @@ impl SettingsView {
                         .child(
                             Button::new(SharedString::from(format!("secret-provider-remove-{id}")), ButtonVariant::Ghost, ButtonSize::Xs)
                                 .label("Remove")
-                                .on_click(cx.listener(move |this, _, _, cx| this.request_remove_secret_provider(id.clone(), &label, cx))),
+                                .on_click(cx.listener(move |this, _, window, cx| this.request_remove_secret_provider(id.clone(), &label, window, cx))),
                         );
                     row.when(editable, |row| row.control(controls)).into_any_element()
                 })
@@ -237,6 +251,66 @@ impl SettingsView {
     }
 
     pub(super) fn secret_dialog_overlay(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if let Some(dialog) = self.secrets.remove_dialog.as_ref() {
+            let p = palette(cx);
+            let config = self.thread_settings(cx)?;
+            config.settings.secret_providers.get(&dialog.id)?;
+            let uses = secrets::secret_provider_uses(&config.settings, &dialog.id);
+            let (title, description) = secrets::remove_confirmation(&dialog.label, uses.is_empty());
+            let body = if uses.is_empty() {
+                div().into_any_element()
+            } else {
+                v_flex()
+                    .gap(r(4.))
+                    .px(r(12.))
+                    .py(r(8.))
+                    .rounded(r(8.))
+                    .border_1()
+                    .border_color(hsla(p.border))
+                    .bg(hsla(p.muted).opacity(0.4))
+                    .children(uses.into_iter().map(|entry| {
+                        h_flex()
+                            .gap(r(6.))
+                            .items_start()
+                            .text_xs()
+                            .text_color(hsla(p.muted_foreground))
+                            .child("\u{2022}")
+                            .child(div().min_w_0().child(entry.label))
+                    }))
+                    .into_any_element()
+            };
+            let footer = dialog_footer(
+                false,
+                vec![
+                    Button::new("secret-provider-remove-cancel", ButtonVariant::Outline, ButtonSize::Default)
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, window, cx| this.close_secret_dialog(window, cx)))
+                        .into_any_element(),
+                    Button::new("secret-provider-remove-confirm", ButtonVariant::DestructiveOutline, ButtonSize::Default)
+                        .label("Remove provider")
+                        .on_click(cx.listener(|this, _, window, cx| this.confirm_remove_secret_provider(window, cx)))
+                        .into_any_element(),
+                ],
+                cx,
+            );
+            let view = cx.entity().downgrade();
+            let frame = DialogFrame {
+                id: "secret-provider-remove-dialog",
+                title: title.into(),
+                description: description.into(),
+                max_width: 448.,
+                body,
+                footer: footer.into_any_element(),
+                focus: dialog.focus.clone(),
+            };
+            return Some(frame.render(
+                window,
+                move |window, cx| {
+                    let _ = view.update(cx, |this, cx| this.close_secret_dialog(window, cx));
+                },
+                cx,
+            ));
+        }
         let dialog = self.secrets.dialog.as_ref()?;
         let p = palette(cx);
         let config = self.thread_settings(cx);
@@ -295,5 +369,147 @@ impl SettingsView {
             },
             cx,
         ))
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod parity_tests {
+    use super::*;
+    use gpui::{AppContext, HeadlessAppContext, IntoElement, ParentElement, Render, Styled, div, px, size};
+    use serde_json::json;
+    use std::sync::Arc;
+    use t3_core::settings::search::Section;
+
+    struct SettingsFrame;
+    impl Render for SettingsFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().bg(hsla(palette(cx).background)).children(super::super::overlay(window, cx))
+        }
+    }
+
+    #[test]
+    fn remove_dialog_lists_uses_dismisses_and_renders() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let drive = |cx: &mut HeadlessAppContext| {
+            cx.run_until_parked();
+            runtime.block_on(async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            });
+            cx.run_until_parked();
+        };
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(crate::icons::Assets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.allow_parking();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "settings:write", "providers:manage", "environment:maintain"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        drive(&mut cx);
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            cx.global_mut::<super::super::Host>().features.secrets = true;
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "fixture-env",
+                            "label": "Studio Mac",
+                            "capabilities": { "secretProviderSettings": true, "secretSourceCheck": true }
+                        },
+                        "secretProviderSettings": true,
+                        "secretReferences": true,
+                        "settings": {
+                            "secretProviders": {
+                                "op-main": { "kind": "one_password", "label": "Work 1Password", "config": { "account": "ops.1password.com" } }
+                            },
+                            "providerInstances": {
+                                "codex": {
+                                    "driver": "codex",
+                                    "displayName": "Codex Main",
+                                    "environment": [
+                                        { "name": "OPENAI_API_KEY", "value": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/OpenAI/api-key" }, "sensitive": true }
+                                    ]
+                                }
+                            },
+                            "cloudSpeechCredentials": {
+                                "openai": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/Speech/openai" }
+                            },
+                            "textGenerators": {
+                                "title": { "label": "Title generator", "apiKey": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/Title/key" } }
+                            },
+                            "simlockDeviceHosts": [
+                                { "id": "sim-1", "label": "Simlock Mac", "agentToken": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/Simlock/token" } }
+                            ]
+                        }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx
+            .open_window(size(px(1280.), px(900.)), |_, cx| cx.new(|_| SettingsFrame))
+            .unwrap();
+        cx.update(|cx| super::super::open(Section::Secrets, cx));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        let view = cx.update(|cx| cx.global::<super::super::Host>().view.clone().expect("settings view open"));
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                let config = view.thread_settings(cx).unwrap();
+                let uses = secrets::secret_provider_uses(&config.settings, "op-main");
+                assert_eq!(uses.len(), 4);
+                view.request_remove_secret_provider("op-main".into(), "Work 1Password", window, cx);
+                assert!(view.secrets.remove_dialog.is_some());
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        if let Some(out) = std::env::var_os("T3_PARITY_386_SHOTS_DIR") {
+            let out = std::path::PathBuf::from(out);
+            std::fs::create_dir_all(&out).unwrap();
+            cx.capture_screenshot(window.into()).unwrap().save(out.join("secrets-remove-dialog.png")).unwrap();
+        }
+
+        // Escape dismisses the remove dialog without closing Settings.
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_action(Box::new(super::super::CloseSettings), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert!(view.secrets.remove_dialog.is_none());
+        });
+
+        state.update(&mut cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

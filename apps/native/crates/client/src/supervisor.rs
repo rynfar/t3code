@@ -99,6 +99,14 @@ pub struct ClientHandle {
 
 /// In-memory channels for app integration tests; no supervisor consumes their commands.
 #[cfg(feature = "test-support")]
+pub type FixtureRequest = (&'static str, Value, oneshot::Sender<Result<Value, RpcError>>);
+#[cfg(feature = "test-support")]
+pub type FixtureStreamRequest = (&'static str, oneshot::Sender<Result<StreamHandle, RpcError>>);
+#[cfg(feature = "test-support")]
+pub type FixtureRequests = (Vec<FixtureRequest>, Vec<FixtureStreamRequest>);
+
+/// In-memory channels for app integration tests; no supervisor consumes their commands.
+#[cfg(feature = "test-support")]
 pub struct ClientFixture {
     pub grants: watch::Sender<Option<AuthSessionState>>,
     pub generation: watch::Sender<u64>,
@@ -158,6 +166,19 @@ impl ClientFixture {
             });
         }
         commands
+    }
+
+    pub fn take_requests(&mut self) -> FixtureRequests {
+        let mut requests = Vec::new();
+        let mut streams = Vec::new();
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                Command::Request { method, payload, reply, .. } => requests.push((method, payload, reply)),
+                Command::Stream { method, reply, .. } => streams.push((method, reply)),
+                Command::OpenThread(_) | Command::CloseThread(_) | Command::CloseAllThreads | Command::RefreshSessionState | Command::RetryNow => {}
+            }
+        }
+        (requests, streams)
     }
 }
 

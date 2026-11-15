@@ -5,15 +5,14 @@
 //! are left out as the web leaves them out.
 
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
+    AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{Sizable, h_flex, v_flex};
 use t3_core::server_config::ServerConfig;
-use t3_core::settings::worktrees::{
-    BranchNaming, CleanupRule, DEFAULT_BRANCH_PREFIX, DEFAULT_RETENTION_DAYS, KeepWhen, Submodules, WorktreeChange, clamp_retention,
-};
+use t3_core::settings::maintenance::{RetentionCommit, RetentionDraft, RetentionToggle};
+use t3_core::settings::worktrees::{BranchNaming, CleanupRule, DEFAULT_BRANCH_PREFIX, KeepWhen, Submodules, WorktreeChange};
 
 use super::controls::{Row, Select, SelectOption, Switch, group, icon, muted_text, r, section, section_title};
 use super::{Block, SettingsView, store};
@@ -28,6 +27,13 @@ enum Retention {
 }
 
 impl Retention {
+    fn index(self) -> usize {
+        match self {
+            Retention::Inactive => 0,
+            Retention::Settled => 1,
+        }
+    }
+
     fn minimum(self) -> u32 {
         match self {
             Retention::Inactive => 1,
@@ -57,6 +63,8 @@ pub(crate) struct WorktreesState {
     pub(crate) instructions: Entity<TextareaState>,
     pub(crate) inactive_days: Entity<InputState>,
     pub(crate) settled_days: Entity<InputState>,
+    retention_drafts: [RetentionDraft; 2],
+    retention_switch_pressed: [bool; 2],
     creation_advanced: bool,
     cleanup_advanced: bool,
     _subscriptions: Vec<Subscription>,
@@ -72,7 +80,7 @@ impl WorktreesState {
         let inactive_days = cx.new(|cx| InputState::new(window, cx));
         let settled_days = cx.new(|cx| InputState::new(window, cx));
         let commit_on = |event: &InputEvent| matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur);
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(&directory, window, move |this, _, event: &InputEvent, _, cx| {
                 if commit_on(event) {
                     this.commit_worktree_directory(cx);
@@ -88,27 +96,40 @@ impl WorktreesState {
                     this.commit_branch_instructions(cx);
                 }
             }),
-            cx.subscribe_in(&inactive_days, window, move |this, _, event: &InputEvent, window, cx| {
-                if commit_on(event) {
-                    this.commit_retention(Retention::Inactive, window, cx);
-                }
-            }),
-            cx.subscribe_in(&settled_days, window, move |this, _, event: &InputEvent, window, cx| {
-                if commit_on(event) {
-                    this.commit_retention(Retention::Settled, window, cx);
-                }
-            }),
         ];
+        for (input, field) in [(&inactive_days, Retention::Inactive), (&settled_days, Retention::Settled)] {
+            subscriptions.push(cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.worktrees.retention_drafts[field.index()].mark_edited(),
+                InputEvent::PressEnter { .. } => {
+                    this.worktrees.retention_switch_pressed[field.index()] = false;
+                    this.commit_retention(field, true, window, cx);
+                }
+                InputEvent::Blur => {
+                    if std::mem::take(&mut this.worktrees.retention_switch_pressed[field.index()]) {
+                        return;
+                    }
+                    this.commit_retention(field, false, window, cx);
+                }
+                _ => {}
+            }));
+        }
         WorktreesState {
             directory,
             prefix,
             instructions,
             inactive_days,
             settled_days,
+            retention_drafts: [RetentionDraft::Closed; 2],
+            retention_switch_pressed: [false; 2],
             creation_advanced: false,
             cleanup_advanced: false,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub(super) fn leave(&mut self) {
+        self.retention_drafts = [RetentionDraft::Closed; 2];
+        self.retention_switch_pressed = [false; 2];
     }
 
     pub(super) fn inputs(&self) -> impl Iterator<Item = &Entity<InputState>> {
@@ -198,20 +219,48 @@ impl SettingsView {
         }
     }
 
-    /// `RetentionControl`'s commit: a number saves clamped; anything else puts the saved value back.
-    fn commit_retention(&mut self, field: Retention, window: &mut Window, cx: &mut Context<Self>) {
+    /// `RetentionControl`'s commit: explicit Enter or edited blur saves clamped; untouched blur
+    /// discards a draft without saving.
+    fn commit_retention(&mut self, field: Retention, explicit: bool, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.worktrees.retention_input(field).clone();
-        let Some(saved) = self.thread_settings(cx).and_then(|config| field.saved(config)) else { return };
-        match input.read(cx).value().trim().parse::<f64>().ok().filter(|days| days.is_finite()) {
-            Some(days) => {
-                let days = clamp_retention(days, field.minimum());
+        let Some(saved) = self.thread_settings(cx).map(|config| field.saved(config)) else { return };
+        let text = input.read(cx).value().to_string();
+        let idx = field.index();
+        match self.worktrees.retention_drafts[idx].commit(saved, &text, field.minimum(), explicit) {
+            RetentionCommit::Save(days) => {
                 input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
-                if days != saved {
-                    self.save_worktree(field.change(Some(days)), cx);
-                }
+                self.save_worktree(field.change(Some(days)), cx);
+                cx.notify();
             }
-            None => input.update(cx, |input, cx| input.set_value(saved.to_string(), window, cx)),
+            RetentionCommit::Restore(days) => {
+                input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
+                cx.notify();
+            }
+            RetentionCommit::Discarded => {
+                cx.notify();
+            }
+            RetentionCommit::Unchanged => {}
         }
+    }
+
+    pub(super) fn dismiss_worktree_retention(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        for field in [Retention::Inactive, Retention::Settled] {
+            let input = self.worktrees.retention_input(field).clone();
+            if self.worktrees.retention_drafts[field.index()].cancel() {
+                if input.focus_handle(cx).is_focused(window) {
+                    self.focus.focus(window, cx);
+                }
+                return true;
+            }
+            if input.focus_handle(cx).is_focused(window)
+                && let Some(saved) = self.thread_settings(cx).and_then(|config| field.saved(config))
+            {
+                input.update(cx, |input, cx| input.set_value(saved.to_string(), window, cx));
+                self.focus.focus(window, cx);
+                return true;
+            }
+        }
+        false
     }
 
     pub(super) fn commit_focused_worktree_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -226,7 +275,7 @@ impl SettingsView {
         }
         for field in [Retention::Inactive, Retention::Settled] {
             if self.worktrees.retention_input(field).focus_handle(cx).is_focused(window) {
-                self.commit_retention(field, window, cx);
+                self.commit_retention(field, false, window, cx);
             }
         }
     }
@@ -238,26 +287,60 @@ impl SettingsView {
         }
     }
 
-    /// `RetentionControl`: a day count while on, "Off" while off, and a switch that turns it on at
-    /// eight days.
-    fn retention_control(&self, field: Retention, id: &'static str, value: Option<u32>, cx: &App) -> impl IntoElement {
+    /// `RetentionControl`: a day count while on, "Off" while off, and a switch that opens a
+    /// draft at eight days without saving until Enter or blur after editing.
+    fn retention_control(&self, field: Retention, id: &'static str, value: Option<u32>, cx: &Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let state = self.state.clone();
+        let idx = field.index();
+        let on = self.worktrees.retention_drafts[idx].is_on(value);
         h_flex()
             .gap(r(12.))
-            .map(|this| match value {
-                Some(_) => this.child(
-                    h_flex()
-                        .gap(r(6.))
-                        .child(div().w(r(72.)).child(Input::new(self.worktrees.retention_input(field)).small()))
-                        .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("days")),
-                ),
-                None => this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Off")),
+            .map(|this| {
+                if on {
+                    this.child(
+                        h_flex()
+                            .gap(r(6.))
+                            .child(div().w(r(72.)).child(Input::new(self.worktrees.retention_input(field)).small()))
+                            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("days")),
+                    )
+                } else {
+                    this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Off"))
+                }
             })
-            .child(Switch::new(id, value.is_some()).on_change(move |on, _, cx| {
-                let days = on.then_some(DEFAULT_RETENTION_DAYS);
-                store::update_server(&state, field.change(days).into_server(), cx);
-            }))
+            .child({
+                let view = cx.entity().downgrade();
+                div()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, _| {
+                            window.prevent_default();
+                            this.worktrees.retention_switch_pressed[idx] = true;
+                        }),
+                    )
+                    .child(Switch::new(id, on).on_change(move |next, window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.worktrees.retention_switch_pressed[idx] = false;
+                            let saved = this.thread_settings(cx).and_then(|config| field.saved(config));
+                            match this.worktrees.retention_drafts[idx].toggle(saved, next) {
+                                RetentionToggle::OpenDraft(days) => {
+                                    this.worktrees.retention_input(field).update(cx, |input, cx| {
+                                        input.set_value(days.to_string(), window, cx);
+                                        input.focus(window, cx);
+                                    });
+                                    cx.notify();
+                                }
+                                RetentionToggle::SaveOff => {
+                                    this.save_worktree(field.change(None), cx);
+                                    cx.notify();
+                                }
+                                RetentionToggle::DiscardDraft => {
+                                    cx.notify();
+                                }
+                                RetentionToggle::Noop => {}
+                            }
+                        });
+                    }))
+            })
     }
 
     fn worktree_switch(&self, id: &'static str, checked: bool, change: impl Fn(bool) -> WorktreeChange + 'static) -> Switch {
@@ -281,6 +364,7 @@ impl SettingsView {
         Self::sync_input(&self.worktrees.prefix, &settings.branch_name_prefix, window, cx);
         Self::sync_textarea(&self.worktrees.instructions, &settings.branch_name_instructions, window, cx);
         for (field, days) in [(Retention::Inactive, rules.worktree_after_days), (Retention::Settled, rules.worktree_settled_after_days)] {
+            self.worktrees.retention_drafts[field.index()].reconcile_saved(days);
             if let Some(days) = days {
                 Self::sync_input(self.worktrees.retention_input(field), &days.to_string(), window, cx);
             }

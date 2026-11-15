@@ -102,6 +102,7 @@ pub struct Button {
     variant: ButtonVariant,
     size: ButtonSize,
     icon: Option<Icon>,
+    icon_color: Option<Hsla>,
     trailing: Option<Icon>,
     label: Option<SharedString>,
     tooltip: Option<SharedString>,
@@ -112,7 +113,12 @@ pub struct Button {
 
 impl Button {
     pub fn new(id: impl Into<ElementId>, variant: ButtonVariant, size: ButtonSize) -> Self {
-        Button { id: id.into(), focus: None, variant, size, icon: None, trailing: None, label: None, tooltip: None, disabled: false, full_width: false, on_click: None }
+        Button { id: id.into(), focus: None, variant, size, icon: None, icon_color: None, trailing: None, label: None, tooltip: None, disabled: false, full_width: false, on_click: None }
+    }
+
+    pub fn icon_color(mut self, color: Hsla) -> Self {
+        self.icon_color = Some(color);
+        self
     }
 
     pub fn focus_handle(mut self, focus: FocusHandle) -> Self {
@@ -228,7 +234,7 @@ impl RenderOnce for Button {
             .when(ring, |this| this.shadow(focus_ring(hsla(p.ring))))
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
             .when(!self.disabled, |this| this.cursor_pointer().hover(move |this| this.bg(hover_fill).text_color(hover_text)))
-            .children(self.icon.map(|glyph| icon(glyph, icon_size, icon_color)))
+            .children(self.icon.map(|glyph| icon(glyph, icon_size, self.icon_color.unwrap_or(icon_color))))
             .children(self.label.map(|label| div().truncate().child(label)))
             .children(self.trailing.map(|glyph| icon(glyph, icon_size, icon_color)))
             .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))

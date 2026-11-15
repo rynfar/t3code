@@ -16,8 +16,9 @@ use crate::server_config::ServerSettings;
 pub const GET_STORAGE_CLEANUP_REPORT: &str = "server.getStorageCleanupReport";
 pub const RUN_STORAGE_CLEANUP: &str = "server.runStorageCleanup";
 pub const GET_DATABASE_STORAGE: &str = "server.getDatabaseStorage";
+pub const RECLAIM_DATABASE_SPACE: &str = "server.reclaimDatabaseSpace";
 
-/// The `ServerSettings` keys the Updates section edits; both default on.
+/// The `ServerSettings` keys the Updates and Background sections edit; all default on.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MaintenanceSettings {
@@ -25,11 +26,17 @@ pub struct MaintenanceSettings {
     pub enable_provider_update_checks: bool,
     #[serde(deserialize_with = "bool_or_true")]
     pub continue_threads_after_server_update: bool,
+    #[serde(deserialize_with = "bool_or_true")]
+    pub keep_awake_while_agents_work: bool,
 }
 
 impl Default for MaintenanceSettings {
     fn default() -> Self {
-        MaintenanceSettings { enable_provider_update_checks: true, continue_threads_after_server_update: true }
+        MaintenanceSettings {
+            enable_provider_update_checks: true,
+            continue_threads_after_server_update: true,
+            keep_awake_while_agents_work: true,
+        }
     }
 }
 
@@ -42,6 +49,7 @@ fn bool_or_true<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
 pub enum MaintenanceChange {
     ProviderUpdateChecks(bool),
     ContinueThreads(bool),
+    KeepAwakeWhileAgentsWork(bool),
     BrowserArtifactsAfterDays(Option<u32>),
     LogsAfterDays(Option<u32>),
 }
@@ -55,6 +63,9 @@ impl MaintenanceChange {
             }
             MaintenanceChange::ContinueThreads(on) => {
                 json!({ "continueThreadsAfterServerUpdate": on })
+            }
+            MaintenanceChange::KeepAwakeWhileAgentsWork(on) => {
+                json!({ "keepAwakeWhileAgentsWork": on })
             }
             MaintenanceChange::BrowserArtifactsAfterDays(days) => {
                 json!({ "storageCleanup": { "browserArtifactsAfterDays": clamp(days) } })
@@ -569,11 +580,14 @@ pub fn format_count(value: f64) -> String {
     if rounded < 0. { format!("-{grouped}") } else { grouped }
 }
 
-/// `DatabaseStorageStatus`: reclaimable space worth suggesting `t3 doctor` for.
+/// `DatabaseStorageStatus`: reclaimable space worth suggesting compaction or in-app reclaim for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DatabaseStorage {
+    pub database_bytes: f64,
     pub reclaimable_bytes: f64,
     pub compact_command: String,
+    pub can_reclaim: bool,
+    pub reclaim_failure: Option<String>,
 }
 
 /// `DATABASE_COMPACTION_RECOMMENDED_BYTES`.
@@ -583,17 +597,167 @@ const COMPACTION_RECOMMENDED_BYTES: f64 = 1024. * 1024. * 1024.;
 pub fn compaction_recommendation(value: &Value) -> Option<DatabaseStorage> {
     let reclaimable = value.get("reclaimableBytes")?.as_f64()?;
     let incremental = value.get("incrementalVacuumEnabled")?.as_bool()?;
-    (!incremental && reclaimable >= COMPACTION_RECOMMENDED_BYTES)
-        .then(|| DatabaseStorage { reclaimable_bytes: reclaimable, compact_command: string(value, "compactCommand").unwrap_or_default() })
+    let database_bytes = value.get("databaseBytes").and_then(Value::as_f64).unwrap_or(reclaimable);
+    (!incremental && reclaimable >= COMPACTION_RECOMMENDED_BYTES).then(|| DatabaseStorage {
+        database_bytes,
+        reclaimable_bytes: reclaimable,
+        compact_command: string(value, "compactCommand").unwrap_or_default(),
+        can_reclaim: value.get("canReclaim").and_then(Value::as_bool).unwrap_or(false),
+        reclaim_failure: string(value, "reclaimFailure"),
+    })
 }
 
 impl DatabaseStorage {
+    pub fn amount(&self) -> String {
+        format!("{} GiB", to_fixed(self.reclaimable_bytes / COMPACTION_RECOMMENDED_BYTES, 1))
+    }
+
     pub fn title(&self, environment: &str) -> String {
-        format!("{} GiB on {environment}", to_fixed(self.reclaimable_bytes / COMPACTION_RECOMMENDED_BYTES, 1))
+        format!("{} on {environment}", self.amount())
+    }
+
+    /// `databaseReclaimMinutes` (`contracts/src/settings.ts`): 30s per GiB of live data, min 1.
+    pub fn reclaim_minutes(&self) -> u64 {
+        let live_gib = (self.database_bytes - self.reclaimable_bytes).max(0.) / COMPACTION_RECOMMENDED_BYTES;
+        (live_gib / 2.).ceil().max(1.) as u64
+    }
+
+    pub fn reclaim_description(&self) -> String {
+        match &self.reclaim_failure {
+            Some(reason) => format!("The last attempt failed: {reason}"),
+            None => format!("Restarts T3 Code there. It will be offline for about {} min.", self.reclaim_minutes()),
+        }
+    }
+
+    pub fn reclaim_confirmation(&self, environment: &str) -> (String, String) {
+        (
+            format!("Reclaim {} on {environment}?", self.amount()),
+            format!(
+                "T3 Code on {environment} stops, rebuilds its database, and starts again. It will be offline for about {} min. Running agents stop when it restarts.",
+                self.reclaim_minutes(),
+            ),
+        )
     }
 }
 
-pub const DATABASE_DESCRIPTION: &str = "Old history is cleaned up automatically, but these databases still hold the freed space. Run the command on each machine to return it to disk; it pauses and restarts the background service. Quit the desktop app first if it hosts the environment.";
+pub fn database_description(all_reclaimable: bool) -> &'static str {
+    if all_reclaimable {
+        "These databases still hold space freed by history cleanup."
+    } else {
+        "These databases still hold space freed by history cleanup. Run the command on each machine to reclaim it. It restarts the background service. Quit the desktop app first if it hosts the environment."
+    }
+}
+
+/// `RetentionControl` draft state (`StorageSettings.tsx`): turning a rule on from Off opens a
+/// draft without saving until Enter or blur after editing; Escape or blurring untouched cancels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetentionDraft {
+    #[default]
+    Closed,
+    /// Switch flipped on from Off (`value == None`); holds default 8 days until edited or Enter.
+    Untouched,
+    /// Draft was edited while `value == None`.
+    Edited,
+    /// Save is in flight after committing from Off.
+    Submitting(u32),
+}
+
+impl RetentionDraft {
+    pub fn is_on(self, saved: Option<u32>) -> bool {
+        saved.is_some() || self != Self::Closed
+    }
+
+    pub fn toggle(&mut self, saved: Option<u32>, on: bool) -> RetentionToggle {
+        if on {
+            if saved.is_none() && *self == Self::Closed {
+                *self = Self::Untouched;
+                return RetentionToggle::OpenDraft(crate::settings::worktrees::DEFAULT_RETENTION_DAYS);
+            }
+            return RetentionToggle::Noop;
+        }
+        let had_save = saved.is_some() || matches!(self, Self::Submitting(_));
+        *self = Self::Closed;
+        if had_save { RetentionToggle::SaveOff } else { RetentionToggle::DiscardDraft }
+    }
+
+    pub fn mark_edited(&mut self) {
+        if *self == Self::Untouched {
+            *self = Self::Edited;
+        }
+    }
+
+    pub fn cancel(&mut self) -> bool {
+        if matches!(self, Self::Untouched | Self::Edited) {
+            *self = Self::Closed;
+            return true;
+        }
+        false
+    }
+
+    /// Commits on Enter (`explicit == true`) or Blur (`explicit == false`). Returns `Some(days)`
+    /// when a server save should be dispatched, or `None` when the draft was discarded/unchanged.
+    pub fn commit(&mut self, saved: Option<u32>, text: &str, minimum: u32, explicit: bool) -> RetentionCommit {
+        if saved.is_none() {
+            match *self {
+                Self::Closed => return RetentionCommit::Unchanged,
+                Self::Untouched if !explicit => {
+                    *self = Self::Closed;
+                    return RetentionCommit::Discarded;
+                }
+                Self::Untouched | Self::Edited | Self::Submitting(_) => {
+                    let parsed = text.trim().parse::<f64>().ok().filter(|days| days.is_finite());
+                    let Some(raw) = parsed else {
+                        if let Self::Submitting(days) = *self {
+                            return RetentionCommit::Restore(days);
+                        }
+                        *self = Self::Closed;
+                        return RetentionCommit::Discarded;
+                    };
+                    let days = crate::settings::worktrees::clamp_retention(raw, minimum);
+                    if matches!(self, Self::Submitting(prev) if *prev == days) {
+                        return RetentionCommit::Restore(days);
+                    }
+                    *self = Self::Submitting(days);
+                    return RetentionCommit::Save(days);
+                }
+            }
+        }
+        let Some(saved_days) = saved else { return RetentionCommit::Unchanged };
+        match text.trim().parse::<f64>().ok().filter(|days| days.is_finite()) {
+            Some(raw) => {
+                let days = crate::settings::worktrees::clamp_retention(raw, minimum);
+                if days != saved_days {
+                    RetentionCommit::Save(days)
+                } else {
+                    RetentionCommit::Restore(days)
+                }
+            }
+            None => RetentionCommit::Restore(saved_days),
+        }
+    }
+
+    pub fn reconcile_saved(&mut self, saved: Option<u32>) {
+        if saved.is_some() {
+            *self = Self::Closed;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionToggle {
+    OpenDraft(u32),
+    SaveOff,
+    DiscardDraft,
+    Noop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionCommit {
+    Save(u32),
+    Restore(u32),
+    Discarded,
+    Unchanged,
+}
 
 #[cfg(test)]
 mod tests;

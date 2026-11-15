@@ -9,7 +9,9 @@ use crate::{
     icons::Icon,
     theme::{hsla, palette},
 };
-use gpui::{AnyElement, App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*};
+use std::collections::HashMap;
+
+use gpui::{AnyElement, App, AppContext, Context, ElementId, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*};
 use gpui_component::{
     Sizable, h_flex,
     input::{Input, InputEvent, InputState},
@@ -17,9 +19,11 @@ use gpui_component::{
 };
 use serde_json::{Value, json};
 use t3_core::{
+    device::SETTINGS_WRITE_SCOPE,
     settings::{
         ServerSettingChange,
         providers::{self as model, form},
+        secrets,
     },
     usage::PROVIDERS_MANAGE_SCOPE,
 };
@@ -43,6 +47,12 @@ struct ArgumentInput {
     input: Entity<InputState>,
     _subscription: Subscription,
 }
+#[derive(Clone, PartialEq, Eq)]
+enum SecretCheckStatus {
+    Checking,
+    Resolved,
+    Failed(String),
+}
 #[derive(Default)]
 pub(super) struct FormState {
     instance_id: String,
@@ -51,6 +61,7 @@ pub(super) struct FormState {
     arguments: form::ArgumentsDraft,
     argument_inputs: Vec<ArgumentInput>,
     variables: Vec<VariableInput>,
+    secret_checks: HashMap<(String, String), SecretCheckStatus>,
     seen: Vec<Value>,
     published: Option<Vec<Value>>,
     next_id: usize,
@@ -332,6 +343,8 @@ impl SettingsView {
                     if !this.form_event_current(generation, cx) || !this.provider_form().variables.iter().any(|field| field.id == id && if is_value { &field.value == source } else { &field.name == source }) { return; }
                     if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) || (this.providers.dialog.is_some() && matches!(event, InputEvent::Change)) {
                         this.commit_variable(id, is_value, window, cx);
+                    } else if is_value && matches!(event, InputEvent::Change) && this.provider_form().variables.iter().any(|field| field.id == id && field.source.provider(&field.raw).is_some()) {
+                        cx.notify();
                     }
                 })
             })
@@ -655,9 +668,15 @@ impl SettingsView {
                         continue;
                     };
                     let clear_key = key.clone();
+                    let secret_check = field.accepts_secret_reference.then(|| {
+                        let provider = saved.get("provider").and_then(Value::as_str)?;
+                        let reference = saved.get("reference").and_then(Value::as_str)?;
+                        self.secret_check_button(SharedString::from(format!("secret-check-config-{key}")).into(), provider, reference, disabled, cx)
+                    }).flatten();
                     h_flex()
                         .gap(r(8.))
                         .child(div().w(r(224.)).child(Input::new(&input).small().disabled(disabled)))
+                        .children(secret_check)
                         .when(field.secret && saved.as_str().is_some_and(|v| !v.is_empty()), |el| {
                             el.child(
                                 Button::new(SharedString::from(format!("clear-config-{key}")), ButtonVariant::GhostMuted, ButtonSize::IconSm)
@@ -871,6 +890,78 @@ impl SettingsView {
         )
     }
 
+    fn check_secret_source(&mut self, provider: String, reference: String, cx: &mut Context<Self>) {
+        if self.state.read(cx).server_config.config.as_ref().is_none_or(|c| c.environment.capabilities.secret_source_check != Some(true))
+            || !self.may(SETTINGS_WRITE_SCOPE, cx)
+        {
+            return;
+        }
+        let key = (provider.clone(), reference.clone());
+        if matches!(self.provider_form().secret_checks.get(&key), Some(SecretCheckStatus::Checking)) {
+            return;
+        }
+        let generation = self.provider_form().generation;
+        self.provider_form_mut().secret_checks.insert(key.clone(), SecretCheckStatus::Checking);
+        let task = self.state.read(cx).rpc(secrets::CHECK_SECRET_SOURCE, secrets::check_secret_source_payload(&provider, &reference));
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let next = match result {
+                Ok(reply) => match secrets::decode_check_secret_source_result(&reply) {
+                    secrets::SecretSourceCheckResult::Resolved => SecretCheckStatus::Resolved,
+                    secrets::SecretSourceCheckResult::Failed(detail) => SecretCheckStatus::Failed(detail),
+                },
+                Err(_) => SecretCheckStatus::Failed("Could not reach the server".to_owned()),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if !this.form_event_current(generation, cx) {
+                    return;
+                }
+                this.provider_form_mut().secret_checks.insert(key, next);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// `SecretCheckButton` (`SecretSourceInput.tsx`): verifies a committed secret reference on demand.
+    fn secret_check_button(&self, button_id: ElementId, provider: &str, reference: &str, disabled: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.state.read(cx).server_config.config.as_ref().is_none_or(|c| c.environment.capabilities.secret_source_check != Some(true)) {
+            return None;
+        }
+        let p = palette(cx);
+        let can_check = self.may(SETTINGS_WRITE_SCOPE, cx);
+        let status = self.provider_form().secret_checks.get(&(provider.to_owned(), reference.to_owned()));
+        let checking = matches!(status, Some(SecretCheckStatus::Checking));
+        let (glyph, color) = match status {
+            Some(SecretCheckStatus::Checking) => (Icon::LoaderCircle, hsla(p.muted_foreground)),
+            Some(SecretCheckStatus::Resolved) => (Icon::Check, hsla(p.success_foreground)),
+            Some(SecretCheckStatus::Failed(_)) => (Icon::TriangleAlert, hsla(p.destructive)),
+            None => (Icon::RefreshCw, hsla(p.muted_foreground)),
+        };
+        let description: SharedString = if !can_check {
+            "You cannot check secrets on this environment".into()
+        } else {
+            match status {
+                None => "Check that the secret resolves".into(),
+                Some(SecretCheckStatus::Checking) => "Checking the secret".into(),
+                Some(SecretCheckStatus::Resolved) => "Secret resolved".into(),
+                Some(SecretCheckStatus::Failed(detail)) => detail.clone().into(),
+            }
+        };
+        let provider = provider.to_owned();
+        let reference = reference.to_owned();
+        Some(
+            Button::new(button_id, ButtonVariant::GhostMuted, ButtonSize::IconMicro)
+                .icon(glyph)
+                .icon_color(color)
+                .tooltip(description)
+                .disabled(disabled || !can_check || checking)
+                .on_click(cx.listener(move |this, _, _, cx| this.check_secret_source(provider.clone(), reference.clone(), cx)))
+                .into_any_element(),
+        )
+    }
+
     fn render_variable(&mut self, index: usize, dedicated: bool, driver: &str, cx: &mut Context<Self>) -> AnyElement {
         let v = &self.provider_form().variables[index];
         let id = v.id;
@@ -880,6 +971,16 @@ impl SettingsView {
         let name = v.raw["name"].as_str().unwrap_or("").to_owned();
         let denial = self.form_denial(driver, &format!("environment.{name}"), cx);
         let disabled = denial.is_some();
+        let committed_ref = v.raw["value"]["provider"]
+            .as_str()
+            .zip(v.raw["value"]["reference"].as_str())
+            .filter(|(provider, reference)| {
+                v.source.provider(&v.raw) == Some(*provider) && v.value.read(cx).value().as_ref() == *reference
+            })
+            .map(|(provider, reference)| (provider.to_owned(), reference.to_owned()));
+        let check_button = committed_ref.as_ref().and_then(|(provider, reference)| {
+            self.secret_check_button(("secret-check", id).into(), provider, reference, disabled, cx)
+        });
         let name_control = (!dedicated).then(|| div().flex_1().min_w_0().child(Input::new(&v.name).small().disabled(disabled || redacted)));
         let source = self.variable_source(index, driver, disabled, cx);
         let v = &self.provider_form().variables[index];
@@ -905,6 +1006,7 @@ impl SettingsView {
                 .gap(r(8.))
                 .children(source)
                 .child(div().w(r(224.)).child(value))
+                .children(check_button)
                 .children(configured.then_some(remove))
                 .children(denial.map(|reason| div().text_xs().text_color(hsla(palette(cx).muted_foreground)).child(reason)))
                 .into_any_element();
@@ -936,8 +1038,203 @@ impl SettingsView {
             .gap(r(6.))
             .when(!dedicated, |el| el.p(r(8.)).rounded(r(8.)).border_1().border_color(hsla(palette(cx).border)))
             .child(h_flex().gap(r(6.)).children(name_control).children(source).child(remove))
-            .child(h_flex().gap(r(6.)).child(div().flex_1().min_w_0().child(value)).children(lock))
+            .child(h_flex().gap(r(6.)).child(div().flex_1().min_w_0().child(value)).children(check_button).children(lock))
             .children(denial.map(|reason| div().text_xs().text_color(hsla(palette(cx).muted_foreground)).child(reason)))
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod secret_check_tests {
+    use super::*;
+    use gpui::{AppContext, HeadlessAppContext, IntoElement, ParentElement, Render, Styled, div, px, size};
+    use serde_json::json;
+    use std::sync::Arc;
+    use t3_core::settings::search::Section;
+
+    struct SettingsFrame;
+    impl Render for SettingsFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().bg(hsla(palette(cx).background)).children(super::super::super::overlay(window, cx))
+        }
+    }
+
+    #[test]
+    fn secret_check_button_verifies_committed_reference_and_respects_gates() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let drive = |cx: &mut HeadlessAppContext| {
+            cx.run_until_parked();
+            runtime.block_on(async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            });
+            cx.run_until_parked();
+        };
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(crate::icons::Assets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.allow_parking();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "settings:write", "providers:manage", "environment:maintain"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        drive(&mut cx);
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": { "environmentId": "fixture-env", "label": "Studio Mac", "capabilities": { "secretProviderSettings": true, "secretSourceCheck": true } },
+                        "secretProviderSettings": true,
+                        "secretReferences": true,
+                        "settings": {
+                            "secretProviders": {
+                                "op-main": { "kind": "one_password", "label": "Work 1Password", "config": { "account": "ops.1password.com" } }
+                            },
+                            "providerInstances": {
+                                "cursor": {
+                                    "driver": "cursor",
+                                    "enabled": true,
+                                    "displayName": "Cursor Main",
+                                    "environment": [
+                                        { "name": "CURSOR_API_KEY", "value": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/OpenAI/api-key" }, "sensitive": true },
+                                        { "name": "CUSTOM_SECRET", "value": { "kind": "secret", "provider": "op-main", "reference": "op://Dev/Custom/token" }, "sensitive": true }
+                                    ]
+                                }
+                            }
+                        },
+                        "providers": [
+                            { "instanceId": "cursor", "driver": "cursor", "enabled": true, "installed": true, "status": "ready" }
+                        ]
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx
+            .open_window(size(px(1280.), px(900.)), |_, cx| cx.new(|_| SettingsFrame))
+            .unwrap();
+        cx.update(|cx| super::super::super::open(Section::Providers, cx));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        let view = cx.update(|cx| cx.global::<super::super::super::Host>().view.clone().expect("settings view open"));
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.providers.selected = Some("cursor".into());
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, _, cx| {
+            view.update(cx, |view, cx| {
+                assert!(
+                    view.secret_check_button("probe-check".into(), "op-main", "op://Dev/OpenAI/api-key", false, cx).is_some(),
+                    "capability secretSourceCheck enables check button"
+                );
+                view.check_secret_source("op-main".into(), "op://Dev/OpenAI/api-key".into(), cx);
+                assert!(matches!(
+                    view.provider_form().secret_checks.get(&("op-main".into(), "op://Dev/OpenAI/api-key".into())),
+                    Some(SecretCheckStatus::Checking)
+                ));
+            });
+        })
+        .unwrap();
+        drive(&mut cx);
+
+        let (requests, _) = fixture.take_requests();
+        let (method, payload, reply) = requests
+            .into_iter()
+            .find(|(method, _, _)| *method == secrets::CHECK_SECRET_SOURCE)
+            .expect("checkSecretSource RPC sent");
+        assert_eq!(method, secrets::CHECK_SECRET_SOURCE);
+        assert_eq!(payload, json!({ "source": { "provider": "op-main", "reference": "op://Dev/OpenAI/api-key" } }));
+        reply.send(Ok(json!({ "_tag": "Resolved" }))).unwrap();
+        drive(&mut cx);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        view.read_with(&cx, |view, _| {
+            assert!(matches!(
+                view.provider_form().secret_checks.get(&("op-main".into(), "op://Dev/OpenAI/api-key".into())),
+                Some(SecretCheckStatus::Resolved)
+            ));
+        });
+
+        if let Some(out) = std::env::var_os("T3_PARITY_386_SHOTS_DIR") {
+            let out = std::path::PathBuf::from(out);
+            std::fs::create_dir_all(&out).unwrap();
+            cx.capture_screenshot(window.into()).unwrap().save(out.join("providers-secret-check.png")).unwrap();
+        }
+
+        // Missing settings:write / legacy orchestration:operate blocks checking.
+        fixture.grants.send(Some(crate::context_menu::project_filter_tests::session(false))).unwrap();
+        drive(&mut cx);
+        cx.update_window(window.into(), |_, _, cx| {
+            view.update(cx, |view, cx| {
+                view.check_secret_source("op-main".into(), "op://Dev/Other/token".into(), cx);
+            });
+        })
+        .unwrap();
+        drive(&mut cx);
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != secrets::CHECK_SECRET_SOURCE));
+
+        // Missing capability hides check button and blocks checking even with permission.
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "settings:write", "providers:manage", "environment:maintain"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        drive(&mut cx);
+        state.update(&mut cx, |state, cx| {
+            state.server_config.config.as_mut().unwrap().environment.capabilities.secret_source_check = Some(false);
+            cx.emit(crate::app_state::AppEvent::ServerConfig);
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, _, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.secret_check_button("probe-check".into(), "op-main", "op://Dev/OpenAI/api-key", false, cx).is_none());
+                view.check_secret_source("op-main".into(), "op://Dev/Other/token".into(), cx);
+            });
+        })
+        .unwrap();
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != secrets::CHECK_SECRET_SOURCE));
+
+        state.update(&mut cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

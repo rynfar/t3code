@@ -644,6 +644,9 @@ impl SettingsView {
         if section != Section::Maintenance {
             self.maintenance.leave();
         }
+        if section != Section::Worktrees {
+            self.worktrees.leave();
+        }
         if section == Section::Diagnostics {
             if changed {
                 self.diagnostics.reset();
@@ -702,7 +705,12 @@ impl SettingsView {
             dialog.update(cx,|dialog,cx|dialog.close(window,cx));
             return;
         }
-        if self.projects.actions.dismiss() || self.secrets.dismiss() || self.maintenance.dismiss() {
+        if self.projects.actions.dismiss()
+            || self.secrets.dismiss()
+            || self.maintenance.dismiss()
+            || self.dismiss_maintenance_retention(window, cx)
+            || self.dismiss_worktree_retention(window, cx)
+        {
             self.focus.focus(window, cx);
             cx.notify();
             return;
