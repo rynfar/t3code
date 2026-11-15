@@ -236,6 +236,7 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("tool-call-visibility", "Tool calls in chat", Chat, &["activity work log tool calls show all hide successful hide all zen"]),
         SearchItem::new("provider-update-checks", "Provider update checks", Maintenance, &["installed cli versions newer available codex claude cursor grok fx kiro opencode"]),
         SearchItem::new("continue-threads-after-server-update", "Continue threads after restarts", Maintenance, &["resume running active interrupted work restart reboot machine crash desktop update automatically"]),
+        SearchItem::new("keep-awake-while-agents-work", "Keep awake while agents work", Maintenance, &["caffeinate sleep prevent stay awake power laptop lid inhibit"]),
         SearchItem::new("background-activity", "Background activity", Maintenance, &["balanced performance battery saver advanced git fetch provider health refresh host power monitor idle policy"]),
         SearchItem::new("new-threads", "New threads", Threads, &["default workspace mode draft local worktree"]),
         SearchItem::new("worktree-submodules", "Submodules", Worktrees, &["git submodule init recursive top-level none worktree t3.json"]),

@@ -132,3 +132,88 @@ fn an_edit_closes_once_its_provider_is_removed_elsewhere() {
     assert!(!edit.is_open_in(&removed), "Save would write the removed provider back");
     assert!(Target::Add.is_open_in(&removed));
 }
+
+#[test]
+fn secret_provider_uses_collects_every_settings_surface_in_order() {
+    let settings: ServerSettings = serde_json::from_value(json!({
+        "providerInstances": {
+            "opencode-main": {
+                "driver": "opencode",
+                "displayName": "Work OpenCode",
+                "config": { "serverPassword": { "provider": "personal", "reference": "op://Dev/OpenCode/pw" } },
+                "environment": [
+                    { "name": "EXTRA_TOKEN", "value": "", "secret": { "provider": "personal", "reference": "op://Dev/Extra/tok" }, "sensitive": true },
+                    { "name": "OTHER", "value": { "provider": "other", "reference": "op://Dev/Other/tok" }, "sensitive": true }
+                ]
+            },
+            "antigravity": {
+                "driver": "antigravity",
+                "config": { "apiKey": { "provider": "personal", "reference": "op://Dev/AG/key" } }
+            }
+        },
+        "sourceControlHosts": {
+            "github": { "tokens": { "github.com": { "provider": "personal", "reference": "op://Dev/GH/tok" } } },
+            "bitbucket": { "accessToken": { "provider": "personal", "reference": "op://Dev/BB/at" } },
+            "gitcafe": { "token": { "provider": "personal", "reference": "op://Dev/GC/tok" } }
+        },
+        "usageLimitSources": {
+            "cliproxy": { "label": "Proxy A", "url": "https://proxy.example", "managementKey": { "provider": "personal", "reference": "op://Dev/P/key" } }
+        },
+        "textGenerators": {
+            "tg1": { "baseUrl": "https://api.example", "apiKey": { "provider": "personal", "reference": "op://Dev/TG/key" } }
+        },
+        "easDeviceHosts": [
+            { "id": "eas-1", "label": "Expo Team", "accessToken": { "provider": "personal", "reference": "op://Dev/EAS/tok" } }
+        ],
+        "simlockDeviceHosts": [
+            { "id": "sim-1", "label": "Sim Lab", "agentToken": { "provider": "personal", "reference": "op://Dev/Sim/tok" } }
+        ],
+        "cloudSpeechCredentials": {
+            "openai": { "provider": "personal", "reference": "op://Dev/Voice/oai" },
+            "xai": "literal-key",
+            "openrouter": { "provider": "personal", "reference": "op://Dev/Voice/or" }
+        }
+    }))
+    .unwrap();
+
+    let labels: Vec<String> = secret_provider_uses(&settings, "personal").into_iter().map(|u| u.label).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "Work OpenCode \u{b7} Server password",
+            "Work OpenCode \u{b7} EXTRA_TOKEN",
+            "Antigravity \u{b7} API key",
+            "GitHub \u{b7} github.com",
+            "Bitbucket \u{b7} Access token",
+            "GitCafe \u{b7} Token",
+            "Proxy A \u{b7} Management Key",
+            "https://api.example \u{b7} Api Key",
+            "Expo Team \u{b7} Access Token",
+            "Sim Lab \u{b7} Agent Token",
+            "Voice \u{b7} OpenAI",
+            "Voice \u{b7} OpenRouter",
+        ]
+    );
+    assert!(secret_provider_uses(&settings, "unused").is_empty());
+    assert_eq!(
+        remove_confirmation("Personal", false),
+        ("Remove Personal?".into(), "These read from Personal and will be unset. The secrets themselves are untouched.".into())
+    );
+    assert_eq!(
+        remove_confirmation("Personal", true),
+        ("Remove Personal?".into(), "Nothing reads from Personal. The secrets themselves are untouched.".into())
+    );
+}
+
+#[test]
+fn check_secret_source_payload_and_result_decode() {
+    assert_eq!(
+        check_secret_source_payload("personal", "op://Dev/Item/token"),
+        json!({ "source": { "provider": "personal", "reference": "op://Dev/Item/token" } })
+    );
+    assert_eq!(decode_check_secret_source_result(&json!({ "_tag": "Resolved" })), SecretSourceCheckResult::Resolved);
+    assert_eq!(
+        decode_check_secret_source_result(&json!({ "_tag": "Failed", "detail": "Vault is locked" })),
+        SecretSourceCheckResult::Failed("Vault is locked".into())
+    );
+}

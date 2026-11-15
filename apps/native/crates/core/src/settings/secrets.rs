@@ -8,8 +8,11 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 use crate::auth::AuthSessionState;
+use crate::server_config::ServerSettings;
+use crate::settings::providers::{self, form};
 use crate::usage::PROVIDERS_MANAGE_SCOPE;
 
+pub const CHECK_SECRET_SOURCE: &str = "server.checkSecretSource";
 pub const ONE_PASSWORD: &str = "one_password";
 /// `SecretProviderLabel` and `SecretProviderSlug`.
 pub const MAX_NAME_LENGTH: usize = 64;
@@ -245,12 +248,156 @@ pub fn dialog_description(environment: &str) -> String {
     format!("Provider variables on {environment} can read values from it by name. Values are read with the op CLI on that server when a provider starts.")
 }
 
+pub fn check_secret_source_payload(provider: &str, reference: &str) -> Value {
+    json!({ "source": { "provider": provider, "reference": reference } })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretSourceCheckResult {
+    Resolved,
+    Failed(String),
+}
+
+pub fn decode_check_secret_source_result(value: &Value) -> SecretSourceCheckResult {
+    match value.get("_tag").and_then(Value::as_str) {
+        Some("Resolved") => SecretSourceCheckResult::Resolved,
+        Some("Failed") => SecretSourceCheckResult::Failed(
+            value.get("detail").and_then(Value::as_str).unwrap_or("Secret check failed.").to_owned(),
+        ),
+        _ => SecretSourceCheckResult::Failed("Unexpected secret check response.".to_owned()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretProviderUse {
+    pub id: String,
+    pub label: String,
+}
+
+fn secret_ref_provider(value: &Value) -> Option<&str> {
+    let provider = value.get("provider")?.as_str()?;
+    value.get("reference")?.as_str()?;
+    Some(provider)
+}
+
+fn non_empty_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key)?.as_str().filter(|s| !s.is_empty())
+}
+
+fn push_object_field_uses(
+    out: &mut Vec<SecretProviderUse>,
+    owner_id: &str,
+    owner: &str,
+    value: &Value,
+    fields: &[(&str, &str)],
+    provider_id: &str,
+) {
+    for &(field, label) in fields {
+        if value.get(field).and_then(secret_ref_provider) == Some(provider_id) {
+            out.push(SecretProviderUse {
+                id: format!("{owner_id}:{field}:"),
+                label: format!("{owner} \u{b7} {label}"),
+            });
+        }
+    }
+}
+
+/// `secretProviderUses` (`SecretsSettings.logic.ts`): every setting reading from `provider_id`,
+/// one readable label per field, in settings order.
+pub fn secret_provider_uses(settings: &ServerSettings, provider_id: &str) -> Vec<SecretProviderUse> {
+    let mut out = Vec::new();
+    for (instance_id, instance) in settings.provider_instances.iter() {
+        let driver_label = providers::DRIVERS.iter().find(|d| d.kind == instance.driver).map(|d| d.label);
+        let owner = instance
+            .display_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(driver_label)
+            .unwrap_or(instance_id);
+        if let Some(config) = instance.config.as_ref() {
+            let fields = form::secret_reference_fields(&instance.driver);
+            push_object_field_uses(&mut out, &format!("provider:{instance_id}"), owner, config, &fields, provider_id);
+        }
+        if let Some(vars) = instance.environment.as_ref().and_then(Value::as_array) {
+            for var in vars {
+                if var.get("value").and_then(secret_ref_provider) == Some(provider_id) {
+                    let name = var.get("name").and_then(Value::as_str).unwrap_or("");
+                    out.push(SecretProviderUse {
+                        id: format!("provider:{instance_id}:env:{name}"),
+                        label: format!("{owner} \u{b7} {name}"),
+                    });
+                }
+            }
+        }
+    }
+    if let Some(tokens) = settings.source_control_hosts.get("github").and_then(|g| g.get("tokens")).and_then(Value::as_object) {
+        for (host, val) in tokens {
+            if secret_ref_provider(val) == Some(provider_id) {
+                out.push(SecretProviderUse {
+                    id: format!("source-control:github:tokens:{host}"),
+                    label: format!("GitHub \u{b7} {host}"),
+                });
+            }
+        }
+    }
+    if let Some(bitbucket) = settings.source_control_hosts.get("bitbucket") {
+        push_object_field_uses(
+            &mut out,
+            "source-control:bitbucket",
+            "Bitbucket",
+            bitbucket,
+            &[("accessToken", "Access token"), ("apiToken", "API token")],
+            provider_id,
+        );
+    }
+    if let Some(gitcafe) = settings.source_control_hosts.get("gitcafe") {
+        push_object_field_uses(&mut out, "source-control:gitcafe", "GitCafe", gitcafe, &[("token", "Token")], provider_id);
+    }
+    if let Some(sources) = settings.usage_limit_sources.as_object() {
+        for (id, source) in sources {
+            let owner = non_empty_str(source, "label").or_else(|| non_empty_str(source, "url")).unwrap_or(id);
+            push_object_field_uses(&mut out, &format!("usage-limit:{id}"), owner, source, &[("managementKey", "Management Key")], provider_id);
+        }
+    }
+    if let Some(generators) = settings.text_generators.as_object() {
+        for (id, generator) in generators {
+            let owner = non_empty_str(generator, "label").or_else(|| non_empty_str(generator, "baseUrl")).unwrap_or(id);
+            push_object_field_uses(&mut out, &format!("text-generator:{id}"), owner, generator, &[("apiKey", "Api Key")], provider_id);
+        }
+    }
+    if let Some(hosts) = settings.eas_device_hosts.as_array() {
+        for host in hosts {
+            let id = non_empty_str(host, "id").unwrap_or("");
+            let owner = non_empty_str(host, "label").unwrap_or(id);
+            push_object_field_uses(&mut out, &format!("eas:{id}"), owner, host, &[("accessToken", "Access Token")], provider_id);
+        }
+    }
+    if let Some(hosts) = settings.simlock_device_hosts.as_array() {
+        for host in hosts {
+            let id = non_empty_str(host, "id").unwrap_or("");
+            let owner = non_empty_str(host, "label").unwrap_or(id);
+            push_object_field_uses(&mut out, &format!("simlock:{id}"), owner, host, &[("agentToken", "Agent Token")], provider_id);
+        }
+    }
+    for (provider, label) in [("openai", "OpenAI"), ("xai", "Grok Voice Transcribe"), ("openrouter", "OpenRouter")] {
+        if settings.cloud_speech_credentials.get(provider).and_then(secret_ref_provider) == Some(provider_id) {
+            out.push(SecretProviderUse {
+                id: format!("voice:{provider}"),
+                label: format!("Voice \u{b7} {label}"),
+            });
+        }
+    }
+    out
+}
+
 /// The `RemoveSecretProviderButton` confirmation: title and description.
-pub fn remove_confirmation(label: &str) -> (String, String) {
-    (
-        format!("Remove {label}?"),
-        format!("Provider variables that read from {label} stop resolving until a provider with the same name is added again. The secrets themselves are untouched."),
-    )
+pub fn remove_confirmation(label: &str, uses_empty: bool) -> (String, String) {
+    let description = if uses_empty {
+        format!("Nothing reads from {label}. The secrets themselves are untouched.")
+    } else {
+        format!("These read from {label} and will be unset. The secrets themselves are untouched.")
+    };
+    (format!("Remove {label}?"), description)
 }
 
 /// What the page shows for the connected environment.

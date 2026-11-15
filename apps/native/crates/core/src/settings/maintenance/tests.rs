@@ -13,9 +13,10 @@ fn panel(value: Value) -> ProviderPanelSettings {
 #[test]
 fn updates_default_on_and_decode_alone() {
     assert_eq!(settings(json!({})).maintenance, MaintenanceSettings::default());
-    let decoded = settings(json!({ "enableProviderUpdateChecks": false, "continueThreadsAfterServerUpdate": "no" })).maintenance;
+    let decoded = settings(json!({ "enableProviderUpdateChecks": false, "continueThreadsAfterServerUpdate": "no", "keepAwakeWhileAgentsWork": false })).maintenance;
     assert!(!decoded.enable_provider_update_checks);
     assert!(decoded.continue_threads_after_server_update, "a bad value takes the default");
+    assert!(!decoded.keep_awake_while_agents_work);
 }
 
 #[test]
@@ -29,6 +30,7 @@ fn retention_reads_beside_the_worktree_rules() {
 fn change_payloads_patch_one_key() {
     assert_eq!(MaintenanceChange::ProviderUpdateChecks(false).payload(), json!({ "patch": { "enableProviderUpdateChecks": false } }));
     assert_eq!(MaintenanceChange::ContinueThreads(true).payload(), json!({ "patch": { "continueThreadsAfterServerUpdate": true } }));
+    assert_eq!(MaintenanceChange::KeepAwakeWhileAgentsWork(false).payload(), json!({ "patch": { "keepAwakeWhileAgentsWork": false } }));
     assert_eq!(MaintenanceChange::BrowserArtifactsAfterDays(Some(9000)).payload(), json!({ "patch": { "storageCleanup": { "browserArtifactsAfterDays": 3650 } } }));
     assert_eq!(MaintenanceChange::LogsAfterDays(None).payload(), json!({ "patch": { "storageCleanup": { "logsAfterDays": null } } }));
 }
@@ -167,11 +169,84 @@ fn format_bytes_matches_the_web() {
 
 #[test]
 fn compaction_is_suggested_only_for_large_unvacuumed_databases() {
-    let big = json!({ "databaseBytes": 5e9, "reclaimableBytes": 2_147_483_648u64, "incrementalVacuumEnabled": false, "compactCommand": "t3 doctor" });
+    let big = json!({
+        "databaseBytes": 5_368_709_120u64,
+        "reclaimableBytes": 2_147_483_648u64,
+        "incrementalVacuumEnabled": false,
+        "compactCommand": "t3 doctor",
+        "canReclaim": true,
+        "reclaimFailure": "Disk full"
+    });
     let recommendation = compaction_recommendation(&big).unwrap();
     assert_eq!(recommendation.title("Studio"), "2.0 GiB on Studio");
+    assert!(recommendation.can_reclaim);
+    assert_eq!(recommendation.reclaim_minutes(), 2);
+    assert_eq!(recommendation.reclaim_description(), "The last attempt failed: Disk full");
+    assert_eq!(
+        recommendation.reclaim_confirmation("Studio"),
+        (
+            "Reclaim 2.0 GiB on Studio?".into(),
+            "T3 Code on Studio stops, rebuilds its database, and starts again. It will be offline for about 2 min. Running agents stop when it restarts.".into(),
+        )
+    );
     assert!(compaction_recommendation(&json!({ "reclaimableBytes": 2e9, "incrementalVacuumEnabled": true, "compactCommand": "x" })).is_none());
     assert!(compaction_recommendation(&json!({ "reclaimableBytes": 1e6, "incrementalVacuumEnabled": false, "compactCommand": "x" })).is_none());
+}
+
+#[test]
+fn retention_draft_defers_save_until_enter_or_edited_blur() {
+    let mut draft = RetentionDraft::default();
+    assert!(!draft.is_on(None));
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    assert!(draft.is_on(None));
+    // Blur without edits or Enter discards without saving.
+    assert_eq!(draft.commit(None, "8", 1, false, 1), RetentionCommit::Discarded);
+    assert!(!draft.is_on(None));
+
+    // Re-open draft and press Enter explicitly -> commits default 8.
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    assert_eq!(draft.commit(None, "8", 1, true, 2), RetentionCommit::Save(8));
+    assert!(draft.is_on(None));
+    // Turning off while save is in flight dispatches SaveOff.
+    assert_eq!(draft.toggle(None, false), RetentionToggle::SaveOff);
+    assert!(!draft.is_on(None));
+
+    // Re-open, edit, and blur -> saves clamped value; Escape before commit discards.
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    draft.mark_edited();
+    assert!(draft.cancel());
+    assert!(!draft.is_on(None));
+
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    draft.mark_edited();
+    assert_eq!(draft.commit(None, "9000", 1, false, 3), RetentionCommit::Save(3650));
+    // Re-committing while the initial save is still in flight does not double-save,
+    // while failing the active save reverts to Closed so the switch turns Off and retries cleanly.
+    assert_eq!(draft.commit(None, "9000", 1, true, 4), RetentionCommit::Restore(3650));
+    assert!(draft.fail_submit(3));
+    assert!(!draft.is_on(None));
+    assert!(!draft.fail_submit(3));
+
+    // Committing a newer age before an older save settles keeps the newer pending submission on old failure.
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    draft.mark_edited();
+    assert_eq!(draft.commit(None, "30", 1, true, 5), RetentionCommit::Save(30));
+    assert_eq!(draft.commit(None, "60", 1, true, 6), RetentionCommit::Save(60));
+    assert!(!draft.fail_submit(5), "stale older failure must not drop newer pending 60-day save");
+    assert_eq!(draft, RetentionDraft::Submitting { days: 60, seq: 6 });
+    assert!(draft.is_on(None));
+    assert!(draft.fail_submit(6), "active 60-day failure reverts switch Off");
+    assert!(!draft.is_on(None));
+
+    // Toggling Off then re-committing the same day count gets a fresh seq so the stale save cannot revert it.
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    assert_eq!(draft.commit(None, "30", 1, true, 7), RetentionCommit::Save(30));
+    assert_eq!(draft.toggle(None, false), RetentionToggle::SaveOff);
+    assert_eq!(draft.toggle(None, true), RetentionToggle::OpenDraft(8));
+    assert_eq!(draft.commit(None, "30", 1, true, 8), RetentionCommit::Save(30));
+    assert!(!draft.fail_submit(7));
+    assert!(draft.is_on(None));
+    assert!(draft.fail_submit(8));
 }
 
 /// Two switches flipped before the first save answers: the second is built from the settings the

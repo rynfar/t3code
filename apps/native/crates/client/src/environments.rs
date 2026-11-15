@@ -111,7 +111,7 @@ pub struct ThreadTitleRegenerationState {
 
 enum Command {
     #[cfg(feature = "test-support")]
-    Fixture { id: String, generation: u64, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus, reply: tokio::sync::oneshot::Sender<mpsc::Sender<ClientEvent>> },
+    Fixture { id: String, generation: u64, client: ClientHandle, shell: Box<ShellState>, config: Box<ServerConfigState>, status: ConnectionStatus, reply: tokio::sync::oneshot::Sender<mpsc::Sender<ClientEvent>> },
     ApplySettings { owner: EnvironmentOwner, settings: Box<t3_core::server_config::ServerSettings>, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
     ApplyKeybindings { owner: EnvironmentOwner, value: serde_json::Value, revision: u64, reply: tokio::sync::oneshot::Sender<Result<bool, DestinationError>> },
     Destination { owner: EnvironmentOwner, scope: String, reply: tokio::sync::oneshot::Sender<Result<Destination, DestinationError>> },
@@ -170,7 +170,7 @@ impl Environments {
         self.generation += 1;
         self.leases.insert(id.into(), (Credentials { http_base: "http://fixture.invalid".into(), access_token: String::new() }, self.generation));
         let (reply, response) = tokio::sync::oneshot::channel();
-        let _ = self.commands.send(Command::Fixture { id: id.into(), generation: self.generation, client, shell, config, status, reply });
+        let _ = self.commands.send(Command::Fixture { id: id.into(), generation: self.generation, client, shell: Box::new(shell), config: Box::new(config), status, reply });
         async move { response.await.expect("fixture environment owner stopped") }
     }
 
@@ -541,7 +541,7 @@ async fn run(
                     let (tx, events) = mpsc::channel(128);
                     let relay = tokio::spawn(relay_events(events, client.session_state(), client.connection_generation(), frames.clone(), id.clone(), generation));
                     let credentials = Credentials { http_base: "http://fixture.invalid".into(), access_token: String::new() };
-                    entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell, config, status, clock_requested_at_ms: wall_now_ms(), clock_recorded: false });
+                    entries.insert(id.clone(), Entry { client, credentials, relay, generation, shell: *shell, config: *config, status, clock_requested_at_ms: wall_now_ms(), clock_recorded: false });
                     publish(&entries, &id, true, &view);
                     #[cfg(test)]
                     let now = current_now(manual_now);

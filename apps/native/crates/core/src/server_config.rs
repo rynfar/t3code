@@ -544,6 +544,8 @@ pub struct EnvironmentCapabilities {
     #[serde(default)]
     pub otlp_endpoint_check: Option<bool>,
     #[serde(default)]
+    pub secret_source_check: Option<bool>,
+    #[serde(default)]
     pub one_time_schedules: Option<bool>,
     /// The server hosts headless Chromium tabs streamed over `/api/preview-stream`.
     #[serde(default)]
@@ -722,6 +724,18 @@ pub struct ServerSettings {
     pub secret_providers: crate::settings::secrets::SecretProviders,
     #[serde(default, deserialize_with = "lenient")]
     pub observability: crate::settings::diagnostics::ObservabilitySettings,
+    #[serde(default)]
+    pub source_control_hosts: Value,
+    #[serde(default)]
+    pub usage_limit_sources: Value,
+    #[serde(default)]
+    pub text_generators: Value,
+    #[serde(default)]
+    pub eas_device_hosts: Value,
+    #[serde(default)]
+    pub simlock_device_hosts: Value,
+    #[serde(default)]
+    pub cloud_speech_credentials: Value,
 }
 
 fn update_settings<'de, D: Deserializer<'de>>(d: D) -> Result<ServerSettings, D::Error> {

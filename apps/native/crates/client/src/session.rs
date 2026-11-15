@@ -97,6 +97,20 @@ pub struct StreamHandle {
 impl StreamHandle {
     /// Connection-wide Defect/ClientProtocolError failures clear the session's pending map.
     pub(crate) fn connection_closed(&self) -> bool { lock(&self.pending).is_none() }
+
+    #[cfg(feature = "test-support")]
+    pub fn fixture() -> (Self, mpsc::Sender<Result<Value, RpcError>>) {
+        let (tx, receiver) = mpsc::channel(8);
+        let (outbound, _) = mpsc::unbounded_channel();
+        let handle = StreamHandle {
+            settled: None,
+            receiver,
+            id: RequestId::Str("fixture-stream".into()),
+            outbound,
+            pending: Arc::new(Mutex::new(Some(HashMap::new()))),
+        };
+        (handle, tx)
+    }
 }
 
 impl Drop for StreamHandle {

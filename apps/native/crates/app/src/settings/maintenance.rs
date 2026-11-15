@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, list, prelude::FluentBuilder,
+    AnyElement, App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, list, prelude::FluentBuilder,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
@@ -17,12 +17,12 @@ use t3_client::supervisor::ConnectionStatus;
 use t3_core::device::SETTINGS_WRITE_SCOPE;
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::ServerSettingChange;
+use t3_core::settings::diagnostics::ENVIRONMENT_MAINTAIN_SCOPE;
 use t3_core::settings::maintenance::{
     self as model, BackgroundEdit, CleanupReport, DatabaseStorage, INTERVAL_FIELDS, IntervalField, LastRun, MaintenanceChange, Outcome, Override, PROFILES, PauseKey,
-    ProfileOption, ReportEntry, Retention,
+    ProfileOption, ReportEntry, Retention, RetentionCommit, RetentionDraft, RetentionToggle,
 };
 use t3_core::settings::search::Section;
-use t3_core::settings::worktrees::{DEFAULT_RETENTION_DAYS, clamp_retention};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, Row, Select, SelectOption, Switch, dialog_footer, group, icon, muted_text, r, section, section_title};
 use super::providers::{Stream, failure_text};
@@ -53,6 +53,13 @@ impl Field {
             Field::Logs => MaintenanceChange::LogsAfterDays(days),
         }
     }
+
+    fn index(self) -> usize {
+        match self {
+            Field::Artifacts => 0,
+            Field::Logs => 1,
+        }
+    }
 }
 
 /// Above this many results the last run's list is virtualized in a fixed height.
@@ -61,12 +68,17 @@ const INLINE_RESULTS: usize = 20;
 pub(crate) struct MaintenanceState {
     artifacts_days: Entity<InputState>,
     logs_days: Entity<InputState>,
+    retention_drafts: [RetentionDraft; 2],
+    retention_switch_pressed: [bool; 2],
+    retention_seq: u64,
     intervals: [Entity<InputState>; 4],
     last_run: LastRun,
     report_stream: Option<(u64, Stream)>,
     database: Option<DatabaseStorage>,
     database_stream: Option<(u64, Stream)>,
     cleanup_pending: bool,
+    reclaim_confirming: Option<FocusHandle>,
+    reclaim_requested: bool,
     last_run_open: bool,
     results: ListState,
     background_dialog: Option<FocusHandle>,
@@ -86,18 +98,23 @@ impl MaintenanceState {
         let logs_days = cx.new(|cx| InputState::new(window, cx));
         let intervals = [(); 4].map(|_| cx.new(|cx| InputState::new(window, cx)));
         let commit_on = |event: &InputEvent| matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur);
-        let mut subscriptions = vec![
-            cx.subscribe_in(&artifacts_days, window, move |this, _, event: &InputEvent, window, cx| {
-                if commit_on(event) {
-                    this.commit_artifact_retention(Field::Artifacts, window, cx);
+        let mut subscriptions = Vec::new();
+        for (input, field) in [(&artifacts_days, Field::Artifacts), (&logs_days, Field::Logs)] {
+            subscriptions.push(cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => this.maintenance.retention_drafts[field.index()].mark_edited(),
+                InputEvent::PressEnter { .. } => {
+                    this.maintenance.retention_switch_pressed[field.index()] = false;
+                    this.commit_artifact_retention(field, true, window, cx);
                 }
-            }),
-            cx.subscribe_in(&logs_days, window, move |this, _, event: &InputEvent, window, cx| {
-                if commit_on(event) {
-                    this.commit_artifact_retention(Field::Logs, window, cx);
+                InputEvent::Blur => {
+                    if std::mem::take(&mut this.maintenance.retention_switch_pressed[field.index()]) {
+                        return;
+                    }
+                    this.commit_artifact_retention(field, false, window, cx);
                 }
-            }),
-        ];
+                _ => {}
+            }));
+        }
         for (input, field) in intervals.iter().zip(INTERVAL_FIELDS) {
             subscriptions.push(cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| {
                 if commit_on(event) {
@@ -108,12 +125,17 @@ impl MaintenanceState {
         MaintenanceState {
             artifacts_days,
             logs_days,
+            retention_drafts: [RetentionDraft::Closed; 2],
+            retention_switch_pressed: [false; 2],
+            retention_seq: 0,
             intervals,
             last_run: LastRun::Loading,
             report_stream: None,
             database: None,
             database_stream: None,
             cleanup_pending: false,
+            reclaim_confirming: None,
+            reclaim_requested: false,
             last_run_open: false,
             results: ListState::new(0, ListAlignment::Top, gpui::px(400.)),
             background_dialog: None,
@@ -139,10 +161,14 @@ impl MaintenanceState {
         self.database_stream = None;
         self.ticker = None;
         self.background_dialog = None;
+        self.reclaim_confirming = None;
+        self.reclaim_requested = false;
+        self.retention_drafts = [RetentionDraft::Closed; 2];
+        self.retention_switch_pressed = [false; 2];
     }
 
     pub(super) fn dismiss(&mut self) -> bool {
-        self.background_dialog.take().is_some()
+        self.background_dialog.take().is_some() | self.reclaim_confirming.take().is_some()
     }
 }
 
@@ -163,8 +189,68 @@ impl SettingsView {
         (!self.may(SETTINGS_WRITE_SCOPE, cx)).then(|| t3_core::settings::diagnostics::telemetry_no_permission(&self.environment_label(cx)))
     }
 
-    fn save_maintenance(&self, change: MaintenanceChange, cx: &mut App) {
-        store::update_server(&self.state, ServerSettingChange::Prepared(change.payload()), cx);
+    pub(super) fn save_retention_setting(
+        &self,
+        change: ServerSettingChange,
+        rollback: impl FnOnce(&mut Self) -> bool + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity().downgrade();
+        store::update_server_with(
+            &self.state,
+            change,
+            Some(Box::new(move |cx| {
+                cx.spawn(async move |cx| {
+                    cx.update(|cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            let _ = rollback(this);
+                            cx.notify();
+                        });
+                    });
+                })
+                .detach();
+            })),
+            cx,
+        );
+    }
+
+    pub(super) fn retention_switch(
+        &self,
+        id: &'static str,
+        on: bool,
+        set_pressed: impl Fn(&mut Self, bool) + Copy + 'static,
+        on_toggle: impl Fn(&mut Self, bool, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let view = cx.entity().downgrade();
+        div()
+            .debug_selector(move || id.to_owned())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, _| {
+                    window.prevent_default();
+                    set_pressed(this, true);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    set_pressed(this, false);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    set_pressed(this, false);
+                }),
+            )
+            .child(Switch::new(id, on).on_change(move |next, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    set_pressed(this, false);
+                    on_toggle(this, next, window, cx);
+                });
+            }))
+            .into_any_element()
     }
 
     /// Built when the save queue sends it, from the settings every earlier save left.
@@ -201,6 +287,9 @@ impl SettingsView {
             let stream = self.subscribe(model::GET_DATABASE_STORAGE, json!({}), cx, |this, item, _| {
                 if let Ok(value) = item {
                     this.maintenance.database = model::compaction_recommendation(&value);
+                    if this.maintenance.database.as_ref().is_some_and(|d| d.reclaim_failure.is_some()) {
+                        this.maintenance.reclaim_requested = false;
+                    }
                 }
             });
             self.maintenance.database_stream = stream.map(|stream| (connection, stream));
@@ -217,22 +306,56 @@ impl SettingsView {
         }
     }
 
-    /// `RetentionControl`'s commit: a number saves clamped; anything else puts the saved value back.
-    fn commit_artifact_retention(&mut self, field: Field, window: &mut Window, cx: &mut Context<Self>) {
-        let input = self.maintenance.input(field).clone();
-        let Some(saved) = self.thread_settings(cx).and_then(|config| field.saved(&Retention::of(&config.settings))) else {
+    /// `RetentionControl`'s commit: explicit Enter or edited blur saves clamped; untouched blur
+    /// discards a draft without saving.
+    fn commit_artifact_retention(&mut self, field: Field, explicit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(saved) = self.thread_settings(cx).map(|config| field.saved(&Retention::of(&config.settings))) else {
             return;
         };
-        match input.read(cx).value().trim().parse::<f64>().ok().filter(|days| days.is_finite()) {
-            Some(days) => {
-                let days = clamp_retention(days, 1);
+        let input = self.maintenance.input(field).clone();
+        let text = input.read(cx).value().to_string();
+        let idx = field.index();
+        let next_seq = self.maintenance.retention_seq.wrapping_add(1);
+        match self.maintenance.retention_drafts[idx].commit(saved, &text, 1, explicit, next_seq) {
+            RetentionCommit::Save(days) => {
+                self.maintenance.retention_seq = next_seq;
                 input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
-                if days != saved {
-                    self.save_maintenance(field.change(Some(days)), cx);
-                }
+                self.save_retention_setting(
+                    ServerSettingChange::Prepared(field.change(Some(days)).payload()),
+                    move |this| this.maintenance.retention_drafts[idx].fail_submit(next_seq),
+                    cx,
+                );
+                cx.notify();
             }
-            None => input.update(cx, |input, cx| input.set_value(saved.to_string(), window, cx)),
+            RetentionCommit::Restore(days) => {
+                input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
+                cx.notify();
+            }
+            RetentionCommit::Discarded => {
+                cx.notify();
+            }
+            RetentionCommit::Unchanged => {}
         }
+    }
+
+    pub(super) fn dismiss_maintenance_retention(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        for field in [Field::Artifacts, Field::Logs] {
+            let input = self.maintenance.input(field).clone();
+            if self.maintenance.retention_drafts[field.index()].cancel() {
+                if input.focus_handle(cx).is_focused(window) {
+                    self.focus.focus(window, cx);
+                }
+                return true;
+            }
+            if input.focus_handle(cx).is_focused(window)
+                && let Some(saved) = self.thread_settings(cx).and_then(|config| field.saved(&Retention::of(&config.settings)))
+            {
+                input.update(cx, |input, cx| input.set_value(saved.to_string(), window, cx));
+                self.focus.focus(window, cx);
+                return true;
+            }
+        }
+        false
     }
 
     /// `IntervalSecondsField`'s commit: rounded, at least the field's minimum; text that is not a
@@ -256,7 +379,7 @@ impl SettingsView {
     pub(super) fn commit_focused_maintenance_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for field in [Field::Artifacts, Field::Logs] {
             if self.maintenance.input(field).focus_handle(cx).is_focused(window) {
-                self.commit_artifact_retention(field, window, cx);
+                self.commit_artifact_retention(field, false, window, cx);
             }
         }
         for (index, field) in INTERVAL_FIELDS.into_iter().enumerate() {
@@ -308,9 +431,32 @@ impl SettingsView {
             ],
             cx,
         );
-        let background = section("Background activity", vec![self.background_row(&config, unavailable.clone(), cx)], cx);
-        let mut blocks =
-            vec![Block::new(&["provider-update-checks", "continue-threads-after-server-update"], updates), Block::new(&["background-activity", "git-fetch-interval"], background)];
+        let background = section(
+            "Background activity",
+            vec![
+                self.background_row(&config, unavailable.clone(), cx),
+                Row::new("keep-awake-while-agents-work", "Keep awake while agents work")
+                    .description("Stop the computer from going to sleep while agents are working, and let it sleep once they finish. Closing a laptop lid still puts it to sleep.")
+                    .highlighted(self.is_target("keep-awake-while-agents-work"))
+                    .unavailable(unavailable.clone())
+                    .reset(!settings.maintenance.keep_awake_while_agents_work, {
+                        let state = state.clone();
+                        move |_, _, cx| Self::save_prepared(&state, MaintenanceChange::KeepAwakeWhileAgentsWork(true).payload(), cx)
+                    })
+                    .control(
+                        Switch::new("keep-awake-while-agents-work-switch", settings.maintenance.keep_awake_while_agents_work).on_change({
+                            let state = state.clone();
+                            move |on, _, cx| Self::save_prepared(&state, MaintenanceChange::KeepAwakeWhileAgentsWork(on).payload(), cx)
+                        }),
+                    )
+                    .into_any_element(),
+            ],
+            cx,
+        );
+        let mut blocks = vec![
+            Block::new(&["provider-update-checks", "continue-threads-after-server-update"], updates),
+            Block::new(&["background-activity", "git-fetch-interval", "keep-awake-while-agents-work"], background),
+        ];
         blocks.extend(self.storage_blocks(&config, unavailable, window, cx));
         let diagnostics = section(
             "Diagnostics",
@@ -389,8 +535,11 @@ impl SettingsView {
         }
     }
 
-    /// `BackgroundActivityAdvancedDialog`.
+    /// `BackgroundActivityAdvancedDialog` and `DatabaseStorageNotice`'s Reclaim confirmation.
     pub(super) fn background_dialog_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if let Some(overlay) = self.reclaim_dialog_overlay(window, cx) {
+            return Some(overlay);
+        }
         let focus = self.maintenance.background_dialog.clone()?;
         let config = self.thread_settings(cx).cloned()?;
         let p = palette(cx);
@@ -486,25 +635,52 @@ impl SettingsView {
         ))
     }
 
-    /// `RetentionControl`: a day count while on, "Off" while off, and a switch that turns it on
-    /// at eight days.
-    fn maintenance_retention(&self, field: Field, id: &'static str, value: Option<u32>, cx: &App) -> impl IntoElement {
+    /// `RetentionControl`: a day count while on, "Off" while off, and a switch that opens a
+    /// draft at eight days without saving until Enter or blur after editing.
+    fn maintenance_retention(&self, field: Field, id: &'static str, value: Option<u32>, cx: &Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let state = self.state.clone();
+        let idx = field.index();
+        let on = self.maintenance.retention_drafts[idx].is_on(value);
         h_flex()
             .gap(r(12.))
-            .map(|this| match value {
-                Some(_) => this.child(
-                    h_flex()
-                        .gap(r(6.))
-                        .child(div().w(r(72.)).child(Input::new(self.maintenance.input(field)).small()))
-                        .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("days")),
-                ),
-                None => this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Off")),
+            .map(|this| {
+                if on {
+                    this.child(
+                        h_flex()
+                            .gap(r(6.))
+                            .child(div().w(r(72.)).child(Input::new(self.maintenance.input(field)).small()))
+                            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("days")),
+                    )
+                } else {
+                    this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Off"))
+                }
             })
-            .child(Switch::new(id, value.is_some()).on_change(move |on, _, cx| {
-                Self::save_prepared(&state, field.change(on.then_some(DEFAULT_RETENTION_DAYS)).payload(), cx);
-            }))
+            .child(self.retention_switch(
+                id,
+                on,
+                move |this, pressed| this.maintenance.retention_switch_pressed[idx] = pressed,
+                move |this, next, window, cx| {
+                    let saved = this.thread_settings(cx).and_then(|config| field.saved(&Retention::of(&config.settings)));
+                    match this.maintenance.retention_drafts[idx].toggle(saved, next) {
+                        RetentionToggle::OpenDraft(days) => {
+                            this.maintenance.input(field).update(cx, |input, cx| {
+                                input.set_value(days.to_string(), window, cx);
+                                input.focus(window, cx);
+                            });
+                            cx.notify();
+                        }
+                        RetentionToggle::SaveOff => {
+                            store::update_server(&this.state, ServerSettingChange::Prepared(field.change(None).payload()), cx);
+                            cx.notify();
+                        }
+                        RetentionToggle::DiscardDraft => {
+                            cx.notify();
+                        }
+                        RetentionToggle::Noop => {}
+                    }
+                },
+                cx,
+            ))
     }
 
     /// `StorageCleanupSections`: the database notice, retention, and the cleanup run.
@@ -526,6 +702,7 @@ impl SettingsView {
         }
         let retention = Retention::of(&config.settings);
         for (field, days) in [(Field::Artifacts, retention.browser_artifacts_after_days), (Field::Logs, retention.logs_after_days)] {
+            self.maintenance.retention_drafts[field.index()].reconcile_saved(days);
             if let Some(days) = days {
                 Self::sync_input(self.maintenance.input(field), &days.to_string(), window, cx);
             }
@@ -558,15 +735,125 @@ impl SettingsView {
         blocks
     }
 
-    /// `DatabaseStorageNotice`: suggests `t3 doctor` while the database holds a GiB of freed pages.
+    fn open_reclaim_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.may(ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+            return;
+        }
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        self.maintenance.reclaim_confirming = Some(focus);
+        cx.notify();
+    }
+
+    fn close_reclaim_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.maintenance.reclaim_confirming.take().is_some() {
+            self.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn start_database_reclaim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.may(ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+            self.close_reclaim_dialog(window, cx);
+            return;
+        }
+        let Some(storage) = self.maintenance.database.clone() else {
+            self.close_reclaim_dialog(window, cx);
+            return;
+        };
+        self.maintenance.reclaim_confirming = None;
+        self.maintenance.reclaim_requested = true;
+        self.focus.focus(window, cx);
+        let amount = storage.amount();
+        let label = self.environment_label(cx);
+        let minutes = storage.reclaim_minutes();
+        let task = self.state.read(cx).rpc(model::RECLAIM_DATABASE_SPACE, json!({}));
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let toast = match result {
+                    Ok(_) => Toast::new(ToastKind::Success, format!("Reclaiming {amount} on {label}"))
+                        .description(format!("T3 Code there restarts and is back in about {minutes} min.")),
+                    Err(error) => {
+                        this.maintenance.reclaim_requested = false;
+                        Toast::new(ToastKind::Error, format!("Could not reclaim space on {label}"))
+                            .description(failure_text(&error, "An error occurred."))
+                    }
+                };
+                this.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn reclaim_dialog_overlay(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let focus = self.maintenance.reclaim_confirming.clone()?;
+        let storage = self.maintenance.database.as_ref()?;
+        let (title, description) = storage.reclaim_confirmation(&self.environment_label(cx));
+        let footer = dialog_footer(
+            false,
+            vec![
+                Button::new("storage-database-reclaim-cancel", ButtonVariant::Outline, ButtonSize::Default)
+                    .label("Cancel")
+                    .on_click(cx.listener(|this, _, window, cx| this.close_reclaim_dialog(window, cx)))
+                    .into_any_element(),
+                Button::new("storage-database-reclaim-confirm", ButtonVariant::Default, ButtonSize::Default)
+                    .label("Restart and reclaim")
+                    .on_click(cx.listener(|this, _, window, cx| this.start_database_reclaim(window, cx)))
+                    .into_any_element(),
+            ],
+            cx,
+        );
+        let view = cx.entity().downgrade();
+        let frame = DialogFrame {
+            id: "storage-database-reclaim-dialog",
+            title: title.into(),
+            description: description.into(),
+            max_width: 448.,
+            body: div().into_any_element(),
+            footer: footer.into_any_element(),
+            focus,
+        };
+        Some(frame.render(
+            window,
+            move |window, cx| {
+                let _ = view.update(cx, |this, cx| this.close_reclaim_dialog(window, cx));
+            },
+            cx,
+        ))
+    }
+
+    /// `DatabaseStorageNotice`: offers in-app Reclaim when supported & permitted, else `t3 doctor`.
     fn database_notice(&self, config: &ServerConfig, cx: &mut Context<Self>) -> Option<AnyElement> {
         if config.environment.capabilities.database_storage != Some(true) || cx.try_global::<DismissedDatabaseNotice>().is_some_and(|dismissed| dismissed.0) {
             return None;
         }
         let storage = self.maintenance.database.clone()?;
+        let reclaimable = storage.can_reclaim && self.may(ENVIRONMENT_MAINTAIN_SCOPE, cx);
+        let restarting = self.maintenance.reclaim_requested && storage.reclaim_failure.is_none();
         let command = storage.compact_command.clone();
-        let rows = vec![
-            Row::new("storage-database-intro", "Reclaim freed database space").description(model::DATABASE_DESCRIPTION).into_any_element(),
+        let dismiss = Button::new("storage-database-dismiss", ButtonVariant::Ghost, ButtonSize::Xs).label("Dismiss").on_click(cx.listener(|_, _, _, cx| {
+            cx.set_global(DismissedDatabaseNotice(true));
+            cx.notify();
+        }));
+        let machine_row = if reclaimable {
+            Row::new("storage-database-machine", storage.title(&self.environment_label(cx)))
+                .description(storage.reclaim_description())
+                .control(
+                    h_flex()
+                        .gap(r(6.))
+                        .child(
+                            Button::new("storage-database-reclaim", ButtonVariant::Outline, ButtonSize::Xs)
+                                .label(if restarting { "Restarting\u{2026}" } else { "Reclaim" })
+                                .disabled(restarting)
+                                .on_click(cx.listener(|this, _, window, cx| this.open_reclaim_dialog(window, cx))),
+                        )
+                        .child(dismiss),
+                )
+                .into_any_element()
+        } else {
             Row::new("storage-database-machine", storage.title(&self.environment_label(cx)))
                 .description_content(div().font_family(cx.theme().mono_font_family.clone()).child(command.clone()))
                 .control(
@@ -575,12 +862,15 @@ impl SettingsView {
                         .child(Button::new("storage-database-copy", ButtonVariant::Outline, ButtonSize::Xs).label("Copy command").on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
                         }))
-                        .child(Button::new("storage-database-dismiss", ButtonVariant::Ghost, ButtonSize::Xs).label("Dismiss").on_click(cx.listener(|_, _, _, cx| {
-                            cx.set_global(DismissedDatabaseNotice(true));
-                            cx.notify();
-                        }))),
+                        .child(dismiss),
                 )
+                .into_any_element()
+        };
+        let rows = vec![
+            Row::new("storage-database-intro", "Reclaim freed database space")
+                .description(model::database_description(reclaimable))
                 .into_any_element(),
+            machine_row,
         ];
         Some(section("Database", rows, cx).into_any_element())
     }
@@ -716,5 +1006,371 @@ impl SettingsView {
         })
         .detach();
         cx.notify();
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod parity_tests {
+    use super::*;
+    use gpui::{AppContext, HeadlessAppContext, IntoElement, ParentElement, Render, Styled, div, px, size};
+    use serde_json::json;
+    use std::sync::Arc;
+    use t3_core::settings::search::Section;
+
+    struct SettingsFrame;
+    impl Render for SettingsFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().bg(hsla(palette(cx).background)).children(super::super::overlay(window, cx))
+        }
+    }
+
+    #[test]
+    fn reclaim_keep_awake_and_deferred_retention_parity() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let drive = |cx: &mut HeadlessAppContext| {
+            cx.run_until_parked();
+            runtime.block_on(async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            });
+            cx.run_until_parked();
+        };
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(crate::icons::Assets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.allow_parking();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "settings:write", "providers:manage", "environment:maintain"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        drive(&mut cx);
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "fixture-env",
+                            "label": "Studio Mac",
+                            "capabilities": { "storageCleanup": true, "storageCleanupRun": true, "databaseStorage": true }
+                        },
+                        "settings": {
+                            "keepAwakeWhileAgentsWork": true,
+                            "storageCleanup": { "browserArtifactsAfterDays": 30, "logsAfterDays": null }
+                        }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx
+            .open_window(size(px(1280.), px(900.)), |_, cx| cx.new(|_| SettingsFrame))
+            .unwrap();
+        cx.update(|cx| super::super::open(Section::Maintenance, cx));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        cx.run_until_parked();
+        runtime.block_on(async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Fulfill stream requests (`server.getDatabaseStorage` + `server.getStorageCleanupReport`).
+        let (_, streams) = fixture.take_requests();
+        let mut db_tx = None;
+        for (method, reply) in streams {
+            let (handle, tx) = t3_client::session::StreamHandle::fixture();
+            let _ = reply.send(Ok(handle));
+            if method == model::GET_DATABASE_STORAGE {
+                db_tx = Some(tx);
+            } else {
+                let _ = tx.try_send(Ok(serde_json::Value::Null));
+                std::mem::forget(tx);
+            }
+        }
+        let db_tx = db_tx.expect("database storage stream subscribed");
+        runtime.block_on(async {
+            db_tx
+                .send(Ok(json!({
+                    "databaseBytes": 4_294_967_296.0,
+                    "reclaimableBytes": 2_147_483_648.0,
+                    "incrementalVacuumEnabled": false,
+                    "compactCommand": "t3 doctor compact",
+                    "canReclaim": true,
+                    "reclaimFailure": null
+                })))
+                .await
+                .unwrap();
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        let view = cx.update(|cx| cx.global::<super::super::Host>().view.clone().expect("settings view open"));
+        view.read_with(&cx, |view, _| {
+            assert!(view.maintenance.database.as_ref().is_some_and(|db| db.can_reclaim));
+        });
+
+        if let Some(out) = std::env::var_os("T3_PARITY_386_SHOTS_DIR") {
+            let out = std::path::PathBuf::from(out);
+            std::fs::create_dir_all(&out).unwrap();
+            cx.capture_screenshot(window.into()).unwrap().save(out.join("maintenance-overview.png")).unwrap();
+        }
+
+        // 1. Keep awake while agents work toggle writes server.updateSettings.
+        cx.update_window(window.into(), |_, _, cx| {
+            view.update(cx, |view, cx| {
+                SettingsView::save_prepared(&view.state, MaintenanceChange::KeepAwakeWhileAgentsWork(false).payload(), cx);
+            });
+        })
+        .unwrap();
+        drive(&mut cx);
+        let (requests, _) = fixture.take_requests();
+        let (method, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.updateSettings").expect("updateSettings sent");
+        assert_eq!(method, "server.updateSettings");
+        assert_eq!(payload["patch"]["keepAwakeWhileAgentsWork"], json!(false));
+        let _ = reply.send(Ok(json!({})));
+        drive(&mut cx);
+
+        // 2. RetentionControl: toggling Logs on opens draft (8) without saving; untouched blur discards it.
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()].toggle(None, true), RetentionToggle::OpenDraft(8));
+                view.maintenance.input(Field::Logs).update(cx, |input, cx| {
+                    input.set_value("8", window, cx);
+                });
+                view.commit_artifact_retention(Field::Logs, false, window, cx);
+                assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()], RetentionDraft::Closed);
+            });
+        })
+        .unwrap();
+        drive(&mut cx);
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.updateSettings"), "untouched draft blur must not save");
+
+        // Escape cancels open draft without closing Settings.
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, _cx| {
+                assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()].toggle(None, true), RetentionToggle::OpenDraft(8));
+                view.maintenance.retention_drafts[Field::Logs.index()].mark_edited();
+            });
+            window.dispatch_action(Box::new(super::super::CloseSettings), cx);
+        })
+        .unwrap();
+        drive(&mut cx);
+        assert!(cx.update(|cx| cx.global::<super::super::Host>().view.is_some()), "Escape cancels retention draft without closing Settings");
+        view.read_with(&cx, |view, _| assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()], RetentionDraft::Closed));
+
+        // Failed initial retention enable rolls back Submitting -> Closed so the switch reverts to Off and retries cleanly.
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()].toggle(None, true), RetentionToggle::OpenDraft(8));
+                view.maintenance.retention_drafts[Field::Logs.index()].mark_edited();
+                view.maintenance.input(Field::Logs).update(cx, |input, cx| input.set_value("14", window, cx));
+                view.commit_artifact_retention(Field::Logs, true, window, cx);
+                assert!(view.maintenance.retention_drafts[Field::Logs.index()].is_on(None));
+            });
+        })
+        .unwrap();
+        drive(&mut cx);
+        let (requests, _) = fixture.take_requests();
+        let (_, _, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.updateSettings").expect("initial retention save sent");
+        let _ = reply.send(Err(t3_client::session::RpcError::Closed));
+        drive(&mut cx);
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()], RetentionDraft::Closed);
+            assert!(!view.maintenance.retention_drafts[Field::Logs.index()].is_on(None), "failed enable must flip switch back Off");
+        });
+
+        // Re-enabling after failure retries saving via Enter cleanly.
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()].toggle(None, true), RetentionToggle::OpenDraft(8));
+                view.maintenance.retention_drafts[Field::Logs.index()].mark_edited();
+                view.maintenance.input(Field::Logs).update(cx, |input, cx| input.set_value("14", window, cx));
+                view.commit_artifact_retention(Field::Logs, true, window, cx);
+            });
+        })
+        .unwrap();
+        drive(&mut cx);
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.updateSettings").expect("retry after failed enable saves");
+        assert_eq!(payload["patch"]["storageCleanup"]["logsAfterDays"], json!(14));
+        let _ = reply.send(Ok(json!({
+            "keepAwakeWhileAgentsWork": false,
+            "storageCleanup": { "browserArtifactsAfterDays": 30, "logsAfterDays": 14 }
+        })));
+        drive(&mut cx);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        view.read_with(&cx, |view, _| assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()], RetentionDraft::Closed));
+
+        // 3. Reclaim confirmation dialog opens, captures, and confirms RPC; permission missing blocks it.
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| view.open_reclaim_dialog(window, cx));
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        view.read_with(&cx, |view, _| assert!(view.maintenance.reclaim_confirming.is_some()));
+
+        if let Some(out) = std::env::var_os("T3_PARITY_386_SHOTS_DIR") {
+            let out = std::path::PathBuf::from(out);
+            cx.capture_screenshot(window.into()).unwrap().save(out.join("maintenance-reclaim-dialog.png")).unwrap();
+        }
+
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| view.start_database_reclaim(window, cx));
+        })
+        .unwrap();
+        drive(&mut cx);
+        let (requests, _) = fixture.take_requests();
+        let (method, payload, reply) = requests
+            .into_iter()
+            .find(|(m, _, _)| *m == model::RECLAIM_DATABASE_SPACE)
+            .expect("reclaimDatabaseSpace RPC sent");
+        assert_eq!(method, model::RECLAIM_DATABASE_SPACE);
+        assert_eq!(payload, json!({}));
+        let _ = reply.send(Ok(json!({})));
+        drive(&mut cx);
+        view.read_with(&cx, |view, _| assert!(view.maintenance.reclaim_requested));
+
+        fixture.grants.send(Some(crate::context_menu::project_filter_tests::session(false))).unwrap();
+        drive(&mut cx);
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| view.open_reclaim_dialog(window, cx));
+        })
+        .unwrap();
+        view.read_with(&cx, |view, _| assert!(view.maintenance.reclaim_confirming.is_none()));
+
+        drop(db_tx);
+        state.update(&mut cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn retention_switch_drag_off_resets_pressed_guard(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.executor().allow_parking();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "settings:write", "providers:manage", "environment:maintain"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "fixture-env",
+                            "label": "Studio Mac",
+                            "capabilities": { "storageCleanup": true }
+                        },
+                        "settings": {
+                            "storageCleanup": { "browserArtifactsAfterDays": null, "logsAfterDays": null }
+                        }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| super::super::open(Section::Maintenance, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let view = vcx.read(|cx| cx.global::<super::super::Host>().view.clone().expect("settings view open"));
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.maintenance.retention_drafts[Field::Logs.index()].toggle(None, true), RetentionToggle::OpenDraft(8));
+                view.maintenance.retention_drafts[Field::Logs.index()].mark_edited();
+                view.maintenance.input(Field::Logs).update(cx, |input, cx| input.set_value("14", window, cx));
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let switch_center = vcx.debug_bounds("storage-logs-switch").expect("logs retention switch bounds").center();
+        vcx.simulate_mouse_move(switch_center, None::<MouseButton>, Default::default());
+        vcx.simulate_mouse_down(switch_center, MouseButton::Left, Default::default());
+        vcx.run_until_parked();
+        assert!(
+            view.read_with(&vcx, |view, _| view.maintenance.retention_switch_pressed[Field::Logs.index()]),
+            "pressing switch sets pressed guard"
+        );
+        let outside = gpui::point(px(4.), px(4.));
+        vcx.simulate_mouse_move(outside, Some(MouseButton::Left), Default::default());
+        vcx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
+        vcx.run_until_parked();
+        assert!(
+            !view.read_with(&vcx, |view, _| view.maintenance.retention_switch_pressed[Field::Logs.index()]),
+            "releasing outside switch clears pressed guard"
+        );
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.commit_artifact_retention(Field::Logs, false, window, cx);
+            });
+        });
+        vcx.run_until_parked();
+        runtime.block_on(async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        });
+        vcx.run_until_parked();
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.updateSettings").expect("blur after drag-off commits");
+        assert_eq!(payload["patch"]["storageCleanup"]["logsAfterDays"], json!(14));
+        let _ = reply.send(Ok(json!({})));
+        vcx.run_until_parked();
+        state.update(&mut vcx, |state, _| state.stop_pump());
     }
 }
