@@ -50,10 +50,9 @@ pub(crate) fn picker_entries(
         Some(ProjectPickerEntry { group, target, is_preferred })
     }).collect::<Vec<_>>();
     entries.sort_by_key(|entry| !entry.group.pinned);
-    if let Some(index) = entries.iter().position(|entry| entry.is_preferred && !entry.group.pinned) {
+    if let Some(index) = entries.iter().position(|entry| entry.is_preferred) {
         let entry = entries.remove(index);
-        let pinned = entries.iter().take_while(|entry| entry.group.pinned).count();
-        entries.insert(pinned, entry);
+        entries.insert(0, entry);
     }
     entries
 }
@@ -319,11 +318,10 @@ impl DraftHero {
             .collect();
         groups.sort_by_key(|group| !group.pinned);
         if let Some(current_id) = current.as_deref()
-            && let Some(index) = groups.iter().position(|group| !group.pinned && group.member_project_ids.iter().any(|id| id == current_id))
+            && let Some(index) = groups.iter().position(|group| group.member_project_ids.iter().any(|id| id == current_id))
         {
             let entry = groups.remove(index);
-            let pinned = groups.iter().take_while(|group| group.pinned).count();
-            groups.insert(pinned, entry);
+            groups.insert(0, entry);
         }
         let can_pin = app.can_pin_projects();
         let rows = groups
@@ -1409,6 +1407,7 @@ mod tests {
                     snapshot.projects.push(t3_core::shell::ProjectShell {
                         id: "scratch-proj".into(),
                         title: "Scratch".into(),
+                        has_custom_title: None,
                         workspace_root: "/tmp/t3-scratch".into(),
                         repository_identity: None,
                         default_model_selection: None,

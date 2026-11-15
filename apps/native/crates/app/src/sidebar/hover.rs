@@ -2,7 +2,12 @@
 //! Built when the glass tooltip opens, from what the app already holds, and dropped with it; the
 //! one read it makes, the checkout's branch, goes with it.
 
-use gpui::{AnyElement, App, AppContext as _, BoxShadow, Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Task, Window, div, point, prelude::*, px, rgba};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::time::Duration;
+
+use gpui::{AnyElement, App, AppContext as _, Bounds, BoxShadow, Context, Entity, EntityId, FontWeight, IntoElement, ListState, ParentElement, Pixels, Render, SharedString, Styled, Task, WeakEntity, Window, div, point, prelude::*, px, rgba};
 use t3_core::pull_requests::thread_badge::{BadgeState, PrGlyph, PrTone};
 use t3_core::sidebar::hover as model;
 use t3_core::sidebar::tag_filter::ThreadKey;
@@ -340,6 +345,7 @@ impl Render for ThreadHoverCard {
                 }))
         });
         div()
+            .debug_selector(|| "thread-hover-card".into())
             .relative()
             .max_w(px(MAX_WIDTH))
             .rounded(px(6.))
@@ -377,9 +383,237 @@ impl Render for ThreadHoverCard {
     }
 }
 
-/// The glass tooltip's builder: the card exists only while it shows.
-pub(super) fn tooltip(target: HoverTarget) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
-    move |_, cx| cx.new(|cx| ThreadHoverCard::new(&target, cx)).into()
+/// `<TooltipProvider delay={150} closeDelay={0} timeout={400}>` timings.
+const OPEN_DELAY: Duration = Duration::from_millis(150);
+const WARM_TIMEOUT: Duration = Duration::from_millis(400);
+
+struct OpenHover {
+    row_id: SharedString,
+    card: Entity<ThreadHoverCard>,
+}
+
+/// Owns the row-anchored thread hover card and its 150ms open / 0ms leave / 400ms warm window.
+#[derive(Default)]
+pub(super) struct SidebarHoverState {
+    active_row: Option<SharedString>,
+    target: Option<HoverTarget>,
+    open: Option<OpenHover>,
+    warm: bool,
+    last_search_query: String,
+    open_timer: Option<Task<()>>,
+    cooldown_timer: Option<Task<()>>,
+    row_bounds: Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>,
+    visible_rows: Rc<RefCell<HashSet<SharedString>>>,
+    tracked_row: Rc<RefCell<Option<SharedString>>>,
+    dismiss_scheduled: Rc<RefCell<bool>>,
+}
+
+impl SidebarHoverState {
+    pub(super) fn sync_search(&mut self, query: &str) {
+        if self.last_search_query != query {
+            self.last_search_query = query.to_owned();
+            self.clear();
+        }
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.active_row.is_some() || self.open.is_some()
+    }
+
+    pub(super) fn record_row_bounds(&self, row_id: SharedString, pane_id: EntityId) -> AnyElement {
+        let bounds_map = self.row_bounds.clone();
+        let visible_rows = self.visible_rows.clone();
+        let tracked_row = self.tracked_row.clone();
+        gpui::canvas(
+            move |bounds, _, cx| {
+                visible_rows.borrow_mut().insert(row_id.clone());
+                let previous = bounds_map.borrow_mut().insert(row_id.clone(), bounds);
+                if previous != Some(bounds) && tracked_row.borrow().as_ref() == Some(&row_id) {
+                    cx.notify(pane_id);
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element()
+    }
+
+    pub(super) fn begin_frame_probe(&self) -> AnyElement {
+        let visible_rows = self.visible_rows.clone();
+        gpui::canvas(
+            move |_, _, _| {
+                visible_rows.borrow_mut().clear();
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size(px(0.))
+        .into_any_element()
+    }
+
+    pub(super) fn end_frame_probe(&self, pane: WeakEntity<super::SidebarPane>, active_list: ListState) -> AnyElement {
+        let bounds_map = self.row_bounds.clone();
+        let visible_rows = self.visible_rows.clone();
+        let tracked_row = self.tracked_row.clone();
+        let dismiss_scheduled = self.dismiss_scheduled.clone();
+        gpui::canvas(
+            |_, _, _| {},
+            move |_, _, window, cx| {
+                let Some(row_id) = tracked_row.borrow().clone() else {
+                    return;
+                };
+                let viewport = active_list.viewport_bounds();
+                let on_screen = visible_rows.borrow().contains(&row_id)
+                    && (viewport.size.width <= px(0.)
+                        || viewport.size.height <= px(0.)
+                        || bounds_map.borrow().get(&row_id).is_some_and(|bounds| bounds.intersects(&viewport)));
+                if !on_screen && !*dismiss_scheduled.borrow() {
+                    *dismiss_scheduled.borrow_mut() = true;
+                    let pane = pane.clone();
+                    let dismiss_flag = dismiss_scheduled.clone();
+                    window.defer(cx, move |_, cx| {
+                        *dismiss_flag.borrow_mut() = false;
+                        let _ = pane.update(cx, |this, cx| {
+                            this.hover.dismiss(cx);
+                        });
+                    });
+                }
+            },
+        )
+        .absolute()
+        .size(px(0.))
+        .into_any_element()
+    }
+
+    pub(super) fn clear(&mut self) -> bool {
+        let changed = self.active_row.is_some()
+            || self.target.is_some()
+            || self.open.is_some()
+            || self.warm
+            || self.open_timer.is_some()
+            || self.cooldown_timer.is_some();
+        self.active_row = None;
+        *self.tracked_row.borrow_mut() = None;
+        self.target = None;
+        self.open = None;
+        self.warm = false;
+        self.open_timer = None;
+        self.cooldown_timer = None;
+        changed
+    }
+
+    pub(super) fn dismiss(&mut self, cx: &mut Context<super::SidebarPane>) {
+        if self.clear() {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn on_hover(
+        &mut self,
+        suppressed: bool,
+        row_id: SharedString,
+        target: HoverTarget,
+        hovered: bool,
+        cx: &mut Context<super::SidebarPane>,
+    ) {
+        if suppressed {
+            self.dismiss(cx);
+            return;
+        }
+        if hovered {
+            if self.active_row.as_ref() == Some(&row_id) {
+                self.target = Some(target);
+                return;
+            }
+            self.cooldown_timer = None;
+            self.open_timer = None;
+            self.active_row = Some(row_id.clone());
+            *self.tracked_row.borrow_mut() = Some(row_id.clone());
+            self.target = Some(target.clone());
+            if self.warm {
+                let card = cx.new(|cx| ThreadHoverCard::new(&target, cx));
+                self.open = Some(OpenHover { row_id, card });
+                cx.notify();
+            } else {
+                self.open = None;
+                let expected = row_id;
+                self.open_timer = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(OPEN_DELAY).await;
+                    let _ = this.update(cx, |pane, cx| {
+                        let suppressed = pane.hover_suppressed();
+                        pane.hover.finish_open_timer(&expected, suppressed, cx);
+                    });
+                }));
+            }
+            return;
+        }
+
+        // Ignore stale leave events from an earlier row after a newer row is already active.
+        if self.active_row.as_ref() != Some(&row_id) {
+            return;
+        }
+        self.active_row = None;
+        *self.tracked_row.borrow_mut() = None;
+        self.target = None;
+        self.open_timer = None;
+        let was_open = self.open.take().is_some();
+        if was_open || self.warm {
+            self.warm = true;
+            self.cooldown_timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(WARM_TIMEOUT).await;
+                let _ = this.update(cx, |pane, _| {
+                    if pane.hover.active_row.is_none() {
+                        pane.hover.warm = false;
+                    }
+                    pane.hover.cooldown_timer = None;
+                });
+            }));
+            if was_open {
+                cx.notify();
+            }
+        }
+    }
+
+    fn finish_open_timer(&mut self, expected: &SharedString, suppressed: bool, cx: &mut Context<super::SidebarPane>) {
+        self.open_timer = None;
+        if suppressed || self.active_row.as_ref() != Some(expected) {
+            return;
+        }
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        self.warm = true;
+        self.cooldown_timer = None;
+        let card = cx.new(|cx| ThreadHoverCard::new(target, cx));
+        self.open = Some(OpenHover { row_id: expected.clone(), card });
+        cx.notify();
+    }
+
+    pub(super) fn overlay(&mut self, suppressed: bool, active_list: &ListState) -> Option<AnyElement> {
+        if suppressed {
+            self.clear();
+            return None;
+        }
+        let open = self.open.as_ref()?;
+        let row_bounds = self.row_bounds.borrow().get(&open.row_id).copied()?;
+        let viewport = active_list.viewport_bounds();
+        if viewport.size.width > px(0.) && viewport.size.height > px(0.) && !row_bounds.intersects(&viewport) {
+            self.clear();
+            return None;
+        }
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position_mode(gpui::AnchoredPositionMode::Window)
+                    .position(point(row_bounds.right() + px(4.), row_bounds.top()))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(open.card.clone()),
+            )
+            .with_priority(140)
+            .into_any_element(),
+        )
+    }
 }
 
 #[cfg(all(test, feature = "snapshot"))]
@@ -615,6 +849,232 @@ mod tests {
             assert_eq!(card.branch, None, "removed worktree checkout must clear branch on hover card");
             assert!(!card.branch_mismatch);
         });
+        state.update(vcx, |state, _| state.stop_pump());
+    }
+
+    struct HoverHost {
+        pane: Entity<super::super::SidebarPane>,
+        menu: Entity<crate::context_menu::ContextMenu>,
+    }
+
+    impl Render for HoverHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .child(
+                    div()
+                        .w(px(320.))
+                        .h_full()
+                        .child(self.pane.clone().cached(gpui::StyleRefinement::default().size_full())),
+                )
+                .child(div().flex_1().h_full())
+                .child(self.menu.clone())
+        }
+    }
+
+    fn setup_hover_host<'a>(
+        cx: &'a mut TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        threads: Vec<Value>,
+    ) -> (Entity<AppState>, Entity<super::super::SidebarPane>, &'a mut gpui::VisualTestContext) {
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let (state, fixture) = install_state(cx, runtime.handle().clone());
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |s, cx| {
+                s.sidebar.snapshot_fixture = true;
+                s.shell.snapshot.as_mut().unwrap().threads =
+                    threads.into_iter().map(|v| serde_json::from_value(v).unwrap()).collect();
+                s.rebuild_sidebar(cx);
+            });
+            (state, fixture)
+        });
+        let (root, vcx) = cx.add_window_view(|window, cx| {
+            let menu = cx.new(|cx| crate::context_menu::ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| crate::snooze_dialog::SnoozeDialog::new(state.clone(), window, cx));
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let pane = cx.new(|cx| super::super::SidebarPane::new(state.clone(), composer, menu.clone(), confirm, snooze, window, cx));
+            HoverHost { pane, menu }
+        });
+        let pane = root.read_with(vcx, |host, _| host.pane.clone());
+        vcx.run_until_parked();
+        pane.update(vcx, |_, cx| cx.notify());
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        (state, pane, vcx)
+    }
+
+    #[gpui::test]
+    async fn row_hover_card_anchors_to_right_edge_regardless_of_pointer_x_and_hands_off_warmly(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, pane, vcx) = setup_hover_host(
+            cx,
+            &runtime,
+            vec![
+                thread_json("th-1", "checkout-a", json!({ "title": "First thread", "pinnedAt": "2026-01-02T00:00:00Z" })),
+                thread_json("th-2", "checkout-a", json!({ "title": "Second thread", "pinnedAt": "2026-01-01T23:00:00Z", "updatedAt": "2026-01-01T23:00:00Z" })),
+            ],
+        );
+
+        let row1_bounds = vcx.debug_bounds("thread-row-None-th-1").expect("row 1 bounds");
+        let row2_bounds = vcx.debug_bounds("thread-row-None-th-2").expect("row 2 bounds");
+
+        // 1. Cold hover near left edge waits 150ms, then anchors at (row1.right() + 4, row1.top()).
+        vcx.update(|window, cx| {
+            window.simulate_mouse_move(point(row1_bounds.left() + px(14.), row1_bounds.center().y), cx);
+        });
+        vcx.run_until_parked();
+        vcx.executor().advance_clock(Duration::from_millis(100));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("thread-hover-card").is_none(), "hover card must wait for 150ms cold delay");
+
+        vcx.executor().advance_clock(Duration::from_millis(60));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let left_card = vcx.debug_bounds("thread-hover-card").expect("hover card opens after 150ms");
+        assert!((left_card.left() - (row1_bounds.right() + px(4.))).abs() <= px(1.));
+        assert!((left_card.top() - row1_bounds.top()).abs() <= px(1.));
+
+        // 2. Leave (closeDelay = 0), wait >400ms cooldown, then hover near right edge -> identical card bounds.
+        vcx.update(|window, cx| {
+            window.simulate_mouse_move(point(px(900.), px(600.)), cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("thread-hover-card").is_none(), "leaving row must dismiss immediately");
+
+        vcx.executor().advance_clock(Duration::from_millis(450));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.simulate_mouse_move(point(row1_bounds.right() - px(14.), row1_bounds.center().y), cx);
+        });
+        vcx.run_until_parked();
+        vcx.executor().advance_clock(Duration::from_millis(160));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let right_card = vcx.debug_bounds("thread-hover-card").expect("hover card opens on right edge");
+        assert_eq!(right_card, left_card, "hover card bounds must not depend on horizontal pointer position");
+
+        // 3. Moving to a second row while warm switches immediately (0ms delay) and anchors to row 2.
+        vcx.update(|window, cx| {
+            window.simulate_mouse_move(row2_bounds.center(), cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let row2_card = vcx.debug_bounds("thread-hover-card").expect("warm handoff must open row 2 immediately");
+        assert!((row2_card.left() - (row2_bounds.right() + px(4.))).abs() <= px(1.));
+        assert!((row2_card.top() - row2_bounds.top()).abs() <= px(1.));
+
+        // 4. Stale leave for row 1 arriving after row 2 entered must not dismiss row 2; clicking row 2 dismisses.
+        let target1 = HoverTarget {
+            state: state.clone(),
+            key: None,
+            thread_id: "th-1".into(),
+            project: Some("Shared repo".into()),
+            favicon: ProjectVisual::default(),
+            is_repo: None,
+        };
+        pane.update(vcx, |pane, cx| {
+            pane.hover.on_hover(false, "thread-row-None-th-1".into(), target1, false, cx);
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("thread-hover-card").is_some(), "stale leave for row 1 must not close row 2");
+
+        vcx.update(|window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                    button: gpui::MouseButton::Left,
+                    position: row2_bounds.center(),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("thread-hover-card").is_none(), "mouse-down on row must dismiss hover card");
+
+        state.update(vcx, |state, _| state.stop_pump());
+    }
+
+    #[gpui::test]
+    async fn search_result_row_hover_card_anchors_to_right_edge(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, pane, vcx) = setup_hover_host(
+            cx,
+            &runtime,
+            vec![
+                thread_json("sr-1", "checkout-a", json!({ "title": "Search Target Alpha" })),
+                thread_json("sr-2", "checkout-a", json!({ "title": "Unrelated Beta" })),
+            ],
+        );
+
+        pane.update(vcx, |pane, cx| {
+            pane.search.set_query("Target".into(), &pane.state, cx);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let key = ThreadKey::new("", "sr-1");
+        let search_selector: &'static str = Box::leak(format!("search-result-{:?}", key).into_boxed_str());
+        let search_bounds = vcx.debug_bounds(search_selector).expect("search result row bounds");
+
+        vcx.update(|window, cx| {
+            window.simulate_mouse_move(search_bounds.center(), cx);
+        });
+        vcx.run_until_parked();
+        vcx.executor().advance_clock(Duration::from_millis(160));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let card_bounds = vcx.debug_bounds("thread-hover-card").expect("search result hover card must open");
+        assert!((card_bounds.left() - (search_bounds.right() + px(4.))).abs() <= px(1.));
+        assert!((card_bounds.top() - search_bounds.top()).abs() <= px(1.));
+
+        // Updating search query clears active hover card immediately.
+        pane.update(vcx, |pane, cx| {
+            pane.search.set_query("Beta".into(), &pane.state, cx);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("thread-hover-card").is_none(), "changing search query must dismiss hover card");
+
         state.update(vcx, |state, _| state.stop_pump());
     }
 }

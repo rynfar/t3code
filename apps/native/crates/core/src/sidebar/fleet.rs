@@ -164,14 +164,18 @@ fn folder_dot(threads: &[&SidebarThread]) -> Option<FolderDot> {
 
 impl ScopedSidebarModel {
     pub fn build(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState) -> Self {
-        Self::build_with_overrides(input, state, false)
+        Self::build_with_overrides(input, state, false, None)
     }
 
     pub fn build_presented(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState) -> Self {
-        Self::build_with_overrides(input, state, true)
+        Self::build_with_overrides(input, state, true, None)
     }
 
-    fn build_with_overrides(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState, presented: bool) -> Self {
+    pub fn build_presented_with_launching(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState, launching: &HashSet<String>) -> Self {
+        Self::build_with_overrides(input, state, true, Some(launching))
+    }
+
+    fn build_with_overrides(input: &ScopedSidebarInput<'_>, state: &mut ScopedSidebarState, presented: bool, launching: Option<&HashSet<String>>) -> Self {
         state.trackers.retain(|(saved_id,canonical_id,generation), _| input.environments.iter().any(|environment| {
             environment.owner.saved_id == *saved_id && environment.owner.canonical_id == *canonical_id && environment.owner.generation == *generation
         }));
@@ -242,17 +246,26 @@ impl ScopedSidebarModel {
             }
         }
         for (environment, admitted) in input.environments.iter().zip(admitted) {
-            let local = admitted.iter().map(|thread| thread.thread.clone()).collect::<Vec<_>>();
+            let local = admitted
+                .iter()
+                .map(|thread| {
+                    if launching.is_some_and(|ids| ids.contains(&thread.thread.id)) {
+                        super::inbox::as_launching_thread(thread.thread.clone())
+                    } else {
+                        thread.thread.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
             let tracker = state.trackers.entry((environment.owner.saved_id.clone(),environment.owner.canonical_id.clone(),environment.owner.generation)).or_default();
             let observation = if working_shelf_enabled { tracker.observe(&local, input.now) } else { tracker.clear(); Default::default() };
             let (local,scoped): (Vec<_>,Vec<_>) = local.into_iter().zip(admitted).filter(|(_,thread)| in_scope(thread)
                 && aliases.get(&(environment.owner.identity(), thread.thread.id.clone())).is_some_and(|(_, key)| *key == thread.key())).unzip();
             let partition = super::partition(&PartitionInput { threads: &local, working_shelf_enabled, config_loaded: environment.config_loaded, now: input.now, inbox: &observation });
             let offset = model.threads.len();
-            for thread in scoped {
+            for (presented_thread, thread) in local.into_iter().zip(scoped) {
                 let key = thread.key();
-                returned.insert(key.clone(), observation.returned_at(&thread.thread));
-                model.threads.push(ScopedSidebarThread { key, project: thread.project_ref(), owner: environment.owner.clone(), thread: thread.thread.clone() });
+                returned.insert(key.clone(), observation.returned_at(&presented_thread));
+                model.threads.push(ScopedSidebarThread { key, project: thread.project_ref(), owner: environment.owner.clone(), thread: presented_thread });
             }
             model.partition.pinned.extend(partition.pinned.iter().map(|index| offset + index));
             model.partition.active.extend(partition.active.iter().map(|index| offset + index));

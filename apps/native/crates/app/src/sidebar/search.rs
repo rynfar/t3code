@@ -129,6 +129,14 @@ impl SearchState {
         self.pending
     }
 
+    pub(super) fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub(super) fn list(&self) -> &ListState {
+        &self.list
+    }
+
     #[cfg(all(test, feature = "snapshot"))]
     pub fn settled_query(&self) -> &str {
         &self.settled_query
@@ -671,17 +679,28 @@ impl SidebarPane {
         .into_any_element()
     }
 
-    fn render_search_result(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_search_result(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let Some(id) = self.search.results.get(index).cloned() else { return div().into_any_element() };
+        let (raw_thread, hover_key, project) = {
+            let state = self.state.read(cx);
+            let scoped = state.sidebar.fleet.thread(&id);
+            let Some(thread) = scoped
+                .map(|row| &row.thread)
+                .or_else(|| state.sidebar.model.thread(&id.thread_id).filter(|_| id.environment_id.is_empty()))
+            else {
+                return div().h(px(RESULT_HEIGHT)).into_any_element();
+            };
+            let hover_key = scoped.map(|_| id.clone());
+            let project = scoped
+                .and_then(|row| state.sidebar.fleet.project_names.get(&row.project).cloned())
+                .or_else(|| state.sidebar.model.project_names.get(&thread.project_id).cloned());
+            (thread.clone(), hover_key, project)
+        };
+        let is_repo = self.ensure_checkout_repo(hover_key.as_ref(), &raw_thread, cx);
         let state = self.state.read(cx);
         let scoped = state.sidebar.fleet.thread(&id);
-        let Some(thread) = scoped
-            .map(|row| &row.thread)
-            .or_else(|| state.sidebar.model.thread(&id.thread_id).filter(|_| id.environment_id.is_empty()))
-        else {
-            return div().h(px(RESULT_HEIGHT)).into_any_element();
-        };
+        let thread = scoped.map(|row| &row.thread).unwrap_or(&raw_thread);
         let active = if scoped.is_some() {
             state.active_thread_key(&id.thread_id).as_ref() == Some(&id)
                 && state.selected_thread.as_deref() == Some(id.thread_id.as_str())
@@ -766,6 +785,16 @@ impl SidebarPane {
         };
         let row_id = SharedString::from(format!("search-result-{:?}", id));
         let debug_row_id = row_id.clone();
+        let hover_bounds_id = row_id.clone();
+        let hover_row_id = row_id.clone();
+        let hover = super::hover::HoverTarget {
+            state: self.state.clone(),
+            key: hover_key,
+            thread_id: thread.id.clone(),
+            project,
+            favicon: visual.clone(),
+            is_repo,
+        };
         div()
             .px(px(8.))
             .py(px(1.))
@@ -774,6 +803,7 @@ impl SidebarPane {
                     .id(row_id)
                     .debug_selector(move || debug_row_id.to_string())
                     .group("sidebar-row")
+                    .relative()
                     .w_full()
                     .min_h(px(RESULT_HEIGHT))
                     .flex()
@@ -787,16 +817,49 @@ impl SidebarPane {
                         this.bg(hsla(p.sidebar_row_active)).when(active && light, |this| this.shadow(vec![ring]))
                     })
                     .when(!active && !highlighted, |this| this.hover(|style| style.bg(hsla(p.sidebar_row_hover))))
-                    .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
-                        style.bg(hsla(p.primary).opacity(0.08))
+                    .child(self.hover.record_row_bounds(hover_bounds_id, cx.entity_id()))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.hover.on_hover(this.hover_suppressed(), hover_row_id.clone(), hover.clone(), *hovered, cx);
+                    }))
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.hover.dismiss(cx)))
+                    .drag_over::<gpui::ExternalPaths>(move |style, paths, _, _| {
+                        if paths.paths().iter().any(|path| !path.is_dir()) {
+                            style.bg(hsla(p.primary).opacity(0.08))
+                        } else {
+                            style
+                        }
                     })
+                    .on_drag_move(cx.listener(move |this, event: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                        if event.bounds.contains(&event.event.position) && event.drag(cx).paths().iter().any(|path| !path.is_dir()) {
+                            if this.folder_drop_active {
+                                this.folder_drop_active = false;
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        }
+                    }))
                     .on_drop(cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
-                        let key = drop_id.clone();
-                        let files = paths.paths().to_vec();
-                        this.state.update(cx, |state, cx| {
-                            state.drop_files_on_sidebar_thread(key, files, cx);
-                        });
+                        this.folder_drop_active = false;
+                        let files: Vec<_> = paths.paths().iter().filter(|path| !path.is_dir()).cloned().collect();
+                        let claimed = !files.is_empty();
+                        let has_folders = paths.paths().iter().any(|path| path.is_dir());
+                        if !claimed && !has_folders {
+                            return;
+                        }
+                        if claimed {
+                            let key = drop_id.clone();
+                            this.state.update(cx, |state, cx| {
+                                state.drop_files_on_sidebar_thread(key, files, cx);
+                            });
+                        }
+                        if has_folders {
+                            this.state.update(cx, |state, cx| {
+                                state.drop_folders_on_sidebar(paths.paths(), claimed, cx);
+                            });
+                        }
                         this.clear_search(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
                     }))
                     .on_mouse_move(cx.listener(move |this, _, _, cx| {
                         if this.search.highlighted != index {
@@ -868,6 +931,7 @@ impl SidebarPane {
                             })),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        this.hover.dismiss(cx);
                         this.activate_search_result(id.clone(), window, cx);
                     })),
             )

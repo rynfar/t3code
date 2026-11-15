@@ -179,7 +179,7 @@ async fn thread_drag_permissions_supports_settlement_and_mid_drag_cancellation(c
     vcx.run_until_parked();
     assert!(state.read_with(vcx, |s, _| s.sidebar.drag.is_none()), "losing can_operate mid-drag must cancel controller drag");
     assert!(pane.read_with(vcx, |p, _| p.drag.is_none()), "losing can_operate mid-drag must cancel pane drag");
-    assert!(fixture.take_commands().is_empty());
+    assert_eq!(fixture.take_commands(), Vec::<&'static str>::new());
 
     // Scoped fleet: supports_settlement is gated by env.config.config.is_some(), and read-only env refuses drag.
     let (c_op, _f_op) = ClientFixture::handle(session(true));
@@ -849,4 +849,370 @@ async fn pending_file_drop_is_consumed_when_target_thread_cannot_attach(cx: &mut
     });
     vcx.run_until_parked();
     assert_eq!(composer.read_with(vcx, |c, cx| c.snapshot_audit(0, cx)["regularAttachmentCount"].clone()), json!(0));
+}
+
+#[gpui::test]
+async fn sidebar_folder_drop_adds_projects_and_rejects_unclaimed_files(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, mut fixture) = setup_app(cx, &runtime);
+    let tmp = TempDir::new("folder-drop");
+    let dir_a = tmp.path().join("repo-alpha");
+    let dir_b = tmp.path().join("repo-beta");
+    let file_a = tmp.path().join("notes.txt");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    std::fs::write(&file_a, "hello").unwrap();
+
+    state.update(cx, |s, cx| {
+        s.environments.environments[0].local = true;
+        let snap = s.shell.snapshot.as_mut().unwrap();
+        snap.projects = vec![serde_json::from_value(json!({
+            "id": "proj-1",
+            "title": "App",
+            "workspaceRoot": "/app",
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z"
+        })).unwrap()];
+        snap.threads = vec![
+            serde_json::from_value(thread_json("th-row", "Target Row", "idle", "2026-01-02T00:00:00.000Z")).unwrap(),
+        ];
+        if let Some(cfg) = s.server_config.config.as_mut() {
+            cfg.environment.capabilities.file_attachments = Some(t3_core::server_config::FileAttachmentsCapability {
+                max_upload_bytes: 1_000_000,
+            });
+        }
+        s.select_thread("th-row", cx);
+        s.rebuild_sidebar(cx);
+    });
+
+    let (root, vcx) = cx.add_window_view(|window, cx| {
+        let menu = cx.new(|cx| ContextMenu::new(state.clone(), cx));
+        let confirm = cx.new(|cx| ConfirmDialog::new(state.clone(), cx));
+        let snooze = cx.new(|cx| SnoozeDialog::new(state.clone(), window, cx));
+        let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+        let pane = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), confirm, snooze, window, cx));
+        DragHost { pane, composer, menu, height: px(600.) }
+    });
+    let pane = root.read_with(vcx, |host, _| host.pane.clone());
+    let composer = root.read_with(vcx, |host, _| host.composer.clone());
+    vcx.run_until_parked();
+    pane.update(vcx, |_, cx| cx.notify());
+    vcx.update(|window, cx| { window.draw(cx).clear(); });
+    let _ = fixture.take_commands();
+
+    let sidebar_bounds = vcx.debug_bounds("sidebar-folder-drop").expect("sidebar-folder-drop bounds");
+    let empty_pos = gpui::point(sidebar_bounds.center().x, sidebar_bounds.bottom() - px(80.));
+
+    async fn next_project_create(
+        runtime: &tokio::runtime::Runtime,
+        mut fixture: ClientFixture,
+    ) -> (
+        ClientFixture,
+        serde_json::Value,
+        tokio::sync::oneshot::Sender<Result<serde_json::Value, t3_client::session::RpcError>>,
+    ) {
+        runtime
+            .spawn(async move {
+                let (params, reply) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let (method, params, reply) = fixture.next_request().await;
+                        if method == t3_core::projects::PROJECTS_MUTATE {
+                            return (params, reply);
+                        }
+                        let _ = reply.send(Ok(json!({})));
+                    }
+                })
+                .await
+                .expect("timed out waiting for projects.mutate request");
+                (fixture, params, reply)
+            })
+            .await
+            .unwrap()
+    }
+
+    // 1. Entering sidebar with a directory activates the drop overlay; dropping adds the project.
+    vcx.simulate_event(gpui::FileDropEvent::Entered {
+        position: empty_pos,
+        paths: gpui::ExternalPaths(vec![dir_a.clone()].into()),
+    });
+    vcx.update(|window, cx| { window.draw(cx).clear(); });
+    assert!(pane.read_with(vcx, |p, _| p.folder_drop_active));
+    assert!(vcx.debug_bounds("sidebar-folder-drop-overlay").is_some(), "folder drop overlay must render");
+
+    vcx.simulate_event(gpui::FileDropEvent::Submit { position: empty_pos });
+    vcx.run_until_parked();
+    assert!(!pane.read_with(vcx, |p, _| p.folder_drop_active));
+    let (fixture, params, reply) = next_project_create(&runtime, fixture).await;
+    assert_eq!(params["type"], "project.create");
+    assert_eq!(params["workspaceRoot"], dir_a.to_string_lossy().as_ref());
+    let (sent, added) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let _added = state.update(vcx, |_, cx| {
+        cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Notice
+                && state.toasts.latest().is_some_and(|toast| toast.title == "Project added")
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
+            }
+        })
+    });
+    let _ = reply.send(Ok(json!({ "sequence": 2 })));
+    added.await.unwrap();
+    vcx.run_until_parked();
+
+    // 2. Dropping a directory over a thread row still adds it as a project and never attaches to composer.
+    pane.update(vcx, |_, cx| cx.notify());
+    vcx.update(|window, cx| { window.draw(cx).clear(); });
+    let row_pos = vcx.debug_bounds("thread-row-None-th-row").expect("rendered thread row bounds").center();
+    vcx.simulate_event(gpui::FileDropEvent::Entered {
+        position: row_pos,
+        paths: gpui::ExternalPaths(vec![dir_b.clone()].into()),
+    });
+    vcx.update(|window, cx| { window.draw(cx).clear(); });
+    vcx.simulate_event(gpui::FileDropEvent::Submit { position: row_pos });
+    vcx.run_until_parked();
+    let (mut fixture, params, reply) = next_project_create(&runtime, fixture).await;
+    assert_eq!(params["type"], "project.create");
+    assert_eq!(params["workspaceRoot"], dir_b.to_string_lossy().as_ref());
+    let (sent, added) = tokio::sync::oneshot::channel();
+    let mut sent = Some(sent);
+    let _added = state.update(vcx, |_, cx| {
+        cx.subscribe(&state, move |state, _, event, _| {
+            if *event == crate::app_state::AppEvent::Notice
+                && state.toasts.latest().is_some_and(|toast| toast.title == "Project added")
+                && let Some(sent) = sent.take()
+            {
+                let _ = sent.send(());
+            }
+        })
+    });
+    let _ = reply.send(Ok(json!({ "sequence": 3 })));
+    added.await.unwrap();
+    vcx.run_until_parked();
+    assert_eq!(composer.read_with(vcx, |c, cx| c.snapshot_audit(0, cx)["regularAttachmentCount"].clone()), json!(0));
+    let _ = fixture.take_commands();
+
+    // 3. Dropping a plain file onto empty sidebar area shows informational guidance toast without adding a project.
+    vcx.simulate_event(gpui::FileDropEvent::Entered {
+        position: empty_pos,
+        paths: gpui::ExternalPaths(vec![file_a.clone()].into()),
+    });
+    assert!(!pane.read_with(vcx, |p, _| p.folder_drop_active), "file-only drag must not activate folder drop overlay");
+    vcx.simulate_event(gpui::FileDropEvent::Submit { position: empty_pos });
+    vcx.run_until_parked();
+    assert_eq!(fixture.take_commands(), Vec::<&'static str>::new());
+    assert_eq!(
+        state.read_with(vcx, |s, _| s.toasts.latest().map(|t| t.title.to_string())),
+        Some("Only folders can be added as projects".into())
+    );
+
+    // 4. Dropping a plain file onto a thread row attaches to composer and does NOT emit the folder-only toast.
+    state.update(vcx, |s, _| s.toasts = Default::default());
+    vcx.simulate_event(gpui::FileDropEvent::Entered {
+        position: row_pos,
+        paths: gpui::ExternalPaths(vec![file_a].into()),
+    });
+    vcx.simulate_event(gpui::FileDropEvent::Submit { position: row_pos });
+    vcx.run_until_parked();
+    assert_eq!(composer.read_with(vcx, |c, cx| c.snapshot_audit(0, cx)["regularAttachmentCount"].clone()), json!(1));
+    assert_eq!(
+        state.read_with(vcx, |s, _| s.toasts.latest().map(|t| t.title.to_string())),
+        None,
+        "row-claimed file drop must not show the folder-only error toast"
+    );
+
+    state.update(vcx, |s, _| s.stop_pump());
+}
+
+#[gpui::test]
+async fn sidebar_folder_drop_targets_local_environment_and_unarchives(cx: &mut gpui::TestAppContext) {
+    use t3_client::environments::{EnvironmentEvent, Environments};
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _fixture) = setup_app(cx, &runtime);
+    let tmp = TempDir::new("folder-drop-routing");
+    let archived_dir = tmp.path().join("archived-repo");
+    let new_local_dir = tmp.path().join("new-local-repo");
+    std::fs::create_dir_all(&archived_dir).unwrap();
+    std::fs::create_dir_all(&new_local_dir).unwrap();
+
+    // 1. Remote-only setup (`local: false`) rejects folder drops without emitting commands.
+    let (connections, mut output) = Environments::start(runtime.handle(), false);
+    let rw_session: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+        "authenticated": true,
+        "permissions": [t3_core::auth::ORCHESTRATION_READ_SCOPE, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE]
+    })).unwrap();
+    let (remote_client, mut remote_fixture) = ClientFixture::handle(rw_session.clone());
+    remote_fixture.grants.send_replace(Some(rw_session.clone()));
+    let mut remote_shell = t3_core::shell::ShellState::default();
+    remote_shell.apply(serde_json::from_value(json!({
+        "kind": "snapshot",
+        "snapshot": { "snapshotSequence": 1, "projects": [], "threads": [] }
+    })).unwrap());
+    remote_shell.synchronized = true;
+    let mut remote_config = t3_core::server_config::ServerConfigState::default();
+    remote_config.apply(serde_json::from_value(json!({
+        "type": "snapshot",
+        "config": {
+            "environment": {"environmentId": "srv-remote", "label": "Remote", "platform": {"os": "linux", "arch": "x64"}, "capabilities": {}},
+            "cwd": "/",
+            "settings": {}
+        }
+    })).unwrap());
+
+    state.update(cx, |s, _| {
+        s.stop_pump();
+        s.connections = connections;
+        s.environments = serde_json::from_value(json!({
+            "active": "env-remote",
+            "environments": [{
+                "id": "env-remote",
+                "environmentId": "srv-remote",
+                "label": "Remote",
+                "httpBase": "http://remote.invalid",
+                "accessToken": "",
+                "disabled": false,
+                "local": false
+            }]
+        })).unwrap();
+    });
+    let mut view = state.read_with(cx, |s, _| s.connections.view());
+    let install_remote = state.update(cx, |s, _| {
+        s.connections.install_fixture("env-remote", remote_client, remote_shell, remote_config, ConnectionStatus::Connected)
+    });
+    let _remote_events = runtime.spawn(install_remote).await.unwrap();
+    let fleet_view = view.borrow_and_update().clone();
+    state.update(cx, |s, cx| {
+        s.apply_fleet_view(fleet_view, cx);
+        s.environments.active = Some("env-remote".into());
+        s.connections.activate(Some("env-remote"));
+    });
+    let (ev_remote, mut output) = runtime.spawn(async move {
+        loop {
+            let ev = output.recv().await.unwrap();
+            if matches!(&ev, EnvironmentEvent::Activated { id, .. } if id == "env-remote") {
+                return (ev, output);
+            }
+        }
+    }).await.unwrap();
+    state.update(cx, |s, cx| s.apply_environment_event(ev_remote, cx));
+    cx.run_until_parked();
+    let _ = remote_fixture.take_commands();
+
+    state.update(cx, |s, cx| {
+        s.drop_folders_on_sidebar(&[new_local_dir.clone()], false, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(remote_fixture.take_commands(), Vec::<&'static str>::new());
+    assert_eq!(
+        state.read_with(cx, |s, _| s.toasts.latest().map(|t| t.title.to_string())),
+        Some("This computer's server is not connected yet".into())
+    );
+
+    // 2. Active remote env + connected local env in fleet routes folder drop strictly to the local server.
+    let (local_client, mut local_fixture) = ClientFixture::handle(rw_session.clone());
+    local_fixture.grants.send_replace(Some(rw_session));
+    let mut local_shell = t3_core::shell::ShellState::default();
+    local_shell.apply(serde_json::from_value(json!({
+        "kind": "snapshot",
+        "snapshot": {
+            "snapshotSequence": 1,
+            "projects": [{
+                "id": "proj-archived",
+                "title": "Archived Repo",
+                "workspaceRoot": archived_dir.to_string_lossy(),
+                "archivedAt": "2026-01-01T00:00:00.000Z",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "updatedAt": "2026-01-01T00:00:00.000Z"
+            }],
+            "threads": []
+        }
+    })).unwrap());
+    local_shell.synchronized = true;
+    let mut local_config = t3_core::server_config::ServerConfigState::default();
+    local_config.apply(serde_json::from_value(json!({
+        "type": "snapshot",
+        "config": {
+            "environment": {"environmentId": "srv-local", "label": "Local", "platform": {"os": "macos", "arch": "arm64"}, "capabilities": {}},
+            "cwd": "/",
+            "settings": {}
+        }
+    })).unwrap());
+    state.update(cx, |s, _| {
+        s.toasts = Default::default();
+        s.environments.environments.push(serde_json::from_value(json!({
+            "id": "env-local",
+            "environmentId": "srv-local",
+            "label": "Local",
+            "httpBase": "http://local.invalid",
+            "accessToken": "",
+            "disabled": false,
+            "local": true
+        })).unwrap());
+    });
+    let install_local = state.update(cx, |s, _| {
+        s.connections.install_fixture("env-local", local_client, local_shell, local_config, ConnectionStatus::Connected)
+    });
+    let _local_events = runtime.spawn(install_local).await.unwrap();
+    let fleet_view = view.borrow_and_update().clone();
+    state.update(cx, |s, cx| {
+        s.apply_fleet_view(fleet_view, cx);
+        s.drop_folders_on_sidebar(&[new_local_dir.clone()], false, cx);
+    });
+    let (local_fixture, params, reply) = runtime.spawn(async move {
+        loop {
+            let (method, params, reply) = local_fixture.next_request().await;
+            if method == t3_core::projects::PROJECTS_MUTATE {
+                return (local_fixture, params, reply);
+            }
+            let _ = reply.send(Ok(json!({})));
+        }
+    }).await.unwrap();
+    assert_eq!(params["type"], "project.create");
+    assert_eq!(params["workspaceRoot"], new_local_dir.to_string_lossy().as_ref());
+    let _ = reply.send(Ok(json!({ "id": "proj-created", "sequence": 2 })));
+    cx.run_until_parked();
+    let remote_commands = remote_fixture.take_commands();
+    assert!(
+        remote_commands.iter().all(|cmd| *cmd == "close-all-threads"),
+        "switching to local destination must only close previous remote subscriptions; got {remote_commands:?}"
+    );
+
+    // 3. Dropping an archived local project unarchives it (`project.update { archived: false }`) and opens its draft.
+    state.update(cx, |s, _cx| {
+        s.environments.active = Some("env-local".into());
+        s.connections.activate(Some("env-local"));
+        s.toasts = Default::default();
+    });
+    let ev_local = runtime.spawn(async move {
+        loop {
+            let ev = output.recv().await.unwrap();
+            if matches!(&ev, EnvironmentEvent::Activated { id, .. } if id == "env-local") {
+                return ev;
+            }
+        }
+    }).await.unwrap();
+    state.update(cx, |s, cx| {
+        s.apply_environment_event(ev_local, cx);
+        s.drop_folders_on_sidebar(&[archived_dir], false, cx);
+    });
+    let (params, reply) = runtime.spawn(async move {
+        let mut local_fixture = local_fixture;
+        loop {
+            let (method, params, reply) = local_fixture.next_request().await;
+            if method == t3_core::projects::PROJECTS_MUTATE {
+                return (params, reply);
+            }
+            let _ = reply.send(Ok(json!({})));
+        }
+    }).await.unwrap();
+    assert_eq!(params["type"], "project.update");
+    assert_eq!(params["projectId"], "proj-archived");
+    assert_eq!(params["archived"], false);
+    let _ = reply.send(Ok(json!({ "sequence": 3 })));
+    cx.run_until_parked();
+    assert_eq!(state.read_with(cx, |s, _| s.draft_project.clone()), Some("proj-archived".into()));
+    state.update(cx, |s, _| s.stop_pump());
 }

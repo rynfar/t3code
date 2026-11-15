@@ -13,6 +13,8 @@ use crate::model::ModelSelection;
 pub struct ProjectShell {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub has_custom_title: Option<bool>,
     pub workspace_root: String,
     #[serde(default)]
     pub repository_identity: Option<serde_json::Value>,

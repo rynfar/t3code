@@ -240,7 +240,14 @@ export function shellCases() {
     ]),
     shellCase("optional row fields the native types model", [
       snapshot({
-        projects: [{ ...project, pinnedAt: "2026-06-20T01:00:00.000Z", archivedAt: null }],
+        projects: [
+          {
+            ...project,
+            hasCustomTitle: true,
+            pinnedAt: "2026-06-20T01:00:00.000Z",
+            archivedAt: null,
+          },
+        ],
         olderSettled: {
           before: "2026-06-01T00:00:00.000Z",
           asOfSequence: 0,

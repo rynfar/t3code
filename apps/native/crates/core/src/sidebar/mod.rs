@@ -241,6 +241,10 @@ pub struct SidebarModel {
 
 impl SidebarModel {
     pub fn build(input: &ModelInput, tracker: &mut InboxReturnTracker) -> SidebarModel {
+        Self::build_with_launching(input, tracker, None)
+    }
+
+    pub fn build_with_launching(input: &ModelInput, tracker: &mut InboxReturnTracker, launching_thread_ids: Option<&HashSet<String>>) -> SidebarModel {
         let snapshot = input.snapshot;
         let subagent_requests = pending_subagent_requests(&snapshot.threads);
         let rows: Vec<&ThreadShell> = snapshot
@@ -254,8 +258,17 @@ impl SidebarModel {
         let unloaded_settled = input
             .older_settled
             .map_or(0, |shelf| older_settled::unloaded_count(shelf.older, input.project_scope, &rows));
-        let threads: Vec<SidebarThread> =
-            rows.iter().map(|thread| present_thread(thread, subagent_requests.get(&thread.id).copied())).collect();
+        let threads: Vec<SidebarThread> = rows
+            .iter()
+            .map(|thread| {
+                let presented = present_thread(thread, subagent_requests.get(&thread.id).copied());
+                if launching_thread_ids.is_some_and(|ids| ids.contains(&presented.id)) {
+                    inbox::as_launching_thread(presented)
+                } else {
+                    presented
+                }
+            })
+            .collect();
         let observation = if input.settings.working_shelf_enabled {
             tracker.observe(&threads, input.now)
         } else {
@@ -445,6 +458,7 @@ pub fn fallback_after_delete<'a>(
                 && !doomed.contains(&thread.id)
                 && !thread.is_settled()
                 && !effective_snoozed(thread, now)
+                && thread.listed
         })
         .collect();
     sort::sort_threads(&mut survivors, order);

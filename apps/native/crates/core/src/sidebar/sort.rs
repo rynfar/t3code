@@ -37,11 +37,15 @@ pub enum ThreadSortOrder {
     CreatedAt,
 }
 
-/// `getThreadSortTimestamp` (shell threads carry no messages, so `latestUserMessageAt` decides).
+/// `getThreadSortTimestamp` (shell threads carry no messages, so `latestUserAuthoredMessageAt`
+/// decides; older servers omit it and fall back to `latestUserMessageAt`).
 pub fn thread_sort_timestamp(thread: &SidebarThread, order: ThreadSortOrder) -> Option<Ms> {
     match order {
         ThreadSortOrder::CreatedAt => thread.created_at.or(thread.updated_at),
-        ThreadSortOrder::UpdatedAt => thread.latest_user_message_at.or(thread.updated_at).or(thread.created_at),
+        ThreadSortOrder::UpdatedAt => match thread.latest_user_authored_message_at {
+            Some(authored) => authored.or(thread.created_at).or(thread.updated_at),
+            None => thread.latest_user_message_at.or(thread.updated_at).or(thread.created_at),
+        },
     }
 }
 

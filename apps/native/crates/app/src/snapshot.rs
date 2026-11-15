@@ -857,6 +857,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
                     shell.projects.push(t3_core::shell::ProjectShell {
                         id: id.clone(),
                         title: "Scratch".into(),
+                        has_custom_title: None,
                         workspace_root: scratch_root,
                         repository_identity: None,
                         default_model_selection: None,
