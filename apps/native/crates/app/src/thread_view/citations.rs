@@ -102,10 +102,15 @@ impl ThreadView {
 
     pub(super) fn dismiss_citation_selection(&mut self, cx: &mut Context<Self>) {
         close_sent_citation_popover(cx);
-        if self.citation_ui.selection.take().is_some() || self.citation_ui.highlighted.take().is_some() {
+        let selection = self.citation_ui.selection.take().is_some();
+        let highlighted = self.citation_ui.highlighted.take().is_some();
+        let pending = self.citation_ui.pending.take().is_some();
+        if highlighted {
+            self.rederive(cx);
+        }
+        if selection || highlighted || pending {
             cx.notify();
         }
-        self.citation_ui.pending = None;
     }
 
     pub(super) fn render_citation_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {

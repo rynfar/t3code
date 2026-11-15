@@ -2606,6 +2606,43 @@ fn final_answer_phase_sent_message_todo_list_latest_compaction_viewed_images_and
         &r.kind,
         RowKind::Message { message, suppress_empty_response: true, .. } if message.id == "empty-1"
     )));
+
+    // 5. Active latest_failed Thinking branch also emits viewed_images_row below Thinking.
+    let mut active_fail_img = work("fail-img-entry", "turn-active", "2026-01-01T00:00:01Z", |w| {
+        w.status = Some(ToolStatus::Failed);
+        w.viewed_image_path = Some("shots/failure.png".into());
+    });
+    Arc::make_mut(&mut active_fail_img).id = "fail-img-entry".into();
+    let active_act = ThreadActivity {
+        is_working: true,
+        active_turn_started_at: Some("2026-01-01T00:00:00Z".into()),
+        latest_run: Some(LatestRun {
+            run_id: "turn-active".into(),
+            status: "running".into(),
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            completed_at: None,
+            turn_ended: false,
+            provider_starting_label: None,
+        }),
+        ..Default::default()
+    };
+    let active_rows = derive_rows(
+        &RowsInput {
+            entries: &[active_fail_img],
+            activity: &active_act,
+            expanded_run_ids: &HashSet::new(),
+            expanded_attempt_ids: &HashSet::new(),
+            expanded_work_group_ids: &HashSet::new(),
+            worktree_setup: None,
+            tool_call_visibility: crate::client_settings::ToolCallVisibility::default(),
+            revealed_message_id: None,
+        },
+        &mut RowsCache::default(),
+    );
+    assert!(active_rows.iter().any(|r| matches!(
+        &r.kind,
+        RowKind::ViewedImages { paths } if paths == &vec!["shots/failure.png".to_string()]
+    )));
 }
 
 #[test]

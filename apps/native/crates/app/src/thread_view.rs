@@ -863,7 +863,11 @@ impl ThreadView {
         if tool_call_visibility == t3_core::client_settings::ToolCallVisibility::Zen && self.find.is_some() {
             tool_call_visibility = t3_core::client_settings::ToolCallVisibility::HideAll;
         }
-        let revealed_message_id = self.find.as_ref().and_then(|find| find.active_entry());
+        let revealed_message_id = self
+            .find
+            .as_ref()
+            .and_then(|find| find.active_entry())
+            .or(self.citation_ui.highlighted.as_deref());
         let input = RowsInput {
             entries: self.entries_cache.entries(),
             activity: &self.activity,
@@ -4370,6 +4374,133 @@ mod tests {
                 view.agent_working_directories_for_key(Some("assistant:m-a-1")),
                 vec!["/repo/after".to_owned(), "/repo/latest".to_owned(), "/repo/first".to_owned()]
             );
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn zen_citation_jump_reveals_and_dismiss_re_hides_hidden_commentary_message(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let assistant_item = |pos: usize, id: &str, text: &str, phase: Option<&str>| {
+            serde_json::json!({
+                "position": pos,
+                "visibility": "local",
+                "sourceThreadId": "t1",
+                "sourceItemId": id,
+                "item": {
+                    "id": id,
+                    "threadId": "t1",
+                    "runId": "r1",
+                    "nodeId": null,
+                    "parentItemId": null,
+                    "ordinal": pos + 1,
+                    "type": "assistant_message",
+                    "status": "completed",
+                    "title": null,
+                    "startedAt": null,
+                    "completedAt": format!("2026-04-01T00:00:0{}.500Z", pos + 1),
+                    "updatedAt": format!("2026-04-01T00:00:0{}.500Z", pos + 1),
+                    "messageId": id,
+                    "text": text,
+                    "streaming": false,
+                    "phase": phase
+                }
+            })
+        };
+        let items = vec![
+            test_user_item("t1", 0, "m-u-0", "Prompt"),
+            assistant_item(1, "m-a-mid", "Intermediate commentary", None),
+            assistant_item(2, "m-a-final", "Final answer", Some("final_answer")),
+        ];
+        let runs_json = serde_json::json!([{
+            "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+            "modelSelection": {"instanceId": "replay", "model": "replay"},
+            "userMessageId": "m-u-0", "rootNodeId": null, "status": "completed",
+            "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+            "completedAt": "2026-04-01T00:00:04.000Z"
+        }]);
+        let snap = test_snapshot_json("t1", runs_json, items);
+        cx.update(|cx| {
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::ToolCallVisibility(t3_core::client_settings::ToolCallVisibility::Zen),
+                cx,
+            );
+        });
+        let env_id = state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 3, "visibleItemCount": 3
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+            state.primary_environment_id().unwrap_or("local").to_owned()
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+
+        let has_message = |view: &ThreadView, id: &str| {
+            view.rows.iter().any(|row| matches!(&row.kind, t3_core::timeline::RowKind::Message { message, .. } if message.id == id))
+        };
+
+        view.read_with(vcx, |view, _| {
+            assert!(!has_message(view, "m-a-mid"), "Zen mode must hide commentary before citation jump");
+            assert!(has_message(view, "m-a-final"), "Zen mode must keep final_answer visible");
+        });
+
+        state.update(vcx, |state, _| {
+            state.citation_source = Some(t3_core::assistant_citations::Citation {
+                version: 1,
+                environment_id: env_id,
+                thread_id: "t1".into(),
+                message_id: "m-a-mid".into(),
+                text: "Intermediate commentary".into(),
+                start: 0,
+                end: 23,
+                prefix: String::new(),
+                suffix: String::new(),
+                comment: None,
+            });
+        });
+        view.update(vcx, |view, cx| view.advance_citation_source(cx));
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.citation_ui.highlighted.as_deref(), Some("m-a-mid"));
+            assert!(has_message(view, "m-a-mid"), "Citation jump in Zen mode must reveal the hidden commentary message");
+        });
+
+        view.update(vcx, |view, cx| view.dismiss_citation_selection(cx));
+        vcx.run_until_parked();
+
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.citation_ui.highlighted, None);
+            assert!(!has_message(view, "m-a-mid"), "Dismissing citation highlight must re-hide the Zen commentary message");
         });
     }
 }

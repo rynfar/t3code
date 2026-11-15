@@ -302,7 +302,7 @@ impl ThreadView {
     /// row into view, or pages history in when the entry is older than the loaded window.
     pub(super) fn reveal_entry(&mut self, entry_id: &str, source: t3_core::timeline::anchor::ScrollSource, cx: &mut Context<Self>) {
         self.disclosure.cancel();
-        if self.find.is_some() {
+        if self.find.is_some() || self.citation_ui.highlighted.is_some() {
             self.rederive(cx);
         }
         let mut expanded = false;

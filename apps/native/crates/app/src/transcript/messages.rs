@@ -1281,6 +1281,21 @@ fn fork_button(message: &ChatMessage, env: &RowEnv, cx: &mut Context<ThreadView>
     Some(tooltip_icon_button(id, Icon::GitFork, FORK_LABEL, busy, cx.listener(move |view, _, _, cx| view.fork_from_run(&source, &run_id, cx)), cx))
 }
 
+fn reply_citation_for_response(
+    env_id: String,
+    thread_id: String,
+    message_id: String,
+    raw_text: &str,
+) -> Option<t3_core::assistant_citations::Citation> {
+    let rendered = t3_core::assistant_citations::markdown_text(raw_text);
+    let source_text: &str = if rendered.trim().is_empty() { raw_text } else { &rendered };
+    let trimmed_start = source_text.len() - source_text.trim_start().len();
+    let trimmed = source_text.trim();
+    let opening = t3_core::assistant_citations::take_units(trimmed, 300, false);
+    let range = trimmed_start..(trimmed_start + opening.len());
+    t3_core::assistant_citations::Citation::from_selection(env_id, thread_id, message_id, source_text, range)
+}
+
 /// `AssistantReplyButton`: starts a reply banner against the opening of a completed assistant response.
 fn reply_button(message: &ChatMessage, env: &RowEnv, cx: &mut Context<ThreadView>) -> Option<AnyElement> {
     if message.streaming || message.text.trim().is_empty() {
@@ -1304,17 +1319,7 @@ fn reply_button(message: &ChatMessage, env: &RowEnv, cx: &mut Context<ThreadView
                 .or(app_read.environments.active.as_deref())
                 .unwrap_or_default()
                 .to_owned();
-            let trimmed_start = raw_text.len() - raw_text.trim_start().len();
-            let trimmed = raw_text.trim();
-            let opening = t3_core::assistant_citations::take_units(trimmed, 300, false);
-            let range = trimmed_start..(trimmed_start + opening.len());
-            let Some(citation) = t3_core::assistant_citations::Citation::from_selection(
-                env_id,
-                thread_id.clone(),
-                message_id.clone(),
-                &raw_text,
-                range,
-            ) else {
+            let Some(citation) = reply_citation_for_response(env_id, thread_id.clone(), message_id.clone(), &raw_text) else {
                 return;
             };
             let subagents = read_response_subagents(app_read, &thread_id, &item_id);
@@ -1942,6 +1947,21 @@ mod tests {
         assert_eq!(format_epoch_elapsed(Some(1_000), Some(66_500), None).as_deref(), Some("1m 5s"));
         assert_eq!(format_epoch_elapsed(None, None, Some(400)).as_deref(), Some("1s"));
         assert_eq!(format_epoch_elapsed(None, None, None), None);
+    }
+
+    #[test]
+    fn reply_citation_uses_rendered_plain_text_for_markdown_openings() {
+        let raw = "## Summary\n\n**Fixed** `replay` via [helper](https://example.com).";
+        let citation = reply_citation_for_response("env-1".into(), "t-1".into(), "m-1".into(), raw).expect("reply citation");
+        assert!(!citation.text.contains("##"));
+        assert!(!citation.text.contains("**"));
+        assert!(!citation.text.contains("https://example.com"));
+        let rendered = t3_core::assistant_citations::markdown_text(raw);
+        assert!(t3_core::assistant_citations::find_citation_range(&rendered, &citation).is_some());
+
+        let image_only = "![diagram](preview.png)";
+        let fallback = reply_citation_for_response("env-1".into(), "t-1".into(), "m-2".into(), image_only).expect("fallback citation");
+        assert_eq!(fallback.text, image_only);
     }
 
     #[cfg(feature = "snapshot")]

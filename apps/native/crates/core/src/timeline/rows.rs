@@ -802,14 +802,16 @@ fn derive_all_rows(input: &RowsInput, cache: &mut RowsCache) -> Vec<TimelineRow>
             Some(anchor) => {
                 let group_id = work_group_id(&anchor.id);
                 let expanded = input.expanded_work_group_ids.contains(&group_id);
+                let work_entries: Vec<Arc<WorkLogEntry>> = visible_active.iter().filter_map(|e| e.work().cloned()).collect();
                 rows.push(row(
                     LIVE_ACTIVITY_ROW_ID,
                     activity.active_turn_started_at.clone(),
                     RowKind::Thinking { group_id: Some(group_id.clone()), expanded, label: None, live_answer_preview: None },
                 ));
                 if expanded {
-                    rows.push(expanded_group_row(&group_id, &anchor.created_at, visible_active.iter().filter_map(|e| e.work().cloned()).collect()));
+                    rows.push(expanded_group_row(&group_id, &anchor.created_at, work_entries.clone()));
                 }
+                rows.extend(viewed_images_row(&group_id, &anchor.created_at, &work_entries));
             }
             None => {
                 let waiting_on = unsettled.as_deref().map_or(0, |run_id| running_subagents_at_run_tail(&raw_entries, run_id));
