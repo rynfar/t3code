@@ -145,14 +145,48 @@ fn pretty_json_text(text: &str) -> String {
 /// `formatToolValue`: text content blocks as text (JSON in them pretty-printed), anything else
 /// as pretty JSON; nothing for an empty value, or for a lone image a preview already shows.
 pub fn format_tool_value(value: Option<&Value>, has_image_preview: bool) -> Option<String> {
+    format_tool_value_with_served_images(value, has_image_preview, None)
+}
+
+fn format_tool_value_with_served_images(
+    value: Option<&Value>,
+    has_image_preview: bool,
+    served_images: Option<&[&Value]>,
+) -> Option<String> {
     let value = value.filter(|value| !value.is_null())?;
     if has_image_preview && value.get("type").and_then(Value::as_str) == Some("image") && value.is_object() {
         return None;
     }
-    if let Some(text) = text_from_blocks(value, 0, &tool_output_image_blocks(value)) {
+    let computed;
+    let image_blocks = match served_images {
+        Some(blocks) => blocks,
+        None => {
+            computed = tool_output_image_blocks(value);
+            &computed
+        }
+    };
+    if let Some(text) = text_from_blocks(value, 0, image_blocks) {
         return (!js_trim(&text).is_empty()).then(|| pretty_json_text(&text));
     }
     format_json_value(value)
+}
+
+/// Unwraps a `{ t3McpApp, result }` dynamic-tool output envelope (`mcpToolResultOutput`).
+pub fn mcp_tool_result_output(result: &Value) -> Value {
+    let Some(object) = result.as_object() else { return result.clone() };
+    let empty_structured = object.get("structuredContent").is_some_and(|sc| match sc {
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    });
+    let structured = if empty_structured { None } else { object.get("structuredContent").filter(|v| !v.is_null()) };
+    let content = object.get("content");
+    if let Some(sc) = structured
+        && content.is_some_and(|c| !tool_output_image_blocks(c).is_empty())
+    {
+        return json!({ "content": content.unwrap_or(&Value::Null), "structuredContent": sc });
+    }
+    structured.cloned().or_else(|| content.cloned()).unwrap_or(Value::Null)
 }
 
 /// `toolCallLines`: a command line, or arguments as `key value` lines, or anything else as text.
@@ -258,7 +292,16 @@ pub fn turn_item_output_text(item: &TurnItem) -> Option<String> {
     match &item.kind {
         TurnItemKind::CommandExecution { output, .. } => output.as_deref().and_then(command_output_text),
         TurnItemKind::DynamicTool { output_omitted: true, .. } => None,
-        TurnItemKind::DynamicTool { output, viewed_image_path, .. } => format_tool_value(output.as_ref(), viewed_image_path.is_some()),
+        TurnItemKind::DynamicTool { output, viewed_image_path, .. } => {
+            if let Some(object) = output.as_ref().and_then(Value::as_object)
+                && object.contains_key("t3McpApp")
+                && let Some(result) = object.get("result")
+            {
+                let unwrapped = if result.is_object() { mcp_tool_result_output(result) } else { result.clone() };
+                return format_tool_value_with_served_images(Some(&unwrapped), false, Some(&[]));
+            }
+            format_tool_value(output.as_ref(), viewed_image_path.is_some())
+        }
         TurnItemKind::FileSearch { results: Some(results), .. } if !results.is_empty() => Some(
             results
                 .iter()

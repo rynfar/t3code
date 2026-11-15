@@ -1,18 +1,33 @@
 //! Markdown link handling (thread links, workspace/host file links, citation popovers, external
 //! preview/PR routing) and fenced shell execution in the thread terminal.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui::{App, ClickEvent, Entity, EntityId, Global, Pixels, Point, Window};
+use gpui::{
+    AnyElement, App, BorrowAppContext, ClickEvent, ClipboardItem, Entity, EntityId, FontWeight, Global,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Point, Styled, Window, div, px,
+};
+use gpui_component::ActiveTheme;
+use serde_json::{Value, json};
 use t3_core::assistant_citations::Citation;
 use t3_core::client_settings::BrowserLinkTarget;
-use t3_core::terminal::method as terminal_method;
-use t3_core::markdown::links::{FileLinkMediaKind, MarkdownLinkKind, ResolvedFileLink, ThreadLinkTarget, classify_link};
+use t3_core::files::{SEARCH_ENTRIES, decode_search};
+use t3_core::markdown::links::{
+    AGENT_DIRECTORY_SEARCH_LIMIT, FileLinkMediaKind, MarkdownLinkKind, ResolvedFileLink, ThreadLinkTarget,
+    WORKSPACE_BASENAME_LOOKUP_LIMIT, WorkspaceEntryCandidate, WorkspaceEntryKind, classify_link,
+    is_macos_app_bundle_path, needs_workspace_basename_lookup, open_in_editor_request_with_root,
+    pick_project_link_match, pick_workspace_link_match, resolve_full_and_relative, unknown_thread_link_label,
+    workspace_link_lookup_query,
+};
 use t3_core::project_scripts;
-use t3_core::project_search::{OPEN_IN_EDITOR, open_in_editor_request};
+use t3_core::project_search::{OPEN_IN_EDITOR, editor_target, preferred_editor};
 use t3_core::sidebar::tag_filter::ThreadKey;
+use t3_core::terminal::method as terminal_method;
 
 use crate::app_state::{AppEvent, AppState, ScopedRouteAction};
+use crate::icons::Icon;
+use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
 static TERMINAL_RUN_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -69,11 +84,171 @@ pub fn close_sent_citation_popover(cx: &mut App) {
     }
 }
 
-/// Dispatches clicks on Markdown hyperlinks and linked inline-code file paths.
-pub fn handle_markdown_link_click(
+/// Active `@model` mention detail popover opened from a `t3-model://` chip/link.
+#[derive(Clone)]
+pub struct ModelMentionPopover {
+    pub label: String,
+    pub provider_label: String,
+    pub source: String,
+    pub position: Point<Pixels>,
+    pub owner: EntityId,
+}
+
+#[derive(Default)]
+pub struct ModelMentionPopoverGlobal {
+    pub active: Option<ModelMentionPopover>,
+}
+
+impl Global for ModelMentionPopoverGlobal {}
+
+pub fn open_model_mention_popover(
+    instance_id: &str,
+    model: &str,
+    position: Point<Pixels>,
+    state: &Entity<AppState>,
+    owner: EntityId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let source = format!("model:{instance_id}/{model}");
+    let (label, provider_label) = state
+        .read(cx)
+        .server_config
+        .config
+        .as_ref()
+        .and_then(|cfg| {
+            let provider = cfg.providers.iter().find(|p| p.instance_id == instance_id)?;
+            let option = provider
+                .models
+                .iter()
+                .find(|m| m.slug == model)
+                .or_else(|| provider.models.iter().find(|m| m.slug.eq_ignore_ascii_case(model)))?;
+            let label = option.short_name.as_deref().filter(|s| !s.is_empty()).unwrap_or(&option.name).to_owned();
+            let provider_label = option
+                .sub_provider
+                .as_deref()
+                .or(provider.display_name.as_deref())
+                .unwrap_or(&provider.driver)
+                .to_owned();
+            Some((label, provider_label))
+        })
+        .unwrap_or_else(|| (model.to_owned(), instance_id.to_owned()));
+
+    cx.set_global(ModelMentionPopoverGlobal {
+        active: Some(ModelMentionPopover { label, provider_label, source, position, owner }),
+    });
+    cx.notify(owner);
+    window.refresh();
+}
+
+pub fn close_model_mention_popover(cx: &mut App) {
+    let owner = cx
+        .try_global::<ModelMentionPopoverGlobal>()
+        .and_then(|g| g.active.as_ref().map(|a| a.owner));
+    if let Some(owner) = owner {
+        cx.set_global(ModelMentionPopoverGlobal { active: None });
+        cx.notify(owner);
+    }
+}
+
+pub fn render_model_mention_popover(owner: EntityId, window: &Window, cx: &mut App) -> Option<AnyElement> {
+    let active = cx
+        .try_global::<ModelMentionPopoverGlobal>()
+        .and_then(|g| g.active.as_ref())
+        .filter(|a| a.owner == owner)?
+        .clone();
+    let p = palette(cx);
+    let bounds = window.viewport_size();
+    let x = f32::from(active.position.x).clamp(8., (f32::from(bounds.width) - 280.).max(8.));
+    let y = (f32::from(active.position.y) + 12.).clamp(8., (f32::from(bounds.height) - 160.).max(8.));
+    let copy_source = active.source.clone();
+
+    Some(
+        div()
+            .id("model-mention-popover-layer")
+            .absolute()
+            .inset_0()
+            .child(
+                div()
+                    .id("model-mention-popover")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(268.))
+                    .p(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(hsla(p.border))
+                    .bg(hsla(p.popover))
+                    .shadow_sm()
+                    .occlude()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down_out(|_, _, cx| close_model_mention_popover(cx))
+                    .on_key_down(|event: &gpui::KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "escape" {
+                            close_model_mention_popover(cx);
+                            cx.stop_propagation();
+                        }
+                    })
+                    .child(
+                        gpui_component::h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(hsla(p.foreground))
+                                    .child(active.label),
+                            )
+                            .child(crate::transcript::parts::ghost_icon_button(
+                                "close-model-mention",
+                                Icon::X,
+                                |_, _, cx| close_model_mention_popover(cx),
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(hsla(p.muted_foreground))
+                            .child(active.provider_label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(hsla(p.muted_foreground))
+                            .child(active.source),
+                    )
+                    .child(
+                        gpui_component::h_flex().justify_end().pt(px(2.)).child(
+                            crate::transcript::parts::ghost_text_button(
+                                "copy-model-mention",
+                                "Copy mention",
+                                Some(Icon::Copy),
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_source.clone()));
+                                    close_model_mention_popover(cx);
+                                },
+                                cx,
+                            ),
+                        ),
+                    ),
+            )
+            .into_any_element(),
+    )
+}
+
+/// Dispatches clicks on Markdown links with optional row key context for `agentWorkingDirectories`.
+pub fn handle_markdown_link_click_for_source(
     url: &str,
     event: &ClickEvent,
     action_ctx: Option<&MarkdownActionContext>,
+    source_key: Option<&str>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -100,6 +275,11 @@ pub fn handle_markdown_link_click(
                 }
             }
         }
+        MarkdownLinkKind::ModelMention { instance_id, model } => {
+            if let Some(ctx) = action_ctx {
+                open_model_mention_popover(&instance_id, &model, event.position(), &ctx.state, ctx.owner, window, cx);
+            }
+        }
         MarkdownLinkKind::Thread(target) => {
             if let Some(ctx) = action_ctx {
                 open_thread_link(&target, &ctx.state, cx);
@@ -107,7 +287,7 @@ pub fn handle_markdown_link_click(
         }
         MarkdownLinkKind::File(file) => {
             if let Some(ctx) = action_ctx {
-                open_file_link(&file, event, ctx, cx);
+                open_file_link_for_source(&file, event, ctx, source_key, cx);
             } else if file.media_kind == FileLinkMediaKind::Pdf || file.full_path.starts_with('/') {
                 cx.open_url(&file_url(&file.full_path));
             }
@@ -145,6 +325,8 @@ pub fn open_thread_link(target: &ThreadLinkTarget, state: &Entity<AppState>, cx:
                     app.navigate_scoped(owner, ScopedRouteAction::Thread(target.thread_id.clone()), cx);
                     return;
                 }
+                app.show_toast(Toast::new(ToastKind::Info, unknown_thread_link_label(false)), cx);
+                return;
             }
             let prev_selected = app.selected_thread.clone();
             app.open_linked_thread(env_id, &target.thread_id, cx);
@@ -174,8 +356,65 @@ pub fn open_thread_link(target: &ThreadLinkTarget, state: &Entity<AppState>, cx:
             }
         }
 
+        if target.environment_id.is_some() {
+            app.show_toast(Toast::new(ToastKind::Info, unknown_thread_link_label(false)), cx);
+            return;
+        }
+
         app.open_related_thread(&target.thread_id, cx);
     });
+}
+
+#[derive(Default)]
+pub struct ThreadLinkMetadataGlobal {
+    pub by_thread_id: HashMap<String, t3_core::markdown::links::ThreadLinkMetadata>,
+}
+
+impl Global for ThreadLinkMetadataGlobal {}
+
+/// Fetches metadata (`title`, optional `projectId`) for unloaded linked threads via
+/// `orchestration.getThreadLinkMetadata` (or `orchestration.getThreadTitles` fallback).
+pub fn prefetch_thread_link_metadata(state: &Entity<AppState>, owner: EntityId, thread_ids: Vec<String>, cx: &mut App) {
+    let missing: Vec<String> = {
+        let cached = cx.try_global::<ThreadLinkMetadataGlobal>();
+        let app = state.read(cx);
+        thread_ids
+            .into_iter()
+            .filter(|id| app.thread_shell(id).is_none() && cached.is_none_or(|g| !g.by_thread_id.contains_key(id)))
+            .collect()
+    };
+    if missing.is_empty() {
+        return;
+    }
+    let Some(client) = state.read(cx).client_handle() else {
+        return;
+    };
+    let supports_metadata = state
+        .read(cx)
+        .server_config
+        .config
+        .as_ref()
+        .is_some_and(|c| c.thread_link_metadata == Some(true));
+    let runtime = state.read(cx).runtime().clone();
+    cx.spawn(async move |cx| {
+        let task = runtime.spawn(async move {
+            t3_client::environments::fetch_thread_link_metadata(&client, &missing, supports_metadata).await
+        });
+        if let Ok(Ok(map)) = task.await
+            && !map.is_empty()
+        {
+            cx.update(|cx| {
+                if !cx.has_global::<ThreadLinkMetadataGlobal>() {
+                    cx.set_global(ThreadLinkMetadataGlobal::default());
+                }
+                cx.update_global::<ThreadLinkMetadataGlobal, _>(|global, _| {
+                    global.by_thread_id.extend(map);
+                });
+                cx.notify(owner);
+            });
+        }
+    })
+    .detach();
 }
 
 fn resolve_action_target(ctx: &MarkdownActionContext, app: &AppState) -> (Option<String>, Option<String>) {
@@ -196,14 +435,59 @@ fn resolve_action_target(ctx: &MarkdownActionContext, app: &AppState) -> (Option
     (thread_id, cwd)
 }
 
-fn open_file_link(file: &ResolvedFileLink, event: &ClickEvent, ctx: &MarkdownActionContext, cx: &mut App) {
-    let state = &ctx.state;
-    if event.modifiers().alt {
-        reveal_or_open_in_editor(ctx, file, true, cx);
+#[derive(Clone)]
+struct LinkClickAction {
+    alt: bool,
+    platform: bool,
+}
+
+fn open_file_link_for_source(
+    file: &ResolvedFileLink,
+    event: &ClickEvent,
+    ctx: &MarkdownActionContext,
+    source_key: Option<&str>,
+    cx: &mut App,
+) {
+    let modifiers = event.modifiers();
+    let click = LinkClickAction { alt: modifiers.alt, platform: modifiers.platform };
+    if cfg!(target_os = "macos") && is_macos_app_bundle_path(&file.full_path) {
+        reveal_or_open_in_editor(ctx, file, None, true, cx);
         return;
     }
-    if event.modifiers().platform {
-        reveal_or_open_in_editor(ctx, file, false, cx);
+    if !click.alt
+        && let Some(lookup_rel) = file.relative_path.as_deref().or_else(|| {
+            (!file.full_path.starts_with('/') && !file.full_path.contains(":\\")).then_some(file.full_path.as_str())
+        })
+        && let Some(cwd) = {
+            let app = ctx.state.read(cx);
+            resolve_action_target(ctx, app).1
+        }
+        && let Some(query) = workspace_link_lookup_query(lookup_rel, &cwd)
+    {
+        resolve_and_open_workspace_file_link(file.clone(), lookup_rel.to_owned(), cwd, query, ctx.clone(), source_key.map(str::to_owned), click, cx);
+        return;
+    }
+    open_resolved_file_now(file, None, &click, ctx, cx);
+}
+
+fn open_resolved_file_now(
+    file: &ResolvedFileLink,
+    resolved_root: Option<&str>,
+    click: &LinkClickAction,
+    ctx: &MarkdownActionContext,
+    cx: &mut App,
+) {
+    let state = &ctx.state;
+    if cfg!(target_os = "macos") && is_macos_app_bundle_path(&file.full_path) {
+        reveal_or_open_in_editor(ctx, file, resolved_root, true, cx);
+        return;
+    }
+    if click.alt {
+        reveal_or_open_in_editor(ctx, file, resolved_root, true, cx);
+        return;
+    }
+    if click.platform {
+        reveal_or_open_in_editor(ctx, file, resolved_root, false, cx);
         return;
     }
     if file.media_kind == FileLinkMediaKind::Pdf {
@@ -222,7 +506,7 @@ fn open_file_link(file: &ResolvedFileLink, event: &ClickEvent, ctx: &MarkdownAct
     }
     let (panel_open, action_cwd) = {
         let app = state.read(cx);
-        (app.panel_thread().is_some(), resolve_action_target(ctx, app).1)
+        (app.panel_thread().is_some(), resolved_root.map(str::to_owned).or_else(|| resolve_action_target(ctx, app).1))
     };
     if panel_open && let Some(cwd) = action_cwd {
         let target = t3_core::files::file_surface_path(&file.full_path, Some(&cwd));
@@ -234,12 +518,247 @@ fn open_file_link(file: &ResolvedFileLink, event: &ClickEvent, ctx: &MarkdownAct
     }
 }
 
-fn reveal_or_open_in_editor(ctx: &MarkdownActionContext, file: &ResolvedFileLink, reveal: bool, cx: &mut App) {
+fn candidate_project_and_agent_roots(
+    app: &AppState,
+    thread_view: Option<&gpui::WeakEntity<crate::thread_view::ThreadView>>,
+    source_key: Option<&str>,
+    active_cwd: &str,
+    cx: &App,
+) -> (Vec<String>, Vec<String>) {
+    let mut other_roots = Vec::new();
+    if let Some(snapshot) = app.shell.snapshot.as_ref() {
+        for project in &snapshot.projects {
+            if !project.workspace_root.is_empty()
+                && project.workspace_root != active_cwd
+                && !other_roots.contains(&project.workspace_root)
+            {
+                other_roots.push(project.workspace_root.clone());
+                if other_roots.len() >= AGENT_DIRECTORY_SEARCH_LIMIT {
+                    break;
+                }
+            }
+        }
+    }
+    let agent_roots: Vec<String> = thread_view
+        .and_then(|tv| tv.upgrade())
+        .map(|tv| {
+            tv.read(cx)
+                .agent_working_directories_for_key(source_key)
+                .into_iter()
+                .filter(|dir| dir != active_cwd)
+                .take(AGENT_DIRECTORY_SEARCH_LIMIT)
+                .collect()
+        })
+        .unwrap_or_default();
+    (other_roots, agent_roots)
+}
+
+async fn search_workspace_candidates(
+    client: &t3_client::supervisor::ClientHandle,
+    cwd: &str,
+    query: &str,
+) -> Vec<WorkspaceEntryCandidate> {
+    let payload = json!({
+        "cwd": cwd,
+        "query": query,
+        "limit": WORKSPACE_BASENAME_LOOKUP_LIMIT,
+        "kind": "file",
+    });
+    let Ok(reply) = client.request(SEARCH_ENTRIES, payload).await else {
+        return Vec::new();
+    };
+    let Ok(listing) = decode_search(&reply) else {
+        return Vec::new();
+    };
+    listing
+        .entries
+        .into_iter()
+        .map(|entry| WorkspaceEntryCandidate {
+            path: entry.path,
+            kind: match entry.kind {
+                t3_core::files::EntryKind::File => WorkspaceEntryKind::File,
+                t3_core::files::EntryKind::Directory => WorkspaceEntryKind::Directory,
+            },
+        })
+        .collect()
+}
+
+async fn filesystem_metadata_entries(
+    client: &t3_client::supervisor::ClientHandle,
+    paths: &[String],
+) -> Option<Vec<Option<String>>> {
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let reply = client.request("filesystem.getMetadata", json!({ "paths": paths })).await.ok()?;
+    let entries = reply.get("entries")?.as_array()?;
+    Some(
+        entries
+            .iter()
+            .map(|entry| entry.get("kind").and_then(Value::as_str).map(str::to_owned))
+            .collect(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_open_workspace_file_link(
+    fallback_file: ResolvedFileLink,
+    lookup_rel: String,
+    cwd: String,
+    query: String,
+    ctx: MarkdownActionContext,
+    source_key: Option<String>,
+    click: LinkClickAction,
+    cx: &mut App,
+) {
+    let Some(client) = ctx.state.read(cx).client_handle() else {
+        open_resolved_file_now(&fallback_file, None, &click, &ctx, cx);
+        return;
+    };
+    let (other_roots, agent_roots) = {
+        let app = ctx.state.read(cx);
+        candidate_project_and_agent_roots(app, ctx.thread_view.as_ref(), source_key.as_deref(), &cwd, cx)
+    };
+    let runtime = ctx.state.read(cx).runtime().clone();
+
+    cx.spawn(async move |cx| {
+        let fallback_full = fallback_file.full_path.clone();
+        let resolved: Option<(String, Option<String>)> = runtime
+            .spawn(async move {
+                let is_basename = needs_workspace_basename_lookup(&lookup_rel);
+                if !is_basename {
+                    let literal_path = resolve_full_and_relative(&lookup_rel, Some(&cwd)).0;
+                    if let Some(entries) = filesystem_metadata_entries(&client, &[literal_path]).await
+                        && entries.first().is_some_and(Option::is_some)
+                    {
+                        return None;
+                    }
+                }
+
+                let active_entries = search_workspace_candidates(&client, &cwd, &query).await;
+                if let Some(matched) = pick_workspace_link_match(&lookup_rel, &cwd, &active_entries) {
+                    let (full, _) = resolve_full_and_relative(&matched, Some(&cwd));
+                    return Some((full, Some(cwd)));
+                }
+
+                if !other_roots.is_empty() || !agent_roots.is_empty() {
+                    let cwd_exists = if is_basename {
+                        let literal_path = resolve_full_and_relative(&lookup_rel, Some(&cwd)).0;
+                        filesystem_metadata_entries(&client, &[literal_path])
+                            .await
+                            .is_some_and(|entries| entries.first().is_some_and(Option::is_some))
+                    } else {
+                        false
+                    };
+                    if cwd_exists {
+                        return Some((fallback_full, Some(cwd)));
+                    }
+
+                    if !other_roots.is_empty() {
+                        let mut project_searches = Vec::with_capacity(other_roots.len());
+                        for root in &other_roots {
+                            let candidates = search_workspace_candidates(&client, root, &query).await;
+                            project_searches.push((root.as_str(), candidates));
+                        }
+                        let borrowed: Vec<(&str, &[WorkspaceEntryCandidate])> = project_searches
+                            .iter()
+                            .map(|(root, entries)| (*root, entries.as_slice()))
+                            .collect();
+                        if let Some(matched_full) = pick_project_link_match(&lookup_rel, borrowed) {
+                            let matched_root = other_roots
+                                .iter()
+                                .find(|root| matched_full.starts_with(root.as_str()))
+                                .cloned();
+                            return Some((matched_full, matched_root));
+                        }
+                    }
+
+                    if !agent_roots.is_empty() {
+                        let agent_paths: Vec<String> = agent_roots
+                            .iter()
+                            .map(|root| resolve_full_and_relative(&lookup_rel, Some(root)).0)
+                            .collect();
+                        if let Some(kinds) = filesystem_metadata_entries(&client, &agent_paths).await {
+                            for (index, kind) in kinds.iter().enumerate() {
+                                if kind.as_deref() == Some("file") {
+                                    return Some((agent_paths[index].clone(), Some(agent_roots[index].clone())));
+                                }
+                            }
+                        }
+                        if is_basename {
+                            for root in &agent_roots {
+                                let entries = search_workspace_candidates(&client, root, &query).await;
+                                if let Some(matched) = pick_workspace_link_match(&lookup_rel, root, &entries) {
+                                    let (full, _) = resolve_full_and_relative(&matched, Some(root));
+                                    return Some((full, Some(root.clone())));
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .await
+            .ok()
+            .flatten();
+
+        cx.update(|cx| {
+            let (mut target_file, resolved_root) = match resolved {
+                Some((full_path, root)) => {
+                    let mut next = fallback_file.clone();
+                    next.relative_path = Some(t3_core::files::file_surface_path(&full_path, root.as_deref()).unwrap_or_else(|| full_path.clone()));
+                    next.full_path = full_path;
+                    (next, root)
+                }
+                None => (fallback_file, None),
+            };
+            if resolved_root.is_some() && target_file.relative_path.is_none() {
+                target_file.relative_path = Some(target_file.full_path.clone());
+            }
+            open_resolved_file_now(&target_file, resolved_root.as_deref(), &click, &ctx, cx);
+        });
+    })
+    .detach();
+}
+
+fn open_in_editor_with_root(app: &mut AppState, cwd: &str, relative_or_full: &str, line: Option<u64>, cx: &mut gpui::Context<AppState>) -> bool {
+    let available = app
+        .server_config
+        .config
+        .as_ref()
+        .map(|config| config.available_editors.clone())
+        .unwrap_or_default();
+    let Some((editor, label)) = preferred_editor(&available, None) else {
+        return false;
+    };
+    let target = editor_target(cwd, relative_or_full, line);
+    let request = app.rpc(OPEN_IN_EDITOR, open_in_editor_request_with_root(&target, editor, Some(cwd)));
+    cx.spawn(async move |this, cx| {
+        let result = request.await;
+        let _ = this.update(cx, |state, cx| match result {
+            Ok(_) => state.announce(format!("Opened in {label}"), None, cx),
+            Err(error) => state.show_toast(
+                Toast::new(ToastKind::Error, format!("Could not open in {label}")).description(error.to_string()),
+                cx,
+            ),
+        });
+    })
+    .detach();
+    true
+}
+
+fn reveal_or_open_in_editor(
+    ctx: &MarkdownActionContext,
+    file: &ResolvedFileLink,
+    resolved_root: Option<&str>,
+    reveal: bool,
+    cx: &mut App,
+) {
     let state = &ctx.state;
-    let cwd = {
+    let cwd = resolved_root.map(str::to_owned).unwrap_or_else(|| {
         let app = state.read(cx);
         resolve_action_target(ctx, app).1.unwrap_or_else(|| "/".to_owned())
-    };
+    });
     let path_for_editor = file.relative_path.as_deref().unwrap_or(&file.full_path);
 
     if reveal {
@@ -250,7 +769,7 @@ fn reveal_or_open_in_editor(ctx: &MarkdownActionContext, file: &ResolvedFileLink
             .as_ref()
             .is_some_and(|cfg| cfg.available_editors.iter().any(|e| e == "file-manager"));
         if can_reveal {
-            let payload = open_in_editor_request(&file.full_path, "file-manager");
+            let payload = open_in_editor_request_with_root(&file.full_path, "file-manager", None);
             let runtime = state.read(cx).runtime().clone();
             if let Some(client) = state.read(cx).client_handle() {
                 runtime.spawn(async move {
@@ -265,7 +784,7 @@ fn reveal_or_open_in_editor(ctx: &MarkdownActionContext, file: &ResolvedFileLink
         return;
     }
 
-    let opened = state.update(cx, |app, cx| app.open_in_editor(&cwd, path_for_editor, file.line, cx));
+    let opened = state.update(cx, |app, cx| open_in_editor_with_root(app, &cwd, path_for_editor, file.line, cx));
     if !opened && file.full_path.starts_with('/') {
         cx.open_url(&file_url(&file.full_path));
     }
@@ -496,5 +1015,99 @@ mod tests {
                 (Some("t-primary".into()), Some("/tmp/primary-wt".into()))
             );
         });
+    }
+
+    #[gpui::test]
+    fn open_thread_link_reports_unreachable_remote_environment_without_active_fallback(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+
+        let target = ThreadLinkTarget {
+            version: 1,
+            environment_id: Some("env-offline".into()),
+            thread_id: "thr-remote".into(),
+            allow_cross_env_fallback: false,
+        };
+        let notices = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let notices_sub = notices.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&state, move |_, ev, _| {
+                if matches!(ev, AppEvent::Notice) {
+                    notices_sub.set(notices_sub.get() + 1);
+                }
+            })
+        });
+        cx.update(|cx| {
+            open_thread_link(&target, &state, cx);
+            let app = state.read(cx);
+            assert!(app.selected_thread.is_none());
+            assert!(!app.has_pending_scoped_route());
+        });
+        assert!(notices.get() >= 1, "expected toast Notice event for unreachable remote env");
+    }
+
+    #[gpui::test]
+    fn model_mention_popover_opens_with_resolved_provider_metadata(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        let cfg: t3_core::server_config::ServerConfig = serde_json::from_value(serde_json::json!({
+            "providers": [{
+                "instanceId": "claude",
+                "driver": "claudeAgent",
+                "displayName": "Claude Code",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "models": [{
+                    "slug": "claude-sonnet-4",
+                    "name": "Claude Sonnet 4",
+                    "shortName": "Sonnet 4",
+                    "subProvider": "Anthropic"
+                }]
+            }]
+        }))
+        .expect("valid ServerConfig");
+        state.update(cx, |app, _| {
+            app.server_config.config = Some(cfg);
+        });
+
+        let window = cx.add_window(|_, _| gpui::Empty);
+        window
+            .update(cx, |_, window, cx| {
+                let owner = state.entity_id();
+                open_model_mention_popover(
+                    "claude",
+                    "claude-sonnet-4",
+                    gpui::point(px(24.), px(48.)),
+                    &state,
+                    owner,
+                    window,
+                    cx,
+                );
+                let active = cx
+                    .try_global::<ModelMentionPopoverGlobal>()
+                    .and_then(|g| g.active.as_ref())
+                    .expect("popover should be active");
+                assert_eq!(active.label, "Sonnet 4");
+                assert_eq!(active.provider_label, "Anthropic");
+                assert_eq!(active.source, "model:claude/claude-sonnet-4");
+                close_model_mention_popover(cx);
+                assert!(
+                    cx.try_global::<ModelMentionPopoverGlobal>()
+                        .and_then(|g| g.active.as_ref())
+                        .is_none()
+                );
+            })
+            .unwrap();
     }
 }

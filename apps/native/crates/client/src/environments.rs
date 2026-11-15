@@ -711,5 +711,30 @@ async fn run(
     }
 }
 
+/// Resolves titles (and `projectId` when `supports_metadata` is enabled) for unloaded thread
+/// links (`pingdotgg/t3code#32830`), falling back cleanly to `orchestration.getThreadTitles`.
+pub async fn fetch_thread_link_metadata(
+    client: &ClientHandle,
+    thread_ids: &[String],
+    supports_metadata: bool,
+) -> Result<HashMap<String, t3_core::markdown::links::ThreadLinkMetadata>, String> {
+    use t3_core::markdown::links::{
+        GET_THREAD_LINK_METADATA, GET_THREAD_TITLES, decode_thread_link_metadata_map,
+    };
+    if thread_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let method = if supports_metadata {
+        GET_THREAD_LINK_METADATA
+    } else {
+        GET_THREAD_TITLES
+    };
+    let response = client
+        .request(method, serde_json::json!({ "threadIds": thread_ids }))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(decode_thread_link_metadata_map(&response, supports_metadata))
+}
+
 #[cfg(test)]
 mod tests;

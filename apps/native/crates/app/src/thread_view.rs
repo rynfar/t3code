@@ -992,6 +992,45 @@ impl ThreadView {
         cx.notify();
     }
 
+    /// Ordered `cd` working directories visited by shell commands before `source_key` (newest first,
+    /// mirroring `agentDirectories` in `MessagesTimeline.tsx`, `pingdotgg/t3code#36364`).
+    pub fn agent_working_directories_for_key(&self, source_key: Option<&str>) -> Vec<String> {
+        let end_index = source_key
+            .and_then(|key| {
+                let rest = key
+                    .strip_prefix("assistant:")
+                    .or_else(|| key.strip_prefix("user:"))
+                    .or_else(|| key.strip_prefix("plan:"))?;
+                let id = rest.split(':').next().unwrap_or(rest);
+                self.rows.iter().position(|row| match &row.kind {
+                    RowKind::Message { message, .. } => message.id == id,
+                    RowKind::ProposedPlan(plan) => plan.id == id,
+                    _ => false,
+                })
+            })
+            .unwrap_or(self.rows.len());
+
+        let mut commands: Vec<&str> = Vec::new();
+        for row in &self.rows[..end_index] {
+            let entries: &[Arc<WorkLogEntry>] = match &row.kind {
+                RowKind::Work { entries, .. }
+                | RowKind::WorkLive { entries, .. }
+                | RowKind::WorkToggle { entries, .. } => entries,
+                _ => continue,
+            };
+            for entry in entries {
+                if let Some(cmd) = entry.raw_command.as_deref().or(entry.command.as_deref()) {
+                    commands.push(cmd);
+                } else if let Some(item) = entry.item.as_ref()
+                    && let t3_core::turn_item::TurnItemKind::CommandExecution { input, .. } = &item.kind
+                {
+                    commands.push(input.as_str());
+                }
+            }
+        }
+        t3_core::markdown::links::agent_working_directories_from_commands(commands)
+    }
+
     /// Public hook for disclosure panels (`command_output`, `inspector`) to request scrolling an
     /// expanded row out from behind the bottom edge once its content is ready (used by #384).
     #[allow(dead_code)]
@@ -1146,8 +1185,15 @@ impl ThreadView {
             self.load_deferred_work(anchors, cx);
             if let Some(entry) = self.find_entry(key) {
                 self.fetch_detail(&entry, cx);
-                if entry.item.as_ref().is_some_and(|item| matches!(self.details.get(&item.id), Some(Detail::Loading { .. }))) {
-                    pending_async = true;
+                if let Some(item) = entry.item.as_ref() {
+                    let (loading, loaded) = match self.details.get(&item.id) {
+                        Some(Detail::Loading { .. }) => (true, None),
+                        Some(Detail::Loaded { item, .. }) => (false, Some(&**item)),
+                        _ => (false, None),
+                    };
+                    if loading || !t3_core::command_output::item_within_inline_budget(item, loaded, 16 * 1024) {
+                        pending_async = true;
+                    }
                 }
             }
         }
@@ -1198,7 +1244,7 @@ impl ThreadView {
             let pump = cx.spawn(async move |this, cx| {
                 while status.changed().await.is_ok() {
                     let next = status.borrow_and_update().clone();
-                    let ready = next.output.is_some() || next.error.is_some();
+                    let ready = !matches!(next.panel(), t3_core::command_output::Panel::Loading);
                     let updated = this.update(cx, |view, cx| {
                         let Some(slot) = view.command_outputs.get_mut(&key) else { return };
                         if slot.update(next) {
@@ -2236,7 +2282,7 @@ impl Render for ThreadView {
                             })),
                     ),
             )
-            .child(minimap).children(banners).children(find_bar).children(scroll_to_end).children(self.render_citation_toolbar(window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
+            .child(minimap).children(banners).children(find_bar).children(scroll_to_end).children(self.render_citation_toolbar(window, cx)).children(crate::transcript::markdown::links::render_model_mention_popover(cx.entity().entity_id(), window, cx)).child(self.viewer.clone()).children(self.render_rewind_confirm(window, cx)).into_any_element()
     }
 }
 

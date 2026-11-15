@@ -262,9 +262,62 @@ fn looks_like_inline_math_body(body: &str) -> bool {
     true
 }
 
+/// Escapes each `%` written right after other text, as in `\text{3.18% yield}` (`escapeLiteralPercents`).
+/// A `%` at a line start or after whitespace stays a comment; skips escapes and `\verb`.
+pub fn escape_literal_percents(tex: &str) -> String {
+    let bytes = tex.as_bytes();
+    let mut repaired = String::new();
+    let mut copied = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let ch = tex[index..].chars().next().unwrap();
+        if ch == '\\' {
+            if tex[index..].starts_with("\\verb") {
+                let after = index + "\\verb".len();
+                let starred = bytes.get(after) == Some(&b'*');
+                let delim_pos = after + usize::from(starred);
+                if let Some(delim) = tex[delim_pos..].chars().next()
+                    && (starred || (!delim.is_ascii_alphabetic() && delim != '*'))
+                {
+                    let mut close = delim_pos + delim.len_utf8();
+                    while close < bytes.len() {
+                        let c = tex[close..].chars().next().unwrap();
+                        if c == delim || c == '\n' || c == '\r' {
+                            break;
+                        }
+                        close += c.len_utf8();
+                    }
+                    if !tex[close..].starts_with(delim) {
+                        return tex.to_owned();
+                    }
+                    index = close + delim.len_utf8();
+                    continue;
+                }
+            }
+            index += 1 + tex[index + 1..].chars().next().map_or(0, char::len_utf8);
+        } else if ch == '%' && index > 0 && !tex[..index].chars().next_back().unwrap().is_whitespace() {
+            repaired.push_str(&tex[copied..index]);
+            repaired.push_str("\\%");
+            index += 1;
+            copied = index;
+        } else if ch == '%' {
+            index = tex[index..].find('\n').map_or(bytes.len(), |n| index + n + 1);
+        } else {
+            index += ch.len_utf8();
+        }
+    }
+    if copied == 0 {
+        tex.to_owned()
+    } else {
+        repaired.push_str(&tex[copied..]);
+        repaired
+    }
+}
+
 /// Converts a LaTeX math expression into a clean Unicode mathematical representation.
 pub fn render_tex_unicode(tex: &str) -> String {
-    let mut p = TexParser { src: tex.trim(), pos: 0 };
+    let repaired = escape_literal_percents(tex);
+    let mut p = TexParser { src: repaired.trim(), pos: 0 };
     p.parse_sequence(None)
 }
 
@@ -516,5 +569,18 @@ mod tests {
         assert!(out.contains("Inline x² + 1 and `$a+b$`."));
         assert!(out.contains("```t3-math\nE = mc^2\n```"));
         assert!(out.ends_with("$$\nunclosed"));
+    }
+
+    #[test]
+    fn escapes_literal_percents_while_keeping_comments_escapes_and_verb() {
+        assert_eq!(escape_literal_percents(r"\text{3.18% yield}"), r"\text{3.18\% yield}");
+        assert_eq!(render_tex_unicode(r"\text{3.18% yield}"), "3.18% yield");
+        assert_eq!(escape_literal_percents(r"\text{3.18\% yield}"), r"\text{3.18\% yield}");
+        assert_eq!(escape_literal_percents("x = 1 % comment 50%\ny = 2"), "x = 1 % comment 50%\ny = 2");
+        assert_eq!(escape_literal_percents(r"\verb|foo%bar| + a%b"), r"\verb|foo%bar| + a\%b");
+        assert_eq!(escape_literal_percents(r"\verb*|foo%bar| + 100%"), r"\verb*|foo%bar| + 100\%");
+        assert_eq!(escape_literal_percents(r"x\\"), r"x\\");
+        assert_eq!(escape_literal_percents(r"100% \\%"), r"100\% \\\%");
+        assert_eq!(escape_literal_percents(r"\verb|unterminated 50%"), r"\verb|unterminated 50%");
     }
 }

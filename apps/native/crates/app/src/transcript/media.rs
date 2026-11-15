@@ -367,6 +367,7 @@ fn unavailable(label: &str, alt: &str, cx: &App) -> AnyElement {
     let p = palette(cx);
     let text: Vec<&str> = [label, alt].into_iter().filter(|part| !part.is_empty()).collect();
     h_flex()
+        .max_w_full()
         .gap(px(6.))
         .rounded(px(6.))
         .border_1()
@@ -377,7 +378,7 @@ fn unavailable(label: &str, alt: &str, cx: &App) -> AnyElement {
         .text_xs()
         .text_color(hsla(p.muted_foreground))
         .child(Icon::TriangleAlert.render(px(14.), hsla(p.muted_foreground)))
-        .child(text.join(" · "))
+        .child(div().min_w_0().child(text.join(" · ")))
         .into_any_element()
 }
 
@@ -499,11 +500,25 @@ pub fn tool_output_image(id: SharedString, source: MediaSource, alt: &str, cx: &
 
 /// Like `tool_output_image`, opening the viewer with all tool output images in the group.
 pub fn tool_output_image_gallery(id: SharedString, sources: &[MediaSource], index: usize, alt: &str, cx: &mut App) -> AnyElement {
-    let Some(source) = sources.get(index).cloned() else { return unavailable("Image", alt, cx) };
-    let scope = cx.try_global::<media::Media>().and_then(|media| media.scope.clone());
-    let Some(scope) = scope else { return unavailable("Image", alt, cx) };
     let name: SharedString = alt.to_owned().into();
     let items: Vec<ViewerItem> = sources.iter().map(|src| ViewerItem::image(src.clone(), name.clone())).collect();
+    tool_output_image_gallery_items(id, items, index, alt, cx)
+}
+
+/// Like `tool_output_image_gallery`, preserving per-item captions across a work-group gallery (`#36321`).
+pub fn tool_output_image_gallery_items(
+    id: SharedString,
+    items: Vec<ViewerItem>,
+    index: usize,
+    alt: &str,
+    cx: &mut App,
+) -> AnyElement {
+    let Some(item) = items.get(index) else { return unavailable("Image", alt, cx) };
+    let source = item.source.clone();
+    let name = item.name.clone();
+    let Some(scope) = cx.try_global::<media::Media>().and_then(|media| media.scope.clone()) else {
+        return unavailable("Image", alt, cx);
+    };
     framed_image(
         id,
         source,
@@ -561,8 +576,13 @@ fn framed_image(
     cx: &mut App,
 ) -> AnyElement {
     let p = palette(cx);
-    if matches!(media::peek(&source, cx), ImageState::Failed(_)) {
-        return div().id(id).relative().child(unavailable("Image unavailable", alt, cx)).child(media::observe_image(source, scope.clone())).into_any_element();
+    if let ImageState::Failed(msg) = media::peek(&source, cx) {
+        let label = if msg.as_ref() == t3_core::media::MISSING_FILE_ACCESS_MESSAGE {
+            t3_core::media::MISSING_FILE_ACCESS_MESSAGE
+        } else {
+            "Image unavailable"
+        };
+        return div().id(id).relative().child(unavailable(label, alt, cx)).child(media::observe_image(source, scope.clone())).into_any_element();
     }
 
     let (width, height) = image_frame_size(media::dimensions(&source, cx), hints, max_height);

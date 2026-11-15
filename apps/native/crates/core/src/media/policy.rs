@@ -3,8 +3,8 @@
 
 use super::{AssetResource, image_mime_from_extension, video_mime_from_extension, is_windows_absolute_path};
 
-pub const ASSET_URL_STALE_TIME_MS: f64 = 5. * 60_000.;
 pub const ASSET_URL_REFRESH_INTERVAL_MS: f64 = 30. * 60_000.;
+pub const ASSET_URL_STALE_TIME_MS: f64 = ASSET_URL_REFRESH_INTERVAL_MS;
 
 pub fn asset_is_stale(settled_at: Option<f64>, now: f64) -> bool {
     settled_at.is_some_and(|at| now - at >= ASSET_URL_STALE_TIME_MS)
@@ -485,14 +485,19 @@ mod tests {
         }
         assert!(!allows_local_media_fallback(&resource("/a.png"), Some("Forbidden"), true));
         assert!(!allows_local_media_fallback(&resource("/a.png"), Some("AssetWorkspaceAssetNotFoundError"), false));
+        assert!(!allows_local_media_fallback(
+            &AssetResource::RemoteMediaFile { thread_id: "t".into(), path: "/repo/a.png".into() },
+            Some("AssetWorkspaceAssetNotFoundError"),
+            true,
+        ));
         assert!(!allows_local_media_fallback(&AssetResource::Attachment { attachment_id: "a".into() }, Some("AssetWorkspaceAssetNotFoundError"), true));
     }
 
     #[test]
-    fn remount_stales_at_five_minutes_and_mounted_refresh_is_thirty_minutes() {
+    fn remount_and_mounted_refresh_align_at_thirty_minutes() {
         assert_eq!(asset_refresh_delay(Some(0.), 299_999., true), Some(1_500_001.));
-        assert!(asset_is_stale(Some(0.), 300_000.));
-        assert!(!asset_is_stale(Some(0.), 299_999.));
+        assert!(asset_is_stale(Some(0.), 1_800_000.));
+        assert!(!asset_is_stale(Some(0.), 1_799_999.));
         assert_eq!(asset_refresh_delay(Some(0.), 1_800_000., true), Some(0.));
         assert_eq!(asset_refresh_delay(Some(0.), 1_800_000., false), None);
         assert_eq!(asset_refresh_delay(None, 0., true), Some(1_800_000.));

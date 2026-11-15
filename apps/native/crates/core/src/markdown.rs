@@ -6,6 +6,7 @@ pub mod alerts_details;
 pub mod code;
 pub mod links;
 pub mod math;
+pub mod mentions;
 pub mod mermaid;
 pub mod table;
 
@@ -26,7 +27,23 @@ pub fn prepare_display_markdown(source: &str, options: DisplayMarkdownOptions<'_
 /// Same as [`prepare_display_markdown`], letting user/work messages disable raw HTML expansion
 /// (`parseRawHtml={false}`) while keeping inline file linking and optional math.
 pub fn prepare_display_markdown_with_raw_html(source: &str, options: DisplayMarkdownOptions<'_>, parse_raw_html: bool) -> String {
-    let with_html_and_files = alerts_details::preprocess_markdown_for_display_with_html(source, options.is_dark, options.cwd, parse_raw_html);
+    prepare_display_markdown_for_surface(source, options, parse_raw_html, false)
+}
+
+/// Full display preparation for a message surface, optionally converting assistant `★ Insight`
+/// blocks into `[!INSIGHT]` callouts before HTML/file/math preprocessing.
+pub fn prepare_display_markdown_for_surface(
+    source: &str,
+    options: DisplayMarkdownOptions<'_>,
+    parse_raw_html: bool,
+    render_insights: bool,
+) -> String {
+    let with_insights = if render_insights {
+        alerts_details::preprocess_assistant_insights(source)
+    } else {
+        source.to_owned()
+    };
+    let with_html_and_files = alerts_details::preprocess_markdown_for_display_with_html(&with_insights, options.is_dark, options.cwd, parse_raw_html);
     if options.math_enabled {
         math::preprocess_math_for_display(&with_html_and_files)
     } else {
@@ -35,13 +52,14 @@ pub fn prepare_display_markdown_with_raw_html(source: &str, options: DisplayMark
 }
 
 /// Returns true when the Markdown text contains syntax handled by custom extensions or display
-/// preprocessing (code blocks, tables, blockquotes/alerts, math, details, HTML/markdown media, or file paths).
+/// preprocessing (code blocks, tables, blockquotes/alerts, insights, math, details, HTML/markdown media, or file paths).
 pub fn has_rich_markdown_syntax(source: &str) -> bool {
     source.contains("```")
         || source.contains("~~~")
         || source.contains('>')
         || source.contains('|')
         || source.contains("![")
+        || source.contains("★ Insight")
         || contains_ascii_case_insensitive_tag(source)
         || math::might_contain_math(source)
         || source.contains('`')

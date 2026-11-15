@@ -17,12 +17,19 @@ use serde_json::{Value, json};
 pub const CREATE_ASSET_URL: &str = "assets.createUrl";
 /// `ASSET_URL_MAX_IN_FLIGHT`: a thread with hundreds of images mints a few URLs at a time.
 pub const MAX_IN_FLIGHT: usize = 6;
+/// `FILESYSTEM_READ` scope required for workspace/media file and app-icon reads (`assets.ts`).
+pub const FILESYSTEM_READ_SCOPE: &str = "filesystem:read";
+/// Message shown when an environment session lacks host file access (`MISSING_FILE_ACCESS_MESSAGE`).
+pub const MISSING_FILE_ACCESS_MESSAGE: &str =
+    "This connection cannot read host files. Pair again with a new link to view it.";
 
 /// The `AssetResource` variants the transcript asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AssetResource {
     Attachment { attachment_id: String },
     MediaFile { thread_id: String, path: String },
+    /// Relative markdown image/video resolved under the remote thread's workspace (`hostOnly: true`).
+    RemoteMediaFile { thread_id: String, path: String },
     /// An image a tool returned, by its position among the item's output images.
     ToolOutputImage { thread_id: String, item_id: String, index: usize },
     /// An attachment served inline under its own name and type, as an HTML render frame loads
@@ -37,6 +44,12 @@ impl AssetResource {
         match self {
             AssetResource::Attachment { attachment_id } => json!({ "_tag": "attachment", "attachmentId": attachment_id }),
             AssetResource::MediaFile { thread_id, path } => json!({ "_tag": "media-file", "threadId": thread_id, "path": path }),
+            AssetResource::RemoteMediaFile { thread_id, path } => json!({
+                "_tag": "media-file",
+                "threadId": thread_id,
+                "path": path,
+                "hostOnly": true,
+            }),
             AssetResource::ToolOutputImage { thread_id, item_id, index } => {
                 json!({ "_tag": "tool-output-image", "threadId": thread_id, "itemId": item_id, "index": index })
             }
@@ -71,6 +84,11 @@ impl AssetResource {
             AssetResource::SourceControlMedia { url, .. } => Some(url.as_str()),
             _ => None,
         }
+    }
+
+    /// True when fetching this resource requires the `filesystem:read` scope (`blockedAssetUrlState`).
+    pub fn requires_filesystem_read(&self) -> bool {
+        matches!(self, AssetResource::MediaFile { .. } | AssetResource::RemoteMediaFile { .. })
     }
 }
 
@@ -374,33 +392,58 @@ fn join_workspace_path(root: &str, relative: &str) -> String {
     format!("{root}{separator}{}", relative.trim_start_matches(separator))
 }
 
+/// Classifies `value` and reports whether it resolved from a relative workspace path (`hostOnly`).
+pub fn classify_markdown_image_source_detailed(value: &str, workspace_root: Option<&str>) -> (MarkdownImageSource, bool) {
+    let source = normalize_destination(value);
+    if source.is_empty() || source.starts_with('#') || source.starts_with('?') {
+        return (MarkdownImageSource::Blocked, false);
+    }
+    if ["http:", "https:", "data:", "blob:", "//"].iter().any(|prefix| starts_with_ignore_case(source, prefix)) {
+        return (MarkdownImageSource::Direct(source.to_owned()), false);
+    }
+    let Some(path) = destination_host_path(source) else { return (MarkdownImageSource::Blocked, false) };
+    if starts_with_ignore_case(source, "file:") {
+        return (host_file_source(path, workspace_root), false);
+    }
+    if path.is_empty() {
+        return (MarkdownImageSource::Blocked, false);
+    }
+    if path.starts_with('/') || is_windows_absolute_path(&path) {
+        return (host_file_source(path, workspace_root), false);
+    }
+    if has_uri_scheme(&path) || path.starts_with("~/") || path.starts_with("~\\") {
+        return (MarkdownImageSource::Blocked, false);
+    }
+    match workspace_root.filter(|root| !root.is_empty()) {
+        Some(root) => (MarkdownImageSource::WorkspaceFile(join_workspace_path(root, &path)), true),
+        None => (MarkdownImageSource::Blocked, false),
+    }
+}
+
 /// `classifyMarkdownImageSource`: filesystem paths belong to the environment host and never load
 /// without first becoming a signed asset URL.
 pub fn classify_markdown_image_source(value: &str, workspace_root: Option<&str>) -> MarkdownImageSource {
-    let source = normalize_destination(value);
-    if source.is_empty() || source.starts_with('#') || source.starts_with('?') {
-        return MarkdownImageSource::Blocked;
-    }
-    if ["http:", "https:", "data:", "blob:", "//"].iter().any(|prefix| starts_with_ignore_case(source, prefix)) {
-        return MarkdownImageSource::Direct(source.to_owned());
-    }
-    let Some(path) = destination_host_path(source) else { return MarkdownImageSource::Blocked };
-    if starts_with_ignore_case(source, "file:") {
-        return host_file_source(path, workspace_root);
-    }
-    if path.is_empty() {
-        return MarkdownImageSource::Blocked;
-    }
-    if path.starts_with('/') || is_windows_absolute_path(&path) {
-        return host_file_source(path, workspace_root);
-    }
-    if has_uri_scheme(&path) || path.starts_with("~/") || path.starts_with("~\\") {
-        return MarkdownImageSource::Blocked;
-    }
-    match workspace_root.filter(|root| !root.is_empty()) {
-        Some(root) => MarkdownImageSource::WorkspaceFile(join_workspace_path(root, &path)),
-        None => MarkdownImageSource::Blocked,
-    }
+    classify_markdown_image_source_detailed(value, workspace_root).0
+}
+
+/// Escapes and wraps `src` in `<...>` when needed (`markdownImageCopy` in `ChatMarkdownMedia.tsx`).
+pub fn markdown_image_copy(alt: &str, src: &str, title: Option<&str>) -> String {
+    let escaped_alt = alt.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]");
+    let dest = if src.chars().any(char::is_whitespace) || src.contains(['<', '>', '(', ')']) {
+        let escaped = src
+            .replace('\\', "\\\\")
+            .replace('<', "\\<")
+            .replace('>', "\\>")
+            .replace('\n', "%0A")
+            .replace('\r', "%0D");
+        format!("<{escaped}>")
+    } else {
+        src.to_owned()
+    };
+    let title_suffix = title
+        .map(|title| format!(" \"{}\"", title.replace('\\', "\\\\").replace('"', "\\\"")))
+        .unwrap_or_default();
+    format!("![{escaped_alt}]({dest}{title_suffix})")
 }
 
 fn image_mime_from_extension(extension: &str) -> Option<&'static str> {
@@ -672,7 +715,7 @@ pub fn resolve_media_source_with_options(
     image_embed: bool,
     options: MediaResolveOptions<'_>,
 ) -> Option<ResolvedMedia> {
-    let classified = classify_markdown_image_source(source, workspace_root);
+    let (classified, host_only) = classify_markdown_image_source_detailed(source, workspace_root);
     let (path, direct) = match &classified {
         MarkdownImageSource::Blocked => return None,
         MarkdownImageSource::Direct(uri) => {
@@ -717,6 +760,9 @@ pub fn resolve_media_source_with_options(
         }
         (Some(uri), Some(sc), _) => Some(MediaSource::Direct(if sc.fetch_url.is_empty() { uri } else { sc.fetch_url })),
         (Some(uri), None, _) => Some(MediaSource::Direct(uri)),
+        (None, _, Some(thread_id)) if host_only => {
+            Some(MediaSource::Asset(AssetResource::RemoteMediaFile { thread_id: thread_id.to_owned(), path }))
+        }
         (None, _, Some(thread_id)) => Some(MediaSource::Asset(AssetResource::MediaFile { thread_id: thread_id.to_owned(), path })),
         (None, _, None) => None,
     };
