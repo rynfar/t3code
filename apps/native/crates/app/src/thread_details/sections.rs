@@ -91,11 +91,9 @@ fn environment_row(ctx: &Ctx, worktree: Option<&str>, project_root: &str, cx: &A
 /// another (the shortcut is `editor.openFavorite`).
 fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
     let app = ctx.state.read(cx);
-    let available = app.server_config.config.as_ref().map(|config| config.available_editors.clone()).unwrap_or_default();
-    let env_label = app
-        .server_config
-        .config
-        .as_ref()
+    let active_config = app.active_open_in_config();
+    let available = active_config.map(|config| config.available_editors.clone()).unwrap_or_default();
+    let env_label = active_config
         .map(|config| config.environment.label.trim().to_owned())
         .filter(|label| !label.is_empty())
         .or_else(|| app.active_environment().map(|env| env.label.clone()))
@@ -123,7 +121,6 @@ fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
             }
         });
     let details = ctx.details.clone();
-    let state = ctx.state.clone();
     let shortcut = crate::keymap::label("editor.openFavorite", cx);
     let trigger = MenuTrigger::new("details-open-in-menu", "Choose editor").disabled(is_host_editor_denied).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
         let mut menu = menu.min_w(px(ROW_WIDTH));
@@ -136,13 +133,12 @@ fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
         }
         for id in options {
             let details = details.clone();
-            let state = state.clone();
             let label = editor_label(id, mac);
             let item = match (Some(id) == preferred, shortcut.clone()) {
                 (true, Some(shortcut)) => PopupMenuItem::element(move |_, cx| h_flex().w_full().gap(px(8.)).child(div().flex_1().child(label)).child(menu_shortcut(shortcut.clone(), cx))),
                 _ => PopupMenuItem::new(label),
             };
-            menu = menu.item(item.disabled(!can_open_editor).on_click(move |_, _, cx| details.update(cx, |details, cx| details.open_in_editor(&state, id, cx))));
+            menu = menu.item(item.disabled(!can_open_editor).on_click(move |_, _, cx| details.update(cx, |details, cx| details.set_last_editor(id, cx))));
         }
         menu
     });
@@ -205,7 +201,7 @@ pub fn workspace(ctx: &Ctx, density: CardDensity, cx: &App) -> Option<AnyElement
     let details = ctx.details.read(cx);
     let rows: Vec<AnyElement> = [
         (details.shows("environment") && item_visible_at_density("environment", density)).then(|| environment_row(ctx, worktree, &project_root, cx)),
-        (details.shows("openIn") && item_visible_at_density("openIn", density)).then(|| open_in_row(ctx, cx)),
+        (details.shows("openIn") && item_visible_at_density("openIn", density) && app.should_show_open_in_picker(true)).then(|| open_in_row(ctx, cx)),
         (details.shows("scripts") && item_visible_at_density("scripts", density)).then(|| scripts_row(ctx, cx)).flatten(),
     ]
     .into_iter()
@@ -942,6 +938,36 @@ mod tests {
             });
         });
         assert_eq!(state.read_with(&vcx, |state, _| state.active_remote_open_state()), RemoteOpenState::LocalExec);
+        assert!(state.read_with(&vcx, |state, _| state.should_show_open_in_picker(true)));
+
+        // Non-SSH connection with advertised `ServerConfig.remoteOpenTargets` resolves to RemoteLinks.
+        state.update(&mut vcx, |state, _| {
+            state.environments.environments[0].ssh = None;
+            state.environments.environments[1].environment_id = Some("env-other-host".into());
+            state.server_config.config.as_mut().unwrap().remote_open_targets = vec![t3_core::server_config::RemoteOpenTarget {
+                kind: "tailscale".into(),
+                host: "box.tailnet.ts.net".into(),
+                username: Some("alice".into()),
+            }];
+        });
+        assert_eq!(
+            state.read_with(&vcx, |state, _| state.active_remote_open_state()),
+            RemoteOpenState::RemoteLinks(t3_core::thread_details::RemoteOpenHost {
+                host: "box.tailnet.ts.net".into(),
+                username: Some("alice".into()),
+            })
+        );
+
+        // Port-forwarded non-local loopback environment != primary/host hides the OpenInPicker row.
+        state.update(&mut vcx, |state, _| {
+            state.environments.environments[0].http_base = "http://127.0.0.1:4777".into();
+            state.server_config.config.as_mut().unwrap().remote_open_targets.clear();
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert_eq!(state.read_with(&vcx, |state, _| state.active_remote_open_state()), RemoteOpenState::LocalExec);
+        assert!(!state.read_with(&vcx, |state, _| state.should_show_open_in_picker(true)));
+        assert!(vcx.debug_bounds("details-open-in").is_none());
+
         state.update(&mut vcx, |state, _| state.stop_pump());
     }
 }

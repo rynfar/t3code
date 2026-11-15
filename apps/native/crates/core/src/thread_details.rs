@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use url::Url;
@@ -532,6 +533,190 @@ pub fn remote_scheme_for_editor(id: &str) -> Option<(&'static str, Option<&'stat
     }
 }
 
+/// `REMOTE_CAPABLE_EDITOR_IDS` (`packages/contracts/src/editor.ts`) in display order.
+pub const REMOTE_CAPABLE_EDITOR_IDS: &[&str] = &[
+    "cursor",
+    "vscode",
+    "vscode-insiders",
+    "vscodium",
+    "zed",
+    "idea",
+    "aqua",
+    "clion",
+    "datagrip",
+    "dataspell",
+    "goland",
+    "phpstorm",
+    "pycharm",
+    "rider",
+    "rubymine",
+    "rustrover",
+    "webstorm",
+];
+
+fn remote_editor_probe_spec(id: &str) -> Option<(&'static [&'static str], &'static [&'static str], bool)> {
+    // `(commands, mac_bundle_names, is_jetbrains)` mirroring `EDITORS` + `installNames` in `packages/shared/src/editor.ts`.
+    match id {
+        "cursor" => Some((&["cursor"], &["Cursor"], false)),
+        "vscode" => Some((&["code"], &["Visual Studio Code"], false)),
+        "vscode-insiders" => Some((&["code-insiders"], &["Visual Studio Code - Insiders"], false)),
+        "vscodium" => Some((&["codium"], &["VSCodium"], false)),
+        "zed" => Some((&["zed", "zeditor"], &["Zed"], false)),
+        "idea" => Some((&["idea"], &["IntelliJ IDEA", "IntelliJ IDEA CE", "IntelliJ IDEA Ultimate"], true)),
+        "aqua" => Some((&["aqua"], &["Aqua"], true)),
+        "clion" => Some((&["clion"], &["CLion"], true)),
+        "datagrip" => Some((&["datagrip"], &["DataGrip"], true)),
+        "dataspell" => Some((&["dataspell"], &["DataSpell"], true)),
+        "goland" => Some((&["goland"], &["GoLand"], true)),
+        "phpstorm" => Some((&["phpstorm"], &["PhpStorm"], true)),
+        "pycharm" => Some((&["pycharm"], &["PyCharm", "PyCharm CE"], true)),
+        "rider" => Some((&["rider"], &["Rider", "JetBrains Rider"], true)),
+        "rubymine" => Some((&["rubymine"], &["RubyMine"], true)),
+        "rustrover" => Some((&["rustrover"], &["RustRover"], true)),
+        "webstorm" => Some((&["webstorm"], &["WebStorm"], true)),
+        _ => None,
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn is_versioned_macos_bundle(entry: &str, name: &str) -> bool {
+    let Some(rest) = entry.strip_prefix(name).and_then(|s| s.strip_prefix(' ')) else { return false };
+    let Some(ver) = rest.strip_suffix(".app") else { return false };
+    !ver.is_empty() && ver.as_bytes()[0].is_ascii_digit() && ver.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+}
+
+fn resolve_on_path(command: &str, path_dirs: &[PathBuf]) -> Option<PathBuf> {
+    path_dirs.iter().map(|dir| dir.join(command)).find(|candidate| is_executable_file(candidate))
+}
+
+fn is_zed_cli_binary(path: &Path) -> bool {
+    std::process::Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success() && String::from_utf8_lossy(&output.stdout).starts_with("Zed"))
+}
+
+fn has_macos_or_toolbox_candidate(
+    id: &str,
+    command: &str,
+    bundle_names: &[&str],
+    is_jetbrains: bool,
+    macos_app_roots: &[PathBuf],
+    toolbox_dir: Option<&Path>,
+) -> bool {
+    for root in macos_app_roots {
+        let mut bundles: Vec<String> = bundle_names.iter().map(|name| format!("{name}.app")).collect();
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str()
+                    && bundle_names.iter().any(|base| name == format!("{base}.app") || is_versioned_macos_bundle(name, base))
+                    && !bundles.iter().any(|existing| existing == name)
+                {
+                    bundles.push(name.to_owned());
+                }
+            }
+        }
+        for bundle in bundles {
+            let contents = root.join(bundle).join("Contents");
+            let found = if is_jetbrains || id == "zed" {
+                is_executable_file(&contents.join("MacOS").join(if id == "zed" { "cli" } else { command }))
+            } else {
+                is_executable_file(&contents.join("Resources/app/bin").join(command)) || is_executable_file(&contents.join("Resources/app/bin/code"))
+            };
+            if found {
+                return true;
+            }
+        }
+    }
+    let Some(toolbox_dir) = toolbox_dir.filter(|_| is_jetbrains) else {
+        return false;
+    };
+    if is_executable_file(&toolbox_dir.join(command)) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(toolbox_dir) else { return false };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { return false };
+        name.strip_prefix(command).is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())) && is_executable_file(&entry.path())
+    })
+}
+
+/// Probes locally installed remote-capable editors (`probeRemoteEditors` / `resolveEditorCommand`
+/// from `apps/desktop/src/ipc/methods/window.ts` + `packages/shared/src/editor.ts`).
+pub fn probe_remote_capable_editors() -> Vec<String> {
+    let path_var = std::env::var_os("PATH");
+    let path_dirs: Vec<PathBuf> = path_var.as_deref().map(std::env::split_paths).into_iter().flatten().collect();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut app_roots = Vec::new();
+    if cfg!(target_os = "macos") {
+        if let Some(home) = &home {
+            app_roots.push(home.join("Applications"));
+        }
+        app_roots.push(PathBuf::from("/Applications"));
+    }
+    let toolbox_dir = if cfg!(target_os = "macos") {
+        home.as_ref().map(|h| h.join("Library/Application Support/JetBrains/Toolbox/scripts"))
+    } else if cfg!(target_os = "linux") {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".local/share")))
+            .map(|d| d.join("JetBrains/Toolbox/scripts"))
+    } else {
+        None
+    };
+    probe_remote_capable_editors_in(&path_dirs, &app_roots, toolbox_dir.as_deref(), cfg!(target_os = "macos"), &is_zed_cli_binary)
+}
+
+fn probe_remote_capable_editors_in(
+    path_dirs: &[PathBuf],
+    macos_app_roots: &[PathBuf],
+    toolbox_dir: Option<&Path>,
+    prefer_zed_bundle: bool,
+    check_zed: &dyn Fn(&Path) -> bool,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    for &id in REMOTE_CAPABLE_EDITOR_IDS {
+        let Some((commands, bundle_names, is_jetbrains)) = remote_editor_probe_spec(id) else { continue };
+        let on_path = if id == "zed" && prefer_zed_bundle {
+            false
+        } else {
+            commands.iter().any(|cmd| {
+                let Some(resolved) = resolve_on_path(cmd, path_dirs) else { return false };
+                id != "zed" || *cmd != "zed" || check_zed(&resolved)
+            })
+        };
+        let in_bundle_or_toolbox = has_macos_or_toolbox_candidate(id, commands[0], bundle_names, is_jetbrains, macos_app_roots, toolbox_dir);
+        let zed_fallback = if id == "zed" && prefer_zed_bundle && !in_bundle_or_toolbox {
+            commands.iter().any(|cmd| resolve_on_path(cmd, path_dirs).is_some_and(|p| *cmd != "zed" || check_zed(&p)))
+        } else {
+            false
+        };
+        if on_path || in_bundle_or_toolbox || zed_fallback {
+            found.push(id.to_owned());
+        }
+    }
+    found
+}
+
 pub fn effective_open_in_editors(remote_state: &RemoteOpenState, server_available: &[String], remote_capable: &[String]) -> Vec<String> {
     match remote_state {
         RemoteOpenState::LocalExec => server_available.to_vec(),
@@ -902,5 +1087,48 @@ mod tests {
             build_remote_open_url("zed", host, "/repo", false).as_deref(),
             Some("zed://ssh/alice@devbox/repo")
         );
+
+        // Non-SSH remote (e.g. Tailscale/mDNS advertised via ServerConfig.remoteOpenTargets).
+        let advertised = resolve_remote_open_state(&RemoteOpenInput {
+            active_environment_id: Some("env-remote"),
+            host_environment_id: Some("env-host"),
+            is_local_saved: false,
+            http_base: Some("https://box.tailnet.ts.net"),
+            ssh_target: None,
+            remote_open_targets: &[RemoteOpenHost { host: "box.tailnet.ts.net".into(), username: Some("dev".into()) }],
+        });
+        assert_eq!(advertised, RemoteOpenState::RemoteLinks(RemoteOpenHost { host: "box.tailnet.ts.net".into(), username: Some("dev".into()) }));
+    }
+
+    #[test]
+    fn probe_remote_capable_editors_finds_path_bundles_and_rejects_openzfs_zed() {
+        let dir = std::env::temp_dir().join(format!("t3-editor-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let apps = dir.join("Applications");
+        let toolbox = dir.join("toolbox");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(apps.join("Cursor.app/Contents/Resources/app/bin")).unwrap();
+        std::fs::create_dir_all(apps.join("IntelliJ IDEA 2025.1.app/Contents/MacOS")).unwrap();
+        std::fs::create_dir_all(&toolbox).unwrap();
+
+        let make_exec = |path: &Path| {
+            std::fs::write(path, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        make_exec(&bin.join("code"));
+        make_exec(&bin.join("zed"));
+        make_exec(&apps.join("Cursor.app/Contents/Resources/app/bin/cursor"));
+        make_exec(&apps.join("IntelliJ IDEA 2025.1.app/Contents/MacOS/idea"));
+        make_exec(&toolbox.join("rustrover1"));
+
+        // `check_zed` returns false to simulate OpenZFS `zed` on PATH when Zed.app is absent.
+        let found = probe_remote_capable_editors_in(&[bin], &[apps], Some(&toolbox), true, &|_| false);
+        assert_eq!(found, vec!["cursor", "vscode", "idea", "rustrover"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

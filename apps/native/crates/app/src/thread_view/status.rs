@@ -96,7 +96,6 @@ struct BannerLines {
 pub struct Banners {
     lines: BannerLines,
     dismissed_errors: HashSet<String>,
-    dismissed_providers: HashSet<String>,
     error_expanded: bool,
     refresh: t3_core::providers::StatusRefresh,
     can_refresh: bool,
@@ -104,19 +103,16 @@ pub struct Banners {
     target: Option<crate::composer::ProviderTarget>,
     environment: String,
     composer: Option<gpui::Subscription>,
-}
-
-impl Banners {
-    fn provider_dismissal_key(environment: &str, key: &str) -> String {
-        format!("{environment}\u{0}{key}")
-    }
-
-    pub(crate) fn dismiss_provider(&mut self, key: &str) {
-        self.dismissed_providers.insert(Self::provider_dismissal_key(&self.environment, key));
-    }
+    app_subscription: Option<gpui::Subscription>,
 }
 
 impl ThreadView {
+    pub(crate) fn dismiss_provider(&mut self, key: &str, cx: &mut Context<Self>) {
+        let environment = self.banners.environment.clone();
+        self.state.update(cx, |state, cx| state.dismiss_provider_banner(&environment, key, cx));
+        self.sync_banners(cx);
+    }
+
     pub(super) fn sync_status(&mut self, cx: &mut Context<Self>) {
         self.watch_banner_grants(cx);
         self.sync_banners(cx);
@@ -188,6 +184,14 @@ impl ThreadView {
     }
 
     fn sync_banners(&mut self, cx: &mut Context<Self>) {
+        if self.banners.app_subscription.is_none() {
+            let state = self.state.clone();
+            self.banners.app_subscription = Some(cx.subscribe(&state, |this, _, event, cx| {
+                if matches!(event, crate::app_state::AppEvent::BannerDismissed) {
+                    this.sync_banners(cx);
+                }
+            }));
+        }
         let state = self.state.read(cx);
         let was_pending = self.banners.refresh.pending();
         let environment = crate::composer::ProviderTarget::environment(state);
@@ -213,7 +217,7 @@ impl ThreadView {
                 .as_ref()
                 .and_then(|id| state.server_config.config.as_ref()?.provider(id))
                 .and_then(provider_banner)
-                .filter(|banner| !self.banners.dismissed_providers.contains(&Banners::provider_dismissal_key(&environment, &banner.key)));
+                .filter(|banner| !state.is_provider_banner_dismissed(&environment, &banner.key));
         }
         self.banners.refresh.set_target(state.connection_id(), self.thread_id.as_deref(), next.provider.as_ref().map(|banner| banner.instance_id.as_str()));
         if next == self.banners.lines {
@@ -780,8 +784,7 @@ impl ThreadView {
                 "dismiss-provider-status",
                 Icon::X,
                 cx.listener(move |view, _, _, cx| {
-                    view.banners.dismiss_provider(&key);
-                    view.sync_banners(cx);
+                    view.dismiss_provider(&key, cx);
                 }),
                 cx,
             );
@@ -1325,10 +1328,12 @@ mod selected_provider_tests {
         side_view.read_with(cx, |view,_| assert_eq!(view.banners.lines.provider.as_ref().unwrap().message,"B updated"));
         side_view.update(cx, |view,cx| {
             let key = view.banners.lines.provider.as_ref().unwrap().key.clone();
-            view.banners.dismiss_provider(&key);
-            view.sync_banners(cx);
+            view.dismiss_provider(&key, cx);
         });
         assert_eq!(shown(&side_view,cx),None);
+        cx.update_window(main.into(), |_,window,cx| composer.update(cx, |composer,cx| composer.pick_banner_test_model("claudeAgent",window,cx))).unwrap();
+        assert_eq!(shown(&view,cx),None,"session-wide dismissal shares across ThreadViews");
+        cx.update_window(main.into(), |_,window,cx| composer.update(cx, |composer,cx| composer.pick_banner_test_model("codex",window,cx))).unwrap();
         cx.update_window(side.into(), |_,window,cx| side_composer.update(cx, |composer,cx| composer.pick_banner_test_model("codex",window,cx))).unwrap();
         assert_eq!(shown(&side_view,cx).as_deref(),Some("codex"));
         cx.update_window(side.into(), |_,window,cx| side_composer.update(cx, |composer,cx| composer.pick_banner_test_model("claudeAgent",window,cx))).unwrap();
