@@ -3,6 +3,7 @@
 //! `ThreadDetailsPanel.tsx`, `ThreadServersPanel.tsx`, `ThreadAutomationsPanel.tsx`).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 
 use serde_json::{Value, json};
@@ -423,6 +424,203 @@ pub fn should_collapse_parent_crumb(available_width: f32, content_width: f32) ->
     available_width > 0. && content_width > available_width
 }
 
+/// Default remote-capable editor fallback on desktop clients (`REMOTE_FALLBACK_EDITORS`).
+pub const REMOTE_FALLBACK_EDITORS: &[&str] = &["vscode"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOpenHost {
+    pub host: String,
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteOpenState {
+    LocalExec,
+    RemoteLinks(RemoteOpenHost),
+    RemoteUnavailable,
+}
+
+pub struct RemoteOpenInput<'a> {
+    pub active_environment_id: Option<&'a str>,
+    pub host_environment_id: Option<&'a str>,
+    pub is_local_saved: bool,
+    pub http_base: Option<&'a str>,
+    /// `(alias, username)` from an SSH saved environment.
+    pub ssh_target: Option<(&'a str, Option<&'a str>)>,
+    pub remote_open_targets: &'a [RemoteOpenHost],
+}
+
+fn is_loopback_http(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else { return false };
+    let Some(host) = parsed.host_str() else { return false };
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare.to_ascii_lowercase().ends_with(".localhost")
+        || bare.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `resolveRemoteOpenState` (`apps/web/src/remoteOpen.ts`), including `pingdotgg/t3code#21661`
+/// where a background service sharing the host environment runs locally.
+pub fn resolve_remote_open_state(input: &RemoteOpenInput<'_>) -> RemoteOpenState {
+    if input.active_environment_id.is_none()
+        || input.host_environment_id.is_some_and(|host| input.active_environment_id == Some(host))
+        || input.is_local_saved
+        || input.http_base.is_some_and(is_loopback_http)
+    {
+        return RemoteOpenState::LocalExec;
+    }
+    if let Some((alias, explicit_user)) = input.ssh_target
+        && !alias.is_empty()
+    {
+        let (host, alias_user) = match alias.rfind('@') {
+            Some(at) => (&alias[at + 1..], Some(&alias[..at])),
+            None => (alias, None),
+        };
+        let username = explicit_user
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .or_else(|| alias_user.filter(|u| !u.is_empty()))
+            .map(str::to_owned);
+        return RemoteOpenState::RemoteLinks(RemoteOpenHost { host: host.to_owned(), username });
+    }
+    if let Some(advertised) = input.remote_open_targets.first() {
+        return RemoteOpenState::RemoteLinks(advertised.clone());
+    }
+    RemoteOpenState::RemoteUnavailable
+}
+
+/// `shouldShowOpenInPicker` (`OpenInPicker.logic.ts`, `pingdotgg/t3code#21661`).
+pub fn should_show_open_in_picker(
+    has_active_project: bool,
+    active_thread_environment_id: Option<&str>,
+    primary_environment_id: Option<&str>,
+    host_environment_id: Option<&str>,
+    remote_state: &RemoteOpenState,
+) -> bool {
+    if !has_active_project {
+        return false;
+    }
+    if let Some(active) = active_thread_environment_id
+        && (Some(active) == primary_environment_id || Some(active) == host_environment_id)
+    {
+        return true;
+    }
+    !matches!(remote_state, RemoteOpenState::LocalExec)
+}
+
+/// Returns `(remote_scheme, jetbrains_product_code)` for editors supporting remote SSH URLs.
+pub fn remote_scheme_for_editor(id: &str) -> Option<(&'static str, Option<&'static str>)> {
+    match id {
+        "cursor" => Some(("cursor", None)),
+        "vscode" => Some(("vscode", None)),
+        "vscode-insiders" => Some(("vscode-insiders", None)),
+        "vscodium" => Some(("vscodium", None)),
+        "zed" => Some(("zed", None)),
+        "idea" => Some(("jetbrains", Some("IU"))),
+        "aqua" => Some(("jetbrains", Some("QA"))),
+        "clion" => Some(("jetbrains", Some("CL"))),
+        "datagrip" => Some(("jetbrains", Some("DB"))),
+        "dataspell" => Some(("jetbrains", Some("DS"))),
+        "goland" => Some(("jetbrains", Some("GO"))),
+        "phpstorm" => Some(("jetbrains", Some("PS"))),
+        "pycharm" => Some(("jetbrains", Some("PY"))),
+        "rider" => Some(("jetbrains", Some("RD"))),
+        "rubymine" => Some(("jetbrains", Some("RM"))),
+        "rustrover" => Some(("jetbrains", Some("RR"))),
+        "webstorm" => Some(("jetbrains", Some("WS"))),
+        _ => None,
+    }
+}
+
+pub fn effective_open_in_editors(remote_state: &RemoteOpenState, server_available: &[String], remote_capable: &[String]) -> Vec<String> {
+    match remote_state {
+        RemoteOpenState::LocalExec => server_available.to_vec(),
+        RemoteOpenState::RemoteLinks(_) => remote_capable.iter().filter(|id| remote_scheme_for_editor(id).is_some()).cloned().collect(),
+        RemoteOpenState::RemoteUnavailable => Vec::new(),
+    }
+}
+
+/// Disabled picker reason (`OpenInPicker.tsx`), shown when remote SSH links are missing or no
+/// computer editors are available on a remote connection.
+pub fn open_in_unavailable_reason(remote_state: &RemoteOpenState, effective_editor_count: usize, environment_label: &str) -> Option<String> {
+    let label = if environment_label.trim().is_empty() { "this machine" } else { environment_label.trim() };
+    match remote_state {
+        RemoteOpenState::RemoteUnavailable => Some(format!("No SSH route to {label}")),
+        RemoteOpenState::RemoteLinks(_) if effective_editor_count == 0 => Some(format!("Open from a computer to edit on {label}")),
+        _ => None,
+    }
+}
+
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        let keep = matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+        if keep {
+            out.push(char::from(*byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+fn encode_slash_segments(path: &str) -> String {
+    path.split('/').map(encode_uri_component).collect::<Vec<_>>().join("/")
+}
+
+/// `buildRemoteOpenUrl` (`packages/contracts/src/editor.ts`).
+pub fn build_remote_open_url(editor: &str, host: &RemoteOpenHost, absolute_path: &str, is_file: bool) -> Option<String> {
+    let (scheme, jetbrains_code) = remote_scheme_for_editor(editor)?;
+    let posix_path = absolute_path.replace('\\', "/");
+    if let Some(code) = jetbrains_code {
+        let mut ser = url::form_urlencoded::Serializer::new(String::new());
+        ser.append_pair("h", &host.host)
+            .append_pair("launchIde", "true")
+            .append_pair("ideHint", code)
+            .append_pair("projectHint", &posix_path);
+        if let Some(user) = &host.username {
+            ser.append_pair("u", user);
+        }
+        return Some(format!("{scheme}://gateway/ssh/environment?{}", ser.finish()));
+    }
+    let rooted_path = if posix_path.starts_with('/') { posix_path } else { format!("/{posix_path}") };
+    if editor == "zed" {
+        let is_win_drive = absolute_path.as_bytes().get(1) == Some(&b':')
+            && absolute_path.as_bytes().first().is_some_and(|b| matches!(b, b'c' | b'C'))
+            && absolute_path.as_bytes().get(2).is_some_and(|b| matches!(b, b'\\' | b'/'));
+        let zed_path = if is_win_drive { &rooted_path[3..] } else { &rooted_path };
+        let encoded_zed_path = encode_slash_segments(zed_path);
+        let encoded_host = encode_uri_component(&host.host);
+        let zed_dest = match &host.username {
+            Some(user) => format!("{}@{encoded_host}", encode_uri_component(user)),
+            None => encoded_host,
+        };
+        return Some(format!("{scheme}://ssh/{zed_dest}{encoded_zed_path}"));
+    }
+    let encoded_path = encode_slash_segments(&rooted_path);
+    let plain_dest = match &host.username {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host.clone(),
+    };
+    let destination = if plain_dest.contains('+') {
+        let mut json_obj = serde_json::Map::new();
+        json_obj.insert("hostName".into(), Value::String(host.host.clone()));
+        if let Some(user) = &host.username {
+            json_obj.insert("user".into(), Value::String(user.clone()));
+        }
+        let encoded_json = Value::Object(json_obj).to_string();
+        let mut hex = String::with_capacity(encoded_json.len() * 2);
+        for byte in encoded_json.as_bytes() {
+            let _ = write!(hex, "{byte:02x}");
+        }
+        hex
+    } else {
+        plain_dest
+    };
+    let suffix = if is_file { ":1:1" } else { "" };
+    Some(format!("{scheme}://vscode-remote/ssh-remote+{}{encoded_path}{suffix}", encode_uri_component(&destination)))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -647,5 +845,62 @@ mod tests {
         );
         assert!(should_collapse_parent_crumb(300., 360.));
         assert!(!should_collapse_parent_crumb(400., 360.));
+    }
+
+    #[test]
+    fn remote_open_checks_host_environment_id_and_unavailable_reasons() {
+        // Background service sharing desktop's T3 home (`pingdotgg/t3code#21661`).
+        let bg_service = resolve_remote_open_state(&RemoteOpenInput {
+            active_environment_id: Some("env-host"),
+            host_environment_id: Some("env-host"),
+            is_local_saved: false,
+            http_base: Some("https://box.tailnet.ts.net"),
+            ssh_target: None,
+            remote_open_targets: &[],
+        });
+        assert_eq!(bg_service, RemoteOpenState::LocalExec);
+        assert!(should_show_open_in_picker(true, Some("env-host"), Some("env-primary"), Some("env-host"), &bg_service));
+        assert!(!should_show_open_in_picker(false, Some("env-host"), Some("env-primary"), Some("env-host"), &bg_service));
+
+        // Remote SSH connection resolves to RemoteLinks and falls back when no desktop editors exist.
+        let ssh_remote = resolve_remote_open_state(&RemoteOpenInput {
+            active_environment_id: Some("env-remote"),
+            host_environment_id: Some("env-host"),
+            is_local_saved: false,
+            http_base: Some("https://box.tailnet.ts.net"),
+            ssh_target: Some(("alice@devbox", None)),
+            remote_open_targets: &[],
+        });
+        let RemoteOpenState::RemoteLinks(host) = &ssh_remote else {
+            panic!("expected RemoteLinks, got {ssh_remote:?}");
+        };
+        assert_eq!(host, &RemoteOpenHost { host: "devbox".into(), username: Some("alice".into()) });
+        assert_eq!(
+            open_in_unavailable_reason(&ssh_remote, 0, "Test host").as_deref(),
+            Some("Open from a computer to edit on Test host")
+        );
+        assert_eq!(open_in_unavailable_reason(&ssh_remote, 1, "Test host"), None);
+
+        let unavailable = resolve_remote_open_state(&RemoteOpenInput {
+            active_environment_id: Some("env-remote"),
+            host_environment_id: Some("env-host"),
+            is_local_saved: false,
+            http_base: Some("https://box.tailnet.ts.net"),
+            ssh_target: None,
+            remote_open_targets: &[],
+        });
+        assert_eq!(unavailable, RemoteOpenState::RemoteUnavailable);
+        assert_eq!(
+            open_in_unavailable_reason(&unavailable, 0, "Test host").as_deref(),
+            Some("No SSH route to Test host")
+        );
+        assert_eq!(
+            build_remote_open_url("vscode", host, "/repo/file.rs", true).as_deref(),
+            Some("vscode://vscode-remote/ssh-remote+alice%40devbox/repo/file.rs:1:1")
+        );
+        assert_eq!(
+            build_remote_open_url("zed", host, "/repo", false).as_deref(),
+            Some("zed://ssh/alice@devbox/repo")
+        );
     }
 }

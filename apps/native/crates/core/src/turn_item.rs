@@ -6,11 +6,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeItemRef {
     #[serde(default)]
     pub native_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +145,7 @@ pub enum TurnItemKind {
     UserMessage {
         message_id: String,
         text: String,
+        #[serde(default)]
         input_intent: String,
         #[serde(default)]
         attachments: Vec<Value>,

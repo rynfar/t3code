@@ -245,7 +245,12 @@ impl RenderOnce for MenuTrigger {
         let fill = hover_fill(cx);
         let enabled = !self.disabled;
         let label = self.label;
-        focusable(self.base, self.id, enabled, window, cx)
+        #[cfg(test)]
+        let debug_name = match &self.id {
+            ElementId::Name(name) => Some(name.clone()),
+            _ => None,
+        };
+        let base = focusable(self.base, self.id, enabled, window, cx)
             .flex()
             .flex_none()
             .items_center()
@@ -257,7 +262,10 @@ impl RenderOnce for MenuTrigger {
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
             .when(enabled, |this| this.cursor_pointer().hover(move |style| style.bg(fill)))
             .child(Icon::ChevronDown.sized(px(16.)).text_color(hsla(p.muted_foreground)))
-            .tooltip(move |window, cx| tooltip_view(label.clone(), window, cx))
+            .tooltip(move |window, cx| tooltip_view(label.clone(), window, cx));
+        #[cfg(test)]
+        let base = base.when_some(debug_name, |this, name| this.debug_selector(move || name.to_string()));
+        base
     }
 }
 

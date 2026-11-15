@@ -153,15 +153,25 @@ pub struct VisitTracker {
     thread_id: String,
     open_pending: bool,
     last_dispatched: Option<Ms>,
+    last_accepted: Option<Ms>,
+    retry_pending: bool,
+    last_dispatch_generation: u64,
     last_dispatch_at: Ms,
 }
 
 impl VisitTracker {
     pub fn new(thread_id: &str, open_pending: bool) -> VisitTracker {
+        Self::new_at(thread_id, open_pending, 0)
+    }
+
+    pub fn new_at(thread_id: &str, open_pending: bool, generation: u64) -> VisitTracker {
         VisitTracker {
             thread_id: thread_id.to_owned(),
             open_pending,
             last_dispatched: None,
+            last_accepted: None,
+            retry_pending: false,
+            last_dispatch_generation: generation,
             last_dispatch_at: Ms::MIN / 2,
         }
     }
@@ -170,16 +180,67 @@ impl VisitTracker {
         &self.thread_id
     }
 
+    /// Records a server-accepted visit watermark (`accept` in `threadVisits.ts`).
+    pub fn accept(&mut self, visited_at: Ms) {
+        if self.last_accepted.is_none_or(|accepted| visited_at > accepted) {
+            self.last_accepted = Some(visited_at);
+        }
+    }
+
+    /// Marks the latest dispatched visit as failed so the next session generation retries it,
+    /// unless a newer watermark was already accepted or a newer visit superseded it. Returns
+    /// true when a retry is armed.
+    pub fn fail(&mut self, visited_at: Ms, opened: bool) -> bool {
+        if self.last_accepted.is_some_and(|accepted| accepted >= visited_at) {
+            return false;
+        }
+        if self.last_dispatched != Some(visited_at) {
+            return false;
+        }
+        if opened {
+            self.open_pending = true;
+        }
+        self.retry_pending = true;
+        true
+    }
+
     pub fn on_shell(&mut self, shell: VisitedShell, now: Ms) -> VisitDecision {
+        self.on_shell_at(shell, now, self.last_dispatch_generation)
+    }
+
+    pub fn on_shell_at(&mut self, shell: VisitedShell, now: Ms, generation: u64) -> VisitDecision {
         let wake_is_latest = shell.woke_at.is_some_and(|woke| woke > shell.updated_at);
         let visited_at = if wake_is_latest {
             shell.woke_at.unwrap_or(shell.updated_at)
         } else {
             shell.updated_at
         };
+        if let Some(visited) = shell.last_visited_at {
+            self.accept(visited);
+        }
+        if self.retry_pending
+            && self
+                .last_accepted
+                .zip(self.last_dispatched)
+                .is_some_and(|(accepted, dispatched)| accepted >= dispatched)
+        {
+            self.retry_pending = false;
+            self.open_pending = false;
+        }
+        // A rejected visit waits for a new session, even if streaming changes the shell.
+        if self.retry_pending && generation == self.last_dispatch_generation {
+            return VisitDecision::Skip;
+        }
+        let elapsed = now - self.last_dispatch_at;
+        if self.retry_pending && elapsed < VISIT_DISPATCH_THROTTLE_MS {
+            return VisitDecision::At {
+                due: self.last_dispatch_at + VISIT_DISPATCH_THROTTLE_MS,
+                visited_at,
+            };
+        }
         if self.open_pending {
             self.open_pending = false;
-            return self.dispatched(visited_at, now, true);
+            return self.dispatched(visited_at, now, generation, true);
         }
         if shell
             .last_visited_at
@@ -190,7 +251,7 @@ impl VisitTracker {
             }
             return VisitDecision::Skip;
         }
-        if self.last_dispatched.is_some_and(|sent| sent >= visited_at) {
+        if !self.retry_pending && self.last_dispatched.is_some_and(|sent| sent >= visited_at) {
             return VisitDecision::Skip;
         }
         let unseen_completion = shell.completed_at.is_some_and(|completed| {
@@ -198,9 +259,8 @@ impl VisitTracker {
                 .last_visited_at
                 .is_none_or(|visited| completed > visited)
         });
-        let elapsed = now - self.last_dispatch_at;
         if unseen_completion || wake_is_latest || elapsed >= VISIT_DISPATCH_THROTTLE_MS {
-            return self.dispatched(visited_at, now, false);
+            return self.dispatched(visited_at, now, generation, false);
         }
         VisitDecision::At {
             due: self.last_dispatch_at + VISIT_DISPATCH_THROTTLE_MS,
@@ -210,20 +270,36 @@ impl VisitTracker {
 
     /// Call when a scheduled `At` decision fires.
     pub fn fire(&mut self, visited_at: Ms, now: Ms) -> VisitDecision {
-        if self.last_dispatched.is_some_and(|sent| sent >= visited_at) {
+        self.fire_at(visited_at, now, self.last_dispatch_generation)
+    }
+
+    pub fn fire_at(&mut self, visited_at: Ms, now: Ms, generation: u64) -> VisitDecision {
+        if self.retry_pending && generation == self.last_dispatch_generation {
             return VisitDecision::Skip;
         }
-        self.dispatched(visited_at, now, false)
+        if !self.retry_pending && self.last_dispatched.is_some_and(|sent| sent >= visited_at) {
+            return VisitDecision::Skip;
+        }
+        let opened = std::mem::take(&mut self.open_pending);
+        self.dispatched(visited_at, now, generation, opened)
     }
 
     pub fn mark_dispatched(&mut self, visited_at: Ms, now: Ms) {
-        self.last_dispatched = Some(self.last_dispatched.map_or(visited_at, |old| old.max(visited_at)));
-        self.last_dispatch_at = now;
+        self.mark_dispatched_at(visited_at, now, self.last_dispatch_generation);
     }
 
-    fn dispatched(&mut self, visited_at: Ms, now: Ms, opened: bool) -> VisitDecision {
+    pub fn mark_dispatched_at(&mut self, visited_at: Ms, now: Ms, generation: u64) {
+        self.retry_pending = false;
+        self.last_dispatched = Some(self.last_dispatched.map_or(visited_at, |old| old.max(visited_at)));
+        self.last_dispatch_at = now;
+        self.last_dispatch_generation = generation;
+    }
+
+    fn dispatched(&mut self, visited_at: Ms, now: Ms, generation: u64, opened: bool) -> VisitDecision {
+        self.retry_pending = false;
         self.last_dispatched = Some(visited_at);
         self.last_dispatch_at = now;
+        self.last_dispatch_generation = generation;
         VisitDecision::Now { visited_at, opened }
     }
 }
@@ -470,6 +546,41 @@ mod tests {
         }
         assert!(history.environments.len() <= OPEN_HISTORY_LIMIT);
         assert!(history.opens.len() <= OPEN_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn failed_visit_waits_for_next_session_generation_and_preserves_open() {
+        let mut tracker = VisitTracker::new_at("t", true, 1);
+        assert_eq!(
+            tracker.on_shell_at(shell(100, None), 1_000, 1),
+            VisitDecision::Now { visited_at: 100, opened: true }
+        );
+        assert!(tracker.fail(100, true));
+        // Same session generation skips even if the thread streams newer updatedAt values.
+        assert_eq!(tracker.on_shell_at(shell(150, None), 2_000, 1), VisitDecision::Skip);
+        // Reconnect before throttle expires schedules At.
+        assert_eq!(
+            tracker.on_shell_at(shell(150, None), 2_000, 2),
+            VisitDecision::At { due: 11_000, visited_at: 150 }
+        );
+        assert_eq!(
+            tracker.fire_at(150, 11_000, 2),
+            VisitDecision::Now { visited_at: 150, opened: true }
+        );
+        tracker.accept(150);
+        // A late failure on an older watermark is ignored once accepted.
+        assert!(!tracker.fail(150, true));
+        assert_eq!(tracker.on_shell_at(shell(150, Some(150)), 12_000, 2), VisitDecision::Skip);
+
+        // If shell catches up via last_visited_at while waiting on reconnect, retry clears.
+        let mut caught_up = VisitTracker::new_at("t", false, 1);
+        assert_eq!(
+            caught_up.on_shell_at(shell(200, Some(100)), 20_000, 1),
+            VisitDecision::Now { visited_at: 200, opened: false }
+        );
+        assert!(caught_up.fail(200, false));
+        assert_eq!(caught_up.on_shell_at(shell(200, Some(200)), 21_000, 1), VisitDecision::Skip);
+        assert_eq!(caught_up.on_shell_at(shell(200, Some(200)), 35_000, 2), VisitDecision::Skip);
     }
 }
 

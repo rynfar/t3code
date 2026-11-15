@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use super::status::{UsageLimitNoticeRows, derive_usage_limit_notice_rows};
 use super::ChatMessage;
 use crate::thread::{Run, ThreadProjection};
 
@@ -32,6 +33,7 @@ pub struct ThreadActivity {
     pub runless_work_active: bool,
     pub active_turn_started_at: Option<String>,
     pub pending_approval_ids: HashSet<String>,
+    pub usage_limit_notice: Option<UsageLimitNoticeRows>,
 }
 
 const ACTIVITY: [&str; 4] = ["preparing", "starting", "running", "waiting"];
@@ -126,6 +128,7 @@ pub fn derive_activity(projection: &ThreadProjection) -> ThreadActivity {
         runless_work_active: runless.is_some(),
         active_turn_started_at,
         pending_approval_ids,
+        usage_limit_notice: derive_usage_limit_notice_rows(projection),
     }
 }
 

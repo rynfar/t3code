@@ -630,6 +630,9 @@ impl AppState {
 
     fn sync_shell_views(&mut self, shell_changed: bool, sidebar_changed: bool, resynchronized: bool, cx: &mut Context<Self>) {
         if sidebar_changed || resynchronized { self.observe_background_announcements(cx); }
+        if resynchronized {
+            self.sync_visit_session_generation(true);
+        }
         if shell_changed {
             self.sync_omitted_rows(cx);
             self.sync_side_threads(cx);
@@ -640,6 +643,8 @@ impl AppState {
             }
             cx.emit(AppEvent::Shell);
             self.restore_shell_selection(cx);
+        } else if resynchronized {
+            self.track_visit(cx);
         }
     }
 
@@ -694,12 +699,16 @@ impl AppState {
     pub(crate) fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
         if self.phase != phase {
             self.phase = phase;
+            self.sync_visit_session_generation(false);
             self.sync_notification_state(cx);
             cx.emit(AppEvent::Phase);
             // Connection state places threads on the Working shelf.
             if self.shell.snapshot.is_some() {
                 self.rebuild_sidebar(cx);
                 cx.emit(AppEvent::Shell);
+            }
+            if matches!(self.phase, Phase::Online(ConnectionStatus::Connected)) {
+                self.track_visit(cx);
             }
         }
     }
@@ -1174,6 +1183,36 @@ impl AppState {
             StopTarget::Run(run_id) => Some(commands::interrupt_run(&uuid_v4(), thread_id, &run_id)),
             StopTarget::Nothing => None,
         }
+    }
+
+    /// Environment ID of the local host daemon when discovered or previously saved.
+    pub fn host_environment_id(&self) -> Option<&str> {
+        self.connect
+            .local_server
+            .as_ref()
+            .and_then(|server| server.environment_id())
+            .or_else(|| self.environments.environments.iter().find(|env| env.local).and_then(|env| env.environment_id.as_deref()))
+    }
+
+    /// Resolves whether the active environment opens editors via RPC (`LocalExec`), remote SSH
+    /// links (`RemoteLinks`), or has no remote route (`RemoteUnavailable`).
+    pub fn active_remote_open_state(&self) -> t3_core::thread_details::RemoteOpenState {
+        let active_env = self.active_environment();
+        let active_environment_id = active_env
+            .and_then(|env| env.environment_id.as_deref())
+            .or_else(|| self.server_config.config.as_ref().map(|c| c.environment.environment_id.as_str()).filter(|id| !id.is_empty()));
+        let ssh_target = active_env.and_then(|env| env.ssh.as_ref()).map(|ssh| {
+            let alias = if ssh.alias.is_empty() { ssh.hostname.as_str() } else { ssh.alias.as_str() };
+            (alias, ssh.username.as_deref())
+        });
+        t3_core::thread_details::resolve_remote_open_state(&t3_core::thread_details::RemoteOpenInput {
+            active_environment_id,
+            host_environment_id: self.host_environment_id(),
+            is_local_saved: active_env.is_some_and(|env| env.local),
+            http_base: active_env.map(|env| env.http_base.as_str()),
+            ssh_target,
+            remote_open_targets: &[],
+        })
     }
 
     /// One unary RPC, run and decoded on the network runtime so large replies never parse on the
