@@ -450,10 +450,6 @@ fn open_file_link_for_source(
 ) {
     let modifiers = event.modifiers();
     let click = LinkClickAction { alt: modifiers.alt, platform: modifiers.platform };
-    if cfg!(target_os = "macos") && is_macos_app_bundle_path(&file.full_path) {
-        reveal_or_open_in_editor(ctx, file, None, true, cx);
-        return;
-    }
     if !click.alt
         && let Some(lookup_rel) = file.relative_path.as_deref().or_else(|| {
             (!file.full_path.starts_with('/') && !file.full_path.contains(":\\")).then_some(file.full_path.as_str())
@@ -470,6 +466,47 @@ fn open_file_link_for_source(
     open_resolved_file_now(file, None, &click, ctx, cx);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosAppBundlePolicy {
+    OpenViaFileManager,
+    Blocked,
+    NotAppBundle,
+}
+
+fn is_client_host(app: &AppState) -> bool {
+    app.active_environment().is_some_and(|env| {
+        env.ssh.is_none()
+            && (env.local
+                || app.local_saved_environment().is_some_and(|local| local.id == env.id)
+                || t3_core::settings::providers::chatgpt::local_server(&env.http_base, false))
+    })
+}
+
+fn can_operate_host(app: &AppState) -> bool {
+    app.client_handle().is_some_and(|client| {
+        client
+            .session_state()
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+    })
+}
+
+fn macos_app_bundle_policy(app: &AppState, full_path: &str) -> MacosAppBundlePolicy {
+    let Some(config) = app.server_config.config.as_ref() else {
+        return MacosAppBundlePolicy::NotAppBundle;
+    };
+    if !config.environment.platform.as_ref().is_some_and(|p| p.os == "darwin") || !is_macos_app_bundle_path(full_path) {
+        return MacosAppBundlePolicy::NotAppBundle;
+    }
+    let has_file_manager = config.available_editors.iter().any(|editor| editor == "file-manager");
+    if is_client_host(app) && can_operate_host(app) && has_file_manager {
+        MacosAppBundlePolicy::OpenViaFileManager
+    } else {
+        MacosAppBundlePolicy::Blocked
+    }
+}
+
 fn open_resolved_file_now(
     file: &ResolvedFileLink,
     resolved_root: Option<&str>,
@@ -478,9 +515,22 @@ fn open_resolved_file_now(
     cx: &mut App,
 ) {
     let state = &ctx.state;
-    if cfg!(target_os = "macos") && is_macos_app_bundle_path(&file.full_path) {
-        reveal_or_open_in_editor(ctx, file, resolved_root, true, cx);
-        return;
+    if !click.alt && !click.platform {
+        match macos_app_bundle_policy(state.read(cx), &file.full_path) {
+            MacosAppBundlePolicy::OpenViaFileManager => {
+                let app = state.read(cx);
+                let payload = open_in_editor_request_with_root(&file.full_path, "file-manager", None);
+                let runtime = app.runtime().clone();
+                if let Some(client) = app.client_handle() {
+                    runtime.spawn(async move {
+                        let _ = client.request(OPEN_IN_EDITOR, payload).await;
+                    });
+                }
+                return;
+            }
+            MacosAppBundlePolicy::Blocked => return,
+            MacosAppBundlePolicy::NotAppBundle => {}
+        }
     }
     if click.alt {
         reveal_or_open_in_editor(ctx, file, resolved_root, true, cx);
@@ -521,21 +571,24 @@ fn open_resolved_file_now(
 fn candidate_project_and_agent_roots(
     app: &AppState,
     thread_view: Option<&gpui::WeakEntity<crate::thread_view::ThreadView>>,
+    target_thread_id: Option<&str>,
     source_key: Option<&str>,
     active_cwd: &str,
     cx: &App,
 ) -> (Vec<String>, Vec<String>) {
+    let thread_project_id = target_thread_id
+        .and_then(|id| app.thread_shell(id))
+        .map(|thread| thread.project_id.as_str())
+        .or(app.draft_project.as_deref());
     let mut other_roots = Vec::new();
     if let Some(snapshot) = app.shell.snapshot.as_ref() {
         for project in &snapshot.projects {
             if !project.workspace_root.is_empty()
+                && Some(project.id.as_str()) != thread_project_id
                 && project.workspace_root != active_cwd
                 && !other_roots.contains(&project.workspace_root)
             {
                 other_roots.push(project.workspace_root.clone());
-                if other_roots.len() >= AGENT_DIRECTORY_SEARCH_LIMIT {
-                    break;
-                }
             }
         }
     }
@@ -551,6 +604,17 @@ fn candidate_project_and_agent_roots(
         })
         .unwrap_or_default();
     (other_roots, agent_roots)
+}
+
+fn root_contains_path(root: &str, full_path: &str) -> bool {
+    let trimmed = root.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return full_path.starts_with('/');
+    }
+    let Some(rest) = full_path.strip_prefix(trimmed) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(['/', '\\'])
 }
 
 async fn search_workspace_candidates(
@@ -617,7 +681,8 @@ fn resolve_and_open_workspace_file_link(
     };
     let (other_roots, agent_roots) = {
         let app = ctx.state.read(cx);
-        candidate_project_and_agent_roots(app, ctx.thread_view.as_ref(), source_key.as_deref(), &cwd, cx)
+        let target_thread_id = resolve_action_target(&ctx, app).0;
+        candidate_project_and_agent_roots(app, ctx.thread_view.as_ref(), target_thread_id.as_deref(), source_key.as_deref(), &cwd, cx)
     };
     let runtime = ctx.state.read(cx).runtime().clone();
 
@@ -667,7 +732,7 @@ fn resolve_and_open_workspace_file_link(
                         if let Some(matched_full) = pick_project_link_match(&lookup_rel, borrowed) {
                             let matched_root = other_roots
                                 .iter()
-                                .find(|root| matched_full.starts_with(root.as_str()))
+                                .find(|root| root_contains_path(root, &matched_full))
                                 .cloned();
                             return Some((matched_full, matched_root));
                         }
@@ -1109,5 +1174,171 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn candidate_project_roots_keeps_all_other_projects_and_excludes_thread_project(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        state.update(cx, |app, _| {
+            let projects = [
+                ("p-thread", "/tmp/worktrees/main"),
+                ("p-same-proj", "/tmp/worktrees/other-in-same-project"),
+                ("p-1", "/tmp/other-1"),
+                ("p-2", "/tmp/other-2"),
+                ("p-3", "/tmp/other-3"),
+                ("p-4", "/tmp/other-4"),
+                ("p-5", "/tmp/other-5"),
+                ("p-dup", "/tmp/other-5"),
+            ]
+            .into_iter()
+            .map(|(id, path)| {
+                serde_json::from_value(serde_json::json!({
+                    "id": if id == "p-same-proj" { "p-thread" } else { id },
+                    "title": id,
+                    "workspaceRoot": path,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-01T00:00:00Z"
+                }))
+                .unwrap()
+            })
+            .collect();
+            let threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t-1",
+                "projectId": "p-thread",
+                "title": "t-1",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "replay",
+                "modelSelection": {"instanceId": "replay", "model": "replay"},
+                "runtimeMode": "auto",
+                "interactionMode": "default",
+                "worktreePath": "/tmp/worktrees/main",
+                "lineage": {"rootThreadId": "t-1"},
+                "status": "idle",
+                "hasActionableProposedPlan": false,
+                "itemCount": 0,
+                "visibleItemCount": 0
+            }))
+            .unwrap()];
+            app.shell.snapshot = Some(ShellSnapshot {
+                projects,
+                threads,
+                ..Default::default()
+            });
+        });
+
+        cx.update(|cx| {
+            let app = state.read(cx);
+            let (other_roots, _) = candidate_project_and_agent_roots(app, None, Some("t-1"), None, "/tmp/worktrees/main", cx);
+            assert_eq!(
+                other_roots,
+                vec![
+                    "/tmp/other-1".to_owned(),
+                    "/tmp/other-2".to_owned(),
+                    "/tmp/other-3".to_owned(),
+                    "/tmp/other-4".to_owned(),
+                    "/tmp/other-5".to_owned(),
+                ]
+            );
+            assert!(root_contains_path("/tmp/repo", "/tmp/repo/src/lib.rs"));
+            assert!(root_contains_path("/tmp/repo/", "/tmp/repo/src/lib.rs"));
+            assert!(!root_contains_path("/tmp/repo", "/tmp/repo-other/src/lib.rs"));
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn macos_app_bundle_policy_requires_darwin_local_client_host_operate_and_file_manager(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+
+        let (op_client, _op_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let (ro_client, _ro_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+
+        let darwin_cfg = |editors: Value, os: &str| -> t3_core::server_config::ServerConfig {
+            serde_json::from_value(serde_json::json!({
+                "environment": {
+                    "environmentId": "env-1",
+                    "label": "Mac",
+                    "platform": { "machine": "arm64", "os": os }
+                },
+                "availableEditors": editors
+            }))
+            .unwrap()
+        };
+        let saved_env = |http_base: &str, local: bool, ssh: bool| t3_client::store::SavedEnvironment {
+            id: "saved-1".into(),
+            environment_id: Some("env-1".into()),
+            label: "Mac".into(),
+            disabled: false,
+            http_base: http_base.into(),
+            access_token: Some("tok".into()),
+            server_version: None,
+            local,
+            ssh: ssh.then(|| serde_json::from_value(serde_json::json!({
+                "alias": "remote",
+                "hostname": "remote.example"
+            })).unwrap()),
+        };
+
+        state.update(cx, |app, cx| {
+            app.environments.active = Some("saved-1".into());
+            app.environments.environments = vec![saved_env("http://127.0.0.1:3773", true, false)];
+            let mut cfg_state = app.server_config.clone();
+            cfg_state.config = Some(darwin_cfg(serde_json::json!(["file-manager", "cursor"]), "darwin"));
+            app.install_active_environment(op_client.clone(), app.shell.clone(), cfg_state, t3_client::supervisor::ConnectionStatus::Connected, cx);
+            assert_eq!(macos_app_bundle_policy(app, "/Applications/Calculator.app"), MacosAppBundlePolicy::OpenViaFileManager);
+            assert_eq!(macos_app_bundle_policy(app, "/tmp/README.md"), MacosAppBundlePolicy::NotAppBundle);
+
+            // Missing file-manager -> Blocked
+            app.server_config.config = Some(darwin_cfg(serde_json::json!(["cursor"]), "darwin"));
+            assert_eq!(macos_app_bundle_policy(app, "/Applications/Calculator.app"), MacosAppBundlePolicy::Blocked);
+
+            // Remote host -> Blocked
+            app.server_config.config = Some(darwin_cfg(serde_json::json!(["file-manager"]), "darwin"));
+            app.environments.environments = vec![saved_env("https://remote.example", false, false)];
+            assert_eq!(macos_app_bundle_policy(app, "/Applications/Calculator.app"), MacosAppBundlePolicy::Blocked);
+
+            // SSH tunnel -> Blocked even on loopback http_base
+            app.environments.environments = vec![saved_env("http://127.0.0.1:3999", false, true)];
+            assert_eq!(macos_app_bundle_policy(app, "/Applications/Calculator.app"), MacosAppBundlePolicy::Blocked);
+
+            // Non-darwin server -> NotAppBundle
+            app.environments.environments = vec![saved_env("http://127.0.0.1:3773", true, false)];
+            app.server_config.config = Some(darwin_cfg(serde_json::json!(["file-manager"]), "linux"));
+            assert_eq!(macos_app_bundle_policy(app, "/Applications/Calculator.app"), MacosAppBundlePolicy::NotAppBundle);
+
+            // Missing orchestration:operate -> Blocked
+            app.server_config.config = Some(darwin_cfg(serde_json::json!(["file-manager"]), "darwin"));
+            app.install_active_environment(ro_client.clone(), app.shell.clone(), app.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            assert_eq!(macos_app_bundle_policy(app, "/Applications/Calculator.app"), MacosAppBundlePolicy::Blocked);
+        });
     }
 }
