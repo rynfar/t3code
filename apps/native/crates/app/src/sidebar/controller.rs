@@ -1689,6 +1689,16 @@ impl AppState {
 
     /// Adds folders dropped on the sidebar as projects (`SidebarFolderDrop`).
     /// Non-directory files show guidance unless a thread row already claimed them.
+    fn local_folder_drop_environment_id(&self) -> Option<String> {
+        self.local_saved_environment()
+            .map(|environment| environment.id.clone())
+            .or_else(|| {
+                let mut local = self.environments.environments.iter().filter(|environment| environment.local);
+                let first = local.next()?;
+                local.next().is_none().then(|| first.id.clone())
+            })
+    }
+
     pub(crate) fn drop_folders_on_sidebar(&mut self, paths: &[std::path::PathBuf], claimed_by_row: bool, cx: &mut Context<Self>) {
         let mut folders = Vec::new();
         let mut has_files = false;
@@ -1700,16 +1710,162 @@ impl AppState {
             }
         }
         if !folders.is_empty() {
-            if !connected(&self.phase) {
-                self.show_toast(
+            let local_id = self.local_folder_drop_environment_id();
+            let not_connected = |state: &mut Self, cx: &mut Context<Self>| {
+                state.show_toast(
                     Toast::new(ToastKind::Error, "This computer's server is not connected yet")
                         .description("Try again when it connects."),
                     cx,
                 );
-            } else {
-                for folder in folders {
-                    self.add_project(&folder.to_string_lossy(), cx);
+            };
+            match local_id {
+                Some(local_id) if self.environments.active.as_deref() == Some(&local_id) => {
+                    if !connected(&self.phase) || self.server_config.config.is_none() || self.shell.snapshot.is_none() {
+                        not_connected(self, cx);
+                    } else {
+                        for folder in folders {
+                            let path = t3_core::projects::add_target(&folder.to_string_lossy());
+                            if path.is_empty() {
+                                continue;
+                            }
+                            let existing = self.shell.snapshot.as_ref().and_then(|snapshot| {
+                                t3_core::projects::find_project_by_path(&snapshot.projects, &path, |project| &project.workspace_root)
+                                    .map(|project| (project.id.clone(), project.archived_at.is_some()))
+                            });
+                            if let Some((project_id, archived)) = existing {
+                                if archived {
+                                    let payload = t3_core::settings::projects::ProjectUpdate {
+                                        archived: Some(false),
+                                        ..Default::default()
+                                    }
+                                    .payload(&uuid(), &project_id);
+                                    let request = self.rpc(t3_core::projects::PROJECTS_MUTATE, payload);
+                                    cx.spawn(async move |this, cx| {
+                                        if let Err(error) = request.await {
+                                            let _ = this.update(cx, |state, cx| {
+                                                state.show_toast(
+                                                    Toast::new(ToastKind::Error, "Failed to unarchive project")
+                                                        .description(error.to_string()),
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    })
+                                    .detach();
+                                }
+                                self.start_draft(&project_id, cx);
+                            } else {
+                                self.add_project(&path, cx);
+                            }
+                        }
+                    }
                 }
+                Some(local_id) => {
+                    let ready_entry = self.fleet.environments.iter().find(|entry| {
+                        entry.summary.owner.saved_id == local_id
+                            && entry.status == ConnectionStatus::Connected
+                            && entry.config.config.is_some()
+                            && entry.summary.synchronized
+                    });
+                    let Some(entry) = ready_entry else {
+                        not_connected(self, cx);
+                        if has_files && !claimed_by_row {
+                            self.show_toast(
+                                Toast::new(ToastKind::Info, "Only folders can be added as projects")
+                                    .description("Drop files on a thread to attach them."),
+                                cx,
+                            );
+                        }
+                        return;
+                    };
+                    let owner = entry.summary.owner.clone();
+                    let destination = self.connections.destination(&owner, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE);
+                    let ops: Vec<_> = folders
+                        .into_iter()
+                        .filter_map(|folder| {
+                            let path = t3_core::projects::add_target(&folder.to_string_lossy());
+                            if path.is_empty() {
+                                return None;
+                            }
+                            let existing = t3_core::projects::find_project_by_path(&entry.summary.projects, &path, |project| &project.project.workspace_root)
+                                .map(|project| (project.project.id.clone(), project.project.archived_at.is_some()));
+                            Some((path, existing))
+                        })
+                        .collect();
+                    cx.spawn(async move |this, cx| {
+                        let Ok(target) = destination.await else {
+                            let _ = this.update(cx, |state, cx| {
+                                state.show_toast(
+                                    Toast::new(ToastKind::Error, "This computer's server is not connected yet")
+                                        .description("Try again when it connects."),
+                                    cx,
+                                );
+                            });
+                            return;
+                        };
+                        let mut last_opened: Option<String> = None;
+                        for (path, existing) in ops {
+                            match existing {
+                                Some((project_id, archived)) => {
+                                    if archived {
+                                        let payload = t3_core::settings::projects::ProjectUpdate {
+                                            archived: Some(false),
+                                            ..Default::default()
+                                        }
+                                        .payload(&uuid(), &project_id);
+                                        if let Err(error) = target.client.request(t3_core::projects::PROJECTS_MUTATE, payload).await {
+                                            let _ = this.update(cx, |state, cx| {
+                                                state.show_toast(
+                                                    Toast::new(ToastKind::Error, "Failed to unarchive project")
+                                                        .description(error.to_string()),
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    }
+                                    last_opened = Some(project_id);
+                                }
+                                None => {
+                                    let project_id = uuid();
+                                    let title = t3_core::projects::infer_project_title(&path);
+                                    let payload = t3_core::projects::create_project(&uuid(), &project_id, &title, &path);
+                                    match target.client.request(t3_core::projects::PROJECTS_MUTATE, payload).await {
+                                        Ok(_) => {
+                                            last_opened = Some(project_id);
+                                            let _ = this.update(cx, |state, cx| {
+                                                state.show_toast(Toast::new(ToastKind::Success, "Project added").description(title), cx);
+                                            });
+                                        }
+                                        Err(error) => {
+                                            let _ = this.update(cx, |state, cx| {
+                                                state.show_toast(
+                                                    Toast::new(ToastKind::Error, format!("Could not add \"{title}\""))
+                                                        .description(error.to_string()),
+                                                    cx,
+                                                );
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(project_id) = last_opened {
+                            let _ = this.update(cx, |state, cx| {
+                                if state.environments.active.as_deref() == Some(&local_id) {
+                                    state.start_draft(&project_id, cx);
+                                } else if let Some(owner) = state
+                                    .scoped_environment(&local_id)
+                                    .map(|entry| entry.summary.owner.clone())
+                                    .filter(|owner| state.scoped_ready(owner, t3_core::auth::ORCHESTRATION_READ_SCOPE))
+                                {
+                                    state.navigate_scoped(owner, crate::app_state::ScopedRouteAction::Draft(project_id), cx);
+                                }
+                            });
+                        }
+                    })
+                    .detach();
+                }
+                None => not_connected(self, cx),
             }
         }
         if has_files && !claimed_by_row {

@@ -865,6 +865,7 @@ async fn sidebar_folder_drop_adds_projects_and_rejects_unclaimed_files(cx: &mut 
     std::fs::write(&file_a, "hello").unwrap();
 
     state.update(cx, |s, cx| {
+        s.environments.environments[0].local = true;
         let snap = s.shell.snapshot.as_mut().unwrap();
         snap.projects = vec![serde_json::from_value(json!({
             "id": "proj-1",
@@ -1023,4 +1024,195 @@ async fn sidebar_folder_drop_adds_projects_and_rejects_unclaimed_files(cx: &mut 
     );
 
     state.update(vcx, |s, _| s.stop_pump());
+}
+
+#[gpui::test]
+async fn sidebar_folder_drop_targets_local_environment_and_unarchives(cx: &mut gpui::TestAppContext) {
+    use t3_client::environments::{EnvironmentEvent, Environments};
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _fixture) = setup_app(cx, &runtime);
+    let tmp = TempDir::new("folder-drop-routing");
+    let archived_dir = tmp.path().join("archived-repo");
+    let new_local_dir = tmp.path().join("new-local-repo");
+    std::fs::create_dir_all(&archived_dir).unwrap();
+    std::fs::create_dir_all(&new_local_dir).unwrap();
+
+    // 1. Remote-only setup (`local: false`) rejects folder drops without emitting commands.
+    let (connections, mut output) = Environments::start(runtime.handle(), false);
+    let rw_session: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+        "authenticated": true,
+        "permissions": [t3_core::auth::ORCHESTRATION_READ_SCOPE, t3_core::auth::ORCHESTRATION_OPERATE_SCOPE]
+    })).unwrap();
+    let (remote_client, mut remote_fixture) = ClientFixture::handle(rw_session.clone());
+    remote_fixture.grants.send_replace(Some(rw_session.clone()));
+    let mut remote_shell = t3_core::shell::ShellState::default();
+    remote_shell.apply(serde_json::from_value(json!({
+        "kind": "snapshot",
+        "snapshot": { "snapshotSequence": 1, "projects": [], "threads": [] }
+    })).unwrap());
+    remote_shell.synchronized = true;
+    let mut remote_config = t3_core::server_config::ServerConfigState::default();
+    remote_config.apply(serde_json::from_value(json!({
+        "type": "snapshot",
+        "config": {
+            "environment": {"environmentId": "srv-remote", "label": "Remote", "platform": {"os": "linux", "arch": "x64"}, "capabilities": {}},
+            "cwd": "/",
+            "settings": {}
+        }
+    })).unwrap());
+
+    state.update(cx, |s, _| {
+        s.stop_pump();
+        s.connections = connections;
+        s.environments = serde_json::from_value(json!({
+            "active": "env-remote",
+            "environments": [{
+                "id": "env-remote",
+                "environmentId": "srv-remote",
+                "label": "Remote",
+                "httpBase": "http://remote.invalid",
+                "accessToken": "",
+                "disabled": false,
+                "local": false
+            }]
+        })).unwrap();
+    });
+    let mut view = state.read_with(cx, |s, _| s.connections.view());
+    let install_remote = state.update(cx, |s, _| {
+        s.connections.install_fixture("env-remote", remote_client, remote_shell, remote_config, ConnectionStatus::Connected)
+    });
+    let _remote_events = runtime.spawn(install_remote).await.unwrap();
+    let fleet_view = view.borrow_and_update().clone();
+    state.update(cx, |s, cx| {
+        s.apply_fleet_view(fleet_view, cx);
+        s.environments.active = Some("env-remote".into());
+        s.connections.activate(Some("env-remote"));
+    });
+    let (ev_remote, mut output) = runtime.spawn(async move {
+        loop {
+            let ev = output.recv().await.unwrap();
+            if matches!(&ev, EnvironmentEvent::Activated { id, .. } if id == "env-remote") {
+                return (ev, output);
+            }
+        }
+    }).await.unwrap();
+    state.update(cx, |s, cx| s.apply_environment_event(ev_remote, cx));
+    cx.run_until_parked();
+    let _ = remote_fixture.take_commands();
+
+    state.update(cx, |s, cx| {
+        s.drop_folders_on_sidebar(&[new_local_dir.clone()], false, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(remote_fixture.take_commands(), Vec::<&'static str>::new());
+    assert_eq!(
+        state.read_with(cx, |s, _| s.toasts.latest().map(|t| t.title.to_string())),
+        Some("This computer's server is not connected yet".into())
+    );
+
+    // 2. Active remote env + connected local env in fleet routes folder drop strictly to the local server.
+    let (local_client, mut local_fixture) = ClientFixture::handle(rw_session.clone());
+    local_fixture.grants.send_replace(Some(rw_session));
+    let mut local_shell = t3_core::shell::ShellState::default();
+    local_shell.apply(serde_json::from_value(json!({
+        "kind": "snapshot",
+        "snapshot": {
+            "snapshotSequence": 1,
+            "projects": [{
+                "id": "proj-archived",
+                "title": "Archived Repo",
+                "workspaceRoot": archived_dir.to_string_lossy(),
+                "archivedAt": "2026-01-01T00:00:00.000Z",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "updatedAt": "2026-01-01T00:00:00.000Z"
+            }],
+            "threads": []
+        }
+    })).unwrap());
+    local_shell.synchronized = true;
+    let mut local_config = t3_core::server_config::ServerConfigState::default();
+    local_config.apply(serde_json::from_value(json!({
+        "type": "snapshot",
+        "config": {
+            "environment": {"environmentId": "srv-local", "label": "Local", "platform": {"os": "macos", "arch": "arm64"}, "capabilities": {}},
+            "cwd": "/",
+            "settings": {}
+        }
+    })).unwrap());
+    state.update(cx, |s, _| {
+        s.toasts = Default::default();
+        s.environments.environments.push(serde_json::from_value(json!({
+            "id": "env-local",
+            "environmentId": "srv-local",
+            "label": "Local",
+            "httpBase": "http://local.invalid",
+            "accessToken": "",
+            "disabled": false,
+            "local": true
+        })).unwrap());
+    });
+    let install_local = state.update(cx, |s, _| {
+        s.connections.install_fixture("env-local", local_client, local_shell, local_config, ConnectionStatus::Connected)
+    });
+    let _local_events = runtime.spawn(install_local).await.unwrap();
+    let fleet_view = view.borrow_and_update().clone();
+    state.update(cx, |s, cx| {
+        s.apply_fleet_view(fleet_view, cx);
+        s.drop_folders_on_sidebar(&[new_local_dir.clone()], false, cx);
+    });
+    let (local_fixture, params, reply) = runtime.spawn(async move {
+        loop {
+            let (method, params, reply) = local_fixture.next_request().await;
+            if method == t3_core::projects::PROJECTS_MUTATE {
+                return (local_fixture, params, reply);
+            }
+            let _ = reply.send(Ok(json!({})));
+        }
+    }).await.unwrap();
+    assert_eq!(params["type"], "project.create");
+    assert_eq!(params["workspaceRoot"], new_local_dir.to_string_lossy().as_ref());
+    let _ = reply.send(Ok(json!({ "id": "proj-created", "sequence": 2 })));
+    cx.run_until_parked();
+    let remote_commands = remote_fixture.take_commands();
+    assert!(
+        remote_commands.iter().all(|cmd| *cmd == "close-all-threads"),
+        "switching to local destination must only close previous remote subscriptions; got {remote_commands:?}"
+    );
+
+    // 3. Dropping an archived local project unarchives it (`project.update { archived: false }`) and opens its draft.
+    state.update(cx, |s, _cx| {
+        s.environments.active = Some("env-local".into());
+        s.connections.activate(Some("env-local"));
+        s.toasts = Default::default();
+    });
+    let ev_local = runtime.spawn(async move {
+        loop {
+            let ev = output.recv().await.unwrap();
+            if matches!(&ev, EnvironmentEvent::Activated { id, .. } if id == "env-local") {
+                return ev;
+            }
+        }
+    }).await.unwrap();
+    state.update(cx, |s, cx| {
+        s.apply_environment_event(ev_local, cx);
+        s.drop_folders_on_sidebar(&[archived_dir], false, cx);
+    });
+    let (params, reply) = runtime.spawn(async move {
+        let mut local_fixture = local_fixture;
+        loop {
+            let (method, params, reply) = local_fixture.next_request().await;
+            if method == t3_core::projects::PROJECTS_MUTATE {
+                return (params, reply);
+            }
+            let _ = reply.send(Ok(json!({})));
+        }
+    }).await.unwrap();
+    assert_eq!(params["type"], "project.update");
+    assert_eq!(params["projectId"], "proj-archived");
+    assert_eq!(params["archived"], false);
+    let _ = reply.send(Ok(json!({ "sequence": 3 })));
+    cx.run_until_parked();
+    assert_eq!(state.read_with(cx, |s, _| s.draft_project.clone()), Some("proj-archived".into()));
+    state.update(cx, |s, _| s.stop_pump());
 }

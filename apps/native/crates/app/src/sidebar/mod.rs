@@ -3726,6 +3726,7 @@ mod sb_380_tests {
             s.run_thread_action("menu-thread", ThreadAction::CopyPath, &[], cx);
             s.run_thread_action("menu-thread", ThreadAction::CopyThreadId, &[], cx);
             s.run_thread_action("menu-thread", ThreadAction::CopyThread, &[], cx);
+            s.copy_project_path("checkout-a", cx);
         });
         state.read_with(vcx, |s, _| {
             assert!(

@@ -73,7 +73,6 @@ impl AppState {
 
     fn copy_project_scoped(&mut self, path: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(path.to_owned()));
-        self.show_toast(Toast::new(ToastKind::Success, "Path copied").description(path.to_owned()), cx);
     }
 
     fn scoped_project_pinnable(&self, project: &t3_core::sidebar::grouping::ScopedProject) -> bool {
@@ -194,8 +193,7 @@ impl AppState {
 
     pub fn copy_project_path(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let Some(path) = self.shell.project(project_id).map(|project| project.workspace_root.clone()) else { return };
-        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-        self.show_toast(Toast::new(ToastKind::Success, "Path copied").description(path), cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(path));
     }
 
     /// `removeMembers` once confirmed: a forced `project.delete` per member, in order, stopping at
