@@ -1,25 +1,30 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gpui::{App, Context, Entity, EventEmitter, Subscription, Task, Window};
+use gpui::{App, Context, Entity, EntityId, EventEmitter, Global, Subscription, Task, WeakEntity, Window};
 use t3_client::auth::Credentials;
-use t3_client::voice::{VoiceClient, VoiceStreamSession};
+use t3_client::voice::{VoiceClient, VoiceClientError};
 use t3_core::client_settings::ClientSettingChange;
 use t3_core::voice_input::{
-    DictationSubmissionDecision, DictationSubmissionGate, EnvironmentSpeechModel, EnvironmentSpeechModelState, EnvironmentSpeechPostProcessingRequest,
-    EnvironmentSpeechState, EnvironmentSpeechStatus, MICROPHONE_PERMISSION_ERROR,
-    SpeechPostProcessingDraft, SpeechPostProcessingOptions, SpeechPostProcessingSelection,
-    SpeechStreamText, SpeechTranscriptionOptions, VoiceControllerEffect, VoiceDraftSnapshot,
+    CLOUD_SPEECH_LANGUAGES, CloudSpeechError, CloudSpeechErrorReason, CloudSpeechProvider,
+    DictationSubmissionDecision, DictationSubmissionGate, EnvironmentSpeechModel,
+    EnvironmentSpeechModelState, EnvironmentSpeechPostProcessingRequest, EnvironmentSpeechState,
+    EnvironmentSpeechStatus, MICROPHONE_PERMISSION_ERROR, SpeechPostProcessingDraft,
+    SpeechPostProcessingOptions, SpeechPostProcessingSelection, SpeechStreamText,
+    SpeechTranscriptionOptions, VoiceControllerEffect, VoiceDraftSnapshot, VoiceErrorAction,
     VoiceInputControllerMachine, VoiceInputPhase, VoiceInputState, VoiceSelection,
-    VoiceTranscriptionDestination, VoiceTranscriptionError, VoiceTranscriptionErrorCode, choose_setup_speech_model, cleanup_context, f32_slice_to_le_bytes,
-    preferred_microphone_id, preferred_speech_languages, remember_microphones,
-    resolve_speech_vocabulary,
+    VoiceTranscriptionDestination, VoiceTranscriptionError, VoiceTranscriptionErrorCode,
+    choose_setup_speech_model, cleanup_context, f32_slice_to_le_bytes, preferred_microphone_id,
+    preferred_speech_languages, remember_microphones, resolve_speech_vocabulary,
 };
 
-use super::consent::{ResolvedVoiceDestination, resolve_voice_destination};
+use super::consent::{
+    ResolvedVoiceDestination, resolve_cleanup_credentials, resolve_voice_destination,
+    voice_consent_generation,
+};
 use super::platform::{
     AudioCaptureCallbacks, AudioCaptureSession, CaptureStartError, MicPermissionStatus,
     PermissionOutcome, audio_platform,
@@ -82,6 +87,45 @@ pub type HintsReader = Rc<dyn Fn(&App) -> Vec<String>>;
 pub type ProjectIdReader = Rc<dyn Fn(&App) -> Option<String>>;
 pub type VoiceSettingsHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
+#[derive(Default)]
+struct ActiveVoiceSessionLock {
+    owner: Option<(EntityId, WeakEntity<VoiceSpeechController>)>,
+}
+
+impl Global for ActiveVoiceSessionLock {}
+
+fn try_acquire_voice_session(
+    entity_id: EntityId,
+    weak: WeakEntity<VoiceSpeechController>,
+    cx: &mut App,
+) -> bool {
+    if cx.try_global::<ActiveVoiceSessionLock>().is_none() {
+        cx.set_global(ActiveVoiceSessionLock::default());
+    }
+    let existing = cx
+        .global::<ActiveVoiceSessionLock>()
+        .owner
+        .as_ref()
+        .and_then(|(id, w)| w.upgrade().map(|e| (*id, e)));
+    if let Some((active_id, active_entity)) = existing
+        && active_id != entity_id
+        && active_entity.read(cx).state().is_busy()
+    {
+        return false;
+    }
+    cx.global_mut::<ActiveVoiceSessionLock>().owner = Some((entity_id, weak));
+    true
+}
+
+fn release_voice_session(entity_id: EntityId, cx: &mut App) {
+    if cx.try_global::<ActiveVoiceSessionLock>().is_some() {
+        let lock = cx.global_mut::<ActiveVoiceSessionLock>();
+        if lock.owner.as_ref().is_some_and(|(id, _)| *id == entity_id) {
+            lock.owner = None;
+        }
+    }
+}
+
 pub struct VoiceSpeechConfig {
     pub app: Entity<AppState>,
     pub owner_key: String,
@@ -89,19 +133,34 @@ pub struct VoiceSpeechConfig {
     pub draft_reader: DraftReader,
     pub hints_reader: HintsReader,
     pub project_id_reader: ProjectIdReader,
+    pub environment_id_reader: ProjectIdReader,
     pub on_open_voice_settings: VoiceSettingsHandler,
 }
 
 struct PreparedStart {
+    owner_key: String,
     destination: ResolvedVoiceDestination,
+    consent_grant_id: String,
+    consent_gen_ref: Arc<AtomicU64>,
+    consent_generation: u64,
+    draft_environment_id: Option<String>,
+    cleanup_requested: bool,
+    cleanup_grant_id: Option<String>,
     options: SpeechTranscriptionOptions,
     cleanup_options: SpeechPostProcessingOptions,
     can_post_process: bool,
 }
 
-#[derive(Default)]
-struct SharedStreamSlot {
-    session: tokio::sync::Mutex<Option<VoiceStreamSession>>,
+enum StreamCommand {
+    Feed(Vec<u8>),
+    Finish(tokio::sync::oneshot::Sender<Result<String, VoiceClientError>>),
+    Cancel,
+}
+
+#[derive(Clone)]
+struct ActiveStreamHandle {
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<StreamCommand>,
+    can_send: Arc<AtomicBool>,
 }
 
 pub struct VoiceSpeechController {
@@ -111,6 +170,7 @@ pub struct VoiceSpeechController {
     draft_reader: DraftReader,
     hints_reader: HintsReader,
     project_id_reader: ProjectIdReader,
+    environment_id_reader: ProjectIdReader,
     on_open_voice_settings: VoiceSettingsHandler,
 
     machine: VoiceInputControllerMachine,
@@ -129,8 +189,7 @@ pub struct VoiceSpeechController {
     recording_order: Vec<String>,
     active_pcm_buffer: Option<Arc<Mutex<Vec<u8>>>>,
     active_capture: Option<Box<dyn AudioCaptureSession>>,
-    active_stream: Option<Arc<SharedStreamSlot>>,
-    stream_can_send: Option<Arc<AtomicBool>>,
+    active_stream: Option<ActiveStreamHandle>,
 
     prepared: Option<PreparedStart>,
     setup_credentials: Option<Credentials>,
@@ -141,7 +200,6 @@ pub struct VoiceSpeechController {
     _app_sub: Subscription,
     _prepare_task: Option<Task<()>>,
     _op_task: Option<Task<()>>,
-    _stream_open_task: Option<Task<()>>,
     _stream_updates_task: Option<Task<()>>,
     _capture_events_task: Option<Task<()>>,
     _timer_task: Option<Task<()>>,
@@ -167,6 +225,7 @@ impl VoiceSpeechController {
             draft_reader: config.draft_reader,
             hints_reader: config.hints_reader,
             project_id_reader: config.project_id_reader,
+            environment_id_reader: config.environment_id_reader,
             on_open_voice_settings: config.on_open_voice_settings,
             machine: VoiceInputControllerMachine::new(true, true),
             submission_gate: DictationSubmissionGate::new(),
@@ -183,7 +242,6 @@ impl VoiceSpeechController {
             active_pcm_buffer: None,
             active_capture: None,
             active_stream: None,
-            stream_can_send: None,
             prepared: None,
             setup_credentials: None,
             setup_selected_model_id: None,
@@ -192,7 +250,6 @@ impl VoiceSpeechController {
             _app_sub: app_sub,
             _prepare_task: None,
             _op_task: None,
-            _stream_open_task: None,
             _stream_updates_task: None,
             _capture_events_task: None,
             _timer_task: None,
@@ -213,8 +270,14 @@ impl VoiceSpeechController {
             return;
         }
         self.owner_key = next;
+        self.start_request_id = self.start_request_id.wrapping_add(1);
+        self.setup = VoiceSetupState::default();
+        self._prepare_task = None;
+        self._setup_task = None;
+        self._download_poll_task = None;
         let effects = self.machine.owner_changed();
         self.submission_gate.clear();
+        release_voice_session(cx.entity_id(), cx);
         self.apply_effects(effects, cx);
         cx.notify();
     }
@@ -290,6 +353,12 @@ impl VoiceSpeechController {
         if self.setup.open && self.setup.downloading {
             return;
         }
+        if !matches!(
+            self.machine.state().phase,
+            VoiceInputPhase::Idle | VoiceInputPhase::Error
+        ) {
+            return;
+        }
         let resolution = resolve_voice_destination(self.app.read(cx), cx);
         if resolution.active.is_none() {
             if resolution.offer_first_run_setup && self.offer_setup {
@@ -300,6 +369,15 @@ impl VoiceSpeechController {
                 let effects = self.machine.start(draft);
                 self.apply_effects(effects, cx);
             }
+            return;
+        }
+
+        if !try_acquire_voice_session(cx.entity_id(), cx.entity().downgrade(), cx) {
+            let effects = self.machine.fail(
+                "Another voice recording is already active.",
+                Some(VoiceErrorAction::Retry),
+            );
+            self.apply_effects(effects, cx);
             return;
         }
 
@@ -322,10 +400,10 @@ impl VoiceSpeechController {
         self.setup = VoiceSetupState::default();
         self._prepare_task = None;
         self._op_task = None;
-        self._stream_open_task = None;
         self._stream_updates_task = None;
         self._capture_events_task = None;
         self._timer_task = None;
+        release_voice_session(cx.entity_id(), cx);
         let effects = self.machine.cancel();
         self.apply_effects(effects, cx);
         cx.notify();
@@ -411,22 +489,40 @@ impl VoiceSpeechController {
             }
         }));
 
+        let setup_token = self.start_request_id;
         self._setup_task = Some(cx.spawn(async move |this, cx| {
             let res = runtime
                 .spawn(async move {
                     let client = VoiceClient::new(credentials)?;
                     let catalog = client.download_model(&model_id).await?;
-                    client.select_model(&model_id).await?;
-                    Ok::<_, t3_client::voice::VoiceClientError>(catalog)
+                    let installed = catalog
+                        .models
+                        .iter()
+                        .any(|m| m.id == model_id && m.state == EnvironmentSpeechModelState::Installed);
+                    if installed {
+                        client.select_model(&model_id).await?;
+                    }
+                    Ok::<_, VoiceClientError>((catalog, installed))
                 })
                 .await;
 
             let _ = this.update(cx, |this, cx| {
+                if this.start_request_id != setup_token {
+                    return;
+                }
                 this._download_poll_task = None;
                 this.setup.downloading = false;
                 match res {
-                    Ok(Ok(_)) => {
+                    Ok(Ok((catalog, true))) => {
+                        this.setup.model = catalog
+                            .models
+                            .into_iter()
+                            .find(|m| m.id == this.setup.model.as_ref().map(|m| m.id.as_str()).unwrap_or(""));
                         this.setup.step = VoiceSetupStep::Ready;
+                        this.setup.error = None;
+                    }
+                    Ok(Ok((_, false))) => {
+                        this.setup.step = VoiceSetupStep::Confirm;
                         this.setup.error = None;
                     }
                     Ok(Err(err)) => {
@@ -444,6 +540,7 @@ impl VoiceSpeechController {
     }
 
     pub fn setup_cancel_download(&mut self, cx: &mut Context<Self>) {
+        self.start_request_id = self.start_request_id.wrapping_add(1);
         let (Some(credentials), Some(model)) =
             (self.setup_credentials.clone(), self.setup.model.clone())
         else {
@@ -454,6 +551,9 @@ impl VoiceSpeechController {
         let model_id = model.id;
         let runtime = self.app.read(cx).runtime().clone();
         self._download_poll_task = None;
+        self.setup.downloading = false;
+        self.setup.step = VoiceSetupStep::Confirm;
+        cx.notify();
         self._setup_task = Some(cx.spawn(async move |this, cx| {
             let _ = runtime
                 .spawn(async move { VoiceClient::new(credentials)?.cancel_model_download(&model_id).await })
@@ -555,11 +655,16 @@ impl VoiceSpeechController {
         };
         cx.notify();
 
+        self.start_request_id = self.start_request_id.wrapping_add(1);
+        let setup_token = self.start_request_id;
         self._setup_task = Some(cx.spawn(async move |this, cx| {
             let res = runtime
                 .spawn(async move { VoiceClient::new(credentials)?.models(false).await })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                if this.start_request_id != setup_token {
+                    return;
+                }
                 match res {
                     Ok(Ok(catalog)) => {
                         if let Some((model, language)) = choose_setup_speech_model(
@@ -698,7 +803,6 @@ impl VoiceSpeechController {
                     self.release_audio_capture();
                     self.cancel_active_stream();
                     self._op_task = None;
-                    self._stream_open_task = None;
                     self._stream_updates_task = None;
                 }
 
@@ -768,6 +872,9 @@ impl VoiceSpeechController {
                         self.recording_started_at = None;
                         self.audio_level = 0.0;
                     }
+                    if !next_state.is_busy() {
+                        release_voice_session(cx.entity_id(), cx);
+                    }
                     cx.emit(VoiceControllerEvent::StateChanged);
                     if let Some(text) = submit_text {
                         cx.emit(VoiceControllerEvent::SubmitAfterDictation { text });
@@ -779,6 +886,11 @@ impl VoiceSpeechController {
     }
 
     fn run_prepare_transcriber(&mut self, operation_token: u64, cx: &mut Context<Self>) {
+        let (consent_gen_ref, consent_generation) = voice_consent_generation(cx);
+        let draft_env_id = (self.environment_id_reader)(cx);
+        let project_id = (self.project_id_reader)(cx);
+        let hint_strings = (self.hints_reader)(cx);
+        let settings_doc = crate::settings::store::try_client(cx).cloned().unwrap_or_default();
         let app_state = self.app.read(cx);
         let resolution = resolve_voice_destination(app_state, cx);
         let Some(active) = resolution.active else {
@@ -793,8 +905,6 @@ impl VoiceSpeechController {
             return;
         };
 
-        let settings_doc = crate::settings::store::try_client(cx).cloned().unwrap_or_default();
-        let project_id = (self.project_id_reader)(cx);
         let project_words = app_state
             .server_config
             .config
@@ -802,23 +912,55 @@ impl VoiceSpeechController {
             .map(|cfg| cfg.settings.project_speech_custom_words(project_id.as_deref()))
             .unwrap_or_default();
         let personal_words = settings_doc.speech_custom_words();
-        let hint_strings = (self.hints_reader)(cx);
-        let hint_refs: Vec<&str> = hint_strings.iter().map(String::as_str).collect();
-        let vocabulary = resolve_speech_vocabulary(&personal_words, &project_words, &hint_refs);
-        let correction_word = {
+        let cleanup_creds = resolve_cleanup_credentials(app_state, draft_env_id.as_deref());
+        let cleanup_granted = active.cleanup_granted;
+        let correction_word = if cleanup_granted && cleanup_creds.is_some() {
             let trimmed = settings_doc.speech_correction_word().trim();
             (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        } else {
+            None
         };
+        let mut hints: Vec<&str> = hint_strings.iter().map(String::as_str).collect();
+        if let Some(cue) = correction_word.as_deref() {
+            hints.insert(0, cue);
+        }
+        let vocabulary = resolve_speech_vocabulary(&personal_words, &project_words, &hints);
         let intent_lang = settings_doc.speech_language().to_owned();
         let translate = settings_doc.speech_translate_to_english();
         let remove_fillers = settings_doc.speech_remove_filler_words();
         let silence_filter = settings_doc.speech_silence_filtering();
         let post_prompt = settings_doc.speech_post_processing_prompt();
-        let cleanup_granted = active.cleanup_granted;
+        let consent_grant_id = active.grant_id.clone();
+        let cleanup_grant_id = active.cleanup_grant_id.clone();
+        let owner_key = self.owner_key.clone();
+        let runtime = app_state.runtime().clone();
 
-        if matches!(active.destination, VoiceTranscriptionDestination::Cloud { .. }) {
+        if let VoiceTranscriptionDestination::Cloud { provider, model, .. } = &active.destination {
+            let provider = *provider;
+            if provider == CloudSpeechProvider::Openrouter
+                && model.as_deref().is_none_or(|m| m.trim().is_empty())
+            {
+                let effects = self.machine.on_transcriber_prepared(
+                    operation_token,
+                    Err(VoiceTranscriptionError::new(
+                        VoiceTranscriptionErrorCode::Unavailable,
+                        "Choose an OpenRouter model in Settings \u{2192} Voice.",
+                    )),
+                );
+                self.apply_effects(effects, cx);
+                return;
+            }
+            let creds = active.credentials.clone();
+            let request_id = self.start_request_id;
+            let cloud_langs: Vec<String> =
+                CLOUD_SPEECH_LANGUAGES.iter().map(|s| (*s).to_owned()).collect();
+            let locale = t3_core::voice_input::effective_speech_language(
+                &cloud_langs,
+                true,
+                &intent_lang,
+            );
             let options = SpeechTranscriptionOptions {
-                speech_language: intent_lang.clone(),
+                speech_language: intent_lang,
                 speech_translate_to_english: translate,
                 speech_custom_words: vocabulary.clone(),
                 speech_remove_filler_words: remove_fillers,
@@ -830,21 +972,80 @@ impl VoiceSpeechController {
                 speech_post_processing_prompt: post_prompt,
                 speech_correction_word: correction_word,
             };
-            self.machine.set_enable_post_processing(cleanup_granted);
-            self.prepared = Some(PreparedStart {
-                destination: active,
-                options,
-                cleanup_options,
-                can_post_process: cleanup_granted,
-            });
-            let effects = self
-                .machine
-                .on_transcriber_prepared(operation_token, Ok((intent_lang, false, false)));
-            self.apply_effects(effects, cx);
+            self._prepare_task = Some(cx.spawn(async move |this, cx| {
+                let keys_res = runtime
+                    .spawn(async move { VoiceClient::new(creds)?.cloud_keys().await })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.aborted_tokens.contains(&operation_token)
+                        || this.start_request_id != request_id
+                    {
+                        return;
+                    }
+                    let keys = match keys_res {
+                        Ok(Ok(keys)) => keys,
+                        Ok(Err(err)) => {
+                            let effects = this.machine.on_transcriber_prepared(
+                                operation_token,
+                                Err(VoiceTranscriptionError::new(
+                                    VoiceTranscriptionErrorCode::PreparationFailed,
+                                    err.to_string(),
+                                )),
+                            );
+                            this.apply_effects(effects, cx);
+                            return;
+                        }
+                        Err(err) => {
+                            let effects = this.machine.on_transcriber_prepared(
+                                operation_token,
+                                Err(VoiceTranscriptionError::new(
+                                    VoiceTranscriptionErrorCode::PreparationFailed,
+                                    err.to_string(),
+                                )),
+                            );
+                            this.apply_effects(effects, cx);
+                            return;
+                        }
+                    };
+                    if !keys.is_configured(provider) {
+                        let msg = CloudSpeechError {
+                            provider,
+                            reason: CloudSpeechErrorReason::MissingKey,
+                        }
+                        .message();
+                        let effects = this.machine.on_transcriber_prepared(
+                            operation_token,
+                            Err(VoiceTranscriptionError::new(
+                                VoiceTranscriptionErrorCode::Unavailable,
+                                msg,
+                            )),
+                        );
+                        this.apply_effects(effects, cx);
+                        return;
+                    }
+                    this.machine.set_enable_post_processing(cleanup_granted);
+                    this.prepared = Some(PreparedStart {
+                        owner_key,
+                        destination: active,
+                        consent_grant_id,
+                        consent_gen_ref,
+                        consent_generation,
+                        draft_environment_id: draft_env_id,
+                        cleanup_requested: cleanup_granted,
+                        cleanup_grant_id,
+                        options,
+                        cleanup_options,
+                        can_post_process: cleanup_granted,
+                    });
+                    let effects = this
+                        .machine
+                        .on_transcriber_prepared(operation_token, Ok((locale, false, false)));
+                    this.apply_effects(effects, cx);
+                });
+            }));
             return;
         }
 
-        let runtime = app_state.runtime().clone();
         let creds = active.credentials.clone();
         let env_id = active.destination.environment_id().to_owned();
         let offer_setup = self.offer_setup;
@@ -925,6 +1126,8 @@ impl VoiceSpeechController {
                     }
                     EnvironmentSpeechStatus::Supported {
                         supports_streaming,
+                        supports_buffered_streaming,
+                        supports_translation,
                         languages,
                         supports_language_detection,
                         ..
@@ -934,8 +1137,15 @@ impl VoiceSpeechController {
                             supports_language_detection.unwrap_or(true),
                             &intent_lang,
                         );
+                        let locale = if !*supports_streaming && *supports_translation && translate {
+                            "en".to_owned()
+                        } else {
+                            effective_lang.clone()
+                        };
+                        let can_stream =
+                            *supports_streaming || supports_buffered_streaming.unwrap_or(false);
                         let options = SpeechTranscriptionOptions {
-                            speech_language: effective_lang.clone(),
+                            speech_language: effective_lang,
                             speech_translate_to_english: translate,
                             speech_custom_words: vocabulary.clone(),
                             speech_remove_filler_words: remove_fillers,
@@ -949,14 +1159,23 @@ impl VoiceSpeechController {
                         };
                         this.machine.set_enable_post_processing(cleanup_granted);
                         this.prepared = Some(PreparedStart {
+                            owner_key,
                             destination: active,
+                            consent_grant_id,
+                            consent_gen_ref,
+                            consent_generation,
+                            draft_environment_id: draft_env_id,
+                            cleanup_requested: cleanup_granted,
+                            cleanup_grant_id,
                             options,
                             cleanup_options,
                             can_post_process: cleanup_granted,
                         });
+                        // `/ws/voice` uses `StreamCommand::Finish` rather than a live-start promise,
+                        // so `has_live_start` is always `false` here.
                         let effects = this.machine.on_transcriber_prepared(
                             operation_token,
-                            Ok((effective_lang, *supports_streaming, *supports_streaming)),
+                            Ok((locale, can_stream, false)),
                         );
                         this.apply_effects(effects, cx);
                     }
@@ -971,93 +1190,203 @@ impl VoiceSpeechController {
         };
         let creds = prepared.destination.credentials.clone();
         let options = prepared.options.clone();
+        let consent_gen_ref = prepared.consent_gen_ref.clone();
+        let expected_consent_gen = prepared.consent_generation;
         let runtime = self.app.read(cx).runtime().clone();
 
-        let slot = Arc::new(SharedStreamSlot::default());
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCommand>();
         let can_send = Arc::new(AtomicBool::new(true));
-        self.active_stream = Some(slot.clone());
-        self.stream_can_send = Some(can_send.clone());
+        self.active_stream = Some(ActiveStreamHandle {
+            cmd_tx,
+            can_send: can_send.clone(),
+        });
 
         let (update_tx, mut update_rx) = futures::channel::mpsc::unbounded::<SpeechStreamText>();
+        let (stream_err_tx, stream_err_rx) = tokio::sync::oneshot::channel::<String>();
 
         self._stream_updates_task = Some(cx.spawn(async move |this, cx| {
             use futures::StreamExt;
-            while let Some(text) = update_rx.next().await {
-                let keep = this
-                    .update(cx, |this, cx| {
-                        if this.aborted_tokens.contains(&operation_token) {
-                            return false;
-                        }
-                        this.live_preview = Some(text);
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep {
-                    break;
-                }
-            }
-        }));
-
-        self._stream_open_task = Some(cx.spawn(async move |this, cx| {
-            let can_send_flag = can_send.clone();
-            let opened = runtime
-                .spawn(async move {
-                    let client = VoiceClient::new(creds)?;
-                    client
-                        .open_stream(
-                            options,
-                            Arc::new(move || can_send_flag.load(Ordering::SeqCst)),
-                        )
-                        .await
-                })
-                .await;
-
-            match opened {
-                Ok(Ok(mut session)) => {
-                    if let Some(mut updates) = session.take_updates() {
-                        runtime.spawn(async move {
-                            while let Some(text) = updates.recv().await {
-                                if update_tx.unbounded_send(text).is_err() {
-                                    break;
+            let mut stream_err_rx = Some(stream_err_rx);
+            loop {
+                tokio::select! {
+                    maybe_text = update_rx.next() => {
+                        let Some(text) = maybe_text else {
+                            break;
+                        };
+                        let keep = this
+                            .update(cx, |this, cx| {
+                                if this.aborted_tokens.contains(&operation_token) {
+                                    return false;
                                 }
-                            }
-                        });
+                                this.live_preview = Some(text);
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !keep {
+                            break;
+                        }
                     }
-                    *slot.session.lock().await = Some(session);
-                }
-                Ok(Err(err)) => {
-                    let _ = this.update(cx, |this, cx| {
-                        let effects = this.machine.on_live_transcription_result(
-                            operation_token,
-                            Err(VoiceTranscriptionError::new(
-                                VoiceTranscriptionErrorCode::TranscriptionFailed,
-                                err.to_string(),
-                            )),
-                        );
-                        this.apply_effects(effects, cx);
-                    });
-                }
-                Err(err) => {
-                    let _ = this.update(cx, |this, cx| {
-                        let effects = this.machine.on_live_transcription_result(
-                            operation_token,
-                            Err(VoiceTranscriptionError::new(
-                                VoiceTranscriptionErrorCode::TranscriptionFailed,
-                                err.to_string(),
-                            )),
-                        );
-                        this.apply_effects(effects, cx);
-                    });
+                    err = async {
+                        match stream_err_rx.as_mut() {
+                            Some(rx) => rx.await.ok(),
+                            None => std::future::pending().await,
+                        }
+                    }, if stream_err_rx.is_some() => {
+                        stream_err_rx = None;
+                        if let Some(msg) = err {
+                            let _ = this.update(cx, |this, cx| {
+                                if !this.aborted_tokens.contains(&operation_token)
+                                    && this.machine.state().phase == VoiceInputPhase::Recording
+                                {
+                                    let effects = this.machine.interrupt_recording(Some(&msg), None);
+                                    this.apply_effects(effects, cx);
+                                }
+                            });
+                        }
+                    }
                 }
             }
         }));
+
+        runtime.spawn(async move {
+            let can_send_flag = can_send.clone();
+            let gen_ref = consent_gen_ref.clone();
+            let open_fut = async move {
+                let client = VoiceClient::new(creds)?;
+                client
+                    .open_stream(
+                        options,
+                        Arc::new(move || {
+                            can_send_flag.load(Ordering::SeqCst)
+                                && gen_ref.load(Ordering::SeqCst) == expected_consent_gen
+                        }),
+                    )
+                    .await
+            };
+            tokio::pin!(open_fut);
+
+            let mut pending_chunks: Vec<Vec<u8>> = Vec::new();
+            let mut pending_finish: Option<
+                tokio::sync::oneshot::Sender<Result<String, VoiceClientError>>,
+            > = None;
+            let mut cancelled = false;
+
+            let opened = loop {
+                tokio::select! {
+                    res = &mut open_fut => break Some(res),
+                    cmd = cmd_rx.recv() => match cmd {
+                        Some(StreamCommand::Feed(bytes)) => {
+                            if pending_finish.is_none() && !cancelled {
+                                pending_chunks.push(bytes);
+                            }
+                        }
+                        Some(StreamCommand::Finish(reply)) => {
+                            pending_finish = Some(reply);
+                        }
+                        Some(StreamCommand::Cancel) | None => {
+                            cancelled = true;
+                            if let Some(reply) = pending_finish.take() {
+                                let _ = reply.send(Err(VoiceClientError::Stream(
+                                    "Voice transcription was cancelled.".to_owned(),
+                                )));
+                            }
+                            break None;
+                        }
+                    }
+                }
+            };
+
+            let Some(opened) = opened else {
+                return;
+            };
+
+            let mut session = match opened {
+                Ok(session) => session,
+                Err(err) => {
+                    let msg = err.to_string();
+                    if let Some(reply) = pending_finish.take() {
+                        let _ = reply.send(Err(err));
+                        return;
+                    }
+                    let _ = stream_err_tx.send(msg.clone());
+                    while let Some(cmd) = cmd_rx.recv().await {
+                        match cmd {
+                            StreamCommand::Feed(_) => {}
+                            StreamCommand::Finish(reply) => {
+                                let _ = reply.send(Err(VoiceClientError::Stream(msg)));
+                                break;
+                            }
+                            StreamCommand::Cancel => break,
+                        }
+                    }
+                    return;
+                }
+            };
+
+            if cancelled {
+                session.cancel();
+                return;
+            }
+
+            if let Some(mut updates) = session.take_updates() {
+                tokio::spawn(async move {
+                    while let Some(text) = updates.recv().await {
+                        if update_tx.unbounded_send(text).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            for chunk in pending_chunks {
+                if !can_send.load(Ordering::SeqCst)
+                    || consent_gen_ref.load(Ordering::SeqCst) != expected_consent_gen
+                {
+                    session.cancel();
+                    if let Some(reply) = pending_finish.take() {
+                        let _ = reply.send(Err(VoiceClientError::Stream(
+                            "Voice transcription consent was turned off.".to_owned(),
+                        )));
+                    }
+                    return;
+                }
+                let _ = session.feed_bytes(chunk);
+            }
+
+            if let Some(reply) = pending_finish.take() {
+                let res = session.finish().await;
+                let _ = reply.send(res);
+                return;
+            }
+
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    StreamCommand::Feed(bytes) => {
+                        if can_send.load(Ordering::SeqCst)
+                            && consent_gen_ref.load(Ordering::SeqCst) == expected_consent_gen
+                        {
+                            let _ = session.feed_bytes(bytes);
+                        }
+                    }
+                    StreamCommand::Finish(reply) => {
+                        let res = session.finish().await;
+                        let _ = reply.send(res);
+                        return;
+                    }
+                    StreamCommand::Cancel => {
+                        session.cancel();
+                        return;
+                    }
+                }
+            }
+            session.cancel();
+        });
     }
 
     fn start_audio_capture(&mut self, cx: &mut Context<Self>) {
         enum CaptureMsg {
             Level(f32),
-            Pcm(Vec<f32>),
             Limit,
             Error(String),
         }
@@ -1077,16 +1406,38 @@ impl VoiceSpeechController {
 
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<CaptureMsg>();
         let tx_level = tx.clone();
-        let tx_pcm = tx.clone();
         let tx_limit = tx.clone();
         let tx_error = tx;
+        let stream_tx = self.active_stream.as_ref().map(|handle| handle.cmd_tx.clone());
+        let stream_can_send = self.active_stream.as_ref().map(|handle| handle.can_send.clone());
+        let consent_check = self
+            .prepared
+            .as_ref()
+            .map(|p| (p.consent_gen_ref.clone(), p.consent_generation));
 
         let callbacks = AudioCaptureCallbacks {
             on_level: Arc::new(move |level| {
                 let _ = tx_level.unbounded_send(CaptureMsg::Level(level));
             }),
             on_pcm: Arc::new(move |samples| {
-                let _ = tx_pcm.unbounded_send(CaptureMsg::Pcm(samples));
+                if let Some((gen_ref, expected_gen)) = &consent_check
+                    && gen_ref.load(Ordering::SeqCst) != *expected_gen
+                {
+                    return;
+                }
+                if let Some(can_send) = &stream_can_send
+                    && !can_send.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                let bytes = f32_slice_to_le_bytes(&samples);
+                pcm_buffer
+                    .lock()
+                    .expect("pcm buffer lock")
+                    .extend_from_slice(&bytes);
+                if let Some(cmd_tx) = &stream_tx {
+                    let _ = cmd_tx.send(StreamCommand::Feed(bytes));
+                }
             }),
             on_limit: Arc::new(move || {
                 let _ = tx_limit.unbounded_send(CaptureMsg::Limit);
@@ -1110,9 +1461,6 @@ impl VoiceSpeechController {
         };
         self.active_capture = Some(capture);
 
-        let stream_slot = self.active_stream.clone();
-        let runtime = self.app.read(cx).runtime().clone();
-
         self._capture_events_task = Some(cx.spawn(async move |this, cx| {
             use futures::StreamExt;
             while let Some(msg) = rx.next().await {
@@ -1122,19 +1470,6 @@ impl VoiceSpeechController {
                             this.audio_level = level;
                             cx.notify();
                         });
-                    }
-                    CaptureMsg::Pcm(samples) => {
-                        let bytes = f32_slice_to_le_bytes(&samples);
-                        pcm_buffer.lock().expect("pcm buffer lock").extend_from_slice(&bytes);
-                        if let Some(slot) = &stream_slot {
-                            let slot = slot.clone();
-                            runtime.spawn(async move {
-                                let guard = slot.session.lock().await;
-                                if let Some(session) = guard.as_ref() {
-                                    let _ = session.feed_bytes(bytes);
-                                }
-                            });
-                        }
                     }
                     CaptureMsg::Limit => {
                         let _ = this.update(cx, |this, cx| {
@@ -1202,14 +1537,9 @@ impl VoiceSpeechController {
     }
 
     fn cancel_active_stream(&mut self) {
-        if let Some(flag) = self.stream_can_send.take() {
-            flag.store(false, Ordering::SeqCst);
-        }
-        if let Some(slot) = self.active_stream.take()
-            && let Ok(mut guard) = slot.session.try_lock()
-            && let Some(session) = guard.take()
-        {
-            session.cancel();
+        if let Some(handle) = self.active_stream.take() {
+            handle.can_send.store(false, Ordering::SeqCst);
+            let _ = handle.cmd_tx.send(StreamCommand::Cancel);
         }
     }
 
@@ -1221,6 +1551,12 @@ impl VoiceSpeechController {
             let oldest = self.recording_order.remove(0);
             self.recordings.remove(&oldest);
         }
+    }
+
+    fn has_matching_active_consent(&self, prepared: &PreparedStart, cx: &App) -> bool {
+        resolve_voice_destination(self.app.read(cx), cx)
+            .active
+            .is_some_and(|active| active.grant_id == prepared.consent_grant_id)
     }
 
     fn finish_transcription(
@@ -1242,11 +1578,27 @@ impl VoiceSpeechController {
             return;
         };
 
+        if !self.has_matching_active_consent(prepared, cx) {
+            self.cancel_active_stream();
+            let effects = self.machine.on_transcription_finished(
+                operation_token,
+                Err(VoiceTranscriptionError::new(
+                    VoiceTranscriptionErrorCode::Unavailable,
+                    "Voice transcription was turned off before finishing.",
+                )),
+                false,
+            );
+            self.apply_effects(effects, cx);
+            return;
+        }
+
         let creds = prepared.destination.credentials.clone();
         let dest = prepared.destination.destination.clone();
         let options = prepared.options.clone();
         let can_post_process = prepared.can_post_process;
-        let stream_slot = self.active_stream.take();
+        let consent_gen_ref = prepared.consent_gen_ref.clone();
+        let expected_consent_gen = prepared.consent_generation;
+        let stream_handle = self.active_stream.take();
         let pcm_bytes = uri
             .as_deref()
             .and_then(|u| self.recordings.get(u).cloned())
@@ -1254,24 +1606,22 @@ impl VoiceSpeechController {
         let runtime = self.app.read(cx).runtime().clone();
 
         self._op_task = Some(cx.spawn(async move |this, cx| {
-            let res: Result<String, VoiceTranscriptionError> = if let Some(slot) = stream_slot {
-                let finish_res = runtime
-                    .spawn(async move {
-                        let session = slot.session.lock().await.take();
-                        match session {
-                            Some(session) => session.finish().await,
-                            None => Err(t3_client::voice::VoiceClientError::Stream(
-                                "Could not finish voice recording.".to_owned(),
-                            )),
-                        }
-                    })
-                    .await;
+            let res: Result<String, VoiceTranscriptionError> = if let Some(handle) = stream_handle {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let finish_res = if handle.cmd_tx.send(StreamCommand::Finish(reply_tx)).is_err() {
+                    Err(VoiceClientError::Stream(
+                        "Could not finish voice recording.".to_owned(),
+                    ))
+                } else {
+                    match reply_rx.await {
+                        Ok(res) => res,
+                        Err(_) => Err(VoiceClientError::Stream(
+                            "Could not finish voice recording.".to_owned(),
+                        )),
+                    }
+                };
                 match finish_res {
-                    Ok(Ok(text)) => Ok(text),
-                    Ok(Err(err)) => Err(VoiceTranscriptionError::new(
-                        VoiceTranscriptionErrorCode::TranscriptionFailed,
-                        err.to_string(),
-                    )),
+                    Ok(text) => Ok(text),
                     Err(err) => Err(VoiceTranscriptionError::new(
                         VoiceTranscriptionErrorCode::TranscriptionFailed,
                         err.to_string(),
@@ -1281,6 +1631,11 @@ impl VoiceSpeechController {
                 Err(VoiceTranscriptionError::new(
                     VoiceTranscriptionErrorCode::TranscriptionFailed,
                     "No speech was detected.",
+                ))
+            } else if consent_gen_ref.load(Ordering::SeqCst) != expected_consent_gen {
+                Err(VoiceTranscriptionError::new(
+                    VoiceTranscriptionErrorCode::Unavailable,
+                    "Voice transcription was turned off before finishing.",
                 ))
             } else {
                 let transcribe_res = runtime
@@ -1347,7 +1702,33 @@ impl VoiceSpeechController {
             return;
         };
 
-        let creds = prepared.destination.credentials.clone();
+        let app_state = self.app.read(cx);
+        let active_resolution = resolve_voice_destination(app_state, cx);
+        let still_consented = active_resolution.active.as_ref().is_some_and(|active| {
+            active.grant_id == prepared.consent_grant_id
+                && prepared.cleanup_requested
+                && active.cleanup_grant_id.is_some()
+                && active.cleanup_grant_id == prepared.cleanup_grant_id
+        });
+        if !still_consented || prepared.owner_key != draft.owner_key {
+            let effects = self
+                .machine
+                .on_post_processing_finished(operation_token, Ok(transcript));
+            self.apply_effects(effects, cx);
+            return;
+        }
+
+        let Some(creds) =
+            resolve_cleanup_credentials(app_state, prepared.draft_environment_id.as_deref())
+        else {
+            let effects = self.machine.on_post_processing_finished(
+                operation_token,
+                Err("The draft's environment is unavailable for transcript cleanup.".to_owned()),
+            );
+            self.apply_effects(effects, cx);
+            return;
+        };
+
         let options = prepared.cleanup_options.clone();
         let (ctx_text, ctx_sel) = cleanup_context(&draft.text, draft.selection);
         let req = EnvironmentSpeechPostProcessingRequest {
@@ -1361,7 +1742,7 @@ impl VoiceSpeechController {
                 },
             },
         };
-        let runtime = self.app.read(cx).runtime().clone();
+        let runtime = app_state.runtime().clone();
 
         self._op_task = Some(cx.spawn(async move |this, cx| {
             let res = runtime

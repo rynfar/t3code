@@ -270,7 +270,7 @@ pub struct Composer {
     enter_repeat: bool,
     picker_dismissed: Option<Instant>,
     menu_dismissed: Option<Instant>,
-    input_state: Option<(String, bool)>,
+    input_state: Option<(String, bool, bool)>,
     /// The question banner takes focus for its digit shortcuts while the prompt cannot type.
     question_focus: FocusHandle,
     limit_recovery: Entity<crate::thread_view::LimitRecoveryBanner>,
@@ -433,6 +433,7 @@ impl Composer {
         let composer_weak = cx.entity().downgrade();
         let composer_weak_hints = composer_weak.clone();
         let composer_weak_proj = composer_weak.clone();
+        let composer_weak_env = composer_weak.clone();
         let composer_weak_focus = composer_weak.clone();
         let composer_weak_disabled = composer_weak.clone();
         let voice = cx.new(|cx| {
@@ -457,6 +458,12 @@ impl Composer {
                         composer_weak_proj
                             .upgrade()
                             .and_then(|c| c.read(cx).snapshot.project_id.clone())
+                    }),
+                    environment_id_reader: std::rc::Rc::new(move |cx| {
+                        composer_weak_env
+                            .upgrade()
+                            .map(|c| c.read(cx).environment_id(cx))
+                            .filter(|id| !id.is_empty())
                     }),
                     on_open_voice_settings: std::rc::Rc::new(|_, cx| {
                         crate::settings::open_voice(cx);
@@ -591,10 +598,14 @@ impl Composer {
                         cx.notify();
                     }
                     crate::voice::VoiceControllerEvent::CommitDraft { text, selection } => {
-                        let caret = t3_core::voice_input::utf16_to_utf8_offset(text, selection.start);
+                        let caret = t3_core::voice_input::utf16_to_utf8_offset(text, selection.start)
+                            .min(text.len());
                         this.input.update(cx, |input, cx| {
-                            input.set_value(text.clone(), window, cx);
+                            let current_len = input.value().len();
+                            input.set_selected_range(0..current_len, cx);
+                            input.replace(text.clone(), window, cx);
                             input.set_selected_range(caret..caret, cx);
+                            input.focus(window, cx);
                         });
                         this.on_prompt_change(cx);
                         cx.notify();
@@ -1278,6 +1289,8 @@ impl Composer {
     pub(super) fn voice_is_disabled(&self, cx: &App) -> bool {
         self.sending
             || self.is_rewinding(cx)
+            || !self.snapshot.can_operate_thread
+            || self.snapshot.setup_blocks_send
             || self.active_input().is_some_and(|input| {
                 !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx)
             })

@@ -479,6 +479,15 @@ impl VoiceInputControllerMachine {
         self.state = state;
     }
 
+    /// Surfaces an external preparation or session-lock error and releases any active resources.
+    pub fn fail(&mut self, message: &str, action: Option<VoiceErrorAction>) -> Vec<VoiceControllerEffect> {
+        let mut effects = Vec::new();
+        self.operation_token += 1;
+        self.set_error(message, action, &mut effects);
+        self.release_resources(&mut effects);
+        effects
+    }
+
     pub fn start(&mut self, draft: Option<VoiceDraftSnapshot>) -> Vec<VoiceControllerEffect> {
         let mut effects = Vec::new();
         if !matches!(self.state.phase, VoiceInputPhase::Idle | VoiceInputPhase::Error) {
@@ -567,7 +576,14 @@ impl VoiceInputControllerMachine {
             }
             Err(err) => {
                 let msg = err.preparation_message().to_owned();
-                self.set_error(&msg, Some(VoiceErrorAction::Retry), &mut effects);
+                let action = if err.code == VoiceTranscriptionErrorCode::Unavailable
+                    && msg.contains("Settings \u{2192} Voice")
+                {
+                    Some(VoiceErrorAction::Settings)
+                } else {
+                    Some(VoiceErrorAction::Retry)
+                };
+                self.set_error(&msg, action, &mut effects);
                 self.release_resources(&mut effects);
             }
         }
@@ -601,11 +617,13 @@ impl VoiceInputControllerMachine {
                     return effects;
                 }
                 self.captured_draft = current_draft;
-                if self.has_live_start
+                if (self.uses_streaming || self.has_live_start)
                     && let Some(u) = uri
                 {
-                    self.live_transcription_started = true;
-                    self.live_transcription_in_flight = true;
+                    if self.has_live_start {
+                        self.live_transcription_started = true;
+                        self.live_transcription_in_flight = true;
+                    }
                     effects.push(VoiceControllerEffect::StartLiveTranscription { uri: u, operation_token });
                 }
                 effects.push(VoiceControllerEffect::StartRecorder {

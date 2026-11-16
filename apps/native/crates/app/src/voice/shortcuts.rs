@@ -270,6 +270,30 @@ pub fn handle_escape(window: &Window, cx: &mut App) -> bool {
     }
 }
 
+pub fn active_setup_controller(cx: &App) -> Option<Entity<VoiceSpeechController>> {
+    let registry = cx.try_global::<DictationShortcutRegistry>()?;
+    registry.targets.iter().find_map(|entry| {
+        let entity = entry.controller.upgrade()?;
+        entity.read(cx).setup().open.then_some(entity)
+    })
+}
+
+pub fn is_setup_modal_open(cx: &App) -> bool {
+    active_setup_controller(cx).is_some()
+}
+
+/// Closes an open VoiceInputSetup modal on Escape when not actively downloading, or consumes
+/// Escape while a download is active so background views don't handle it.
+pub fn handle_setup_escape(cx: &mut App) -> bool {
+    let Some(controller) = active_setup_controller(cx) else {
+        return false;
+    };
+    if !controller.read(cx).setup().downloading {
+        controller.update(cx, |voice, cx| voice.setup_set_open(false, cx));
+    }
+    true
+}
+
 pub fn dictation_shortcut_label(cx: &App) -> String {
     crate::keymap::label("composer.dictation", cx).unwrap_or_else(|| {
         if cfg!(target_os = "macos") {

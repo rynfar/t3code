@@ -73,6 +73,7 @@ impl Composer {
         let owner_for_draft = owner_key.clone();
         let composer_weak_hints = cx.entity().downgrade();
         let composer_weak_proj = cx.entity().downgrade();
+        let composer_weak_env = cx.entity().downgrade();
         let composer_weak_disabled = cx.entity().downgrade();
         let input_for_focus = input.downgrade();
         let voice = cx.new(|cx| {
@@ -105,6 +106,12 @@ impl Composer {
                         composer_weak_proj
                             .upgrade()
                             .and_then(|c| c.read(cx).snapshot.project_id.clone())
+                    }),
+                    environment_id_reader: std::rc::Rc::new(move |cx| {
+                        composer_weak_env
+                            .upgrade()
+                            .map(|c| c.read(cx).environment_id(cx))
+                            .filter(|id| !id.is_empty())
                     }),
                     on_open_voice_settings: std::rc::Rc::new(|_, cx| {
                         crate::settings::open_voice(cx);
@@ -154,21 +161,31 @@ impl Composer {
                 crate::voice::VoiceControllerEvent::StateChanged => {
                     if let Some(editor) = &this.citation_editor {
                         let frozen = editor.voice.read(cx).freezes_editor();
-                        editor.input.update(cx, |input, cx| input.set_disabled(frozen, cx));
+                        editor.input.update(cx, |input, cx| input.set_readonly(frozen, cx));
                     }
                     cx.notify();
                 }
                 crate::voice::VoiceControllerEvent::CommitDraft { text, selection } => {
                     if let Some(editor) = &this.citation_editor {
-                        let caret = utf16_to_utf8_offset(text, selection.start);
+                        let caret = utf16_to_utf8_offset(text, selection.start).min(text.len());
                         editor.input.update(cx, |input, cx| {
-                            input.set_value(text.clone(), window, cx);
+                            let current_len = input.value().len();
+                            input.set_selected_range(0..current_len, cx);
+                            input.replace(text.clone(), window, cx);
                             input.set_selected_range(caret..caret, cx);
+                            input.focus(window, cx);
                         });
                     }
                     cx.notify();
                 }
-                crate::voice::VoiceControllerEvent::SubmitAfterDictation { .. } => {
+                crate::voice::VoiceControllerEvent::SubmitAfterDictation { text } => {
+                    if rules::utf16_len(text) > rules::MAX_COMMENT {
+                        if let Some(editor) = this.citation_editor.as_mut() {
+                            editor.pending_secondary_submit = false;
+                        }
+                        cx.notify();
+                        return;
+                    }
                     let secondary = this
                         .citation_editor
                         .as_ref()
@@ -339,6 +356,7 @@ impl Composer {
         };
         let too_long = rules::utf16_len(&editor.input.read(cx).value()) > rules::MAX_COMMENT;
         let voice_frozen = editor.voice.read(cx).freezes_editor();
+        let voice_blocks = editor.voice.read(cx).blocks_submission();
         let voice_preparing = editor.voice.read(cx).preparing();
         menu_surface(cx)
             .id("citation-comment-editor")
@@ -390,7 +408,7 @@ impl Composer {
                             .aria_label("Comment on selected text")
                             .appearance(false)
                             .bordered(false)
-                            .disabled(voice_frozen),
+                            .readonly(voice_frozen),
                     )
                     .when(too_long, |this| this.child(div().text_size(px(12.)).text_color(hsla(palette(cx).destructive)).child("Comments can contain up to 8,000 characters.")))
                     .child(
@@ -412,7 +430,7 @@ impl Composer {
                                     })))
                                     .child(
                                         Button::new("save-citation-comment", ButtonVariant::Default, ButtonSize::Xs)
-                                            .disabled(too_long || voice_preparing)
+                                            .disabled(voice_preparing || (too_long && !voice_blocks))
                                             .label(if too_long { "Shorten comment" } else { "Save" })
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 if let Some(editor) = this.citation_editor.as_mut()

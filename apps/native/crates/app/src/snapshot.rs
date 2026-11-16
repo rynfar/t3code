@@ -119,7 +119,7 @@ fn apply_voice_fixture(
 
     state.update(cx, |state, cx| {
         state.freeze_snapshot();
-        if !matches!(state.phase, crate::app_state::Phase::Online(_)) {
+        if !state.shell.synchronized {
             let mut config = ServerConfigState::default();
             config.apply(
                 serde_json::from_value(json!({

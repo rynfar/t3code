@@ -309,7 +309,10 @@ impl Render for Workspace {
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 this.state.update(cx, |state, cx| state.star_prompt_activity(cx));
                 crate::voice::record_key_down(&event.keystroke.key, event.is_held, cx);
-                if event.keystroke.key == "escape" && crate::voice::handle_escape(window, cx) {
+                if event.keystroke.key == "escape"
+                    && (crate::voice::handle_escape(window, cx)
+                        || crate::voice::handle_setup_escape(cx))
+                {
                     cx.stop_propagation();
                 }
             }))
@@ -393,6 +396,7 @@ impl Render for Workspace {
                         || this.snooze.read(cx).is_open()
                         || this.palette.read(cx).is_open()
                         || crate::updates::overlay(cx).is_some()
+                        || crate::voice::is_setup_modal_open(cx)
                         || this.welcome.read(cx).is_open()
                         || crate::settings::overlay(window, cx).is_some()
                         || crate::usage::overlay(window, cx).is_some()
@@ -417,6 +421,7 @@ impl Render for Workspace {
                         || this.snooze.read(cx).is_open()
                         || this.palette.read(cx).is_open()
                         || crate::updates::overlay(cx).is_some()
+                        || crate::voice::is_setup_modal_open(cx)
                         || this.welcome.read(cx).is_open()
                         || crate::settings::overlay(window, cx).is_some()
                         || crate::usage::overlay(window, cx).is_some()
@@ -513,6 +518,7 @@ impl Render for Workspace {
             .child(self.device_setup.clone())
             .child(self.ssh_prompt.clone())
             .child(self.welcome.clone())
+            .children(crate::voice::render_active_voice_setup_modal(cx))
             .children(crate::toast::stack(&self.state, window, cx))
             .children(crate::updates::overlay(cx))
             .children(settings)

@@ -22,10 +22,11 @@ pub use controller::{VoiceControllerEvent, VoiceSpeechConfig, VoiceSpeechControl
 pub use platform::{MockAudioPlatform, install_audio_platform};
 pub use platform::{MicPermissionStatus, audio_platform};
 pub use shortcuts::{
-    Dictation, handle_dictation_action, handle_escape, handle_key_up, handle_window_blur,
-    record_key_down, register_dictation_target, unregister_dictation_target,
+    Dictation, handle_dictation_action, handle_escape, handle_key_up, handle_setup_escape,
+    handle_window_blur, is_setup_modal_open, record_key_down, register_dictation_target,
+    unregister_dictation_target,
 };
 pub use ui::{
-    VoiceUiSize, render_speech_button, render_speech_recording_pill,
-    render_text_field_speech_controls, render_voice_preview, render_voice_setup_modal,
+    VoiceUiSize, render_active_voice_setup_modal, render_speech_button,
+    render_speech_recording_pill, render_text_field_speech_controls, render_voice_preview,
 };

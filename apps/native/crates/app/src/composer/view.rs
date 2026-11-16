@@ -51,22 +51,27 @@ impl Composer {
         DEFAULT_PLACEHOLDER.to_owned()
     }
 
-    /// Placeholder and disabled state follow what the agent waits on; written only on change.
-    pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let placeholder = self.placeholder(cx);
-        let disabled = self.is_rewinding(cx)
-            || self.voice.read(cx).freezes_editor()
+    fn input_disabled(&self, cx: &App) -> bool {
+        self.is_rewinding(cx)
             || self.active_input().is_some_and(|input| {
                 !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx)
             })
-            || self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer());
-        if self.input_state.as_ref() == Some(&(placeholder.clone(), disabled)) {
+            || self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer())
+    }
+
+    /// Placeholder and disabled/readonly state follow what the agent waits on; written only on change.
+    pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = self.placeholder(cx);
+        let disabled = self.input_disabled(cx);
+        let readonly = self.voice.read(cx).freezes_editor();
+        if self.input_state.as_ref() == Some(&(placeholder.clone(), disabled, readonly)) {
             return;
         }
-        self.input_state = Some((placeholder.clone(), disabled));
+        self.input_state = Some((placeholder.clone(), disabled, readonly));
         self.input.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx);
             input.set_disabled(disabled, cx);
+            input.set_readonly(readonly, cx);
         });
     }
 
@@ -196,18 +201,19 @@ impl Composer {
         };
         let voice_blocks = self.voice.read(cx).blocks_submission();
         let voice_preparing = self.voice.read(cx).preparing();
+        let voice_disabled = self.voice_is_disabled(cx);
         let speech_pill = crate::voice::render_speech_recording_pill(
             "composer",
             &self.voice,
             crate::voice::VoiceUiSize::Regular,
-            self.sending || rewinding,
+            voice_disabled,
             cx,
         );
         let speech_button = crate::voice::render_speech_button(
             "composer",
             &self.voice,
             crate::voice::VoiceUiSize::Regular,
-            self.sending || rewinding,
+            voice_disabled,
             cx,
         );
         let with_voice = |primary: AnyElement| -> AnyElement {
@@ -235,10 +241,19 @@ impl Composer {
                     })
                     .child(
                         Pill::new("question-submit", requests::primary_action_label(&progress, responding))
-                            .disabled(!can_operate || responding || !enabled)
+                            .disabled(!can_operate || responding || voice_preparing || (!voice_blocks && !enabled))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.stop_phase != StopPhase::Landed {
-                                    this.advance(window, cx);
+                                    if this.voice.read(cx).blocks_submission() {
+                                        if !this.voice.read(cx).preparing() {
+                                            this.voice_pending_intent = Some(rules::SubmitIntent::Foreground);
+                                            this.voice.update(cx, |voice, cx| {
+                                                voice.submit_after_dictation(cx);
+                                            });
+                                        }
+                                    } else {
+                                        this.advance(window, cx);
+                                    }
                                 }
                             })),
                     )
@@ -387,6 +402,8 @@ impl Render for Composer {
         let show_permissions = resolved.runtime_mode != resolved.default_runtime_mode;
         let show_attach = self.shows_attach_button(cx);
         let (drop_fill, drop_ring) = (hsla(p.accent).opacity(0.45), hsla(p.primary).opacity(0.7));
+        let input_disabled = self.input_disabled(cx);
+        let voice_frozen = self.voice.read(cx).freezes_editor();
         let gutter = if self.fixed.is_some() { 12. } else { 48. };
         div().w_full().flex().justify_center().px(px(gutter)).pb(px(if self.fixed.is_some() { 12. } else { 16. })).pt(px(8.)).child(
             v_flex()
@@ -592,6 +609,8 @@ impl Render for Composer {
                                 .children(self.render_context_chips(cx))
                                 .children(self.render_citation_chips(cx))
                                 .child(Editor::new(&self.input).appearance(false)
+                                    .disabled(input_disabled)
+                                    .readonly(voice_frozen)
                                     .h(px(self.composer_editor_height(cx)))
                                     .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Prompt, cx))
                                     .text_size(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx)))
@@ -637,8 +656,7 @@ impl Render for Composer {
                 .children(self.render_workspace(cx).map(|control| h_flex().pt(px(8.)).px(px(8.)).child(control)))
                 .when(matches!(self.snapshot.target, Some(Target::Draft(_))), |this| {
                     this.children(self.render_usage_limits_banner(true, cx).map(render_draft_usage_limits_overlay))
-                })
-                .child(crate::voice::render_voice_setup_modal("composer", &self.voice, cx)),
+                }),
         )
     }
 }

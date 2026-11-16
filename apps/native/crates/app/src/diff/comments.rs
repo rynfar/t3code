@@ -330,6 +330,14 @@ index 1111111..2222222 100644
             .completion_scope
             .as_ref()
             .map(|scope| scope.project_id.clone());
+        let env_id_for_voice = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .map(|cfg| cfg.environment.environment_id.clone())
+            .filter(|id| !id.is_empty());
         let voice = cx.new(|cx| {
             crate::voice::VoiceSpeechController::new(
                 crate::voice::VoiceSpeechConfig {
@@ -352,6 +360,7 @@ index 1111111..2222222 100644
                     }),
                     hints_reader: Rc::new(move |_| vec![hint_file.clone()]),
                     project_id_reader: Rc::new(move |_| project_id.clone()),
+                    environment_id_reader: Rc::new(move |_| env_id_for_voice.clone()),
                     on_open_voice_settings: Rc::new(|_, cx| {
                         crate::settings::open_voice(cx);
                     }),
@@ -406,13 +415,16 @@ index 1111111..2222222 100644
                     };
                     if let Some(editor) = &this.comments.editor {
                         let frozen = voice_entity.read(cx).freezes_editor();
-                        editor.input.update(cx, |input, cx| input.set_disabled(frozen, cx));
+                        editor.input.update(cx, |input, cx| input.set_readonly(frozen, cx));
                     }
                     this.set_comment_dictation_state(next, cx);
                 }
                 crate::voice::VoiceControllerEvent::CommitDraft { text, selection } => {
                     let caret = utf16_to_utf8_offset(text, selection.start);
                     this.commit_comment_draft(text.clone(), Some(caret), window, cx);
+                    if let Some(editor) = &this.comments.editor {
+                        editor.input.update(cx, |input, cx| input.focus(window, cx));
+                    }
                 }
                 crate::voice::VoiceControllerEvent::SubmitAfterDictation { .. } => {
                     this.submit_comment(cx);
@@ -991,7 +1003,7 @@ index 1111111..2222222 100644
                     .child(
                         Textarea::new(&editor.input)
                             .aria_label(format!("Comment on lines {}", editor.comment.range_label))
-                            .disabled(frozen),
+                            .readonly(frozen),
                     )
                     .child(
                         h_flex()

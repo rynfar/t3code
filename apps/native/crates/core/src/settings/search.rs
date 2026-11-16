@@ -82,6 +82,7 @@ impl Section {
                     | Section::Browser
                     | Section::SnapShot
                 | Section::Keybindings
+                | Section::Voice
                 | Section::Providers
                 | Section::Threads
                 | Section::Devices
@@ -115,7 +116,7 @@ impl Features {
 
 /// `SETTINGS_NAV_GROUPS`: a group without a heading is set apart by space alone.
 pub const NAV_GROUPS: &[(Option<&str>, &[Section])] = &[
-    (None, &[Section::General, Section::Appearance, Section::Chat, Section::Diffs, Section::Keybindings, Section::SnapShot]),
+    (None, &[Section::General, Section::Appearance, Section::Chat, Section::Diffs, Section::Keybindings, Section::Voice, Section::SnapShot]),
     (Some("Agents"), &[Section::Providers, Section::Threads, Section::Browser, Section::Devices, Section::ScheduledTasks]),
     (Some("Code"), &[Section::Projects, Section::SourceControl, Section::Worktrees]),
     (Some("Connections"), &[Section::Connections, Section::Access, Section::Secrets]),
@@ -253,6 +254,10 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("telemetry-export", "OpenTelemetry export", Diagnostics, &["OTel OTLP telemetry export endpoints logs traces metrics Grafana"]),
         SearchItem::new("diagnostics", "Diagnostics", Maintenance, &["logs traces processes resource history failures spans cpu memory"]),
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
+        SearchItem::new("voice-transcription-destination", "Voice transcription", Voice, &["send microphone audio dictation destination speech voice stt transcription environment machine consent privacy cloud OpenAI Grok OpenRouter"]),
+        SearchItem::new("voice-cleanup-consent", "Clean up transcripts", Voice, &["speech transcription polish clean provider prompt post-processing"]),
+        SearchItem::new("voice-microphone-permission", "Microphone access", Voice, &["mic input audio permission system settings"]),
+        SearchItem::new("voice-shortcut-mode", "Dictation shortcut mode", Voice, &["speech voice keyboard hotkey hold toggle auto"]),
         SearchItem::new("providers", "Providers", Providers, &["agents cli codex claude cursor grok fx kiro opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory codex_home shadow home endpoint arguments environment variables display name accent color custom favorite hidden auto compact native sessions import resume"]),
         SearchItem::new("provider-health-check-interval", "Health check interval", Providers, &["refresh availability versions auth state models background probes seconds off"]),
         SearchItem::new("agent-device-access", "Agents can use devices", Devices, &["allow simulator emulator ios android drive tools sessions"]).target("devices"),

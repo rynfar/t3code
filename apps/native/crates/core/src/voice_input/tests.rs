@@ -323,6 +323,32 @@ fn controller_retries_failed_batch_audio_without_recording_again_then_deletes() 
 }
 
 #[test]
+fn streaming_without_live_start_emits_start_and_finish_without_hanging() {
+    let mut ctrl = VoiceInputControllerMachine::new(true, true);
+    let draft = default_draft();
+    ctrl.start(Some(draft.clone()));
+    let tok = ctrl.operation_token();
+    ctrl.on_permission(tok, true, true);
+    ctrl.on_transcriber_prepared(tok, Ok(("en".into(), true, false)));
+    let rec_effects = ctrl.on_recorder_prepared(
+        tok,
+        Ok(Some("memory://voice/1".into())),
+        Some(draft),
+        false,
+    );
+    assert!(rec_effects.contains(&VoiceControllerEffect::StartLiveTranscription {
+        uri: "memory://voice/1".into(),
+        operation_token: tok,
+    }));
+    let stop_effects = ctrl.stop();
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Transcribing);
+    assert!(stop_effects.contains(&VoiceControllerEffect::FinishTranscription {
+        operation_token: tok,
+        uri: Some("memory://voice/1".into()),
+    }));
+}
+
+#[test]
 fn controller_deletes_retained_audio_when_cancelled_and_handles_skip_post_processing() {
     let mut ctrl = VoiceInputControllerMachine::new(true, true);
     let initial = default_draft();

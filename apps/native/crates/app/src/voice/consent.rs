@@ -1,7 +1,11 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use gpui::{App, Global};
 use t3_client::auth::Credentials;
 use t3_client::store::{load_ui_state, save_ui_state};
 use t3_client::supervisor::ConnectionStatus;
+use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::voice_input::{
     AudioGrant, SavedAudioChoice, VoiceConsentState, VoiceTranscriptionDestination,
 };
@@ -24,9 +28,11 @@ pub struct VoiceEnvironmentCandidate {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedVoiceDestination {
+    pub grant_id: String,
     pub destination: VoiceTranscriptionDestination,
     pub credentials: Credentials,
     pub environment_label: String,
+    pub cleanup_grant_id: Option<String>,
     pub cleanup_granted: bool,
 }
 
@@ -39,12 +45,13 @@ pub struct VoiceDestinationResolution {
 struct StoredVoiceConsent {
     state: VoiceConsentState,
     persist_to_disk: bool,
+    generation: Arc<AtomicU64>,
 }
 
 impl Global for StoredVoiceConsent {}
 
 impl StoredVoiceConsent {
-    fn load() -> Self {
+    fn load(generation: Option<Arc<AtomicU64>>) -> Self {
         let mut state = VoiceConsentState::new();
         if let Some(value) = load_ui_state(AUDIO_GRANT_STORE_KEY)
             && let Ok(choice) = serde_json::from_value::<SavedAudioChoice>(value)
@@ -63,7 +70,11 @@ impl StoredVoiceConsent {
         {
             state.choose_transcript_cleanup(Some(grant_id));
         }
-        Self { state, persist_to_disk: true }
+        Self {
+            state,
+            persist_to_disk: true,
+            generation: generation.unwrap_or_else(|| Arc::new(AtomicU64::new(1))),
+        }
     }
 
     fn save(&self) {
@@ -81,8 +92,17 @@ impl StoredVoiceConsent {
 
 fn ensure_consent(cx: &mut App) {
     if cx.try_global::<StoredVoiceConsent>().is_none() {
-        cx.set_global(StoredVoiceConsent::load());
+        cx.set_global(StoredVoiceConsent::load(None));
     }
+}
+
+pub fn voice_consent_generation(cx: &mut App) -> (Arc<AtomicU64>, u64) {
+    ensure_consent(cx);
+    let stored = cx.global::<StoredVoiceConsent>();
+    (
+        stored.generation.clone(),
+        stored.generation.load(Ordering::SeqCst),
+    )
 }
 
 /// Installs an isolated in-memory consent state for GPUI tests and `--snapshot` fixtures.
@@ -101,13 +121,24 @@ pub fn install_memory_voice_consent(
     } else if matches!(choice, SavedAudioChoice::Off) {
         state.choose_audio_destination(None, None);
     }
-    cx.set_global(StoredVoiceConsent { state, persist_to_disk: false });
+    let generation = cx
+        .try_global::<StoredVoiceConsent>()
+        .map(|existing| {
+            existing.generation.fetch_add(1, Ordering::SeqCst);
+            existing.generation.clone()
+        })
+        .unwrap_or_else(|| Arc::new(AtomicU64::new(1)));
+    cx.set_global(StoredVoiceConsent {
+        state,
+        persist_to_disk: false,
+        generation,
+    });
 }
 
 pub fn voice_audio_choice(cx: &App) -> SavedAudioChoice {
     cx.try_global::<StoredVoiceConsent>()
         .map(|stored| stored.state.active_audio_choice())
-        .unwrap_or_else(|| StoredVoiceConsent::load().state.active_audio_choice())
+        .unwrap_or_else(|| StoredVoiceConsent::load(None).state.active_audio_choice())
 }
 
 pub fn voice_cleanup_granted(cx: &App) -> bool {
@@ -120,7 +151,7 @@ pub fn voice_cleanup_granted(cx: &App) -> bool {
     if let Some(stored) = cx.try_global::<StoredVoiceConsent>() {
         check(stored)
     } else {
-        check(&StoredVoiceConsent::load())
+        check(&StoredVoiceConsent::load(None))
     }
 }
 
@@ -138,6 +169,7 @@ pub fn choose_voice_destination(
     } else {
         stored.state.choose_transcript_cleanup(None);
     }
+    stored.generation.fetch_add(1, Ordering::SeqCst);
     stored.save();
     stored.state.active_grant()
 }
@@ -149,6 +181,7 @@ pub fn set_voice_cleanup_enabled(enabled: bool, cx: &mut App) {
     stored
         .state
         .choose_transcript_cleanup(enabled.then_some(active_id).flatten());
+    stored.generation.fetch_add(1, Ordering::SeqCst);
     stored.save();
 }
 
@@ -244,7 +277,7 @@ pub fn resolve_voice_destination(state: &AppState, cx: &App) -> VoiceDestination
     let stored = match stored {
         Some(stored) => stored,
         None => {
-            fallback = StoredVoiceConsent::load();
+            fallback = StoredVoiceConsent::load(None);
             &fallback
         }
     };
@@ -267,11 +300,18 @@ pub fn resolve_voice_destination(state: &AppState, cx: &App) -> VoiceDestination
                             candidate.cloud_transcription
                         }
                     };
+                    let cleanup_grant_id = stored
+                        .state
+                        .cleanup_grant()
+                        .filter(|id| *id == grant.id)
+                        .map(str::to_owned);
                     capable.then(|| ResolvedVoiceDestination {
+                        grant_id: grant.id.clone(),
                         destination: grant.destination.clone(),
                         credentials: candidate.credentials.clone(),
                         environment_label: candidate.label.clone(),
-                        cleanup_granted: stored.state.cleanup_grant() == Some(grant.id.as_str()),
+                        cleanup_granted: cleanup_grant_id.is_some(),
+                        cleanup_grant_id,
                     })
                 })
         }
@@ -282,4 +322,76 @@ pub fn resolve_voice_destination(state: &AppState, cx: &App) -> VoiceDestination
         offer_first_run_setup,
         active,
     }
+}
+
+/// Resolves credentials for optional transcript post-processing on the draft's own environment
+/// (never the audio destination unless they are the same environment).
+pub fn resolve_cleanup_credentials(
+    state: &AppState,
+    draft_env_id: Option<&str>,
+) -> Option<Credentials> {
+    let target_env_id = draft_env_id
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            state
+                .server_config
+                .config
+                .as_ref()
+                .map(|c| c.environment.environment_id.clone())
+        });
+    let target_id = target_env_id.as_deref();
+
+    for view in &state.fleet.environments {
+        if view.status != ConnectionStatus::Connected {
+            continue;
+        }
+        let Some(cfg) = view.config.config.as_ref() else {
+            continue;
+        };
+        let env_id = cfg.environment.environment_id.as_str();
+        let saved_id = view.summary.owner.saved_id.as_str();
+        let matches = target_id.is_none_or(|id| id == env_id || id == saved_id);
+        if !matches {
+            continue;
+        }
+        let supports_voice = cfg.environment.capabilities.voice_transcription == Some(true)
+            || cfg.environment.capabilities.cloud_voice_transcription == Some(true);
+        let can_operate = view
+            .grants
+            .as_ref()
+            .is_none_or(|session| session.grants(ORCHESTRATION_OPERATE_SCOPE));
+        if !supports_voice || !can_operate {
+            return None;
+        }
+        return state
+            .environments
+            .get(saved_id)
+            .and_then(|saved| saved.credentials())
+            .or_else(|| {
+                state
+                    .client_handle()
+                    .map(|client| client.credentials().clone())
+            });
+    }
+
+    if let (Some(client), Some(cfg)) = (state.client_handle(), state.server_config.config.as_ref()) {
+        let env_id = cfg.environment.environment_id.as_str();
+        let matches = target_id.is_none_or(|id| id == env_id);
+        if !matches {
+            return None;
+        }
+        let supports_voice = cfg.environment.capabilities.voice_transcription == Some(true)
+            || cfg.environment.capabilities.cloud_voice_transcription == Some(true);
+        let can_operate = client
+            .session_state()
+            .borrow()
+            .as_ref()
+            .is_none_or(|session| session.grants(ORCHESTRATION_OPERATE_SCOPE));
+        if supports_voice && can_operate {
+            return Some(client.credentials().clone());
+        }
+    }
+
+    None
 }

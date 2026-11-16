@@ -1,7 +1,8 @@
 use gpui::{
     AnyElement, App, BoxShadow, ElementId, Entity, FontWeight, MouseButton, ParentElement,
-    SharedString, Styled, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px, svg,
+    SharedString, Styled, StyledText, TextRun, Window, deferred, div, point, prelude::*, px, svg,
 };
+use gpui_component::ActiveTheme;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{h_flex, v_flex};
 use t3_core::voice_input::{
@@ -11,8 +12,7 @@ use t3_core::voice_input::{
 };
 
 use super::controller::{VoiceSetupStep, VoiceSpeechController};
-use super::shortcuts::dictation_shortcut_label;
-use crate::composer::controls::menu_surface;
+use super::shortcuts::{active_setup_controller, dictation_shortcut_label};
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
@@ -453,6 +453,31 @@ pub fn render_voice_preview(
         return div().into_any_element();
     }
     let p = palette(cx);
+    let font = gpui::font(cx.theme().font_family.clone());
+    let mut full = String::with_capacity(preview.committed.len() + preview.tentative.len());
+    let mut runs = Vec::new();
+    if !preview.committed.is_empty() {
+        full.push_str(&preview.committed);
+        runs.push(TextRun {
+            len: preview.committed.len(),
+            font: font.clone(),
+            color: hsla(p.foreground),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
+    if !preview.tentative.is_empty() {
+        full.push_str(&preview.tentative);
+        runs.push(TextRun {
+            len: preview.tentative.len(),
+            font,
+            color: hsla(p.muted_foreground),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
     div()
         .id(SharedString::from(format!("{id_prefix}-speech-preview")))
         .w_full()
@@ -465,19 +490,7 @@ pub fn render_voice_preview(
         .px(px(10.))
         .py(px(6.))
         .text_sm()
-        .child(
-            h_flex()
-                .flex_wrap()
-                .gap_x(px(4.))
-                .child(div().text_color(hsla(p.foreground)).child(preview.committed.clone()))
-                .when(!preview.tentative.is_empty(), |el| {
-                    el.child(
-                        div()
-                            .text_color(hsla(p.muted_foreground))
-                            .child(preview.tentative.clone()),
-                    )
-                }),
-        )
+        .child(StyledText::new(SharedString::from(full)).with_runs(runs))
         .into_any_element()
 }
 
@@ -505,6 +518,11 @@ pub fn render_text_field_speech_controls(
             cx,
         ))
         .into_any_element()
+}
+
+pub fn render_active_voice_setup_modal(cx: &App) -> Option<AnyElement> {
+    let controller = active_setup_controller(cx)?;
+    Some(render_voice_setup_modal("workspace", &controller, cx))
 }
 
 pub fn render_voice_setup_modal(
@@ -535,10 +553,12 @@ pub fn render_voice_setup_modal(
             .id(SharedString::from(format!("{id_prefix}-voice-setup-backdrop")))
             .absolute()
             .inset_0()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
-            .bg(hsla(p.background).opacity(0.62))
+            .p(px(16.))
+            .bg(hsla(p.dialog_backdrop))
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 if !setup.downloading {
                     scrim_close.update(cx, |voice, cx| voice.setup_set_open(false, cx));
@@ -546,23 +566,30 @@ pub fn render_voice_setup_modal(
                 cx.stop_propagation();
             })
             .child(
-                menu_surface(cx)
+                v_flex()
                     .id(SharedString::from(format!("{id_prefix}-voice-setup-dialog")))
-                    .w(px(400.))
-                    .max_w_full()
-                    .p(px(16.))
-                    .rounded(px(12.))
+                    .w_full()
+                    .max_w(px(420.))
+                    .relative()
+                    .rounded(px(16.))
+                    .child(crate::glass::backdrop(
+                        16.,
+                        hsla(p.dialog_surface),
+                        hsla(p.dialog_border),
+                        cx,
+                    ))
                     .shadow(vec![BoxShadow {
-                        color: gpui_hsla(0., 0., 0., 0.28),
-                        offset: point(px(0.), px(12.)),
-                        blur_radius: px(28.),
-                        spread_radius: px(-4.),
+                        color: hsla(p.dialog_backdrop),
+                        offset: point(px(0.), px(24.)),
+                        blur_radius: px(64.),
+                        spread_radius: px(-24.),
                         inset: false,
                     }])
-                    .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         v_flex()
+                            .relative()
+                            .p(px(20.))
                             .gap(px(12.))
                             .child(
                                 h_flex()
