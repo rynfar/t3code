@@ -59,6 +59,12 @@ pub(super) struct Outgoing {
 }
 
 impl Composer {
+    pub(crate) fn send_alternate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot.running && !matches!(self.snapshot.target, Some(Target::Draft(_))) {
+            self.submit(SubmitIntent::Alternate, window, cx);
+        }
+    }
+
     /// Submit, as the send button and Enter do.
     pub(crate) fn submit(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "snapshot")]

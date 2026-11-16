@@ -315,7 +315,19 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &crate::composer::OpenWorkspace, window, cx| this.composer.update(cx, |composer, cx| composer.open_workspace(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::OpenHost, window, cx| this.composer.update(cx, |composer, cx| composer.open_host(window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::CycleHost, window, cx| this.composer.update(cx, |composer, cx| composer.cycle_host(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::UsePreviousWorktree, window, cx| this.composer.update(cx, |composer, cx| composer.use_previous_worktree(window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::SendAlternate, window, cx| this.composer.update(cx, |composer, cx| composer.send_alternate(window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::SteerQueuedMessage, window, cx| {
+                if !this.composer.update(cx, |composer, cx| composer.steer_queued_message(window, cx)) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::composer::EditQueuedMessage, window, cx| {
+                if !this.composer.update(cx, |composer, cx| composer.edit_queued_message(window, cx)) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.open_permissions(window, cx));
             }))

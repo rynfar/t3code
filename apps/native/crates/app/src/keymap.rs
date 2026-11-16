@@ -70,9 +70,13 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),
         "composer.workspace" => Box::new(crate::composer::OpenWorkspace),
         "composer.host" => Box::new(crate::composer::OpenHost),
+        "composer.cycleHost" => Box::new(crate::composer::CycleHost),
         "composer.previousWorktree" => Box::new(crate::composer::UsePreviousWorktree),
         "composer.mode" => Box::new(crate::composer::OpenPermissions),
         "composer.stash" => Box::new(crate::composer::StashPrompt),
+        "composer.sendAlternate" => Box::new(crate::composer::SendAlternate),
+        "thread.steerQueuedMessage" => Box::new(crate::composer::SteerQueuedMessage),
+        "thread.editQueuedMessage" => Box::new(crate::composer::EditQueuedMessage),
         "rightPanel.toggle" => Box::new(crate::right_panel::ToggleRightPanel),
         "rightPanel.toggleMaximized" => Box::new(crate::right_panel::ToggleMaximized),
         "rightPanel.close" => Box::new(crate::right_panel::CloseActiveSurface),
@@ -195,8 +199,13 @@ pub fn install(server_keybindings: &serde_json::Value, cx: &mut App) {
 
 /// The display label for a command's effective shortcut, such as `⌘B`.
 pub fn label(command: &str, cx: &App) -> Option<String> {
+    label_in(command, &ShortcutMatchContext::default(), cx)
+}
+
+/// The display label for a command's effective shortcut under an explicit `when` context.
+pub fn label_in(command: &str, context: &ShortcutMatchContext, cx: &App) -> Option<String> {
     let rules = cx.try_global::<Keymap>().map_or(default_resolved_keybindings(), |keymap| keymap.rules.as_slice());
-    shortcut_label_for_command(rules, command, &ShortcutMatchContext::default(), cfg!(target_os = "macos"))
+    shortcut_label_for_command(rules, command, context, cfg!(target_os = "macos"))
 }
 
 /// Flags app state contributes to `when` clauses, set on the workspace root.

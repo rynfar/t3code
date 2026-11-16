@@ -58,7 +58,24 @@ use crate::toast::{Toast, ToastKind};
 use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
-actions!(composer, [OutdentList, ToggleModelPicker, OpenPermissions, PasteAsText, StashPrompt, FocusPrompt, OpenWorkspace, OpenHost, UsePreviousWorktree]);
+actions!(
+    composer,
+    [
+        OutdentList,
+        ToggleModelPicker,
+        OpenPermissions,
+        PasteAsText,
+        StashPrompt,
+        FocusPrompt,
+        OpenWorkspace,
+        OpenHost,
+        CycleHost,
+        UsePreviousWorktree,
+        SendAlternate,
+        SteerQueuedMessage,
+        EditQueuedMessage,
+    ]
+);
 
 pub fn init(cx: &mut App) {
     // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
@@ -3304,6 +3321,548 @@ mod stream_error_tests {
                 composer.sync_stop_phase(cx);
                 assert_eq!(composer.stop_phase, StopPhase::Landed);
             });
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn c4_worktree_base_branch_picker_search_pagination_and_host_visibility_parity(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, cx| {
+            state.environments.environments = vec![
+                t3_client::store::SavedEnvironment {
+                    id: "local".into(),
+                    environment_id: Some("env-local".into()),
+                    label: "MacBook Pro".into(),
+                    disabled: false,
+                    http_base: "http://127.0.0.1:1".into(),
+                    access_token: None,
+                    server_version: None,
+                    local: true,
+                    ssh: None,
+                },
+                t3_client::store::SavedEnvironment {
+                    id: "remote-1".into(),
+                    environment_id: Some("env-remote".into()),
+                    label: "Build Box".into(),
+                    disabled: false,
+                    http_base: "http://127.0.0.1:2".into(),
+                    access_token: None,
+                    server_version: None,
+                    local: false,
+                    ssh: None,
+                },
+            ];
+            state.environments.active = Some("local".into());
+            let mut shell = state.shell.snapshot.clone().unwrap_or_default();
+            if let Some(proj) = shell.projects.iter_mut().find(|p| p.id == "checkout-a") {
+                proj.repository_identity = Some(serde_json::json!({
+                    "canonicalKey": "github.com/acme/repo",
+                    "locator": { "source": "git-remote", "remoteName": "origin", "remoteUrl": "https://github.com/acme/repo.git" }
+                }));
+            }
+            state.shell.apply(t3_core::shell::ShellStreamItem::Snapshot {
+                snapshot: Box::new(shell),
+                resolved_repository_identity_roots: None,
+            });
+            state.start_draft("checkout-a", cx);
+        });
+
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let workspace = self.0.update(cx, |composer, cx| composer.render_workspace(cx));
+                gpui::div().w(gpui::px(720.)).children(workspace)
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.sync_workspace(false, cx);
+                composer.workspace.is_repo = true;
+                let req = composer.workspace.refs.begin("", false).unwrap();
+                composer.workspace.refs.finish(
+                    &req,
+                    Ok(vec![t3_core::vcs::ListRefsResult {
+                        is_repo: true,
+                        has_primary_remote: true,
+                        refs: vec![t3_core::vcs::VcsRef {
+                            name: "main".into(),
+                            current: true,
+                            is_default: true,
+                            is_remote: Some(false),
+                            remote_name: None,
+                            worktree_path: None,
+                        }],
+                        next_cursor: Some(100),
+                        total_count: 150,
+                    }]),
+                );
+            });
+            window.draw(cx).clear();
+        });
+
+        // Finding 3: single/non-fleet primary host must stay hidden even when >1 saved envs exist.
+        vcx.update(|_, cx| {
+            let c = composer.read(cx);
+            assert!(c.host_options(cx).active.is_none());
+        });
+        assert!(vcx.debug_bounds("composer-host").is_none());
+        assert!(vcx.debug_bounds("composer-host-indicator").is_none());
+
+        // Finding 3: remote non-fleet host renders muted non-interactive indicator (`composer-host-indicator`).
+        vcx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.environments.environments[0].local = false;
+                state.environments.environments[0].label = "Remote Box".into();
+                cx.emit(AppEvent::Shell);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("composer-host-indicator").is_some());
+        assert!(vcx.debug_bounds("composer-host").is_none());
+
+        // Restore primary and test fleet mode with `add_targets` when another connected machine lacks the project.
+        vcx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.environments.environments[0].local = true;
+                state.environments.environments[0].label = "MacBook Pro".into();
+                let owner_local = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "local".into(),
+                    canonical_id: Some("env-local".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                let owner_remote = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "remote-1".into(),
+                    canonical_id: Some("env-remote".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                let mut config_remote = t3_core::server_config::ServerConfigState::default();
+                let cfg: t3_core::server_config::ServerConfig = serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "env-remote", "label": "Build Box", "platform": { "os": "linux", "arch": "x64" } },
+                    "auth": { "policy": "loopback-auto" }
+                })).unwrap();
+                config_remote.config = Some(cfg);
+                let remote_grants: t3_core::auth::AuthSessionState = serde_json::from_value(serde_json::json!({
+                    "authenticated": true,
+                    "scopes": ["source-control:write", "orchestration:read"]
+                })).unwrap();
+                let mut remote_shell = t3_core::shell::ShellState::default();
+                remote_shell.synchronized = true;
+                state.fleet = std::sync::Arc::new(t3_client::environments::FleetView {
+                    revision: 1,
+                    environments: vec![
+                        std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                            summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner_local,
+                                &state.shell,
+                                &state.server_config,
+                            )),
+                            status: t3_client::supervisor::ConnectionStatus::Connected,
+                            config: state.server_config.clone(),
+                            grants: Some(remote_grants.clone()),
+                            settings_revision: 0,
+                            keybindings_revision: 0,
+                        }),
+                        std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                            summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner_remote,
+                                &remote_shell,
+                                &config_remote,
+                            )),
+                            status: t3_client::supervisor::ConnectionStatus::Connected,
+                            config: config_remote,
+                            grants: Some(remote_grants),
+                            settings_revision: 0,
+                            keybindings_revision: 0,
+                        }),
+                    ],
+                });
+                state.sidebar.grouping_projects = state.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect();
+                state.sidebar.grouping_threads = state.fleet.environments.iter().flat_map(|entry| entry.summary.threads.iter().cloned()).collect();
+                state.rebuild_sidebar(cx);
+                cx.emit(AppEvent::Shell);
+            });
+            window.draw(cx).clear();
+            let host = composer.read(cx).host_options(cx);
+            assert!(host.can_pick);
+            assert_eq!(host.options.len(), 1);
+            assert_eq!(host.add_targets.len(), 1);
+            assert_eq!(host.add_targets[0].saved_id, "remote-1");
+        });
+        assert!(vcx.debug_bounds("composer-host").is_some());
+
+        // Finding 1: WorktreeBaseBranchPicker pagination status, empty state, and search reset on close.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.mutate_draft_workspace(cx, |ws| ws.mode = t3_core::server_config::ThreadEnvMode::Worktree);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("composer-base-branch").is_some());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.open_base_branch_picker(window, cx);
+                assert!(composer.workspace.branch_open);
+                assert!(composer.workspace.base_search.is_some());
+                assert_eq!(composer.base_branch_status_text().as_deref(), Some("Showing 1 of 150 refs"));
+
+                let next = composer.workspace.refs.begin("", true).unwrap();
+                composer.workspace.refs.finish(
+                    &next,
+                    Ok(vec![t3_core::vcs::ListRefsResult {
+                        is_repo: true,
+                        has_primary_remote: true,
+                        refs: vec![t3_core::vcs::VcsRef {
+                            name: "origin/release".into(),
+                            current: false,
+                            is_default: false,
+                            is_remote: Some(true),
+                            remote_name: Some("origin".into()),
+                            worktree_path: None,
+                        }],
+                        next_cursor: None,
+                        total_count: 2,
+                    }]),
+                );
+                assert_eq!(composer.workspace.refs.refs.len(), 2);
+                assert_eq!(composer.base_branch_status_text(), None);
+
+                let empty_req = composer.workspace.refs.begin("missing-ref", false).unwrap();
+                composer.workspace.refs.finish(
+                    &empty_req,
+                    Ok(vec![t3_core::vcs::ListRefsResult {
+                        is_repo: true,
+                        has_primary_remote: true,
+                        refs: Vec::new(),
+                        next_cursor: None,
+                        total_count: 0,
+                    }]),
+                );
+                assert!(composer.workspace.refs.refs.is_empty());
+                assert_eq!(composer.workspace.refs.error, None);
+
+                composer.workspace.base_search.as_ref().unwrap().update(cx, |input, cx| input.set_value("missing-ref", window, cx));
+                composer.close_base_branch_picker(false, window, cx);
+                assert!(!composer.workspace.branch_open);
+                assert_eq!(composer.workspace.base_search.as_ref().unwrap().read(cx).value(), "");
+            });
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn c4_composer_queue_and_host_keybindings_dispatch_and_tooltips(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+
+        cx.update(|cx| {
+            crate::keymap::init(cx);
+            assert_eq!(crate::keymap::action_for("composer.cycleHost").as_any().type_id(), std::any::TypeId::of::<CycleHost>());
+            assert_eq!(crate::keymap::action_for("composer.sendAlternate").as_any().type_id(), std::any::TypeId::of::<SendAlternate>());
+            assert_eq!(crate::keymap::action_for("thread.steerQueuedMessage").as_any().type_id(), std::any::TypeId::of::<SteerQueuedMessage>());
+            assert_eq!(crate::keymap::action_for("thread.editQueuedMessage").as_any().type_id(), std::any::TypeId::of::<EditQueuedMessage>());
+            assert!(crate::keymap::label("thread.steerQueuedMessage", cx).is_some());
+            assert!(
+                crate::keymap::label_in(
+                    "thread.editQueuedMessage",
+                    &t3_core::keybindings::ShortcutMatchContext::default().with("composerFocus", true),
+                    cx,
+                )
+                .is_some()
+            );
+            assert!(
+                crate::keymap::label_in(
+                    "composer.sendAlternate",
+                    &t3_core::keybindings::ShortcutMatchContext::default().with("composerFocus", true).with("turnRunning", true),
+                    cx,
+                )
+                .is_some()
+            );
+        });
+
+        let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+            "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": false, "historyCursor": null,
+            "projection": {
+                "thread": {
+                    "id": "t1", "projectId": "checkout-a", "title": "T1",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                    "providerInstanceId": "codex", "modelSelection": {"instanceId":"codex","model":"m"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                    "activeRunId": "run-active"
+                },
+                "runs": [
+                    { "id": "run-active", "threadId": "t1", "ordinal": 1, "providerInstanceId": "codex", "modelSelection": {"instanceId":"codex","model":"m"}, "status": "running", "userMessageId": "m0", "activeAttemptId": "att-0", "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z", "completedAt": null },
+                    { "id": "run-q1", "threadId": "t1", "ordinal": 2, "queuePosition": 1, "providerInstanceId": "codex", "modelSelection": {"instanceId":"codex","model":"m"}, "status": "queued", "userMessageId": "m1", "requestedAt": "2026-04-01T00:00:02.000Z", "startedAt": null, "completedAt": null },
+                    { "id": "run-q2", "threadId": "t1", "ordinal": 3, "queuePosition": 2, "providerInstanceId": "codex", "modelSelection": {"instanceId":"codex","model":"m"}, "status": "queued", "userMessageId": "m2", "requestedAt": "2026-04-01T00:00:03.000Z", "startedAt": null, "completedAt": null }
+                ],
+                "attempts": [], "nodes": [], "subagents": [],
+                "providerSessions": [{ "id": "ps1", "threadId": "t1", "providerInstanceId": "codex", "status": "running", "capabilities": { "turns": { "supportsActiveSteering": true } } }],
+                "providerThreads": [],
+                "providerTurns": [{ "id": "pt1", "threadId": "t1", "runAttemptId": "att-0", "status": "running" }],
+                "runtimeRequests": [],
+                "messages": [
+                    { "id": "m0", "role": "user", "text": "active" },
+                    { "id": "m1", "role": "user", "text": "First queued" },
+                    { "id": "m2", "role": "user", "text": "Latest queued" }
+                ],
+                "plans": [], "turnItems": [], "checkpointScopes": [],
+                "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                "visibleTurnItems": [], "updatedAt": "2026-04-01T00:00:05.000Z"
+            }
+        }"#).unwrap();
+        state.update(cx, |state, cx| {
+            state.client_settings.follow_up_behavior = t3_core::composer::FollowUpBehavior::Steer;
+            let config = state.server_config.config.get_or_insert_with(|| {
+                serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "env-local", "label": "MacBook Pro", "platform": { "os": "darwin", "arch": "arm64" } },
+                    "auth": { "policy": "loopback-auto" }
+                }))
+                .unwrap()
+            });
+            config.providers = serde_json::from_value(serde_json::json!([
+                {
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "auth": { "status": "authenticated" },
+                    "models": [{ "slug": "m", "name": "GPT-5" }]
+                }
+            ]))
+            .unwrap();
+            let mut shell_snap = state.shell.snapshot.clone().unwrap_or_default();
+            shell_snap.threads.push(serde_json::from_value(serde_json::json!({
+                "id": "t1",
+                "projectId": "checkout-a",
+                "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z",
+                "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "codex",
+                "modelSelection": {"instanceId":"codex","model":"m"},
+                "runtimeMode": "auto",
+                "interactionMode": "default",
+                "lineage": {"rootThreadId":"t1"},
+                "status": "running",
+                "activeRunId": "run-active",
+                "hasActionableProposedPlan": false,
+                "itemCount": 0,
+                "visibleItemCount": 0
+            })).unwrap());
+            state.shell.apply(t3_core::shell::ShellStreamItem::Snapshot {
+                snapshot: Box::new(shell_snap),
+                resolved_repository_identity_roots: None,
+            });
+            state.select_thread("t1", cx);
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::ServerConfig);
+            cx.emit(AppEvent::Shell);
+            cx.emit(AppEvent::Thread);
+        });
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let queue = self.0.update(cx, |composer, cx| composer.render_queue(cx));
+                gpui::div().w(gpui::px(720.)).children(queue)
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        vcx.update(|window, cx| window.draw(cx).clear());
+
+        // `edit_queued_message` checks caret position: rejected when caret is not at 0..0, edits latest (`run-q2`) when at 0..0.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("drafting", window, cx);
+                composer.input.update(cx, |input, cx| input.set_selected_range(3..3, cx));
+                assert!(!composer.edit_queued_message(window, cx));
+                assert!(composer.editing_queued().is_none());
+
+                composer.set_prompt("", window, cx);
+                composer.input.update(cx, |input, cx| input.set_selected_range(0..0, cx));
+                assert!(composer.edit_queued_message(window, cx));
+                assert_eq!(composer.editing_queued().map(|e| e.run_id.as_str()), Some("run-q2"));
+                assert_eq!(composer.prompt(cx), "Latest queued");
+                composer.cancel_queued_edit(window, cx);
+                assert!(composer.editing_queued().is_none());
+
+                // `steer_queued_message` promotes the FIRST queued run (`run-q1`).
+                assert!(composer.steer_queued_message(window, cx));
+            });
+        });
+        let req_payload = loop {
+            let (m, payload, tx) = fixture.next_request().await;
+            if m == t3_core::commands::method::DISPATCH_COMMAND && payload["type"] != "thread.visit" {
+                let _ = tx.send(Ok(serde_json::json!({"sequence": 2})));
+                break payload;
+            }
+            let _ = tx.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(req_payload["type"], "queued-message.promote-to-steer");
+        assert_eq!(req_payload["queuedRunId"], "run-q1");
+        vcx.run_until_parked();
+
+        // `send_alternate` dispatches while running when `composer.sendAlternate` fires.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                assert!(composer.snapshot.running, "thread must be running for send_alternate");
+                assert!(!composer.sending, "composer should not still be sending");
+                assert!(!composer.snapshot.setup_blocks_send, "setup should not block send");
+                assert!(composer.resolve(cx).model.is_some(), "provider/model should resolve");
+                composer.set_prompt("Alternate send", window, cx);
+                composer.send_alternate(window, cx);
+                assert_eq!(composer.error, None, "send_alternate should not error");
+                assert!(composer.sending, "send_alternate should start sending");
+            });
+        });
+        let alt_payload = loop {
+            let (m, payload, tx) = fixture.next_request().await;
+            if m == t3_core::commands::method::DISPATCH_COMMAND && payload["type"] != "thread.visit" {
+                let _ = tx.send(Ok(serde_json::json!({"sequence": 3})));
+                break payload;
+            }
+            let _ = tx.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(alt_payload["type"], "message.dispatch");
+        assert_eq!(alt_payload["dispatchMode"]["type"], "queue_after_active");
+        vcx.run_until_parked();
+
+        // `cycle_host` switches between 2 fleet project environments.
+        vcx.update(|_window, cx| {
+            state.update(cx, |state, cx| {
+                state.environments.environments = vec![
+                    t3_client::store::SavedEnvironment {
+                        id: "local".into(),
+                        environment_id: Some("env-local".into()),
+                        label: "MacBook Pro".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:1".into(),
+                        access_token: None,
+                        server_version: None,
+                        local: true,
+                        ssh: None,
+                    },
+                    t3_client::store::SavedEnvironment {
+                        id: "remote-1".into(),
+                        environment_id: Some("env-remote".into()),
+                        label: "Build Box".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:2".into(),
+                        access_token: None,
+                        server_version: None,
+                        local: false,
+                        ssh: None,
+                    },
+                ];
+                state.environments.active = Some("local".into());
+                let owner_local = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "local".into(),
+                    canonical_id: Some("env-local".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                let owner_remote = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "remote-1".into(),
+                    canonical_id: Some("env-remote".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                let mut shell_remote = state.shell.snapshot.clone().unwrap_or_default();
+                for proj in &mut shell_remote.projects {
+                    if proj.id == "checkout-a" {
+                        proj.repository_identity = Some(serde_json::json!({"canonicalKey": "github.com/acme/repo"}));
+                    }
+                }
+                state.shell.apply(t3_core::shell::ShellStreamItem::Snapshot {
+                    snapshot: Box::new(shell_remote.clone()),
+                    resolved_repository_identity_roots: None,
+                });
+                let mut remote_shell_state = t3_core::shell::ShellState::default();
+                remote_shell_state.synchronized = true;
+                remote_shell_state.apply(t3_core::shell::ShellStreamItem::Snapshot {
+                    snapshot: Box::new(shell_remote),
+                    resolved_repository_identity_roots: None,
+                });
+                let mut config_remote = t3_core::server_config::ServerConfigState::default();
+                config_remote.config = Some(serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "env-remote", "label": "Build Box", "platform": { "os": "linux", "arch": "x64" } },
+                    "auth": { "policy": "loopback-auto" }
+                })).unwrap());
+                let grants: t3_core::auth::AuthSessionState = serde_json::from_value(serde_json::json!({
+                    "authenticated": true,
+                    "scopes": ["source-control:write", "orchestration:read"]
+                })).unwrap();
+                state.fleet = std::sync::Arc::new(t3_client::environments::FleetView {
+                    revision: 1,
+                    environments: vec![
+                        std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                            summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner_local,
+                                &state.shell,
+                                &state.server_config,
+                            )),
+                            status: t3_client::supervisor::ConnectionStatus::Connected,
+                            config: state.server_config.clone(),
+                            grants: Some(grants.clone()),
+                            settings_revision: 0,
+                            keybindings_revision: 0,
+                        }),
+                        std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                            summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner_remote,
+                                &remote_shell_state,
+                                &config_remote,
+                            )),
+                            status: t3_client::supervisor::ConnectionStatus::Connected,
+                            config: config_remote,
+                            grants: Some(grants),
+                            settings_revision: 0,
+                            keybindings_revision: 0,
+                        }),
+                    ],
+                });
+                state.sidebar.grouping_projects = state.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect();
+                state.sidebar.grouping_threads = state.fleet.environments.iter().flat_map(|entry| entry.summary.threads.iter().cloned()).collect();
+                state.rebuild_sidebar(cx);
+                state.start_draft("checkout-a", cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                assert_eq!(composer.host_options(cx).options.len(), 2);
+                composer.cycle_host(window, cx);
+            });
+            assert_eq!(state.read(cx).environments.active.as_deref(), Some("remote-1"));
         });
 
         state.update(cx, |state, _| state.stop_pump());

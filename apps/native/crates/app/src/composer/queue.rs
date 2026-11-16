@@ -59,6 +59,46 @@ impl Composer {
         cx.notify();
     }
 
+    /// `steerNext`: steer or send the first queued run if eligible (`ChatView.tsx`).
+    pub(crate) fn steer_queued_message(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if matches!(self.snapshot.target, Some(super::Target::Draft(_))) || self.queue.busy.is_some() || self.is_rewinding(cx) {
+            return false;
+        }
+        let queue = self.snapshot.queue.clone();
+        let Some(next) = queue.queued.first() else {
+            return false;
+        };
+        if !queue.can_send_run(next.fresh_context) {
+            return false;
+        }
+        self.send_queued_now(next.run_id.clone(), cx);
+        true
+    }
+
+    /// `editLatest`: load the last editable queued run into the composer when caret is at start (`ChatView.tsx`).
+    pub(crate) fn edit_queued_message(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if matches!(self.snapshot.target, Some(super::Target::Draft(_)))
+            || self.queue.editing.is_some()
+            || self.queue.busy.is_some()
+            || self.is_rewinding(cx)
+            || !self.snapshot.pending.user_inputs.is_empty()
+        {
+            return false;
+        }
+        let sel = self.input.read(cx).selected_range();
+        if sel.start != 0 || sel.end != 0 {
+            return false;
+        }
+        let Some(latest) = self.snapshot.queue.queued.last().cloned() else {
+            return false;
+        };
+        if !latest.editable {
+            return false;
+        }
+        self.begin_queued_edit(&latest, window, cx);
+        true
+    }
+
     fn send_queued_now(&mut self, run_id: String, cx: &mut Context<Self>) {
         let Some(thread_id) = self.thread_id() else { return };
         if self.queue.busy.is_some() || self.is_rewinding(cx) {
@@ -295,7 +335,14 @@ impl Composer {
             let run_for_send = run.run_id.clone();
             let run_for_remove = run.run_id.clone();
             let run_for_edit = run.clone();
-            let send_tooltip = queue.send_tooltip();
+            let steer_shortcut = (position == 0).then(|| crate::keymap::label("thread.steerQueuedMessage", cx)).flatten();
+            let send_tooltip = steer_shortcut.map_or_else(|| queue.send_tooltip().to_owned(), |shortcut| format!("{} ({shortcut})", queue.send_tooltip()));
+            let edit_shortcut = (position + 1 == queue.queued.len())
+                .then(|| crate::keymap::label_in("thread.editQueuedMessage", &t3_core::keybindings::ShortcutMatchContext::default().with("composerFocus", true), cx))
+                .flatten();
+            let edit_tooltip = blocked
+                .map(str::to_owned)
+                .unwrap_or_else(|| edit_shortcut.map_or_else(|| "Edit in the composer".to_owned(), |shortcut| format!("Edit in the composer ({shortcut})")));
             let can_send_this_run = queue.can_send_run(run.fresh_context);
             let open_thread_id = source_thread_id.clone();
             let open_thread_env = linked_env_id.clone();
@@ -370,7 +417,7 @@ impl Composer {
                         this.child(
                             Button::new(("queued-edit", position), ButtonVariant::Ghost, ButtonSize::IconXs)
                                 .icon(Icon::Pencil)
-                                .tooltip(blocked.unwrap_or("Edit in the composer"))
+                                .tooltip(edit_tooltip)
                                 .disabled(!run.editable || busy || blocked.is_some())
                                 .on_click(cx.listener(move |this, _, window, cx| this.begin_queued_edit(&run_for_edit, window, cx))),
                         )

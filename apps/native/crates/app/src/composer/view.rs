@@ -278,7 +278,13 @@ impl Composer {
             format!("Summarize {tokens} tokens of history, then send").into()
         } else if running && can_steer && !editing_queued {
             let action = |mode| if mode == ComposerDispatch::Queue { "queue" } else { "steer" };
-            format!("Click to {}, ⌘-click to {}", action(dispatch), action(alternate)).into()
+            let alt_key = crate::keymap::label_in(
+                "composer.sendAlternate",
+                &t3_core::keybindings::ShortcutMatchContext::default().with("composerFocus", true).with("turnRunning", true),
+                cx,
+            );
+            let via = alt_key.map_or_else(|| "⌘-click".to_owned(), |shortcut| format!("{shortcut} or ⌘-click"));
+            format!("Click to {}, {via} to {}", action(dispatch), action(alternate)).into()
         } else {
             label.into()
         };
@@ -357,7 +363,19 @@ impl Render for Composer {
                 .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| this.toggle_picker(window, cx)))
                 .on_action(cx.listener(|this, _: &super::OpenWorkspace, window, cx| this.open_workspace(window, cx)))
                 .on_action(cx.listener(|this, _: &super::OpenHost, window, cx| this.open_host(window, cx)))
+                .on_action(cx.listener(|this, _: &super::CycleHost, window, cx| this.cycle_host(window, cx)))
                 .on_action(cx.listener(|this, _: &super::UsePreviousWorktree, window, cx| this.use_previous_worktree(window, cx)))
+                .on_action(cx.listener(|this, _: &super::SendAlternate, window, cx| this.send_alternate(window, cx)))
+                .on_action(cx.listener(|this, _: &super::SteerQueuedMessage, window, cx| {
+                    if !this.steer_queued_message(window, cx) {
+                        cx.propagate();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &super::EditQueuedMessage, window, cx| {
+                    if !this.edit_queued_message(window, cx) {
+                        cx.propagate();
+                    }
+                }))
                 .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| this.open_permissions(window, cx)))
                 // The open menu takes these keys before the prompt does (`composerCommandKey`).
                 .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
