@@ -77,6 +77,10 @@ pub fn client(cx: &App) -> &ClientSettingsDoc {
     &cx.global::<ClientPrefs>().doc
 }
 
+pub fn try_client(cx: &App) -> Option<&ClientSettingsDoc> {
+    cx.try_global::<ClientPrefs>().map(|prefs| &prefs.doc)
+}
+
 pub fn error(cx: &App) -> Option<SharedString> {
     cx.global::<ClientPrefs>().error.clone()
 }

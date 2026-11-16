@@ -266,6 +266,7 @@ fn nav_keeps_the_web_order_and_drops_unported_sections() {
             Section::Chat,
             Section::Diffs,
             Section::Keybindings,
+            Section::Voice,
             Section::SnapShot,
             Section::Providers,
             Section::Threads,

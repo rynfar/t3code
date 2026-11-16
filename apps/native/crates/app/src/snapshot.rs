@@ -82,6 +82,316 @@ fn gestures(args: &[String]) -> Vec<Gesture> {
         .collect()
 }
 
+fn apply_voice_fixture(
+    mode: &str,
+    state: &Entity<AppState>,
+    window: AnyWindowHandle,
+    cx: &mut VisualTestAppContext,
+) -> Result<(), String> {
+    use serde_json::json;
+    use t3_client::environments::{EnvironmentView, FleetView};
+    use t3_client::store::{SavedEnvironment, SavedEnvironments};
+    use t3_client::supervisor::ConnectionStatus;
+    use t3_core::server_config::ServerConfigState;
+    use t3_core::shell::ShellState;
+    use t3_core::sidebar::fleet::EnvironmentSummary;
+    use t3_core::sidebar::grouping::EnvironmentOwner;
+    use t3_core::voice_input::{
+        AudioGrant, EnvironmentSpeechModel, EnvironmentSpeechModelState,
+        MICROPHONE_PERMISSION_ERROR, SavedAudioChoice, SpeechStreamText, VoiceErrorAction,
+        VoiceInputState, VoiceTranscriptionDestination,
+    };
+
+    cx.update(|cx| {
+        crate::voice::install_audio_platform(
+            Arc::new(crate::voice::MockAudioPlatform::new()),
+            cx,
+        );
+        crate::voice::install_memory_voice_consent(
+            SavedAudioChoice::Granted(AudioGrant {
+                id: "snapshot-grant".into(),
+                destination: VoiceTranscriptionDestination::environment("env-snapshot"),
+            }),
+            true,
+            cx,
+        );
+    });
+
+    state.update(cx, |state, cx| {
+        state.freeze_snapshot();
+        if !state.shell.synchronized {
+            let mut config = ServerConfigState::default();
+            config.apply(
+                serde_json::from_value(json!({
+                    "type": "snapshot",
+                    "config": {
+                        "environment": {
+                            "environmentId": "env-snapshot",
+                            "label": "MacBook Pro",
+                            "capabilities": {
+                                "voiceTranscription": true,
+                                "cloudVoiceTranscription": true
+                            }
+                        },
+                        "providers": [{
+                            "instanceId": "codex",
+                            "driver": "codex",
+                            "displayName": "Codex",
+                            "models": [{
+                                "slug": "gpt-5.3-codex",
+                                "name": "GPT-5.3 Codex",
+                                "supportsReasoning": false
+                            }]
+                        }],
+                        "settings": {}
+                    }
+                }))
+                .expect("voice snapshot config"),
+            );
+            let mut shell = ShellState::default();
+            shell.synchronized = true;
+            shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                projects: vec![t3_core::shell::ProjectShell {
+                    id: "proj-snapshot".into(),
+                    title: "t3code".into(),
+                    has_custom_title: None,
+                    workspace_root: "/repo".into(),
+                    repository_identity: None,
+                    default_model_selection: None,
+                    pinned_at: None,
+                    archived_at: None,
+                    favicon_path: None,
+                    project_icon: None,
+                    scripts: Vec::new(),
+                    created_at: "2026-04-01T00:00:00.000Z".into(),
+                    updated_at: "2026-04-01T00:00:00.000Z".into(),
+                }],
+                threads: vec![serde_json::from_value(json!({
+                    "id": "thread-snapshot",
+                    "projectId": "proj-snapshot",
+                    "title": "Voice dictation review",
+                    "tags": [],
+                    "providerInstanceId": "codex",
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5.3-codex" },
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "branch": "main",
+                    "worktreePath": null,
+                    "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "thread-snapshot" },
+                    "latestRunId": null,
+                    "activeRunId": null,
+                    "status": "ready",
+                    "pendingRuntimeRequest": null,
+                    "latestVisibleMessage": null,
+                    "latestUserMessageAt": null,
+                    "hasActionableProposedPlan": false,
+                    "itemCount": 0,
+                    "visibleItemCount": 0,
+                    "createdAt": "2026-04-01T00:00:00.000Z",
+                    "updatedAt": "2026-04-01T00:00:00.000Z",
+                    "archivedAt": null,
+                    "settledOverride": null,
+                    "settledAt": null
+                })).expect("voice snapshot thread")],
+                archived_threads: Vec::new(),
+                older_settled: None,
+                snapshot_sequence: 1,
+            });
+            let owner = EnvironmentOwner {
+                saved_id: "env-snapshot".into(),
+                canonical_id: Some("env-snapshot".into()),
+                generation: 1,
+                connection_generation: 1,
+                shell_generation: 1,
+            };
+            let summary = Arc::new(EnvironmentSummary::from_shell(owner, &shell, &config));
+            state.environments = SavedEnvironments {
+                active: Some("env-snapshot".into()),
+                environments: vec![SavedEnvironment {
+                    id: "env-snapshot".into(),
+                    environment_id: Some("env-snapshot".into()),
+                    label: "MacBook Pro".into(),
+                    http_base: "http://127.0.0.1:0".into(),
+                    access_token: Some("tok".into()),
+                    server_version: None,
+                    disabled: false,
+                    local: true,
+                    ssh: None,
+                }],
+            };
+            state.server_config = config.clone();
+            state.shell = shell;
+            state.apply_fleet_view(
+                Arc::new(FleetView {
+                    revision: 1,
+                    environments: vec![Arc::new(EnvironmentView {
+                        summary,
+                        status: ConnectionStatus::Connected,
+                        config,
+                        grants: None,
+                        settings_revision: 0,
+                        keybindings_revision: 0,
+                    })],
+                }),
+                cx,
+            );
+            state.set_phase(
+                crate::app_state::Phase::Online(ConnectionStatus::Connected),
+                cx,
+            );
+            if mode == "diff-comment-dictation" {
+                state.select_thread("thread-snapshot", cx);
+            } else {
+                state.start_draft("proj-snapshot", cx);
+            }
+        }
+    });
+    pump(cx, 0.2, |_| false);
+
+    match mode {
+        "composer-mic" => {}
+        "composer-recording" => {
+            cx.update(|cx| {
+                let voice = crate::composer::snapshot_composer(cx)
+                    .read(cx)
+                    .snapshot_voice();
+                voice.update(cx, |voice, cx| {
+                    voice.set_snapshot_state_for_preview(
+                        VoiceInputState::recording(),
+                        Some(SpeechStreamText {
+                            committed: "Please refactor the audio resampler ".into(),
+                            tentative: "and wire the macOS capture queue".into(),
+                        }),
+                        0.72,
+                        14,
+                        None,
+                        cx,
+                    );
+                });
+            });
+        }
+        "composer-error" => {
+            cx.update(|cx| {
+                let voice = crate::composer::snapshot_composer(cx)
+                    .read(cx)
+                    .snapshot_voice();
+                voice.update(cx, |voice, cx| {
+                    voice.set_snapshot_state_for_preview(
+                        VoiceInputState::error(
+                            MICROPHONE_PERMISSION_ERROR,
+                            Some(VoiceErrorAction::Settings),
+                        ),
+                        None,
+                        0.0,
+                        0,
+                        None,
+                        cx,
+                    );
+                });
+            });
+        }
+        "composer-setup" => {
+            cx.update(|cx| {
+                let voice = crate::composer::snapshot_composer(cx)
+                    .read(cx)
+                    .snapshot_voice();
+                voice.update(cx, |voice, cx| {
+                    voice.set_snapshot_state_for_preview(
+                        VoiceInputState::idle(),
+                        None,
+                        0.0,
+                        0,
+                        Some(crate::voice::VoiceSetupState {
+                            open: true,
+                            step: crate::voice::VoiceSetupStep::Confirm,
+                            model: Some(EnvironmentSpeechModel {
+                                id: "whisper-large-v3-turbo".into(),
+                                name: "Whisper Large v3 Turbo".into(),
+                                description: "Fast multilingual speech model".into(),
+                                size: 1_620_000_000.0,
+                                languages: vec!["en".into()],
+                                accuracy: 0.96,
+                                speed: 0.9,
+                                benchmark: None,
+                                recommended: true,
+                                supports_streaming: true,
+                                supports_language_detection: true,
+                                supports_translation: false,
+                                active: false,
+                                state: EnvironmentSpeechModelState::Downloadable,
+                                downloaded: None,
+                                linked_from: None,
+                            }),
+                            language: Some("en".into()),
+                            downloading: false,
+                            error: None,
+                            catalog_failed: false,
+                            downloaded_bytes: None,
+                            total_bytes: None,
+                        }),
+                        cx,
+                    );
+                });
+            });
+        }
+        "citation-dictation" => {
+            cx.update_window(window, |_, window, cx| {
+                let composer = crate::composer::snapshot_composer(cx);
+                let voice = composer.update(cx, |composer, cx| {
+                    composer.open_citation_voice_for_snapshot(window, cx)
+                });
+                if let Some(voice) = voice {
+                    voice.update(cx, |voice, cx| {
+                        voice.set_snapshot_state_for_preview(
+                            VoiceInputState::recording(),
+                            Some(SpeechStreamText {
+                                committed: "Clarify why the queue uses ".into(),
+                                tentative: "2048 frames per buffer".into(),
+                            }),
+                            0.62,
+                            7,
+                            None,
+                            cx,
+                        );
+                    });
+                }
+            })
+            .map_err(|err| err.to_string())?;
+        }
+        "diff-comment-dictation" => {
+            state.update(cx, |state, cx| {
+                crate::right_panel::open_surface(state, "diff", cx);
+            });
+            pump(cx, 0.2, |_| false);
+            cx.update_window(window, |_, window, cx| {
+                let diff = crate::right_panel::snapshot_diff(cx);
+                let voice = diff.update(cx, |panel, cx| {
+                    panel.open_comment_voice_for_snapshot(window, cx)
+                });
+                if let Some(voice) = voice {
+                    voice.update(cx, |voice, cx| {
+                        voice.set_snapshot_state_for_preview(
+                            VoiceInputState::recording(),
+                            Some(SpeechStreamText {
+                                committed: "Check sample rate conversion ".into(),
+                                tentative: "for 44.1 kHz microphones".into(),
+                            }),
+                            0.65,
+                            5,
+                            None,
+                            cx,
+                        );
+                    });
+                }
+            })
+            .map_err(|err| err.to_string())?;
+        }
+        other => return Err(format!("unknown T3_NATIVE_VOICE_FIXTURE mode {other:?}")),
+    }
+
+    Ok(())
+}
+
 fn replay(cx: &mut VisualTestAppContext, window: AnyWindowHandle, gesture: &Gesture) {
     let none = Modifiers::default();
     match gesture {
@@ -1055,6 +1365,12 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         }
     }
     pump(&mut cx, options.wait.min(3.), |_| false);
+    if let Some(mode) = std::env::var_os("T3_NATIVE_VOICE_FIXTURE")
+        .and_then(|v| v.into_string().ok())
+    {
+        apply_voice_fixture(&mode, &state, window, &mut cx)?;
+        pump(&mut cx, 0.2, |_| false);
+    }
     if let Some(path) = &options.composer_audit {
         let value = cx.update(|cx| {
             let submissions = cx.global::<crate::composer::SnapshotAudit>().submissions.get();

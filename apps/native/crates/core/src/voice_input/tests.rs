@@ -323,6 +323,32 @@ fn controller_retries_failed_batch_audio_without_recording_again_then_deletes() 
 }
 
 #[test]
+fn streaming_without_live_start_emits_start_and_finish_without_hanging() {
+    let mut ctrl = VoiceInputControllerMachine::new(true, true);
+    let draft = default_draft();
+    ctrl.start(Some(draft.clone()));
+    let tok = ctrl.operation_token();
+    ctrl.on_permission(tok, true, true);
+    ctrl.on_transcriber_prepared(tok, Ok(("en".into(), true, false)));
+    let rec_effects = ctrl.on_recorder_prepared(
+        tok,
+        Ok(Some("memory://voice/1".into())),
+        Some(draft),
+        false,
+    );
+    assert!(rec_effects.contains(&VoiceControllerEffect::StartLiveTranscription {
+        uri: "memory://voice/1".into(),
+        operation_token: tok,
+    }));
+    let stop_effects = ctrl.stop();
+    assert_eq!(ctrl.state().phase, VoiceInputPhase::Transcribing);
+    assert!(stop_effects.contains(&VoiceControllerEffect::FinishTranscription {
+        operation_token: tok,
+        uri: Some("memory://voice/1".into()),
+    }));
+}
+
+#[test]
 fn controller_deletes_retained_audio_when_cancelled_and_handles_skip_post_processing() {
     let mut ctrl = VoiceInputControllerMachine::new(true, true);
     let initial = default_draft();
@@ -763,4 +789,39 @@ fn consent_languages_microphone_order_and_shortcuts() {
         shortcut.on_keyup_or_blur(Some("KeyD"), 1400),
         DictationShortcutAction::Stop
     );
+}
+
+#[test]
+fn saved_audio_choice_serde_and_presentation_helpers() {
+    assert_eq!(serde_json::from_str::<SavedAudioChoice>("null").unwrap(), SavedAudioChoice::Unset);
+    assert_eq!(serde_json::to_value(SavedAudioChoice::Unset).unwrap(), serde_json::json!(null));
+    assert_eq!(serde_json::from_str::<SavedAudioChoice>(r#""off""#).unwrap(), SavedAudioChoice::Off);
+    assert_eq!(serde_json::to_value(SavedAudioChoice::Off).unwrap(), serde_json::json!("off"));
+
+    let granted = SavedAudioChoice::Granted(AudioGrant {
+        id: "g1".into(),
+        destination: VoiceTranscriptionDestination::openrouter("env-1", "openai/whisper-1"),
+    });
+    let raw = serde_json::to_string(&granted).unwrap();
+    assert_eq!(serde_json::from_str::<SavedAudioChoice>(&raw).unwrap(), granted);
+
+    assert_eq!(speech_language_label("auto"), "Auto-detect");
+    assert_eq!(speech_language_label("en-US"), "English");
+    assert_eq!(speech_language_label("nb_NO"), "Norwegian");
+    assert_eq!(speech_language_label("xx"), "xx");
+
+    assert_eq!(format_elapsed_mm_ss(0), "0:00");
+    assert_eq!(format_elapsed_mm_ss(65), "1:05");
+
+    let mut state = VoiceInputState::default();
+    assert_eq!(resolve_speech_presentation(&state, None), (None, false));
+    state.phase = VoiceInputPhase::Preparing;
+    assert_eq!(resolve_speech_presentation(&state, Some((3, 4))), (Some("Downloading model 75%".into()), true));
+    state.phase = VoiceInputPhase::Recording;
+    assert_eq!(resolve_speech_presentation(&state, None), (Some("Recording".into()), true));
+    state.phase = VoiceInputPhase::Error;
+    state.error = Some("The microphone disconnected.".into());
+    assert_eq!(voice_error_label(state.error.as_deref()), "Mic disconnected");
+    assert!(!is_retryable_transcription_error(state.error.as_deref()));
+    assert!(is_retryable_transcription_error(Some("Could not transcribe this recording.")));
 }

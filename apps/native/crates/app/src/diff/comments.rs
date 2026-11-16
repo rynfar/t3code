@@ -8,7 +8,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Context, Div, Entity, IntoElement, MouseButton, MouseMoveEvent, ParentElement, Pixels, Point, Styled, Subscription, Task, Window,
+    AnyElement, App, Context, Div, Entity, Focusable, IntoElement, MouseButton, MouseMoveEvent, ParentElement, Pixels, Point, Styled, Subscription, Task, Window,
     div, prelude::*, px,
 };
 use gpui_component::{
@@ -26,6 +26,10 @@ use t3_core::{
         pull_request_completions,
     },
     pull_requests::method,
+    voice_input::{
+        VoiceDraftSnapshot, VoiceInputPhase, VoiceSelection, utf8_to_utf16_offset,
+        utf16_to_utf8_offset,
+    },
 };
 
 use super::DiffPanel;
@@ -82,7 +86,10 @@ pub(super) struct Editor {
     pub file_key: String,
     comment: ReviewComment,
     input: Entity<TextareaState>,
+    pub(super) voice: Entity<crate::voice::VoiceSpeechController>,
+    dictation_target_id: u64,
     _subscription: Subscription,
+    _voice_subscription: Subscription,
 }
 
 impl DiffPanel {
@@ -253,6 +260,50 @@ impl DiffPanel {
         self.open_comment(file, *selection, window, cx);
     }
 
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn open_comment_voice_for_snapshot(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::voice::VoiceSpeechController>> {
+        const PATCH: &str = "\
+diff --git a/crates/app/src/voice/macos.rs b/crates/app/src/voice/macos.rs
+index 1111111..2222222 100644
+--- a/crates/app/src/voice/macos.rs
++++ b/crates/app/src/voice/macos.rs
+@@ -1,4 +1,5 @@
+ fn start_audio_queue() {
++    let buffer_frames = 2048;
+     enqueue_buffers();
+ }
+";
+        self.fixture = true;
+        self.error = None;
+        self.pending = false;
+        self.show_external(
+            super::External {
+                key: "diff:voice-snapshot".into(),
+                parsed: Some(super::Parsed::new(PATCH, false, None, None, None)),
+                pending: false,
+                error: None,
+            },
+            cx,
+        );
+        self.set_folded(0, false, cx);
+        self.open_comment(
+            0,
+            Selection {
+                start: 2,
+                side: Side::Additions,
+                end: 2,
+                end_side: Side::Additions,
+            },
+            window,
+            cx,
+        );
+        self.comments.editor.as_ref().map(|editor| editor.voice.clone())
+    }
+
     pub(super) fn open_comment(&mut self, file: usize, selection: Selection, window: &mut Window, cx: &mut Context<Self>) {
         let (section, title) = match &self.scope {
             DiffScope::Branch { .. } => ("branch".into(), "Changes".into()),
@@ -267,7 +318,68 @@ impl DiffPanel {
         let Some(diff) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)) else { return };
         let Some(comment) = review::build_diff_comment(uuid_v4(), section, title, diff, selection, "") else { return };
         let Some(file_key) = self.view.as_ref().and_then(|view| view.key(file)).map(str::to_owned) else { return };
+        self.clear_comment_editor(cx);
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("Add a comment…"));
+        let owner_key = format!("diff-comment:{}", comment.id);
+        let owner_for_draft = owner_key.clone();
+        let input_for_draft = input.downgrade();
+        let input_for_focus = input.downgrade();
+        let hint_file = file_key.clone();
+        let project_id = self
+            .comments_config
+            .completion_scope
+            .as_ref()
+            .map(|scope| scope.project_id.clone());
+        let env_id_for_voice = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .map(|cfg| cfg.environment.environment_id.clone())
+            .filter(|id| !id.is_empty());
+        let voice = cx.new(|cx| {
+            crate::voice::VoiceSpeechController::new(
+                crate::voice::VoiceSpeechConfig {
+                    app: self.state.clone(),
+                    owner_key,
+                    offer_setup: false,
+                    draft_reader: Rc::new(move |cx| {
+                        let input = input_for_draft.upgrade()?;
+                        let state = input.read(cx);
+                        let text = state.value().to_string();
+                        let range = state.selected_range();
+                        Some(VoiceDraftSnapshot {
+                            owner_key: owner_for_draft.clone(),
+                            selection: VoiceSelection {
+                                start: utf8_to_utf16_offset(&text, range.start),
+                                end: utf8_to_utf16_offset(&text, range.end),
+                            },
+                            text,
+                        })
+                    }),
+                    hints_reader: Rc::new(move |_| vec![hint_file.clone()]),
+                    project_id_reader: Rc::new(move |_| project_id.clone()),
+                    environment_id_reader: Rc::new(move |_| env_id_for_voice.clone()),
+                    on_open_voice_settings: Rc::new(|_, cx| {
+                        crate::settings::open_voice(cx);
+                    }),
+                },
+                cx,
+            )
+        });
+        let panel_weak = cx.entity().downgrade();
+        let dictation_target_id = crate::voice::register_dictation_target(
+            &voice,
+            true,
+            Rc::new(move |window, cx| {
+                input_for_focus
+                    .upgrade()
+                    .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window))
+            }),
+            Rc::new(move |cx| panel_weak.upgrade().is_none_or(|p| p.read(cx).comments.editor.is_none())),
+            cx,
+        );
         let subscription = cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Change => {
                 this.comments.completion.clear_dismissed();
@@ -291,8 +403,44 @@ impl DiffPanel {
             }
             InputEvent::PressEnter { .. } => {}
         });
+        let voice_subscription = cx.subscribe_in(&voice, window, |this, voice_entity, event: &crate::voice::VoiceControllerEvent, window, cx| {
+            match event {
+                crate::voice::VoiceControllerEvent::StateChanged => {
+                    let next = match voice_entity.read(cx).state().phase {
+                        VoiceInputPhase::Preparing => CommentDictationState::Preparing,
+                        VoiceInputPhase::Recording
+                        | VoiceInputPhase::Transcribing
+                        | VoiceInputPhase::PostProcessing => CommentDictationState::Active,
+                        VoiceInputPhase::Idle | VoiceInputPhase::Error => CommentDictationState::Idle,
+                    };
+                    if let Some(editor) = &this.comments.editor {
+                        let frozen = voice_entity.read(cx).freezes_editor();
+                        editor.input.update(cx, |input, cx| input.set_readonly(frozen, cx));
+                    }
+                    this.set_comment_dictation_state(next, cx);
+                }
+                crate::voice::VoiceControllerEvent::CommitDraft { text, selection } => {
+                    let caret = utf16_to_utf8_offset(text, selection.start);
+                    this.commit_comment_draft(text.clone(), Some(caret), window, cx);
+                    if let Some(editor) = &this.comments.editor {
+                        editor.input.update(cx, |input, cx| input.focus(window, cx));
+                    }
+                }
+                crate::voice::VoiceControllerEvent::SubmitAfterDictation { .. } => {
+                    this.submit_comment(cx);
+                }
+            }
+        });
         input.update(cx, |input, cx| input.focus(window, cx));
-        self.comments.editor = Some(Editor { file_key, comment, input, _subscription: subscription });
+        self.comments.editor = Some(Editor {
+            file_key,
+            comment,
+            input,
+            voice,
+            dictation_target_id,
+            _subscription: subscription,
+            _voice_subscription: voice_subscription,
+        });
         self.comments.focused = true;
         self.comments.completion = PrCompletionState::default();
         self.comments.completion_loading = false;
@@ -322,9 +470,16 @@ impl DiffPanel {
         }
     }
 
+    fn clear_comment_editor(&mut self, cx: &mut App) {
+        if let Some(editor) = self.comments.editor.take() {
+            crate::voice::unregister_dictation_target(editor.dictation_target_id, cx);
+            editor.voice.update(cx, |voice, cx| voice.cancel(cx));
+        }
+    }
+
     fn cancel_comment(&mut self, cx: &mut Context<Self>) {
         self.invalidate_comment_row();
-        self.comments.editor = None;
+        self.clear_comment_editor(cx);
         self.comments.selected = None;
         self.reset_comment_completion();
         cx.notify();
@@ -339,6 +494,16 @@ impl DiffPanel {
     }
 
     pub(super) fn submit_comment(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = &self.comments.editor
+            && editor.voice.read(cx).blocks_submission()
+        {
+            if !editor.voice.read(cx).preparing() {
+                editor.voice.update(cx, |voice, cx| {
+                    voice.submit_after_dictation(cx);
+                });
+            }
+            return;
+        }
         if self.comments_config.dictation_state.blocks_submission() {
             return;
         }
@@ -690,7 +855,11 @@ impl DiffPanel {
         let p = palette(cx);
         let empty = editor.input.read(cx).value().trim().is_empty();
         let dictation_state = self.comments_config.dictation_state;
-        let frozen = dictation_state.is_frozen();
+        let voice_frozen = editor.voice.read(cx).freezes_editor();
+        let voice_blocks = editor.voice.read(cx).blocks_submission();
+        let voice_preparing = editor.voice.read(cx).preparing();
+        let frozen = dictation_state.is_frozen() || voice_frozen;
+        let blocks_submit = dictation_state.blocks_submission() || voice_blocks;
         let trigger = self.comments.completion.trigger.as_ref();
         let completion_items = self.active_completion_items();
         let selected_ix = self.comments.completion.selected.min(completion_items.len().saturating_sub(1));
@@ -698,7 +867,10 @@ impl DiffPanel {
             .comments_config
             .dictation_controls
             .as_ref()
-            .map(|builder| builder(dictation_state, window, cx));
+            .map(|builder| builder(dictation_state, window, cx))
+            .unwrap_or_else(|| {
+                crate::voice::render_text_field_speech_controls("diff-comment", &editor.voice, false, cx)
+            });
 
         v_flex()
             .w_full()
@@ -719,6 +891,13 @@ impl DiffPanel {
                             .as_ref()
                             .is_some_and(|cancel| cancel(cx))
                         {
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if let Some(editor) = &this.comments.editor
+                            && editor.voice.read(cx).state().is_busy()
+                        {
+                            editor.voice.update(cx, |voice, cx| voice.cancel(cx));
                             cx.stop_propagation();
                             return;
                         }
@@ -767,6 +946,15 @@ impl DiffPanel {
                     .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                         let Some(editor) = &this.comments.editor else { return };
                         let key = &event.keystroke;
+                        if key.key == "enter"
+                            && (key.modifiers.platform || key.modifiers.control)
+                            && editor.voice.read(cx).blocks_submission()
+                            && !editor.voice.read(cx).preparing()
+                        {
+                            this.submit_comment(cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         if review::is_submit_shortcut_with_dictation(
                             &key.key,
                             key.modifiers.platform,
@@ -811,10 +999,11 @@ impl DiffPanel {
                             cx,
                         )
                     }))
+                    .child(crate::voice::render_voice_preview("diff-comment", &editor.voice, cx))
                     .child(
                         Textarea::new(&editor.input)
                             .aria_label(format!("Comment on lines {}", editor.comment.range_label))
-                            .disabled(frozen),
+                            .readonly(frozen),
                     )
                     .child(
                         h_flex()
@@ -830,7 +1019,7 @@ impl DiffPanel {
                                         "⌘/Ctrl Enter to send"
                                     }),
                             )
-                            .children(dictation_controls)
+                            .child(dictation_controls)
                             .child(
                                 Button::new("diff-comment-cancel", ButtonVariant::Ghost, ButtonSize::Xs)
                                     .label("Cancel")
@@ -839,7 +1028,11 @@ impl DiffPanel {
                             .child(
                                 Button::new("diff-comment-submit", ButtonVariant::Default, ButtonSize::Xs)
                                     .label("Comment")
-                                    .disabled(empty || frozen)
+                                    .disabled(
+                                        voice_preparing
+                                            || (empty && !voice_blocks)
+                                            || (!voice_blocks && blocks_submit),
+                                    )
                                     .on_click(cx.listener(|this, _, _, cx| this.submit_comment(cx))),
                             ),
                     ),

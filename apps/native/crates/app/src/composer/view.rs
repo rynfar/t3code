@@ -51,21 +51,27 @@ impl Composer {
         DEFAULT_PLACEHOLDER.to_owned()
     }
 
-    /// Placeholder and disabled state follow what the agent waits on; written only on change.
-    pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let placeholder = self.placeholder(cx);
-        let disabled = self.is_rewinding(cx)
+    fn input_disabled(&self, cx: &App) -> bool {
+        self.is_rewinding(cx)
             || self.active_input().is_some_and(|input| {
                 !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx)
             })
-            || self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer());
-        if self.input_state.as_ref() == Some(&(placeholder.clone(), disabled)) {
+            || self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer())
+    }
+
+    /// Placeholder and disabled/readonly state follow what the agent waits on; written only on change.
+    pub(super) fn sync_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = self.placeholder(cx);
+        let disabled = self.input_disabled(cx);
+        let readonly = self.voice.read(cx).freezes_editor();
+        if self.input_state.as_ref() == Some(&(placeholder.clone(), disabled, readonly)) {
             return;
         }
-        self.input_state = Some((placeholder.clone(), disabled));
+        self.input_state = Some((placeholder.clone(), disabled, readonly));
         self.input.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx);
             input.set_disabled(disabled, cx);
+            input.set_readonly(readonly, cx);
         });
     }
 
@@ -193,37 +199,74 @@ impl Composer {
                         .on_click(cx.listener(|this, _, _, cx| this.request_stop(cx))),
                 )
         };
+        let voice_blocks = self.voice.read(cx).blocks_submission();
+        let voice_preparing = self.voice.read(cx).preparing();
+        let voice_disabled = self.voice_is_disabled(cx);
+        let speech_pill = crate::voice::render_speech_recording_pill(
+            "composer",
+            &self.voice,
+            crate::voice::VoiceUiSize::Regular,
+            voice_disabled,
+            cx,
+        );
+        let speech_button = crate::voice::render_speech_button(
+            "composer",
+            &self.voice,
+            crate::voice::VoiceUiSize::Regular,
+            voice_disabled,
+            cx,
+        );
+        let with_voice = |primary: AnyElement| -> AnyElement {
+            h_flex()
+                .items_center()
+                .gap(px(8.))
+                .child(speech_pill)
+                .child(speech_button)
+                .child(primary)
+                .into_any_element()
+        };
         if let (Some(input), Some(progress)) = (self.active_input(), self.progress(cx)) {
             let responding = rewinding || !self.can_answer(cx) || self.question_responding(&input.request_id, cx) || !input.can_respond();
             let enabled = if progress.is_last_question { progress.is_complete } else { progress.can_advance };
-            return h_flex()
-                .gap(px(8.))
-                .when(progress.question_index > 0, |this| {
-                    this.child(
-                        Button::new("question-previous", ButtonVariant::Outline, ButtonSize::Sm)
-                            .label("Previous")
-                            .disabled(responding)
-                            .on_click(cx.listener(|this, _, window, cx| this.previous(window, cx))),
+            return with_voice(
+                h_flex()
+                    .gap(px(8.))
+                    .when(progress.question_index > 0, |this| {
+                        this.child(
+                            Button::new("question-previous", ButtonVariant::Outline, ButtonSize::Sm)
+                                .label("Previous")
+                                .disabled(responding)
+                                .on_click(cx.listener(|this, _, window, cx| this.previous(window, cx))),
+                        )
+                    })
+                    .child(
+                        Pill::new("question-submit", requests::primary_action_label(&progress, responding))
+                            .disabled(!can_operate || responding || voice_preparing || (!voice_blocks && !enabled))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.stop_phase != StopPhase::Landed {
+                                    if this.voice.read(cx).blocks_submission() {
+                                        if !this.voice.read(cx).preparing() {
+                                            this.voice_pending_intent = Some(rules::SubmitIntent::Foreground);
+                                            this.voice.update(cx, |voice, cx| {
+                                                voice.submit_after_dictation(cx);
+                                            });
+                                        }
+                                    } else {
+                                        this.advance(window, cx);
+                                    }
+                                }
+                            })),
                     )
-                })
-                .child(
-                    Pill::new("question-submit", requests::primary_action_label(&progress, responding))
-                        .disabled(!can_operate || responding || !enabled)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if this.stop_phase != StopPhase::Landed {
-                                this.advance(window, cx);
-                            }
-                        })),
-                )
-                .when(can_interrupt || stop_retained, |this| this.child(stop_button()))
-                .into_any_element();
+                    .when(can_interrupt || stop_retained, |this| this.child(stop_button()))
+                    .into_any_element(),
+            );
         }
         let has_text = self.has_text || !self.staged().is_empty() || self.current_reply_to().is_some();
         let editing_queued = self.editing_queued().is_some();
-        if (can_interrupt || stop_retained) && !has_text && !editing_queued {
-            return stop_button().into_any_element();
+        if (can_interrupt || stop_retained) && !has_text && !editing_queued && !voice_blocks {
+            return with_voice(stop_button().into_any_element());
         }
-        let show_resume = self.snapshot.can_resume && !has_text && !editing_queued;
+        let show_resume = self.snapshot.can_resume && !has_text && !editing_queued && !voice_blocks;
         if show_resume {
             let resume_btn = RoundButton::new("send", RoundKind::Resume, "Resume thread")
                 .disabled(self.sending || !can_operate || rewinding)
@@ -232,11 +275,12 @@ impl Composer {
                         this.resume(window, cx);
                     }
                 }));
-            return if stop_retained {
+            let elem = if stop_retained {
                 h_flex().gap(px(8.)).child(resume_btn).child(stop_button()).into_any_element()
             } else {
                 resume_btn.into_any_element()
             };
+            return with_voice(elem);
         }
         let fresh_armed = self.is_fresh_session_armed(cx);
         let compact_tokens = (!editing_queued && !fresh_armed)
@@ -263,7 +307,7 @@ impl Composer {
             _ => (RoundKind::Send, "Submit message"),
         };
         let blocked = self.snapshot.setup_blocks_send || rewinding || !can_operate;
-        let disabled = self.sending || !has_text || (resolved.model.is_none() && resolved.multi_models.is_empty()) || attachment_block.is_some() || blocked;
+        let disabled = self.sending || voice_preparing || (!has_text && !voice_blocks) || (resolved.model.is_none() && resolved.multi_models.is_empty()) || attachment_block.is_some() || blocked;
         let tooltip: SharedString = if resolved.model.is_none() && resolved.multi_models.is_empty() {
             "No provider available".into()
         } else if rewinding {
@@ -300,7 +344,16 @@ impl Composer {
                     let key = rules::EnterKey { modifier, ..rules::EnterKey::default() };
                     let intent = rules::submit_intent(key, this.snapshot.running, draft, rules::SendShortcut::Enter, "");
                     if let Some(intent) = intent {
-                        this.submit(intent, window, cx);
+                        if this.voice.read(cx).blocks_submission() {
+                            if !this.voice.read(cx).preparing() {
+                                this.voice_pending_intent = Some(intent);
+                                this.voice.update(cx, |voice, cx| {
+                                    voice.submit_after_dictation(cx);
+                                });
+                            }
+                        } else {
+                            this.submit(intent, window, cx);
+                        }
                     }
                 })),
         );
@@ -322,12 +375,12 @@ impl Composer {
             )
         });
         if compact_toggle.is_none() && !stop_retained {
-            return submit_btn.into_any_element();
+            return with_voice(submit_btn.into_any_element());
         }
         h_flex()
             .gap(px(8.))
             .children(compact_toggle)
-            .child(submit_btn)
+            .child(with_voice(submit_btn.into_any_element()))
             .when(stop_retained, |this| this.child(stop_button()))
             .into_any_element()
     }
@@ -349,13 +402,38 @@ impl Render for Composer {
         let show_permissions = resolved.runtime_mode != resolved.default_runtime_mode;
         let show_attach = self.shows_attach_button(cx);
         let (drop_fill, drop_ring) = (hsla(p.accent).opacity(0.45), hsla(p.primary).opacity(0.7));
+        let input_disabled = self.input_disabled(cx);
+        let voice_frozen = self.voice.read(cx).freezes_editor();
         let gutter = if self.fixed.is_some() { 12. } else { 48. };
         div().w_full().flex().justify_center().px(px(gutter)).pb(px(if self.fixed.is_some() { 12. } else { 16. })).pt(px(8.)).child(
             v_flex()
                 .key_context("Composer")
-                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, _| {
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     if event.keystroke.key == "enter" {
                         this.enter_repeat = event.is_held;
+                        if !event.is_held
+                            && !event.keystroke.modifiers.shift
+                            && this.voice.read(cx).blocks_submission()
+                            && !this.voice.read(cx).preparing()
+                        {
+                            let modifier = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+                            let draft = matches!(this.snapshot.target, Some(Target::Draft(_)));
+                            let settings = this.state.read(cx).client_settings;
+                            let prompt = this.prompt(cx);
+                            if let Some(intent) = rules::submit_intent(
+                                rules::EnterKey { modifier, repeat: false, composing: false },
+                                this.snapshot.running,
+                                draft,
+                                settings.send_shortcut,
+                                &prompt,
+                            ) {
+                                this.voice_pending_intent = Some(intent);
+                                this.voice.update(cx, |voice, cx| {
+                                    voice.submit_after_dictation(cx);
+                                });
+                                cx.stop_propagation();
+                            }
+                        }
                     }
                 }))
                 .on_action(cx.listener(|this, _: &OutdentList, window, cx| this.outdent_list(window, cx)))
@@ -458,6 +536,11 @@ impl Render for Composer {
                 }))
                 .on_action(cx.listener(|this, _: &PasteAsText, window, cx| this.paste_as_text(window, cx)))
                 .on_action(cx.listener(|this, _: &Escape, _, cx| {
+                    if this.voice.read(cx).state().is_busy() {
+                        this.voice.update(cx, |voice, cx| voice.cancel(cx));
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.close_context_details(cx) {
                         return;
                     }
@@ -486,6 +569,13 @@ impl Render for Composer {
                 })
                 .children(self.render_stash_badge(cx))
                 .children(self.render_stash_menu(cx))
+                .when(self.voice.read(cx).preview().is_some(), |this| {
+                    this.child(
+                        div()
+                            .pb(px(8.))
+                            .child(crate::voice::render_voice_preview("composer", &self.voice, cx)),
+                    )
+                })
                 .child(
                     div().relative().children(self.render_menu(cx)).child(
                     v_flex()
@@ -519,6 +609,8 @@ impl Render for Composer {
                                 .children(self.render_context_chips(cx))
                                 .children(self.render_citation_chips(cx))
                                 .child(Editor::new(&self.input).appearance(false)
+                                    .disabled(input_disabled)
+                                    .readonly(voice_frozen)
                                     .h(px(self.composer_editor_height(cx)))
                                     .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Prompt, cx))
                                     .text_size(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx)))

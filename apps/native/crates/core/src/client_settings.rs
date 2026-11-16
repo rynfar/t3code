@@ -252,6 +252,15 @@ pub enum ClientSettingChange {
     LastEnabledProjectGrouping(ProjectGroupingMode),
     /// `completeOnboarding`: when the welcome wizard finished, as an ISO timestamp.
     OnboardingCompletedAt(String),
+    VoiceMicrophones(Vec<crate::voice_input::VoiceMicrophoneEntry>),
+    VoiceShortcutMode(crate::voice_input::VoiceShortcutMode),
+    SpeechLanguage(String),
+    SpeechTranslateToEnglish(bool),
+    SpeechSilenceFiltering(bool),
+    SpeechRemoveFillerWords(bool),
+    SpeechCustomWords(Vec<crate::voice_input::SpeechCustomWordEntry>),
+    SpeechPostProcessingPrompt(crate::voice_input::SpeechPostProcessingPromptSettings),
+    SpeechCorrectionWord(String),
 }
 
 impl ClientSettingChange {
@@ -328,6 +337,24 @@ impl ClientSettingChange {
                 ("t3code:last-enabled-project-grouping-mode", text(mode.as_str()))
             }
             ClientSettingChange::OnboardingCompletedAt(at) => ("onboardingCompletedAt", text(at)),
+            ClientSettingChange::VoiceMicrophones(entries) => (
+                "voiceMicrophones",
+                serde_json::to_value(entries).unwrap_or_else(|_| Value::Array(Vec::new())),
+            ),
+            ClientSettingChange::VoiceShortcutMode(mode) => ("voiceShortcutMode", text(mode.as_str())),
+            ClientSettingChange::SpeechLanguage(language) => ("speechLanguage", text(language)),
+            ClientSettingChange::SpeechTranslateToEnglish(on) => ("speechTranslateToEnglish", Value::Bool(*on)),
+            ClientSettingChange::SpeechSilenceFiltering(on) => ("speechSilenceFiltering", Value::Bool(*on)),
+            ClientSettingChange::SpeechRemoveFillerWords(on) => ("speechRemoveFillerWords", Value::Bool(*on)),
+            ClientSettingChange::SpeechCustomWords(words) => (
+                "speechCustomWords",
+                serde_json::to_value(words).unwrap_or_else(|_| Value::Array(Vec::new())),
+            ),
+            ClientSettingChange::SpeechPostProcessingPrompt(prompt) => (
+                "speechPostProcessingPrompt",
+                serde_json::to_value(prompt).unwrap_or(Value::Null),
+            ),
+            ClientSettingChange::SpeechCorrectionWord(word) => ("speechCorrectionWord", text(word)),
         }
     }
 }
@@ -620,6 +647,58 @@ impl ClientSettingsDoc {
     /// Opt-in TeX math rendering (`mathRenderingEnabled` in `contracts/settings.ts`, false by default).
     pub fn math_rendering_enabled(&self) -> bool {
         self.flag("mathRenderingEnabled", false)
+    }
+
+    pub fn legacy_voice_microphone(&self) -> &str {
+        self.text("voiceMicrophone").unwrap_or("")
+    }
+
+    pub fn voice_microphones(&self) -> Vec<crate::voice_input::VoiceMicrophoneEntry> {
+        self.entries
+            .get("voiceMicrophones")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn voice_shortcut_mode(&self) -> crate::voice_input::VoiceShortcutMode {
+        self.literal("voiceShortcutMode", crate::voice_input::VoiceShortcutMode::parse)
+    }
+
+    pub fn speech_language(&self) -> &str {
+        self.text("speechLanguage")
+            .filter(|lang| !lang.trim().is_empty())
+            .unwrap_or("auto")
+    }
+
+    pub fn speech_translate_to_english(&self) -> bool {
+        self.flag("speechTranslateToEnglish", false)
+    }
+
+    pub fn speech_silence_filtering(&self) -> bool {
+        self.flag("speechSilenceFiltering", true)
+    }
+
+    pub fn speech_remove_filler_words(&self) -> bool {
+        self.flag("speechRemoveFillerWords", true)
+    }
+
+    pub fn speech_custom_words(&self) -> Vec<crate::voice_input::SpeechCustomWordEntry> {
+        self.entries
+            .get("speechCustomWords")
+            .and_then(|value| serde_json::from_value::<Vec<crate::voice_input::SpeechCustomWordEntry>>(value.clone()).ok())
+            .filter(|entries| crate::voice_input::validate_speech_custom_words(entries).is_ok())
+            .unwrap_or_default()
+    }
+
+    pub fn speech_post_processing_prompt(&self) -> crate::voice_input::SpeechPostProcessingPromptSettings {
+        self.entries
+            .get("speechPostProcessingPrompt")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn speech_correction_word(&self) -> &str {
+        self.text("speechCorrectionWord").unwrap_or("")
     }
 }
 

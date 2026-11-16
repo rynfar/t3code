@@ -137,6 +137,32 @@ pub enum SavedAudioChoice {
     Granted(AudioGrant),
 }
 
+impl Serialize for SavedAudioChoice {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unset => serializer.serialize_none(),
+            Self::Off => serializer.serialize_str("off"),
+            Self::Granted(grant) => grant.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SavedAudioChoice {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Self::Unset),
+            serde_json::Value::String(s) if s == "off" => Ok(Self::Off),
+            serde_json::Value::Object(_) => {
+                serde_json::from_value::<AudioGrant>(value)
+                    .map(Self::Granted)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Err(serde::de::Error::custom("Invalid saved audio choice")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioChoice {
     Saved(SavedAudioChoice),
@@ -457,4 +483,57 @@ pub fn forget_microphone(order: &[VoiceMicrophoneEntry], key: &str) -> Vec<Voice
         return order.to_vec();
     }
     order.iter().filter(|entry| microphone_entry_key(entry) != key).cloned().collect()
+}
+
+/// Human-readable English display name for a speech language tag (`SpeechLanguageSelect.tsx`).
+pub fn speech_language_label(code: &str) -> std::borrow::Cow<'static, str> {
+    let base = code.split(['-', '_']).next().unwrap_or(code).to_ascii_lowercase();
+    let label = match base.as_str() {
+        "auto" => "Auto-detect",
+        "ar" => "Arabic",
+        "bg" => "Bulgarian",
+        "ca" => "Catalan",
+        "cs" => "Czech",
+        "da" => "Danish",
+        "de" => "German",
+        "el" => "Greek",
+        "en" => "English",
+        "es" => "Spanish",
+        "et" => "Estonian",
+        "fa" => "Persian",
+        "fi" => "Finnish",
+        "fr" => "French",
+        "he" => "Hebrew",
+        "hi" => "Hindi",
+        "hr" => "Croatian",
+        "hu" => "Hungarian",
+        "id" => "Indonesian",
+        "it" => "Italian",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "lo" => "Lao",
+        "lt" => "Lithuanian",
+        "lv" => "Latvian",
+        "mk" => "Macedonian",
+        "ms" => "Malay",
+        "my" => "Burmese",
+        "nl" => "Dutch",
+        "no" | "nb" | "nn" => "Norwegian",
+        "pl" => "Polish",
+        "pt" => "Portuguese",
+        "ro" => "Romanian",
+        "ru" => "Russian",
+        "sk" => "Slovak",
+        "sl" => "Slovenian",
+        "sv" => "Swedish",
+        "th" => "Thai",
+        "tr" => "Turkish",
+        "uk" => "Ukrainian",
+        "ur" => "Urdu",
+        "vi" => "Vietnamese",
+        "yue" => "Cantonese",
+        "zh" => "Chinese",
+        _ => return std::borrow::Cow::Owned(code.to_owned()),
+    };
+    std::borrow::Cow::Borrowed(label)
 }

@@ -75,6 +75,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "composer.mode" => Box::new(crate::composer::OpenPermissions),
         "composer.stash" => Box::new(crate::composer::StashPrompt),
         "composer.sendAlternate" => Box::new(crate::composer::SendAlternate),
+        "composer.dictation" => Box::new(crate::voice::Dictation),
         "thread.steerQueuedMessage" => Box::new(crate::composer::SteerQueuedMessage),
         "thread.editQueuedMessage" => Box::new(crate::composer::EditQueuedMessage),
         "rightPanel.toggle" => Box::new(crate::right_panel::ToggleRightPanel),

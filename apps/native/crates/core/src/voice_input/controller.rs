@@ -471,6 +471,23 @@ impl VoiceInputControllerMachine {
         self.operation_token
     }
 
+    pub fn recording_uri(&self) -> Option<&str> {
+        self.recording_uri.as_deref()
+    }
+
+    pub fn force_state_for_preview(&mut self, state: VoiceInputState) {
+        self.state = state;
+    }
+
+    /// Surfaces an external preparation or session-lock error and releases any active resources.
+    pub fn fail(&mut self, message: &str, action: Option<VoiceErrorAction>) -> Vec<VoiceControllerEffect> {
+        let mut effects = Vec::new();
+        self.operation_token += 1;
+        self.set_error(message, action, &mut effects);
+        self.release_resources(&mut effects);
+        effects
+    }
+
     pub fn start(&mut self, draft: Option<VoiceDraftSnapshot>) -> Vec<VoiceControllerEffect> {
         let mut effects = Vec::new();
         if !matches!(self.state.phase, VoiceInputPhase::Idle | VoiceInputPhase::Error) {
@@ -559,7 +576,14 @@ impl VoiceInputControllerMachine {
             }
             Err(err) => {
                 let msg = err.preparation_message().to_owned();
-                self.set_error(&msg, Some(VoiceErrorAction::Retry), &mut effects);
+                let action = if err.code == VoiceTranscriptionErrorCode::Unavailable
+                    && msg.contains("Settings \u{2192} Voice")
+                {
+                    Some(VoiceErrorAction::Settings)
+                } else {
+                    Some(VoiceErrorAction::Retry)
+                };
+                self.set_error(&msg, action, &mut effects);
                 self.release_resources(&mut effects);
             }
         }
@@ -593,11 +617,13 @@ impl VoiceInputControllerMachine {
                     return effects;
                 }
                 self.captured_draft = current_draft;
-                if self.has_live_start
+                if (self.uses_streaming || self.has_live_start)
                     && let Some(u) = uri
                 {
-                    self.live_transcription_started = true;
-                    self.live_transcription_in_flight = true;
+                    if self.has_live_start {
+                        self.live_transcription_started = true;
+                        self.live_transcription_in_flight = true;
+                    }
                     effects.push(VoiceControllerEffect::StartLiveTranscription { uri: u, operation_token });
                 }
                 effects.push(VoiceControllerEffect::StartRecorder {
@@ -1260,4 +1286,82 @@ impl DictationSubmissionGate {
         self.pending_owner_key = None;
         self.committed_text = None;
     }
+}
+
+pub const WAVEFORM_BAR_COUNT: usize = 24;
+pub const WAVEFORM_REST_SCALE: f32 = 0.2;
+
+/// `resolveSpeechPresentation` from `apps/web/src/components/chat/ComposerSpeechButton.tsx`.
+pub fn resolve_speech_presentation(
+    state: &VoiceInputState,
+    progress: Option<(u64, u64)>,
+) -> (Option<String>, bool) {
+    match state.phase {
+        VoiceInputPhase::Idle => (None, false),
+        VoiceInputPhase::Error => (
+            Some(state.error.clone().unwrap_or_else(|| "Voice input failed".to_owned())),
+            false,
+        ),
+        VoiceInputPhase::Preparing => {
+            let status = match progress {
+                Some((downloaded, total)) => {
+                    let pct = ((downloaded as f64 / (total.max(1) as f64)) * 100.0).round() as u64;
+                    format!("Downloading model {pct}%")
+                }
+                None => "Starting\u{2026}".to_owned(),
+            };
+            (Some(status), true)
+        }
+        VoiceInputPhase::Recording => (Some("Recording".to_owned()), true),
+        VoiceInputPhase::Transcribing => (Some("Transcribing\u{2026}".to_owned()), true),
+        VoiceInputPhase::PostProcessing => (Some("Cleaning up\u{2026}".to_owned()), true),
+    }
+}
+
+/// `formatElapsed` from `apps/web/src/components/chat/ComposerSpeechButton.tsx`.
+pub fn format_elapsed_mm_ss(seconds: u64) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// `VOICE_ERROR_LABELS` from `apps/web/src/components/chat/VoiceInputErrorPill.tsx`.
+pub fn voice_error_label(error: Option<&str>) -> &'static str {
+    let Some(msg) = error else {
+        return "Voice input failed";
+    };
+    if msg == MICROPHONE_PERMISSION_ERROR {
+        return "Mic blocked";
+    }
+    match msg {
+        "Microphone access is required for voice input." => "Mic blocked",
+        "This draft is no longer available." => "Draft unavailable",
+        "Another voice recording is already active." => "Already recording",
+        "Voice transcription is not available." => "Voice input unavailable",
+        "Voice transcription is still finishing. Try again shortly." => "Still transcribing",
+        "Voice transcription is not available for this language." => "Language unsupported",
+        "Could not prepare voice transcription." | "Could not start voice recording." => {
+            "Couldn\u{2019}t start"
+        }
+        "Voice recording was interrupted." => "Recording interrupted",
+        "Could not finish voice recording." => "Couldn\u{2019}t finish",
+        "Could not transcribe this recording."
+        | "Voice transcription on this environment failed." => "Transcription failed",
+        "The draft changed while voice input was running. The transcript was not added." => {
+            "Draft changed"
+        }
+        "No speech was detected." => "No speech heard",
+        "Microphone processing failed." => "Mic failed",
+        "The microphone disconnected." => "Mic disconnected",
+        _ => "Voice input failed",
+    }
+}
+
+/// `RETRYABLE_TRANSCRIPTIONS` from `apps/web/src/components/chat/VoiceInputErrorPill.tsx`.
+pub fn is_retryable_transcription_error(error: Option<&str>) -> bool {
+    matches!(
+        error,
+        Some(
+            "Could not transcribe this recording."
+                | "Voice transcription on this environment failed."
+        )
+    )
 }

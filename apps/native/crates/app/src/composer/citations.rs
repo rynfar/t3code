@@ -10,15 +10,22 @@ use crate::{
     icons::Icon,
     theme::{hsla, palette},
 };
-use gpui::{AnyElement, Context, Entity, IntoElement, ParentElement, Styled, Subscription, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Entity, Focusable, IntoElement, KeyDownEvent, ParentElement, Styled, Subscription, Window, div, prelude::*, px};
 use gpui_component::input::{Escape, InputEvent, Textarea, TextareaState};
 use gpui_component::{h_flex, v_flex};
 use t3_core::assistant_citations::{self as rules, Citation, CommentAnchor, CommentSettlement};
+use t3_core::voice_input::{
+    VoiceDraftSnapshot, VoiceSelection, utf8_to_utf16_offset, utf16_to_utf8_offset,
+};
 
 pub(super) struct CommentEditor {
     anchor: CommentAnchor,
     input: Entity<TextareaState>,
+    pub(super) voice: Entity<crate::voice::VoiceSpeechController>,
+    dictation_target_id: u64,
+    pending_secondary_submit: bool,
     _subscription: Subscription,
+    _voice_subscription: Subscription,
 }
 
 impl Composer {
@@ -61,8 +68,86 @@ impl Composer {
             input.set_selected_range(end..end, cx);
             input.focus(window, cx);
         });
+        let owner_key = format!("citation-comment:{}", crate::app_state::uuid_v4());
+        let input_for_draft = input.downgrade();
+        let owner_for_draft = owner_key.clone();
+        let composer_weak_hints = cx.entity().downgrade();
+        let composer_weak_proj = cx.entity().downgrade();
+        let composer_weak_env = cx.entity().downgrade();
+        let composer_weak_disabled = cx.entity().downgrade();
+        let input_for_focus = input.downgrade();
+        let voice = cx.new(|cx| {
+            crate::voice::VoiceSpeechController::new(
+                crate::voice::VoiceSpeechConfig {
+                    app: self.state.clone(),
+                    owner_key,
+                    offer_setup: false,
+                    draft_reader: std::rc::Rc::new(move |cx| {
+                        let input = input_for_draft.upgrade()?;
+                        let state = input.read(cx);
+                        let text = state.value().to_string();
+                        let range = state.selected_range();
+                        Some(VoiceDraftSnapshot {
+                            owner_key: owner_for_draft.clone(),
+                            selection: VoiceSelection {
+                                start: utf8_to_utf16_offset(&text, range.start),
+                                end: utf8_to_utf16_offset(&text, range.end),
+                            },
+                            text,
+                        })
+                    }),
+                    hints_reader: std::rc::Rc::new(move |cx| {
+                        composer_weak_hints
+                            .upgrade()
+                            .map(|c| c.read(cx).voice_vocabulary_hints(cx))
+                            .unwrap_or_default()
+                    }),
+                    project_id_reader: std::rc::Rc::new(move |cx| {
+                        composer_weak_proj
+                            .upgrade()
+                            .and_then(|c| c.read(cx).snapshot.project_id.clone())
+                    }),
+                    environment_id_reader: std::rc::Rc::new(move |cx| {
+                        composer_weak_env
+                            .upgrade()
+                            .map(|c| c.read(cx).environment_id(cx))
+                            .filter(|id| !id.is_empty())
+                    }),
+                    on_open_voice_settings: std::rc::Rc::new(|_, cx| {
+                        crate::settings::open_voice(cx);
+                    }),
+                },
+                cx,
+            )
+        });
+        let dictation_target_id = crate::voice::register_dictation_target(
+            &voice,
+            true,
+            std::rc::Rc::new(move |window, cx| {
+                input_for_focus
+                    .upgrade()
+                    .is_some_and(|i| i.read(cx).focus_handle(cx).is_focused(window))
+            }),
+            std::rc::Rc::new(move |cx| {
+                composer_weak_disabled
+                    .upgrade()
+                    .is_some_and(|c| c.read(cx).is_rewinding(cx))
+            }),
+            cx,
+        );
         let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::PressEnter { secondary, shift: false } => {
+                if let Some(editor) = this.citation_editor.as_mut()
+                    && editor.voice.read(cx).blocks_submission()
+                {
+                    if !editor.voice.read(cx).preparing() {
+                        editor.pending_secondary_submit = *secondary;
+                        editor.voice.update(cx, |voice, cx| {
+                            voice.submit_after_dictation(cx);
+                        });
+                    }
+                    return;
+                }
                 if this.close_citation_comment("save", window, cx) && *secondary {
                     this.submit(t3_core::composer::SubmitIntent::Foreground, window, cx);
                 }
@@ -71,17 +156,77 @@ impl Composer {
             InputEvent::Blur => { this.close_citation_comment("focus-out", window, cx); },
             _ => {}
         });
-        self.citation_editor = Some(CommentEditor { anchor, input, _subscription: subscription });
+        let voice_subscription = cx.subscribe_in(&voice, window, |this, _, event: &crate::voice::VoiceControllerEvent, window, cx| {
+            match event {
+                crate::voice::VoiceControllerEvent::StateChanged => {
+                    if let Some(editor) = &this.citation_editor {
+                        let frozen = editor.voice.read(cx).freezes_editor();
+                        editor.input.update(cx, |input, cx| input.set_readonly(frozen, cx));
+                    }
+                    cx.notify();
+                }
+                crate::voice::VoiceControllerEvent::CommitDraft { text, selection } => {
+                    if let Some(editor) = &this.citation_editor {
+                        let caret = utf16_to_utf8_offset(text, selection.start).min(text.len());
+                        editor.input.update(cx, |input, cx| {
+                            let current_len = input.value().len();
+                            input.set_selected_range(0..current_len, cx);
+                            input.replace(text.clone(), window, cx);
+                            input.set_selected_range(caret..caret, cx);
+                            input.focus(window, cx);
+                        });
+                    }
+                    cx.notify();
+                }
+                crate::voice::VoiceControllerEvent::SubmitAfterDictation { text } => {
+                    if rules::utf16_len(text) > rules::MAX_COMMENT {
+                        if let Some(editor) = this.citation_editor.as_mut() {
+                            editor.pending_secondary_submit = false;
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    let secondary = this
+                        .citation_editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.pending_secondary_submit);
+                    if this.close_citation_comment("save", window, cx) && secondary {
+                        this.submit(t3_core::composer::SubmitIntent::Foreground, window, cx);
+                    }
+                }
+            }
+        });
+        self.citation_editor = Some(CommentEditor {
+            anchor,
+            input,
+            voice,
+            dictation_target_id,
+            pending_secondary_submit: false,
+            _subscription: subscription,
+            _voice_subscription: voice_subscription,
+        });
         cx.notify();
+    }
+
+    fn clear_citation_editor(&mut self, cx: &mut gpui::App) {
+        if let Some(editor) = self.citation_editor.take() {
+            crate::voice::unregister_dictation_target(editor.dictation_target_id, cx);
+            editor.voice.update(cx, |voice, cx| voice.cancel(cx));
+        }
     }
 
     pub(super) fn close_citation_comment(&mut self, reason: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(editor) = &self.citation_editor else { return true };
+        if matches!(reason, "focus-out" | "outside-press")
+            && (editor.voice.read(cx).blocks_submission() || editor.voice.read(cx).setup().open)
+        {
+            return false;
+        }
         let draft = editor.input.read(cx).value().to_string();
         match editor.anchor.dismiss(&self.prompt(cx), &draft, reason) {
             CommentSettlement::KeepOpen => return false,
             CommentSettlement::Close(edit) => {
-                self.citation_editor = None;
+                self.clear_citation_editor(cx);
                 if let Some(edit) = edit { self.apply_citation_edit(edit, window, cx); }
             }
         }
@@ -94,7 +239,7 @@ impl Composer {
         let Some(editor) = self.citation_editor.as_mut() else { return };
         let previous = editor.anchor.link.start;
         if !editor.anchor.relocate(prompt) {
-            self.citation_editor = None;
+            self.clear_citation_editor(cx);
             cx.notify();
         } else if editor.anchor.link.start != previous {
             cx.notify();
@@ -161,7 +306,7 @@ impl Composer {
                                                     if this.is_rewinding(cx) {
                                                         return;
                                                     }
-                                                    this.citation_editor = None;
+                                                    this.clear_citation_editor(cx);
                                                     let prompt = this.prompt(cx);
                                                     if let Some(edit) = remove.replace(&prompt, String::new()) {
                                                         this.apply_citation_edit(edit, window, cx);
@@ -179,11 +324,40 @@ impl Composer {
         )
     }
 
+    #[cfg(feature = "snapshot")]
+    pub(crate) fn open_citation_voice_for_snapshot(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::voice::VoiceSpeechController>> {
+        let citation = Citation {
+            version: 1,
+            environment_id: "env-snapshot".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            message_id: "msg-1".to_owned(),
+            text: "audio resampler".to_owned(),
+            start: 9,
+            end: 24,
+            prefix: String::new(),
+            suffix: String::new(),
+            comment: None,
+        };
+        let prompt = self.prompt(cx);
+        let len = prompt.len();
+        let (edit, anchor) = rules::insert_citation(&prompt, len..len, false, citation);
+        self.apply_citation_edit(edit, window, cx);
+        self.open_citation_comment(anchor, window, cx);
+        self.citation_editor.as_ref().map(|editor| editor.voice.clone())
+    }
+
     fn citation_comment_popup(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(editor) = &self.citation_editor else {
             return div().into_any_element();
         };
         let too_long = rules::utf16_len(&editor.input.read(cx).value()) > rules::MAX_COMMENT;
+        let voice_frozen = editor.voice.read(cx).freezes_editor();
+        let voice_blocks = editor.voice.read(cx).blocks_submission();
+        let voice_preparing = editor.voice.read(cx).preparing();
         menu_surface(cx)
             .id("citation-comment-editor")
             .w(px(360.))
@@ -194,29 +368,85 @@ impl Composer {
             .on_mouse_down_out(cx.listener(|this, _, window, cx| {
                 this.close_citation_comment("outside-press", window, cx);
             }))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter"
+                    && !event.is_held
+                    && !event.keystroke.modifiers.shift
+                    && let Some(editor) = this.citation_editor.as_mut()
+                    && editor.voice.read(cx).blocks_submission()
+                    && !editor.voice.read(cx).preparing()
+                {
+                    editor.pending_secondary_submit =
+                        event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+                    editor.voice.update(cx, |voice, cx| {
+                        voice.submit_after_dictation(cx);
+                    });
+                    cx.stop_propagation();
+                }
+            }))
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                if let Some(editor) = &this.citation_editor
+                    && editor.voice.read(cx).state().is_busy()
+                {
+                    editor.voice.update(cx, |voice, cx| voice.cancel(cx));
+                    cx.stop_propagation();
+                    return;
+                }
                 this.close_citation_comment("escape-key", window, cx);
                 cx.stop_propagation();
             }))
             .child(
                 v_flex()
                     .gap(px(8.))
-                    .child(Textarea::new(&editor.input).aria_label("Comment on selected text").appearance(false).bordered(false))
+                    .child(crate::voice::render_voice_preview(
+                        "citation-comment",
+                        &editor.voice,
+                        cx,
+                    ))
+                    .child(
+                        Textarea::new(&editor.input)
+                            .aria_label("Comment on selected text")
+                            .appearance(false)
+                            .bordered(false)
+                            .readonly(voice_frozen),
+                    )
                     .when(too_long, |this| this.child(div().text_size(px(12.)).text_color(hsla(palette(cx).destructive)).child("Comments can contain up to 8,000 characters.")))
                     .child(
                         h_flex()
-                            .justify_end()
+                            .items_center()
+                            .justify_between()
                             .gap(px(8.))
-                            .child(Button::new("cancel-citation-comment", ButtonVariant::Outline, ButtonSize::Xs).label("Cancel").on_click(cx.listener(|this, _, window, cx| {
-                                this.close_citation_comment("escape-key", window, cx);
-                            })))
+                            .child(crate::voice::render_text_field_speech_controls(
+                                "citation-comment",
+                                &editor.voice,
+                                false,
+                                cx,
+                            ))
                             .child(
-                                Button::new("save-citation-comment", ButtonVariant::Default, ButtonSize::Xs)
-                                    .disabled(too_long)
-                                    .label(if too_long { "Shorten comment" } else { "Save" })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_citation_comment("save", window, cx);
-                                    })),
+                                h_flex()
+                                    .gap(px(8.))
+                                    .child(Button::new("cancel-citation-comment", ButtonVariant::Outline, ButtonSize::Xs).label("Cancel").on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_citation_comment("escape-key", window, cx);
+                                    })))
+                                    .child(
+                                        Button::new("save-citation-comment", ButtonVariant::Default, ButtonSize::Xs)
+                                            .disabled(voice_preparing || (too_long && !voice_blocks))
+                                            .label(if too_long { "Shorten comment" } else { "Save" })
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if let Some(editor) = this.citation_editor.as_mut()
+                                                    && editor.voice.read(cx).blocks_submission()
+                                                {
+                                                    if !editor.voice.read(cx).preparing() {
+                                                        editor.pending_secondary_submit = false;
+                                                        editor.voice.update(cx, |voice, cx| {
+                                                            voice.submit_after_dictation(cx);
+                                                        });
+                                                    }
+                                                    return;
+                                                }
+                                                this.close_citation_comment("save", window, cx);
+                                            })),
+                                    ),
                             ),
                     ),
             )
