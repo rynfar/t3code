@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, Styled, Window, div, prelude::*, px};
-use gpui_component::{ActiveTheme, h_flex, v_flex};
+use gpui_component::{h_flex, v_flex};
 use t3_core::commands;
 use t3_core::requests::{self, PendingUserInput, Question};
 
@@ -19,41 +19,45 @@ use crate::theme::{hsla, palette};
 /// side and tucked 17px under the card, or detached (`rounded(14px)`) under the Draft Hero.
 pub(crate) fn banner_surface_card(warning: bool, detached: bool, content: impl IntoElement, cx: &App) -> gpui::Div {
     let p = palette(cx);
-    let dark = cx.theme().is_dark();
-    let outline = if warning {
-        hsla(p.warning).opacity(0.28)
-    } else if dark {
-        gpui::white().opacity(0.05)
-    } else {
-        hsla(p.foreground).opacity(0.08)
-    };
-    let card = div()
-        .border_1()
-        .border_color(outline)
-        .bg(hsla(if dark { p.surface_raised } else { p.card }));
+    let outline = if warning { hsla(p.warning).opacity(0.28) } else { hsla(p.composer_outline) };
+    let fill = hsla(p.composer_surface);
     if detached {
-        return card.rounded(px(14.)).child(
+        return div()
+            .relative()
+            .block_mouse_except_scroll()
+            .rounded(px(14.))
+            .child(crate::glass::backdrop(14., fill, outline, cx))
+            .child(
+                div()
+                    .relative()
+                    .rounded(px(13.))
+                    .py(px(6.))
+                    .px(px(6.))
+                    .when(warning, |this| this.bg(hsla(p.warning).opacity(0.08)))
+                    .text_xs()
+                    .line_height(px(16.))
+                    .child(content),
+            );
+    }
+    div()
+        .relative()
+        .block_mouse_except_scroll()
+        .mx(px(22.))
+        .mb(px(-1.))
+        .rounded_t(px(16.))
+        .child(crate::glass::backdrop_top(16., fill, outline, cx))
+        .child(
             div()
-                .rounded(px(13.))
-                .py(px(6.))
-                .px(px(6.))
+                .relative()
+                .rounded_t(px(15.))
+                .pt(px(4.))
+                .pb(px(5.))
+                .px(px(4.))
                 .when(warning, |this| this.bg(hsla(p.warning).opacity(0.08)))
                 .text_xs()
                 .line_height(px(16.))
                 .child(content),
-        );
-    }
-    card.mx(px(22.)).mb(px(-17.)).rounded_t(px(16.)).child(
-        div()
-            .rounded_t(px(15.))
-            .pt(px(4.))
-            .pb(px(21.))
-            .px(px(4.))
-            .when(warning, |this| this.bg(hsla(p.warning).opacity(0.08)))
-            .text_xs()
-            .line_height(px(16.))
-            .child(content),
-    )
+        )
 }
 
 pub(crate) fn banner_surface(warning: bool, content: impl IntoElement, cx: &App) -> gpui::Div {

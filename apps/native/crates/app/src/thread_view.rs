@@ -107,6 +107,8 @@ pub struct ThreadView {
     minimap_layer: Entity<minimap::MinimapLayer>,
     timeline_rows: Entity<rows::TimelineRows>,
     footer: status::ThreadFooter,
+    bottom_inset: f32,
+    tail_in_list: bool,
     turn_diffs: HashMap<String, Arc<TurnDiffSummary>>,
     fork_support: HashMap<String, bool>,
     forking: std::collections::HashSet<String>,
@@ -252,6 +254,8 @@ impl ThreadView {
             minimap_layer,
             timeline_rows,
             footer: status::ThreadFooter::default(),
+            bottom_inset: 0.,
+            tail_in_list: false,
             turn_diffs: HashMap::new(),
             fork_support: HashMap::new(),
             forking: std::collections::HashSet::new(),
@@ -286,6 +290,81 @@ impl ThreadView {
 
     fn header_count(&self) -> usize {
         usize::from(self.history.is_some())
+    }
+
+    fn wants_tail_item(&self) -> bool {
+        self.footer_shown() || self.bottom_inset > 0.
+    }
+
+    pub(super) fn sync_tail_item(&mut self, remeasure_existing: bool) {
+        let was_shown = self.tail_in_list;
+        let should_show = self.wants_tail_item();
+        let end = self.header_count() + self.rows.len();
+        match (was_shown, should_show) {
+            (false, true) => {
+                self.list.splice(end..end, 1);
+                self.tail_in_list = true;
+            }
+            (true, false) => {
+                self.list.splice(end..end + 1, 0);
+                self.tail_in_list = false;
+            }
+            (true, true) if remeasure_existing => self.list.remeasure_items(end..end + 1),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn set_bottom_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
+        let next = inset.ceil().max(0.);
+        if (self.bottom_inset - next).abs() < 0.5 {
+            return;
+        }
+        let keep_end = self.follow.is_following()
+            && !self.is_follow_paused(cx)
+            && self.follow.anchored_user_message_id().is_none()
+            && self.pending_restore.is_none()
+            && self.smooth_scroll.is_none();
+        self.bottom_inset = next;
+        self.sync_tail_item(true);
+        if keep_end && !self.rows.is_empty() {
+            self.pending_scroll_source = None;
+            self.list.scroll_to_end();
+        } else if self.follow.anchored_user_message_id().is_some() && !self.is_follow_paused(cx) {
+            let _ = self.apply_new_turn_anchor(cx);
+        }
+        cx.notify();
+    }
+
+    /// Floats the composer / lineage overlay at the bottom of the transcript pane and feeds its
+    /// measured pixel height back to `ThreadView::set_bottom_inset` on frame change.
+    pub(crate) fn floating_bottom_overlay(
+        thread: &Entity<Self>,
+        measured: Rc<std::cell::Cell<f32>>,
+        content: impl IntoElement,
+    ) -> gpui::Div {
+        let weak = thread.downgrade();
+        div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        let next = f32::from(bounds.size.height).ceil().max(0.);
+                        if (measured.replace(next) - next).abs() >= 0.5 {
+                            let weak = weak.clone();
+                            window.on_next_frame(move |_, cx| {
+                                let _ = weak.update(cx, |view, cx| view.set_bottom_inset(next, cx));
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(content)
     }
 
     pub(crate) fn thread_state<'a>(&self, state: &'a AppState) -> &'a t3_core::thread::ThreadState {
@@ -361,6 +440,7 @@ impl ThreadView {
             self.reset_rewind();
             self.anchor_gap.borrow_mut().take();
             self.list.reset(0);
+            self.tail_in_list = false;
             self.setup_env = SetupEnv::default();
             self.read_setup(cx);
             if let Some(saved) = self.thread_id.as_deref().and_then(|id| self.remembered_positions.get(id)).cloned() {
@@ -426,6 +506,7 @@ impl ThreadView {
         let visible = self.visible_rows(cx);
         self.sync_history(cx);
         let changed = self.rederive_rows(cx);
+        self.sync_tail_item(false);
         if self.find.is_some() {
             self.pending_restore = None;
         }
@@ -1104,7 +1185,7 @@ impl ThreadView {
             }
         }
 
-        let delta = anchor::resolve_disclosure_reveal_scroll_delta(row_top, row_bottom, 0., viewport_h, 0., anchor::ANCHOR_TOP_OFFSET_PX);
+        let delta = anchor::resolve_disclosure_reveal_scroll_delta(row_top, row_bottom, 0., viewport_h, self.bottom_inset, anchor::ANCHOR_TOP_OFFSET_PX);
         let max_scroll = f32::from(self.list.max_offset_for_scrollbar().y).max(0.);
         if pending.ready && scroll + delta <= max_scroll + 0.5 {
             self.pending_disclosure_reveal = None;
@@ -1984,6 +2065,11 @@ impl ThreadView {
         if !outer_bounds.contains(&position) {
             return None;
         }
+        if self.bottom_inset > 0.
+            && f32::from(position.y - outer_bounds.top()) >= (f32::from(outer_bounds.size.height) - self.bottom_inset).max(0.)
+        {
+            return None;
+        }
         let header = self.header_count();
         let scroll_y = -self.list.scroll_px_offset_for_scrollbar().y;
         let view_end = scroll_y + outer_bounds.size.height;
@@ -2122,6 +2208,7 @@ impl ThreadView {
 
         let pill = div()
             .id("scroll-to-end-pill")
+            .debug_selector(|| "scroll-to-end-pill".to_owned())
             .relative()
             .occlude()
             .cursor_pointer()
@@ -2143,10 +2230,11 @@ impl ThreadView {
             .child("Scroll to end")
             .when_some(summary, |el, summary| el.child(div().text_color(muted).child(format!("· {summary}"))));
 
+        let bottom = if self.bottom_inset > 0. { self.bottom_inset + 4. } else { 12. };
         Some(
             div()
                 .absolute()
-                .bottom(px(12.))
+                .bottom(px(bottom))
                 .left_0()
                 .right_0()
                 .flex()
@@ -2173,12 +2261,17 @@ impl Render for ThreadView {
             return div()
                 .relative()
                 .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .text_color(muted)
-                .child("Send a message to start the conversation.")
+                .child(
+                    div()
+                        .size_full()
+                        .pb(px(self.bottom_inset))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("Send a message to start the conversation."),
+                )
                 .children(banners)
                 .into_any_element();
         }
@@ -4501,6 +4594,126 @@ mod tests {
         view.read_with(vcx, |view, _| {
             assert_eq!(view.citation_ui.highlighted, None);
             assert!(!has_message(view, "m-a-mid"), "Dismissing citation highlight must re-hide the Zen commentary message");
+        });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn floating_bottom_inset_adds_tail_clearance_preserves_scroll_and_offsets_scroll_to_end_pill(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let mut items = Vec::new();
+        for i in 0..28usize {
+            let msg_id = format!("m-{i}");
+            let text = format!("Long message {i}\nline a\nline b\nline c\nline d");
+            items.push(if i % 2 == 0 {
+                test_user_item("t1", i, &msg_id, &text)
+            } else {
+                test_assistant_item("t1", i, &msg_id, "r0", &text)
+            });
+        }
+        let item_count = items.len();
+        let snap = test_snapshot_json("t1", serde_json::json!([]), items);
+        state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": item_count, "visibleItemCount": item_count
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+
+        let (view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+
+        let base_height = view.read_with(vcx, |view, _| {
+            assert!(!view.tail_in_list);
+            assert_eq!(view.bottom_inset, 0.);
+            assert!(f32::from(view.list.max_offset_for_scrollbar().y) > 0., "fixture thread must overflow viewport");
+            f32::from(view.list.offset_for_item(view.list.item_count()))
+        });
+
+        view.update(vcx, |view, cx| view.set_bottom_inset(140., cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+        view.read_with(vcx, |view, _| {
+            assert!(view.tail_in_list);
+            let with_140 = f32::from(view.list.offset_for_item(view.list.item_count()));
+            assert!((with_140 - (base_height + 156.)).abs() < 1.0, "expected tail clearance +156px (base={base_height}, got={with_140})");
+            let distance = f32::from(view.list.max_offset_for_scrollbar().y) + f32::from(view.list.scroll_px_offset_for_scrollbar().y);
+            assert!(distance.abs() <= 1.0, "following thread must stay pinned at end after setting bottom inset (distance={distance})");
+        });
+
+        view.update(vcx, |view, cx| view.set_bottom_inset(180., cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+        view.read_with(vcx, |view, _| {
+            let with_180 = f32::from(view.list.offset_for_item(view.list.item_count()));
+            assert!((with_180 - (base_height + 196.)).abs() < 1.0);
+            let distance = f32::from(view.list.max_offset_for_scrollbar().y) + f32::from(view.list.scroll_px_offset_for_scrollbar().y);
+            assert!(distance.abs() <= 1.0, "following thread must stay pinned when inset grows (distance={distance})");
+        });
+
+        // Scroll up away from the end so `scroll-to-end-pill` appears above the 180px composer overlay.
+        vcx.update(|window, cx| {
+            let focus = view.read(cx).citation_ui.selection_focus.clone();
+            window.focus(&focus, cx);
+        });
+        vcx.simulate_keystrokes("pageup");
+        vcx.background_executor.advance_clock(Duration::from_millis(600));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+
+        let (scrolled_y, viewport_bottom) = view.read_with(vcx, |view, _| {
+            assert!(!view.follow.is_following());
+            (view.list.scroll_px_offset_for_scrollbar().y, f32::from(view.list.viewport_bounds().bottom()))
+        });
+        let pill_bounds = vcx.debug_bounds("scroll-to-end-pill").expect("scroll-to-end-pill bounds while scrolled up");
+        let clearance = viewport_bottom - f32::from(pill_bounds.bottom());
+        assert!(clearance >= 183., "pill bottom must clear 180px inset + 4px margin (clearance={clearance})");
+
+        // Growing bottom_inset while scrolled up must keep scroll position steady and lift the pill.
+        view.update(vcx, |view, cx| view.set_bottom_inset(220., cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+        let viewport_bottom = view.read_with(vcx, |view, _| {
+            assert!(!view.follow.is_following());
+            let after_y = view.list.scroll_px_offset_for_scrollbar().y;
+            assert!((f32::from(after_y) - f32::from(scrolled_y)).abs() < 1.0, "inset growth must preserve scrolled-up position ({scrolled_y:?} -> {after_y:?})");
+            f32::from(view.list.viewport_bounds().bottom())
+        });
+        let pill_bounds = vcx.debug_bounds("scroll-to-end-pill").expect("scroll-to-end-pill bounds at 220px inset");
+        let clearance = viewport_bottom - f32::from(pill_bounds.bottom());
+        assert!(clearance >= 223., "pill bottom must lift to clear 220px inset + 4px margin (clearance={clearance})");
+
+        view.update(vcx, |view, cx| view.set_bottom_inset(0., cx));
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, _| {
+            assert!(!view.tail_in_list, "tail spacer item must be spliced out once bottom_inset returns to 0");
         });
     }
 }

@@ -555,9 +555,22 @@ impl Render for Composer {
                 .relative()
                 .w_full()
                 .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
+                .child(crate::webview::occluder("composer-overlay-cover", crate::webview::Layer::TranscriptChrome))
                 .children(self.render_queue(cx))
                 .children(error.map(|error| {
-                    div().id("composer-stream-error").debug_selector(|| "composer-stream-error".to_owned()).pb(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(SharedString::from(error))
+                    div()
+                        .id("composer-stream-error")
+                        .debug_selector(|| "composer-stream-error".to_owned())
+                        .relative()
+                        .block_mouse_except_scroll()
+                        .px(px(8.))
+                        .py(px(4.))
+                        .mb(px(4.))
+                        .rounded(px(8.))
+                        .text_xs()
+                        .text_color(hsla(p.error_foreground))
+                        .child(crate::glass::page_backdrop(8., cx))
+                        .child(div().relative().child(SharedString::from(error)))
                 }))
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))) && self.fixed.is_none(), |this| this.child(self.limit_recovery.clone()))
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))), |this| this.children(self.render_branch_mismatch_banner(cx)))
@@ -572,6 +585,8 @@ impl Render for Composer {
                 .when(self.voice.read(cx).preview().is_some(), |this| {
                     this.child(
                         div()
+                            .id("composer-voice-preview-wrap")
+                            .block_mouse_except_scroll()
                             .pb(px(8.))
                             .child(crate::voice::render_voice_preview("composer", &self.voice, cx)),
                     )
@@ -580,6 +595,7 @@ impl Render for Composer {
                     div().relative().children(self.render_menu(cx)).child(
                     v_flex()
                         .id("composer-card")
+                        .block_mouse_except_scroll()
                         .when(rewinding, |this| this.opacity(0.65))
                         .rounded(px(16.))
                         .border_1()
@@ -653,7 +669,18 @@ impl Render for Composer {
                         ),
                     ),
                 )
-                .children(self.render_workspace(cx).map(|control| h_flex().pt(px(8.)).px(px(8.)).child(control)))
+                .children(self.render_workspace(cx).map(|control| {
+                    h_flex()
+                        .id("composer-context-strip")
+                        .relative()
+                        .block_mouse_except_scroll()
+                        .w_full()
+                        .pt(px(8.))
+                        .px(px(8.))
+                        .rounded_b(px(10.))
+                        .child(crate::glass::page_backdrop(10., cx))
+                        .child(div().relative().min_w_0().w_full().child(control))
+                }))
                 .when(matches!(self.snapshot.target, Some(Target::Draft(_))), |this| {
                     this.children(self.render_usage_limits_banner(true, cx).map(render_draft_usage_limits_overlay))
                 }),

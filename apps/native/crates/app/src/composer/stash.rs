@@ -4,7 +4,7 @@
 //! prompt's edges recall what the user sent in this thread (`composerCommandKey.ts`).
 
 use gpui::{AnyElement, Context, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
-use gpui_component::{ActiveTheme, h_flex, v_flex};
+use gpui_component::{h_flex, v_flex};
 use t3_client::store;
 use t3_core::composer::attachments::Upload;
 use t3_core::composer::drafts::{Draft, SavedAttachment};
@@ -253,23 +253,22 @@ impl Composer {
             return None;
         }
         let p = palette(cx);
-        let dark = cx.theme().is_dark();
         let open = self.stash_state.open;
         let color = if open { hsla(p.foreground) } else { hsla(p.muted_foreground) };
         let tab = h_flex()
             .id("stash-badge")
+            .relative()
+            .block_mouse_except_scroll()
             .h(px(28.))
             .px(px(8.))
             .pb(px(4.))
             .gap(px(6.))
             .rounded_t(px(12.))
-            .border_1()
-            .border_color(hsla(p.composer_outline))
-            .bg(hsla(if dark { p.surface_raised } else { p.card }))
             .text_xs()
             .text_color(color)
             .cursor_pointer()
             .hover(|this| this.text_color(hsla(p.foreground)))
+            .child(crate::glass::backdrop_top(12., hsla(p.composer_surface), hsla(p.composer_outline), cx))
             .child(Icon::Bookmark.render(px(14.), color))
             .child("Stash")
             .child(div().text_color(hsla(p.muted_foreground)).child(count.to_string()))
@@ -283,7 +282,6 @@ impl Composer {
             return None;
         }
         let p = palette(cx);
-        let dark = cx.theme().is_dark();
         let entries = &self.stash_state.store.entries;
         let now = now_ms();
         let header = h_flex()
@@ -354,13 +352,14 @@ impl Composer {
         let outline = hsla(p.composer_outline);
         Some(
             div()
+                .id("stash-menu")
+                .relative()
+                .occlude()
                 .mx(px(22.))
-                .mb(px(-17.))
+                .mb(px(-1.))
                 .rounded_t(px(16.))
-                .border_1()
-                .border_color(outline)
-                .bg(hsla(if dark { p.surface_raised } else { p.card }))
-                .child(div().pt(px(4.)).pb(px(21.)).px(px(4.)).text_xs().line_height(px(16.)).child(header).child(body))
+                .child(crate::glass::backdrop_top(16., hsla(p.composer_surface), outline, cx))
+                .child(div().relative().pt(px(4.)).pb(px(5.)).px(px(4.)).text_xs().line_height(px(16.)).child(header).child(body))
                 .into_any_element(),
         )
     }

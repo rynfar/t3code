@@ -2243,7 +2243,7 @@ impl Composer {
             body = body.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(notice.clone()));
         }
         Some(
-            banner_surface_card(false, detached, v_flex().child(header).child(div().id("usage-limits-scroll").max_h(px(240.)).overflow_y_scroll().child(body)), cx)
+            banner_surface_card(false, detached, v_flex().child(header).child(div().id("usage-limits-scroll").occlude().max_h(px(240.)).overflow_y_scroll().child(body)), cx)
                 .id("usage-limits-banner")
                 .debug_selector(|| "usage-limits-banner".to_owned())
                 .into_any_element(),

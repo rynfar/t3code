@@ -23,6 +23,7 @@ pub struct SideChatPane {
     thread_id: String,
     transcript: Entity<ThreadView>,
     composer: Entity<Composer>,
+    composer_overlay_height: std::rc::Rc<std::cell::Cell<f32>>,
     visit: Option<VisitTracker>,
     visit_scope: Option<(OpenEnvironment, Option<u64>)>,
     visit_revision: u64,
@@ -57,6 +58,7 @@ impl SideChatPane {
             thread_id,
             transcript,
             composer,
+            composer_overlay_height: std::rc::Rc::new(std::cell::Cell::new(0.)),
             visit: None,
             visit_scope: None,
             visit_revision: 0,
@@ -253,11 +255,12 @@ impl Render for SideChatPane {
             let deleted = state.shell.synchronized.then(|| div().p(px(12.)).text_xs().text_color(muted).child("This side chat was deleted."));
             div().flex_1().children(deleted).into_any_element()
         } else {
-            v_flex()
+            div()
+                .relative()
                 .flex_1()
                 .min_h_0()
-                .child(div().flex_1().min_h_0().child(self.transcript.clone()))
-                .child(self.composer.clone())
+                .child(div().size_full().child(self.transcript.clone()))
+                .child(ThreadView::floating_bottom_overlay(&self.transcript, self.composer_overlay_height.clone(), self.composer.clone()))
                 .into_any_element()
         };
         // The open thread's chat shortcuts ignore keys from a side chat (`isInSideChatPane`); its

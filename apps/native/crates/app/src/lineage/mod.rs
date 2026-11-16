@@ -236,6 +236,9 @@ impl ComposerLineage {
         let note = |text: String| div().mt(px(8.)).text_color(muted).child(text);
         let detail = approval.detail.clone().filter(|detail| !detail.is_empty()).unwrap_or_else(|| approval.request_kind.clone());
         v_flex()
+            .id(SharedString::from(format!("child-approval-card-{}", approval.request_id)))
+            .relative()
+            .occlude()
             .w_full()
             .p(px(12.))
             .rounded(px(8.))
@@ -272,8 +275,8 @@ impl ComposerLineage {
         // Sized by the chat column, not the window: a docked side panel narrows it on a wide window.
         let layout = BarLayout::of(self.bar_width.get());
         let parent = bar.parent_id.clone();
-        let surface = hsla(if dark { p.surface_raised } else { p.card });
-        let outline = if dark { gpui::white().opacity(0.05) } else { gpui::black().opacity(0.08) };
+        let surface = hsla(p.composer_surface);
+        let outline = hsla(p.composer_outline);
         let model = h_flex()
             .min_w_0()
             .max_w_full()
@@ -282,6 +285,9 @@ impl ComposerLineage {
             .child(div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(bar.model_label.clone()))
             .children(bar.effort_label.clone().map(|effort| div().flex_none().text_color(muted).child(effort)));
         h_flex()
+            .id("subagent-bar")
+            .relative()
+            .block_mouse_except_scroll()
             .w_full()
             .min_h(px(48.))
             .items_center()
@@ -291,11 +297,21 @@ impl ComposerLineage {
             .pr(px(8.))
             .rounded(px(16.))
             .border_1()
-            .border_color(outline)
-            .bg(surface)
+            .border_color(outline.opacity(0.))
+            .child(crate::glass::backdrop_with_highlight(16., surface, outline, dark.then(|| hsla(p.composer_highlight)), cx))
+            .when(!dark, |this| {
+                this.shadow(vec![gpui::BoxShadow {
+                    color: hsla(p.border).opacity(0.35),
+                    offset: gpui::point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }])
+            })
             .text_sm()
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_1()
                     .min_w_0()
@@ -304,7 +320,7 @@ impl ComposerLineage {
                     .child(model)
                     .child(div().min_w_0().max_w_full().truncate().text_color(muted).when(layout.stacked, |this| this.text_xs()).child(status)),
             )
-            .when(!layout.hide_note, |this| this.child(div().flex_none().text_color(muted).child("Runs on its own")))
+            .when(!layout.hide_note, |this| this.child(div().relative().flex_none().text_color(muted).child("Runs on its own")))
             .when(bar.child_work, |this| {
                 this.child(
                     Button::new("subagent-work")
@@ -367,14 +383,25 @@ impl Render for ComposerLineage {
             .justify_center()
             .px(crate::theme::rem(48.))
             .when(has_bar, |this| this.pb(px(16.)).pt(px(8.)))
+            .when(has_approvals && !has_bar, |this| this.pt(px(8.)))
             .child(
                 v_flex()
                     .w_full()
                     .relative()
                     .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
+                    .child(crate::webview::occluder("composer-lineage-cover", crate::webview::Layer::TranscriptChrome))
                     .children(measure)
                     .when(has_approvals, |this| {
-                        this.child(v_flex().id("child-thread-approvals").max_h(px(320.)).overflow_y_scroll().gap(px(8.)).mb(px(8.)).children(approvals))
+                        this.child(
+                            v_flex()
+                                .id("child-thread-approvals")
+                                .occlude()
+                                .max_h(px(320.))
+                                .overflow_y_scroll()
+                                .gap(px(8.))
+                                .when(has_bar, |this| this.mb(px(8.)))
+                                .children(approvals),
+                        )
                     })
                     .children(bar),
             )

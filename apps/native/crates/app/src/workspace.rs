@@ -51,6 +51,7 @@ pub struct Workspace {
     thread: Entity<ThreadView>,
     composer: Entity<Composer>,
     lineage: Entity<crate::lineage::ComposerLineage>,
+    composer_overlay_height: std::rc::Rc<std::cell::Cell<f32>>,
     composer_replaced: bool,
     draft: Entity<DraftHero>,
     prompt_links: Entity<crate::prompt_links::PromptLinks>,
@@ -169,6 +170,7 @@ impl Workspace {
             thread,
             composer,
             lineage,
+            composer_overlay_height: std::rc::Rc::new(std::cell::Cell::new(0.)),
             composer_replaced: false,
             draft,
             prompt_links,
@@ -478,9 +480,21 @@ impl Render for Workspace {
                                 .min_h_0()
                                 .pr(px(details_layout.lane_inset))
                                 // An uncached shell lets minimap frames reuse the transcript's row cache.
-                                .child(div().flex_1().min_h_0().child(self.thread.clone()))
-                                .child(self.lineage.clone())
-                                .when(!composer_replaced, |this| this.child(self.composer.clone()))
+                                .child(
+                                    div()
+                                        .relative()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .child(div().size_full().child(self.thread.clone()))
+                                        .child(ThreadView::floating_bottom_overlay(
+                                            &self.thread,
+                                            self.composer_overlay_height.clone(),
+                                            v_flex()
+                                                .w_full()
+                                                .child(self.lineage.clone())
+                                                .when(!composer_replaced, |this| this.child(self.composer.clone())),
+                                        )),
+                                )
                                 .child(self.details.clone()),
                         )
                         .child(self.terminal.clone())

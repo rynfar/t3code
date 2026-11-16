@@ -316,7 +316,6 @@ impl ThreadView {
         if next == self.footer.lines {
             return;
         }
-        let was_shown = self.footer.lines.is_shown();
         let env_id = self.state.read(cx).environment().map(str::to_owned);
         self.footer.stop_timer = match &next.stop {
             Some(stop) if self.footer.stop_timer.as_ref().is_some_and(|timer| timer.read(cx).matches(&stop.requested_at, env_id.as_deref(), TimerKind::Elapsed)) => {
@@ -354,13 +353,7 @@ impl ThreadView {
             _ => None,
         };
         self.footer.lines = next;
-        let end = self.header_count() + self.rows.len();
-        match (was_shown, self.footer.lines.is_shown()) {
-            (false, true) => self.list.splice(end..end, 1),
-            (true, false) => self.list.splice(end..end + 1, 0),
-            (true, true) => self.list.remeasure_items(end..end + 1),
-            (false, false) => {}
-        }
+        self.sync_tail_item(true);
         cx.notify();
     }
 
@@ -393,7 +386,7 @@ impl ThreadView {
                     let message = error.to_string();
                     view.show_local_error(if message.trim().is_empty() { failure.to_owned() } else { message }, cx);
                 }
-                view.list.remeasure_items(view.header_count() + view.rows.len()..view.header_count() + view.rows.len() + 1);
+                view.remeasure_footer();
                 cx.notify();
             });
         })
@@ -403,7 +396,7 @@ impl ThreadView {
     }
 
     pub(super) fn remeasure_footer(&self) {
-        if self.footer.lines.is_shown() {
+        if self.tail_in_list {
             let end = self.header_count() + self.rows.len();
             self.list.remeasure_items(end..end + 1);
         }

@@ -326,8 +326,26 @@ impl ThreadView {
                 self.smooth_scroll = None;
                 self.pending_restore = None;
                 self.pending_scroll_top = None;
+                let target = self.header_count() + index;
                 self.list.set_tail_reservation(None);
-                self.list.scroll_to_reveal_item(self.header_count() + index);
+                self.list.scroll_to_reveal_item(target);
+                if self.bottom_inset > 0. {
+                    let viewport_h = f32::from(self.list.viewport_bounds().size.height);
+                    let usable_bottom = (viewport_h - self.bottom_inset).max(0.);
+                    if viewport_h > 0. && usable_bottom > 0. {
+                        let scroll = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+                        let item_top = f32::from(self.list.offset_for_item(target)) - scroll;
+                        let item_bottom = f32::from(self.list.offset_for_item(target + 1)) - scroll;
+                        if item_bottom > usable_bottom {
+                            let extra = (item_bottom - usable_bottom).min(item_top.max(0.));
+                            if extra > 0.5 {
+                                let max_scroll = f32::from(self.list.max_offset_for_scrollbar().y).max(0.);
+                                let next_scroll = (scroll + extra).min(max_scroll);
+                                self.list.set_offset_from_scrollbar(gpui::point(px(0.), px(-next_scroll)));
+                            }
+                        }
+                    }
+                }
                 if expanded {
                     self.pending_scroll_source = None;
                     let now = self.follow_now(cx);

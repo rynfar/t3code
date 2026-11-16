@@ -273,6 +273,7 @@ impl Composer {
                 let chevron = if expanded { Icon::ChevronDown } else { Icon::ChevronRight };
                 h_flex()
                     .id(SharedString::from(format!("queued-fold-{position}")))
+                    .relative()
                     .debug_selector(move || format!("queued-fold-{position}"))
                     .w_full()
                     .justify_between()
@@ -309,6 +310,8 @@ impl Composer {
                     .child(chevron.render(px(14.), hsla(p.muted_foreground)))
             });
             let bubble = v_flex()
+                .relative()
+                .block_mouse_except_scroll()
                 .min_w_0()
                 .max_w(relative(0.8))
                 .when(is_fold && expanded, |this| this.w_full())
@@ -319,9 +322,11 @@ impl Composer {
                 .text_sm()
                 .text_color(if editing { hsla(p.foreground) } else { hsla(p.muted_foreground) })
                 .when(!is_fold, |this| this.px(px(12.)).py(px(8.)).gap(px(8.)))
+                .child(crate::glass::backdrop(16., hsla(p.composer_surface), gpui::transparent_black(), cx))
                 .children(fold_header)
                 .when(expanded, |this| {
                     let body = v_flex()
+                        .relative()
                         .gap(px(8.))
                         .when(is_fold, |this| this.px(px(12.)).pb(px(8.)))
                         .when(images > 0, |this| {
@@ -348,6 +353,7 @@ impl Composer {
             let open_thread_env = linked_env_id.clone();
             let open_task_id = run.scheduled_task_id.clone();
             let controls = h_flex()
+                .block_mouse_except_scroll()
                 .gap(px(2.))
                 .pr(px(4.))
                 .text_xs()
@@ -447,6 +453,7 @@ impl Composer {
             let label = if self.queue.show_all { "Show fewer".to_owned() } else { format!("Show all {} queued", queue.queued.len()) };
             h_flex()
                 .id("queued-show-all")
+                .block_mouse_except_scroll()
                 .self_end()
                 .pr(px(4.))
                 .gap(px(4.))
