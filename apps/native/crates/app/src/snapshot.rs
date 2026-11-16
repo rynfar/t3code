@@ -906,7 +906,14 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         cx.update_window(window, |_, window, cx| crate::composer::snapshot_composer(cx).update(cx, |composer, cx| composer.verify_failed_launch_recovery(window, cx))).map_err(|error| error.to_string())??;
     }
     if let Some(prompt) = &options.prompt {
-        cx.simulate_input(window, prompt);
+        if prompt.len() > 1024 {
+            cx.update_window(window, |_, window, cx| {
+                crate::composer::snapshot_composer(cx).update(cx, |composer, cx| composer.set_prompt(prompt, window, cx))
+            })
+            .map_err(|error| error.to_string())?;
+        } else {
+            cx.simulate_input(window, prompt);
+        }
     }
     if let Some(url) = &options.open_url {
         state.update(&mut cx, |state, cx| state.open_prompt_url(url.clone(), cx));

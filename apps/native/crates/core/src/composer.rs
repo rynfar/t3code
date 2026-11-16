@@ -40,7 +40,8 @@ pub enum FollowUpBehavior {
     Steer,
 }
 
-pub const MAX_PROMPT_LENGTH: usize = crate::prompt_links::MAX_PROMPT_LENGTH;
+/// `PROVIDER_SEND_TURN_MAX_INPUT_CHARS` (`packages/contracts/src/provider.ts`).
+pub const MAX_PROMPT_LENGTH: usize = 120_000;
 
 /// `getComposerPromptLengthValidationMessage` (`apps/web/src/components/chat/composerSubmission.ts`).
 pub fn prompt_length_validation_message(prompt: &str, provider_input: Option<&str>) -> Option<String> {

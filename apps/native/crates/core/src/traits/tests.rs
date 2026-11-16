@@ -68,7 +68,7 @@ fn layout_puts_reasoning_in_the_column_and_speed_in_the_footer() {
 #[test]
 fn effort_suffix_names_the_level_and_flags_fast() {
     let fast = resolve_descriptors(&descriptors(), &selections(Some(&json!([{"id": "fastMode", "value": true}]))));
-    assert_eq!(effort_suffix("claudeAgent", &fast), EffortSuffix { word: Some("High".into()), fast: true, ultrafast: false, ultracode: false });
+    assert_eq!(effort_suffix("claudeAgent", &fast), EffortSuffix { word: Some("High".into()), fast: true, ultrafast: false, ultracode: false, context_window: None });
     let tiers: Vec<OptionDescriptor> = serde_json::from_value(json!([
         {"id": "serviceTier", "label": "Speed", "type": "select", "currentValue": "flex",
          "options": [{"id": "default", "label": "Standard"}, {"id": "flex", "label": "Ultrafast"}]}
@@ -80,6 +80,17 @@ fn effort_suffix_names_the_level_and_flags_fast() {
     assert!(effort_suffix("pi", &tiers).ultrafast);
     assert_eq!(effort_suffix("pi", &tiers).word, None);
     assert!(matches!(layout("pi", &tiers).speed, Some(Speed::Tier(_))));
+
+    let with_window: Vec<OptionDescriptor> = serde_json::from_value(json!([
+        {"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "high", "label": "High", "isDefault": true}]},
+        {"id": "contextWindow", "label": "Context window", "type": "select", "currentValue": "1m",
+         "options": [{"id": "200k", "label": "200k"}, {"id": "1m", "label": "1M"}]}
+    ]))
+    .unwrap();
+    assert_eq!(
+        effort_suffix("claudeAgent", &with_window),
+        EffortSuffix { word: Some("High".into()), fast: false, ultrafast: false, ultracode: false, context_window: Some("1M".into()) }
+    );
 }
 
 #[test]
@@ -180,5 +191,5 @@ fn ultracode_boolean_normalizes_legacy_effort_and_layouts_in_footer() {
     assert_eq!(parts.effort.map(OptionDescriptor::id), Some("effort"));
     assert!(parts.others.is_empty());
     assert_eq!(parts.ultracode.map(|u| (u.id.as_str(), u.current_value)), Some(("ultracode", Some(true))));
-    assert_eq!(effort_suffix("claudeAgent", &both), EffortSuffix { word: Some("High".into()), fast: false, ultrafast: false, ultracode: true });
+    assert_eq!(effort_suffix("claudeAgent", &both), EffortSuffix { word: Some("High".into()), fast: false, ultrafast: false, ultracode: true, context_window: None });
 }

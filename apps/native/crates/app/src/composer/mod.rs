@@ -873,13 +873,25 @@ impl Composer {
         }
         match event {
             PickerEvent::Model { instance_id, model } => {
-                let selection = ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None };
-                if let Some(choices) = self.choices_mut() {
+                let resolved = self.resolve(cx);
+                let same_shown = resolved.multi_models.is_empty()
+                    && resolved
+                        .model
+                        .as_ref()
+                        .is_some_and(|current| current.instance_id == *instance_id && current.model == *model);
+                let selection = if same_shown {
+                    resolved.model.unwrap_or_else(|| ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None })
+                } else {
+                    ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None }
+                };
+                if !same_shown && let Some(choices) = self.choices_mut() {
                     choices.multi_models.clear();
                     choices.model = Some(selection.clone());
                 }
-                self.draft_changed(cx);
-                self.sync_usage_limits(cx);
+                if !same_shown {
+                    self.draft_changed(cx);
+                    self.sync_usage_limits(cx);
+                }
                 if let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() {
                     self.persist_thread_model_pick(&thread_id, &selection, cx);
                 }
@@ -989,7 +1001,7 @@ impl Composer {
         self.input.read(cx).value().to_string()
     }
 
-    fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.cancel_pending_send() { cx.notify(); }
         if text.is_empty() {
             self.prompt_length_error = None;
@@ -2215,7 +2227,7 @@ mod stream_error_tests {
                 assert!(!composer.sending);
                 assert_eq!(
                     composer.prompt_length_error.as_deref(),
-                    Some("Prompt is 3 characters over the 8,000-character limit. Shorten or split it before sending.")
+                    Some("Prompt is 3 characters over the 120,000-character limit. Shorten or split it before sending.")
                 );
             });
             window.draw(cx).clear();
@@ -2322,6 +2334,15 @@ mod stream_error_tests {
                 let suffix = traits::effort_suffix(&resolved.driver, &resolved.descriptors);
                 assert!(suffix.ultracode);
                 assert_eq!(suffix.word.as_deref(), Some("High"));
+                // Re-picking the active model preserves its options (`useComposerSelection.ts`).
+                composer.on_picker(
+                    &PickerEvent::Model { instance_id: "claudeAgent".into(), model: "claude-sonnet-4-6".into() },
+                    window,
+                    cx,
+                );
+                let repicked = composer.resolve(cx);
+                assert!(repicked.model.as_ref().and_then(|m| m.options.as_ref()).is_some());
+                assert!(traits::effort_suffix(&repicked.driver, &repicked.descriptors).ultracode);
             });
             window.draw(cx).clear();
         });

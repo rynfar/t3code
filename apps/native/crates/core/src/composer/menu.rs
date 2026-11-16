@@ -1016,6 +1016,20 @@ pub fn title_text(text: &str) -> String {
         cursor = reference.end;
     }
     prose.push_str(&text[cursor..]);
+    let mentions = crate::markdown::mentions::collect_composer_model_mentions(&prose);
+    let prose = if mentions.is_empty() {
+        prose
+    } else {
+        let mut rewritten = String::with_capacity(prose.len());
+        let mut mention_cursor = 0;
+        for mention in mentions {
+            rewritten.push_str(&prose[mention_cursor..mention.start]);
+            rewritten.push_str(mention.model);
+            mention_cursor = mention.end;
+        }
+        rewritten.push_str(&prose[mention_cursor..]);
+        rewritten
+    };
     let prose = crate::assistant_citations::to_plain_text(&prose);
     let normalized = prose.split_whitespace().collect::<Vec<_>>().join(" ");
     match (normalized.is_empty(), images.len()) {

@@ -69,18 +69,18 @@ fn prompt_length_validation_counts_trimmed_utf16_units_and_provider_input() {
     let one_over = format!("{exact}x");
     assert_eq!(
         prompt_length_validation_message(&one_over, None).as_deref(),
-        Some("Prompt is 1 character over the 8,000-character limit. Shorten or split it before sending.")
+        Some("Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending.")
     );
     // Surrogate pairs take 2 UTF-16 code units, matching TypeScript `.length`.
     let emoji_over = format!("{exact}🚀");
     assert_eq!(
         prompt_length_validation_message(&emoji_over, None).as_deref(),
-        Some("Prompt is 2 characters over the 8,000-character limit. Shorten or split it before sending.")
+        Some("Prompt is 2 characters over the 120,000-character limit. Shorten or split it before sending.")
     );
     let expanded = "b".repeat(MAX_PROMPT_LENGTH + 12);
     assert_eq!(
         prompt_length_validation_message("short", Some(&expanded)).as_deref(),
-        Some("Prompt is 12 characters over the 8,000-character limit. Shorten or split it before sending.")
+        Some("Prompt is 12 characters over the 120,000-character limit. Shorten or split it before sending.")
     );
 }
 

@@ -321,6 +321,10 @@ fn titles_read_links_as_labels() {
     assert_eq!(title_text("![a](t3-context://v1/image/i1) ![b](t3-context://v1/image/i2)"), "Attached images");
     let cite = crate::assistant_citations::Citation::from_selection("e".into(), "t".into(), "m".into(), "quoted text", 0..11).unwrap().with_comment("fix this");
     assert_eq!(title_text(&format!("Check {}", cite.serialize())), "Check quoted text Comment: fix this");
+    assert_eq!(
+        title_text("ask model:codex/gpt-5.3-codex and model:claudeAgent/claude-sonnet-4-6"),
+        "ask gpt-5.3-codex and claude-sonnet-4-6"
+    );
     assert_eq!(title_text("  "), "");
 }
 

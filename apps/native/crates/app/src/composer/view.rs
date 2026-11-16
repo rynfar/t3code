@@ -91,6 +91,7 @@ impl Composer {
                 this.children(suffix.word.map(|word| div().max_w(px(96.)).truncate().child(word)))
                     .when(suffix.fast || suffix.ultrafast, |this| this.child(Icon::ZapFill.render(px(12.), suffix_color)))
                     .when(suffix.ultracode, |this| this.child(Icon::Workflow.render(px(12.), suffix_color)))
+                    .children(suffix.context_window.map(|window| div().max_w(px(96.)).truncate().text_xs().child(window)))
             });
         let tooltip_label = resolved.multi_model_tooltip.as_deref().unwrap_or(&label);
         let tooltip = [Some(tooltip_label.to_owned()), Some("⌘⇧M".to_owned())].into_iter().flatten().collect::<Vec<_>>().join(" · ");

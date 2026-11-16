@@ -341,6 +341,7 @@ pub struct EffortSuffix {
     pub fast: bool,
     pub ultrafast: bool,
     pub ultracode: bool,
+    pub context_window: Option<String>,
 }
 
 pub fn effort_suffix(driver: &str, descriptors: &[OptionDescriptor]) -> EffortSuffix {
@@ -353,7 +354,11 @@ pub fn effort_suffix(driver: &str, descriptors: &[OptionDescriptor]) -> EffortSu
     });
     let speed = speed_label(driver, descriptors);
     let ultracode = layout.ultracode.is_some_and(|boolean| boolean.current_value == Some(true));
-    EffortSuffix { word, fast: speed == Some("Fast"), ultrafast: speed == Some("Ultrafast"), ultracode }
+    let context_window = descriptors
+        .iter()
+        .find(|descriptor| matches!(descriptor, OptionDescriptor::Select(select) if select.id == "contextWindow"))
+        .and_then(current_label);
+    EffortSuffix { word, fast: speed == Some("Fast"), ultrafast: speed == Some("Ultrafast"), ultracode, context_window }
 }
 
 /// The speed half of `buildTraitsTriggerDisplay`: "Fast" or "Ultrafast" when a speed is on.
