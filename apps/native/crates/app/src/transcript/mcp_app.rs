@@ -1009,6 +1009,7 @@ impl McpFrame {
         let html = self.html.clone()?;
         self.update_context(cx);
         let dark = self.context["theme"] == "dark";
+        let html: Arc<str> = Arc::from(t3_core::mcp_apps::inject_color_scheme_meta(&html, dark));
         let page = Page {
             html,
             dark,

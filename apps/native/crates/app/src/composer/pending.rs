@@ -10,7 +10,7 @@ use t3_core::commands;
 use t3_core::requests::{self, PendingUserInput, Question};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, checkbox, kbd, radio};
-use super::{AUTO_ADVANCE, Composer, Target};
+use super::{AUTO_ADVANCE, Composer, DisplacedAnswer, Target, drafts};
 use crate::app_state::uuid_v4;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -134,7 +134,11 @@ impl Composer {
         let Some(answers) = self.answers.get_mut(&key) else { return };
         let progress = requests::progress(&input.questions, &drafts, answers.index);
         if progress.is_last_question {
-            if let Some(built) = requests::build_answers(&input.questions, &drafts) {
+            if let Some(mut built) = requests::build_answers(&input.questions, &drafts) {
+                for (question_id, value) in built.iter_mut() {
+                    let records = self.answer_context_records(&input.request_id, question_id);
+                    *value = requests::project_pending_user_input_answer(std::mem::take(value), &records);
+                }
                 self.submit_answers(input.request_id, built, cx);
             }
             return;
@@ -174,6 +178,16 @@ impl Composer {
             let carried = !displaced.trim().is_empty() && next_stash != *stash;
             *stash = next_stash;
             if carried {
+                if self.queue.editing.is_none()
+                    && let Some(target) = self.snapshot.target.clone()
+                {
+                    self.displaced_answers.push(DisplacedAnswer {
+                        draft: drafts::key(&target),
+                        key: format!("{key}:{}", question.id),
+                        text: displaced,
+                    });
+                    self.record_draft(&target, cx);
+                }
                 self.state.update(cx, |state, cx| {
                     state.show_toast(
                         crate::toast::Toast::new(crate::toast::ToastKind::Info, "Your typed text was set aside")
@@ -245,6 +259,163 @@ impl Composer {
         true
     }
 
+    pub(super) fn answer_context_records(&self, request_id: &str, question_id: &str) -> Vec<serde_json::Value> {
+        let mut records = Vec::new();
+        if let Some(target) = self.snapshot.target.as_ref() {
+            records.extend(self.mentions(target).iter().map(t3_core::composer::menu::ThreadContext::to_record));
+            records.extend(self.reviews_for(target).iter().map(t3_core::composer::review::ReviewComment::record));
+            records.extend(self.records_for(target).iter().map(|r| (**r).clone()));
+        }
+        if let Some(question_target) = self.question_target(request_id, question_id) {
+            records.extend(self.mentions(&question_target).iter().map(t3_core::composer::menu::ThreadContext::to_record));
+            records.extend(self.reviews_for(&question_target).iter().map(t3_core::composer::review::ReviewComment::record));
+            records.extend(self.records_for(&question_target).iter().map(|r| (**r).clone()));
+        }
+        records
+    }
+
+    pub(super) fn withdraw_restored_answer(&mut self, request_id: &str, question_id: &str, value: &str, cx: &mut Context<Self>) {
+        let Some(target) = self.snapshot.target.clone() else { return };
+        let draft_key = drafts::key(&target);
+        let answer_key = format!("{}:{question_id}", self.answer_key(request_id));
+        let trimmed = value.trim();
+        let Some(index) = self.displaced_answers.iter().rposition(|entry| {
+            entry.draft == draft_key && entry.key == answer_key && entry.text.trim() == trimmed
+        }) else {
+            return;
+        };
+        let displaced = self.displaced_answers.remove(index);
+        let later: Vec<String> = self.displaced_answers[index..]
+            .iter()
+            .filter(|entry| entry.draft == displaced.draft)
+            .map(|entry| entry.text.clone())
+            .collect();
+        let later_refs: Vec<&str> = later.iter().map(String::as_str).collect();
+        if self.queue.editing.is_none()
+            && let Some(stash) = self.stash.as_mut()
+        {
+            let next = requests::withdraw_displaced_answer(stash, &displaced.text, &later_refs);
+            if next != *stash {
+                *stash = next;
+                self.record_draft(&target, cx);
+            }
+        } else if let Some(saved) = self.drafts.store.get(&draft_key).cloned() {
+            let next = requests::withdraw_displaced_answer(&saved.prompt, &displaced.text, &later_refs);
+            if next != saved.prompt {
+                let mut updated = saved;
+                updated.prompt = next;
+                if self.mutate_drafts(cx, |store| store.set(&draft_key, updated)) {
+                    self.schedule_draft_save(&target, cx);
+                }
+            }
+        }
+    }
+
+    /// Stop cancels an open question and a provider timeout expires it; neither sent the typed
+    /// answers, so move unsent text + referenced thread chips back to the thread's own draft
+    /// (never a queued-message edit) before pruning.
+    pub(super) fn return_unanswered_user_inputs(
+        &mut self,
+        environment: &str,
+        next_target: &Option<Target>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut by_thread: std::collections::BTreeMap<String, Vec<(String, String)>> = std::collections::BTreeMap::new();
+        for key in self.answers.keys() {
+            if let Ok(parts) = serde_json::from_str::<Vec<String>>(key)
+                && parts.len() == 3
+                && parts[0] == environment
+            {
+                by_thread.entry(parts[1].clone()).or_default().push((parts[2].clone(), key.clone()));
+            }
+        }
+        let mut changed = false;
+        for (thread_id, entries) in by_thread {
+            let unanswered = {
+                let state = self.state.read(cx);
+                let Some(projection) = state.thread_state(&thread_id).projection.as_ref().filter(|p| p.thread.id == thread_id) else {
+                    continue;
+                };
+                requests::unanswered_request_ids(projection)
+            };
+            if unanswered.is_empty() {
+                continue;
+            }
+            let target = Target::Thread(thread_id.clone());
+            let draft_key = drafts::key(&target);
+            let active_thread_draft = next_target.as_ref() == Some(&target) && self.queue.editing.is_none();
+            let initial_prompt = if active_thread_draft {
+                if self.answering.is_some() {
+                    self.stash.clone().unwrap_or_else(|| self.drafts.store.get(&draft_key).map(|d| d.prompt.clone()).unwrap_or_default())
+                } else {
+                    self.prompt(cx)
+                }
+            } else {
+                self.drafts.store.get(&draft_key).map(|d| d.prompt.clone()).unwrap_or_default()
+            };
+            let mut prompt = initial_prompt.clone();
+            let mut restored_threads = Vec::new();
+            let mut restored_records = Vec::new();
+            for request_id in unanswered {
+                let Some((_, answer_key)) = entries.iter().find(|(req, _)| req == &request_id) else { continue };
+                let Some(answers) = self.answers.get(answer_key) else { continue };
+                let mut draft_entries: Vec<_> = answers.drafts.iter().collect();
+                draft_entries.sort_by_key(|&(a, _)| a);
+                for (question_id, draft) in draft_entries {
+                    let custom = draft.custom.as_deref().unwrap_or("");
+                    let next_prompt = requests::carry_displaced_answer(&prompt, custom);
+                    if next_prompt == prompt {
+                        continue;
+                    }
+                    prompt = next_prompt;
+                    let referenced = t3_core::composer::menu::referenced_context_ids(custom);
+                    if referenced.is_empty() {
+                        continue;
+                    }
+                    let q_target = Target::Question(t3_core::requests::attachments::QuestionDraftKey {
+                        environment: environment.to_owned(),
+                        thread: thread_id.clone(),
+                        request: request_id.clone(),
+                        question: question_id.clone(),
+                    });
+                    for src in [&q_target, &target] {
+                        for thread in self.mentions(src) {
+                            if referenced.contains(&thread.context_id.as_str()) {
+                                restored_threads.push(thread.clone());
+                            }
+                        }
+                        for rec in self.records_for(src) {
+                            if t3_core::composer::records::field(rec, "kind") == "thread"
+                                && referenced.contains(&t3_core::composer::records::field(rec, "contextId"))
+                            {
+                                restored_records.push(rec.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if prompt == initial_prompt {
+                continue;
+            }
+            changed = true;
+            self.restore_threads(&target, restored_threads);
+            self.seed_records(&target, restored_records);
+            if active_thread_draft {
+                if self.answering.is_some() {
+                    self.stash = Some(prompt.clone());
+                } else {
+                    self.set_prompt(&prompt, window, cx);
+                }
+            }
+            let updated_draft = self.capture_draft(&target, prompt);
+            if self.mutate_drafts(cx, |store| store.set(&draft_key, updated_draft)) {
+                self.schedule_draft_save(&target, cx);
+            }
+        }
+        changed
+    }
+
     pub(super) fn render_question(&mut self, input: &PendingUserInput, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let index = self.question_index(input);
@@ -255,18 +426,34 @@ impl Composer {
         let draft = drafts.and_then(|drafts| drafts.get(&question.id)).cloned();
         let request_id = input.request_id.clone();
         let question_id = question.id.clone();
+        let action_ctx = crate::transcript::markdown::links::MarkdownActionContext {
+            state: self.state.clone(),
+            owner: cx.entity().entity_id(),
+            cwd: self.menu_cwd(cx),
+            thread_id: self.thread_id(),
+            thread_view: None,
+        };
         let prompt_markdown = (!collapsed).then(|| {
-            let text: Arc<str> = Arc::from(question.question.as_str());
+            let text: Arc<str> = Arc::from(normalize_markdown_line_breaks(&question.question));
             let key = format!("composer-question:{}:{}", self.answer_key(&input.request_id), question.id);
-            let action_ctx = crate::transcript::markdown::links::MarkdownActionContext {
-                state: self.state.clone(),
-                owner: cx.entity().entity_id(),
-                cwd: self.menu_cwd(cx),
-                thread_id: self.thread_id(),
-                thread_view: None,
-            };
-            self.question_markdown.state_in_context(&key, &text, Some(action_ctx), cx)
+            self.question_markdown.state_in_context(&key, &text, Some(action_ctx.clone()), cx)
         });
+        let option_previews: Vec<Option<_>> = if collapsed {
+            Vec::new()
+        } else {
+            let answer_key = self.answer_key(&input.request_id);
+            question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(position, option)| {
+                    let preview = option.preview.as_deref().map(str::trim).filter(|p| !p.is_empty())?;
+                    let text: Arc<str> = Arc::from(normalize_markdown_line_breaks(preview));
+                    let key = format!("composer-question-preview:{answer_key}:{}:{position}", question.id);
+                    Some(self.question_markdown.state_in_context(&key, &text, Some(action_ctx.clone()), cx))
+                })
+                .collect()
+        };
         let collapsed_preview = question.question.replace('\n', " ");
         let content = v_flex()
             .child(
@@ -357,37 +544,54 @@ impl Composer {
                         .child(v_flex().mt(px(6.)).ml(px(-6.)).children(question.options.iter().enumerate().map(|(position, option)| {
                             let value = option.answer_value().to_owned();
                             let selected = requests::is_option_selected(&question, draft.as_ref(), &value);
-                            h_flex()
-                                .id(("question-option", position))
-                                .items_start()
-                                .gap(px(10.))
-                                .py(px(6.))
-                                .pl(px(6.))
-                                .rounded(px(6.))
-                                .text_color(if selected { hsla(p.foreground) } else { hsla(p.foreground).opacity(0.7) })
-                                .when(responding, |this| this.opacity(0.5))
-                                .when(!responding, |this| {
-                                    this.cursor_pointer()
-                                        .when(!selected, |this| this.hover(|this| this.bg(hsla(p.muted).opacity(0.3))))
-                                        .on_click(cx.listener(move |this, _, window, cx| this.toggle_option(value.clone(), window, cx)))
-                                })
-                                .child(div().h(px(20.)).flex().items_center().child(if question.multi_select {
-                                    checkbox(selected, cx)
-                                } else {
-                                    radio(selected, cx)
-                                }))
+                            let preview = option_previews.get(position).and_then(|state| state.clone());
+                            // The preview sits outside the option row: it can hold links, and clicking a single-select option advances.
+                            v_flex()
                                 .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap(px(2.))
-                                        .child(div().text_sm().line_height(px(20.)).font_weight(FontWeight::MEDIUM).child(option.label.clone()))
-                                        .when(!option.description.is_empty() && option.description != option.label, |this| {
-                                            this.child(div().text_size(px(11.)).text_color(hsla(p.secondary_label)).child(option.description.clone()))
+                                    h_flex()
+                                        .id(("question-option", position))
+                                        .items_start()
+                                        .gap(px(10.))
+                                        .py(px(6.))
+                                        .pl(px(6.))
+                                        .rounded(px(6.))
+                                        .text_color(if selected { hsla(p.foreground) } else { hsla(p.foreground).opacity(0.7) })
+                                        .when(responding, |this| this.opacity(0.5))
+                                        .when(!responding, |this| {
+                                            this.cursor_pointer()
+                                                .when(!selected, |this| this.hover(|this| this.bg(hsla(p.muted).opacity(0.3))))
+                                                .on_click(cx.listener(move |this, _, window, cx| this.toggle_option(value.clone(), window, cx)))
+                                        })
+                                        .child(div().h(px(20.)).flex().items_center().child(if question.multi_select {
+                                            checkbox(selected, cx)
+                                        } else {
+                                            radio(selected, cx)
+                                        }))
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap(px(2.))
+                                                .child(div().text_sm().line_height(px(20.)).font_weight(FontWeight::MEDIUM).child(option.label.clone()))
+                                                .when(!option.description.is_empty() && option.description != option.label, |this| {
+                                                    this.child(div().text_size(px(11.)).text_color(hsla(p.secondary_label)).child(option.description.clone()))
+                                                }),
+                                        )
+                                        .when(position < 9, |this| {
+                                            this.child(div().h(px(20.)).w(px(24.)).flex().items_center().justify_center().child(kbd((position + 1).to_string(), cx)))
                                         }),
                                 )
-                                .when(position < 9, |this| {
-                                    this.child(div().h(px(20.)).w(px(24.)).flex().items_center().justify_center().child(kbd((position + 1).to_string(), cx)))
+                                .when_some(preview, |this, state| {
+                                    this.child(
+                                        div()
+                                            .id(("question-option-preview", position))
+                                            .pl(px(32.))
+                                            .pr(px(8.))
+                                            .pb(px(6.))
+                                            .text_xs()
+                                            .text_color(hsla(p.muted_foreground))
+                                            .child(crate::transcript::markdown::prose(&state, cx)),
+                                    )
                                 })
                         }))),
                 )
@@ -459,5 +663,67 @@ impl Composer {
                     .on_click(cx.listener(|this, _, _, cx| this.clear_reply_to(cx))),
             );
         Some(banner_surface(false, content, cx).into_any_element())
+    }
+}
+
+/// Normalizes newlines and avoids Markdown `Node::Break` (`  \n` / `\\\n`), which
+/// `gpui_component` drops; `markdown-rs` keeps raw single `\n` inside `Node::Text`.
+fn normalize_markdown_line_breaks(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(normalized.len());
+    let mut fence: Option<(char, usize)> = None;
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if let Some((fc, flen)) = fence {
+            out.push_str(line);
+            let trimmed = line.trim_start();
+            let close_len = trimmed.bytes().take_while(|&b| b as char == fc).count();
+            if close_len >= flen && trimmed[close_len..].trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start_matches(' ');
+        let leading = line.len() - trimmed.len();
+        if leading <= 3
+            && let Some(fc @ ('`' | '~')) = trimmed.chars().next()
+        {
+            let count = trimmed.bytes().take_while(|&b| b as char == fc).count();
+            if count >= 3 {
+                fence = Some((fc, count));
+                out.push_str(line);
+                continue;
+            }
+        }
+        let has_next = index + 1 < lines.len();
+        if has_next && !line.trim().is_empty() {
+            let clean = line.trim_end_matches(' ');
+            let clean = if clean.ends_with('\\') && !clean.ends_with("\\\\") {
+                &clean[..clean.len() - 1]
+            } else {
+                clean
+            };
+            out.push_str(clean);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_markdown_line_breaks;
+
+    #[test]
+    fn normalize_markdown_line_breaks_strips_hard_break_markers_outside_fences() {
+        let input = "line 1\r\nline 2  \nline 3\\\n```md\nkeep  \nkeep\\\n```\nline 4";
+        assert_eq!(
+            normalize_markdown_line_breaks(input),
+            "line 1\nline 2\nline 3\n```md\nkeep  \nkeep\\\n```\nline 4"
+        );
     }
 }

@@ -227,3 +227,83 @@ fn attachments_complete_only_custom_questions_and_block_even_selected_answers_un
         assert_eq!(resolve_answer(&q, Some(&draft)), None);
     }
 }
+
+#[test]
+fn unanswered_requests_track_cancelled_and_expired_and_option_preview_decodes() {
+    let proj = projection(
+        vec![
+            request("r-pending", "user_input", "pending", live(true), T),
+            request("r-resolved", "user_input", "resolved", live(true), T),
+            request("r-cancelled", "user_input", "cancelled", live(true), T),
+            request("r-expired", "approval", "expired", live(true), T),
+        ],
+        vec![],
+    );
+    assert_eq!(unanswered_request_ids(&proj), vec!["r-cancelled", "r-expired"]);
+
+    let option: QuestionOption = serde_json::from_value(json!({
+        "label": "Use dark tokens",
+        "description": "Applies palette",
+        "preview": "```css\n--bg: #000;\n```"
+    }))
+    .unwrap();
+    assert_eq!(option.preview.as_deref(), Some("```css\n--bg: #000;\n```"));
+}
+
+#[test]
+fn withdraw_displaced_answer_removes_only_matching_displaced_copy() {
+    assert_eq!(withdraw_displaced_answer("typed", "typed", &[]), "");
+    assert_eq!(withdraw_displaced_answer("draft\n\ntyped", "typed", &[]), "draft");
+    assert_eq!(withdraw_displaced_answer("draft\n\nfirst\n\nsecond", "first", &["second"]), "draft\n\nsecond");
+    assert_eq!(withdraw_displaced_answer("first\n\nsecond", "first", &["second"]), "second");
+    assert_eq!(withdraw_displaced_answer("my typed note", "typed", &[]), "my typed note");
+    assert_eq!(withdraw_displaced_answer("draft", "   ", &[]), "draft");
+}
+
+#[test]
+fn project_pending_user_input_answer_expands_thread_review_and_preview_records() {
+    let thread = json!({
+        "version": 1,
+        "kind": "thread",
+        "contextId": "thread_1",
+        "environmentId": "env-a",
+        "threadId": "thr-2",
+        "title": "Fix bug",
+        "label": "Fix bug"
+    });
+    let review = json!({
+        "version": 1,
+        "kind": "review-comment",
+        "contextId": "review-comment_1",
+        "label": "src/main.rs L3",
+        "filePath": "src/main.rs",
+        "rangeLabel": "L3",
+        "startIndex": 3,
+        "endIndex": 3,
+        "sectionTitle": "Changes",
+        "text": "Handle None here",
+        "diff": "- a\n+ b",
+        "fenceLanguage": "rust"
+    });
+    let preview = json!({
+        "version": 1,
+        "kind": "preview-annotation",
+        "contextId": "preview-annotation_1",
+        "label": "Hero CTA",
+        "pageUrl": "http://localhost:3000/home",
+        "pageTitle": "Home",
+        "comment": "Increase contrast",
+        "targetSummary": "button.cta",
+        "styleChanges": ["color: #fff"]
+    });
+    let answer = Value::String(
+        "See [Fix bug](t3-context://v1/thread/thread_1), [src/main.rs L3](t3-context://v1/review-comment/review-comment_1), and [Hero CTA](t3-context://v1/preview-annotation/preview-annotation_1) and [Missing](t3-context://v1/thread/missing)"
+            .into(),
+    );
+    let projected = project_pending_user_input_answer(answer, &[thread, review, preview]);
+    let text = projected.as_str().unwrap();
+    assert!(text.contains("[Fix bug](t3-thread://v2/env-a/thr-2)"), "{text}");
+    assert!(text.contains("[Review comment: src/main.rs L3; ref=review-comment_1]\n\n<t3_context version=\"1\">\n<context kind=\"review-comment\" id=\"review-comment_1\">\nfile: src/main.rs\nrange: L3 (3-3)\nsection: Changes\ncomment:\n  Handle None here\nrust:\n  - a\n  + b\n</context>\n</t3_context>"), "{text}");
+    assert!(text.contains("[Preview annotation: Hero CTA; ref=preview-annotation_1]\n\n<t3_context version=\"1\">\n<context kind=\"preview-annotation\" id=\"preview-annotation_1\">\npage: Home\nurl: http://localhost:3000/home\ncomment: Increase contrast\ntargets: button.cta\nrequested visual changes:\n- color: #fff\n</context>\n</t3_context>"), "{text}");
+    assert!(text.ends_with(" and [Missing](t3-context://v1/thread/missing)"), "{text}");
+}

@@ -112,6 +112,8 @@ pub struct QuestionOption {
     pub description: String,
     #[serde(default)]
     pub value: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
 }
 
 impl QuestionOption {
@@ -429,6 +431,48 @@ pub fn carry_displaced_answer(prompt: &str, displaced: &str) -> String {
         (false, false) => format!("{}\n\n{displaced}", prompt.trim_end()),
     }
 }
+
+/// Requests that closed without an answer (`cancelled` or `expired`), so typed drafts were never sent.
+pub fn unanswered_request_ids(projection: &ThreadProjection) -> Vec<String> {
+    projection
+        .runtime_requests
+        .iter()
+        .filter(|entity| {
+            matches!(entity.value.get("status").and_then(Value::as_str), Some("cancelled" | "expired"))
+        })
+        .map(|entity| entity.id.clone())
+        .collect()
+}
+
+/// Takes set-aside answer text back out of the thread draft once it is the answer again.
+pub fn withdraw_displaced_answer(prompt: &str, displaced: &str, later_displaced: &[&str]) -> String {
+    const SEP: &str = "\n\n";
+    let text = displaced.trim();
+    if text.is_empty() {
+        return prompt.to_owned();
+    }
+    let mut parts = vec![text];
+    let later: Vec<&str> = later_displaced
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    parts.extend(later.iter().copied());
+    let suffix = parts.join(SEP);
+    let Some(before) = prompt.strip_suffix(&suffix) else {
+        return prompt.to_owned();
+    };
+    let after = later.join(SEP);
+    if before.is_empty() {
+        return after;
+    }
+    let Some(stripped) = before.strip_suffix(SEP) else {
+        return prompt.to_owned();
+    };
+    if after.is_empty() { stripped.to_owned() } else { format!("{stripped}{SEP}{after}") }
+}
+
+pub use crate::composer::records::project_pending_user_input_answer;
 
 /// `formatPendingPrimaryActionLabel` for the full-width footer.
 pub fn primary_action_label(progress: &Progress, responding: bool) -> &'static str {

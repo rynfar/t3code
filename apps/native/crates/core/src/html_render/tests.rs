@@ -246,8 +246,8 @@ fn page_images_validate_sources_and_trim_names() {
         "params": { "src": valid_png, "name": "   architecture diagram \n  " }
     }))
     .unwrap();
-    assert_eq!(img.src, valid_png);
-    assert_eq!(img.name, "architecture diagram");
+    assert_eq!(img.images, vec![host::ImageEntry { src: valid_png.into(), name: "architecture diagram".into() }]);
+    assert_eq!(img.index, 0);
 
     let https_img = host::read_image(&json!({
         "jsonrpc": "2.0",
@@ -255,7 +255,7 @@ fn page_images_validate_sources_and_trim_names() {
         "params": { "src": "https://cdn.example.com/chart.png", "name": "   " }
     }))
     .unwrap();
-    assert_eq!(https_img.name, "Image");
+    assert_eq!(https_img.images[0].name, "Image");
 
     let long_name = "a".repeat(250);
     let capped = host::read_image(&json!({
@@ -264,7 +264,56 @@ fn page_images_validate_sources_and_trim_names() {
         "params": { "src": "http://localhost:8080/a.jpg", "name": long_name }
     }))
     .unwrap();
-    assert_eq!(capped.name.len(), 200);
+    assert_eq!(capped.images[0].name.len(), 200);
+
+    let emoji_boundary = host::read_image(&json!({
+        "jsonrpc": "2.0",
+        "method": "t3/notifications/open-image",
+        "params": { "src": "https://example.com/a.png", "name": format!("{}😀", "a".repeat(199)) }
+    }))
+    .unwrap();
+    assert_eq!(emoji_boundary.images[0].name, "a".repeat(199));
+
+    let gallery = host::read_image(&json!({
+        "jsonrpc": "2.0",
+        "method": "t3/notifications/open-image",
+        "params": {
+            "src": "https://example.com/b.png",
+            "name": "Second",
+            "index": 2,
+            "images": [
+                { "src": "javascript:alert(1)", "name": "Ignored" },
+                { "src": "https://example.com/a.png", "name": "First" },
+                { "src": "https://example.com/b.png", "name": "Second" }
+            ]
+        }
+    }))
+    .unwrap();
+    assert_eq!(gallery.index, 1);
+    assert_eq!(
+        gallery.images,
+        vec![
+            host::ImageEntry { src: "https://example.com/a.png".into(), name: "First".into() },
+            host::ImageEntry { src: "https://example.com/b.png".into(), name: "Second".into() },
+        ]
+    );
+
+    let mismatched = host::read_image(&json!({
+        "jsonrpc": "2.0",
+        "method": "t3/notifications/open-image",
+        "params": {
+            "src": "https://example.com/b.png",
+            "name": "Second",
+            "index": 0,
+            "images": [
+                { "src": "https://example.com/a.png", "name": "First" },
+                { "src": "https://example.com/b.png", "name": "Second" }
+            ]
+        }
+    }))
+    .unwrap();
+    assert_eq!(mismatched.index, 0);
+    assert_eq!(mismatched.images, vec![host::ImageEntry { src: "https://example.com/b.png".into(), name: "Second".into() }]);
 
     for bad in [
         "javascript:alert(1)",

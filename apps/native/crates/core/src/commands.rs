@@ -382,6 +382,21 @@ pub fn secret_request_answer_save(thread_id: &str, turn_item_id: &str, secret: &
     })
 }
 
+/// `secrets.answerRequest` reference payload (`type: "reference"`).
+pub fn secret_request_answer_reference(thread_id: &str, turn_item_id: &str, provider: &str, reference: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "turnItemId": turn_item_id,
+        "answer": {
+            "type": "reference",
+            "reference": {
+                "provider": provider,
+                "reference": reference,
+            },
+        },
+    })
+}
+
 /// `secrets.answerRequest` decline payload.
 pub fn secret_request_answer_decline(thread_id: &str, turn_item_id: &str) -> Value {
     json!({

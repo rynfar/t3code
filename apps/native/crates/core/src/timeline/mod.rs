@@ -58,12 +58,16 @@ pub use plan::{
     build_proposed_plan_markdown_filename, normalize_plan_markdown_for_export, proposed_plan_title,
 };
 pub use requests::{
-    ExistingPeerLink, HandoffEndpoint, LINK_ACCESS_LEVELS, LinkRequestDisplay, LinkTone,
-    MachineCandidate, RPC_REQUEST_FALLBACK_ERROR, SecretRequestDisplay, SecretTone,
-    can_manage_peer_links, link_access_description, link_access_label,
-    link_request_default_access, link_request_display, linkable_machines, mcp_client_scopes,
+    ANOTHER_ADDRESS, ExistingPeerLink, HandoffEndpoint, LINK_ACCESS_LEVELS, LinkRequestDisplay,
+    LinkRequestTarget, LinkTone, MachineCandidate, RPC_REQUEST_FALLBACK_ERROR,
+    SecretRequestDisplay, SecretRequestLink, SecretRequestSource, SecretTone,
+    can_manage_peer_links, is_loopback_url, link_access_description, link_access_label,
+    link_destination, link_request_default_access, link_request_display, link_request_target,
+    link_request_target_name, linkable_machines, mcp_client_scopes, origin_of,
     rank_machines_by_hint, resolve_handoff_endpoints, sanitize_link_request_error,
-    sanitize_secret_request_error, secret_request_display, secret_request_privacy_note,
+    sanitize_secret_request_error, secret_request_display, secret_request_link,
+    secret_request_page_url, secret_request_privacy_note, secret_request_reference,
+    secret_request_sources,
 };
 pub use detail::{
     GET_TURN_ITEM, MAX_TOOL_OUTPUT_IMAGES, ToolCallLines, command_output_text, decode_detail, detail_request, detail_revision, format_tool_value, needs_detail_fetch,

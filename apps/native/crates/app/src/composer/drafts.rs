@@ -149,7 +149,7 @@ impl Composer {
         }
     }
 
-    fn capture_draft(&self, target: &Target, prompt: String) -> Draft {
+    pub(super) fn capture_draft(&self, target: &Target, prompt: String) -> Draft {
         let choices = self.choices.get(target).cloned().unwrap_or_default();
         Draft {
             workspace: self.drafts.store.get(&key(target)).and_then(|draft| draft.workspace.clone()),

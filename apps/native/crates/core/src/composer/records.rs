@@ -682,8 +682,219 @@ pub fn copy_message(
         if let Some(thread) = thread {
             source["threadId"] = json!(thread);
         }
-        let encoded = json!({"version":1,"source":source,"records":media}).to_string();
+    let encoded = json!({"version":1,"source":source,"records":media}).to_string();
         (encoded.encode_utf16().count() <= 16_000_000).then_some(encoded)
     };
     (text, fragment)
+}
+
+fn format_thread_link(environment_id: &str, thread_id: &str, label: &str) -> String {
+    let href = if environment_id.is_empty() {
+        format!("t3-thread://v1/{thread_id}")
+    } else {
+        format!("t3-thread://v2/{environment_id}/{thread_id}")
+    };
+    let cleaned = label
+        .replace(['[', ']', '\\', '\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let destination = if href.contains(['(', ')']) { format!("<{href}>") } else { href.clone() };
+    if cleaned.is_empty() { format!("<{href}>") } else { format!("[{cleaned}]({destination})") }
+}
+
+fn escape_xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_context_payload_text(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let after_slash = if bytes.get(i + 1) == Some(&b'/') { i + 2 } else { i + 1 };
+            let rest = &text[after_slash..];
+            let matched = ["t3_context", "context"].iter().find(|tag| {
+                rest.get(..tag.len()).is_some_and(|head| head.eq_ignore_ascii_case(tag))
+                    && !rest.as_bytes().get(tag.len()).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            });
+            if matched.is_some() {
+                out.push_str("&lt;");
+                i += 1;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().expect("valid utf8 boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn indent_lines(text: &str) -> String {
+    text.split('\n').map(|line| format!("  {line}")).collect::<Vec<_>>().join("\n")
+}
+
+fn kind_display_name(kind: &str) -> String {
+    let spaced = kind.replace('-', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn format_element_details(element: &Value) -> Vec<String> {
+    let mut lines = vec![
+        format!("url: {}", field(element, "pageUrl")),
+        format!("tag: {}", field(element, "tagName")),
+    ];
+    for (json_key, label) in [
+        ("pageTitle", "title"),
+        ("selector", "selector"),
+        ("componentName", "component"),
+    ] {
+        let val = field(element, json_key);
+        if !val.is_empty() {
+            lines.push(format!("{label}: {val}"));
+        }
+    }
+    if let Some(source) = element.get("source")
+        && let Some(file_name) = source.get("fileName").and_then(Value::as_str).filter(|s| !s.is_empty())
+    {
+        let loc = match source.get("lineNumber").and_then(Value::as_u64) {
+            Some(line) => match source.get("columnNumber").and_then(Value::as_u64) {
+                Some(col) => format!("{file_name}:{line}:{col}"),
+                None => format!("{file_name}:{line}"),
+            },
+            None => file_name.to_owned(),
+        };
+        lines.push(format!("source: {loc}"));
+    }
+    let html_preview = field(element, "htmlPreview").trim();
+    if !html_preview.is_empty() {
+        lines.push("html:".into());
+        lines.push(indent_lines(html_preview));
+    }
+    let styles = field(element, "styles").trim();
+    if !styles.is_empty() {
+        lines.push("styles:".into());
+        lines.push(indent_lines(styles));
+    }
+    lines
+}
+
+fn format_provider_payload(record: &Value) -> String {
+    match field(record, "kind") {
+        "review-comment" => {
+            let start = record.get("startIndex").and_then(Value::as_u64).unwrap_or(0);
+            let end = record.get("endIndex").and_then(Value::as_u64).unwrap_or(0);
+            let mut lines = vec![
+                format!("file: {}", field(record, "filePath")),
+                format!("range: {} ({start}-{end})", field(record, "rangeLabel")),
+                format!("section: {}", field(record, "sectionTitle")),
+            ];
+            let comment = field(record, "text").trim();
+            if !comment.is_empty() {
+                lines.push("comment:".into());
+                lines.push(indent_lines(comment));
+            }
+            let diff = field(record, "diff");
+            if !diff.trim().is_empty() {
+                let lang = record.get("fenceLanguage").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("diff");
+                lines.push(format!("{lang}:"));
+                lines.push(indent_lines(diff.trim_end_matches('\n')));
+            }
+            lines.join("\n")
+        }
+        "preview-annotation" => {
+            let page_url = field(record, "pageUrl");
+            let page_title = field(record, "pageTitle").trim();
+            let page = if page_title.is_empty() { page_url } else { page_title };
+            let mut lines = vec![format!("page: {page}"), format!("url: {page_url}")];
+            let comment = field(record, "comment").trim();
+            if !comment.is_empty() {
+                lines.push(format!("comment: {comment}"));
+            }
+            let target_summary = field(record, "targetSummary");
+            if !target_summary.is_empty() {
+                lines.push(format!("targets: {target_summary}"));
+            }
+            if let Some(changes) = record.get("styleChanges").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+                lines.push("requested visual changes:".into());
+                for change in changes.iter().filter_map(Value::as_str) {
+                    lines.push(format!("- {change}"));
+                }
+            }
+            let screenshot_id = field(record, "screenshotContextId");
+            if !screenshot_id.is_empty() {
+                lines.push(format!("screenshot: ref={screenshot_id}"));
+            }
+            if let Some(elements) = record.get("elements").and_then(Value::as_array) {
+                for (index, element) in elements.iter().enumerate() {
+                    lines.push(format!("element {}:", index + 1));
+                    lines.push(indent_lines(&format_element_details(element).join("\n")));
+                }
+            }
+            lines.join("\n")
+        }
+        _ => record.get("payload").map(|p| p.to_string()).unwrap_or_else(|| record.to_string()),
+    }
+}
+
+fn project_single_context_for_provider(kind: &str, context_id: &str, label: &str, record: &Value) -> String {
+    let clean_label = label
+        .replace(['\r', '\n', ';', ']'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let marker = format!(
+        "[{}: {}; ref={context_id}]",
+        kind_display_name(kind),
+        escape_context_payload_text(&clean_label),
+    );
+    let body = escape_context_payload_text(&format_provider_payload(record));
+    format!(
+        "{marker}\n\n<t3_context version=\"1\">\n<context kind=\"{}\" id=\"{}\">\n{body}\n</context>\n</t3_context>",
+        escape_xml_attribute(kind),
+        escape_xml_attribute(context_id),
+    )
+}
+
+/// Projects `t3-context://` references in a user-input answer (`projectPendingUserInputAnswer`):
+/// thread mentions become `t3-thread://` markdown links, while `review-comment` /
+/// `preview-annotation` links expand to `<t3_context>` provider payloads.
+pub fn project_pending_user_input_answer(answer: Value, records: &[Value]) -> Value {
+    let Value::String(text) = &answer else { return answer };
+    if records.is_empty() {
+        return answer;
+    }
+    let occurrences = context_references(text);
+    if occurrences.is_empty() {
+        return answer;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for r in occurrences {
+        out.push_str(&text[cursor..r.start]);
+        let record = records.iter().find(|rec| field(rec, "contextId") == r.context_id);
+        match record {
+            Some(rec) if field(rec, "kind") == r.kind => {
+                if r.kind == "thread" {
+                    out.push_str(&format_thread_link(field(rec, "environmentId"), field(rec, "threadId"), r.label));
+                } else {
+                    out.push_str(&project_single_context_for_provider(r.kind, r.context_id, r.label, rec));
+                }
+            }
+            _ => out.push_str(&text[r.start..r.end]),
+        }
+        cursor = r.end;
+    }
+    out.push_str(&text[cursor..]);
+    Value::String(out)
 }

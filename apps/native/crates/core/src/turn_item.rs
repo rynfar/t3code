@@ -327,6 +327,8 @@ pub enum TurnItemKind {
         reason: String,
         secret_status: String,
         #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
         placeholder: Option<String>,
         #[serde(default)]
         delivery: Option<String>,

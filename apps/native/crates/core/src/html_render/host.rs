@@ -101,9 +101,15 @@ pub fn web_url(url: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageRequest {
+pub struct ImageEntry {
     pub src: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRequest {
+    pub images: Vec<ImageEntry>,
+    pub index: usize,
 }
 
 pub fn image_src(src: &str) -> bool {
@@ -114,18 +120,40 @@ pub fn image_src(src: &str) -> bool {
             && crate::media::decode_data_url(src).is_some_and(|bytes| !bytes.is_empty()))
 }
 
-pub fn read_image(value: &Value) -> Option<ImageRequest> {
-    let p = params(value, "t3/notifications/open-image")?;
-    let src = p.get("src")?.as_str()?;
+fn read_image_entry(src: &str, name: Option<&str>) -> Option<ImageEntry> {
     if !image_src(src) {
         return None;
     }
-    let trimmed = p.get("name").and_then(Value::as_str).map(super::js_trim).unwrap_or("");
+    let trimmed = name.map(super::js_trim).unwrap_or("");
     let label = super::utf16_prefix(trimmed, super::MAX_TITLE_LENGTH);
-    Some(ImageRequest {
+    Some(ImageEntry {
         src: src.into(),
         name: if label.is_empty() { "Image".into() } else { label.into() },
     })
+}
+
+pub fn read_image(value: &Value) -> Option<ImageRequest> {
+    let p = params(value, "t3/notifications/open-image")?;
+    let clicked = read_image_entry(p.get("src")?.as_str()?, p.get("name").and_then(Value::as_str))?;
+    let mut gallery = Vec::new();
+    let mut at: Option<usize> = None;
+    let target_index = p.get("index").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok());
+    if let Some(entries) = p.get("images").and_then(Value::as_array) {
+        for (position, entry) in entries.iter().enumerate() {
+            let Some(obj) = entry.as_object() else { continue };
+            let Some(src) = obj.get("src").and_then(Value::as_str) else { continue };
+            let Some(image) = read_image_entry(src, obj.get("name").and_then(Value::as_str)) else { continue };
+            if target_index == Some(position) {
+                at = Some(gallery.len());
+            }
+            gallery.push(image);
+        }
+    }
+    if let Some(index) = at.filter(|&i| gallery.get(i).is_some_and(|img| img.src == clicked.src)) {
+        Some(ImageRequest { images: gallery, index })
+    } else {
+        Some(ImageRequest { images: vec![clicked], index: 0 })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

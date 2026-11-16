@@ -12,12 +12,14 @@ use gpui_component::{h_flex, v_flex};
 use serde_json::Value;
 use t3_core::providers::entries as provider_entries;
 use t3_core::timeline::{
-    CompactionTokens, ExistingPeerLink, HandoffEndpoint, LINK_ACCESS_LEVELS, LinkTone,
-    MachineCandidate, SecretTone, can_manage_peer_links, format_duration, link_access_description,
-    link_access_label, link_request_default_access, link_request_display, linkable_machines,
-    mcp_client_scopes, parse_iso_ms, rank_machines_by_hint, resolve_handoff_endpoints,
-    sanitize_link_request_error, sanitize_secret_request_error, secret_request_display,
-    secret_request_privacy_note,
+    ANOTHER_ADDRESS, CompactionTokens, ExistingPeerLink, HandoffEndpoint, LINK_ACCESS_LEVELS,
+    LinkRequestTarget, LinkTone, MachineCandidate, SecretRequestSource, SecretTone,
+    can_manage_peer_links, format_duration, link_access_description, link_access_label,
+    link_destination, link_request_default_access, link_request_display, link_request_target,
+    link_request_target_name, linkable_machines, mcp_client_scopes, parse_iso_ms,
+    rank_machines_by_hint, resolve_handoff_endpoints, sanitize_link_request_error,
+    sanitize_secret_request_error, secret_request_display, secret_request_link,
+    secret_request_privacy_note, secret_request_reference, secret_request_sources,
 };
 use t3_core::turn_item::{TurnItem, TurnItemKind};
 
@@ -31,6 +33,7 @@ use crate::app_state::AppState;
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant};
 use crate::icons::Icon;
 use crate::provider_icon::{ProviderIcon, ProviderMark};
+use crate::settings::controls::{Select, SelectOption};
 use crate::theme::{hsla, palette, rem};
 use crate::thread_view::ThreadView;
 
@@ -545,12 +548,14 @@ fn link_card_headline(default_label: Option<&str>, default_url: Option<&str>, de
     let lbl = clean(default_label);
     let url = clean(default_url);
     let env_id = clean(default_environment_id);
-    let title = match lbl.or(url).or(env_id) {
+    if let Some(url) = url {
+        return (format!("Link {} to this environment", link_destination(url)), Some(url.to_owned()));
+    }
+    let title = match lbl.or(env_id) {
         Some(target) => format!("Link {target} to this environment"),
         None => "Link a machine to this environment".to_owned(),
     };
-    let subtitle = if lbl.is_some() { url.map(str::to_owned) } else { None };
-    (title, subtitle)
+    (title, None)
 }
 
 fn link_access_full_description(access: &str) -> String {
@@ -562,6 +567,9 @@ fn link_access_full_description(access: &str) -> String {
 
 struct SecretCardState {
     input: Entity<InputState>,
+    source_id: Option<String>,
+    secret_draft: String,
+    reference_draft: String,
     submitting: bool,
     error: Option<String>,
 }
@@ -573,6 +581,7 @@ struct SecretRequestCard {
     turn_item_id: String,
     label: String,
     reason: String,
+    url: Option<String>,
     placeholder: Option<String>,
     delivery: Option<String>,
     state: Entity<AppState>,
@@ -581,19 +590,77 @@ struct SecretRequestCard {
 impl RenderOnce for SecretRequestCard {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
-        let placeholder = self.placeholder.clone().unwrap_or_else(|| "Paste secret".to_owned());
+        let default_placeholder = self.placeholder.clone().unwrap_or_else(|| "Paste the secret".to_owned());
+        let init_placeholder = default_placeholder.clone();
         let card_state = window.use_keyed_state(SharedString::from(format!("secret-ui:{}", self.id)), cx, |window, cx| SecretCardState {
-            input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder)),
+            input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(init_placeholder)),
+            source_id: None,
+            secret_draft: String::new(),
+            reference_draft: String::new(),
             submitting: false,
             error: None,
         });
-        let (input, submitting, error) = {
+        let sources: Vec<SecretRequestSource> = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| secret_request_sources(c.secret_request_references, &c.settings.secret_providers))
+            .unwrap_or_default();
+        let (input, source_id, submitting, error) = {
             let s = card_state.read(cx);
-            (s.input.clone(), s.submitting, s.error.clone())
+            (s.input.clone(), s.source_id.clone(), s.submitting, s.error.clone())
         };
+        let active_source = source_id.as_deref().and_then(|id| sources.iter().find(|s| s.id == id)).cloned();
+        let link = secret_request_link(self.url.as_deref(), &self.reason);
+        let url_caption = self.url.as_deref().map(str::trim).filter(|u| !u.is_empty()).map(str::to_owned);
         let privacy_note = secret_request_privacy_note(self.delivery.as_deref());
+
+        let source_select = (!sources.is_empty()).then(|| {
+            let options = std::iter::once(SelectOption::new("__stored__", "Value").icon(Icon::FileText))
+                .chain(sources.iter().map(|source| {
+                    SelectOption::new(source.id.clone(), source.label.clone())
+                        .icon(if source.one_password { Icon::OnePassword } else { Icon::KeyRound })
+                }))
+                .collect();
+            let selected = active_source.as_ref().map_or("__stored__", |s| s.id.as_str()).to_owned();
+            let select_state = card_state.clone();
+            let select_input = input.clone();
+            let select_sources = sources.clone();
+            let select_default_placeholder = default_placeholder.clone();
+            Select::new(SharedString::from(format!("secret-source:{}", self.id)), options)
+                .selected(selected)
+                .label("")
+                .popup_width(192.)
+                .disabled(submitting)
+                .on_change(move |next_val, window, cx| {
+                    let next_id = (next_val.as_ref() != "__stored__").then(|| next_val.to_string());
+                    let next_source = next_id.as_deref().and_then(|id| select_sources.iter().find(|s| s.id == id));
+                    let next_placeholder = next_source.map_or_else(|| select_default_placeholder.clone(), |s| s.reference_placeholder.to_owned());
+                    let cur_text = select_input.read(cx).value().to_string();
+                    let restored = select_state.update(cx, |s, cx| {
+                        if s.source_id.is_some() {
+                            s.reference_draft = cur_text;
+                        } else {
+                            s.secret_draft = cur_text;
+                        }
+                        s.source_id = next_id.clone();
+                        s.error = None;
+                        cx.notify();
+                        if next_id.is_some() { s.reference_draft.clone() } else { s.secret_draft.clone() }
+                    });
+                    select_input.update(cx, |inp, cx| {
+                        inp.set_masked(next_id.is_none(), window, cx);
+                        inp.set_placeholder(next_placeholder, window, cx);
+                        inp.set_value(restored, window, cx);
+                    });
+                })
+        });
+
         let save_state = card_state.clone();
         let save_input = input.clone();
+        let save_source = active_source.clone();
         let save_app = self.state.clone();
         let save_thread = self.thread_id.clone();
         let save_item = self.turn_item_id.clone();
@@ -620,38 +687,111 @@ impl RenderOnce for SecretRequestCard {
             .when(!self.reason.trim().is_empty(), |this| {
                 this.child(div().text_size(px(13.)).text_color(hsla(p.muted_foreground)).child(self.reason))
             })
+            .when_some(link, |this, link| {
+                let open_href = link.href.clone();
+                let open_debug_id = format!("secret-open-link:{}", self.id);
+                this.child(
+                    v_flex()
+                        .items_start()
+                        .gap(px(4.))
+                        .child(
+                            div().debug_selector(move || open_debug_id.clone()).child(
+                                Button::new(SharedString::from(format!("secret-open-link:{}", self.id)), ButtonVariant::Outline, ButtonSize::Xs)
+                                    .label(format!("Open {}", link.host))
+                                    .icon(Icon::ExternalLink)
+                                    .on_click(move |_, _, cx| cx.open_url(&open_href)),
+                            ),
+                        )
+                        .when_some(url_caption.clone(), |col, url| {
+                            col.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(url))
+                        }),
+                )
+            })
             .child(
                 h_flex()
                     .gap(px(8.))
+                    .when_some(source_select, |row, select| {
+                        let source_debug_id = format!("secret-source:{}", self.id);
+                        row.child(div().debug_selector(move || source_debug_id.clone()).child(select))
+                    })
                     .child(div().flex_1().min_w_0().child(Input::new(&input).disabled(submitting)))
-                    .child(
-                        Button::new(SharedString::from(format!("secret-save:{}", self.id)), ButtonVariant::Outline, ButtonSize::Xs)
-                            .label(if submitting { "Saving..." } else { "Save securely" })
-                            .disabled(submitting)
-                            .on_click(move |_, _, cx| {
+                    .child({
+                        let save_debug_id = format!("secret-save:{}", self.id);
+                        div().debug_selector(move || save_debug_id.clone()).child(
+                            Button::new(SharedString::from(format!("secret-save:{}", self.id)), ButtonVariant::Outline, ButtonSize::Xs)
+                                .label(if submitting { "Saving..." } else { "Save securely" })
+                                .disabled(submitting)
+                                .on_click(move |_, _, cx| {
+                                    if submitting {
+                                        return;
+                                    }
+                                    let draft = save_input.read(cx).value().to_string();
+                                    let payload = if let Some(source) = save_source.as_ref() {
+                                        let Some((provider, reference)) = secret_request_reference(source, &draft) else {
+                                            save_state.update(cx, |s, cx| {
+                                                s.error = Some(source.invalid_reference_message.to_owned());
+                                                cx.notify();
+                                            });
+                                            return;
+                                        };
+                                        t3_core::commands::secret_request_answer_reference(&save_thread, &save_item, provider, &reference)
+                                    } else {
+                                        let trimmed = draft.trim();
+                                        if trimmed.is_empty() {
+                                            save_state.update(cx, |s, cx| {
+                                                s.error = Some("Enter a secret value first.".to_owned());
+                                                cx.notify();
+                                            });
+                                            return;
+                                        }
+                                        t3_core::commands::secret_request_answer_save(&save_thread, &save_item, trimmed)
+                                    };
+                                    save_state.update(cx, |s, cx| {
+                                        s.submitting = true;
+                                        s.error = None;
+                                        cx.notify();
+                                    });
+                                    let task = save_app.update(cx, |app, _| {
+                                        app.rpc(t3_core::commands::method::SECRETS_ANSWER_REQUEST, payload)
+                                    });
+                                    let weak = save_state.downgrade();
+                                    cx.spawn(async move |cx| {
+                                        let res = task.await;
+                                        let _ = weak.update(cx, |s, cx| {
+                                            s.submitting = false;
+                                            if let Err(err) = res {
+                                                let (tag, msg) = rpc_error_tag_and_message(&err);
+                                                s.error = Some(sanitize_secret_request_error(tag, msg));
+                                            }
+                                            cx.notify();
+                                        });
+                                    })
+                                    .detach();
+                                }),
+                        )
+                    })
+                    .child({
+                        let decline_debug_id = format!("secret-decline:{}", self.id);
+                        div().debug_selector(move || decline_debug_id.clone()).child(ghost_button(
+                            SharedString::from(format!("secret-decline:{}", self.id)),
+                            "Decline",
+                            submitting,
+                            move |_, _, cx| {
                                 if submitting {
                                     return;
                                 }
-                                let secret = save_input.read(cx).value().to_string();
-                                if secret.trim().is_empty() {
-                                    save_state.update(cx, |s, cx| {
-                                        s.error = Some("Enter a secret value first.".to_owned());
-                                        cx.notify();
-                                    });
-                                    return;
-                                }
-                                save_state.update(cx, |s, cx| {
+                                decline_state.update(cx, |s, cx| {
                                     s.submitting = true;
                                     s.error = None;
                                     cx.notify();
                                 });
-                                let task = save_app.update(cx, |app, _| {
+                                let task = decline_app.update(cx, |app, _| {
                                     app.rpc(
                                         t3_core::commands::method::SECRETS_ANSWER_REQUEST,
-                                        t3_core::commands::secret_request_answer_save(&save_thread, &save_item, &secret),
+                                        t3_core::commands::secret_request_answer_decline(&decline_thread, &decline_item),
                                     )
                                 });
-                                let weak = save_state.downgrade();
+                                let weak = decline_state.downgrade();
                                 cx.spawn(async move |cx| {
                                     let res = task.await;
                                     let _ = weak.update(cx, |s, cx| {
@@ -664,43 +804,10 @@ impl RenderOnce for SecretRequestCard {
                                     });
                                 })
                                 .detach();
-                            }),
-                    )
-                    .child(ghost_button(
-                        SharedString::from(format!("secret-decline:{}", self.id)),
-                        "Decline",
-                        submitting,
-                        move |_, _, cx| {
-                            if submitting {
-                                return;
-                            }
-                            decline_state.update(cx, |s, cx| {
-                                s.submitting = true;
-                                s.error = None;
-                                cx.notify();
-                            });
-                            let task = decline_app.update(cx, |app, _| {
-                                app.rpc(
-                                    t3_core::commands::method::SECRETS_ANSWER_REQUEST,
-                                    t3_core::commands::secret_request_answer_decline(&decline_thread, &decline_item),
-                                )
-                            });
-                            let weak = decline_state.downgrade();
-                            cx.spawn(async move |cx| {
-                                let res = task.await;
-                                let _ = weak.update(cx, |s, cx| {
-                                    s.submitting = false;
-                                    if let Err(err) = res {
-                                        let (tag, msg) = rpc_error_tag_and_message(&err);
-                                        s.error = Some(sanitize_secret_request_error(tag, msg));
-                                    }
-                                    cx.notify();
-                                });
-                            })
-                            .detach();
-                        },
-                        cx,
-                    )),
+                            },
+                            cx,
+                        ))
+                    }),
             )
             .when_some(error, |this, err| this.child(div().text_xs().text_color(hsla(p.destructive)).child(err)))
             .child(
@@ -716,8 +823,7 @@ impl RenderOnce for SecretRequestCard {
 
 struct LinkCardState {
     dialog_open: bool,
-    manual_mode: bool,
-    default_manual_mode: bool,
+    manual_override: Option<bool>,
     selected_machine_id: Option<String>,
     access: String,
     loading_links: bool,
@@ -732,7 +838,7 @@ struct LinkCardState {
 impl LinkCardState {
     fn reset(&mut self, default_access: String, default_url: &str, default_label: &str, window: &mut Window, cx: &mut App) {
         self.dialog_open = false;
-        self.manual_mode = self.default_manual_mode;
+        self.manual_override = None;
         self.selected_machine_id = None;
         self.access = default_access;
         self.submitting = false;
@@ -743,6 +849,7 @@ impl LinkCardState {
     }
 
     fn seed_manual_machine(&mut self, machine_id: &str, url: Option<&str>, label: &str, window: &mut Window, cx: &mut App) {
+        self.manual_override = Some(true);
         self.selected_machine_id = Some(machine_id.to_owned());
         if let Some(url) = url.filter(|u| !u.trim().is_empty()) {
             self.url_input.update(cx, |input, cx| input.set_value(url.to_owned(), window, cx));
@@ -772,17 +879,18 @@ impl RenderOnce for LinkRequestCard {
         let p = palette(cx);
         let default_access = link_request_default_access(self.requested_access.as_deref()).to_owned();
         let default_url = self.default_url.clone().unwrap_or_default();
-        let default_label = self.default_label.clone().unwrap_or_default();
-        let initial_manual_mode = self.default_environment_id.is_none()
-            && self.default_url.as_deref().is_some_and(|u| !u.trim().is_empty());
+        let trusted_default_label = if self.default_url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+            String::new()
+        } else {
+            self.default_label.clone().unwrap_or_default()
+        };
         let wh = window.window_handle();
         let init_access = default_access.clone();
         let init_url = default_url.clone();
-        let init_label = default_label.clone();
+        let init_label = trusted_default_label.clone();
         let card_state = window.use_keyed_state(SharedString::from(format!("link-ui:{}", self.id)), cx, |window, cx| LinkCardState {
             dialog_open: false,
-            manual_mode: initial_manual_mode,
-            default_manual_mode: initial_manual_mode,
+            manual_override: None,
             selected_machine_id: None,
             access: init_access,
             loading_links: false,
@@ -793,11 +901,11 @@ impl RenderOnce for LinkRequestCard {
             label_input: cx.new(|cx| InputState::new(window, cx).default_value(init_label).placeholder("Machine label (optional)")),
             code_input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Paste pairing code")),
         });
-        let (dialog_open, manual_mode, access, loading_links, links, submitting, error, url_input, label_input, code_input) = {
+        let (dialog_open, manual_override, access, loading_links, links, submitting, error, url_input, label_input, code_input) = {
             let s = card_state.read(cx);
             (
                 s.dialog_open,
-                s.manual_mode,
+                s.manual_override,
                 s.access.clone(),
                 s.loading_links,
                 s.links.clone(),
@@ -820,27 +928,53 @@ impl RenderOnce for LinkRequestCard {
         let saved_envs = app_read.environments.environments.clone();
         let _ = app_read;
 
-        let machines = rank_machines_by_hint(
+        let mut machines = rank_machines_by_hint(
             linkable_machines(&candidates, &links, current_env_id.as_deref()),
             self.hint.as_deref(),
             self.default_label.as_deref(),
             self.default_environment_id.as_deref(),
         );
 
+        let url_target = link_request_target(
+            self.default_environment_id.as_deref(),
+            self.default_url.as_deref(),
+            &machines,
+            manual_override.and_then(|manual| manual.then_some(ANOTHER_ADDRESS)),
+        );
+        if let LinkRequestTarget::Machine { ref environment_id, .. } = url_target
+            && let Some(idx) = machines.iter().position(|m| &m.id == environment_id)
+            && idx > 0
+        {
+            let matched = machines.remove(idx);
+            machines.insert(0, matched);
+        }
         let has_machines = !machines.is_empty();
+        let manual_mode = manual_override.unwrap_or_else(|| {
+            if self.default_url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+                matches!(url_target, LinkRequestTarget::Address)
+            } else {
+                !has_machines
+            }
+        });
+        let target_name = match &url_target {
+            LinkRequestTarget::Machine { label, .. } => label.clone(),
+            _ => link_request_target_name(self.default_url.as_deref()),
+        };
+        let typed_url = url_input.read(cx).value().trim().to_owned();
+        let destination_url = if typed_url.is_empty() { default_url.clone() } else { typed_url };
         let (title, url_subtitle) = link_card_headline(self.default_label.as_deref(), self.default_url.as_deref(), self.default_environment_id.as_deref());
         let open_state = card_state.clone();
         let open_app = self.state.clone();
         let open_default_access = default_access.clone();
         let open_default_url = default_url.clone();
-        let open_default_label = default_label.clone();
+        let open_default_label = trusted_default_label.clone();
         let decline_state = card_state.clone();
         let decline_app = self.state.clone();
         let decline_thread = self.thread_id.clone();
         let decline_item = self.turn_item_id.clone();
         let decline_default_access = default_access.clone();
         let decline_default_url = default_url.clone();
-        let decline_default_label = default_label.clone();
+        let decline_default_label = trusted_default_label.clone();
         let decline_wh = wh;
         let manual_toggle_state = card_state.clone();
         let manual_submit_state = card_state.clone();
@@ -853,7 +987,7 @@ impl RenderOnce for LinkRequestCard {
         let manual_access = access.clone();
         let manual_default_access = default_access.clone();
         let manual_default_url = default_url.clone();
-        let manual_default_label = default_label.clone();
+        let manual_default_label = trusted_default_label.clone();
         let manual_wh = wh;
 
         v_flex()
@@ -1062,16 +1196,7 @@ impl RenderOnce for LinkRequestCard {
                                     let existing = machine.existing_link_environment_id.clone();
                                     let machine_id = machine.id.clone();
                                     let machine_label = machine.label.clone();
-                                    let mut effective_urls = machine.urls.clone();
-                                    if self.default_environment_id.as_deref() == Some(machine_id.as_str())
-                                        && let Some(url) = self
-                                            .default_url
-                                            .as_deref()
-                                            .map(str::trim)
-                                            .filter(|u| !u.is_empty() && !effective_urls.iter().any(|existing_url| existing_url == u))
-                                    {
-                                        effective_urls.push(url.to_owned());
-                                    }
+                                    let effective_urls = machine.urls.clone();
                                     let creds = saved_envs
                                         .iter()
                                         .find(|e| e.environment_id.as_deref() == Some(machine_id.as_str()) || e.id == machine_id)
@@ -1083,7 +1208,7 @@ impl RenderOnce for LinkRequestCard {
                                     let cur_access = access.clone();
                                     let reset_access = default_access.clone();
                                     let reset_url = default_url.clone();
-                                    let reset_label = default_label.clone();
+                                    let reset_label = trusted_default_label.clone();
                                     let button_label = if existing.is_some() {
                                         "Use existing link"
                                     } else if effective_urls.is_empty() {
@@ -1104,7 +1229,10 @@ impl RenderOnce for LinkRequestCard {
                                             v_flex()
                                                 .min_w_0()
                                                 .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(machine.label))
-                                                .when_some(effective_urls.first().cloned(), |row, url| {
+                                                .when(existing.is_some(), |row| {
+                                                    row.child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Already linked · Change access in Settings → Environments."))
+                                                })
+                                                .when_some(effective_urls.first().cloned().filter(|_| existing.is_none()), |row, url| {
                                                     row.child(div().truncate().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(url))
                                                 }),
                                         )
@@ -1118,7 +1246,6 @@ impl RenderOnce for LinkRequestCard {
                                                     }
                                                     if existing.is_none() && effective_urls.is_empty() {
                                                         st.update(cx, |s, cx| {
-                                                            s.manual_mode = true;
                                                             s.seed_manual_machine(&machine_id, None, &machine_label, window, cx);
                                                             s.error = Some("No direct address is saved for that machine. Enter its URL and pairing code below.".to_owned());
                                                             cx.notify();
@@ -1198,7 +1325,6 @@ impl RenderOnce for LinkRequestCard {
                                                                     let _ = wh.update(cx, |_, window, cx| {
                                                                         let _ = weak.update(cx, |s, cx| {
                                                                             s.submitting = false;
-                                                                            s.manual_mode = true;
                                                                             s.seed_manual_machine(
                                                                                 &machine_id,
                                                                                 machine_urls.first().map(String::as_str),
@@ -1217,7 +1343,6 @@ impl RenderOnce for LinkRequestCard {
                                                                 let _ = wh.update(cx, |_, window, cx| {
                                                                     let _ = weak.update(cx, |s, cx| {
                                                                         s.submitting = false;
-                                                                        s.manual_mode = true;
                                                                         s.seed_manual_machine(
                                                                             &machine_id,
                                                                             machine_urls.first().map(String::as_str),
@@ -1268,7 +1393,6 @@ impl RenderOnce for LinkRequestCard {
                                                         let _ = wh.update(cx, |_, window, cx| {
                                                             st.update(cx, |s, cx| {
                                                                 s.submitting = false;
-                                                                s.manual_mode = true;
                                                                 s.seed_manual_machine(&machine_id, first_url.as_deref(), &machine_label, window, cx);
                                                                 s.error = Some("No active credentials for that machine; enter a pairing code manually.".to_owned());
                                                                 cx.notify();
@@ -1284,12 +1408,40 @@ impl RenderOnce for LinkRequestCard {
                             panel.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("No other saved machines found. Enter connection details manually."))
                         })
                         .when(manual_mode || !has_machines, |panel| {
+                            let dest = link_destination(&destination_url);
                             panel.child(
                                 v_flex()
                                     .gap(px(6.))
+                                    .child(
+                                        v_flex()
+                                            .gap(px(2.))
+                                            .p(px(10.))
+                                            .rounded(px(8.))
+                                            .border_1()
+                                            .border_color(hsla(p.border).opacity(0.7))
+                                            .bg(hsla(p.card).opacity(0.6))
+                                            .child(
+                                                h_flex()
+                                                    .gap(px(6.))
+                                                    .child(Icon::TriangleAlert.render(px(13.), hsla(p.foreground)))
+                                                    .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Check this address")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(hsla(p.muted_foreground))
+                                                    .child(format!("This app cannot confirm it is one of your machines. The pairing code you paste is sent there. {dest}")),
+                                            ),
+                                    )
                                     .child(Input::new(&url_input).disabled(submitting))
                                     .child(Input::new(&label_input).disabled(submitting))
                                     .child(Input::new(&code_input).disabled(submitting))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(hsla(p.muted_foreground))
+                                            .child(format!("Create a link on {target_name}: Settings → Sharing & access → Authorized clients → Create link, then paste its code here. Revoke it later in that machine's Sharing & access.")),
+                                    )
                                     .child(
                                         h_flex().justify_end().child(
                                             Button::new(SharedString::from(format!("link-manual-submit:{id_str}")), ButtonVariant::Outline, ButtonSize::Xs)
@@ -1363,7 +1515,7 @@ impl RenderOnce for LinkRequestCard {
                                 submitting,
                                 move |_, _, cx| {
                                     manual_toggle_state.update(cx, |s, cx| {
-                                        s.manual_mode = !s.manual_mode;
+                                        s.manual_override = Some(!manual_mode);
                                         s.selected_machine_id = None;
                                         s.error = None;
                                         cx.notify();
@@ -1513,7 +1665,7 @@ pub fn event_row(
     match &item.kind {
         TurnItemKind::Subagent { .. } if subagents.len() > 1 => subagent_group(id, subagents, &marks, env, cx),
         TurnItemKind::Subagent { .. } => subagent_row(item, &marks, env, cx),
-        TurnItemKind::SecretRequest { label, reason, placeholder, delivery, secret_status } => {
+        TurnItemKind::SecretRequest { label, reason, url, placeholder, delivery, secret_status } => {
             if secret_status == "pending"
                 && can_answer_here
                 && let Some(thread_id) = env.thread_id
@@ -1524,6 +1676,7 @@ pub fn event_row(
                     turn_item_id: item.id.clone(),
                     label: label.clone(),
                     reason: reason.clone(),
+                    url: url.clone(),
                     placeholder: placeholder.clone(),
                     delivery: delivery.clone(),
                     state: env.state.clone(),
@@ -1725,12 +1878,12 @@ mod tests {
             ("Link a machine to this environment".to_owned(), None)
         );
         assert_eq!(
-            link_card_headline(Some("Studio Mac"), Some("https://studio.ts.net"), None),
-            ("Link Studio Mac to this environment".to_owned(), Some("https://studio.ts.net".to_owned()))
+            link_card_headline(Some("Studio Mac"), Some("https://studio.ts.net/pair"), None),
+            ("Link https://studio.ts.net to this environment".to_owned(), Some("https://studio.ts.net/pair".to_owned()))
         );
         assert_eq!(
             link_card_headline(None, Some("https://studio.ts.net"), None),
-            ("Link https://studio.ts.net to this environment".to_owned(), None)
+            ("Link https://studio.ts.net to this environment".to_owned(), Some("https://studio.ts.net".to_owned()))
         );
 
         let relay = vec![
@@ -1885,5 +2038,51 @@ mod tests {
         vcx.update(|window, cx| {
             window.draw(cx).clear();
         });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn pending_secret_request_renders_open_host_link_and_secret_source_select(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        state.update(cx, |state, _| {
+            let mut config = state.server_config.config.take().unwrap_or_default();
+            config.secret_request_references = true;
+            config.settings.secret_providers = serde_json::from_value(serde_json::json!({
+                "op-work": { "kind": "one_password", "label": "Work 1Password", "config": { "account": "work.1password.com" } }
+            }))
+            .unwrap();
+            state.server_config.config = Some(config);
+        });
+        struct SecretHost {
+            state: Entity<AppState>,
+        }
+        impl gpui::Render for SecretHost {
+            fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                gpui::div()
+                    .size_full()
+                    .child(SecretRequestCard {
+                        id: "secret-test-1".into(),
+                        thread_id: "t1".into(),
+                        turn_item_id: "item-sec-1".into(),
+                        label: "OPENAI_API_KEY".into(),
+                        reason: "Sign in to copy your API key.".into(),
+                        url: Some("https://platform.openai.com/api-keys".into()),
+                        placeholder: None,
+                        delivery: None,
+                        state: self.state.clone(),
+                    })
+            }
+        }
+        let (_host, vcx) = cx.add_window_view(|_, _| SecretHost { state: state.clone() });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("secret-open-link:secret-test-1").is_some());
+        assert!(vcx.debug_bounds("secret-source:secret-test-1").is_some());
+        assert!(vcx.debug_bounds("secret-save:secret-test-1").is_some());
+        assert!(vcx.debug_bounds("secret-decline:secret-test-1").is_some());
     }
 }
