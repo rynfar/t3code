@@ -44,9 +44,10 @@ use crate::turn_item::TurnItem;
 
 pub use activity::{
     Attribution, LatestRun, ModelSwitchDisplay, ThreadActivity, UserAttachmentPartition, UserFileCard, UserMessagePresentation,
-    derive_activity, is_audio_attachment, is_workflow_script_message, partition_user_attachments, plan_title,
-    resolve_model_switch_change, resolve_user_message_presentation, scheduled_task_id_from_message,
-    should_collapse_user_message, strip_displayed_plan_markdown, user_message_attribution, user_message_file_label,
+    attribution_for_fields, derive_activity, is_audio_attachment, is_workflow_script_message, partition_user_attachments,
+    plan_title, resolve_model_switch_change, resolve_user_message_presentation, scheduled_task_id_from_fields,
+    scheduled_task_id_from_message, should_collapse_user_message, strip_displayed_plan_markdown,
+    strip_legacy_automation_prefix, user_message_attribution, user_message_file_label,
 };
 pub use directives::{
     CodexArtifactTemplate, CodexAssistantSegment, codex_artifact_template_presentation_label,

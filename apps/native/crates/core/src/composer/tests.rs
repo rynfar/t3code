@@ -307,3 +307,31 @@ fn resolve_prompt_suggestion_run_skips_queued_or_unstarted_cancelled_and_rejects
         Some(("run-4", "running"))
     );
 }
+
+#[test]
+fn clear_compact_commands_and_plan_composer_turn() {
+    assert!(is_clear_composer_command("  /CLEAR \n"));
+    assert!(!is_clear_composer_command("/clear extra"));
+    assert!(is_compact_command("/compact"));
+    assert!(is_compact_command(" /COMPACT focus on auth "));
+    assert!(!is_compact_command("/compaction"));
+
+    assert_eq!(
+        plan_composer_turn("fix bug", false, true, false, ComposerDispatch::Auto, false),
+        PlannedComposerTurn { compact_before_send: true, turn_dispatch: ComposerDispatch::Queue }
+    );
+    // Explicit /compact or keepFullHistory or freshContext never double-compacts.
+    assert_eq!(
+        plan_composer_turn("/compact auth", false, true, false, ComposerDispatch::Auto, false),
+        PlannedComposerTurn { compact_before_send: false, turn_dispatch: ComposerDispatch::Auto }
+    );
+    assert_eq!(
+        plan_composer_turn("fix bug", false, true, true, ComposerDispatch::Auto, false),
+        PlannedComposerTurn { compact_before_send: false, turn_dispatch: ComposerDispatch::Auto }
+    );
+    // Fresh session suppresses both compaction and steering.
+    assert_eq!(
+        plan_composer_turn("fresh start", false, true, false, ComposerDispatch::Steer, true),
+        PlannedComposerTurn { compact_before_send: false, turn_dispatch: ComposerDispatch::Queue }
+    );
+}

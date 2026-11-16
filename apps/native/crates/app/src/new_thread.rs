@@ -146,7 +146,7 @@ impl PickerRow {
     }
 }
 
-fn environment_machine_icon(state: &AppState, saved_id: &str) -> Icon {
+pub(crate) fn environment_machine_icon(state: &AppState, saved_id: &str) -> Icon {
     let config = state
         .scoped_environment(saved_id)
         .and_then(|entry| entry.config.config.as_ref())
@@ -1218,6 +1218,7 @@ impl AppState {
         let choice = t3_core::workspace::DraftWorkspace {
             destination: Some((self.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()).unwrap_or_default(), project.created_at.clone())),
             branch: thread.branch.clone(),
+            start_from_origin: None,
             environment_id: self.environments.active.clone().unwrap_or_default(),
             project_root: project.workspace_root.clone(),
             mode: if thread.worktree_path.is_some() { t3_core::server_config::ThreadEnvMode::Worktree } else { t3_core::server_config::ThreadEnvMode::Local },

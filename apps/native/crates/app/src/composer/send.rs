@@ -59,6 +59,12 @@ pub(super) struct Outgoing {
 }
 
 impl Composer {
+    pub(crate) fn send_alternate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.snapshot.running && !matches!(self.snapshot.target, Some(Target::Draft(_))) {
+            self.submit(SubmitIntent::Alternate, window, cx);
+        }
+    }
+
     /// Submit, as the send button and Enter do.
     pub(crate) fn submit(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "snapshot")]
@@ -94,6 +100,15 @@ impl Composer {
         }
         let prompt = self.prompt(cx);
         let staged = self.staged_attachments();
+        if self.fresh_session_command_available(cx)
+            && !self.has_non_prompt_content(&prompt, &staged)
+            && rules::is_clear_composer_command(&prompt)
+        {
+            self.arm_fresh_session(cx);
+            self.set_prompt("", window, cx);
+            self.draft_changed(cx);
+            return;
+        }
         if t3_core::usage::limits::UsageLimitsReport::is_command(&prompt)
             && !self.has_non_prompt_content(&prompt, &staged)
             && self.usage_limits_offered(cx)
@@ -118,6 +133,8 @@ impl Composer {
         ) {
             if terminals.expired > 0 {
                 self.expired_toast(terminals.expired, ExpiredNotice::Empty, cx);
+            } else if self.snapshot.can_resume && intent == SubmitIntent::Foreground {
+                self.resume(window, cx);
             }
             return;
         }
@@ -346,7 +363,12 @@ impl Composer {
         let start_from_origin = config.is_some_and(|config| workspace::start_from_origin(&config.settings, &project_id, ThreadEnvMode::Worktree));
         let cwd = root.clone().unwrap_or_default();
         let project_file = state.rpc(method::PROJECTS_READ_FILE, workspace::project_file_request(&cwd));
-        let refs = workspace_choice.as_ref().and_then(workspace::DraftWorkspace::strategy).is_none().then(|| state.request(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd), |value| serde_json::from_value::<VcsRefs>(value).map_err(|error| error.to_string()))).flatten();
+        let refs = workspace_choice
+            .as_ref()
+            .and_then(workspace::DraftWorkspace::strategy)
+            .is_none()
+            .then(|| state.request(method::VCS_LIST_REFS, workspace::list_refs_request(&cwd), |value| serde_json::from_value::<VcsRefs>(value).map_err(|error| error.to_string())))
+            .flatten();
         self.record_draft(&target, cx);
         let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -363,7 +385,7 @@ impl Composer {
                 (ThreadEnvMode::Worktree, Some(_)) if selected.is_none() => match refs {Some(task) => task.await.ok().and_then(Result::ok), None => None},
                 _ => None,
             };
-            let strategy = selected.map(Ok).unwrap_or_else(|| workspace::launch_strategy(mode, refs.as_ref(), start_from_origin));
+            let strategy = workspace::effective_strategy(workspace_choice.as_ref(), mode, refs.as_ref(), start_from_origin);
             let launch = this.update_in(cx, |this, _, cx| {
                 let state = this.state.read(cx);
                 let current = (state.connection_id(), state.client_handle().map(|client| *client.connection_generation().borrow()), state.environment().map(str::to_owned));
@@ -397,22 +419,23 @@ impl Composer {
                 let worktree_launch = connection.filter(|_| matches!(strategy, workspace::Strategy::Worktree { .. })).map(|connection| {
                     t3_core::worktree_setup::DraftLaunch { thread_id: thread_id.clone(), connection, launch: payload.clone() }
                 });
+                this.state.update(cx, |state, cx| state.mark_launching_thread(&thread_id, cx));
                 Ok::<_, String>((thread_id, worktree_launch, this.state.read(cx).rpc(method::LAUNCH_THREAD, payload)))
             });
             let executor = cx.background_executor().clone();
-            let (result, worktree_launch) = match launch {
-                Ok(Ok((thread_id, worktree_launch, request))) => (
-                    match with_dispatch_timeout(&executor, request).await {
-                        Ok(Ok(_)) => Ok(thread_id),
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(timeout) => Err(timeout.to_owned()),
-                    },
-                    worktree_launch,
-                ),
-                Ok(Err(error)) => (Err(error), None),
+            let (result, failed_thread_id, worktree_launch) = match launch {
+                Ok(Ok((thread_id, worktree_launch, request))) => match with_dispatch_timeout(&executor, request).await {
+                    Ok(Ok(_)) => (Ok(thread_id), None, worktree_launch),
+                    Ok(Err(error)) => (Err(error.to_string()), Some(thread_id), worktree_launch),
+                    Err(timeout) => (Err(timeout.to_owned()), Some(thread_id), worktree_launch),
+                },
+                Ok(Err(error)) => (Err(error), None, None),
                 Err(_) => return,
             };
             let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(failed_id) = failed_thread_id {
+                    this.state.update(cx, |state, cx| state.clear_launching_thread(&failed_id, cx));
+                }
                 if result.is_ok() {
                     this.clear_usage_limits_for(&taken.target);
                     this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
@@ -526,21 +549,28 @@ impl Composer {
                             context: outgoing.context.as_ref(),
                             attachments: &outgoing.attachments,
                         });
-                        (raw.clone(), state.rpc(method::LAUNCH_THREAD, payload))
+                        ((raw.clone(), thread_id), payload)
                     })
                     .collect::<Vec<_>>();
-                Ok::<_, String>(rpcs)
+                this.state.update(cx, |state, cx| {
+                    for ((_, thread_id), _) in &rpcs {
+                        state.mark_launching_thread(thread_id, cx);
+                    }
+                });
+                let state = this.state.read(cx);
+                Ok::<_, String>(rpcs.into_iter().map(|(meta, payload)| (meta, state.rpc(method::LAUNCH_THREAD, payload))).collect::<Vec<_>>())
             });
             let executor = cx.background_executor().clone();
-            let (started_count, failed_selections, failure_msg) = match requests {
+            let (started_count, failed_selections, failed_thread_ids, failure_msg) = match requests {
                 Ok(Ok(rpcs)) => {
-                    let (raws, futs): (Vec<_>, Vec<_>) = rpcs.into_iter().unzip();
+                    let (metas, futs): (Vec<_>, Vec<_>) = rpcs.into_iter().unzip();
                     match with_dispatch_timeout(&executor, futures::future::join_all(futs)).await {
                         Ok(outcomes) => {
                             let mut started = 0usize;
                             let mut failed = Vec::new();
+                            let mut failed_ids = Vec::new();
                             let mut first_error = None;
-                            for (raw, outcome) in raws.into_iter().zip(outcomes) {
+                            for ((raw, tid), outcome) in metas.into_iter().zip(outcomes) {
                                 match outcome {
                                     Ok(_) => started += 1,
                                     Err(err) => {
@@ -548,22 +578,33 @@ impl Composer {
                                             first_error = Some(err.to_string());
                                         }
                                         failed.push(raw);
+                                        failed_ids.push(tid);
                                     }
                                 }
                             }
-                            (started, failed, first_error)
+                            (started, failed, failed_ids, first_error)
                         }
-                        Err(timeout) => (0, raws, Some(timeout.to_owned())),
+                        Err(timeout) => {
+                            let (raws, tids): (Vec<_>, Vec<_>) = metas.into_iter().unzip();
+                            (0, raws, tids, Some(timeout.to_owned()))
+                        }
                     }
                 }
                 Ok(Err(error)) => {
                     let failed = dispatch_selections.into_iter().map(|(raw, _)| raw).collect();
-                    (0, failed, Some(error))
+                    (0, failed, Vec::new(), Some(error))
                 }
                 Err(_) => return,
             };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
+                if !failed_thread_ids.is_empty() {
+                    this.state.update(cx, |state, cx| {
+                        for tid in &failed_thread_ids {
+                            state.clear_launching_thread(tid, cx);
+                        }
+                    });
+                }
                 if started_count > 0 {
                     this.retire_sent_attachments(&taken.target, &taken.attachments, cx);
                     this.clear_usage_limits_for(&taken.target);
@@ -616,6 +657,61 @@ impl Composer {
         cx.notify();
     }
 
+    /// `useComposerResume`: resumes an interrupted or usage-limited run (`manualContinuationOfRunId`)
+    /// and/or releases held queued runs (`queue.resume`).
+    pub(super) fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sending || self.is_rewinding(cx) || !self.snapshot.can_resume || !self.snapshot.can_operate_thread {
+            return;
+        }
+        let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
+        let resolved = self.resolve(cx);
+        let selection = Self::dispatch_selection(&resolved);
+        let mut steps: Vec<(Value, &'static str)> = Vec::new();
+        if let Some(resumable_run_id) = self.snapshot.resumable_run_id.as_deref() {
+            if Some(resolved.runtime_mode) != self.snapshot.thread_runtime {
+                steps.push((commands::set_runtime_mode(&uuid_v4(), &thread_id, resolved.runtime_mode), "Could not resume thread."));
+            }
+            if Some(resolved.interaction_mode) != self.snapshot.thread_interaction {
+                steps.push((commands::set_interaction_mode(&uuid_v4(), &thread_id, resolved.interaction_mode), "Could not resume thread."));
+            }
+            steps.push((
+                commands::resume_thread_turn(&uuid_v4(), &thread_id, &uuid_v4(), resumable_run_id, selection.as_ref()),
+                "Could not resume thread.",
+            ));
+            if self.snapshot.has_held_queued_runs {
+                steps.push((commands::resume_thread_queue(&uuid_v4(), &thread_id), "Could not resume queued runs."));
+            }
+        } else {
+            steps.push((commands::resume_thread_queue(&uuid_v4(), &thread_id), "Could not resume thread."));
+        }
+        let target = Target::Thread(thread_id);
+        let failures: Vec<&'static str> = steps.iter().map(|(_, failure)| *failure).collect();
+        let request = self.state.read(cx).dispatch_in_order(steps.into_iter().map(|(command, _)| command).collect());
+        self.sending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let failure = match with_dispatch_timeout(&executor, request).await {
+                Ok(Ok(())) => None,
+                Ok(Err((index, error))) => {
+                    Some(format!("{} {error}", failures.get(index).copied().unwrap_or("Could not resume thread.")))
+                }
+                Err(timeout) => Some(timeout.to_owned()),
+            };
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.sending = false;
+                if let Some(error) = failure {
+                    this.error = Some(error);
+                } else {
+                    this.clear_usage_limits_for(&target);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn send(&mut self, thread_id: String, outgoing: Outgoing, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
         let resolved = self.resolve(cx);
         let Some(selection) = Self::dispatch_selection(&resolved) else {
@@ -625,9 +721,21 @@ impl Composer {
         };
         let settings = self.state.read(cx).client_settings;
         let approvals = self.snapshot.pending.approvals.clone();
+        let fresh_arm = self.fresh_session_arm(cx);
+        let fresh_context = fresh_arm.is_some();
         let follow_up = if approvals.is_empty() { settings.follow_up_behavior } else { FollowUpBehavior::Steer };
-        let can_steer = !self.snapshot.compacting;
-        let dispatch = rules::turn_dispatch_mode(rules::dispatch_mode(self.snapshot.running, intent == SubmitIntent::Alternate, follow_up, can_steer), self.snapshot.setup_queues);
+        let can_steer = !self.snapshot.compaction_blocks_steer && !fresh_context;
+        let base_dispatch = rules::dispatch_mode(self.snapshot.running, intent == SubmitIntent::Alternate, follow_up, can_steer);
+        let compact_offered = self.compact_before_send_tokens(&resolved, cx).is_some();
+        let keep_full_history = self.is_keep_full_history(cx);
+        let plan = rules::plan_composer_turn(
+            &outgoing.text,
+            self.snapshot.setup_queues,
+            compact_offered,
+            keep_full_history,
+            base_dispatch,
+            fresh_context,
+        );
         let feedback = approvals.first().filter(|approval| approval.supports_feedback && approval.live).map(|approval| approval.request_id.clone());
         if feedback.is_some() && (!outgoing.attachments.is_empty() || outgoing.context.is_some()) {
             self.error = Some("Send approval feedback without attachments or added context.".to_owned());
@@ -649,6 +757,25 @@ impl Composer {
             if Some(resolved.interaction_mode) != self.snapshot.thread_interaction {
                 steps.push((commands::set_interaction_mode(&uuid_v4(), &thread_id, resolved.interaction_mode), "Failed to send message."));
             }
+            if plan.compact_before_send {
+                let (compact_cmd, compact_msg) = (uuid_v4(), uuid_v4());
+                steps.push((
+                    commands::composer_message(&ComposerMessage {
+                        command_id: &compact_cmd,
+                        thread_id: &thread_id,
+                        message_id: &compact_msg,
+                        text: "/compact",
+                        title_seed: &outgoing.title,
+                        model_selection: &selection,
+                        dispatch: commands::ComposerDispatch::Auto,
+                        context: None,
+                        attachments: &[],
+                        fresh_context: false,
+                        idle_compaction: Some("onReturn"),
+                    }),
+                    "Failed to compact thread before sending.",
+                ));
+            }
             let (command_id, message_id) = (uuid_v4(), uuid_v4());
             let message = ComposerMessage {
                 command_id: &command_id,
@@ -657,9 +784,11 @@ impl Composer {
                 text: &outgoing.text,
                 title_seed: &outgoing.title,
                 model_selection: &selection,
-                dispatch,
+                dispatch: plan.turn_dispatch,
                 context: outgoing.context.as_ref(),
                 attachments: &outgoing.attachments,
+                fresh_context,
+                idle_compaction: None,
             };
             steps.push((commands::composer_message(&message), "Failed to send message."));
         }
@@ -683,6 +812,10 @@ impl Composer {
                 if let Some(error) = failure {
                     this.restore(taken, error, window, cx);
                 } else {
+                    if let Some(arm) = fresh_arm {
+                        this.consume_fresh_session_arm(arm, cx);
+                    }
+                    this.clear_keep_full_history(taken.environment.as_deref(), &taken.target);
                     this.retire_sent_attachments(&taken.target, &taken.attachments, cx);
                     this.clear_usage_limits_for(&taken.target);
                     if sends_prompt {

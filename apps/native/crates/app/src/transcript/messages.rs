@@ -905,7 +905,8 @@ pub fn user_row(
         .as_ref()
         .map(|config| t3_core::providers::entries(config, None))
         .unwrap_or_default();
-    let fresh_divider = (fresh_context == Some(true)).then(|| system_divider("New session".into(), None, Some(Icon::RotateCcw), DividerTone::Neutral, cx));
+    let fresh_divider = (fresh_context == Some(true) || message.meta.fresh_context == Some(true))
+        .then(|| system_divider("New session".into(), None, Some(Icon::Eraser), DividerTone::Neutral, cx));
     let model_switch = message.meta.model_switch.as_ref().and_then(|value| model_switch(value, &providers, cx));
 
     if is_workflow_script_message(message.role, &message.text, workflow_script.or(message.meta.workflow_script)) {

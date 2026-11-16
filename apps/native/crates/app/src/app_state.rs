@@ -954,6 +954,18 @@ impl AppState {
         }
     }
 
+    /// Marks `thread_id` as launching from a draft before `thread.launch` commits so the sidebar
+    /// places it in Working in one step (`#33783`).
+    pub fn mark_launching_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.sidebar.history.mark_launching(thread_id);
+        self.rebuild_sidebar(cx);
+    }
+
+    pub fn clear_launching_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        self.sidebar.history.clear_launching(thread_id);
+        self.rebuild_sidebar(cx);
+    }
+
     /// Any RPC on the network runtime. The future resolves wherever it is awaited.
     /// Nothing is sent until the future is first polled, so futures built together still run in
     /// the order they are awaited.

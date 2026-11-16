@@ -58,7 +58,24 @@ use crate::toast::{Toast, ToastKind};
 use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
-actions!(composer, [OutdentList, ToggleModelPicker, OpenPermissions, PasteAsText, StashPrompt, FocusPrompt, OpenWorkspace, UsePreviousWorktree]);
+actions!(
+    composer,
+    [
+        OutdentList,
+        ToggleModelPicker,
+        OpenPermissions,
+        PasteAsText,
+        StashPrompt,
+        FocusPrompt,
+        OpenWorkspace,
+        OpenHost,
+        CycleHost,
+        UsePreviousWorktree,
+        SendAlternate,
+        SteerQueuedMessage,
+        EditQueuedMessage,
+    ]
+);
 
 pub fn init(cx: &mut App) {
     // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
@@ -98,6 +115,20 @@ struct Choices {
     interaction_mode: Option<InteractionMode>,
 }
 
+/// `StopPhase` (`ComposerPrimaryActions.tsx`): Stop turns Pending -> TimedOut after 10s, and
+/// transitions to a 500ms Landed click-guard window once the run stops being interruptible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum StopPhase {
+    #[default]
+    Idle,
+    Pending,
+    TimedOut,
+    Landed,
+}
+
+const STOP_PENDING_MAX: Duration = Duration::from_secs(10);
+const STOP_LANDED_CLICK_GUARD: Duration = Duration::from_millis(500);
+
 /// What the composer reads from app state, kept so streamed events that change nothing it shows
 /// do not repaint it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -106,14 +137,20 @@ struct Snapshot {
     target: Option<Target>,
     project_id: Option<String>,
     running: bool,
+    active_run_id: Option<String>,
+    can_interrupt: bool,
+    can_operate_thread: bool,
     thread_model: Option<ModelSelection>,
     thread_runtime: Option<RuntimeMode>,
     thread_interaction: Option<InteractionMode>,
     /// The thread has run, so switching providers needs a handoff it may not support.
     started: bool,
     handoff: bool,
-    /// A `/compact` turn is running, which a send cannot steer into.
-    compacting: bool,
+    /// True when the thread already has projected messages or visible items (`/clear` history gate).
+    has_existing_history: bool,
+    /// Active compaction blocks steering (`compactionBlocksSteering`), allowing auto-compaction
+    /// steals only when the session advertises `activeSteeringDuringCompaction`.
+    compaction_blocks_steer: bool,
     /// The thread's projection has arrived, so `pending` is authoritative.
     loaded: bool,
     pending_key: PendingKey,
@@ -124,6 +161,8 @@ struct Snapshot {
     setup_blocks_send: bool,
     /// The run is being prepared, so a send queues behind it (`sendQueuesBehindSetup`).
     setup_queues: bool,
+    resumable_run_id: Option<String>,
+    has_held_queued_runs: bool,
     /// Whether the thread currently offers a resume primary action (`resumableRunId !== null || hasHeldQueuedRuns`).
     can_resume: bool,
     last_error: Option<String>,
@@ -239,7 +278,14 @@ pub struct Composer {
     checkout_vcs: Option<branch_mismatch::CheckoutWatcher>,
     revealed_branch_mismatch_key: Option<String>,
     restoring_branch_threads: HashSet<String>,
-    fresh_session_armed: HashSet<Target>,
+    fresh_session_arms: HashMap<(String, Target), u64>,
+    fresh_session_seq: u64,
+    keep_full_history: HashSet<(String, Target)>,
+    compact_expiry_timer: Option<Task<()>>,
+    stop_phase: StopPhase,
+    stop_run_id: Option<String>,
+    stop_timer_seq: u64,
+    stop_timer: Option<Task<()>>,
     prompt_suggestion: Option<PromptSuggestionWatcher>,
     dismissed_prompt_suggestions: HashSet<(String, String)>,
     /// A side chat's own thread, in the right panel; `None` follows the selection and draft.
@@ -521,7 +567,14 @@ impl Composer {
             menu_dismissed: None,
             input_state: None,
             question_focus: cx.focus_handle(),
-            fresh_session_armed: HashSet::new(),
+            fresh_session_arms: HashMap::new(),
+            fresh_session_seq: 0,
+            keep_full_history: HashSet::new(),
+            compact_expiry_timer: None,
+            stop_phase: StopPhase::Idle,
+            stop_run_id: None,
+            stop_timer_seq: 0,
+            stop_timer: None,
             prompt_suggestion: None,
             dismissed_prompt_suggestions: HashSet::new(),
             fixed,
@@ -563,9 +616,16 @@ impl Composer {
             _ => None,
         };
         let last_error = state.last_error.clone();
+        let can_operate_thread = state.client_handle().is_none_or(|client| {
+            client
+                .session_state()
+                .borrow()
+                .as_ref()
+                .is_none_or(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+        });
         let Some(Target::Thread(thread_id)) = &target else {
             let project_id = state.draft_project.clone();
-            return Snapshot { environment, target, project_id, last_error, ..Snapshot::default() };
+            return Snapshot { environment, target, project_id, can_operate_thread, last_error, ..Snapshot::default() };
         };
         let shell = state.thread_shell(thread_id);
         let projection = state.thread_state(thread_id).projection.as_ref().filter(|projection| projection.thread.id == *thread_id);
@@ -576,27 +636,35 @@ impl Composer {
             projection.map(requests::pending_requests).unwrap_or_default()
         };
         let running = state.is_thread_running(thread_id);
+        let active_run_id = projection.and_then(workflows::active_run).map(|run| run.id.clone());
+        let can_interrupt = running || projection.is_some_and(workflows::has_pending_background_work);
         let setup = self.setup.as_ref().and_then(|setup| setup.read(cx).view_for(Some(thread_id)));
         let (setup_blocks_send, setup_queues) = setup.map_or((false, false), |view| (view.blocks_send, view.queues_behind_setup));
+        let resumable_run_id = projection.and_then(t3_core::timeline::plan::resumable_run_id);
+        let has_held_queued_runs = projection.is_some_and(|p| p.runs.iter().any(|run| run.status == "queued" && run.queue_held == Some(true)));
         Snapshot {
             environment,
             setup_blocks_send,
             setup_queues,
             project_id: shell.map(|thread| thread.project_id.clone()),
             running,
+            active_run_id: active_run_id.clone(),
+            can_interrupt,
+            can_operate_thread,
             thread_model: shell.map(|thread| thread.model_selection.clone()),
             thread_runtime: shell.and_then(|thread| RuntimeMode::parse(&thread.runtime_mode)),
             thread_interaction: shell.and_then(|thread| InteractionMode::parse(&thread.interaction_mode)),
             started: projection.is_some_and(|projection| !projection.runs.is_empty()),
             handoff: projection.is_some_and(workflows::supports_provider_handoff),
-            compacting: running
-                && projection.is_some_and(|projection| {
-                    workflows::is_compacting(projection, workflows::active_run(projection).map(|run| run.id.as_str()))
-                }),
+            has_existing_history: projection.is_some_and(|p| !p.messages.is_empty() || !p.visible_turn_items.is_empty()),
+            compaction_blocks_steer: running
+                && projection.is_some_and(|projection| workflows::compaction_blocks_steering(projection, active_run_id.as_deref())),
             loaded: projection.is_some(),
             pending_key,
             pending,
             queue: projection.map(t3_core::composer::queue::queue_state).unwrap_or_default(),
+            resumable_run_id,
+            has_held_queued_runs,
             can_resume: projection.is_some_and(t3_core::timeline::plan::can_resume_thread),
             last_error,
             target,
@@ -670,6 +738,8 @@ impl Composer {
             pending_ids.contains(&request_id)
         });
         self.snapshot = next;
+        self.sync_stop_phase(cx);
+        self.sync_compact_expiry_timer(cx);
         self.sync_provider_target(cx);
         self.sync_usage_limits(cx);
         self.sync_checkout_vcs(cx);
@@ -1190,33 +1260,210 @@ impl Composer {
     }
 
     pub(super) fn fresh_session_available(&self, cx: &App) -> bool {
-        // #291 (`/clear` + fresh-session send/divider) is assigned to Wave C4; keep gated off until
-        // C4 wires `freshContext: true` send/queue handling and the transcript divider.
-        let _ = cx;
-        false
+        matches!(self.snapshot.target, Some(Target::Thread(_)))
+            && self.snapshot.has_existing_history
+            && self
+                .state
+                .read(cx)
+                .server_config
+                .config
+                .as_ref()
+                .is_some_and(|config| config.environment.capabilities.fresh_context == Some(true))
+    }
+
+    pub(super) fn fresh_session_command_available(&self, cx: &App) -> bool {
+        self.fresh_session_available(cx)
+            && self.snapshot.pending.approvals.is_empty()
+            && self.snapshot.pending.user_inputs.is_empty()
+    }
+
+    fn fresh_session_arm(&self, cx: &App) -> Option<(String, Target, u64)> {
+        if !self.fresh_session_command_available(cx) {
+            return None;
+        }
+        let target = self.snapshot.target.clone()?;
+        let key = (self.snapshot.environment.clone(), target.clone());
+        let seq = *self.fresh_session_arms.get(&key)?;
+        Some((key.0, target, seq))
     }
 
     pub(super) fn is_fresh_session_armed(&self, cx: &App) -> bool {
-        let Some(target) = self.snapshot.target.as_ref() else { return false };
-        self.fresh_session_armed.contains(target) && self.fresh_session_available(cx)
+        self.fresh_session_arm(cx).is_some()
     }
 
     pub(super) fn arm_fresh_session(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self.snapshot.target.clone() else { return };
-        if self.fresh_session_available(cx) && self.fresh_session_armed.insert(target) {
-            cx.notify();
+        if !self.fresh_session_command_available(cx) {
+            return;
         }
+        let Some(target) = self.snapshot.target.clone() else { return };
+        self.fresh_session_seq = self.fresh_session_seq.wrapping_add(1);
+        self.fresh_session_arms.insert((self.snapshot.environment.clone(), target), self.fresh_session_seq);
+        cx.notify();
     }
 
     pub(super) fn disarm_fresh_session(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self.snapshot.target.as_ref() else { return };
-        if self.fresh_session_armed.remove(target) {
+        let Some(target) = self.snapshot.target.clone() else { return };
+        if self.fresh_session_arms.remove(&(self.snapshot.environment.clone(), target)).is_some() {
             cx.notify();
         }
     }
 
+    fn consume_fresh_session_arm(&mut self, arm: (String, Target, u64), cx: &mut Context<Self>) {
+        let (env, target, expected_seq) = arm;
+        let key = (env, target);
+        if self.fresh_session_arms.get(&key).copied() == Some(expected_seq) {
+            self.fresh_session_arms.remove(&key);
+            cx.notify();
+        }
+    }
+
+    fn compact_before_send_tokens(&self, resolved: &Resolved, cx: &App) -> Option<f64> {
+        if self.snapshot.running || !resolved.multi_models.is_empty() {
+            return None;
+        }
+        let Target::Thread(thread_id) = self.snapshot.target.as_ref()? else { return None };
+        let selection = resolved.model.as_ref()?;
+        let state = self.state.read(cx);
+        let config = state.server_config.config.as_ref()?;
+        let projection = state.thread_state(thread_id).projection.as_ref().filter(|p| p.thread.id == *thread_id)?;
+        let prompt = self.prompt(cx);
+        t3_core::usage::context_window::compact_before_send_tokens(
+            projection,
+            selection,
+            &config.providers,
+            &config.settings,
+            &prompt,
+            !self.snapshot.running,
+            crate::sidebar::controller::now_ms(),
+        )
+    }
+
+    pub(super) fn is_keep_full_history(&self, cx: &App) -> bool {
+        let _ = cx;
+        let Some(target) = self.snapshot.target.as_ref() else { return false };
+        self.keep_full_history.contains(&(self.snapshot.environment.clone(), target.clone()))
+    }
+
+    pub(super) fn toggle_keep_full_history(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.snapshot.target.clone() else { return };
+        let key = (self.snapshot.environment.clone(), target);
+        if !self.keep_full_history.remove(&key) {
+            self.keep_full_history.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn clear_keep_full_history(&mut self, environment: Option<&str>, target: &Target) {
+        let env = environment.unwrap_or(&self.snapshot.environment).to_owned();
+        self.keep_full_history.remove(&(env, target.clone()));
+    }
+
+    fn sync_compact_expiry_timer(&mut self, cx: &mut Context<Self>) {
+        self.compact_expiry_timer = None;
+        if self.snapshot.running {
+            return;
+        }
+        let Some(Target::Thread(thread_id)) = self.snapshot.target.as_ref() else { return };
+        let resolved = self.resolve(cx);
+        if !resolved.multi_models.is_empty() {
+            return;
+        }
+        let Some(selection) = resolved.model.as_ref() else { return };
+        let state = self.state.read(cx);
+        let Some(config) = state.server_config.config.as_ref() else { return };
+        let Some(provider) = config.providers.iter().find(|p| p.instance_id == selection.instance_id) else { return };
+        if provider.driver != "claudeAgent" {
+            return;
+        }
+        let Some(projection) = state.thread_state(thread_id).projection.as_ref().filter(|p| p.thread.id == *thread_id) else {
+            return;
+        };
+        let Some(window_snap) = t3_core::usage::context_window::context_window_snapshot(projection) else { return };
+        if window_snap.used_tokens < t3_core::usage::context_window::COMPACTION_SUGGESTION_MIN_TOKENS {
+            return;
+        }
+        let Some(updated_ms) = t3_core::sidebar::time::parse_iso(&window_snap.updated_at) else { return };
+        let ttl_ms = window_snap
+            .prompt_cache_ttl_ms
+            .filter(|ttl| ttl.is_finite() && *ttl >= 0.0)
+            .map(|ttl| ttl as i64)
+            .unwrap_or(t3_core::usage::context_window::CLAUDE_RESUME_COMPACTION_FALLBACK_MS);
+        let remaining_ms = updated_ms.saturating_add(ttl_ms).saturating_sub(crate::sidebar::controller::now_ms());
+        if remaining_ms > 0 {
+            self.compact_expiry_timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(remaining_ms as u64 + 5)).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.compact_expiry_timer = None;
+                    cx.notify();
+                });
+            }));
+        }
+    }
+
+    fn set_stop_phase(&mut self, next: StopPhase, cx: &mut Context<Self>) {
+        if self.stop_phase == next {
+            return;
+        }
+        self.stop_phase = next;
+        self.stop_timer_seq = self.stop_timer_seq.wrapping_add(1);
+        let seq = self.stop_timer_seq;
+        self.stop_timer = match next {
+            StopPhase::Pending => Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(STOP_PENDING_MAX).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.stop_timer_seq == seq && this.stop_phase == StopPhase::Pending {
+                        this.stop_phase = StopPhase::TimedOut;
+                        this.stop_timer = None;
+                        cx.notify();
+                    }
+                });
+            })),
+            StopPhase::Landed => Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(STOP_LANDED_CLICK_GUARD).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.stop_timer_seq == seq && this.stop_phase == StopPhase::Landed {
+                        this.stop_phase = StopPhase::Idle;
+                        this.stop_timer = None;
+                        cx.notify();
+                    }
+                });
+            })),
+            StopPhase::Idle | StopPhase::TimedOut => None,
+        };
+    }
+
+    fn sync_stop_phase(&mut self, cx: &mut Context<Self>) {
+        if self.snapshot.active_run_id.is_some() && self.stop_run_id != self.snapshot.active_run_id {
+            self.stop_run_id = self.snapshot.active_run_id.clone();
+            self.set_stop_phase(StopPhase::Idle, cx);
+            return;
+        }
+        if !self.snapshot.can_operate_thread {
+            return;
+        }
+        if matches!(self.stop_phase, StopPhase::Pending | StopPhase::TimedOut) && !self.snapshot.can_interrupt {
+            self.set_stop_phase(StopPhase::Landed, cx);
+        } else if self.stop_phase == StopPhase::Landed && self.snapshot.can_interrupt {
+            self.set_stop_phase(StopPhase::Idle, cx);
+        }
+    }
+
+    pub(super) fn request_stop(&mut self, cx: &mut Context<Self>) {
+        if !self.snapshot.can_operate_thread || self.stop_phase == StopPhase::Pending || self.is_rewinding(cx) {
+            return;
+        }
+        self.stop_run_id = self.snapshot.active_run_id.clone();
+        self.set_stop_phase(StopPhase::Pending, cx);
+        let fixed = self.fixed.clone();
+        self.state.update(cx, |state, cx| match fixed {
+            Some(id) => state.stop_thread(&id, cx),
+            None => state.stop_selected_thread(cx),
+        });
+        cx.notify();
+    }
+
     pub(super) fn render_fresh_session_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        if !self.is_fresh_session_armed(cx) {
+        if !self.is_fresh_session_armed(cx) || self.editing_queued().is_some() {
             return None;
         }
         let p = palette(cx);
@@ -1239,7 +1486,7 @@ impl Composer {
             .w_full()
             .min_h(px(24.))
             .gap(px(6.))
-            .child(div().flex_none().w(px(24.)).flex().justify_center().child(Icon::RefreshCw.render(px(12.), hsla(p.info))))
+            .child(div().flex_none().w(px(24.)).flex().justify_center().child(Icon::Eraser.render(px(12.), hsla(p.info))))
             .child(
                 h_flex()
                     .flex_1()
@@ -1249,7 +1496,7 @@ impl Composer {
                     .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child("The agent won't see earlier messages in this thread.")),
             )
             .child(div().flex_none().ml_auto().child(dismiss));
-        Some(banner_surface(false, content, cx).id("fresh-session-banner").into_any_element())
+        Some(banner_surface(false, content, cx).id("fresh-session-banner").debug_selector(|| "fresh-session-banner".to_owned()).into_any_element())
     }
 
     fn sync_prompt_suggestion(&mut self, cx: &mut Context<Self>) {
@@ -2745,7 +2992,7 @@ mod stream_error_tests {
                 assert!(composer.stash_state.open);
                 assert_eq!(composer.stash_state.highlighted.as_deref(), Some("s-first"));
 
-                // #291 (`/clear`) stays gated off until Wave C4 wires fresh-session send/divider.
+                // #291 (`/clear`) remains false on Draft (requires a thread with existing history).
                 assert!(!composer.fresh_session_available(cx));
             });
         });
@@ -2903,6 +3150,719 @@ mod stream_error_tests {
                     t3_core::composer::attachments::Upload::Ready { ref attachment_id } if attachment_id == "srv-synced"
                 ));
             });
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn c4_fresh_session_compact_toggle_stop_phase_queue_and_launching_work_end_to_end(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let stale_at = "2020-01-01T00:00:00.000Z";
+        state.update(cx, |state, cx| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.environment.capabilities.fresh_context = Some(true);
+                config.providers = serde_json::from_value(json!([
+                    {
+                        "instanceId": "claudeAgent",
+                        "driver": "claudeAgent",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "auth": {"status": "authenticated"},
+                        "models": [{"slug": "sonnet", "name": "Sonnet", "isCustom": false}],
+                        "slashCommands": [{"name": "compact", "description": "Compact"}]
+                    }
+                ]))
+                .unwrap();
+            }
+            // #33783: pre-launch mark puts thread in Working immediately and clears on failure.
+            state.mark_launching_thread("t-launching-c4", cx);
+            assert!(state.sidebar.history.launching_threads().contains("t-launching-c4"));
+            state.clear_launching_thread("t-launching-c4", cx);
+            assert!(!state.sidebar.history.launching_threads().contains("t-launching-c4"));
+
+            let mut shell = state.shell.clone();
+            if let Some(snapshot) = shell.snapshot.as_mut() {
+                snapshot.threads.push(serde_json::from_value(json!({
+                    "id": "t-c4", "projectId": "checkout-a", "title": "C4 Thread",
+                    "createdAt": stale_at, "updatedAt": stale_at, "archivedAt": null,
+                    "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                    "providerInstanceId": "claudeAgent", "modelSelection": {"instanceId": "claudeAgent", "model": "sonnet"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId": "t-c4"},
+                    "latestRunId": "r1", "activeRunId": null, "status": "idle", "hasActionableProposedPlan": false,
+                    "itemCount": 1, "visibleItemCount": 1
+                })).unwrap());
+            }
+            state.shell = shell;
+            state.select_thread("t-c4", cx);
+            let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+                "kind": "snapshot",
+                "snapshotSequence": 1,
+                "hasMoreHistory": false,
+                "projection": {
+                    "thread": {
+                        "id": "t-c4", "projectId": "checkout-a", "title": "C4 Thread",
+                        "createdAt": "2020-01-01T00:00:00.000Z", "updatedAt": "2020-01-01T00:00:00.000Z", "archivedAt": null,
+                        "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "claudeAgent", "modelSelection": {"instanceId": "claudeAgent", "model": "sonnet"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId": "t-c4"},
+                        "activeProviderThreadId": "pt1"
+                    },
+                    "runs": [
+                        {
+                            "id": "r1", "ordinal": 1, "providerInstanceId": "claudeAgent",
+                            "modelSelection": {"instanceId": "claudeAgent", "model": "sonnet"},
+                            "providerThreadId": "pt1", "userMessageId": "m1", "rootNodeId": null,
+                            "status": "interrupted", "requestedAt": "2020-01-01T00:00:00.000Z", "startedAt": "2020-01-01T00:00:00.000Z", "completedAt": "2020-01-01T00:00:00.000Z"
+                        },
+                        {
+                            "id": "r2", "ordinal": 2, "providerInstanceId": "claudeAgent",
+                            "modelSelection": {"instanceId": "claudeAgent", "model": "sonnet"},
+                            "providerThreadId": "pt1", "userMessageId": "m2", "rootNodeId": null,
+                            "status": "queued", "requestedAt": "2020-01-01T00:00:00.000Z", "startedAt": null, "completedAt": null,
+                            "queuePosition": 1, "freshContext": true
+                        }
+                    ],
+                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [{"id": "pt1", "appThreadId": "t-c4", "updatedAt": "2020-01-01T00:00:00.000Z"}],
+                    "providerTurns": [{"id": "turn1", "providerThreadId": "pt1", "tokenUsage": {"usedTokens": 250000, "maxTokens": 1000000, "updatedAt": "2020-01-01T00:00:00.000Z"}}],
+                    "runtimeRequests": [],
+                    "messages": [
+                        {"id": "m1", "text": "prior prompt", "attachments": []},
+                        {"id": "m2", "text": "queued fresh", "attachments": [], "createdBy": "agent", "creationSource": "cli", "linkedSender": {"environmentId": "env-missing", "threadId": "t-rem", "title": "Remote Agent"}}
+                    ],
+                    "plans": [], "turnItems": [], "checkpointScopes": [], "checkpoints": [],
+                    "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [{
+                        "position": 0, "visibility": "local", "sourceThreadId": "t-c4", "sourceItemId": "i1",
+                        "item": {
+                            "id": "i1", "threadId": "t-c4", "runId": "r1", "nodeId": "n1", "parentItemId": null,
+                            "ordinal": 1, "status": "completed", "title": null, "startedAt": "2020-01-01T00:00:00.000Z",
+                            "completedAt": "2020-01-01T00:00:00.000Z", "updatedAt": "2020-01-01T00:00:00.000Z",
+                            "type": "user_message", "messageId": "m1", "text": "prior prompt", "inputIntent": "turn", "attachments": []
+                        }
+                    }],
+                    "updatedAt": "2020-01-01T00:00:00.000Z"
+                }
+            }"#).unwrap();
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::Thread);
+            cx.emit(AppEvent::Selection);
+        });
+
+        let (composer, vcx) = cx.add_window_view(|window, cx| Composer::new(state.clone(), window, cx));
+        vcx.update(|window, cx| window.draw(cx).clear());
+        // Queued linked-sender card renders static folded row & unknown remote env omits Open thread.
+        assert!(vcx.debug_bounds("queued-fold-0").is_some());
+        assert!(vcx.debug_bounds("queued-open-thread-0").is_none());
+
+        // #291: /clear command arms fresh session for existing thread with capability & matches seq on consumption.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                assert!(composer.fresh_session_available(cx));
+                assert!(composer.fresh_session_command_available(cx));
+                assert!(composer.snapshot.can_resume);
+                assert_eq!(composer.snapshot.resumable_run_id.as_deref(), Some("r1"));
+                composer.set_prompt("/clear", window, cx);
+                composer.submit(rules::SubmitIntent::Foreground, window, cx);
+                assert!(composer.is_fresh_session_armed(cx));
+                assert!(composer.prompt(cx).is_empty());
+                let first_arm = composer.fresh_session_arm(cx).expect("armed");
+                composer.arm_fresh_session(cx);
+                let second_arm = composer.fresh_session_arm(cx).expect("re-armed");
+                assert_ne!(first_arm.2, second_arm.2);
+                composer.consume_fresh_session_arm(first_arm, cx);
+                assert!(composer.is_fresh_session_armed(cx), "stale arm must not consume newer arm");
+                composer.consume_fresh_session_arm(second_arm, cx);
+                assert!(!composer.is_fresh_session_armed(cx));
+
+                // #280: idle stale Claude thread offers Compact toggle when typing prompt.
+                composer.set_prompt("continue debugging", window, cx);
+                let resolved = composer.resolve(cx);
+                assert_eq!(composer.compact_before_send_tokens(&resolved, cx), Some(250_000.0));
+                assert!(!composer.is_keep_full_history(cx));
+                composer.toggle_keep_full_history(cx);
+                assert!(composer.is_keep_full_history(cx));
+                composer.toggle_keep_full_history(cx);
+                assert!(!composer.is_keep_full_history(cx));
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("compact-before-send").is_some());
+
+        // #20809: Stop transition sets Pending and retains Stop button beside Send while typing, then lands on stop completion.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.snapshot.running = true;
+                composer.snapshot.can_interrupt = true;
+                composer.snapshot.active_run_id = Some("r-live".into());
+                composer.request_stop(cx);
+                assert_eq!(composer.stop_phase, StopPhase::Pending);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("stop").is_some());
+        assert!(vcx.debug_bounds("send").is_some());
+        vcx.update(|_, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.snapshot.running = false;
+                composer.snapshot.can_interrupt = false;
+                composer.sync_stop_phase(cx);
+                assert_eq!(composer.stop_phase, StopPhase::Landed);
+            });
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn c4_worktree_base_branch_picker_search_pagination_and_host_visibility_parity(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, cx| {
+            state.environments.environments = vec![
+                t3_client::store::SavedEnvironment {
+                    id: "local".into(),
+                    environment_id: Some("env-local".into()),
+                    label: "MacBook Pro".into(),
+                    disabled: false,
+                    http_base: "http://127.0.0.1:1".into(),
+                    access_token: None,
+                    server_version: None,
+                    local: true,
+                    ssh: None,
+                },
+                t3_client::store::SavedEnvironment {
+                    id: "remote-1".into(),
+                    environment_id: Some("env-remote".into()),
+                    label: "Build Box".into(),
+                    disabled: false,
+                    http_base: "http://127.0.0.1:2".into(),
+                    access_token: None,
+                    server_version: None,
+                    local: false,
+                    ssh: None,
+                },
+            ];
+            state.environments.active = Some("local".into());
+            let mut shell = state.shell.snapshot.clone().unwrap_or_default();
+            if let Some(proj) = shell.projects.iter_mut().find(|p| p.id == "checkout-a") {
+                proj.repository_identity = Some(serde_json::json!({
+                    "canonicalKey": "github.com/acme/repo",
+                    "locator": { "source": "git-remote", "remoteName": "origin", "remoteUrl": "https://github.com/acme/repo.git" }
+                }));
+            }
+            state.shell.apply(t3_core::shell::ShellStreamItem::Snapshot {
+                snapshot: Box::new(shell),
+                resolved_repository_identity_roots: None,
+            });
+            state.start_draft("checkout-a", cx);
+        });
+
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let workspace = self.0.update(cx, |composer, cx| composer.render_workspace(cx));
+                gpui::div().w(gpui::px(720.)).children(workspace)
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.sync_workspace(false, cx);
+                composer.workspace.is_repo = true;
+                let req = composer.workspace.refs.begin("", false).unwrap();
+                composer.workspace.refs.finish(
+                    &req,
+                    Ok(vec![t3_core::vcs::ListRefsResult {
+                        is_repo: true,
+                        has_primary_remote: true,
+                        refs: vec![t3_core::vcs::VcsRef {
+                            name: "main".into(),
+                            current: true,
+                            is_default: true,
+                            is_remote: Some(false),
+                            remote_name: None,
+                            worktree_path: None,
+                        }],
+                        next_cursor: Some(100),
+                        total_count: 150,
+                    }]),
+                );
+            });
+            window.draw(cx).clear();
+        });
+
+        // Finding 3: single/non-fleet primary host must stay hidden even when >1 saved envs exist.
+        vcx.update(|_, cx| {
+            let c = composer.read(cx);
+            assert!(c.host_options(cx).active.is_none());
+        });
+        assert!(vcx.debug_bounds("composer-host").is_none());
+        assert!(vcx.debug_bounds("composer-host-indicator").is_none());
+
+        // Finding 3: remote non-fleet host renders muted non-interactive indicator (`composer-host-indicator`).
+        vcx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.environments.environments[0].local = false;
+                state.environments.environments[0].label = "Remote Box".into();
+                cx.emit(AppEvent::Shell);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("composer-host-indicator").is_some());
+        assert!(vcx.debug_bounds("composer-host").is_none());
+
+        // Restore primary and test fleet mode with `add_targets` when another connected machine lacks the project.
+        vcx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.environments.environments[0].local = true;
+                state.environments.environments[0].label = "MacBook Pro".into();
+                let owner_local = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "local".into(),
+                    canonical_id: Some("env-local".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                let owner_remote = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "remote-1".into(),
+                    canonical_id: Some("env-remote".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                let mut config_remote = t3_core::server_config::ServerConfigState::default();
+                let cfg: t3_core::server_config::ServerConfig = serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "env-remote", "label": "Build Box", "platform": { "os": "linux", "arch": "x64" } },
+                    "auth": { "policy": "loopback-auto" }
+                })).unwrap();
+                config_remote.config = Some(cfg);
+                let remote_grants: t3_core::auth::AuthSessionState = serde_json::from_value(serde_json::json!({
+                    "authenticated": true,
+                    "scopes": ["source-control:write", "orchestration:read"]
+                })).unwrap();
+                let mut remote_shell = t3_core::shell::ShellState::default();
+                remote_shell.synchronized = true;
+                state.fleet = std::sync::Arc::new(t3_client::environments::FleetView {
+                    revision: 1,
+                    environments: vec![
+                        std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                            summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner_local,
+                                &state.shell,
+                                &state.server_config,
+                            )),
+                            status: t3_client::supervisor::ConnectionStatus::Connected,
+                            config: state.server_config.clone(),
+                            grants: Some(remote_grants.clone()),
+                            settings_revision: 0,
+                            keybindings_revision: 0,
+                        }),
+                        std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                            summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner_remote,
+                                &remote_shell,
+                                &config_remote,
+                            )),
+                            status: t3_client::supervisor::ConnectionStatus::Connected,
+                            config: config_remote,
+                            grants: Some(remote_grants),
+                            settings_revision: 0,
+                            keybindings_revision: 0,
+                        }),
+                    ],
+                });
+                state.sidebar.grouping_projects = state.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect();
+                state.sidebar.grouping_threads = state.fleet.environments.iter().flat_map(|entry| entry.summary.threads.iter().cloned()).collect();
+                state.rebuild_sidebar(cx);
+                cx.emit(AppEvent::Shell);
+            });
+            window.draw(cx).clear();
+            let host = composer.read(cx).host_options(cx);
+            assert!(host.can_pick);
+            assert_eq!(host.options.len(), 1);
+            assert_eq!(host.add_targets.len(), 1);
+            assert_eq!(host.add_targets[0].saved_id, "remote-1");
+        });
+        assert!(vcx.debug_bounds("composer-host").is_some());
+
+        // Finding 1: WorktreeBaseBranchPicker pagination status, empty state, and search reset on close.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.mutate_draft_workspace(cx, |ws| ws.mode = t3_core::server_config::ThreadEnvMode::Worktree);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("composer-base-branch").is_some());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.open_base_branch_picker(window, cx);
+                assert!(composer.workspace.branch_open);
+                assert!(composer.workspace.base_search.is_some());
+                assert_eq!(composer.base_branch_status_text().as_deref(), Some("Showing 1 of 150 refs"));
+
+                let next = composer.workspace.refs.begin("", true).unwrap();
+                composer.workspace.refs.finish(
+                    &next,
+                    Ok(vec![t3_core::vcs::ListRefsResult {
+                        is_repo: true,
+                        has_primary_remote: true,
+                        refs: vec![t3_core::vcs::VcsRef {
+                            name: "origin/release".into(),
+                            current: false,
+                            is_default: false,
+                            is_remote: Some(true),
+                            remote_name: Some("origin".into()),
+                            worktree_path: None,
+                        }],
+                        next_cursor: None,
+                        total_count: 2,
+                    }]),
+                );
+                assert_eq!(composer.workspace.refs.refs.len(), 2);
+                assert_eq!(composer.base_branch_status_text(), None);
+
+                let empty_req = composer.workspace.refs.begin("missing-ref", false).unwrap();
+                composer.workspace.refs.finish(
+                    &empty_req,
+                    Ok(vec![t3_core::vcs::ListRefsResult {
+                        is_repo: true,
+                        has_primary_remote: true,
+                        refs: Vec::new(),
+                        next_cursor: None,
+                        total_count: 0,
+                    }]),
+                );
+                assert!(composer.workspace.refs.refs.is_empty());
+                assert_eq!(composer.workspace.refs.error, None);
+
+                composer.workspace.base_search.as_ref().unwrap().update(cx, |input, cx| input.set_value("missing-ref", window, cx));
+                composer.close_base_branch_picker(false, window, cx);
+                assert!(!composer.workspace.branch_open);
+                assert_eq!(composer.workspace.base_search.as_ref().unwrap().read(cx).value(), "");
+            });
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn c4_composer_queue_and_host_keybindings_dispatch_and_tooltips(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+
+        cx.update(|cx| {
+            crate::keymap::init(cx);
+            assert_eq!(crate::keymap::action_for("composer.cycleHost").as_any().type_id(), std::any::TypeId::of::<CycleHost>());
+            assert_eq!(crate::keymap::action_for("composer.sendAlternate").as_any().type_id(), std::any::TypeId::of::<SendAlternate>());
+            assert_eq!(crate::keymap::action_for("thread.steerQueuedMessage").as_any().type_id(), std::any::TypeId::of::<SteerQueuedMessage>());
+            assert_eq!(crate::keymap::action_for("thread.editQueuedMessage").as_any().type_id(), std::any::TypeId::of::<EditQueuedMessage>());
+            assert!(crate::keymap::label("thread.steerQueuedMessage", cx).is_some());
+            assert!(
+                crate::keymap::label_in(
+                    "thread.editQueuedMessage",
+                    &t3_core::keybindings::ShortcutMatchContext::default().with("composerFocus", true),
+                    cx,
+                )
+                .is_some()
+            );
+            assert!(
+                crate::keymap::label_in(
+                    "composer.sendAlternate",
+                    &t3_core::keybindings::ShortcutMatchContext::default().with("composerFocus", true).with("turnRunning", true),
+                    cx,
+                )
+                .is_some()
+            );
+        });
+
+        let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+            "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": false, "historyCursor": null,
+            "projection": {
+                "thread": {
+                    "id": "t1", "projectId": "checkout-a", "title": "T1",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                    "providerInstanceId": "codex", "modelSelection": {"instanceId":"codex","model":"m"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                    "activeRunId": "run-active"
+                },
+                "runs": [
+                    { "id": "run-active", "threadId": "t1", "ordinal": 1, "providerInstanceId": "codex", "modelSelection": {"instanceId":"codex","model":"m"}, "status": "running", "userMessageId": "m0", "activeAttemptId": "att-0", "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z", "completedAt": null },
+                    { "id": "run-q1", "threadId": "t1", "ordinal": 2, "queuePosition": 1, "providerInstanceId": "codex", "modelSelection": {"instanceId":"codex","model":"m"}, "status": "queued", "userMessageId": "m1", "requestedAt": "2026-04-01T00:00:02.000Z", "startedAt": null, "completedAt": null },
+                    { "id": "run-q2", "threadId": "t1", "ordinal": 3, "queuePosition": 2, "providerInstanceId": "codex", "modelSelection": {"instanceId":"codex","model":"m"}, "status": "queued", "userMessageId": "m2", "requestedAt": "2026-04-01T00:00:03.000Z", "startedAt": null, "completedAt": null }
+                ],
+                "attempts": [], "nodes": [], "subagents": [],
+                "providerSessions": [{ "id": "ps1", "threadId": "t1", "providerInstanceId": "codex", "status": "running", "capabilities": { "turns": { "supportsActiveSteering": true } } }],
+                "providerThreads": [],
+                "providerTurns": [{ "id": "pt1", "threadId": "t1", "runAttemptId": "att-0", "status": "running" }],
+                "runtimeRequests": [],
+                "messages": [
+                    { "id": "m0", "role": "user", "text": "active" },
+                    { "id": "m1", "role": "user", "text": "First queued" },
+                    { "id": "m2", "role": "user", "text": "Latest queued" }
+                ],
+                "plans": [], "turnItems": [], "checkpointScopes": [],
+                "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                "visibleTurnItems": [], "updatedAt": "2026-04-01T00:00:05.000Z"
+            }
+        }"#).unwrap();
+        state.update(cx, |state, cx| {
+            state.client_settings.follow_up_behavior = t3_core::composer::FollowUpBehavior::Steer;
+            let config = state.server_config.config.get_or_insert_with(|| {
+                serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "env-local", "label": "MacBook Pro", "platform": { "os": "darwin", "arch": "arm64" } },
+                    "auth": { "policy": "loopback-auto" }
+                }))
+                .unwrap()
+            });
+            config.providers = serde_json::from_value(serde_json::json!([
+                {
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "auth": { "status": "authenticated" },
+                    "models": [{ "slug": "m", "name": "GPT-5" }]
+                }
+            ]))
+            .unwrap();
+            let mut shell_snap = state.shell.snapshot.clone().unwrap_or_default();
+            shell_snap.threads.push(serde_json::from_value(serde_json::json!({
+                "id": "t1",
+                "projectId": "checkout-a",
+                "title": "T1",
+                "createdAt": "2026-04-01T00:00:00.000Z",
+                "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "codex",
+                "modelSelection": {"instanceId":"codex","model":"m"},
+                "runtimeMode": "auto",
+                "interactionMode": "default",
+                "lineage": {"rootThreadId":"t1"},
+                "status": "running",
+                "activeRunId": "run-active",
+                "hasActionableProposedPlan": false,
+                "itemCount": 0,
+                "visibleItemCount": 0
+            })).unwrap());
+            state.shell.apply(t3_core::shell::ShellStreamItem::Snapshot {
+                snapshot: Box::new(shell_snap),
+                resolved_repository_identity_roots: None,
+            });
+            state.select_thread("t1", cx);
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::ServerConfig);
+            cx.emit(AppEvent::Shell);
+            cx.emit(AppEvent::Thread);
+        });
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let queue = self.0.update(cx, |composer, cx| composer.render_queue(cx));
+                gpui::div().w(gpui::px(720.)).children(queue)
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        vcx.update(|window, cx| window.draw(cx).clear());
+
+        // `edit_queued_message` checks caret position: rejected when caret is not at 0..0, edits latest (`run-q2`) when at 0..0.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("drafting", window, cx);
+                composer.input.update(cx, |input, cx| input.set_selected_range(3..3, cx));
+                assert!(!composer.edit_queued_message(window, cx));
+                assert!(composer.editing_queued().is_none());
+
+                composer.set_prompt("", window, cx);
+                composer.input.update(cx, |input, cx| input.set_selected_range(0..0, cx));
+                assert!(composer.edit_queued_message(window, cx));
+                assert_eq!(composer.editing_queued().map(|e| e.run_id.as_str()), Some("run-q2"));
+                assert_eq!(composer.prompt(cx), "Latest queued");
+                composer.cancel_queued_edit(window, cx);
+                assert!(composer.editing_queued().is_none());
+
+                // `steer_queued_message` promotes the FIRST queued run (`run-q1`).
+                assert!(composer.steer_queued_message(window, cx));
+            });
+        });
+        let req_payload = loop {
+            let (m, payload, tx) = fixture.next_request().await;
+            if m == t3_core::commands::method::DISPATCH_COMMAND && payload["type"] != "thread.visit" {
+                let _ = tx.send(Ok(serde_json::json!({"sequence": 2})));
+                break payload;
+            }
+            let _ = tx.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(req_payload["type"], "queued-message.promote-to-steer");
+        assert_eq!(req_payload["queuedRunId"], "run-q1");
+        vcx.run_until_parked();
+
+        // `send_alternate` dispatches while running when `composer.sendAlternate` fires.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                assert!(composer.snapshot.running, "thread must be running for send_alternate");
+                assert!(!composer.sending, "composer should not still be sending");
+                assert!(!composer.snapshot.setup_blocks_send, "setup should not block send");
+                assert!(composer.resolve(cx).model.is_some(), "provider/model should resolve");
+                composer.set_prompt("Alternate send", window, cx);
+                composer.send_alternate(window, cx);
+                assert_eq!(composer.error, None, "send_alternate should not error");
+                assert!(composer.sending, "send_alternate should start sending");
+            });
+        });
+        let alt_payload = loop {
+            let (m, payload, tx) = fixture.next_request().await;
+            if m == t3_core::commands::method::DISPATCH_COMMAND && payload["type"] != "thread.visit" {
+                let _ = tx.send(Ok(serde_json::json!({"sequence": 3})));
+                break payload;
+            }
+            let _ = tx.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(alt_payload["type"], "message.dispatch");
+        assert_eq!(alt_payload["dispatchMode"]["type"], "queue_after_active");
+        vcx.run_until_parked();
+
+        // `cycle_host` switches between 2 fleet project environments.
+        vcx.update(|_window, cx| {
+            state.update(cx, |state, cx| {
+                state.environments.environments = vec![
+                    t3_client::store::SavedEnvironment {
+                        id: "local".into(),
+                        environment_id: Some("env-local".into()),
+                        label: "MacBook Pro".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:1".into(),
+                        access_token: None,
+                        server_version: None,
+                        local: true,
+                        ssh: None,
+                    },
+                    t3_client::store::SavedEnvironment {
+                        id: "remote-1".into(),
+                        environment_id: Some("env-remote".into()),
+                        label: "Build Box".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:2".into(),
+                        access_token: None,
+                        server_version: None,
+                        local: false,
+                        ssh: None,
+                    },
+                ];
+                state.environments.active = Some("local".into());
+                let owner_local = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "local".into(),
+                    canonical_id: Some("env-local".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                let owner_remote = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "remote-1".into(),
+                    canonical_id: Some("env-remote".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                let mut shell_remote = state.shell.snapshot.clone().unwrap_or_default();
+                for proj in &mut shell_remote.projects {
+                    if proj.id == "checkout-a" {
+                        proj.repository_identity = Some(serde_json::json!({"canonicalKey": "github.com/acme/repo"}));
+                    }
+                }
+                state.shell.apply(t3_core::shell::ShellStreamItem::Snapshot {
+                    snapshot: Box::new(shell_remote.clone()),
+                    resolved_repository_identity_roots: None,
+                });
+                let mut remote_shell_state = t3_core::shell::ShellState::default();
+                remote_shell_state.synchronized = true;
+                remote_shell_state.apply(t3_core::shell::ShellStreamItem::Snapshot {
+                    snapshot: Box::new(shell_remote),
+                    resolved_repository_identity_roots: None,
+                });
+                let mut config_remote = t3_core::server_config::ServerConfigState::default();
+                config_remote.config = Some(serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": "env-remote", "label": "Build Box", "platform": { "os": "linux", "arch": "x64" } },
+                    "auth": { "policy": "loopback-auto" }
+                })).unwrap());
+                let grants: t3_core::auth::AuthSessionState = serde_json::from_value(serde_json::json!({
+                    "authenticated": true,
+                    "scopes": ["source-control:write", "orchestration:read"]
+                })).unwrap();
+                state.fleet = std::sync::Arc::new(t3_client::environments::FleetView {
+                    revision: 1,
+                    environments: vec![
+                        std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                            summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner_local,
+                                &state.shell,
+                                &state.server_config,
+                            )),
+                            status: t3_client::supervisor::ConnectionStatus::Connected,
+                            config: state.server_config.clone(),
+                            grants: Some(grants.clone()),
+                            settings_revision: 0,
+                            keybindings_revision: 0,
+                        }),
+                        std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                            summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner_remote,
+                                &remote_shell_state,
+                                &config_remote,
+                            )),
+                            status: t3_client::supervisor::ConnectionStatus::Connected,
+                            config: config_remote,
+                            grants: Some(grants),
+                            settings_revision: 0,
+                            keybindings_revision: 0,
+                        }),
+                    ],
+                });
+                state.sidebar.grouping_projects = state.fleet.environments.iter().flat_map(|entry| entry.summary.projects.iter().cloned()).collect();
+                state.sidebar.grouping_threads = state.fleet.environments.iter().flat_map(|entry| entry.summary.threads.iter().cloned()).collect();
+                state.rebuild_sidebar(cx);
+                state.start_draft("checkout-a", cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                assert_eq!(composer.host_options(cx).options.len(), 2);
+                composer.cycle_host(window, cx);
+            });
+            assert_eq!(state.read(cx).environments.active.as_deref(), Some("remote-1"));
         });
 
         state.update(cx, |state, _| state.stop_pump());

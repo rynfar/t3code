@@ -180,6 +180,7 @@ export function run(
     activeAttemptId: null,
     queueHeld: status === "queued",
     queuePosition: status === "queued" ? ordinal : null,
+    freshContext: false,
     status,
     requestedAt: NOW,
     startedAt: NOW,

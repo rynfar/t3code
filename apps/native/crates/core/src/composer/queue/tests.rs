@@ -82,8 +82,81 @@ fn a_running_turn_takes_a_steer_only_when_the_provider_can() {
 }
 
 #[test]
+fn fresh_context_queued_runs_cannot_steer_non_compaction_active_turns() {
+    let mut fresh_run = run("r2", 2, "queued", Some(1));
+    fresh_run["freshContext"] = json!(true);
+    let runs = vec![run("r1", 1, "running", None), fresh_run];
+    let turns = vec![json!({ "id": "pt", "runAttemptId": "a1", "status": "running" })];
+
+    let steerable = queue_state(&projection(
+        runs.clone(),
+        vec![message("r1", "go", json!({})), message("r2", "fresh", json!({}))],
+        turns.clone(),
+        true,
+    ));
+    assert!(steerable.queued[0].fresh_context);
+    assert!(steerable.can_send());
+    assert!(!steerable.can_send_run(true));
+    assert_eq!(send_now(&steerable, "c1", "t1", "r2"), None);
+
+    // A `/compact` active run may still be skipped and replaced even when the queued run is fresh.
+    let compacting = queue_state(&projection(
+        runs,
+        vec![message("r1", "/compact", json!({})), message("r2", "fresh", json!({}))],
+        turns,
+        true,
+    ));
+    assert!(compacting.can_send_run(true));
+    assert_eq!(send_now(&compacting, "c1", "t1", "r2").unwrap()["type"], "queued-message.promote-to-steer");
+}
+
+#[test]
+fn queued_runs_decode_linked_env_agent_t3code_guest_and_automation_attribution() {
+    use crate::timeline::Attribution;
+    let runs = vec![
+        run("r2", 2, "queued", Some(1)),
+        run("r3", 3, "queued", Some(2)),
+        run("r4", 4, "queued", Some(3)),
+    ];
+    let messages = vec![
+        message(
+            "r2",
+            "from remote agent",
+            json!({
+                "createdBy": "agent",
+                "creationSource": "cli",
+                "createdAt": T,
+                "linkedSender": { "environmentId": "env-remote", "threadId": "t-remote", "title": "Remote Thread" }
+            }),
+        ),
+        message("r3", "from t3", json!({ "createdBy": "agent", "creationSource": "server", "createdAt": T })),
+        message("r4", "[Triggered by schedule task: Daily]\n\nCheck CI", json!({ "scheduledTaskId": "task-1", "createdAt": T })),
+    ];
+    let state = queue_state(&projection(runs, messages, vec![], false));
+    assert_eq!(state.queued[0].attribution, Some(Attribution::Agent));
+    assert_eq!(state.queued[0].linked_sender.as_ref().map(|s| (s.environment_id.as_str(), s.thread_id.as_str(), s.title.as_str())), Some(("env-remote", "t-remote", "Remote Thread")));
+    assert_eq!(state.queued[1].attribution, Some(Attribution::T3Code));
+    assert_eq!(state.queued[2].attribution, Some(Attribution::Automation));
+    assert_eq!(state.queued[2].scheduled_task_id.as_deref(), Some("task-1"));
+    assert_eq!(state.queued[2].text, "Check CI");
+}
+
+#[test]
 fn rows_read_like_sent_messages() {
-    let queued = |text: &str, attachments: Vec<Value>| QueuedRun { run_id: "r".into(), message_id: "m".into(), text: text.into(), attachments, editable: true };
+    let queued = |text: &str, attachments: Vec<Value>| QueuedRun {
+        run_id: "r".into(),
+        message_id: "m".into(),
+        text: text.into(),
+        attachments,
+        editable: true,
+        fresh_context: false,
+        created_at: None,
+        attribution: None,
+        scheduled_task_id: None,
+        sender_thread_id: None,
+        linked_sender: None,
+        guest_name: None,
+    };
     assert_eq!(preview_text(&queued(ATTACHMENT_ONLY_PROMPT, vec![])), "");
     assert_eq!(preview_text(&queued(&format!("Ultrathink: {ATTACHMENT_ONLY_PROMPT}"), vec![])), "");
     let image = json!({ "type": "image", "id": "a" });

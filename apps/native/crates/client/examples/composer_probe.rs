@@ -218,6 +218,8 @@ async fn queue_probe(
             dispatch,
             context: None,
             attachments: &[],
+            fresh_context: false,
+            idle_compaction: None,
         })
     };
     client.open_thread(thread_id);

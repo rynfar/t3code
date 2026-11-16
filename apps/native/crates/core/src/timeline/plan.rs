@@ -92,10 +92,8 @@ pub fn normalize_plan_markdown_for_export(plan_markdown: &str) -> String {
     format!("{}\n", plan_markdown.trim_end())
 }
 
-/// Whether the thread currently has a resumable interrupted/usage-limited run (without a
-/// pending runtime request blocking continuation), else a held queued run
-/// (`canResumeThread`).
-pub fn can_resume_thread(projection: &ThreadProjection) -> bool {
+/// The latest interrupted or usage-limited run that a manual resume continues (`deriveResumableRunId`).
+pub fn resumable_run_id(projection: &ThreadProjection) -> Option<String> {
     let latest_executed = projection
         .runs
         .iter()
@@ -104,14 +102,19 @@ pub fn can_resume_thread(projection: &ThreadProjection) -> bool {
             let end_a = a.completed_at.as_deref().and_then(super::parse_iso_ms).unwrap_or(i64::MAX);
             let end_b = b.completed_at.as_deref().and_then(super::parse_iso_ms).unwrap_or(i64::MAX);
             end_a.cmp(&end_b).then_with(|| a.ordinal.cmp(&b.ordinal))
-        });
-    let has_resumable_run = latest_executed.is_some_and(|run| {
-        run.status == "interrupted"
-            || (run.status == "failed"
-                && super::status::thread_error(projection)
-                    .is_some_and(|err| err.class.as_deref() == Some("usage_limit")))
-    });
-    if !has_resumable_run {
+        })?;
+    let resumable = latest_executed.status == "interrupted"
+        || (latest_executed.status == "failed"
+            && super::status::thread_error(projection)
+                .is_some_and(|err| err.class.as_deref() == Some("usage_limit")));
+    resumable.then(|| latest_executed.id.clone())
+}
+
+/// Whether the thread currently has a resumable interrupted/usage-limited run (without a
+/// pending runtime request blocking continuation), else a held queued run
+/// (`canResumeThread`).
+pub fn can_resume_thread(projection: &ThreadProjection) -> bool {
+    if resumable_run_id(projection).is_none() {
         return projection.runs.iter().any(|run| run.status == "queued" && run.queue_held == Some(true));
     }
     !projection

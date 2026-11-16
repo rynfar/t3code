@@ -155,6 +155,7 @@ fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
     let choice = DraftWorkspace {
         destination: None,
         branch: None,
+        start_from_origin: None,
         environment_id: "env-a".into(),
         project_root: "/repo".into(),
         mode: ThreadEnvMode::Worktree,
@@ -203,10 +204,28 @@ fn reused_worktree_launches_preserve_scope_branch_and_path_without_checkout() {
     let new = DraftWorkspace {
         destination: None,
         branch: None,
+        start_from_origin: None,
         previous: None,
         ..choice
     };
     assert_eq!(new.strategy(), None);
+    let custom_base = DraftWorkspace {
+        branch: Some("release/v2".into()),
+        start_from_origin: Some(false),
+        ..new.clone()
+    };
+    assert_eq!(
+        effective_strategy(Some(&custom_base), ThreadEnvMode::Worktree, None, true).unwrap().to_json(),
+        json!({ "type": "worktree", "baseRef": "release/v2" })
+    );
+    let origin_base = DraftWorkspace {
+        start_from_origin: Some(true),
+        ..custom_base
+    };
+    assert_eq!(
+        effective_strategy(Some(&origin_base), ThreadEnvMode::Worktree, None, false).unwrap().to_json(),
+        json!({ "type": "worktree", "baseRef": "release/v2", "startFromOrigin": true })
+    );
     assert!(can_use_previous_worktree(false, false, false));
     for (server, locked, force) in [
         (true, false, false),
