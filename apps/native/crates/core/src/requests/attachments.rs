@@ -2,11 +2,12 @@
 //! `usePendingThreadRequests.ts`. Each question owns its files independently of message drafts.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 
 use super::{DraftAnswer, PendingUserInput, Question};
 use crate::auth::{AuthSessionState, ORCHESTRATION_OPERATE_SCOPE};
-use crate::composer::attachments::{Attachment, limit_error};
+use crate::composer::attachments::{Attachment, Upload, chat_attachments, limit_error, retry_on_send};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QuestionDraftKey {
@@ -509,5 +510,352 @@ mod resolution_tests {
         ];
         let loaded = HashMap::from([("background".into(), vec!["pending".into()])]);
         assert_eq!(resolved_draft_keys(&keys, "env", &loaded), vec![&key]);
+    }
+}
+
+/// User-facing validation error copy matching `apps/web/src/components/chat/usePendingThreadRequests.ts`.
+pub const QUESTION_UPLOAD_WAIT_ERROR: &str =
+    "Wait for attachments to finish uploading, or remove failed uploads.";
+pub const QUESTION_PREPARE_WAIT_ERROR: &str =
+    "Wait for attachments to finish preparing before submitting.";
+pub const QUESTION_ATTACHMENTS_UNSUPPORTED_ERROR: &str =
+    "This provider does not support attaching files to question answers.";
+pub const QUESTION_CUSTOM_ANSWER_DISABLED_ERROR: &str =
+    "This question does not accept file attachments.";
+
+/// Prefix shared by all persisted question attachment draft keys for `(environment, thread)`
+/// (`questionAttachmentDraftPrefix` in `apps/web/src/questionAttachments.ts`).
+pub fn question_draft_prefix(environment: &str, thread: &str) -> String {
+    format!(
+        "question-request:{}:{}",
+        url::form_urlencoded::byte_serialize(environment.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(thread.as_bytes()).collect::<String>(),
+    )
+}
+
+/// Returns every `QuestionDraftKey` belonging to `(environment, thread, request_id)`.
+pub fn question_keys_for_request<'a>(
+    keys: &'a [QuestionDraftKey],
+    environment: &str,
+    thread: &str,
+    request_id: &str,
+) -> Vec<&'a QuestionDraftKey> {
+    keys.iter()
+        .filter(|key| {
+            key.environment == environment && key.thread == thread && key.request == request_id
+        })
+        .collect()
+}
+
+/// Counts all attachments staged across all questions of one pending request
+/// (`countQuestionRequestAttachments` in `apps/web/src/questionAttachments.ts`).
+pub fn count_question_request_attachments(
+    draft_counts: &[(QuestionDraftKey, usize)],
+    environment: &str,
+    thread: &str,
+    request_id: &str,
+) -> usize {
+    draft_counts
+        .iter()
+        .filter(|(key, _)| {
+            key.environment == environment && key.thread == thread && key.request == request_id
+        })
+        .map(|(_, count)| *count)
+        .sum()
+}
+
+/// Validation failure while preparing `attachmentsByQuestionId` for a pending user-input response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuestionResponseAttachmentError {
+    Unsupported {
+        question_id: String,
+        message: String,
+    },
+    CustomAnswerDisabled {
+        question_id: String,
+        message: String,
+    },
+    Preparing {
+        question_id: String,
+        message: String,
+    },
+    LimitExceeded {
+        question_id: String,
+        message: String,
+    },
+    UploadsIncomplete {
+        question_id: String,
+        retryable_ids: Vec<String>,
+        message: String,
+    },
+}
+
+impl QuestionResponseAttachmentError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unsupported { message, .. }
+            | Self::CustomAnswerDisabled { message, .. }
+            | Self::Preparing { message, .. }
+            | Self::LimitExceeded { message, .. }
+            | Self::UploadsIncomplete { message, .. } => message,
+        }
+    }
+
+    pub fn question_id(&self) -> &str {
+        match self {
+            Self::Unsupported { question_id, .. }
+            | Self::CustomAnswerDisabled { question_id, .. }
+            | Self::Preparing { question_id, .. }
+            | Self::LimitExceeded { question_id, .. }
+            | Self::UploadsIncomplete { question_id, .. } => question_id,
+        }
+    }
+}
+
+/// Collects every failed attachment ID across all questions in `input` so callers can trigger
+/// retry-on-send before awaiting uploads (`usePendingThreadRequests.ts`).
+pub fn question_retry_on_send_ids(
+    input: &PendingUserInput,
+    attachments_by_question: &BTreeMap<String, Vec<Attachment>>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for question in &input.questions {
+        if let Some(attachments) = attachments_by_question.get(&question.id) {
+            ids.extend(retry_on_send(attachments));
+        }
+    }
+    ids
+}
+
+/// Validates every question's staged attachments for `input` and encodes the non-empty
+/// question attachment lists into `attachmentsByQuestionId` (`Map<String, Value>`).
+///
+/// Enforces:
+/// - `preparing == 0` when any attachments are being prepared
+/// - `supports_question_attachments` and `question.allows_custom_answer()` when attachments exist
+/// - `limit_error` (max 100 attachments and 80 MiB total images per question)
+/// - All staged attachments are `Upload::Ready`; returns `UploadsIncomplete` with `retryable_ids`
+///   if any upload is still `Uploading` or `Failed`.
+pub fn build_question_response_attachments(
+    input: &PendingUserInput,
+    attachments_by_question: &BTreeMap<String, Vec<Attachment>>,
+    preparing_by_question: &BTreeMap<String, usize>,
+    supports_question_attachments: bool,
+) -> Result<Map<String, Value>, QuestionResponseAttachmentError> {
+    let mut encoded = Map::new();
+
+    for question in &input.questions {
+        let preparing = preparing_by_question.get(&question.id).copied().unwrap_or(0);
+        let attachments = attachments_by_question
+            .get(&question.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        if preparing > 0 {
+            return Err(QuestionResponseAttachmentError::Preparing {
+                question_id: question.id.clone(),
+                message: QUESTION_PREPARE_WAIT_ERROR.to_owned(),
+            });
+        }
+        if attachments.is_empty() {
+            continue;
+        }
+        if !supports_question_attachments {
+            return Err(QuestionResponseAttachmentError::Unsupported {
+                question_id: question.id.clone(),
+                message: QUESTION_ATTACHMENTS_UNSUPPORTED_ERROR.to_owned(),
+            });
+        }
+        if !question.allows_custom_answer() {
+            return Err(QuestionResponseAttachmentError::CustomAnswerDisabled {
+                question_id: question.id.clone(),
+                message: QUESTION_CUSTOM_ANSWER_DISABLED_ERROR.to_owned(),
+            });
+        }
+        if let Some(message) = limit_error(attachments) {
+            return Err(QuestionResponseAttachmentError::LimitExceeded {
+                question_id: question.id.clone(),
+                message,
+            });
+        }
+        let Some(serialized) = chat_attachments(attachments) else {
+            let retryable_ids = attachments
+                .iter()
+                .filter(|attachment| matches!(attachment.upload, Upload::Failed { .. }))
+                .map(|attachment| attachment.id.clone())
+                .collect();
+            return Err(QuestionResponseAttachmentError::UploadsIncomplete {
+                question_id: question.id.clone(),
+                retryable_ids,
+                message: QUESTION_UPLOAD_WAIT_ERROR.to_owned(),
+            });
+        };
+        encoded.insert(question.id.clone(), Value::Array(serialized));
+    }
+
+    Ok(encoded)
+}
+
+#[cfg(test)]
+mod response_encoding_tests {
+    use super::*;
+    use crate::composer::attachments::{AttachmentKind, MAX_IMAGE_BYTES};
+
+    fn make_input(allows_other: bool) -> PendingUserInput {
+        let q: Question = serde_json::from_value(serde_json::json!({
+            "id": "q1",
+            "header": "Details",
+            "question": "Share details",
+            "options": [],
+            "allowCustomAnswer": allows_other,
+        }))
+        .unwrap();
+        let q2: Question = serde_json::from_value(serde_json::json!({
+            "id": "q2",
+            "header": "Pick",
+            "question": "Pick one",
+            "options": [{ "label": "Yes", "description": "Accept" }],
+            "allowCustomAnswer": true,
+        }))
+        .unwrap();
+        PendingUserInput {
+            request_id: "req-1".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            questions: vec![q, q2],
+            response_capability: "live".into(),
+            dismissible: true,
+        }
+    }
+
+    fn attachment(id: &str, upload: Upload) -> Attachment {
+        Attachment {
+            id: id.into(),
+            kind: AttachmentKind::File,
+            name: "trace.log".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 42,
+            pasted_text: true,
+            upload,
+        }
+    }
+
+    #[test]
+    fn encodes_ready_attachments_and_skips_empty_questions() {
+        let input = make_input(true);
+        let map = BTreeMap::from([(
+            "q1".into(),
+            vec![attachment(
+                "local-1",
+                Upload::Ready {
+                    attachment_id: "srv-1".into(),
+                },
+            )],
+        )]);
+
+        let encoded =
+            build_question_response_attachments(&input, &map, &BTreeMap::new(), true).unwrap();
+        assert_eq!(encoded.len(), 1);
+        let q1_arr = encoded.get("q1").and_then(Value::as_array).unwrap();
+        assert_eq!(q1_arr.len(), 1);
+        assert_eq!(q1_arr[0]["id"], "srv-1");
+        assert_eq!(q1_arr[0]["type"], "file");
+        assert_eq!(q1_arr[0]["source"]["_tag"], "pasted-text");
+        assert!(!encoded.contains_key("q2"));
+    }
+
+    #[test]
+    fn rejects_incomplete_preparing_unsupported_and_oversized_question_attachments() {
+        let input = make_input(true);
+        let uploading = attachment("u1", Upload::Uploading);
+        let failed = attachment(
+            "f1",
+            Upload::Failed {
+                reason: "offline".into(),
+            },
+        );
+
+        let incomplete = BTreeMap::from([("q1".into(), vec![uploading, failed])]);
+        assert_eq!(
+            question_retry_on_send_ids(&input, &incomplete),
+            vec!["f1".to_owned()]
+        );
+        let err = build_question_response_attachments(&input, &incomplete, &BTreeMap::new(), true)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            QuestionResponseAttachmentError::UploadsIncomplete {
+                question_id: "q1".into(),
+                retryable_ids: vec!["f1".into()],
+                message: QUESTION_UPLOAD_WAIT_ERROR.into(),
+            }
+        );
+
+        let ready = BTreeMap::from([(
+            "q1".into(),
+            vec![attachment(
+                "r1",
+                Upload::Ready {
+                    attachment_id: "srv-r1".into(),
+                },
+            )],
+        )]);
+        assert!(matches!(
+            build_question_response_attachments(&input, &ready, &BTreeMap::from([("q1".into(), 1)]), true),
+            Err(QuestionResponseAttachmentError::Preparing { .. })
+        ));
+        assert!(matches!(
+            build_question_response_attachments(&input, &ready, &BTreeMap::new(), false),
+            Err(QuestionResponseAttachmentError::Unsupported { .. })
+        ));
+
+        let blocked_custom = make_input(false);
+        assert!(matches!(
+            build_question_response_attachments(&blocked_custom, &ready, &BTreeMap::new(), true),
+            Err(QuestionResponseAttachmentError::CustomAnswerDisabled { .. })
+        ));
+
+        // 9 images x 10 MiB = 90 MiB > 80 MiB total limit triggers LimitExceeded.
+        let images: Vec<Attachment> = (0..9)
+            .map(|i| Attachment {
+                id: format!("img-{i}"),
+                kind: AttachmentKind::Image,
+                name: format!("img-{i}.png"),
+                mime_type: "image/png".into(),
+                size_bytes: MAX_IMAGE_BYTES,
+                pasted_text: false,
+                upload: Upload::Ready {
+                    attachment_id: format!("srv-{i}"),
+                },
+            })
+            .collect();
+        let over_limit = BTreeMap::from([("q1".into(), images)]);
+        assert!(matches!(
+            build_question_response_attachments(&input, &over_limit, &BTreeMap::new(), true),
+            Err(QuestionResponseAttachmentError::LimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn counts_request_attachments_and_formats_distinct_prefixes() {
+        let k1 = QuestionDraftKey {
+            environment: "env-a".into(),
+            thread: "thr-1".into(),
+            request: "req-1".into(),
+            question: "q1".into(),
+        };
+        let k2 = QuestionDraftKey {
+            question: "q2".into(),
+            ..k1.clone()
+        };
+        let other_req = QuestionDraftKey {
+            request: "req-2".into(),
+            ..k1.clone()
+        };
+        let counts = vec![(k1, 2), (k2, 3), (other_req, 5)];
+        assert_eq!(count_question_request_attachments(&counts, "env-a", "thr-1", "req-1"), 5);
+        assert_ne!(
+            question_draft_prefix("a:b", "c"),
+            question_draft_prefix("a", "b:c")
+        );
     }
 }
