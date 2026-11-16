@@ -1,8 +1,9 @@
 //! Async Tokio execution engine for `t3_core::composer::attachments::queue::UploadQueue`.
 //!
-//! Enforces `MAX_UPLOADS_PER_ENVIRONMENT = 3` concurrent HTTP transfers per environment, forwards
-//! quantized streaming progress callbacks, reconciles draft ownership/adoption, cleans up minted
-//! server assets on cancel/release, verifies persisted uploads, and auto-retries failed jobs on
+//! Enforces `MAX_UPLOADS_PER_ENVIRONMENT = 3` concurrent HTTP transfers per environment, checks
+//! `ORCHESTRATION_OPERATE_SCOPE` grants, forwards quantized streaming progress callbacks, reconciles
+//! draft ownership/adoption, cleans up minted/persisted server assets on cancel/release, verifies
+//! persisted uploads, and auto-retries failed jobs (including in-flight reconnect races) on
 //! environment reconnection.
 
 use std::collections::{HashMap, HashSet};
@@ -11,14 +12,15 @@ use std::time::Duration;
 
 use serde_json::Value;
 use t3_core::composer::attachments::queue::{
-    AttachmentUploadState, DraftTarget, JobToken, QueueEffect, UPLOAD_TIMEOUT_MS, UploadQueue,
+    AttachmentUploadState, DraftTarget, JobToken, PersistedAttachmentVerification, QueueEffect,
+    UPLOAD_TIMEOUT_MS, UploadCycleOutcome, UploadCycleStep, UploadQueue,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::UploadedAttachment;
 use super::cycle::{
-    DEFAULT_UPLOAD_CHUNK_SIZE, delete_pending_attachment, run_attachment_upload_cycle,
-    verify_persisted_attachment_upload,
+    DEFAULT_UPLOAD_CHUNK_SIZE, delete_pending_attachment, has_orchestration_operate_scope,
+    run_attachment_upload_cycle, verify_persisted_attachment_upload,
 };
 use crate::supervisor::ClientHandle;
 
@@ -128,13 +130,21 @@ impl AttachmentUploadQueueClient {
                 let next = *gen_rx.borrow_and_update();
                 if next > last_seen {
                     last_seen = next;
-                    this.notify_connection_transition(&env_id, false, true);
+                    let latest_client = {
+                        let inner = this.inner.lock().unwrap_or_else(|p| p.into_inner());
+                        inner.clients.get(&env_id).cloned()
+                    };
+                    if latest_client.as_ref().is_some_and(has_orchestration_operate_scope) {
+                        this.notify_connection_transition(&env_id, false, true);
+                    }
                 }
             }
         }));
     }
 
     /// Enqueues or adopts an attachment upload under `job_key`.
+    ///
+    /// Matches `startAttachmentUpload`: no-ops when `client` lacks `ORCHESTRATION_OPERATE_SCOPE`.
     pub fn start_upload(
         &self,
         job_key: String,
@@ -142,15 +152,24 @@ impl AttachmentUploadQueueClient {
         client: ClientHandle,
         payload: UploadPayload,
     ) -> Option<JobToken> {
+        if !has_orchestration_operate_scope(&client) {
+            return None;
+        }
         self.register_client(client.clone());
         let env_id = client.environment().to_owned();
-        let has_bytes = payload.bytes.is_some();
         let persisted_id = payload.persisted_attachment_id.clone();
         let current_state = payload.current_state.clone();
 
         let (token, effects) = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            inner.payloads.insert(job_key.clone(), payload);
+            let mut merged = payload;
+            if merged.bytes.is_none()
+                && let Some(prev) = inner.payloads.get(&job_key)
+            {
+                merged.bytes = prev.bytes.clone();
+            }
+            let has_bytes = merged.bytes.is_some();
+            inner.payloads.insert(job_key.clone(), merged);
             inner.queue.start(
                 job_key,
                 target,
@@ -164,21 +183,41 @@ impl AttachmentUploadQueueClient {
         token
     }
 
-    /// Retries a settled failed upload for `job_key`.
+    /// Retries a settled failed upload for `job_key`, gated on `ORCHESTRATION_OPERATE_SCOPE`.
     pub fn retry_upload(&self, job_key: &str) -> Option<JobToken> {
         let (token, effects) = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let env_id = inner.queue.state(job_key)?.environment_id().to_owned();
+            if !inner
+                .clients
+                .get(&env_id)
+                .is_some_and(has_orchestration_operate_scope)
+            {
+                return None;
+            }
             inner.queue.retry(job_key)
         };
         self.apply_effects(effects);
         token
     }
 
-    /// Retries every failed job in `job_keys` on send (`retry-on-send`).
+    /// Retries every failed job in `job_keys` on send (`retry-on-send`), gated on
+    /// `ORCHESTRATION_OPERATE_SCOPE`.
     pub fn retry_on_send(&self, job_keys: &[String]) -> Vec<JobToken> {
         let (tokens, effects) = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            inner.queue.retry_on_send(job_keys)
+            let permitted_keys: Vec<String> = job_keys
+                .iter()
+                .filter(|key| {
+                    inner
+                        .queue
+                        .state(key)
+                        .and_then(|state| inner.clients.get(state.environment_id()))
+                        .is_some_and(has_orchestration_operate_scope)
+                })
+                .cloned()
+                .collect();
+            inner.queue.retry_on_send(&permitted_keys)
         };
         self.apply_effects(effects);
         tokens
@@ -196,7 +235,7 @@ impl AttachmentUploadQueueClient {
         self.apply_effects(effects);
     }
 
-    /// Releases an upload owned by `job_key`, deleting any staged/failed server asset.
+    /// Releases an upload owned by `job_key`, deleting any staged/failed/persisted server asset.
     pub fn release_upload(&self, job_key: &str) {
         let effects = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -227,9 +266,8 @@ impl AttachmentUploadQueueClient {
         self.apply_effects(effects);
     }
 
-    /// Adopts an existing live or settled upload under a new `job_key` and `DraftTarget` (e.g.
-    /// when promoting a new-thread draft or returning question attachments to the composer draft)
-    /// without aborting the transfer or deleting server assets.
+    /// Adopts an existing live or settled upload under a new `job_key` and `DraftTarget` without
+    /// aborting the upload or deleting server assets.
     pub fn adopt_target(&self, old_job_key: &str, new_job_key: String, new_target: DraftTarget) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let adopted = inner
@@ -262,7 +300,8 @@ impl AttachmentUploadQueueClient {
         }))
     }
 
-    /// Triggers reconnect retry handling on a `!was_connected && is_connected` edge.
+    /// Triggers reconnect retry handling on a `!was_connected && is_connected` edge (or records a
+    /// disconnect via `is_connected == false`).
     pub fn notify_connection_transition(
         &self,
         environment_id: &str,
@@ -271,6 +310,14 @@ impl AttachmentUploadQueueClient {
     ) {
         let effects = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if is_connected
+                && !inner
+                    .clients
+                    .get(environment_id)
+                    .is_some_and(has_orchestration_operate_scope)
+            {
+                return;
+            }
             inner
                 .queue
                 .on_connection_transition(environment_id, was_connected, is_connected)
@@ -310,13 +357,14 @@ impl AttachmentUploadQueueClient {
         let _ = futures::future::join_all(receivers).await;
     }
 
-    fn apply_effects(&self, effects: Vec<QueueEffect>) {
+    fn apply_effects(&self, initial_effects: Vec<QueueEffect>) {
+        let mut pending_effects: std::collections::VecDeque<QueueEffect> = initial_effects.into();
         let mut tasks_to_spawn = Vec::new();
         let mut deletes_to_spawn = Vec::new();
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            for effect in effects {
+            while let Some(effect) = pending_effects.pop_front() {
                 match effect {
                     QueueEffect::StartUpload {
                         job_token,
@@ -326,6 +374,28 @@ impl AttachmentUploadQueueClient {
                         ..
                     } => {
                         let Some(client) = inner.clients.get(&environment_id).cloned() else {
+                            // Never leave an active slot wedged when no client handle is registered.
+                            let follow_up = if persisted_attachment_id.is_some() {
+                                inner
+                                    .queue
+                                    .complete_persisted_verification(
+                                        job_token,
+                                        PersistedAttachmentVerification::Failed {
+                                            reason: "Not connected".to_owned(),
+                                        },
+                                    )
+                                    .1
+                            } else {
+                                inner.queue.complete_cycle(
+                                    job_token,
+                                    UploadCycleOutcome::Failed {
+                                        step: UploadCycleStep::ResolveUploadUrl,
+                                        attachment_id: None,
+                                        error: "Not connected".to_owned(),
+                                    },
+                                )
+                            };
+                            pending_effects.extend(follow_up);
                             continue;
                         };
                         let payload = inner.payloads.get(&job_key).cloned();
@@ -383,13 +453,6 @@ impl AttachmentUploadQueueClient {
                         target,
                         state,
                     } => {
-                        if matches!(state, Some(AttachmentUploadState::Ready(_)) | None)
-                            && let Some(payload) = inner.payloads.get_mut(&job_key)
-                            && matches!(state, Some(AttachmentUploadState::Ready(_)))
-                        {
-                            // Free raw buffer memory once uploaded, unless caller later supplies bytes.
-                            payload.bytes = None;
-                        }
                         let _ = inner.events.send(QueueEvent::StateChanged {
                             job_key,
                             target,
@@ -447,6 +510,7 @@ impl AttachmentUploadQueueClient {
 
                 let outcome = match payload.and_then(|p| p.bytes.map(|b| (p.request, p.mime_type, b))) {
                     Some((request, mime_type, bytes)) => {
+                        let mint_this = this.clone();
                         let mint_abort = abort_rx.clone();
                         let progress_this = this.clone();
                         run_attachment_upload_cycle(
@@ -457,7 +521,13 @@ impl AttachmentUploadQueueClient {
                             chunk_size,
                             timeout,
                             &mut abort_rx,
-                            |_| !*mint_abort.borrow(),
+                            |minted_id| {
+                                if *mint_abort.borrow() {
+                                    return false;
+                                }
+                                let mut inner = mint_this.inner.lock().unwrap_or_else(|p| p.into_inner());
+                                inner.queue.record_minted(job_token, minted_id.to_owned())
+                            },
                             |progress| {
                                 let effects = {
                                     let mut inner =
@@ -469,8 +539,8 @@ impl AttachmentUploadQueueClient {
                         )
                         .await
                     }
-                    None => t3_core::composer::attachments::queue::UploadCycleOutcome::Failed {
-                        step: t3_core::composer::attachments::queue::UploadCycleStep::UploadBytes,
+                    None => UploadCycleOutcome::Failed {
+                        step: UploadCycleStep::UploadBytes,
                         attachment_id: None,
                         error: format!("Upload payload missing for {job_key}"),
                     },

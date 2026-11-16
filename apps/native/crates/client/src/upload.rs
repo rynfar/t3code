@@ -9,7 +9,8 @@ mod owned;
 pub mod queue;
 pub use cycle::{
     DEFAULT_UPLOAD_CHUNK_SIZE, UploadTransferError, delete_pending_attachment,
-    run_attachment_upload_cycle, upload_bytes_with_progress, verify_persisted_attachment_upload,
+    has_orchestration_operate_scope, run_attachment_upload_cycle, upload_bytes_with_progress,
+    verify_persisted_attachment_upload,
 };
 pub use owned::UploadedAttachment;
 pub use queue::{AttachmentUploadQueueClient, QueueEvent, UploadPayload};

@@ -22,9 +22,11 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 
 use super::{
     AttachmentUploadQueueClient, QueueEvent, UploadPayload, UploadTransferError,
-    run_attachment_upload_cycle, upload_bytes_with_progress, verify_persisted_attachment_upload,
+    delete_pending_attachment, run_attachment_upload_cycle, upload_bytes_with_progress,
+    verify_persisted_attachment_upload,
 };
 use crate::auth::Credentials;
+use crate::supervisor::ClientHandle;
 use crate::test_server::FakeServer;
 
 async fn read_http_head_and_body(
@@ -127,8 +129,16 @@ struct MockUploadWsServer {
 
 impl MockUploadWsServer {
     async fn start() -> Self {
+        Self::start_with_session(
+            r#"{"authenticated":true,"auth":{},"permissions":["orchestration:operate","filesystem:read"]}"#,
+        )
+        .await
+    }
+
+    async fn start_with_session(initial_session_json: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let session_srv = Arc::new(Mutex::new(initial_session_json.to_owned()));
         let (conn_tx, conn_rx) = mpsc::unbounded_channel();
         let (upload_tx, upload_rx) = mpsc::unbounded_channel();
 
@@ -136,6 +146,7 @@ impl MockUploadWsServer {
             while let Ok((stream, _)) = listener.accept().await {
                 let conn_tx = conn_tx.clone();
                 let upload_tx = upload_tx.clone();
+                let session_srv = Arc::clone(&session_srv);
                 tokio::spawn(async move {
                     let Some((head, body, mut stream)) = read_http_head_and_body(stream).await
                     else {
@@ -152,7 +163,7 @@ impl MockUploadWsServer {
                         return;
                     }
                     if head.starts_with("GET /api/auth/session") {
-                        let resp_body = r#"{"authenticated":true,"role":"owner","grants":["orchestration:operate","filesystem:read"]}"#;
+                        let resp_body = session_srv.lock().unwrap().clone();
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{resp_body}",
                             resp_body.len()
@@ -216,6 +227,13 @@ impl MockUploadWsServer {
             .await;
         conn
     }
+}
+
+async fn wait_session(client: &ClientHandle) {
+    let mut rx = client.session_state();
+    let _ = tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|s| s.is_some()))
+        .await
+        .expect("session state loads");
 }
 
 #[tokio::test]
@@ -352,6 +370,7 @@ async fn upload_cycle_deletes_minted_id_when_cancelled_after_mint_and_keeps_fail
     let (client, _events) =
         crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
     let mut conn = server.accept_ws().await;
+    wait_session(&client).await;
 
     // 1. Cancel inside `on_minted` triggers immediate `attachments.delete`.
     let (_cancel_tx, mut cancel_rx) = watch::channel(false);
@@ -422,6 +441,7 @@ async fn queue_enforces_max_3_per_env_reconnect_retries_and_adopts_on_draft_move
     let (client, _client_events) =
         crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
     let mut conn = server.accept_ws().await;
+    wait_session(&client).await;
 
     let (queue, mut events) = AttachmentUploadQueueClient::with_options(
         tokio::runtime::Handle::current(),
@@ -442,10 +462,7 @@ async fn queue_enforces_max_3_per_env_reconnect_retries_and_adopts_on_draft_move
                 mime_type: "application/octet-stream".into(),
                 bytes: Some(vec![b'x'; 256]),
                 persisted_attachment_id: None,
-                current_state: Some(AttachmentUploadState::Ready(ReadyAttachmentUpload {
-                    environment_id: client.environment().to_owned(),
-                    attachment_id: format!("prev-{i}"),
-                })),
+                current_state: None,
             },
         );
     }
@@ -480,39 +497,15 @@ async fn queue_enforces_max_3_per_env_reconnect_retries_and_adopts_on_draft_move
     let mut iter = http_gates.into_iter();
     let _ = iter.next().unwrap().send(200);
 
-    let mut saw_delete_prev0 = false;
-    let mut saw_mint_3 = false;
-    for _ in 0..2 {
-        let msg = conn.recv_upload_rpc().await;
-        if msg["tag"] == attachments::DELETE {
-            assert_eq!(msg["payload"]["attachmentId"], "prev-0");
-            saw_delete_prev0 = true;
-            conn.respond_exit_success(&msg, Value::Null).await;
-        } else {
-            assert_eq!(msg["tag"], CREATE_UPLOAD_URL);
-            saw_mint_3 = true;
-            conn.respond_exit_success(
-                &msg,
-                json!({ "attachmentId": "srv-3", "relativeUrl": "/up/3" }),
-            )
-            .await;
-        }
-    }
-    assert!(saw_delete_prev0 && saw_mint_3);
+    // Completing job-0 promotes job-3-moved.
+    let mint3 = conn.recv_request(Some(CREATE_UPLOAD_URL)).await;
+    conn.respond_exit_success(&mint3, json!({ "attachmentId": "srv-3", "relativeUrl": "/up/3" }))
+        .await;
 
     let _ = iter.next().unwrap().send(500);
     let _ = iter.next().unwrap().send(200);
     let (_path3, _body3, gate3) = server.uploads.recv().await.unwrap();
     let _ = gate3.send(200);
-
-    let mut deleted_prevs = Vec::new();
-    while deleted_prevs.len() < 2 {
-        let msg = conn.recv_request(Some(attachments::DELETE)).await;
-        deleted_prevs.push(msg["payload"]["attachmentId"].as_str().unwrap().to_owned());
-        conn.respond_exit_success(&msg, Value::Null).await;
-    }
-    deleted_prevs.sort();
-    assert_eq!(deleted_prevs, vec!["prev-2", "prev-3"]);
 
     queue
         .await_uploads(&[
@@ -559,10 +552,6 @@ async fn queue_enforces_max_3_per_env_reconnect_retries_and_adopts_on_draft_move
     let (_p, _b, retry_gate) = server.uploads.recv().await.unwrap();
     let _ = retry_gate.send(200);
 
-    let del_prev1 = conn2.recv_request(Some(attachments::DELETE)).await;
-    assert_eq!(del_prev1["payload"]["attachmentId"], "prev-1");
-    conn2.respond_exit_success(&del_prev1, Value::Null).await;
-
     queue.await_uploads(&["job-1".into()]).await;
     assert_eq!(
         queue
@@ -595,9 +584,15 @@ async fn queue_enforces_max_3_per_env_reconnect_retries_and_adopts_on_draft_move
 #[tokio::test]
 async fn real_ws_fake_server_completes_queued_upload_and_takes_owned_asset() {
     let mut server = FakeServer::start().await;
+    server.set_session(json!({
+        "authenticated": true,
+        "auth": {},
+        "permissions": ["orchestration:operate"]
+    }));
     let (client, _client_events) =
         crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
     let mut connection = server.connection().await;
+    wait_session(&client).await;
     let config = connection
         .request(t3_core::commands::method::SUBSCRIBE_SERVER_CONFIG)
         .await;
@@ -651,4 +646,284 @@ async fn real_ws_fake_server_completes_queued_upload_and_takes_owned_asset() {
             "exit": { "_tag": "Success", "value": null }
         }))
         .await;
+}
+
+#[tokio::test]
+async fn scope_guards_block_unpermitted_uploads_and_deletes_without_wedging_queue() {
+    let mut server = MockUploadWsServer::start_with_session(
+        r#"{"authenticated":true,"auth":{},"permissions":["orchestration:read"]}"#,
+    )
+    .await;
+    let (client, _events) =
+        crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut conn = server.accept_ws().await;
+    wait_session(&client).await;
+
+    let (queue, _) = AttachmentUploadQueueClient::new(tokio::runtime::Handle::current());
+    let started = queue.start_upload(
+        "no-scope".into(),
+        DraftTarget {
+            draft_id: "d1".into(),
+            file_id: "f1".into(),
+        },
+        client.clone(),
+        UploadPayload {
+            request: json!({ "name": "a.txt" }),
+            mime_type: "text/plain".into(),
+            bytes: Some(b"abc".to_vec()),
+            persisted_attachment_id: None,
+            current_state: None,
+        },
+    );
+    assert!(started.is_none());
+    assert!(queue.state("no-scope").is_none());
+    queue.await_uploads(&["no-scope".into()]).await;
+
+    // Calling delete_pending_attachment without ORCHESTRATION_OPERATE_SCOPE is a no-op.
+    delete_pending_attachment(&client, "should-not-delete").await;
+
+    // `run_attachment_upload_cycle` fails with explicit capability message when scope is missing
+    // before resolving upload URL.
+    let (_tx, mut rx) = watch::channel(false);
+    let client_cycle = client.clone();
+    let cycle_task = tokio::spawn(async move {
+        run_attachment_upload_cycle(
+            &client_cycle,
+            json!({ "name": "a.txt" }),
+            "text/plain",
+            b"abc",
+            64,
+            Duration::from_secs(5),
+            &mut rx,
+            |_| true,
+            |_| {},
+        )
+        .await
+    });
+    let req = conn.recv_request(Some(CREATE_UPLOAD_URL)).await;
+    conn.respond_exit_success(
+        &req,
+        json!({ "attachmentId": "mint-no-scope", "relativeUrl": "/up/1" }),
+    )
+    .await;
+    assert_eq!(
+        cycle_task.await.unwrap(),
+        UploadCycleOutcome::Failed {
+            step: UploadCycleStep::ResolveUploadUrl,
+            attachment_id: Some("mint-no-scope".into()),
+            error: "This connection cannot upload attachments.".into(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn release_during_persisted_verification_deletes_persisted_server_asset() {
+    let mut server = FakeServer::start().await;
+    server.set_session(json!({
+        "authenticated": true,
+        "auth": {},
+        "permissions": ["orchestration:operate"]
+    }));
+    let (client, _events) =
+        crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut conn = server.connection().await;
+    wait_session(&client).await;
+    let config = conn
+        .request(t3_core::commands::method::SUBSCRIBE_SERVER_CONFIG)
+        .await;
+    conn.send(json!({
+        "_tag": "Exit",
+        "requestId": config["id"],
+        "exit": { "_tag": "Failure", "cause": [{ "_tag": "Fail", "error": { "message": "no config" } }] }
+    }))
+    .await;
+
+    let (queue, _) = AttachmentUploadQueueClient::new(tokio::runtime::Handle::current());
+    queue.start_upload(
+        "persisted-job".into(),
+        DraftTarget {
+            draft_id: "thread:t2".into(),
+            file_id: "f-persisted".into(),
+        },
+        client,
+        UploadPayload {
+            request: json!({ "name": "log.txt" }),
+            mime_type: "text/plain".into(),
+            bytes: None,
+            persisted_attachment_id: Some("persisted-srv-1".into()),
+            current_state: None,
+        },
+    );
+
+    // Hold `assets.createUrl` open while caller releases the attachment.
+    let verify_req = conn.request(CREATE_ASSET_URL).await;
+    queue.release_upload("persisted-job");
+
+    let del_req = conn.request(attachments::DELETE).await;
+    assert_eq!(del_req["payload"]["attachmentId"], "persisted-srv-1");
+    conn.send(json!({
+        "_tag": "Exit",
+        "requestId": del_req["id"],
+        "exit": { "_tag": "Success", "value": null }
+    }))
+    .await;
+    conn.send(json!({
+        "_tag": "Exit",
+        "requestId": verify_req["id"],
+        "exit": { "_tag": "Success", "value": { "relativeUrl": "/asset/1", "expiresAt": 9999.0 } }
+    }))
+    .await;
+    queue.await_uploads(&["persisted-job".into()]).await;
+}
+
+#[tokio::test]
+async fn retarget_roundtrip_restores_ready_and_in_flight_reconnect_retries_upon_failure() {
+    let mut server_a = MockUploadWsServer::start().await;
+    let mut server_b = MockUploadWsServer::start().await;
+    let (client_a, _ev_a) =
+        crate::supervisor::start(&tokio::runtime::Handle::current(), server_a.credentials());
+    let (client_b, _ev_b) =
+        crate::supervisor::start(&tokio::runtime::Handle::current(), server_b.credentials());
+    let mut conn_a = server_a.accept_ws().await;
+    let mut conn_b = server_b.accept_ws().await;
+    wait_session(&client_a).await;
+    wait_session(&client_b).await;
+
+    let (queue, _) = AttachmentUploadQueueClient::with_options(
+        tokio::runtime::Handle::current(),
+        64,
+        Duration::from_secs(5),
+    );
+    let target = DraftTarget {
+        draft_id: "draft-rt".into(),
+        file_id: "f1".into(),
+    };
+
+    // 1. Upload ready on env-a.
+    queue.start_upload(
+        "rt-job".into(),
+        target.clone(),
+        client_a.clone(),
+        UploadPayload {
+            request: json!({ "name": "doc.txt" }),
+            mime_type: "text/plain".into(),
+            bytes: Some(b"retained bytes".to_vec()),
+            persisted_attachment_id: None,
+            current_state: None,
+        },
+    );
+    let req_a = conn_a.recv_request(Some(CREATE_UPLOAD_URL)).await;
+    conn_a
+        .respond_exit_success(&req_a, json!({ "attachmentId": "att-a", "relativeUrl": "/up/a" }))
+        .await;
+    let (_p, _b, gate_a) = server_a.uploads.recv().await.unwrap();
+    let _ = gate_a.send(200);
+    queue.await_uploads(&["rt-job".into()]).await;
+    assert_eq!(
+        queue.state("rt-job").and_then(|s| s.ready_attachment_id().map(str::to_owned)),
+        Some("att-a".into())
+    );
+
+    // 2. Retarget to env-b (holds in flight), then immediately retarget BACK to env-a -> restores
+    // `att-a` without re-uploading!
+    queue.start_upload(
+        "rt-job".into(),
+        target.clone(),
+        client_b.clone(),
+        UploadPayload {
+            request: json!({ "name": "doc.txt" }),
+            mime_type: "text/plain".into(),
+            bytes: None,
+            persisted_attachment_id: None,
+            current_state: None,
+        },
+    );
+    let req_b1 = conn_b.recv_request(Some(CREATE_UPLOAD_URL)).await;
+    conn_b
+        .respond_exit_success(&req_b1, json!({ "attachmentId": "att-b1", "relativeUrl": "/up/b1" }))
+        .await;
+    let (_p, _b, gate_b1) = server_b.uploads.recv().await.unwrap();
+
+    // Retarget back to env-a while att-b1 HTTP upload is in flight.
+    queue.start_upload(
+        "rt-job".into(),
+        target.clone(),
+        client_a.clone(),
+        UploadPayload {
+            request: json!({ "name": "doc.txt" }),
+            mime_type: "text/plain".into(),
+            bytes: None,
+            persisted_attachment_id: None,
+            current_state: None,
+        },
+    );
+    assert_eq!(
+        queue.state("rt-job"),
+        Some(AttachmentUploadState::Ready(ReadyAttachmentUpload {
+            environment_id: client_a.environment().to_owned(),
+            attachment_id: "att-a".into(),
+        }))
+    );
+    let _ = gate_b1.send(200);
+    let del_b1 = conn_b.recv_request(Some(attachments::DELETE)).await;
+    assert_eq!(del_b1["payload"]["attachmentId"], "att-b1");
+    conn_b.respond_exit_success(&del_b1, Value::Null).await;
+
+    // 3. Retarget to env-b again: bytes were retained across Ready on env-a, so env-b uploads.
+    // While that attempt is active, force a WS reconnect on env-b, then fail the old HTTP gate
+    // (500) -> queue must automatically retry once settled instead of staying Failed.
+    queue.start_upload(
+        "rt-job".into(),
+        target,
+        client_b.clone(),
+        UploadPayload {
+            request: json!({ "name": "doc.txt" }),
+            mime_type: "text/plain".into(),
+            bytes: None,
+            persisted_attachment_id: None,
+            current_state: None,
+        },
+    );
+    let req_b2 = conn_b.recv_request(Some(CREATE_UPLOAD_URL)).await;
+    conn_b
+        .respond_exit_success(&req_b2, json!({ "attachmentId": "att-b2", "relativeUrl": "/up/b2" }))
+        .await;
+    let (_p, _b, gate_b2) = server_b.uploads.recv().await.unwrap();
+
+    // Disconnect/reconnect env-b while gate_b2 is STILL in flight.
+    let _ = conn_b.socket.close(None).await;
+    drop(conn_b);
+    let mut conn_b2 = server_b.accept_ws().await;
+
+    // Now fail gate_b2 (500); the in-flight reconnect flag retries it on conn_b2 and cleans up att-b2.
+    let _ = gate_b2.send(500);
+    let mut deleted_b2 = false;
+    let mut minted_b3 = false;
+    for _ in 0..2 {
+        let msg = conn_b2.recv_upload_rpc().await;
+        if msg["tag"] == attachments::DELETE {
+            assert_eq!(msg["payload"]["attachmentId"], "att-b2");
+            deleted_b2 = true;
+            conn_b2.respond_exit_success(&msg, Value::Null).await;
+        } else {
+            assert_eq!(msg["tag"], CREATE_UPLOAD_URL);
+            minted_b3 = true;
+            conn_b2
+                .respond_exit_success(&msg, json!({ "attachmentId": "att-b3", "relativeUrl": "/up/b3" }))
+                .await;
+        }
+    }
+    assert!(deleted_b2 && minted_b3);
+
+    let (_p, _b, gate_b3) = server_b.uploads.recv().await.unwrap();
+    let _ = gate_b3.send(200);
+    let del_a = conn_a.recv_request(Some(attachments::DELETE)).await;
+    assert_eq!(del_a["payload"]["attachmentId"], "att-a");
+    conn_a.respond_exit_success(&del_a, Value::Null).await;
+
+    queue.await_uploads(&["rt-job".into()]).await;
+    assert_eq!(
+        queue.state("rt-job").and_then(|s| s.ready_attachment_id().map(str::to_owned)),
+        Some("att-b3".into())
+    );
 }

@@ -633,7 +633,8 @@ pub fn question_retry_on_send_ids(
 /// Enforces:
 /// - `preparing == 0` when any attachments are being prepared
 /// - `supports_question_attachments` and `question.allows_custom_answer()` when attachments exist
-/// - `limit_error` (max 100 attachments and 80 MiB total images per question)
+/// - `limit_error` (max 100 attachments and 80 MiB total images combined across all questions
+///   in `input`)
 /// - All staged attachments are `Upload::Ready`; returns `UploadsIncomplete` with `retryable_ids`
 ///   if any upload is still `Uploading` or `Failed`.
 pub fn build_question_response_attachments(
@@ -643,6 +644,7 @@ pub fn build_question_response_attachments(
     supports_question_attachments: bool,
 ) -> Result<Map<String, Value>, QuestionResponseAttachmentError> {
     let mut encoded = Map::new();
+    let mut cumulative = Vec::new();
 
     for question in &input.questions {
         let preparing = preparing_by_question.get(&question.id).copied().unwrap_or(0);
@@ -672,7 +674,8 @@ pub fn build_question_response_attachments(
                 message: QUESTION_CUSTOM_ANSWER_DISABLED_ERROR.to_owned(),
             });
         }
-        if let Some(message) = limit_error(attachments) {
+        cumulative.extend(attachments.iter().cloned());
+        if let Some(message) = limit_error(&cumulative) {
             return Err(QuestionResponseAttachmentError::LimitExceeded {
                 question_id: question.id.clone(),
                 message,
@@ -832,6 +835,46 @@ mod response_encoding_tests {
         assert!(matches!(
             build_question_response_attachments(&input, &over_limit, &BTreeMap::new(), true),
             Err(QuestionResponseAttachmentError::LimitExceeded { .. })
+        ));
+
+        // 5 images on q1 (50 MiB) + 4 images on q2 (40 MiB) = 90 MiB > 80 MiB combined across questions.
+        let mk_images = |prefix: &str, count: usize| -> Vec<Attachment> {
+            (0..count)
+                .map(|i| Attachment {
+                    id: format!("{prefix}-{i}"),
+                    kind: AttachmentKind::Image,
+                    name: format!("{prefix}-{i}.png"),
+                    mime_type: "image/png".into(),
+                    size_bytes: MAX_IMAGE_BYTES,
+                    pasted_text: false,
+                    upload: Upload::Ready {
+                        attachment_id: format!("srv-{prefix}-{i}"),
+                    },
+                })
+                .collect()
+        };
+        let split_images = BTreeMap::from([
+            ("q1".into(), mk_images("a", 5)),
+            ("q2".into(), mk_images("b", 4)),
+        ]);
+        assert!(matches!(
+            build_question_response_attachments(&input, &split_images, &BTreeMap::new(), true),
+            Err(QuestionResponseAttachmentError::LimitExceeded { ref question_id, .. }) if question_id == "q2"
+        ));
+
+        // 60 files on q1 + 41 files on q2 = 101 > MAX_ATTACHMENTS (100) combined across questions.
+        let mk_files = |prefix: &str, count: usize| -> Vec<Attachment> {
+            (0..count)
+                .map(|i| attachment(&format!("{prefix}-{i}"), Upload::Ready { attachment_id: format!("srv-{prefix}-{i}") }))
+                .collect()
+        };
+        let over_count = BTreeMap::from([
+            ("q1".into(), mk_files("fa", 60)),
+            ("q2".into(), mk_files("fb", 41)),
+        ]);
+        assert!(matches!(
+            build_question_response_attachments(&input, &over_count, &BTreeMap::new(), true),
+            Err(QuestionResponseAttachmentError::LimitExceeded { ref question_id, .. }) if question_id == "q2"
         ));
     }
 

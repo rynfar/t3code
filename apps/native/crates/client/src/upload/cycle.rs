@@ -42,8 +42,22 @@ impl UploadTransferError {
     }
 }
 
-/// Best-effort `attachments.delete` for cancelled/superseded/retired pending uploads.
+/// Returns `true` when `client`'s session state grants `ORCHESTRATION_OPERATE_SCOPE`
+/// (`readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)`).
+pub fn has_orchestration_operate_scope(client: &ClientHandle) -> bool {
+    client
+        .session_state()
+        .borrow()
+        .as_ref()
+        .is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
+}
+
+/// Best-effort `attachments.delete` for cancelled/superseded/retired pending uploads, gated on
+/// `ORCHESTRATION_OPERATE_SCOPE` (`deletePendingUpload` in `attachmentUploadQueue.ts`).
 pub async fn delete_pending_attachment(client: &ClientHandle, attachment_id: &str) {
+    if !has_orchestration_operate_scope(client) {
+        return;
+    }
     let _ = client
         .request(attachments::DELETE, attachments::delete_request(attachment_id))
         .await;
@@ -349,6 +363,14 @@ where
         delete_pending_attachment(client, &ticket.attachment_id).await;
         return UploadCycleOutcome::Cancelled {
             minted_attachment_id: None,
+        };
+    }
+
+    if !has_orchestration_operate_scope(client) {
+        return UploadCycleOutcome::Failed {
+            step: UploadCycleStep::ResolveUploadUrl,
+            attachment_id: Some(ticket.attachment_id),
+            error: "This connection cannot upload attachments.".to_owned(),
         };
     }
 

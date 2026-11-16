@@ -3,10 +3,14 @@
 //!
 //! Ports `apps/web/src/lib/imageCompression.ts`,
 //! `packages/client-runtime/src/imageAttachmentSize.ts`,
-//! `packages/shared/src/imageDimensions.ts`, and
+//! `packages/shared/src/imageDimensions.ts`,
+//! `packages/shared/src/mediaPreview.ts`, and
 //! `apps/web/src/components/chat/composerAttachmentFiles.ts`.
 
-use super::{Attachment, AttachmentKind, extension, file_mime, format_size, too_large_message};
+use super::{
+    Attachment, AttachmentKind, MAX_FILE_BYTES, Upload, extension, file_mime, format_size,
+    too_large_message,
+};
 
 /// `IMAGE_ATTACHMENT_MAX_EDGE` (`packages/client-runtime/src/imageAttachmentSize.ts`).
 pub const IMAGE_ATTACHMENT_MAX_EDGE: u32 = 2000;
@@ -30,12 +34,26 @@ pub const DEFAULT_FALLBACK_UPLOAD_MIME_TYPE: &str = "application/octet-stream";
 pub const SVG_ATTACHMENT_MIME_TYPE: &str = "image/svg+xml";
 pub const DNG_ATTACHMENT_MIME_TYPE: &str = "image/x-adobe-dng";
 
-/// Target MIME type when downscaling an image attachment (`downscalableImageMimeType`).
-pub fn downscalable_image_mime_type(mime_type: &str) -> &'static str {
-    if mime_type == "image/png" {
-        "image/png"
-    } else {
-        "image/jpeg"
+/// `WORKSPACE_IMAGE_PREVIEW_EXTENSIONS` (`packages/shared/src/mediaPreview.ts`).
+pub const WORKSPACE_IMAGE_PREVIEW_EXTENSIONS: &[&str] = &[
+    "avif", "bmp", "gif", "ico", "heic", "heif", "jpeg", "jpg", "png", "svg", "tif", "tiff",
+    "webp",
+];
+
+/// True when `path` can be opened in the workspace image preview (`isWorkspaceImagePreviewPath`).
+pub fn is_workspace_image_preview_path(path: &str) -> bool {
+    extension(path).is_some_and(|ext| WORKSPACE_IMAGE_PREVIEW_EXTENSIONS.contains(&ext.as_str()))
+}
+
+/// Target MIME type when downscaling an image attachment (`downscalableImageMimeType` in
+/// `packages/client-runtime/src/imageAttachmentSize.ts`). Only PNG and JPEG are downscaled; GIF
+/// and WebP return `None`.
+pub fn downscalable_image_mime_type(mime_type: &str) -> Option<&'static str> {
+    let normalized = mime_type.split(';').next().unwrap_or(mime_type).trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        _ => None,
     }
 }
 
@@ -49,8 +67,8 @@ pub fn fit_image_attachment_size(width: u32, height: u32, max_edge: u32) -> (u32
         return (width, height);
     }
     let scale = f64::from(max_edge) / f64::from(longest);
-    let target_w = ((f64::from(width) * scale).round() as u32).max(1);
-    let target_h = ((f64::from(height) * scale).round() as u32).max(1);
+    let target_w = ((f64::from(width) * scale).round() as u32).clamp(1, max_edge);
+    let target_h = ((f64::from(height) * scale).round() as u32).clamp(1, max_edge);
     (target_w, target_h)
 }
 
@@ -84,7 +102,7 @@ pub fn file_name_for_compressed_mime(name: &str, mime_type: &str) -> String {
 
 /// Target MIME type selection for `compressImageToByteLimit`.
 pub fn compression_target_mime(source_mime_type: &str, prefer_jpeg_fallback: bool) -> &'static str {
-    if source_mime_type == "image/png" && !prefer_jpeg_fallback {
+    if source_mime_type.eq_ignore_ascii_case("image/png") && !prefer_jpeg_fallback {
         "image/png"
     } else {
         "image/jpeg"
@@ -102,6 +120,10 @@ pub fn is_compressible_source_size(size_bytes: u64) -> bool {
 }
 
 /// True when `prepareImageForAttachment` must decode/resize/re-encode before upload.
+///
+/// Only HEIC conversions, images over `max_bytes`, and downscalable PNG/JPEG files whose longest
+/// edge exceeds `IMAGE_ATTACHMENT_MAX_EDGE` require re-encoding (large WebP/GIF under `max_bytes`
+/// stay untouched).
 pub fn needs_image_compression(
     mime_type: &str,
     size_bytes: u64,
@@ -114,23 +136,42 @@ pub fn needs_image_compression(
     if size_bytes > max_bytes {
         return true;
     }
-    dimensions.is_some_and(|(w, h)| w > IMAGE_ATTACHMENT_MAX_EDGE || h > IMAGE_ATTACHMENT_MAX_EDGE)
+    downscalable_image_mime_type(mime_type).is_some()
+        && dimensions.is_some_and(|(w, h)| w > IMAGE_ATTACHMENT_MAX_EDGE || h > IMAGE_ATTACHMENT_MAX_EDGE)
+}
+
+fn normalized_mime_head(raw_mime_type: Option<&str>) -> Option<String> {
+    raw_mime_type.map(|s| {
+        s.split(';')
+            .next()
+            .unwrap_or(s)
+            .trim()
+            .to_ascii_lowercase()
+    })
+}
+
+fn has_unknown_mime(raw_mime_type: Option<&str>) -> bool {
+    match normalized_mime_head(raw_mime_type).as_deref() {
+        None | Some("") | Some("application/octet-stream") => true,
+        Some(_) => false,
+    }
 }
 
 fn is_heic_mime(mime_type: &str) -> bool {
-    let lower = mime_type.trim().to_ascii_lowercase();
+    let lower = mime_type.split(';').next().unwrap_or(mime_type).trim().to_ascii_lowercase();
     matches!(
         lower.as_str(),
         "image/heic" | "image/heif" | "image/heic-sequence" | "image/heif-sequence"
     )
 }
 
-/// `isHeicImageFile` (`apps/web/src/lib/imageCompression.ts`).
+/// `isHeicImageFile` (`apps/web/src/lib/imageCompression.ts`): matches explicit HEIC/HEIF MIME
+/// types, or `.heic`/`.heif` filename when MIME is empty or `application/octet-stream`.
 pub fn is_heic_image_file(name: &str, mime_type: Option<&str>) -> bool {
     if mime_type.is_some_and(is_heic_mime) {
         return true;
     }
-    matches!(extension(name).as_deref(), Some("heic" | "heif"))
+    has_unknown_mime(mime_type) && matches!(extension(name).as_deref(), Some("heic" | "heif"))
 }
 
 /// Result of inspecting a HEIC/HEIF container's `ispe` primary dimensions before decoding.
@@ -277,7 +318,6 @@ fn read_webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     }
     let chunk = &bytes[12..16];
     if chunk == b"VP8 " && bytes.len() >= 30 {
-        // Keyframe start code 0x9d 0x01 0x2a sits at bytes 23..26.
         if bytes[23] == 0x9d && bytes[24] == 0x01 && bytes[25] == 0x2a {
             let raw_w = u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3fff;
             let raw_h = u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3fff;
@@ -322,7 +362,6 @@ fn read_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         let marker = bytes[pos];
         pos += 1;
 
-        // Standalone markers / SOS / EOI.
         if marker == 0xd8 || marker == 0xd9 || marker == 0x00 || (0xd0..=0xd7).contains(&marker) {
             if marker == 0xd9 {
                 break;
@@ -411,11 +450,10 @@ fn parse_jpeg_exif_orientation(app1: &[u8]) -> Option<u16> {
 }
 
 /// Normalizes an input MIME type / filename to one of the four provider-supported image MIME types
-/// (`normalizeComposerImageFileMimeType` in `composerAttachmentFiles.ts`).
+/// (`normalizeComposerImageFileMimeType` in `composerAttachmentFiles.ts`). Only infers from
+/// extension when `raw_mime_type` is empty or `application/octet-stream`.
 pub fn normalize_composer_image_mime_type(name: &str, raw_mime_type: Option<&str>) -> Option<&'static str> {
-    let raw = raw_mime_type
-        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
-    match raw.as_deref() {
+    match normalized_mime_head(raw_mime_type).as_deref() {
         Some("image/gif") => return Some("image/gif"),
         Some("image/jpeg" | "image/jpg") => return Some("image/jpeg"),
         Some("image/png" | "image/x-png") => return Some("image/png"),
@@ -423,7 +461,10 @@ pub fn normalize_composer_image_mime_type(name: &str, raw_mime_type: Option<&str
         _ => {}
     }
 
-    // Fall back to extension if browser/OS omitted MIME or sent application/octet-stream.
+    if !has_unknown_mime(raw_mime_type) {
+        return None;
+    }
+
     match extension(name).as_deref() {
         Some("gif") => Some("image/gif"),
         Some("jpg" | "jpeg") => Some("image/jpeg"),
@@ -433,19 +474,18 @@ pub fn normalize_composer_image_mime_type(name: &str, raw_mime_type: Option<&str
     }
 }
 
-/// `isDngAttachmentFile` (`composerAttachmentFiles.ts`).
+/// `isDngFile` (`composerAttachmentFiles.ts`).
 pub fn is_dng_attachment(name: &str, raw_mime_type: Option<&str>) -> bool {
-    let raw = raw_mime_type
-        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
-    matches!(raw.as_deref(), Some("image/x-adobe-dng" | "image/dng"))
-        || extension(name).as_deref() == Some("dng")
+    matches!(
+        normalized_mime_head(raw_mime_type).as_deref(),
+        Some("image/x-adobe-dng" | "image/x-dng" | "image/dng")
+    ) || extension(name).as_deref() == Some("dng")
 }
 
-/// `isSvgAttachmentFile` (`composerAttachmentFiles.ts`).
+/// `isSvgAttachment` (`composerAttachmentFiles.ts`).
 pub fn is_svg_attachment(name: &str, raw_mime_type: Option<&str>) -> bool {
-    let raw = raw_mime_type
-        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
-    raw.as_deref() == Some(SVG_ATTACHMENT_MIME_TYPE) || extension(name).as_deref() == Some("svg")
+    normalized_mime_head(raw_mime_type).as_deref() == Some(SVG_ATTACHMENT_MIME_TYPE)
+        || extension(name).as_deref() == Some("svg")
 }
 
 /// Resolves the MIME type under which a non-raster file attachment is staged
@@ -476,11 +516,7 @@ pub enum MimeClassified {
 
 /// Classifies an incoming picked/dropped/pasted file using both its filename and any OS/browser MIME
 /// hint, matching `classifyComposerAttachmentFile` in `composerAttachmentFiles.ts`.
-pub fn classify_file_with_mime(
-    name: &str,
-    raw_mime_type: Option<&str>,
-    is_workspace_image_preview: bool,
-) -> MimeClassified {
+pub fn classify_file_with_mime(name: &str, raw_mime_type: Option<&str>) -> MimeClassified {
     if is_svg_attachment(name, raw_mime_type) {
         return MimeClassified::File {
             mime_type: SVG_ATTACHMENT_MIME_TYPE.to_owned(),
@@ -491,97 +527,125 @@ pub fn classify_file_with_mime(
             mime_type: DNG_ATTACHMENT_MIME_TYPE.to_owned(),
         };
     }
+    if is_heic_image_file(name, raw_mime_type) {
+        return MimeClassified::Image {
+            mime_type: normalized_mime_head(raw_mime_type)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "image/heic".to_owned()),
+            convertible_heic: true,
+        };
+    }
     if let Some(mime_type) = normalize_composer_image_mime_type(name, raw_mime_type) {
         return MimeClassified::Image {
             mime_type: mime_type.to_owned(),
             convertible_heic: false,
         };
     }
-    if is_heic_image_file(name, raw_mime_type) {
-        return MimeClassified::Image {
-            mime_type: raw_mime_type
-                .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "image/heic".to_owned()),
-            convertible_heic: true,
+
+    let raw_lower = normalized_mime_head(raw_mime_type);
+    if !raw_lower
+        .as_deref()
+        .is_some_and(|mime| mime.starts_with("image/"))
+    {
+        return MimeClassified::File {
+            mime_type: composer_file_attachment_mime_type(name, raw_mime_type),
         };
     }
 
-    let raw_lower = raw_mime_type
-        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
-    let looks_like_image = raw_lower
-        .as_deref()
-        .is_some_and(|mime| mime.starts_with("image/"))
-        || matches!(
-            extension(name).as_deref(),
-            Some("tif" | "tiff" | "bmp" | "avif" | "ico" | "icns")
-        );
-
-    if looks_like_image && !is_workspace_image_preview {
-        return MimeClassified::UnsupportedImage;
-    }
-
-    MimeClassified::File {
-        mime_type: composer_file_attachment_mime_type(name, raw_mime_type),
+    if is_workspace_image_preview_path(name) {
+        MimeClassified::File {
+            mime_type: composer_file_attachment_mime_type(name, raw_mime_type),
+        }
+    } else {
+        MimeClassified::UnsupportedImage
     }
 }
 
 /// `composerImageDedupKey` (`apps/web/src/components/chat/composerAttachmentFiles.ts`).
-pub fn composer_image_dedup_key(name: &str, size_bytes: u64, last_modified_ms: Option<i64>) -> String {
-    format!("{name}|{size_bytes}|{}", last_modified_ms.unwrap_or(0))
+pub fn composer_image_dedup_key(mime_type: &str, size_bytes: u64, name: &str) -> String {
+    format!("{mime_type}\0{size_bytes}\0{name}")
+}
+
+/// `fileAttachmentStagingLimit` (`apps/web/src/components/chat/composerAttachmentFiles.ts`).
+pub fn file_attachment_staging_limit(
+    capability_known: bool,
+    supports_attachment_uploads: bool,
+    max_file_attachment_bytes: Option<u64>,
+) -> Option<u64> {
+    if !capability_known {
+        return Some(MAX_FILE_BYTES);
+    }
+    if !supports_attachment_uploads {
+        return None;
+    }
+    max_file_attachment_bytes.map(|limit| limit.min(MAX_FILE_BYTES))
 }
 
 /// `fileAttachmentCapabilityBlockReason` (`composerAttachmentFiles.ts`).
 pub fn file_attachment_capability_block_reason(
-    connected: bool,
-    can_upload_attachments: bool,
-    file_limit: Option<u64>,
-    name: &str,
-    size_bytes: u64,
+    capability_known: bool,
+    supports_attachment_uploads: bool,
+    max_file_attachment_bytes: Option<u64>,
+    files: &[(&str, u64)],
 ) -> Option<String> {
-    if !connected {
-        return Some("Reconnect to attach non-image files.".to_owned());
+    if files.is_empty() {
+        return None;
     }
-    if !can_upload_attachments {
-        return Some("File uploads are not enabled for this server connection.".to_owned());
+    if !capability_known {
+        return Some("Waiting for the server before file attachments can send".to_owned());
     }
-    if let Some(limit) = file_limit
-        && size_bytes > limit
-    {
-        return Some(too_large_message(name, limit));
-    }
-    None
+    let Some(limit) = file_attachment_staging_limit(
+        capability_known,
+        supports_attachment_uploads,
+        max_file_attachment_bytes,
+    ) else {
+        return Some(
+            "This server does not accept file attachments right now. Remove the files to send."
+                .to_owned(),
+        );
+    };
+    files
+        .iter()
+        .find(|(_, size_bytes)| *size_bytes > limit)
+        .map(|(name, _)| too_large_message(name, limit))
 }
 
-/// Computes the staged attachment IDs that must be released if upload permissions or server upload
-/// byte limits shrink while a draft is open (`attachmentsToReleaseOnUploadCapabilityLoss`).
+/// Returns staged attachment IDs that must be released when file upload capability turns off
+/// (`attachmentsToReleaseOnUploadCapabilityLoss` in `composerAttachmentFiles.ts`).
+///
+/// Releases images and unpersisted files (`is_persisted_file == false`), while keeping hydrated or
+/// uploaded file entries that carry a server `uploadedAttachmentId`.
 pub fn attachments_to_release_on_upload_capability_loss(
     attachments: &[Attachment],
-    can_upload_attachments: bool,
-    next_file_limit: Option<u64>,
 ) -> Vec<String> {
     attachments
         .iter()
-        .filter(|attachment| attachment.kind == AttachmentKind::File)
         .filter(|attachment| {
-            !can_upload_attachments
-                || next_file_limit.is_some_and(|limit| attachment.size_bytes > limit)
+            !(attachment.kind == AttachmentKind::File
+                && matches!(attachment.upload, Upload::Ready { .. }))
         })
         .map(|attachment| attachment.id.clone())
         .collect()
 }
 
 /// `shouldHandleComposerAttachmentPaste` (`composerAttachmentFiles.ts`).
-pub fn should_handle_attachment_paste(
-    has_pasted_attachments: bool,
-    pasted_text: &str,
-    bypass_text_folding: bool,
-    would_exceed_input_limit: bool,
-) -> bool {
-    if has_pasted_attachments {
+pub fn should_handle_attachment_paste(files: &[(&str, Option<&str>)], plain_text: &str) -> bool {
+    if files.iter().any(|(name, mime)| {
+        is_dng_attachment(name, *mime)
+            || is_svg_attachment(name, *mime)
+            || matches!(
+                classify_file_with_mime(name, *mime),
+                MimeClassified::Image { .. } | MimeClassified::UnsupportedImage
+            )
+    }) {
         return true;
     }
-    super::folds_into_file(pasted_text, bypass_text_folding, would_exceed_input_limit)
+    if !plain_text.is_empty() {
+        return false;
+    }
+    files
+        .iter()
+        .any(|(name, mime)| matches!(classify_file_with_mime(name, *mime), MimeClassified::File { .. }))
 }
 
 /// Human-readable HEIC validation rejection message (`imageCompression.ts`).
@@ -602,16 +666,25 @@ pub fn heic_validation_error_message(name: &str, validation: HeicDimensionValida
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composer::attachments::Upload;
 
     #[test]
-    fn fits_and_budgets_image_sizes() {
+    fn fits_budgets_and_respects_downscalable_mime_types() {
         assert_eq!(fit_image_to_max_edge(4000, 1000), (2000, 500));
         assert_eq!(fit_image_to_max_edge(800, 600), (800, 600));
         assert_eq!(fit_image_to_max_edge(10_000, 1), (2000, 1));
         assert_eq!(fit_image_to_max_edge(0, 100), (0, 0));
-        assert_eq!(downscalable_image_mime_type("image/png"), "image/png");
-        assert_eq!(downscalable_image_mime_type("image/webp"), "image/jpeg");
+
+        assert_eq!(downscalable_image_mime_type("IMAGE/PNG"), Some("image/png"));
+        assert_eq!(downscalable_image_mime_type("image/jpg"), Some("image/jpeg"));
+        assert_eq!(downscalable_image_mime_type("image/webp"), None);
+        assert_eq!(downscalable_image_mime_type("image/gif"), None);
+
+        // Large WebP/GIF already under max_bytes does NOT trigger re-encode.
+        assert!(!needs_image_compression("image/webp", 500_000, 1_000_000, Some((4000, 3000))));
+        assert!(!needs_image_compression("image/gif", 500_000, 1_000_000, Some((4000, 3000))));
+        assert!(needs_image_compression("image/png", 500_000, 1_000_000, Some((4000, 3000))));
+        assert!(needs_image_compression("image/heic", 500_000, 1_000_000, Some((100, 100))));
+
         assert_eq!(compression_budget_chars(300), 400);
         assert_eq!(data_url_length("image/jpeg", 3), "data:image/jpeg;base64,".len() + 4);
         assert_eq!(file_name_for_compressed_mime("photo.heic", "image/jpeg"), "photo.jpg");
@@ -634,7 +707,6 @@ mod tests {
         gif.extend_from_slice(&480u16.to_le_bytes());
         assert_eq!(read_image_dimensions(&gif), Some((640, 480)));
 
-        // VP8X WebP: width=1920 (stored as 1919), height=1080 (stored as 1079).
         let mut webp = vec![0u8; 30];
         webp[..4].copy_from_slice(b"RIFF");
         webp[8..16].copy_from_slice(b"WEBPVP8X");
@@ -644,9 +716,7 @@ mod tests {
         webp[27..30].copy_from_slice(&h[..3]);
         assert_eq!(read_image_dimensions(&webp), Some((1920, 1080)));
 
-        // JPEG with APP1 EXIF Orientation=6 (90 deg rotation -> swaps width and height) + SOF0.
         let mut jpeg = vec![0xff, 0xd8];
-        // APP1 with Exif\0\0 + MM + 42 + offset 8 + 1 entry (tag 0x0112, short, count 1, val 6).
         let tiff: Vec<u8> = vec![
             b'E', b'x', b'i', b'f', 0, 0,
             b'M', b'M', 0x00, 0x2a, 0x00, 0x00, 0x00, 0x08,
@@ -656,7 +726,6 @@ mod tests {
         jpeg.extend_from_slice(&[0xff, 0xe1]);
         jpeg.extend_from_slice(&((tiff.len() + 2) as u16).to_be_bytes());
         jpeg.extend_from_slice(&tiff);
-        // SOF0 with stored width=800, height=600 -> orientation 6 returns (600, 800).
         jpeg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x0b, 0x08]);
         jpeg.extend_from_slice(&600u16.to_be_bytes());
         jpeg.extend_from_slice(&800u16.to_be_bytes());
@@ -673,13 +742,13 @@ mod tests {
     }
 
     fn make_heic_with_ispe(width: u32, height: u32) -> Vec<u8> {
-        let mut ispe_payload = vec![0u8; 4]; // FullBox version + flags
+        let mut ispe_payload = vec![0u8; 4];
         ispe_payload.extend_from_slice(&width.to_be_bytes());
         ispe_payload.extend_from_slice(&height.to_be_bytes());
         let ispe = make_box(b"ispe", &ispe_payload);
         let ipco = make_box(b"ipco", &ispe);
         let iprp = make_box(b"iprp", &ipco);
-        let mut meta_payload = vec![0u8; 4]; // FullBox version + flags
+        let mut meta_payload = vec![0u8; 4];
         meta_payload.extend_from_slice(&iprp);
         make_box(b"meta", &meta_payload)
     }
@@ -708,67 +777,120 @@ mod tests {
     }
 
     #[test]
-    fn classifies_with_mime_and_checks_capability_loss() {
+    fn classifies_mime_dedup_capability_and_paste_matching_upstream() {
         assert_eq!(
-            classify_file_with_mime("photo.DNG", Some("image/tiff"), false),
+            classify_file_with_mime("photo.DNG", Some("image/tiff")),
             MimeClassified::File {
                 mime_type: DNG_ATTACHMENT_MIME_TYPE.to_owned(),
             }
         );
         assert_eq!(
-            classify_file_with_mime("live.heic", Some("application/octet-stream"), false),
+            classify_file_with_mime("doc.png", Some("application/pdf")),
+            MimeClassified::File {
+                mime_type: "application/pdf".to_owned(),
+            }
+        );
+        assert_eq!(
+            classify_file_with_mime("photo.heic", Some("text/plain")),
+            MimeClassified::File {
+                mime_type: "text/plain".to_owned(),
+            }
+        );
+        assert_eq!(
+            classify_file_with_mime("live.heic", Some("application/octet-stream")),
             MimeClassified::Image {
                 mime_type: "application/octet-stream".to_owned(),
                 convertible_heic: true,
             }
         );
         assert_eq!(
-            classify_file_with_mime("scan.tiff", Some("image/tiff"), false),
-            MimeClassified::UnsupportedImage
+            classify_file_with_mime("scan.tiff", None),
+            MimeClassified::File {
+                mime_type: "application/octet-stream".to_owned(),
+            }
         );
         assert_eq!(
-            classify_file_with_mime("scan.tiff", Some("image/tiff"), true),
+            classify_file_with_mime("photo.tiff", Some("image/tiff")),
             MimeClassified::File {
                 mime_type: "image/tiff".to_owned(),
             }
         );
+        assert_eq!(
+            classify_file_with_mime("layers.psd", Some("image/vnd.adobe.photoshop")),
+            MimeClassified::UnsupportedImage
+        );
+
+        assert_eq!(
+            composer_image_dedup_key("image/png", 1234, "shot.png"),
+            "image/png\x001234\0shot.png"
+        );
+
+        assert_eq!(file_attachment_capability_block_reason(false, false, None, &[]), None);
+        assert_eq!(
+            file_attachment_capability_block_reason(false, false, None, &[("pending.zip", 10)]),
+            Some("Waiting for the server before file attachments can send".to_owned())
+        );
+        assert_eq!(
+            file_attachment_capability_block_reason(true, true, None, &[("pending.zip", 10)]),
+            Some(
+                "This server does not accept file attachments right now. Remove the files to send."
+                    .to_owned()
+            )
+        );
+        assert!(
+            file_attachment_capability_block_reason(true, true, Some(5), &[("pending.zip", 10)])
+                .is_some()
+        );
+
+        assert!(should_handle_attachment_paste(
+            &[("photo.dng", Some("application/octet-stream"))],
+            "Inspect this"
+        ));
+        assert!(!should_handle_attachment_paste(
+            &[("photo.tiff", Some("image/tiff"))],
+            "Image caption"
+        ));
+        assert!(!should_handle_attachment_paste(
+            &[("clipboard.rtf", Some("application/rtf"))],
+            "Copied text"
+        ));
 
         let attachments = vec![
             Attachment {
-                id: "img".into(),
+                id: "image-1".into(),
                 kind: AttachmentKind::Image,
-                name: "a.png".into(),
+                name: "photo.png".into(),
                 mime_type: "image/png".into(),
-                size_bytes: 5_000,
+                size_bytes: 3,
                 pasted_text: false,
-                upload: Upload::Ready { attachment_id: "r1".into() },
+                upload: Upload::Ready {
+                    attachment_id: "img-ready".into(),
+                },
             },
             Attachment {
-                id: "small".into(),
+                id: "file-uploading".into(),
                 kind: AttachmentKind::File,
-                name: "a.txt".into(),
-                mime_type: "text/plain".into(),
-                size_bytes: 500,
+                name: "fresh.pdf".into(),
+                mime_type: "application/pdf".into(),
+                size_bytes: 3,
                 pasted_text: false,
-                upload: Upload::Ready { attachment_id: "r2".into() },
+                upload: Upload::Uploading,
             },
             Attachment {
-                id: "big".into(),
+                id: "file-hydrated".into(),
                 kind: AttachmentKind::File,
-                name: "big.bin".into(),
-                mime_type: "application/octet-stream".into(),
-                size_bytes: 5_000,
+                name: "report.pdf".into(),
+                mime_type: "application/pdf".into(),
+                size_bytes: 3,
                 pasted_text: false,
-                upload: Upload::Ready { attachment_id: "r3".into() },
+                upload: Upload::Ready {
+                    attachment_id: "pending-report-pdf".into(),
+                },
             },
         ];
         assert_eq!(
-            attachments_to_release_on_upload_capability_loss(&attachments, true, Some(1024)),
-            vec!["big".to_owned()]
-        );
-        assert_eq!(
-            attachments_to_release_on_upload_capability_loss(&attachments, false, None),
-            vec!["small".to_owned(), "big".to_owned()]
+            attachments_to_release_on_upload_capability_loss(&attachments),
+            vec!["image-1".to_owned(), "file-uploading".to_owned()]
         );
     }
 }
