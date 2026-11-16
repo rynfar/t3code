@@ -55,6 +55,7 @@ mod timestamp;
 mod transcript;
 mod usage;
 mod updates;
+mod voice;
 mod webview;
 mod workspace;
 mod worktree_setup;

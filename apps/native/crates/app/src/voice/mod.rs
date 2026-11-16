@@ -1,0 +1,31 @@
+pub mod consent;
+pub mod controller;
+#[cfg(target_os = "macos")]
+pub mod macos;
+pub mod platform;
+pub mod shortcuts;
+pub mod ui;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(feature = "snapshot")]
+pub use consent::install_memory_voice_consent;
+pub use consent::{
+    choose_voice_destination, list_voice_candidates, set_voice_cleanup_enabled, voice_audio_choice,
+    voice_cleanup_granted,
+};
+#[cfg(feature = "snapshot")]
+pub use controller::{VoiceSetupState, VoiceSetupStep};
+pub use controller::{VoiceControllerEvent, VoiceSpeechConfig, VoiceSpeechController};
+#[cfg(feature = "snapshot")]
+pub use platform::{MockAudioPlatform, install_audio_platform};
+pub use platform::{MicPermissionStatus, audio_platform};
+pub use shortcuts::{
+    Dictation, handle_dictation_action, handle_escape, handle_key_up, handle_window_blur,
+    record_key_down, register_dictation_target, unregister_dictation_target,
+};
+pub use ui::{
+    VoiceUiSize, render_speech_button, render_speech_recording_pill,
+    render_text_field_speech_controls, render_voice_preview, render_voice_setup_modal,
+};

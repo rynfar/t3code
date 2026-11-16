@@ -156,6 +156,8 @@ impl Workspace {
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.state.update(cx, |state, cx| state.clear_pending_notifications(cx));
+                } else {
+                    crate::voice::handle_window_blur(cx);
                 }
             }),
         ];
@@ -304,9 +306,23 @@ impl Render for Workspace {
             .relative()
             .size_full()
             .map(crate::quit_hold::listen)
-            .capture_key_down(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.star_prompt_activity(cx))))
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.state.update(cx, |state, cx| state.star_prompt_activity(cx));
+                crate::voice::record_key_down(&event.keystroke.key, event.is_held, cx);
+                if event.keystroke.key == "escape" && crate::voice::handle_escape(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_key_up(cx.listener(|_, event: &gpui::KeyUpEvent, _, cx| {
+                crate::voice::handle_key_up(&event.keystroke.key, cx);
+            }))
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.star_prompt_activity(cx))))
             .child(crate::github_star_prompt::activity_listener(self.state.clone()))
+            .on_action(cx.listener(|_, _: &crate::voice::Dictation, window, cx| {
+                if !crate::voice::handle_dictation_action(window, cx) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.toggle_picker(window, cx));
             }))

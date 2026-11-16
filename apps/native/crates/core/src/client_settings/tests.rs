@@ -279,3 +279,62 @@ fn tool_call_visibility_defaults_round_trips_and_tolerates_unknown_values() {
     assert_eq!(unknown.tool_call_visibility(), ToolCallVisibility::ShowAll);
     assert_eq!(unknown.entries()["futureSetting"], 7);
 }
+
+#[test]
+fn voice_settings_round_trip_and_project_custom_words() {
+    use crate::voice_input::{
+        SpeechCustomWordEntry, SpeechPostProcessingPromptSettings, VoiceMicrophoneEntry,
+        VoiceShortcutMode,
+    };
+
+    let mut doc = ClientSettingsDoc::default();
+    assert_eq!(doc.voice_shortcut_mode(), VoiceShortcutMode::Auto);
+    assert_eq!(doc.speech_language(), "auto");
+    assert!(!doc.speech_translate_to_english());
+    assert!(doc.speech_silence_filtering());
+    assert!(doc.speech_remove_filler_words());
+    assert!(doc.speech_custom_words().is_empty());
+
+    doc.apply(&ClientSettingChange::VoiceShortcutMode(VoiceShortcutMode::Hold));
+    doc.apply(&ClientSettingChange::SpeechLanguage("de".into()));
+    doc.apply(&ClientSettingChange::SpeechTranslateToEnglish(true));
+    doc.apply(&ClientSettingChange::SpeechSilenceFiltering(false));
+    doc.apply(&ClientSettingChange::SpeechRemoveFillerWords(false));
+    doc.apply(&ClientSettingChange::SpeechCorrectionWord("wait actually".into()));
+    doc.apply(&ClientSettingChange::VoiceMicrophones(vec![
+        VoiceMicrophoneEntry::Device { device_id: "usb-1".into(), label: "USB Mic".into() },
+        VoiceMicrophoneEntry::Default,
+    ]));
+    doc.apply(&ClientSettingChange::SpeechCustomWords(vec![
+        SpeechCustomWordEntry { term: "Effect-TS".into(), aliases: vec!["effect ts".into()] },
+    ]));
+    doc.apply(&ClientSettingChange::SpeechPostProcessingPrompt(SpeechPostProcessingPromptSettings {
+        custom_instructions: "Keep code terms exact.".into(),
+        ..Default::default()
+    }));
+
+    let reread = ClientSettingsDoc::from_json(&doc.to_json());
+    assert_eq!(reread.voice_shortcut_mode(), VoiceShortcutMode::Hold);
+    assert_eq!(reread.speech_language(), "de");
+    assert!(reread.speech_translate_to_english());
+    assert!(!reread.speech_silence_filtering());
+    assert!(!reread.speech_remove_filler_words());
+    assert_eq!(reread.speech_correction_word(), "wait actually");
+    assert_eq!(reread.voice_microphones().len(), 2);
+    assert_eq!(reread.speech_custom_words()[0].term, "Effect-TS");
+    assert_eq!(reread.speech_post_processing_prompt().custom_instructions, "Keep code terms exact.");
+
+    let server_settings: crate::server_config::ServerSettings = serde_json::from_value(serde_json::json!({
+        "projectSettingsOverrides": {
+            "/repo": {
+                "speechProjectCustomWords": [
+                    { "term": "GPUI", "aliases": ["g p u i"] }
+                ]
+            }
+        }
+    }))
+    .unwrap();
+    let words = server_settings.project_speech_custom_words(Some("/repo"));
+    assert_eq!(words.len(), 1);
+    assert_eq!(words[0].term, "GPUI");
+}

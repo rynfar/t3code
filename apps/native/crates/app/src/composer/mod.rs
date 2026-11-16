@@ -297,6 +297,8 @@ pub struct Composer {
     /// Terminal excerpts per target and the chip row's popover.
     context: context::ContextChips,
     citation_editor: Option<citations::CommentEditor>,
+    pub(crate) voice: Entity<crate::voice::VoiceSpeechController>,
+    voice_pending_intent: Option<rules::SubmitIntent>,
     drafts: drafts::Drafts,
     workspace: workspace::Workspace,
     queue: queue::Queue,
@@ -322,6 +324,13 @@ struct SnapshotComposer(Entity<Composer>);
 impl gpui::Global for SnapshotComposer {}
 #[cfg(feature = "snapshot")]
 pub(crate) fn snapshot_composer(cx: &App) -> Entity<Composer> {cx.global::<SnapshotComposer>().0.clone()}
+
+#[cfg(feature = "snapshot")]
+impl Composer {
+    pub(crate) fn snapshot_voice(&self) -> Entity<crate::voice::VoiceSpeechController> {
+        self.voice.clone()
+    }
+}
 
 pub(crate) fn insert_artifact_template(
     thread_id: Option<&str>,
@@ -421,6 +430,56 @@ impl Composer {
         let decorations = input.update(cx, |input, cx| input.create_decorations_collection(Vec::new(), cx));
         let picker = cx.new(|cx| ModelPicker::new(state.clone(), window, cx));
         let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
+        let composer_weak = cx.entity().downgrade();
+        let composer_weak_hints = composer_weak.clone();
+        let composer_weak_proj = composer_weak.clone();
+        let composer_weak_focus = composer_weak.clone();
+        let composer_weak_disabled = composer_weak.clone();
+        let voice = cx.new(|cx| {
+            crate::voice::VoiceSpeechController::new(
+                crate::voice::VoiceSpeechConfig {
+                    app: state.clone(),
+                    owner_key: fixed
+                        .as_ref()
+                        .map(|id| format!("thread:{id}"))
+                        .unwrap_or_else(|| "composer:initial".to_owned()),
+                    offer_setup: true,
+                    draft_reader: std::rc::Rc::new(move |cx| {
+                        composer_weak.upgrade().map(|c| c.read(cx).voice_draft_snapshot(cx))
+                    }),
+                    hints_reader: std::rc::Rc::new(move |cx| {
+                        composer_weak_hints
+                            .upgrade()
+                            .map(|c| c.read(cx).voice_vocabulary_hints(cx))
+                            .unwrap_or_default()
+                    }),
+                    project_id_reader: std::rc::Rc::new(move |cx| {
+                        composer_weak_proj
+                            .upgrade()
+                            .and_then(|c| c.read(cx).snapshot.project_id.clone())
+                    }),
+                    on_open_voice_settings: std::rc::Rc::new(|_, cx| {
+                        crate::settings::open_voice(cx);
+                    }),
+                },
+                cx,
+            )
+        });
+        let _dictation_target_id = crate::voice::register_dictation_target(
+            &voice,
+            false,
+            std::rc::Rc::new(move |window, cx| {
+                composer_weak_focus
+                    .upgrade()
+                    .is_some_and(|c| c.read(cx).input.read(cx).focus_handle(cx).is_focused(window))
+            }),
+            std::rc::Rc::new(move |cx| {
+                composer_weak_disabled
+                    .upgrade()
+                    .is_none_or(|c| c.read(cx).voice_is_disabled(cx))
+            }),
+            cx,
+        );
         let mut subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { secondary, shift } => this.on_enter(*secondary, *shift, window, cx),
@@ -525,6 +584,30 @@ impl Composer {
                 this.sync_menu(false, cx);
                 this.sync_rich_decorations(cx);
             }),
+            cx.subscribe_in(&voice, window, |this, _, event: &crate::voice::VoiceControllerEvent, window, cx| {
+                match event {
+                    crate::voice::VoiceControllerEvent::StateChanged => {
+                        this.sync_input_state(window, cx);
+                        cx.notify();
+                    }
+                    crate::voice::VoiceControllerEvent::CommitDraft { text, selection } => {
+                        let caret = t3_core::voice_input::utf16_to_utf8_offset(text, selection.start);
+                        this.input.update(cx, |input, cx| {
+                            input.set_value(text.clone(), window, cx);
+                            input.set_selected_range(caret..caret, cx);
+                        });
+                        this.on_prompt_change(cx);
+                        cx.notify();
+                    }
+                    crate::voice::VoiceControllerEvent::SubmitAfterDictation { .. } => {
+                        let intent = this
+                            .voice_pending_intent
+                            .take()
+                            .unwrap_or(rules::SubmitIntent::Foreground);
+                        this.submit(intent, window, cx);
+                    }
+                }
+            }),
         ];
         if let Some(setup) = &setup {
             subscriptions.push(cx.subscribe_in(setup, window, |this, _, _: &crate::worktree_setup::SetupEvent, window, cx| this.refresh(false, window, cx)));
@@ -582,6 +665,8 @@ impl Composer {
             attachments: Default::default(),
             context: Default::default(),
             citation_editor: None,
+            voice,
+            voice_pending_intent: None,
             drafts: Default::default(),
             workspace: Default::default(),
             queue: Default::default(),
@@ -738,6 +823,15 @@ impl Composer {
             pending_ids.contains(&request_id)
         });
         self.snapshot = next;
+        let voice_owner = match &self.snapshot.target {
+            Some(Target::Thread(id)) => format!("{}:thread:{id}", self.snapshot.environment),
+            Some(Target::Draft(id)) => format!("{}:draft:{id}", self.snapshot.environment),
+            Some(Target::Question(key)) => {
+                format!("{}:question:{}:{}", self.snapshot.environment, key.request, key.question)
+            }
+            None => self.snapshot.environment.clone(),
+        };
+        self.voice.update(cx, |voice, cx| voice.set_owner_key(voice_owner, cx));
         self.sync_stop_phase(cx);
         self.sync_compact_expiry_timer(cx);
         self.sync_provider_target(cx);
@@ -1153,6 +1247,43 @@ impl Composer {
         cx.notify();
     }
 
+    pub(super) fn voice_draft_snapshot(&self, cx: &App) -> t3_core::voice_input::VoiceDraftSnapshot {
+        let input = self.input.read(cx);
+        let text = input.value().to_string();
+        let range = input.selected_range();
+        t3_core::voice_input::VoiceDraftSnapshot {
+            owner_key: self.voice.read(cx).owner_key().to_owned(),
+            selection: t3_core::voice_input::VoiceSelection {
+                start: t3_core::voice_input::utf8_to_utf16_offset(&text, range.start),
+                end: t3_core::voice_input::utf8_to_utf16_offset(&text, range.end),
+            },
+            text,
+        }
+    }
+
+    pub(super) fn voice_vocabulary_hints(&self, cx: &App) -> Vec<String> {
+        let Some(project_id) = self.snapshot.project_id.as_deref() else {
+            return Vec::new();
+        };
+        self.state
+            .read(cx)
+            .shell
+            .snapshot
+            .as_ref()
+            .and_then(|snap| snap.projects.iter().find(|p| p.id == project_id))
+            .map(|p| vec![p.title.clone()])
+            .unwrap_or_default()
+    }
+
+    pub(super) fn voice_is_disabled(&self, cx: &App) -> bool {
+        self.sending
+            || self.is_rewinding(cx)
+            || self.active_input().is_some_and(|input| {
+                !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx)
+            })
+            || self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer())
+    }
+
     fn on_enter(&mut self, modifier: bool, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.open && self.workspace_enabled() {return;}
         let composing = self.input.update(cx, |input, cx| input.marked_text_range(window, cx).is_some());
@@ -1178,7 +1309,18 @@ impl Composer {
         let settings = self.state.read(cx).client_settings;
         let draft = matches!(self.snapshot.target, Some(Target::Draft(_)));
         match rules::submit_intent(key, self.snapshot.running, draft, settings.send_shortcut, &prompt) {
-            Some(intent) => self.submit(intent, window, cx),
+            Some(intent) => {
+                if self.voice.read(cx).blocks_submission() {
+                    if !self.voice.read(cx).preparing() {
+                        self.voice_pending_intent = Some(intent);
+                        self.voice.update(cx, |voice, cx| {
+                            voice.submit_after_dictation(cx);
+                        });
+                    }
+                } else {
+                    self.submit(intent, window, cx);
+                }
+            }
             // The input method commits its composition on Enter.
             None if composing => {}
             None => {

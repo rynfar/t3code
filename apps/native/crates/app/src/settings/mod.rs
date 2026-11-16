@@ -26,6 +26,7 @@ mod source_control;
 pub(crate) mod store;
 mod threads;
 mod typography;
+mod voice;
 mod worktrees;
 
 use gpui::{
@@ -323,6 +324,10 @@ fn open_at(section: Section, anchor: Option<String>, cx: &mut App) {
     cx.global_mut::<Host>().pending_provider = None;
     cx.global_mut::<Host>().pending = Some((section, anchor));
     cx.refresh_windows();
+}
+
+pub fn open_voice(cx: &mut App) {
+    open_at(Section::Voice, Some("voice-transcription-destination".to_owned()), cx);
 }
 
 /// Opens Settings → Projects on the project holding `project_id`, from every "Project settings"
@@ -1070,6 +1075,7 @@ impl SettingsView {
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),
             Section::Devices => self.devices_page(cx),
+            Section::Voice => self.voice_page(cx),
         }
     }
 
@@ -1087,6 +1093,7 @@ fn section_icon(section: Section) -> Icon {
         Section::Providers => Icon::Bot,
         Section::Threads => Icon::MessagesSquare,
         Section::Devices => Icon::Smartphone,
+        Section::Voice => Icon::Mic,
         Section::ScheduledTasks => Icon::CalendarClock,
         Section::Projects => Icon::PanelsTopLeft,
         Section::SourceControl => Icon::GitBranch,

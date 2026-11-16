@@ -143,6 +143,7 @@ icons! {
     MessageSquarePlus => "icons/lucide/message-square-plus.svg",
     MessageSquareText => "icons/lucide/message-square-text.svg",
     MessagesSquare => "icons/lucide/messages-square.svg",
+    Mic => "icons/lucide/mic.svg",
     Minimize2 => "icons/lucide/minimize-2.svg",
     Minus => "icons/lucide/minus.svg",
     Monitor => "icons/lucide/monitor.svg",

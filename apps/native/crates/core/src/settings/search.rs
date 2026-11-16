@@ -29,6 +29,8 @@ pub enum Section {
     Archived,
     /// A detail page Maintenance links to; the nav highlights Maintenance while it is open.
     Diagnostics,
+    /// Voice destination consent & permission bridge until ST-VOICE (#377) ships.
+    Voice,
 }
 
 impl Section {
@@ -56,6 +58,7 @@ impl Section {
             Section::About => "About",
             Section::Archived => "Archive",
             Section::Diagnostics => "Diagnostics",
+            Section::Voice => "Voice",
         }
     }
 

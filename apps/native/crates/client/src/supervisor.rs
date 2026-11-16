@@ -97,6 +97,12 @@ pub struct ClientHandle {
     connection_generation: watch::Receiver<u64>,
 }
 
+impl ClientHandle {
+    pub fn credentials(&self) -> &Credentials {
+        &self.credentials
+    }
+}
+
 /// In-memory channels for app integration tests; no supervisor consumes their commands.
 #[cfg(feature = "test-support")]
 pub type FixtureRequest = (&'static str, Value, oneshot::Sender<Result<Value, RpcError>>);

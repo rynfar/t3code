@@ -66,9 +66,20 @@ pub struct RightPanelView {
     _subscription: Subscription,
 }
 
+#[cfg(feature = "snapshot")]
+struct SnapshotDiffPanel(Entity<DiffPanel>);
+#[cfg(feature = "snapshot")]
+impl gpui::Global for SnapshotDiffPanel {}
+#[cfg(feature = "snapshot")]
+pub(crate) fn snapshot_diff(cx: &gpui::App) -> Entity<DiffPanel> {
+    cx.global::<SnapshotDiffPanel>().0.clone()
+}
+
 impl RightPanelView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|cx| DiffPanel::new(state.clone(), window, cx));
+        #[cfg(feature = "snapshot")]
+        cx.set_global(SnapshotDiffPanel(diff.clone()));
         let pull_requests = cx.new(|cx| crate::pull_requests::ThreadPullRequestsPanel::new(state.clone(), cx));
         let files = cx.new(|cx| FilesPanel::new(state.clone(), window, cx));
         let subscription = cx.subscribe(&state, |this, state, event: &AppEvent, cx| match event {

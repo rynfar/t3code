@@ -578,6 +578,10 @@ pub struct EnvironmentCapabilities {
     /// Supports `freshSession` (`/clear` fresh provider context).
     #[serde(default)]
     pub fresh_context: Option<bool>,
+    #[serde(default)]
+    pub voice_transcription: Option<bool>,
+    #[serde(default)]
+    pub cloud_voice_transcription: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -673,6 +677,8 @@ pub struct ProjectSettingsOverrides {
     pub provider_instances: HashMap<String, ProjectInstanceOverride>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub default_project_scripts: Option<Vec<ProjectScript>>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub speech_project_custom_words: Option<Vec<crate::voice_input::SpeechCustomWordEntry>>,
     /// Present-null means no project default; absent inherits the environment's.
     #[serde(default, deserialize_with = "present_nullable")]
     pub pull_request_merge_method: Option<Option<crate::pull_requests::wire::MergeMethod>>,
@@ -760,6 +766,8 @@ pub struct ServerSettings {
     pub simlock_device_hosts: Value,
     #[serde(default)]
     pub cloud_speech_credentials: Value,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub speech_project_custom_words: Vec<crate::voice_input::SpeechCustomWordEntry>,
 }
 
 fn update_settings<'de, D: Deserializer<'de>>(d: D) -> Result<ServerSettings, D::Error> {
@@ -775,6 +783,17 @@ impl ServerSettings {
     pub fn hidden_tags(&self) -> Option<Vec<String>> {
         let tags: Vec<String> = self.hidden_thread_tags.iter().map(|tag| tag.trim()).filter(|tag| !tag.is_empty()).map(str::to_owned).collect();
         (self.hide_tagged_threads && !tags.is_empty()).then_some(tags)
+    }
+
+    /// `resolveProjectSettings(settings, projectId).settings.speechProjectCustomWords`.
+    pub fn project_speech_custom_words(
+        &self,
+        project_id: Option<&str>,
+    ) -> Vec<crate::voice_input::SpeechCustomWordEntry> {
+        project_id
+            .and_then(|id| self.project_settings_overrides.get(id))
+            .and_then(|overrides| overrides.speech_project_custom_words.clone())
+            .unwrap_or_else(|| self.speech_project_custom_words.clone())
     }
 }
 
