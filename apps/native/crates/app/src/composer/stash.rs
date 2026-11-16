@@ -21,9 +21,9 @@ use crate::toast::{Toast, ToastKind};
 
 #[derive(Default)]
 pub(super) struct Stashed {
-    store: Stash,
+    pub(super) store: Stash,
     pub(super) open: bool,
-    highlighted: Option<String>,
+    pub(super) highlighted: Option<String>,
     /// The history entry the prompt shows, for the target it was recalled in.
     history: Option<(Target, HistoryPosition)>,
 }
@@ -48,7 +48,11 @@ impl Composer {
     pub(super) fn toggle_stash_menu(&mut self, cx: &mut Context<Self>) {
         if self.is_rewinding(cx) { return; }
         self.stash_state.open = !self.stash_state.open;
-        self.stash_state.highlighted = None;
+        self.stash_state.highlighted = self
+            .stash_state
+            .open
+            .then(|| self.stash_state.store.entries.first().map(|entry| entry.id.clone()))
+            .flatten();
         cx.notify();
     }
 
@@ -260,7 +264,7 @@ impl Composer {
             .gap(px(6.))
             .rounded_t(px(12.))
             .border_1()
-            .border_color(if dark { gpui::white().opacity(0.05) } else { hsla(p.foreground).opacity(0.08) })
+            .border_color(hsla(p.composer_outline))
             .bg(hsla(if dark { p.surface_raised } else { p.card }))
             .text_xs()
             .text_color(color)
@@ -347,7 +351,7 @@ impl Composer {
                 }))
                 .into_any_element()
         };
-        let outline = if dark { gpui::white().opacity(0.05) } else { hsla(p.foreground).opacity(0.08) };
+        let outline = hsla(p.composer_outline);
         Some(
             div()
                 .mx(px(22.))

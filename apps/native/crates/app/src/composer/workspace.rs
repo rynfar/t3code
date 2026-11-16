@@ -351,7 +351,7 @@ impl Composer {
         self.open_workspace(window, cx);
         if self.workspace.open || self.render_workspace(cx).is_some() {return Err("non-repository shortcut opened an invisible workspace popup".into());}
         if self.workspace_key(MenuKey::Down, window, cx) || self.workspace_key(MenuKey::Accept, window, cx) {return Err("hidden workspace popup captured prompt keys".into());}
-        self.on_enter(false, window, cx);
+        self.on_enter(false, false, window, cx);
         if cx.global::<super::SnapshotAudit>().submissions.replace(0) != 1 {return Err("hidden workspace popup suppressed ordinary empty Enter".into());}
         self.workspace.error = Some("fixture read failed".into());
         self.open_workspace(window, cx);
@@ -364,7 +364,7 @@ impl Composer {
         self.workspace.is_repo = false;
         if self.workspace_key(MenuKey::Accept, window, cx) || self.workspace.open {return Err("workspace popup retained keys after repository availability changed".into());}
         self.workspace.open = true;
-        self.on_enter(false, window, cx);
+        self.on_enter(false, false, window, cx);
         if cx.global::<super::SnapshotAudit>().submissions.replace(0) != 1 {return Err("stale hidden popup suppressed empty Enter fallback".into());}
         self.workspace.open = false;
         self.workspace.task = None;

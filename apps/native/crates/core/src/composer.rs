@@ -88,13 +88,24 @@ pub fn offered_prompt_suggestion<'a>(
     {
         return None;
     }
-    if input.latest_run_id != Some(suggestion.run_id.as_str()) {
-        return None;
-    }
-    if matches!(input.latest_run_status, Some("steered" | "cancelled")) {
+    if input.latest_run_id != Some(suggestion.run_id.as_str()) || input.latest_run_status != Some("completed") {
         return None;
     }
     (!suggestion.text.trim().is_empty()).then_some(suggestion.text.as_str())
+}
+
+/// `announcedRun` (`usePromptSuggestion.ts`): skips queued and unstarted cancelled runs while
+/// refusing to fall back to an older run if the shell's `latestRunId` has not arrived in `runs`.
+pub fn resolve_prompt_suggestion_run<'a>(
+    shell_latest_run_id: Option<&str>,
+    runs: &'a [crate::thread::Run],
+) -> Option<(&'a str, &'a str)> {
+    if let Some(shell_id) = shell_latest_run_id
+        && !runs.iter().any(|run| run.id == shell_id)
+    {
+        return None;
+    }
+    crate::announcements::latest_executed_run(runs).map(|run| (run.id.as_str(), run.status.as_str()))
 }
 
 /// `getComposerPromptLengthValidationMessage` (`apps/web/src/components/chat/composerSubmission.ts`).

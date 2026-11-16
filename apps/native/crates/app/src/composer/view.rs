@@ -360,7 +360,7 @@ impl Render for Composer {
                         ("b", false) => Some(t3_core::composer::rich_text::InlineFormat::Bold),
                         ("i", false) => Some(t3_core::composer::rich_text::InlineFormat::Italic),
                         ("e", false) => Some(t3_core::composer::rich_text::InlineFormat::Code),
-                        ("x", true) => Some(t3_core::composer::rich_text::InlineFormat::Strike),
+                        ("s", true) => Some(t3_core::composer::rich_text::InlineFormat::Strike),
                         _ => None,
                     };
                     if let Some(format) = format {

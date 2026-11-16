@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
-/// Inline formatting toggle (`Mod+B`, `Mod+I`, `Mod+E`, `Mod+Shift+X`).
+/// Inline formatting toggle (`Mod+B`, `Mod+I`, `Mod+E`, `Mod+Shift+S`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InlineFormat {
     Bold,

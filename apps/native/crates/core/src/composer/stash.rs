@@ -103,17 +103,19 @@ pub fn merge_prompt(current: &str, restored: &str) -> String {
 /// Normalizes a prompt for stashing: trims outer whitespace while keeping a trailing space after
 /// an inline context or citation link so restoring doesn't glue text onto the chip (`useComposerStash.ts`).
 pub fn stash_prompt_text(raw: &str) -> String {
-    let trimmed_start = raw.trim_start();
-    let trimmed = trimmed_start.trim_end();
+    let trimmed_end = raw.trim_end();
+    let trimmed = trimmed_end.trim_start();
     if trimmed.is_empty() {
         return String::new();
     }
-    let ends_with_link = (trimmed.ends_with(')')
-        && (super::menu::context_references(trimmed).last().is_some_and(|r| r.end == trimmed.len())
-            || crate::assistant_citations::collect(trimmed).last().is_some_and(|(range, _)| range.end == trimmed.len())
-            || (trimmed.contains("](file://") && trimmed.rfind('[').is_some())))
-        || crate::markdown::mentions::collect_composer_model_mentions(trimmed).last().is_some_and(|m| m.end == trimmed.len());
-    if trimmed_start.len() > trimmed.len() && ends_with_link {
+    let ends_with_token = super::rich_text::collect_inline_tokens(raw, &[])
+        .last()
+        .is_some_and(|token| token.range.end == trimmed_end.len())
+        || (trimmed.ends_with(')')
+            && trimmed
+                .rfind("](file://")
+                .is_some_and(|idx| !trimmed[idx..trimmed.len() - 1].contains(['\n', '\r', ' '])));
+    if ends_with_token {
         format!("{trimmed} ")
     } else {
         trimmed.to_owned()

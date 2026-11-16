@@ -50,11 +50,8 @@ impl Composer {
         let mut decos: Vec<TextDecoration> = Vec::new();
         let revealed_marker_color = hsla(p.muted_foreground);
         let collapsed_marker_color = hsla(p.muted_foreground).opacity(0.24);
-        let code_bg = if dark {
-            gpui::white().opacity(0.07)
-        } else {
-            hsla(p.foreground).opacity(0.06)
-        };
+        let code_bg = hsla(p.code_block_background);
+        let inline_code_bg = hsla(p.inline_code_background);
 
         for block in &doc.code_blocks {
             if !block.code_range.is_empty() {
@@ -115,7 +112,7 @@ impl Composer {
                     color: Some(hsla(p.muted_foreground)),
                     ..Default::default()
                 },
-                InlineFormat::Code => HighlightStyle { background_color: Some(code_bg), color: Some(hsla(p.foreground)), ..Default::default() },
+                InlineFormat::Code => HighlightStyle { background_color: Some(inline_code_bg), color: Some(hsla(p.foreground)), ..Default::default() },
             };
             if !span.content_range.is_empty() {
                 decos.push(TextDecoration::new(span.content_range.clone(), content_style));

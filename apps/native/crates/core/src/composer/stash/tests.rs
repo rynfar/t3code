@@ -134,6 +134,8 @@ fn stash_prompt_text_preserves_trailing_space_after_inline_chip() {
     let chip = format!("[main.rs](t3-context://v1/file/{})", super::super::menu::kind_scoped_context_id("file", "main.rs"));
     assert_eq!(stash_prompt_text(&format!("  see {chip}  ")), format!("see {chip} "));
     assert_eq!(stash_prompt_text("  check model:codex/gpt-5.4  "), "check model:codex/gpt-5.4 ");
+    assert_eq!(stash_prompt_text("see @src/foo.rs"), "see @src/foo.rs ");
+    assert_eq!(stash_prompt_text("run $skill-name"), "run $skill-name ");
     assert_eq!(stash_prompt_text("  plain text   "), "plain text");
     assert_eq!(stash_prompt_text("   "), "");
 }

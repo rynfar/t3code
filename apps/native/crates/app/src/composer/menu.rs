@@ -61,7 +61,11 @@ pub(super) struct Menu {
     /// The latest `pullRequests.list` reply: project_id, query, entries.
     prs: Option<(String, String, Vec<ComposerPullRequest>)>,
     pr_search: Option<(String, String, Task<()>)>,
+    /// The latest `pullRequests.detail` fallback for an exact positive `#123` query.
+    pr_detail: Option<(String, String, u64, Option<ComposerPullRequest>)>,
+    pr_detail_search: Option<(String, String, u64, Task<()>)>,
     prs_unavailable: bool,
+    prs_failed: bool,
     snapshots: HashMap<SnapshotKey, WorkspaceSnapshot>,
     /// When each snapshot was last asked for; one scan per TTL.
     requested: HashMap<SnapshotKey, i64>,
@@ -171,7 +175,10 @@ impl Composer {
         self.menu.path_search = None;
         self.menu.prs = None;
         self.menu.pr_search = None;
+        self.menu.pr_detail = None;
+        self.menu.pr_detail_search = None;
         self.menu.prs_unavailable = false;
+        self.menu.prs_failed = false;
         self.menu.items.clear();
         self.menu.highlighted = None;
         true
@@ -212,6 +219,7 @@ impl Composer {
             self.menu.loading = false;
             self.menu.path_search = None;
             self.menu.pr_search = None;
+            self.menu.pr_detail_search = None;
             return;
         };
         let cwd = self.menu_cwd(cx);
@@ -227,8 +235,28 @@ impl Composer {
     fn pull_request_menu(&mut self, trigger: &Trigger, cx: &mut Context<Self>) -> (Vec<MenuItem>, bool) {
         let Some(project_id) = self.snapshot.project_id.clone() else {
             self.menu.pr_search = None;
+            self.menu.pr_detail_search = None;
+            self.menu.prs_unavailable = true;
+            self.menu.prs_failed = false;
             return (Vec::new(), false);
         };
+        let repository = {
+            let state = self.state.read(cx);
+            state
+                .server_config
+                .config
+                .as_ref()
+                .and_then(|_| state.shell.project(&project_id))
+                .and_then(|project| rules::project_repository(project.repository_identity.as_ref()))
+        };
+        let Some(repository) = repository else {
+            self.menu.pr_search = None;
+            self.menu.pr_detail_search = None;
+            self.menu.prs_unavailable = true;
+            self.menu.prs_failed = false;
+            return (Vec::new(), false);
+        };
+        self.menu.prs_unavailable = false;
         let linked: Vec<ComposerPullRequest> = self
             .thread_id()
             .and_then(|id| {
@@ -243,15 +271,57 @@ impl Composer {
             })
             .unwrap_or_default();
         let query = trigger.query.trim().to_owned();
-        let (cached, exact) = match &self.menu.prs {
-            Some((pid, cached_query, entries)) if *pid == project_id => (entries.clone(), *cached_query == query),
+        let exact_number = (!query.is_empty() && query.chars().all(|c| c.is_ascii_digit()))
+            .then(|| query.parse::<u64>().ok().filter(|&n| n > 0))
+            .flatten();
+        // `useComposerMenuItems.ts`: digits-only queries share the `""` list query and add
+        // `pullRequests.detail` when the exact PR is missing from the recent 99 entries.
+        let list_query = if exact_number.is_some() { String::new() } else { query.clone() };
+        let (cached, list_exact) = match &self.menu.prs {
+            Some((pid, cached_query, entries)) if *pid == project_id => (entries.clone(), *cached_query == list_query),
             _ => (Vec::new(), false),
         };
-        let items = rules::pull_request_items(&cached, &linked, &query);
-        if !exact && !matches!(&self.menu.pr_search, Some((pid, q, _)) if *pid == project_id && *q == query) {
-            self.search_pull_requests(project_id, query, cx);
+        if !list_exact && !matches!(&self.menu.pr_search, Some((pid, q, _)) if *pid == project_id && *q == list_query) {
+            self.search_pull_requests(project_id.clone(), list_query, cx);
         }
-        (items, !exact)
+        let mut combined = Vec::new();
+        let mut waiting_detail = false;
+        if let Some(number) = exact_number {
+            let in_cached = list_exact
+                && cached.iter().any(|entry| {
+                    entry.project_id == project_id
+                        && entry.repository.trim().eq_ignore_ascii_case(&repository)
+                        && entry.number == number
+                });
+            if !in_cached {
+                let detail_ready = match &self.menu.pr_detail {
+                    Some((pid, repo, n, entry))
+                        if *pid == project_id && repo.eq_ignore_ascii_case(&repository) && *n == number =>
+                    {
+                        if let Some(pr) = entry {
+                            combined.push(pr.clone());
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if !detail_ready {
+                    waiting_detail = true;
+                    let in_flight = matches!(
+                        &self.menu.pr_detail_search,
+                        Some((pid, repo, n, _)) if *pid == project_id && repo.eq_ignore_ascii_case(&repository) && *n == number
+                    );
+                    if !in_flight {
+                        self.fetch_pull_request_detail(project_id.clone(), repository.clone(), number, cx);
+                    }
+                }
+            }
+        } else {
+            self.menu.pr_detail_search = None;
+        }
+        combined.extend(cached);
+        let items = rules::pull_request_items(&combined, &linked, &project_id, &repository, &query);
+        (items, !list_exact || waiting_detail)
     }
 
     fn search_pull_requests(&mut self, project_id: String, query: String, cx: &mut Context<Self>) {
@@ -266,8 +336,7 @@ impl Composer {
                 if this.state.read(cx).environments.active.clone().zip(this.menu_cwd(cx)) != scope {
                     return None;
                 }
-                let all_states = !searched.is_empty() && searched.chars().all(|c| c.is_ascii_digit());
-                let payload = rules::pull_request_list_request(&searched_project, &searched, all_states);
+                let payload = rules::pull_request_list_request(&searched_project, &searched);
                 this.state.read(cx).request(pr_method::LIST, payload, |reply| {
                     let result: ListResult = serde_json::from_value(reply).map_err(|e| e.to_string())?;
                     Ok(result)
@@ -286,11 +355,11 @@ impl Composer {
                 match result {
                     Some(list) => {
                         let entries: Vec<ComposerPullRequest> = list.entries.iter().map(ComposerPullRequest::from).collect();
-                        this.menu.prs_unavailable = entries.is_empty() && list.providers.iter().all(|p| !p.configured);
+                        this.menu.prs_failed = list.errors.iter().any(|error| error.project_id == searched_project);
                         this.menu.prs = Some((searched_project, searched, entries));
                     }
                     None => {
-                        this.menu.prs_unavailable = true;
+                        this.menu.prs_failed = true;
                         this.menu.prs = Some((searched_project, searched, Vec::new()));
                     }
                 }
@@ -299,6 +368,39 @@ impl Composer {
             });
         });
         self.menu.pr_search = Some((project_id, query, task));
+    }
+
+    fn fetch_pull_request_detail(&mut self, project_id: String, repository: String, number: u64, cx: &mut Context<Self>) {
+        let (target_project, target_repo) = (project_id.clone(), repository.clone());
+        let scope = self.menu.scope.clone();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(rules::PULL_REQUEST_SEARCH_DEBOUNCE_MS)).await;
+            let request = this.update(cx, |this, cx| {
+                if this.state.read(cx).environments.active.clone().zip(this.menu_cwd(cx)) != scope {
+                    return None;
+                }
+                let payload = rules::pull_request_detail_request(&target_project, &target_repo, number);
+                this.state.read(cx).request(pr_method::DETAIL, payload, |reply| Ok(rules::decode_pull_request_detail(&reply)))
+            });
+            let Ok(Some(request)) = request else { return };
+            let entry = request.await.ok().and_then(Result::ok).flatten();
+            let _ = this.update(cx, |this, cx| {
+                if this.menu.scope != scope
+                    || this.state.read(cx).environments.active.clone().zip(this.menu_cwd(cx)) != scope
+                    || !matches!(
+                        &this.menu.pr_detail_search,
+                        Some((p, r, n, _)) if *p == target_project && r.eq_ignore_ascii_case(&target_repo) && *n == number
+                    )
+                {
+                    return;
+                }
+                this.menu.pr_detail_search = None;
+                this.menu.pr_detail = Some((target_project, target_repo, number, entry));
+                this.refresh_menu(cx);
+                cx.notify();
+            });
+        });
+        self.menu.pr_detail_search = Some((project_id, repository, number, task));
     }
 
     /// Threads first, then the workspace entries of the latest search for this cwd. While a
@@ -730,7 +832,7 @@ impl Composer {
         let trigger = self.menu.triggers.trigger()?;
         let p = palette(cx);
         let dark = cx.theme().is_dark();
-        let outline = if dark { gpui::white().opacity(0.05) } else { hsla(p.foreground).opacity(0.08) };
+        let outline = hsla(p.composer_outline);
         let body = if self.menu.items.is_empty() {
             div()
                 .px(px(20.))
@@ -739,10 +841,10 @@ impl Composer {
                 .text_xs()
                 .text_color(hsla(p.secondary_label))
                 .child(
-                    if trigger.kind == TriggerKind::PullRequest && !self.menu.loading && !self.menu.prs_unavailable {
-                        "No matching pull requests."
+                    if trigger.kind == TriggerKind::PullRequest && !self.menu.loading {
+                        rules::pull_request_empty_text(self.menu.prs_unavailable, self.menu.prs_failed, &trigger.query)
                     } else {
-                        rules::empty_text(trigger.kind, self.menu.loading)
+                        rules::empty_text(trigger.kind, self.menu.loading).to_owned()
                     },
                 )
                 .into_any_element()

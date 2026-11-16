@@ -377,7 +377,7 @@ impl Composer {
         let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
         let mut subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { secondary, shift: false } => this.on_enter(*secondary, window, cx),
+                InputEvent::PressEnter { secondary, shift } => this.on_enter(*secondary, *shift, window, cx),
                 InputEvent::Change => this.on_prompt_change(cx),
                 _ => {}
             }),
@@ -1076,7 +1076,7 @@ impl Composer {
         cx.notify();
     }
 
-    fn on_enter(&mut self, modifier: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_enter(&mut self, modifier: bool, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.open && self.workspace_enabled() {return;}
         let composing = self.input.update(cx, |input, cx| input.marked_text_range(window, cx).is_some());
         let key = EnterKey { modifier, repeat: std::mem::take(&mut self.enter_repeat), composing };
@@ -1090,6 +1090,12 @@ impl Composer {
             && let Some(edit) = rules::rich_text::code_block_enter(&prompt, sel.start, sel.end)
         {
             self.apply_rich_edit(edit, window, cx);
+            return;
+        }
+        if shift {
+            if !composing {
+                self.input.update(cx, |input, cx| input.insert("\n", window, cx));
+            }
             return;
         }
         let settings = self.state.read(cx).client_settings;
@@ -1177,24 +1183,10 @@ impl Composer {
     }
 
     pub(super) fn fresh_session_available(&self, cx: &App) -> bool {
-        let Some(Target::Thread(thread_id)) = &self.snapshot.target else { return false };
-        if !self.snapshot.loaded
-            || !self.snapshot.pending.approvals.is_empty()
-            || !self.snapshot.pending.user_inputs.is_empty()
-        {
-            return false;
-        }
-        let state = self.state.read(cx);
-        let cap = state.server_config.config.as_ref().and_then(|c| c.environment.capabilities.fresh_context) == Some(true);
-        if !cap {
-            return false;
-        }
-        state
-            .thread_state(thread_id)
-            .projection
-            .as_ref()
-            .filter(|p| p.thread.id == *thread_id)
-            .is_some_and(|p| !p.messages.is_empty() || !p.visible_turn_items.is_empty())
+        // #291 (`/clear` + fresh-session send/divider) is assigned to Wave C4; keep gated off until
+        // C4 wires `freshContext: true` send/queue handling and the transcript divider.
+        let _ = cx;
+        false
     }
 
     pub(super) fn is_fresh_session_armed(&self, cx: &App) -> bool {
@@ -1343,11 +1335,12 @@ impl Composer {
         let watcher = self.prompt_suggestion.as_ref().filter(|w| w.thread_id == *thread_id)?;
         let suggestion = watcher.suggestion.as_ref()?;
         let state = self.state.read(cx);
-        let latest_run = state
+        let shell_latest_run_id = state.shell.thread(thread_id).and_then(|t| t.latest_run_id.as_deref());
+        let resolved_run = state
             .thread_state(thread_id)
             .projection
             .as_ref()
-            .and_then(|p| p.runs.last());
+            .and_then(|p| rules::resolve_prompt_suggestion_run(shell_latest_run_id, &p.runs));
         let dismissed = self
             .dismissed_prompt_suggestions
             .contains(&(watcher.environment.clone(), suggestion.run_id.clone()));
@@ -1358,8 +1351,8 @@ impl Composer {
         rules::offered_prompt_suggestion(
             Some(suggestion),
             rules::PromptSuggestionOfferInput {
-                latest_run_id: latest_run.map(|r| r.id.as_str()),
-                latest_run_status: latest_run.map(|r| r.status.as_str()),
+                latest_run_id: resolved_run.map(|(id, _)| id),
+                latest_run_status: resolved_run.map(|(_, status)| status),
                 prompt_empty,
                 has_non_prompt_content,
                 has_pending_approvals: !self.snapshot.pending.approvals.is_empty(),
@@ -2693,5 +2686,69 @@ mod stream_error_tests {
             });
             window.draw(cx).clear();
         });
+    }
+
+    #[gpui::test]
+    fn shift_enter_indents_code_blocks_without_continuing_lists_and_stash_highlights_first(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, _| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.environment.capabilities.fresh_context = Some(true);
+            }
+        });
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                // Shift+Enter inside a fenced code block preserves leading indentation (`CO-RICH`).
+                composer.set_prompt("```rust\n  let x = 1;\n```", window, cx);
+                let caret = "```rust\n  let x = 1;".len();
+                composer.input.update(cx, |input, cx| input.set_selected_range(caret..caret, cx));
+                composer.on_enter(false, true, window, cx);
+                assert_eq!(composer.prompt(cx), "```rust\n  let x = 1;\n  \n```");
+
+                // Shift+Enter on a list item inserts a plain newline instead of continuing `- ` (`#36285`).
+                composer.set_prompt("- first", window, cx);
+                let end = "- first".len();
+                composer.input.update(cx, |input, cx| input.set_selected_range(end..end, cx));
+                composer.on_enter(false, true, window, cx);
+                assert_eq!(composer.prompt(cx), "- first\n");
+
+                // Stash menu highlights its first entry when toggled open (`CO-STASH`).
+                composer.stash_state.store.push(t3_core::composer::stash::StashEntry {
+                    id: "s-first".into(),
+                    created_at: 100,
+                    prompt: "stashed prompt".into(),
+                    attachments: Vec::new(),
+                    threads: Vec::new(),
+                    terminals: Vec::new(),
+                    review_comments: Vec::new(),
+                    context_records: Vec::new(),
+                    reply_to: None,
+                });
+                composer.toggle_stash_menu(cx);
+                assert!(composer.stash_state.open);
+                assert_eq!(composer.stash_state.highlighted.as_deref(), Some("s-first"));
+
+                // #291 (`/clear`) stays gated off until Wave C4 wires fresh-session send/divider.
+                assert!(!composer.fresh_session_available(cx));
+            });
+        });
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

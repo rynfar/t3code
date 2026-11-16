@@ -298,9 +298,15 @@ fn decode_draft_model_selection(obj: &serde_json::Map<String, Value>) -> Option<
             selections.push(crate::traits::OptionSelection { id: id.to_owned(), value });
         }
     };
-    push_if_missing("effort", obj.get("effort"));
-    push_if_missing("fastMode", obj.get("codexFastMode"));
-    push_if_missing("serviceTier", obj.get("serviceTier"));
+    if provider == "codex" {
+        let effort = obj.get("effort").filter(|value| value.as_str().is_none_or(|s| !s.is_empty()));
+        push_if_missing("reasoningEffort", effort);
+        let fast = obj.get("codexFastMode").and_then(Value::as_bool) == Some(true)
+            || obj.get("serviceTier").and_then(Value::as_str) == Some("fast");
+        if fast {
+            push_if_missing("fastMode", Some(&Value::Bool(true)));
+        }
+    }
     Some(crate::traits::model_selection(provider, model, &selections))
 }
 

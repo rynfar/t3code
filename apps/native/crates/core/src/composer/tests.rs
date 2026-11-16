@@ -262,7 +262,48 @@ fn offered_prompt_suggestion_gates_on_run_match_status_and_clean_composer() {
     assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { latest_run_id: Some("run-1"), ..ready }), None);
     assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { latest_run_status: Some("steered"), ..ready }), None);
     assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { latest_run_status: Some("cancelled"), ..ready }), None);
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { latest_run_status: Some("running"), ..ready }), None);
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { latest_run_status: Some("failed"), ..ready }), None);
     assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { prompt_empty: false, ..ready }), None);
     assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { fresh_session_armed: true, ..ready }), None);
     assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { dismissed: true, ..ready }), None);
+}
+
+#[test]
+fn resolve_prompt_suggestion_run_skips_queued_or_unstarted_cancelled_and_rejects_unseen_shell_run() {
+    let run = |id: &str, ordinal: u64, status: &str, started_at: Option<&str>, completed_at: Option<&str>| {
+        serde_json::from_value::<crate::thread::Run>(json!({
+            "id": id,
+            "ordinal": ordinal,
+            "providerInstanceId": "codex",
+            "modelSelection": {"instanceId": "codex", "model": "gpt-5.4"},
+            "userMessageId": "m1",
+            "rootNodeId": null,
+            "status": status,
+            "requestedAt": "2026-11-02T09:59:00Z",
+            "startedAt": started_at,
+            "completedAt": completed_at
+        }))
+        .unwrap()
+    };
+    let completed = run("run-1", 1, "completed", Some("2026-11-02T09:59:01Z"), Some("2026-11-02T09:59:10Z"));
+    let queued = run("run-2", 2, "queued", None, None);
+    let cancelled_unstarted = run("run-3", 3, "cancelled", None, None);
+    let running = run("run-4", 4, "running", Some("2026-11-02T09:59:12Z"), None);
+
+    assert_eq!(
+        resolve_prompt_suggestion_run(Some("run-2"), &[completed.clone(), queued]),
+        Some(("run-1", "completed"))
+    );
+    assert_eq!(
+        resolve_prompt_suggestion_run(Some("run-3"), &[completed.clone(), cancelled_unstarted]),
+        Some(("run-1", "completed"))
+    );
+    // Shell reports a newer run that has not arrived in detail projection yet -> return None.
+    assert_eq!(resolve_prompt_suggestion_run(Some("run-9"), std::slice::from_ref(&completed)), None);
+    // An actively running run becomes the resolved run so status != "completed" suppresses the offer.
+    assert_eq!(
+        resolve_prompt_suggestion_run(Some("run-4"), &[completed, running]),
+        Some(("run-4", "running"))
+    );
 }

@@ -404,6 +404,7 @@ fn slash_clear_respects_fresh_session_capability_and_prompt_start() {
     let offered = slash_items(&at_start, "codex", &[], std::slice::from_ref(&provider_clear), SlashMenuOptions { fresh_session: true, ..Default::default() });
     assert_eq!(offered.len(), 1);
     assert_eq!(offered[0].action, MenuAction::Slash(SlashCommand::Clear));
+    assert_eq!(offered[0].description, "Start a fresh session; earlier messages stay visible");
 
     let mid_prompt = Trigger { kind: TriggerKind::SlashCommand, query: "cl".into(), range_start: 4, range_end: 7 };
     assert!(slash_items(&mid_prompt, "codex", &[], &[provider_clear], SlashMenuOptions { fresh_session: true, ..Default::default() }).is_empty());
@@ -427,12 +428,55 @@ fn pull_request_items_prioritize_linked_and_exact_number_and_build_valid_record(
     };
     let linked = vec![pr(12, "Linked PR")];
     let listed = vec![pr(42, "Fix 12 regression"), pr(12, "Linked PR"), pr(7, "Other")];
-    let bare = pull_request_items(&listed, &linked, "");
+    let bare = pull_request_items(&listed, &linked, "p1", "acme/repo", "");
     assert_eq!(bare.len(), 3);
     assert_eq!(bare[0].label, "#12", "linked PR comes first and is deduplicated");
 
-    let exact = pull_request_items(&listed, &linked, "42");
+    let exact = pull_request_items(&listed, &linked, "p1", "acme/repo", "42");
     assert_eq!(exact[0].label, "#42");
+    assert_eq!(exact[0].description, "Fix 12 regression");
+
+    let mut cross_repo = pr(99, "Upstream change");
+    cross_repo.repository = "upstream/repo".into();
+    let cross = pull_request_items(&listed, &[cross_repo], "p1", "acme/repo", "99");
+    assert_eq!(cross[0].description, "upstream/repo · Upstream change");
+
+    let other_repo_entry = pr(77, "Wrong repo");
+    let mut wrong_repo_entries = listed.clone();
+    let mut wrong = other_repo_entry;
+    wrong.repository = "other/repo".into();
+    wrong_repo_entries.push(wrong);
+    assert!(!pull_request_items(&wrong_repo_entries, &[], "p1", "acme/repo", "").iter().any(|i| i.label == "#77"));
+
+    let many: Vec<_> = (1..=20).map(|n| pr(n, &format!("PR {n}"))).collect();
+    assert_eq!(pull_request_items(&many, &[], "p1", "acme/repo", "").len(), 12, "caps PR composer menu results at 12");
+
+    let req = pull_request_list_request("p1", "123");
+    assert_eq!(req["state"], "all");
+    assert_eq!(req["limit"], 99);
+    assert!(req.get("query").is_none(), "pure numeric queries skip query param and rely on detail fallback");
+
+    let text_req = pull_request_list_request("p1", "auth");
+    assert_eq!(text_req["state"], "all");
+    assert_eq!(text_req["limit"], 99);
+    assert_eq!(text_req["query"], "auth");
+
+    assert_eq!(
+        pull_request_detail_request("p1", "acme/repo", 42),
+        json!({ "projectId": "p1", "repository": "acme/repo", "number": 42 })
+    );
+    assert_eq!(
+        project_repository(Some(&json!({ "provider": "github", "displayName": "acme/repo" }))),
+        Some("acme/repo".into())
+    );
+    assert_eq!(
+        project_repository(Some(&json!({ "provider": "azure-devops", "displayName": "proj/_git/my%20repo" }))),
+        Some("my repo".into())
+    );
+    assert_eq!(pull_request_empty_text(true, false, ""), "Pull requests are not available for this project.");
+    assert_eq!(pull_request_empty_text(false, true, "foo"), "Pull requests could not be read for this project.");
+    assert_eq!(pull_request_empty_text(false, false, "foo"), "No pull request matches foo.");
+    assert_eq!(pull_request_empty_text(false, false, ""), "No pull requests found in this repository.");
 
     let record = build_pull_request_reference_record(&listed[0]);
     assert!(super::super::records::pull_request(&record));

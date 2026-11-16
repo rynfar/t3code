@@ -219,7 +219,7 @@ fn decodes_legacy_v3_to_v5_model_selections_without_wiping_valid_drafts() {
                 "provider": "codex",
                 "model": "gpt-5.4",
                 "effort": "medium",
-                "codexFastMode": true,
+                "serviceTier": "fast",
                 "updatedAt": 80
             },
             "thread:corrupt-model-selection": {
@@ -251,7 +251,11 @@ fn decodes_legacy_v3_to_v5_model_selections_without_wiping_valid_drafts() {
     let top_sel = top_draft.model_selection.as_ref().unwrap();
     assert_eq!(top_sel.instance_id, "codex");
     assert_eq!(top_sel.model, "gpt-5.4");
-    assert_eq!(crate::traits::selections(top_sel.options.as_ref()).len(), 2);
+    let top_opts = crate::traits::selections(top_sel.options.as_ref());
+    assert_eq!(top_opts.len(), 2);
+    assert!(top_opts.iter().any(|opt| opt.id == "reasoningEffort" && matches!(&opt.value, crate::traits::OptionValue::Str(s) if s == "medium")));
+    assert!(top_opts.iter().any(|opt| opt.id == "fastMode" && opt.value == crate::traits::OptionValue::Bool(true)));
+    assert!(!top_opts.iter().any(|opt| opt.id == "effort" || opt.id == "serviceTier"));
 
     let salvaged = store.get("thread:corrupt-model-selection").expect("corrupt modelSelection does not wipe prompt");
     assert_eq!(salvaged.prompt, "still salvageable");

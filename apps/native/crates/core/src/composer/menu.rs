@@ -24,7 +24,8 @@ use crate::server_config::{ProviderSkill, ProviderSlashCommand, ServerProvider, 
 pub const PATH_SEARCH_LIMIT: usize = 80;
 pub const PATH_SEARCH_DEBOUNCE_MS: u64 = 120;
 pub const PULL_REQUEST_SEARCH_DEBOUNCE_MS: u64 = 180;
-const PULL_REQUEST_RESULT_LIMIT: usize = 20;
+pub const COMPOSER_PULL_REQUEST_LIST_LIMIT: u32 = 99;
+const PULL_REQUEST_RESULT_LIMIT: usize = 12;
 const THREAD_RESULT_LIMIT: usize = 5;
 const MODEL_MENTION_LIMIT: usize = 8;
 /// `PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS`.
@@ -562,6 +563,26 @@ impl From<&crate::pull_requests::wire::ListEntry> for ComposerPullRequest {
     }
 }
 
+impl From<&crate::pull_requests::wire::Detail> for ComposerPullRequest {
+    fn from(detail: &crate::pull_requests::wire::Detail) -> Self {
+        let host = url::Url::parse(&detail.url).ok().and_then(|u| u.host_str().map(str::to_lowercase)).unwrap_or_default();
+        Self {
+            number: detail.number,
+            title: detail.title.clone(),
+            url: detail.url.clone(),
+            head_branch: detail.head_branch.clone(),
+            base_branch: detail.base_branch.clone(),
+            state: detail.state,
+            is_draft: detail.is_draft,
+            host,
+            repository: detail.repository.clone(),
+            project_id: detail.project_id.clone(),
+            author_login: detail.author.as_ref().map(|a| a.login.clone()),
+            updated_at: detail.updated_at.clone(),
+        }
+    }
+}
+
 impl ComposerPullRequest {
     pub fn from_thread_link(project_id: &str, link: &crate::pull_requests::link::ThreadLink) -> Option<Self> {
         let snapshot = link.snapshot.as_ref()?;
@@ -671,7 +692,7 @@ pub fn slash_items(
 ) -> Vec<MenuItem> {
     let mut items = vec![builtin_item(SlashCommand::Model, "Switch response model for this thread")];
     if options.fresh_session {
-        items.push(builtin_item(SlashCommand::Clear, "Start the next message in a fresh provider session"));
+        items.push(builtin_item(SlashCommand::Clear, "Start a fresh session; earlier messages stay visible"));
     }
     if options.side_chat {
         items.push(builtin_item(SlashCommand::Side, options.side_chat_disabled.unwrap_or("Ask a side question in a new side chat")));
@@ -848,18 +869,47 @@ pub fn model_items(
     Vec::new()
 }
 
+/// `sourceControlClients.repositorySelector` for a project's `repositoryIdentity`.
+pub fn project_repository(identity: Option<&Value>) -> Option<String> {
+    let identity = identity?.as_object()?;
+    let text = |key: &str| identity.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    if text("provider") == Some("azure-devops") {
+        let segments: Vec<&str> = text("displayName").unwrap_or("").split('/').filter(|part| *part != "_git").collect();
+        let name = text("name").or_else(|| segments.last().copied().filter(|s| !s.is_empty()))?;
+        return Some(crate::markdown::links::percent_decode(name));
+    }
+    if let Some(display) = text("displayName") {
+        return Some(display.to_owned());
+    }
+    Some(format!("{}/{}", text("owner")?, text("name")?))
+}
+
 /// `pullRequests.list` payload for the `#` composer trigger (`useComposerMenuItems.ts`).
-pub fn pull_request_list_request(project_id: &str, query: &str, all_states: bool) -> Value {
+pub fn pull_request_list_request(project_id: &str, query: &str) -> Value {
     let trimmed = query.trim().trim_start_matches('#');
     let mut input = serde_json::Map::new();
-    input.insert("state".into(), json!(if all_states { "all" } else { "open" }));
+    input.insert("state".into(), json!("all"));
     input.insert("involvement".into(), json!("all"));
     input.insert("projectId".into(), json!(project_id));
-    input.insert("limit".into(), json!(PULL_REQUEST_RESULT_LIMIT as u32));
-    if !trimmed.is_empty() {
+    input.insert("limit".into(), json!(COMPOSER_PULL_REQUEST_LIST_LIMIT));
+    if !trimmed.is_empty() && !trimmed.chars().all(|c| c.is_ascii_digit()) {
         input.insert("query".into(), json!(crate::pull_requests::query::truncate_utf16(trimmed, 200)));
     }
     Value::Object(input)
+}
+
+/// `pullRequests.detail` payload for an exact positive `#123` query absent from the list.
+pub fn pull_request_detail_request(project_id: &str, repository: &str, number: u64) -> Value {
+    json!({
+        "projectId": project_id,
+        "repository": repository,
+        "number": number,
+    })
+}
+
+pub fn decode_pull_request_detail(reply: &Value) -> Option<ComposerPullRequest> {
+    let detail: crate::pull_requests::wire::Detail = serde_json::from_value(reply.clone()).ok()?;
+    Some(ComposerPullRequest::from(&detail))
 }
 
 fn pr_dedupe_key(pr: &ComposerPullRequest) -> String {
@@ -871,25 +921,40 @@ fn pr_dedupe_key(pr: &ComposerPullRequest) -> String {
 }
 
 /// Filters and ranks `#` pull request items (`composerPullRequestMatches.ts` +
-/// `withLinkedComposerPullRequestsFirst`), deduplicating by URL/ref and prioritizing linked PRs.
-pub fn pull_request_items(entries: &[ComposerPullRequest], linked: &[ComposerPullRequest], query: &str) -> Vec<MenuItem> {
+/// `withLinkedComposerPullRequestsFirst`), scoping `entries` to `(project_id, repository)`,
+/// deduplicating by URL/ref, and prioritizing linked PRs.
+pub fn pull_request_items(
+    entries: &[ComposerPullRequest],
+    linked: &[ComposerPullRequest],
+    project_id: &str,
+    repository: &str,
+    query: &str,
+) -> Vec<MenuItem> {
     let q = query.trim().trim_start_matches('#').to_lowercase();
+    let target_repo = repository.trim();
     let mut seen = std::collections::HashSet::new();
     let mut ordered: Vec<(bool, &ComposerPullRequest)> = Vec::new();
     for pr in linked {
-        if seen.insert(pr_dedupe_key(pr)) {
+        if pr.project_id == project_id && seen.insert(pr_dedupe_key(pr)) {
             ordered.push((true, pr));
         }
     }
     for pr in entries {
-        if seen.insert(pr_dedupe_key(pr)) {
+        if pr.project_id == project_id
+            && pr.repository.trim().eq_ignore_ascii_case(target_repo)
+            && seen.insert(pr_dedupe_key(pr))
+        {
             ordered.push((false, pr));
         }
     }
     let to_item = |pr: &ComposerPullRequest| MenuItem {
         id: format!("pull-request:{}", pr_dedupe_key(pr)),
         label: format!("#{}", pr.number),
-        description: pr.title.clone(),
+        description: if pr.repository.trim().eq_ignore_ascii_case(target_repo) {
+            pr.title.clone()
+        } else {
+            format!("{} · {}", pr.repository, pr.title)
+        },
         action: MenuAction::PullRequest(pr.clone()),
     };
     if q.is_empty() {
@@ -1011,6 +1076,22 @@ pub fn empty_text(kind: TriggerKind, loading: bool) -> &'static str {
         (TriggerKind::Path, false) => "No matching files or folders.",
         (TriggerKind::PullRequest, false) => "Pull requests are not available for this project.",
         (TriggerKind::SlashCommand, false) => "No matching command.",
+    }
+}
+
+/// Empty-state copy for the `#` pull request trigger (`useComposerMenuItems.ts`).
+pub fn pull_request_empty_text(unavailable: bool, failed: bool, query: &str) -> String {
+    if unavailable {
+        return "Pull requests are not available for this project.".to_owned();
+    }
+    if failed {
+        return "Pull requests could not be read for this project.".to_owned();
+    }
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        "No pull requests found in this repository.".to_owned()
+    } else {
+        format!("No pull request matches {trimmed}.")
     }
 }
 
