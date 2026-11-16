@@ -307,3 +307,73 @@ fn project_pending_user_input_answer_expands_thread_review_and_preview_records()
     assert!(text.contains("[Preview annotation: Hero CTA; ref=preview-annotation_1]\n\n<t3_context version=\"1\">\n<context kind=\"preview-annotation\" id=\"preview-annotation_1\">\npage: Home\nurl: http://localhost:3000/home\ncomment: Increase contrast\ntargets: button.cta\nrequested visual changes:\n- color: #fff\n</context>\n</t3_context>"), "{text}");
     assert!(text.ends_with(" and [Missing](t3-context://v1/thread/missing)"), "{text}");
 }
+
+#[test]
+fn responds_to_user_input_with_validated_attachments_by_question_id() {
+    use std::collections::BTreeMap;
+    use super::attachments::{answer_draft, build_question_response_attachments};
+    use crate::commands::respond_to_user_input_with_attachments;
+    use crate::composer::attachments::{Attachment, AttachmentKind, Upload};
+
+    let q1: Question = serde_json::from_value(json!({
+        "id": "q-files",
+        "header": "Logs",
+        "question": "Attach logs",
+        "options": [],
+        "allowCustomAnswer": true
+    }))
+    .unwrap();
+    let q2: Question = serde_json::from_value(json!({
+        "id": "q-choice",
+        "header": "Mode",
+        "question": "Pick mode",
+        "options": [{ "label": "Fast", "description": "Use defaults" }],
+        "allowCustomAnswer": true
+    }))
+    .unwrap();
+    let input = PendingUserInput {
+        request_id: "req-42".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        questions: vec![q1.clone(), q2.clone()],
+        response_capability: "live".into(),
+        dismissible: true,
+    };
+
+    let ready = Attachment {
+        id: "local-log".into(),
+        kind: AttachmentKind::File,
+        name: "error.log".into(),
+        mime_type: "text/plain".into(),
+        size_bytes: 128,
+        pasted_text: false,
+        upload: Upload::Ready {
+            attachment_id: "srv-log-1".into(),
+        },
+    };
+
+    let mut answer_drafts = HashMap::new();
+    answer_drafts.insert("q-files".into(), answer_draft(None, std::slice::from_ref(&ready), 0, true));
+    answer_drafts.insert(
+        "q-choice".into(),
+        DraftAnswer {
+            selected: vec!["Fast".into()],
+            ..Default::default()
+        },
+    );
+    let answers = build_answers(&input.questions, &answer_drafts).expect("complete with attachment");
+
+    let by_question = BTreeMap::from([("q-files".into(), vec![ready])]);
+    let encoded_attachments =
+        build_question_response_attachments(&input, &by_question, &BTreeMap::new(), true).unwrap();
+
+    let cmd = respond_to_user_input_with_attachments(
+        "cmd-1",
+        "thr-9",
+        &input.request_id,
+        answers,
+        encoded_attachments,
+    );
+    assert_eq!(cmd["type"], "runtime-request.respond");
+    assert_eq!(cmd["attachmentsByQuestionId"]["q-files"][0]["id"], "srv-log-1");
+    assert!(cmd["attachmentsByQuestionId"].get("q-choice").is_none());
+}

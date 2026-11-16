@@ -4,8 +4,16 @@
 
 use std::time::Duration;
 
+pub mod cycle;
 mod owned;
+pub mod queue;
+pub use cycle::{
+    DEFAULT_UPLOAD_CHUNK_SIZE, UploadTransferError, delete_pending_attachment,
+    has_orchestration_operate_scope, run_attachment_upload_cycle, upload_bytes_with_progress,
+    verify_persisted_attachment_upload,
+};
 pub use owned::UploadedAttachment;
+pub use queue::{AttachmentUploadQueueClient, QueueEvent, UploadPayload};
 
 use t3_core::composer::attachments::{self, CREATE_UPLOAD_URL, decode_ticket};
 
@@ -82,3 +90,6 @@ mod copy_tests {
         assert_eq!(server.http_requests(),[("/test-copy-source".into(),vec![]),("/test-copy-destination".into(),b"source bytes".to_vec()),("/test-copy-source".into(),vec![]),("/test-copy-destination".into(),b"source bytes".to_vec())]);
     }
 }
+
+#[cfg(test)]
+mod tests;
