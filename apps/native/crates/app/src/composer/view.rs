@@ -17,7 +17,7 @@ use t3_core::traits;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, ComposerControl, Float, Pill, RoundButton, RoundKind, floating, menu_surface};
 use super::model_picker::permissions_section;
-use super::{Composer, MenuKey, OpenPermissions, OutdentList, PasteAsText, Resolved, StashPrompt, Target, ToggleModelPicker, runtime_mode_icon};
+use super::{Composer, MenuKey, OpenPermissions, OutdentList, PasteAsText, Resolved, StashPrompt, StopPhase, Target, ToggleModelPicker, runtime_mode_icon};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{hsla, palette};
@@ -176,28 +176,28 @@ impl Composer {
     }
 
     fn render_primary(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
         let running = self.snapshot.running;
+        let can_interrupt = self.snapshot.can_interrupt;
+        let can_operate = self.snapshot.can_operate_thread;
         let rewinding = self.is_rewinding(cx);
-        let stop = || {
-            RoundButton::new("stop", RoundKind::Stop, "Interrupt")
-                .disabled(rewinding)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.is_rewinding(cx) {
-                        return;
-                    }
-                    let fixed = this.fixed.clone();
-                    this.state.update(cx, |state, cx| match fixed {
-                        Some(id) => state.stop_thread(&id, cx),
-                        None => state.stop_selected_thread(cx),
-                    })
-                }))
+        let stop_pending = self.stop_phase == StopPhase::Pending;
+        let stop_retained = matches!(self.stop_phase, StopPhase::Pending | StopPhase::TimedOut);
+        let stop_button = || {
+            div()
+                .flex_none()
+                .debug_selector(|| "stop".to_owned())
+                .child(
+                    RoundButton::new("stop", RoundKind::Stop, if stop_pending { "Stopping…" } else { "Interrupt" })
+                        .disabled(rewinding || !can_operate || stop_pending)
+                        .on_click(cx.listener(|this, _, _, cx| this.request_stop(cx))),
+                )
         };
         if let (Some(input), Some(progress)) = (self.active_input(), self.progress(cx)) {
             let responding = rewinding || !self.can_answer(cx) || self.question_responding(&input.request_id, cx) || !input.can_respond();
             let enabled = if progress.is_last_question { progress.is_complete } else { progress.can_advance };
             return h_flex()
                 .gap(px(8.))
-                .when(running, |this| this.child(stop()))
                 .when(progress.question_index > 0, |this| {
                     this.child(
                         Button::new("question-previous", ButtonVariant::Outline, ButtonSize::Sm)
@@ -208,16 +208,43 @@ impl Composer {
                 })
                 .child(
                     Pill::new("question-submit", requests::primary_action_label(&progress, responding))
-                        .disabled(responding || !enabled)
-                        .on_click(cx.listener(|this, _, window, cx| this.advance(window, cx))),
+                        .disabled(!can_operate || responding || !enabled)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if this.stop_phase != StopPhase::Landed {
+                                this.advance(window, cx);
+                            }
+                        })),
                 )
+                .when(can_interrupt || stop_retained, |this| this.child(stop_button()))
                 .into_any_element();
         }
         let has_text = self.has_text || !self.staged().is_empty() || self.current_reply_to().is_some();
         let editing_queued = self.editing_queued().is_some();
-        if running && !has_text && !editing_queued {
-            return stop().into_any_element();
+        if (can_interrupt || stop_retained) && !has_text && !editing_queued {
+            return stop_button().into_any_element();
         }
+        let show_resume = self.snapshot.can_resume && !has_text && !editing_queued;
+        if show_resume {
+            let resume_btn = RoundButton::new("send", RoundKind::Resume, "Resume thread")
+                .disabled(self.sending || !can_operate || rewinding)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this.stop_phase != StopPhase::Landed {
+                        this.resume(window, cx);
+                    }
+                }));
+            return if stop_retained {
+                h_flex().gap(px(8.)).child(resume_btn).child(stop_button()).into_any_element()
+            } else {
+                resume_btn.into_any_element()
+            };
+        }
+        let fresh_armed = self.is_fresh_session_armed(cx);
+        let compact_tokens = (!editing_queued && !fresh_armed)
+            .then(|| self.compact_before_send_tokens(resolved, cx))
+            .flatten()
+            .map(|tokens| t3_core::usage::context_window::format_context_tokens(Some(tokens)));
+        let keep_full_history = self.is_keep_full_history(cx);
+        let compacts_before_send = compact_tokens.is_some() && !keep_full_history;
         let attachment_block = if self.snapshot.pending.approvals.is_empty() {
             t3_core::composer::attachments::send_block_reason(&self.staged_attachments())
         } else {
@@ -225,20 +252,21 @@ impl Composer {
         };
         let settings = self.state.read(cx).client_settings;
         let follow_up = if self.snapshot.pending.approvals.is_empty() { settings.follow_up_behavior } else { rules::FollowUpBehavior::Steer };
-        let can_steer = !self.snapshot.compacting;
+        let can_steer = !self.snapshot.compaction_blocks_steer && !fresh_armed;
         let dispatch = rules::dispatch_mode(running, false, follow_up, can_steer);
         let alternate = rules::dispatch_mode(running, true, follow_up, can_steer);
-        let (kind, label) = match (editing_queued, running, dispatch) {
-            (true, _, _) => (RoundKind::Send, "Update queued message"),
-            (false, true, ComposerDispatch::Queue) => (RoundKind::Queue, "Queue message"),
-            (false, true, _) => (RoundKind::Steer, "Steer message"),
+        let (kind, label) = match (editing_queued, compacts_before_send, running, dispatch) {
+            (true, _, _, _) => (RoundKind::Send, "Update queued message"),
+            (false, true, _, _) => (RoundKind::Send, "Compact and send"),
+            (false, false, true, ComposerDispatch::Queue) => (RoundKind::Queue, "Queue message"),
+            (false, false, true, _) => (RoundKind::Steer, "Steer message"),
             _ => (RoundKind::Send, "Submit message"),
         };
-        let blocked = self.snapshot.setup_blocks_send || self.is_rewinding(cx);
+        let blocked = self.snapshot.setup_blocks_send || rewinding || !can_operate;
         let disabled = self.sending || !has_text || (resolved.model.is_none() && resolved.multi_models.is_empty()) || attachment_block.is_some() || blocked;
         let tooltip: SharedString = if resolved.model.is_none() && resolved.multi_models.is_empty() {
             "No provider available".into()
-        } else if self.is_rewinding(cx) {
+        } else if rewinding {
             "Reverting checkpoint...".into()
         } else if self.snapshot.setup_blocks_send {
             t3_core::worktree_setup::SEND_BLOCKED.into()
@@ -246,23 +274,55 @@ impl Composer {
             reason.into()
         } else if self.sending {
             if editing_queued { "Updating queued message".into() } else { "Submitting message".into() }
+        } else if let Some(tokens) = compact_tokens.as_deref().filter(|_| compacts_before_send) {
+            format!("Summarize {tokens} tokens of history, then send").into()
         } else if running && can_steer && !editing_queued {
             let action = |mode| if mode == ComposerDispatch::Queue { "queue" } else { "steer" };
             format!("Click to {}, ⌘-click to {}", action(dispatch), action(alternate)).into()
         } else {
             label.into()
         };
-        RoundButton::new("send", kind, tooltip)
-            .disabled(disabled)
-            .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
-                let modifier = event.modifiers().platform || event.modifiers().control;
-                let draft = matches!(this.snapshot.target, Some(Target::Draft(_)));
-                let key = rules::EnterKey { modifier, ..rules::EnterKey::default() };
-                let intent = rules::submit_intent(key, this.snapshot.running, draft, rules::SendShortcut::Enter, "");
-                if let Some(intent) = intent {
-                    this.submit(intent, window, cx);
-                }
-            }))
+        let submit_btn = div().flex_none().debug_selector(|| "send".to_owned()).child(
+            RoundButton::new("send", kind, tooltip)
+                .disabled(disabled)
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                    if this.stop_phase == StopPhase::Landed {
+                        return;
+                    }
+                    let modifier = event.modifiers().platform || event.modifiers().control;
+                    let draft = matches!(this.snapshot.target, Some(Target::Draft(_)));
+                    let key = rules::EnterKey { modifier, ..rules::EnterKey::default() };
+                    let intent = rules::submit_intent(key, this.snapshot.running, draft, rules::SendShortcut::Enter, "");
+                    if let Some(intent) = intent {
+                        this.submit(intent, window, cx);
+                    }
+                })),
+        );
+        let compact_toggle = compact_tokens.map(|tokens| {
+            let toggle_tooltip = if keep_full_history {
+                format!("Next send keeps all {tokens} tokens. Click to compact first")
+            } else {
+                format!("Next send compacts {tokens} tokens first. Click to keep full history")
+            };
+            div().flex_none().debug_selector(|| "compact-before-send".to_owned()).child(
+                ComposerControl::new("compact-before-send")
+                    .icon(Icon::Minimize2)
+                    .label(if keep_full_history { "Keep" } else { "Compact" })
+                    .suffix(div().text_color(hsla(p.muted_foreground)).child(SharedString::from(tokens)))
+                    .active(!keep_full_history)
+                    .disabled(!can_operate)
+                    .tooltip(toggle_tooltip)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_keep_full_history(cx))),
+            )
+        });
+        if compact_toggle.is_none() && !stop_retained {
+            return submit_btn.into_any_element();
+        }
+        h_flex()
+            .gap(px(8.))
+            .children(compact_toggle)
+            .child(submit_btn)
+            .when(stop_retained, |this| this.child(stop_button()))
             .into_any_element()
     }
 }
@@ -296,6 +356,7 @@ impl Render for Composer {
                 // Each composer takes its own shortcuts, so a side chat's never reach the open thread's.
                 .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| this.toggle_picker(window, cx)))
                 .on_action(cx.listener(|this, _: &super::OpenWorkspace, window, cx| this.open_workspace(window, cx)))
+                .on_action(cx.listener(|this, _: &super::OpenHost, window, cx| this.open_host(window, cx)))
                 .on_action(cx.listener(|this, _: &super::UsePreviousWorktree, window, cx| this.use_previous_worktree(window, cx)))
                 .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| this.open_permissions(window, cx)))
                 // The open menu takes these keys before the prompt does (`composerCommandKey`).

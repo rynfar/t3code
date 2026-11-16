@@ -140,6 +140,8 @@ async fn main() -> anyhow::Result<()> {
                 dispatch: commands::ComposerDispatch::Auto,
                 context: None,
                 attachments: &[],
+                fresh_context: false,
+                idle_compaction: None,
             });
             steps.push(message);
             let count = steps.len();

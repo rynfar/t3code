@@ -279,6 +279,11 @@ fn known_mode(mode: &str) -> Option<&'static str> {
     IDLE_COMPACTION_MODES.iter().map(|(value, _)| *value).find(|value| *value == mode)
 }
 
+/// Validates a known idle compaction mode (`onReturn`, `beforeCacheExpires`, `off`).
+pub fn known_idle_compaction_mode(mode: &str) -> Option<&'static str> {
+    known_mode(mode)
+}
+
 fn seconds(ms: u64) -> u64 {
     (ms + 500) / 1000
 }

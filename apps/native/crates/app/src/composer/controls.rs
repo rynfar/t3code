@@ -32,6 +32,7 @@ pub struct ComposerControl {
     max_label_width: Option<f32>,
     suffix: Option<AnyElement>,
     pressed: bool,
+    active: bool,
     emphasized: bool,
     disabled: bool,
     tooltip: Option<SharedString>,
@@ -48,6 +49,7 @@ impl ComposerControl {
             max_label_width: None,
             suffix: None,
             pressed: false,
+            active: false,
             emphasized: false,
             disabled: false,
             tooltip: None,
@@ -87,6 +89,12 @@ impl ComposerControl {
         self
     }
 
+    /// Toggled-on state (such as `Compact <tokens>`): uses accent fill while preserving tooltip.
+    pub fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
+    }
+
     /// Draws the icon in the label color, for a mode that differs from the default.
     pub fn emphasized(mut self, emphasized: bool) -> Self {
         self.emphasized = emphasized;
@@ -113,7 +121,7 @@ impl RenderOnce for ComposerControl {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
         let label_color = hsla(p.foreground).opacity(0.8);
-        let icon_color = if self.emphasized || self.pressed { label_color } else { hsla(p.muted_foreground) };
+        let icon_color = if self.emphasized || self.pressed || self.active { label_color } else { hsla(p.muted_foreground) };
         h_flex()
             .id(self.id)
             .h(px(28.))
@@ -123,8 +131,9 @@ impl RenderOnce for ComposerControl {
             .rounded(px(8.))
             .text_sm()
             .font_weight(FontWeight::MEDIUM)
-            .text_color(if self.pressed { hsla(p.foreground) } else { label_color })
+            .text_color(if self.pressed || self.active { hsla(p.foreground) } else { label_color })
             .when(self.pressed, |this| this.bg(hsla(p.accent)))
+            .when(!self.pressed && self.active, |this| this.bg(hsla(p.accent).opacity(0.6)))
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
             .when(!self.disabled, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground))))
             .children(self.icon.map(|glyph| glyph.render(px(16.), icon_color)))
@@ -143,6 +152,7 @@ impl RenderOnce for ComposerControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundKind {
     Send,
+    Resume,
     Steer,
     Queue,
     Stop,
@@ -188,6 +198,7 @@ impl RenderOnce for RoundButton {
             }
             kind => {
                 let (glyph, size) = match kind {
+                    RoundKind::Resume => (Icon::Play, 14.),
                     RoundKind::Steer => (Icon::CornerUpRight, 16.),
                     RoundKind::Queue => (Icon::ListPlus, 16.),
                     _ => (Icon::Send, 14.),
@@ -204,6 +215,7 @@ impl RenderOnce for RoundButton {
             .justify_center()
             .rounded_full()
             .bg(fill)
+            .when(self.disabled && self.kind == RoundKind::Stop, |this| this.opacity(DISABLED_OPACITY))
             .when(!self.disabled, |this| {
                 this.cursor_pointer().hover(|this| this.bg(hover)).shadow(vec![BoxShadow {
                     color: fill.opacity(0.24),

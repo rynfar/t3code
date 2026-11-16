@@ -344,6 +344,15 @@ pub struct ServerProvider {
     pub runtime_paths: Option<Value>,
     #[serde(default)]
     pub checked_at: CheckedAt,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub continuation: Option<ProviderContinuation>,
+}
+
+/// `ServerProviderContinuation`: providers sharing a `group_key` can hand off conversation context.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderContinuation {
+    pub group_key: String,
 }
 
 /// `ServerProviderSlashCommand`.

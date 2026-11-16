@@ -85,6 +85,7 @@ icons! {
     Download => "icons/lucide/download.svg",
     Earth => "icons/lucide/earth.svg",
     Ellipsis => "icons/lucide/ellipsis.svg",
+    Eraser => "icons/lucide/eraser.svg",
     ExternalLink => "icons/lucide/external-link.svg",
     Eye => "icons/lucide/eye.svg",
     File => "icons/lucide/file.svg",

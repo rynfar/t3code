@@ -57,6 +57,14 @@ impl NavHistory {
         &self.launched_from_draft
     }
 
+    pub fn mark_launching(&mut self, id: &str) {
+        self.launched_from_draft.insert(id.to_owned());
+    }
+
+    pub fn clear_launching(&mut self, id: &str) {
+        self.launched_from_draft.remove(id);
+    }
+
     pub fn retain_launching(&mut self, mut keep: impl FnMut(&str) -> bool) {
         self.launched_from_draft.retain(|id| keep(id));
     }

@@ -487,7 +487,7 @@ impl Composer {
         let items = match trigger.kind {
             TriggerKind::SlashCommand => {
                 let options = SlashMenuOptions {
-                    fresh_session: self.fresh_session_available(cx),
+                    fresh_session: self.fresh_session_command_available(cx),
                     side_chat: self.fixed.is_none() && state.side_chats_offered(),
                     side_chat_disabled: self.side_chat_disabled_reason(cx),
                     compact: self.compact_available(trigger, cx),

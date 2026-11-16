@@ -73,22 +73,12 @@ fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "interrupted" | "cancelled")
 }
 
-/// `isCompacting` in `ChatView.tsx` from server state: the active run is a `/compact` turn whose
-/// compaction has not settled, or a compaction is running. Steering into it is rejected, so a send
-/// queues behind it instead.
-pub fn is_compacting(projection: &ThreadProjection, active_run_id: Option<&str>) -> bool {
-    let Some(run_id) = active_run_id else { return false };
+fn compact_command_active(projection: &ThreadProjection, run_id: &str) -> bool {
     let items = || projection.visible_turn_items.iter().map(|row| &row.item);
-    let compaction_running = items().any(|item| {
-        matches!(item.kind, TurnItemKind::Compaction { .. }) && item.run_id.as_deref() == Some(run_id) && item.status == "running"
-    });
-    if compaction_running {
-        return true;
-    }
     let run_unfinished = projection.runs.iter().any(|run| run.id == run_id && run.is_unfinished());
     let compact_request = items().rev().find(|item| matches!(item.kind, TurnItemKind::UserMessage { .. })).is_some_and(|item| {
         matches!(&item.kind, TurnItemKind::UserMessage { text, attachments, .. }
-            if text.trim().eq_ignore_ascii_case("/compact") && attachments.is_empty())
+            if crate::composer::is_compact_command(text) && attachments.is_empty())
             && item.run_id.as_deref() == Some(run_id)
             && run_unfinished
     });
@@ -96,6 +86,49 @@ pub fn is_compacting(projection: &ThreadProjection, active_run_id: Option<&str>)
         matches!(item.kind, TurnItemKind::Compaction { .. }) && item.run_id.as_deref() == Some(run_id) && is_terminal(&item.status)
     });
     compact_request && !settled
+}
+
+/// `threadSteersDuringCompaction` (`client-runtime/src/state/threadWorkflows.ts`).
+pub fn steers_during_compaction(projection: &ThreadProjection) -> bool {
+    provider_session(projection)
+        .and_then(|session| session.pointer("/capabilities/turns/activeSteeringDuringCompaction"))
+        == Some(&Value::Bool(true))
+}
+
+/// `isCompacting` in `ChatView.tsx` from server state: the active run is a `/compact` turn whose
+/// compaction has not settled, or a compaction is running.
+pub fn is_compacting(projection: &ThreadProjection, active_run_id: Option<&str>) -> bool {
+    let Some(run_id) = active_run_id else { return false };
+    let compaction_running = projection.visible_turn_items.iter().map(|row| &row.item).any(|item| {
+        matches!(item.kind, TurnItemKind::Compaction { .. }) && item.run_id.as_deref() == Some(run_id) && item.status == "running"
+    });
+    compaction_running || compact_command_active(projection, run_id)
+}
+
+/// `compactionBlocksSteering` (`client-runtime/src/state/composerDispatch.ts`): automatic
+/// compaction allows steering only when the active session declares `activeSteeringDuringCompaction`.
+pub fn compaction_blocks_steering(projection: &ThreadProjection, active_run_id: Option<&str>) -> bool {
+    let Some(run_id) = active_run_id else { return false };
+    if compact_command_active(projection, run_id) {
+        return true;
+    }
+    let compaction_running = projection.visible_turn_items.iter().map(|row| &row.item).any(|item| {
+        matches!(item.kind, TurnItemKind::Compaction { .. }) && item.run_id.as_deref() == Some(run_id) && item.status == "running"
+    });
+    if !compaction_running {
+        return false;
+    }
+    if !steers_during_compaction(projection) {
+        return true;
+    }
+    let Some(run) = projection.runs.iter().find(|run| run.id == run_id) else {
+        return false;
+    };
+    projection.messages.iter().find(|entity| entity.id == run.user_message_id).is_some_and(|entity| {
+        let attachments_empty = entity.value.get("attachments").and_then(Value::as_array).is_none_or(Vec::is_empty);
+        let text = entity.value.get("text").and_then(Value::as_str).unwrap_or("");
+        attachments_empty && crate::composer::is_compact_command(text)
+    })
 }
 
 /// `derivePendingBackgroundWork(...).length > 0` for a thread's own projection, pull request

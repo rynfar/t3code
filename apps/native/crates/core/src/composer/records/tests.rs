@@ -171,6 +171,8 @@ fn all_portable_kinds_survive_copy_paste_and_send_without_changing_prompt_text()
         dispatch: crate::commands::ComposerDispatch::Auto,
         context: Some(&context),
         attachments: &[],
+        fresh_context: false,
+        idle_compaction: None,
     });
     assert_eq!(
         command["text"],

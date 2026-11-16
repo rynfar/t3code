@@ -69,6 +69,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "chat.find" => Box::new(crate::thread_view::FindInThread),
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),
         "composer.workspace" => Box::new(crate::composer::OpenWorkspace),
+        "composer.host" => Box::new(crate::composer::OpenHost),
         "composer.previousWorktree" => Box::new(crate::composer::UsePreviousWorktree),
         "composer.mode" => Box::new(crate::composer::OpenPermissions),
         "composer.stash" => Box::new(crate::composer::StashPrompt),

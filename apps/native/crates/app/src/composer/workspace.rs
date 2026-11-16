@@ -1,16 +1,20 @@
 //! Draft workspace menu and previous entry from `BranchToolbar.tsx`,
 //! `BranchToolbarEnvModeSelector.tsx` and `PreviousWorktreeItemContent.tsx`.
 
-use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, Task, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, Context, IntoElement, ParentElement, Styled, Task, Window, div, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
 use t3_core::commands::method;
 use t3_core::server_config::ThreadEnvMode;
+use t3_core::sidebar::grouping::{EnvironmentOwner, GroupConsumer};
+use t3_core::vcs::VcsRef;
 use t3_core::workspace::{self as rules, DraftWorkspace, PreviousThread, PreviousWorktreeSeed};
 
 use super::controls::{ComposerControl, Float, MenuItem, floating, menu_surface};
 use super::{Composer, Target, drafts};
 use super::menu::MenuKey;
+use crate::app_state::ScopedRouteAction;
 use crate::icons::Icon;
+use crate::new_thread::environment_machine_icon;
 use crate::theme::{hsla, palette};
 
 #[derive(Clone, PartialEq, Eq)]
@@ -27,13 +31,28 @@ struct Scope {
 pub(super) struct Workspace {
     scope: Option<Scope>,
     is_repo: bool,
+    refs: Vec<VcsRef>,
+    default_start_from_origin: bool,
     default_mode: Option<ThreadEnvMode>,
     previous: Option<PreviousWorktreeSeed>,
     pub(super) open: bool,
     highlighted: usize,
+    pub(super) branch_open: bool,
+    branch_highlighted: usize,
+    pub(super) host_open: bool,
+    host_highlighted: usize,
     loading: bool,
     error: Option<String>,
     task: Option<Task<()>>,
+}
+
+#[derive(Clone)]
+struct HostOption {
+    owner: Option<EnvironmentOwner>,
+    saved_id: String,
+    project_id: String,
+    label: String,
+    is_primary: bool,
 }
 
 impl Composer {
@@ -101,6 +120,8 @@ impl Composer {
             return;
         };
         let configured = rules::configured_env_mode(&config.settings, &scope.project);
+        let default_start_from_origin = rules::start_from_origin(&config.settings, &scope.project, ThreadEnvMode::Worktree);
+        self.workspace.default_start_from_origin = default_start_from_origin;
         let new_root = config.new_projects_root.clone();
         let has_threads = state.shell.snapshot.as_ref().is_some_and(|shell| {
             shell.threads.iter().any(|thread| thread.project_id == scope.project)
@@ -137,6 +158,7 @@ impl Composer {
                 match result {
                     Ok(Some(refs)) => {
                         this.workspace.is_repo = refs.is_repo;
+                        this.workspace.refs = refs.refs;
                         this.workspace.error = None;
                     }
                     Ok(None) => {
@@ -156,6 +178,8 @@ impl Composer {
             return;
         }
         self.workspace.open = !self.workspace.open;
+        self.workspace.branch_open = false;
+        self.workspace.host_open = false;
         if self.workspace.open {
             let choice = self.workspace_choice();
             self.workspace.highlighted = usize::from(choice.map_or(self.workspace.default_mode.unwrap_or(ThreadEnvMode::Local) == ThreadEnvMode::Worktree, |choice| choice.mode == ThreadEnvMode::Worktree && choice.previous.is_none()));
@@ -165,7 +189,83 @@ impl Composer {
         cx.notify();
     }
 
+    pub(crate) fn open_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (_, options, can_pick) = self.host_options(cx);
+        if self.is_rewinding(cx) || !can_pick || options.is_empty() || !matches!(self.snapshot.target, Some(Target::Draft(_))) {
+            if self.workspace.host_open {
+                self.workspace.host_open = false;
+                cx.notify();
+            }
+            return;
+        }
+        self.workspace.host_open = !self.workspace.host_open;
+        self.workspace.open = false;
+        self.workspace.branch_open = false;
+        if self.workspace.host_open {
+            let active = self.state.read(cx).environments.active.as_deref();
+            self.workspace.host_highlighted = options
+                .iter()
+                .position(|opt| active == Some(opt.saved_id.as_str()))
+                .unwrap_or(0);
+        }
+        self.focus(window, cx);
+        cx.notify();
+    }
+
     pub(super) fn workspace_key(&mut self, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.workspace.host_open {
+            let (_, options, can_pick) = self.host_options(cx);
+            if !can_pick || options.is_empty() || !matches!(self.snapshot.target, Some(Target::Draft(_))) {
+                self.workspace.host_open = false;
+                cx.notify();
+                return false;
+            }
+            let count = options.len();
+            self.workspace.host_highlighted = self.workspace.host_highlighted.min(count - 1);
+            match key {
+                MenuKey::Up => self.workspace.host_highlighted = (self.workspace.host_highlighted + count - 1) % count,
+                MenuKey::Down => self.workspace.host_highlighted = (self.workspace.host_highlighted + 1) % count,
+                MenuKey::Dismiss => {
+                    self.workspace.host_open = false;
+                    self.focus(window, cx);
+                }
+                MenuKey::Accept => {
+                    if let Some(option) = options.get(self.workspace.host_highlighted).cloned() {
+                        self.select_host(option, window, cx);
+                    }
+                }
+                MenuKey::Delete => return false,
+            }
+            cx.notify();
+            return true;
+        }
+        if self.workspace.branch_open {
+            if !self.base_branch_picker_visible(cx) {
+                self.workspace.branch_open = false;
+                cx.notify();
+                return false;
+            }
+            let count = 1 + self.workspace.refs.len();
+            self.workspace.branch_highlighted = self.workspace.branch_highlighted.min(count - 1);
+            match key {
+                MenuKey::Up => self.workspace.branch_highlighted = (self.workspace.branch_highlighted + count - 1) % count,
+                MenuKey::Down => self.workspace.branch_highlighted = (self.workspace.branch_highlighted + 1) % count,
+                MenuKey::Dismiss => {
+                    self.workspace.branch_open = false;
+                    self.focus(window, cx);
+                }
+                MenuKey::Accept => {
+                    if self.workspace.branch_highlighted == 0 {
+                        self.toggle_start_from_origin(window, cx);
+                    } else if let Some(reference) = self.workspace.refs.get(self.workspace.branch_highlighted - 1).cloned() {
+                        self.choose_base_branch(reference.name, window, cx);
+                    }
+                }
+                MenuKey::Delete => return false,
+            }
+            cx.notify();
+            return true;
+        }
         if !self.workspace.open {return false;}
         self.sync_workspace(false, cx);
         if !self.workspace.open || !self.workspace_enabled() {self.workspace.open = false; cx.notify(); return false;}
@@ -210,15 +310,357 @@ impl Composer {
         self.record_draft(&target, cx);
         let mut draft = self.drafts.store.get(&drafts::key(&target)).cloned().unwrap_or_default();
         draft.updated_at = crate::sidebar::controller::now_ms();
-        draft.workspace = Some(DraftWorkspace { destination: Some(scope.destination), branch: None, environment_id: scope.environment, project_root: scope.root, mode, previous });
+        let existing = draft.workspace.as_ref().filter(|w| w.in_scope(&scope.environment, &scope.root));
+        let branch = existing.and_then(|w| w.branch.clone());
+        let start_from_origin = existing.and_then(|w| w.start_from_origin);
+        draft.workspace = Some(DraftWorkspace {
+            destination: Some(scope.destination),
+            branch,
+            start_from_origin,
+            environment_id: scope.environment,
+            project_root: scope.root,
+            mode,
+            previous,
+        });
         self.mutate_drafts(cx, |store| store.set(&drafts::key(&target), draft));
         self.schedule_draft_save(&target, cx);
         self.workspace.open = false;
+        self.workspace.branch_open = false;
+        self.workspace.host_open = false;
         self.error = None;
         self.sync_workspace(false, cx);
         self.sync_menu(true, cx);
         self.focus(window, cx);
         cx.notify();
+    }
+
+    fn base_branch_picker_visible(&self, cx: &App) -> bool {
+        if !self.workspace_enabled() || self.has_multiple_models(cx) {
+            return false;
+        }
+        let choice = self.workspace_choice();
+        let previous = choice.and_then(|choice| choice.previous.as_ref());
+        let mode = choice.map_or(self.workspace.default_mode.unwrap_or(ThreadEnvMode::Local), |choice| choice.mode);
+        self.workspace.is_repo && mode == ThreadEnvMode::Worktree && previous.is_none()
+    }
+
+    fn effective_base_branch(&self) -> (Option<String>, Option<bool>, bool) {
+        let choice = self.workspace_choice();
+        let branch = choice.and_then(|c| c.branch.clone()).or_else(|| {
+            self.workspace
+                .refs
+                .iter()
+                .find(|r| r.is_default)
+                .or_else(|| self.workspace.refs.iter().find(|r| r.current))
+                .map(|r| r.name.clone())
+        });
+        let is_remote = branch
+            .as_deref()
+            .and_then(|name| self.workspace.refs.iter().find(|r| r.name == name))
+            .and_then(|r| r.is_remote);
+        let start_from_origin = choice
+            .and_then(|c| c.start_from_origin)
+            .unwrap_or(self.workspace.default_start_from_origin);
+        (branch, is_remote, start_from_origin)
+    }
+
+    fn open_base_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.base_branch_picker_visible(cx) || self.is_rewinding(cx) {
+            self.workspace.branch_open = false;
+            cx.notify();
+            return;
+        }
+        self.workspace.branch_open = !self.workspace.branch_open;
+        self.workspace.open = false;
+        self.workspace.host_open = false;
+        if self.workspace.branch_open {
+            let (selected, _, _) = self.effective_base_branch();
+            self.workspace.branch_highlighted = selected
+                .as_deref()
+                .and_then(|name| self.workspace.refs.iter().position(|r| r.name == name))
+                .map_or(0, |index| index + 1);
+            self.sync_workspace(true, cx);
+        }
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn mutate_draft_workspace(&mut self, cx: &mut Context<Self>, edit: impl FnOnce(&mut DraftWorkspace)) {
+        let Some(scope) = self.workspace.scope.clone() else { return };
+        let target = Target::Draft(scope.project);
+        self.record_draft(&target, cx);
+        let mut draft = self.drafts.store.get(&drafts::key(&target)).cloned().unwrap_or_default();
+        draft.updated_at = crate::sidebar::controller::now_ms();
+        let default_mode = self.workspace.default_mode.unwrap_or(ThreadEnvMode::Local);
+        let mut workspace = draft
+            .workspace
+            .filter(|w| w.in_scope(&scope.environment, &scope.root))
+            .unwrap_or(DraftWorkspace {
+                destination: Some(scope.destination.clone()),
+                branch: None,
+                start_from_origin: None,
+                environment_id: scope.environment,
+                project_root: scope.root,
+                mode: default_mode,
+                previous: None,
+            });
+        workspace.destination = Some(scope.destination);
+        edit(&mut workspace);
+        draft.workspace = Some(workspace);
+        self.mutate_drafts(cx, |store| store.set(&drafts::key(&target), draft));
+        self.schedule_draft_save(&target, cx);
+    }
+
+    fn choose_base_branch(&mut self, branch: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.base_branch_picker_visible(cx) {
+            return;
+        }
+        self.mutate_draft_workspace(cx, |workspace| {
+            workspace.mode = ThreadEnvMode::Worktree;
+            workspace.previous = None;
+            workspace.branch = Some(branch);
+        });
+        self.workspace.branch_open = false;
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_start_from_origin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.base_branch_picker_visible(cx) {
+            return;
+        }
+        let (_, _, current) = self.effective_base_branch();
+        self.mutate_draft_workspace(cx, |workspace| {
+            workspace.start_from_origin = Some(!current);
+        });
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn host_options(&self, cx: &App) -> (Option<HostOption>, Vec<HostOption>, bool) {
+        let state = self.state.read(cx);
+        let active_env = state.environments.active.as_deref();
+        let active_project = self.snapshot.project_id.as_deref();
+        let primary_id = state.local_saved_environment().map(|env| env.id.as_str()).or_else(|| {
+            let mut local = state.environments.environments.iter().filter(|env| env.local);
+            let first = local.next()?;
+            local.next().is_none().then_some(first.id.as_str())
+        });
+        if state.fleet.environments.is_empty() {
+            let Some(saved) = state.environments.active() else {
+                return (None, Vec::new(), false);
+            };
+            let is_primary = primary_id == Some(saved.id.as_str()) || saved.local;
+            let opt = HostOption {
+                owner: None,
+                saved_id: saved.id.clone(),
+                project_id: active_project.unwrap_or_default().to_owned(),
+                label: saved.label.clone(),
+                is_primary,
+            };
+            let show = !is_primary || state.environments.environments.len() > 1;
+            return (show.then_some(opt), Vec::new(), false);
+        }
+        let mut group_options: Vec<HostOption> = Vec::new();
+        if let Some(pid) = active_project {
+            for group in state.project_groups_for(GroupConsumer::DraftPicker, cx) {
+                let matches = group.registrations.iter().any(|reg| {
+                    reg.project.id == pid && active_env.is_none_or(|env| env == reg.owner.saved_id)
+                });
+                if !matches {
+                    continue;
+                }
+                for reg in group.registrations {
+                    let is_primary = primary_id == Some(reg.owner.saved_id.as_str())
+                        || state.environments.environments.iter().any(|e| e.id == reg.owner.saved_id && e.local);
+                    let label = if reg.environment_label.trim().is_empty() {
+                        state
+                            .environments
+                            .environments
+                            .iter()
+                            .find(|e| e.id == reg.owner.saved_id)
+                            .map(|e| e.label.clone())
+                            .unwrap_or_else(|| reg.owner.saved_id.clone())
+                    } else {
+                        reg.environment_label
+                    };
+                    let saved_id = reg.owner.saved_id.clone();
+                    group_options.push(HostOption {
+                        owner: Some(reg.owner),
+                        saved_id,
+                        project_id: reg.project.id,
+                        label,
+                        is_primary,
+                    });
+                }
+                break;
+            }
+        }
+        let active = group_options
+            .iter()
+            .find(|opt| active_env == Some(opt.saved_id.as_str()))
+            .cloned()
+            .or_else(|| {
+                let saved = state.environments.active()?;
+                let is_primary = primary_id == Some(saved.id.as_str()) || saved.local;
+                let owner = state.scoped_environment(&saved.id).map(|entry| entry.summary.owner.clone());
+                Some(HostOption {
+                    owner,
+                    saved_id: saved.id.clone(),
+                    project_id: active_project.unwrap_or_default().to_owned(),
+                    label: saved.label.clone(),
+                    is_primary,
+                })
+            });
+        let can_pick = group_options.len() > 1;
+        let show = can_pick || active.as_ref().is_some_and(|opt| !opt.is_primary);
+        if !show {
+            return (None, Vec::new(), false);
+        }
+        (active, group_options, can_pick)
+    }
+
+    fn select_host(&mut self, option: HostOption, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.host_open = false;
+        let Some(owner) = option.owner else {
+            self.focus(window, cx);
+            cx.notify();
+            return;
+        };
+        let (from_project, same_env) = {
+            let state = self.state.read(cx);
+            (state.draft_project.clone(), state.environments.active.as_deref() == Some(option.saved_id.as_str()))
+        };
+        if same_env && from_project.as_deref() == Some(option.project_id.as_str()) {
+            self.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        if let Some(from) = from_project {
+            self.retarget_draft(&from, &option.project_id, same_env, window, cx);
+        }
+        self.state.update(cx, |state, cx| {
+            state.navigate_scoped(owner, ScopedRouteAction::Draft(option.project_id), cx);
+        });
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn render_host_selector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (active, options, can_pick) = self.host_options(cx);
+        let active = active?;
+        let p = palette(cx);
+        let state = self.state.read(cx);
+        let icon = environment_machine_icon(state, &active.saved_id);
+        let is_draft = matches!(self.snapshot.target, Some(Target::Draft(_)));
+        let interactive = is_draft && can_pick && !self.is_rewinding(cx);
+        if !interactive {
+            return Some(
+                ComposerControl::new("composer-host")
+                    .icon(icon)
+                    .label(active.label.clone())
+                    .tooltip(active.label)
+                    .disabled(true)
+                    .into_any_element(),
+            );
+        }
+        let tooltip = crate::keymap::label("composer.host", cx)
+            .map_or_else(|| active.label.clone(), |shortcut| format!("{} · {}", active.label, shortcut));
+        let mut popup = menu_surface(cx)
+            .w(px(260.))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.workspace.host_open = false;
+                cx.notify();
+            }))
+            .child(div().px(px(8.)).py(px(6.)).text_xs().text_color(hsla(p.muted_foreground)).child("Run on"));
+        let active_env = state.environments.active.as_deref();
+        for (index, option) in options.into_iter().enumerate() {
+            let checked = active_env == Some(option.saved_id.as_str());
+            let highlighted = self.workspace.host_highlighted == index;
+            let opt_icon = environment_machine_icon(state, &option.saved_id);
+            let label = option.label.clone();
+            popup = popup.child(
+                MenuItem::new(("host-opt", index), label)
+                    .icon(opt_icon, hsla(p.muted_foreground))
+                    .checked(checked)
+                    .highlighted(highlighted)
+                    .on_click(cx.listener(move |this, _, window, cx| this.select_host(option.clone(), window, cx))),
+            );
+        }
+        Some(
+            div()
+                .relative()
+                .min_w_0()
+                .child(
+                    ComposerControl::new("composer-host")
+                        .icon(icon)
+                        .label(active.label)
+                        .pressed(self.workspace.host_open)
+                        .tooltip(tooltip)
+                        .on_click(cx.listener(|this, _, window, cx| this.open_host(window, cx))),
+                )
+                .when(self.workspace.host_open, |this| this.child(floating(Float::AboveStart, div().mb(px(4.)).child(popup))))
+                .into_any_element(),
+        )
+    }
+
+    fn render_base_branch_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.base_branch_picker_visible(cx) {
+            return None;
+        }
+        let p = palette(cx);
+        let (branch, is_remote, start_from_origin) = self.effective_base_branch();
+        let label = t3_core::vcs::branch_trigger_label(true, branch.as_deref(), is_remote, start_from_origin);
+        let mut popup = menu_surface(cx)
+            .w(px(300.))
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.workspace.branch_open = false;
+                cx.notify();
+            }))
+            .child(div().px(px(8.)).py(px(6.)).text_xs().text_color(hsla(p.muted_foreground)).child("Base branch"))
+            .child(
+                MenuItem::new("base-branch-origin", "Start from origin")
+                    .checked(start_from_origin)
+                    .highlighted(self.workspace.branch_highlighted == 0)
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_start_from_origin(window, cx))),
+            );
+        let mut refs_list = div().id("base-branch-refs").max_h(px(220.)).overflow_y_scroll();
+        for (index, reference) in self.workspace.refs.iter().enumerate() {
+            let name = reference.name.clone();
+            let checked = branch.as_deref() == Some(name.as_str());
+            let highlighted = self.workspace.branch_highlighted == index + 1;
+            let row_label = if reference.is_remote == Some(true) {
+                format!("{name} (remote)")
+            } else {
+                name.clone()
+            };
+            refs_list = refs_list.child(
+                MenuItem::new(("base-branch-ref", index), row_label)
+                    .checked(checked)
+                    .highlighted(highlighted)
+                    .on_click(cx.listener(move |this, _, window, cx| this.choose_base_branch(name.clone(), window, cx))),
+            );
+        }
+        popup = popup.child(refs_list);
+        Some(
+            div()
+                .relative()
+                .min_w_0()
+                .child(
+                    ComposerControl::new("composer-base-branch")
+                        .icon(Icon::GitBranch)
+                        .label(label.clone())
+                        .max_label_width(220.)
+                        .suffix(Icon::ChevronDown.render(px(12.), hsla(p.muted_foreground)))
+                        .pressed(self.workspace.branch_open)
+                        .tooltip(label)
+                        .on_click(cx.listener(|this, _, window, cx| this.open_base_branch_picker(window, cx))),
+                )
+                .when(self.workspace.branch_open, |this| this.child(floating(Float::AboveStart, div().mb(px(4.)).child(popup))))
+                .into_any_element(),
+        )
     }
 
     pub(crate) fn use_previous_worktree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -235,9 +677,12 @@ impl Composer {
     }
 
     pub(super) fn render_workspace(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.workspace_visible() {
+        let host = self.render_host_selector(cx);
+        let workspace_visible = self.workspace_visible();
+        if !workspace_visible && host.is_none() {
             return None;
         }
+        let mode_control = workspace_visible.then(|| {
         let p = palette(cx);
         let choice = self.workspace_choice();
         let previous = choice.and_then(|choice| choice.previous.as_ref());
@@ -310,29 +755,38 @@ impl Composer {
                 .child(div().px(px(8.)).py(px(6.)).text_xs().text_color(hsla(p.error_foreground)).child(error.clone()))
                 .child(MenuItem::new("workspace-retry", "Retry").highlighted(self.workspace.highlighted == 2 + usize::from(self.workspace.previous.is_some())).on_click(cx.listener(|this, _, _, cx| this.sync_workspace(true, cx))));
         }
+        div()
+            .relative()
+            .min_w_0()
+            .child(
+                ComposerControl::new("composer-workspace")
+                    .icon(if previous.is_some() {
+                        Icon::FolderGit
+                    } else if mode == ThreadEnvMode::Worktree {
+                        Icon::FolderGit2
+                    } else {
+                        Icon::Folder
+                    })
+                    .label(label)
+                    .when_some(previous.and_then(|seed| seed.branch.clone()), |control, branch| {
+                        control.suffix(div().min_w_0().max_w(px(224.)).truncate().text_xs().text_color(hsla(p.muted_foreground)).child(branch))
+                    })
+                    .pressed(self.workspace.open)
+                    .disabled(!enabled)
+                    .tooltip(tooltip)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_workspace(window, cx))),
+            )
+            .when(self.workspace.open && enabled, |this| this.child(floating(Float::AboveStart, div().mb(px(4.)).child(popup))))
+            .into_any_element()
+        });
+        let base_branch = self.render_base_branch_picker(cx);
         Some(
-            div()
-                .relative()
+            h_flex()
                 .min_w_0()
-                .child(
-                    ComposerControl::new("composer-workspace")
-                        .icon(if previous.is_some() {
-                            Icon::FolderGit
-                        } else if mode == ThreadEnvMode::Worktree {
-                            Icon::FolderGit2
-                        } else {
-                            Icon::Folder
-                        })
-                        .label(label)
-                        .when_some(previous.and_then(|seed| seed.branch.clone()), |control, branch| {
-                            control.suffix(div().min_w_0().max_w(px(224.)).truncate().text_xs().text_color(hsla(p.muted_foreground)).child(branch))
-                        })
-                        .pressed(self.workspace.open)
-                        .disabled(!enabled)
-                        .tooltip(tooltip)
-                        .on_click(cx.listener(|this, _, window, cx| this.open_workspace(window, cx))),
-                )
-                .when(self.workspace.open && enabled, |this| this.child(floating(Float::AboveStart, div().mb(px(4.)).child(popup))))
+                .gap(px(4.))
+                .children(host)
+                .children(mode_control)
+                .children(base_branch)
                 .into_any_element(),
         )
     }

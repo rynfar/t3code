@@ -110,6 +110,41 @@ fn compacting_covers_a_running_compaction_and_an_unsettled_compact_turn() {
 }
 
 #[test]
+fn compaction_blocks_steering_allows_steers_during_auto_compaction_when_capable() {
+    let compacting = item("c1", "r1", "running", json!({"type": "compaction"}));
+    let runs = vec![run("r1", 1, "running", None)];
+    let capable_session = json!({
+        "providerSessions": [{
+            "id": "s1",
+            "status": "running",
+            "capabilities": {"turns": {"activeSteeringDuringCompaction": true}}
+        }]
+    });
+    let normal_message = json!([{"id": "m0", "text": "fix the tests", "attachments": []}]);
+    let compact_message = json!([{"id": "m0", "text": "/compact", "attachments": []}]);
+
+    // Auto compaction: blocked without capability, allowed with capability.
+    let without_cap = projection(runs.clone(), vec![compacting.clone()], json!({"messages": normal_message}));
+    assert!(compaction_blocks_steering(&without_cap, Some("r1")));
+
+    let auto_capable = projection(
+        runs.clone(),
+        vec![compacting.clone()],
+        json!({"providerSessions": capable_session["providerSessions"], "messages": normal_message}),
+    );
+    assert!(steers_during_compaction(&auto_capable));
+    assert!(!compaction_blocks_steering(&auto_capable, Some("r1")));
+
+    // Explicit `/compact` command still blocks even when session advertises activeSteeringDuringCompaction.
+    let explicit_capable = projection(
+        runs,
+        vec![compacting],
+        json!({"providerSessions": capable_session["providerSessions"], "messages": compact_message}),
+    );
+    assert!(compaction_blocks_steering(&explicit_capable, Some("r1")));
+}
+
+#[test]
 fn stop_targets_the_live_run_or_background_work_when_thread_stop_is_missing() {
     let live = projection(vec![run("r1", 1, "completed", None), run("r2", 2, "waiting", None)], vec![], json!({}));
     assert_eq!(stop_target(Some(&live), None, true), StopTarget::Thread);

@@ -25,6 +25,13 @@ pub struct QueuedRun {
     pub attachments: Vec<Value>,
     /// A guest's message can be cancelled, not rewritten.
     pub editable: bool,
+    pub fresh_context: bool,
+    pub created_at: Option<String>,
+    pub attribution: Option<crate::timeline::Attribution>,
+    pub scheduled_task_id: Option<String>,
+    pub sender_thread_id: Option<String>,
+    pub linked_sender: Option<crate::turn_item::LinkedSender>,
+    pub guest_name: Option<String>,
 }
 
 impl QueuedRun {
@@ -47,9 +54,15 @@ pub struct QueueState {
 }
 
 impl QueueState {
+    /// "Send now" works for a run: start a turn when idle, else steer the running one unless
+    /// `fresh_context` forbids steering into a non-compaction turn (`QueuedRunsControl.tsx`).
+    pub fn can_send_run(&self, fresh_context: bool) -> bool {
+        self.can_send_now || (self.can_promote_to_steer && (!fresh_context || self.promote_skips_compaction))
+    }
+
     /// "Send now" works: start a turn, or steer the running one.
     pub fn can_send(&self) -> bool {
-        self.can_send_now || self.can_promote_to_steer
+        self.can_send_run(false)
     }
 
     /// The Send now tooltip.
@@ -109,18 +122,58 @@ pub fn queue_state(projection: &ThreadProjection) -> QueueState {
         .map(|run| {
             let message = message(projection, &run.user_message_id);
             let guest = message.and_then(|message| message.pointer("/context/guest")).filter(|guest| !guest.is_null());
-            let text = guest
-                .and_then(|guest| guest.get("text"))
-                .or_else(|| message.and_then(|message| message.get("text")))
+            let guest_name = guest
+                .and_then(|guest| guest.get("name"))
                 .and_then(Value::as_str)
-                .unwrap_or("Queued message")
-                .to_owned();
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned);
+            let guest_text = guest.and_then(|guest| guest.get("text")).and_then(Value::as_str);
+            let raw_text = message.and_then(|message| message.get("text")).and_then(Value::as_str).unwrap_or("Queued message");
+            let linked_sender = message
+                .and_then(|message| message.get("linkedSender"))
+                .filter(|value| !value.is_null())
+                .and_then(|value| serde_json::from_value::<crate::turn_item::LinkedSender>(value.clone()).ok());
+            let meta_task_id = message.and_then(|message| message.get("scheduledTaskId")).and_then(Value::as_str);
+            let scheduled_task_id = crate::timeline::scheduled_task_id_from_fields(&run.user_message_id, meta_task_id);
+            let created_by = message.and_then(|message| message.get("createdBy")).and_then(Value::as_str);
+            let creation_source = message.and_then(|message| message.get("creationSource")).and_then(Value::as_str);
+            let attribution = crate::timeline::attribution_for_fields(
+                &run.user_message_id,
+                raw_text,
+                guest_name.is_some() || guest_text.is_some(),
+                meta_task_id,
+                linked_sender.is_some(),
+                created_by,
+                creation_source,
+            );
+            let stripped_text = if attribution == Some(crate::timeline::Attribution::Automation) {
+                crate::timeline::strip_legacy_automation_prefix(raw_text).unwrap_or(raw_text)
+            } else {
+                raw_text
+            };
+            let text = guest_text.unwrap_or(stripped_text).to_owned();
+            let created_at = message
+                .and_then(|message| message.get("createdAt"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let sender_thread_id = message
+                .and_then(|message| message.get("senderThreadId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             QueuedRun {
                 run_id: run.id.clone(),
                 message_id: run.user_message_id.clone(),
                 text,
                 attachments: message.and_then(|message| message.get("attachments")).and_then(Value::as_array).cloned().unwrap_or_default(),
                 editable: guest.is_none(),
+                fresh_context: run.fresh_context == Some(true),
+                created_at,
+                attribution,
+                scheduled_task_id,
+                sender_thread_id,
+                linked_sender,
+                guest_name,
             }
         })
         .collect();
@@ -184,8 +237,12 @@ pub fn promote_queued_run(command_id: &str, thread_id: &str, queued_run_id: &str
     })
 }
 
-/// "Send now": start a turn when idle, else steer the active one.
+/// "Send now": start a turn when idle, else steer the active one unless blocked by `fresh_context`.
 pub fn send_now(state: &QueueState, command_id: &str, thread_id: &str, run_id: &str) -> Option<Value> {
+    let fresh_context = state.queued.iter().any(|run| run.run_id == run_id && run.fresh_context);
+    if !state.can_send_run(fresh_context) {
+        return None;
+    }
     if state.can_send_now {
         return Some(start_queued_run(command_id, thread_id, run_id));
     }

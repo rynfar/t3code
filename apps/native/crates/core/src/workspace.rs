@@ -88,6 +88,8 @@ pub struct VcsRef {
     pub current: bool,
     #[serde(default)]
     pub is_default: bool,
+    #[serde(default)]
+    pub is_remote: bool,
 }
 
 /// `VcsListRefsResult`, the parts a launch reads.
@@ -170,6 +172,27 @@ pub fn launch_strategy(mode: ThreadEnvMode, refs: Option<&VcsRefs>, start_from_o
     }
 }
 
+/// `planComposerTurn` honoring an explicit base branch and `startFromOrigin` override stored on
+/// `DraftWorkspace` (`WorktreeBaseBranchPicker`).
+pub fn effective_strategy(
+    choice: Option<&DraftWorkspace>,
+    mode: ThreadEnvMode,
+    refs: Option<&VcsRefs>,
+    default_start_from_origin: bool,
+) -> Result<Strategy, &'static str> {
+    if let Some(selected) = choice.and_then(DraftWorkspace::strategy) {
+        return Ok(selected);
+    }
+    if mode == ThreadEnvMode::Local || refs.is_some_and(|refs| !refs.is_repo) {
+        return Ok(Strategy::Root);
+    }
+    let start_from_origin = choice.and_then(|c| c.start_from_origin).unwrap_or(default_start_from_origin);
+    match choice.and_then(|c| c.branch.clone()).or_else(|| refs.and_then(base_branch)) {
+        Some(base_ref) => Ok(Strategy::Worktree { base_ref, start_from_origin }),
+        None => Err("Select a base branch before sending in New worktree mode."),
+    }
+}
+
 /// `resolvePreviousWorktreeSeed` reads project-scoped shells, never a checkout history.
 pub struct PreviousThread<'a> {
     pub project_id: &'a str,
@@ -246,6 +269,8 @@ pub struct DraftWorkspace {
     pub destination: Option<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_from_origin: Option<bool>,
     pub environment_id: String,
     pub project_root: String,
     pub mode: ThreadEnvMode,

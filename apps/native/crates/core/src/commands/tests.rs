@@ -29,6 +29,8 @@ fn composer_message_steers_with_delivery_intent_and_queues_without_it() {
         dispatch,
         context: None,
         attachments: &[],
+        fresh_context: false,
+        idle_compaction: None,
     };
     let steer = composer_message(&message(ComposerDispatch::Steer));
     assert_eq!(steer["dispatchMode"], json!({ "type": "start_immediately" }));
@@ -40,11 +42,33 @@ fn composer_message_steers_with_delivery_intent_and_queues_without_it() {
     assert_eq!(queue["dispatchMode"], json!({ "type": "queue_after_active" }));
     assert!(queue.get("deliveryIntent").is_none());
     assert!(queue.get("context").is_none());
+    assert!(queue.get("freshContext").is_none());
+    assert!(queue.get("idleCompaction").is_none());
     let context = json!({ "version": 1, "records": [] });
     let attachments = [json!({ "type": "image", "id": "a1" })];
-    let with_context = composer_message(&ComposerMessage { context: Some(&context), attachments: &attachments, ..message(ComposerDispatch::Auto) });
+    let with_context = composer_message(&ComposerMessage {
+        context: Some(&context),
+        attachments: &attachments,
+        fresh_context: true,
+        idle_compaction: Some("onReturn"),
+        ..message(ComposerDispatch::Auto)
+    });
     assert_eq!(with_context["context"], context);
     assert_eq!(with_context["attachments"], json!([{ "type": "image", "id": "a1" }]));
+    assert_eq!(with_context["freshContext"], json!(true));
+    assert_eq!(with_context["idleCompaction"], json!("onReturn"));
+
+    let resume_queue = resume_thread_queue("c2", "t1");
+    assert_eq!(resume_queue, json!({ "type": "queue.resume", "commandId": "c2", "threadId": "t1" }));
+    let resume_turn = resume_thread_turn("c3", "t1", "m2", "r0", Some(&selection));
+    assert_eq!(resume_turn["type"], "message.dispatch");
+    assert_eq!(resume_turn["manualContinuationOfRunId"], "r0");
+    assert_eq!(resume_turn["text"], "");
+    assert_eq!(resume_turn["attachments"], json!([]));
+    assert_eq!(resume_turn["dispatchMode"], json!({ "type": "start_immediately" }));
+    assert_eq!(resume_turn["modelSelection"], json!({ "instanceId": "devReplay", "model": "showcase" }));
+    assert!(resume_turn.get("deliveryIntent").is_none());
+    assert!(resume_turn.get("titleSeed").is_none());
 }
 
 #[test]

@@ -140,22 +140,43 @@ pub enum Attribution {
     Guest,
 }
 
-/// `resolveUserMessagePresentation(...).attribution`.
-pub fn user_message_attribution(message: &ChatMessage) -> Option<Attribution> {
-    if message.meta.guest_name.is_some() || message.meta.guest_text.is_some() {
+/// Shared attribution classifier used by both projected transcript messages and queued runs.
+pub fn attribution_for_fields(
+    message_id: &str,
+    text: &str,
+    has_guest: bool,
+    scheduled_task_id: Option<&str>,
+    has_linked_sender: bool,
+    created_by: Option<&str>,
+    creation_source: Option<&str>,
+) -> Option<Attribution> {
+    if has_guest {
         return Some(Attribution::Guest);
     }
-    if scheduled_task_id_from_message(message).is_some() || has_legacy_automation_prefix(&message.text) {
+    if scheduled_task_id_from_fields(message_id, scheduled_task_id).is_some() || has_legacy_automation_prefix(text) {
         return Some(Attribution::Automation);
     }
-    if message.meta.linked_sender.is_some() {
+    if has_linked_sender {
         return Some(Attribution::Agent);
     }
-    match (message.meta.created_by.as_deref(), message.meta.creation_source.as_deref()) {
+    match (created_by, creation_source) {
         (Some("agent"), Some("server")) => Some(Attribution::T3Code),
         (Some("agent"), _) => Some(Attribution::Agent),
         _ => None,
     }
+}
+
+/// `resolveUserMessagePresentation(...).attribution`.
+pub fn user_message_attribution(message: &ChatMessage) -> Option<Attribution> {
+    attribution_for_fields(
+        &message.id,
+        &message.text,
+        message.meta.guest_name.is_some() || message.meta.guest_text.is_some(),
+        message.meta.scheduled_task_id.as_deref(),
+        message.meta.linked_sender.is_some(),
+        message.meta.created_by.as_deref(),
+        message.meta.creation_source.as_deref(),
+    )
 }
 
 const MAX_COLLAPSED_LINES: usize = 8;
@@ -234,11 +255,11 @@ pub struct UserMessagePresentation {
 }
 
 /// Parse `scheduled-task-message:<id>:<ts>:(scheduled|manual)` when `meta.scheduled_task_id` is absent.
-pub fn scheduled_task_id_from_message(message: &ChatMessage) -> Option<String> {
-    if let Some(id) = message.meta.scheduled_task_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+pub fn scheduled_task_id_from_fields(message_id: &str, meta_task_id: Option<&str>) -> Option<String> {
+    if let Some(id) = meta_task_id.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(id.to_owned());
     }
-    let rest = message.id.strip_prefix("scheduled-task-message:")?;
+    let rest = message_id.strip_prefix("scheduled-task-message:")?;
     let suffix_start = rest.rfind(':')?;
     let trigger = &rest[suffix_start + 1..];
     if !matches!(trigger, "scheduled" | "manual") {
@@ -254,11 +275,16 @@ pub fn scheduled_task_id_from_message(message: &ChatMessage) -> Option<String> {
     (!id.is_empty()).then(|| id.to_owned())
 }
 
+/// Parse `scheduled-task-message:<id>:<ts>:(scheduled|manual)` when `meta.scheduled_task_id` is absent.
+pub fn scheduled_task_id_from_message(message: &ChatMessage) -> Option<String> {
+    scheduled_task_id_from_fields(&message.id, message.meta.scheduled_task_id.as_deref())
+}
+
 fn has_legacy_automation_prefix(text: &str) -> bool {
     strip_legacy_automation_prefix(text).is_some()
 }
 
-fn strip_legacy_automation_prefix(text: &str) -> Option<&str> {
+pub fn strip_legacy_automation_prefix(text: &str) -> Option<&str> {
     let rest = text.strip_prefix("[Triggered by schedule task: ")?;
     let close = rest.find(']')?;
     if rest[..close].contains(['\r', '\n']) {

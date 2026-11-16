@@ -186,6 +186,8 @@ mod tests {
                 dispatch,
                 context: None,
                 attachments: &[],
+                fresh_context: false,
+                idle_compaction: None,
             });
             assert!(plan_sends_prompt([&message]));
             let decline = commands::respond_to_approval(

@@ -148,6 +148,8 @@ pub struct ComposerMessage<'a> {
     pub context: Option<&'a Value>,
     /// Persisted `ChatAttachment`s.
     pub attachments: &'a [Value],
+    pub fresh_context: bool,
+    pub idle_compaction: Option<&'a str>,
 }
 
 pub fn composer_message(message: &ComposerMessage) -> Value {
@@ -166,6 +168,12 @@ pub fn composer_message(message: &ComposerMessage) -> Value {
     if let Some(context) = message.context {
         command["context"] = context.clone();
     }
+    if let Some(idle_compaction) = message.idle_compaction {
+        command["idleCompaction"] = json!(idle_compaction);
+    }
+    if message.fresh_context {
+        command["freshContext"] = json!(true);
+    }
     match message.dispatch {
         ComposerDispatch::Queue => command["dispatchMode"] = json!({ "type": "queue_after_active" }),
         ComposerDispatch::Auto | ComposerDispatch::Steer => {
@@ -173,6 +181,37 @@ pub fn composer_message(message: &ComposerMessage) -> Value {
             command["deliveryIntent"] = json!(intent);
             command["dispatchMode"] = json!({ "type": "start_immediately" });
         }
+    }
+    command
+}
+
+/// Resumes a thread queue that was held on interruption (`queue.resume`).
+pub fn resume_thread_queue(command_id: &str, thread_id: &str) -> Value {
+    json!({ "type": "queue.resume", "commandId": command_id, "threadId": thread_id })
+}
+
+/// Manually continues an interrupted or usage-limited run (`startThreadTurn` with `dispatchMode: "start"`).
+pub fn resume_thread_turn(
+    command_id: &str,
+    thread_id: &str,
+    message_id: &str,
+    manual_continuation_of_run_id: &str,
+    model_selection: Option<&ModelSelection>,
+) -> Value {
+    let mut command = json!({
+        "type": "message.dispatch",
+        "commandId": command_id,
+        "createdBy": "user",
+        "creationSource": CREATION_SOURCE,
+        "threadId": thread_id,
+        "messageId": message_id,
+        "manualContinuationOfRunId": manual_continuation_of_run_id,
+        "text": "",
+        "attachments": [],
+        "dispatchMode": { "type": "start_immediately" },
+    });
+    if let Some(selection) = model_selection {
+        command["modelSelection"] = json!(selection);
     }
     command
 }

@@ -142,6 +142,7 @@ fn workspace_only_draft_survives_restart_with_its_destination_scope() {
     let workspace = crate::workspace::DraftWorkspace {
         destination: None,
         branch: None,
+        start_from_origin: None,
         environment_id: "env-a".into(),
         project_root: "/repo".into(),
         mode: crate::server_config::ThreadEnvMode::Worktree,

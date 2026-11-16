@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::chart::{self, Point};
-use super::context_window::{self, context_window_snapshot};
+use super::context_window::{self, compact_before_send_tokens, context_window_snapshot, has_pending_handoff};
 use super::format::*;
 use super::limits::{self, LimitEnvironment, LimitPace};
 use super::merge::{self, AnsweredUsage, ChartMetric};
@@ -598,4 +598,134 @@ fn context_window_reads_inherited_fork_usage_before_first_turn() {
         }]
     }));
     assert!(context_window_snapshot(&handed_off).is_none());
+}
+
+#[test]
+fn compact_before_send_tokens_enforces_claude_ttl_settings_handoff_dismissal_and_blockers() {
+    use crate::model::ModelSelection;
+    use crate::server_config::ServerSettings;
+
+    let provider_with = |id: &str, driver: &str, group: Option<&str>, has_compact: bool| -> ServerProvider {
+        serde_json::from_value(json!({
+            "instanceId": id,
+            "driver": driver,
+            "enabled": true,
+            "installed": true,
+            "status": "ready",
+            "auth": {"status": "authenticated"},
+            "models": [{"slug": "sonnet", "name": "Sonnet", "isCustom": false}],
+            "slashCommands": if has_compact { json!([{"name": "compact"}]) } else { json!([]) },
+            "continuation": group.map(|key| json!({"groupKey": key})),
+        }))
+        .unwrap()
+    };
+    let providers = vec![
+        provider_with("claudeAgent", "claudeAgent", Some("claude-a"), true),
+        provider_with("claudeB", "claudeAgent", Some("claude-a"), true),
+        provider_with("codex", "codex", Some("codex"), true),
+    ];
+    let claude_sel = ModelSelection { instance_id: "claudeAgent".into(), model: "sonnet".into(), options: None };
+    let updated_at = "2026-09-03T10:00:00.000Z";
+    let base_ms = parse_iso(updated_at).unwrap();
+    let stale_ms = base_ms + 70 * 60_000;
+    let base_proj = |extra: Value| -> ThreadProjection {
+        let mut val = json!({
+            "thread": {
+                "id": "t1", "projectId": "p1", "title": "Claude", "providerInstanceId": "claudeAgent",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "sonnet"},
+                "runtimeMode": "full-access", "interactionMode": "default",
+                "branch": null, "worktreePath": null,
+                "lineage": {"parentThreadId": null, "relationshipToParent": null, "rootThreadId": "t1"},
+                "activeProviderThreadId": "pt1", "createdAt": updated_at, "updatedAt": updated_at, "archivedAt": null
+            },
+            "runs": [{
+                "id": "r1", "ordinal": 1, "providerInstanceId": "claudeAgent",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "sonnet"},
+                "providerThreadId": "pt1", "userMessageId": "m1", "rootNodeId": null,
+                "status": "completed", "requestedAt": updated_at, "startedAt": updated_at, "completedAt": updated_at
+            }],
+            "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+            "providerThreads": [{"id": "pt1", "appThreadId": "t1", "updatedAt": updated_at}],
+            "providerTurns": [{
+                "id": "turn1", "providerThreadId": "pt1",
+                "tokenUsage": {"usedTokens": 250000, "maxTokens": 1000000, "updatedAt": updated_at}
+            }],
+            "runtimeRequests": [],
+            "messages": [{"id": "m1", "text": "hello", "attachments": []}],
+            "plans": [], "turnItems": [], "checkpointScopes": [], "checkpoints": [],
+            "contextHandoffs": [], "contextTransfers": [],
+            "visibleTurnItems": [{
+                "position": 0, "visibility": "local", "sourceThreadId": "t1", "sourceItemId": "i1",
+                "item": {
+                    "id": "i1", "threadId": "t1", "runId": "r1", "nodeId": "n1", "parentItemId": null,
+                    "ordinal": 1, "status": "completed", "title": null, "startedAt": updated_at,
+                    "completedAt": updated_at, "updatedAt": updated_at,
+                    "type": "user_message", "messageId": "m1", "text": "hello", "inputIntent": "turn", "attachments": []
+                }
+            }],
+            "updatedAt": updated_at
+        });
+        if let (Value::Object(base), Value::Object(map)) = (&mut val, extra) {
+            base.extend(map);
+        }
+        serde_json::from_value(val).unwrap()
+    };
+    let default_settings: ServerSettings = serde_json::from_value(json!({})).unwrap();
+    let proj = base_proj(json!({}));
+
+    assert_eq!(
+        compact_before_send_tokens(&proj, &claude_sel, &providers, &default_settings, "next", true, stale_ms),
+        Some(250_000.0)
+    );
+    // Custom promptCacheTtlMs overrides the 70m fallback.
+    let short_ttl = base_proj(json!({
+        "providerTurns": [{
+            "id": "turn1", "providerThreadId": "pt1",
+            "tokenUsage": {"usedTokens": 250000, "maxTokens": 1000000, "promptCacheTtlMs": 300_000, "updatedAt": updated_at}
+        }]
+    }));
+    assert_eq!(
+        compact_before_send_tokens(&short_ttl, &claude_sel, &providers, &default_settings, "next", true, base_ms + 300_000),
+        Some(250_000.0)
+    );
+    assert_eq!(
+        compact_before_send_tokens(&short_ttl, &claude_sel, &providers, &default_settings, "next", true, base_ms + 299_999),
+        None
+    );
+    // Fresh (< 70m) or < 200k tokens or non-idle or typed `/compact` returns None.
+    assert_eq!(compact_before_send_tokens(&proj, &claude_sel, &providers, &default_settings, "next", true, stale_ms - 1), None);
+    assert_eq!(compact_before_send_tokens(&proj, &claude_sel, &providers, &default_settings, "next", false, stale_ms), None);
+    assert_eq!(compact_before_send_tokens(&proj, &claude_sel, &providers, &default_settings, "/compact focus", true, stale_ms), None);
+    // Settings `off` or per-instance `off` disables it.
+    let off_settings: ServerSettings = serde_json::from_value(json!({"idleCompaction": "off"})).unwrap();
+    assert_eq!(compact_before_send_tokens(&proj, &claude_sel, &providers, &off_settings, "next", true, stale_ms), None);
+    let inst_off: ServerSettings = serde_json::from_value(json!({
+        "idleCompaction": "onReturn",
+        "providerInstances": {"claudeAgent": {"driver": "claudeAgent", "config": {"idleCompaction": "off"}}}
+    })).unwrap();
+    assert_eq!(compact_before_send_tokens(&proj, &claude_sel, &providers, &inst_off, "next", true, stale_ms), None);
+    // Pending handoff (switching to non-continuation codex) blocks; switching within same groupKey keeps offering.
+    let codex_sel = ModelSelection { instance_id: "codex".into(), model: "gpt".into(), options: None };
+    assert!(!has_pending_handoff(&proj, &ModelSelection { instance_id: "claudeB".into(), model: "sonnet".into(), options: None }, &providers));
+    assert!(has_pending_handoff(&proj, &codex_sel, &providers));
+    // Pending request, held queue, and "Don't ask again" dismissal suppress offer.
+    let dismissed = base_proj(json!({
+        "runtimeRequests": [{
+            "id": "req1", "kind": "user_input", "status": "resolved",
+            "answers": {"This session is 1h 10m old and uses 250,000 tokens. Compact it before continuing?": "Don't ask again"}
+        }]
+    }));
+    assert_eq!(compact_before_send_tokens(&dismissed, &claude_sel, &providers, &default_settings, "next", true, stale_ms), None);
+    let held_queue = base_proj(json!({
+        "runs": [
+            proj.runs[0],
+            {
+                "id": "r2", "ordinal": 2, "providerInstanceId": "claudeAgent",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "sonnet"},
+                "userMessageId": "m2", "rootNodeId": null, "status": "queued",
+                "requestedAt": updated_at, "startedAt": null, "completedAt": null, "queueHeld": true
+            }
+        ]
+    }));
+    assert_eq!(compact_before_send_tokens(&held_queue, &claude_sel, &providers, &default_settings, "next", true, stale_ms), None);
 }

@@ -408,5 +408,48 @@ pub fn replace_triage_playbook_link(prompt: &str, prepared_prompt: &str) -> Stri
     next
 }
 
+/// `isClearComposerCommand` (`packages/shared/src/composerTrigger.ts`).
+pub fn is_clear_composer_command(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("/clear")
+}
+
+/// `COMPACT_COMMAND_PATTERN` (`/^\/compact(?:\s|$)/i`).
+pub fn is_compact_command(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.get(..8).is_some_and(|head| head.eq_ignore_ascii_case("/compact"))
+        && trimmed.as_bytes().get(8).is_none_or(u8::is_ascii_whitespace)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedComposerTurn {
+    pub compact_before_send: bool,
+    pub turn_dispatch: ComposerDispatch,
+}
+
+/// `planComposerTurn` (`ChatView.logic.ts`): decides whether a stale Claude session runs `/compact`
+/// ahead of this message and enforces queue dispatch when compacting or starting a fresh session.
+pub fn plan_composer_turn(
+    message_text: &str,
+    queues_behind_setup: bool,
+    compact_before_send_offered: bool,
+    keep_full_history: bool,
+    dispatch: ComposerDispatch,
+    fresh_context: bool,
+) -> PlannedComposerTurn {
+    let compact_before_send =
+        !fresh_context && compact_before_send_offered && !keep_full_history && !is_compact_command(message_text);
+    let dispatch = if fresh_context && dispatch == ComposerDispatch::Steer {
+        ComposerDispatch::Queue
+    } else {
+        dispatch
+    };
+    let turn_dispatch = if compact_before_send || (queues_behind_setup && dispatch != ComposerDispatch::Steer) {
+        ComposerDispatch::Queue
+    } else {
+        dispatch
+    };
+    PlannedComposerTurn { compact_before_send, turn_dispatch }
+}
+
 #[cfg(test)]
 mod tests;
