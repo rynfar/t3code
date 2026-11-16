@@ -8,7 +8,7 @@ use gpui::{
     AnyElement, App, Context, ExternalPaths, Focusable, IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window,
     div, prelude::*, px,
 };
-use gpui_component::input::{Enter, Escape, IndentInline, MoveDown, MoveUp, Copy, Paste, Textarea};
+use gpui_component::input::{Copy, Editor, Enter, Escape, IndentInline, MoveDown, MoveUp, Paste};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::ComposerDispatch;
 use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_label};
@@ -30,22 +30,25 @@ const REOPEN_GUARD: Duration = Duration::from_millis(300);
 
 impl Composer {
     /// `ChatComposer` placeholders, most specific first.
-    fn placeholder(&self, _cx: &App) -> &'static str {
+    fn placeholder(&self, cx: &App) -> String {
         if let Some(approval) = self.snapshot.pending.approvals.first() {
             return if approval.supports_feedback {
-                "Send feedback to decline this request"
+                "Send feedback to decline this request".to_owned()
             } else {
-                "Send a message to decline and redirect the agent"
+                "Send a message to decline and redirect the agent".to_owned()
             };
         }
         if let Some((_, question)) = self.active_question() {
             return if question.allows_custom_answer() {
-                "Type your own answer, or leave this blank to use the selected option"
+                "Type your own answer, or leave this blank to use the selected option".to_owned()
             } else {
-                "Choose an option above"
+                "Choose an option above".to_owned()
             };
         }
-        DEFAULT_PLACEHOLDER
+        if let Some(suggestion) = self.offered_prompt_suggestion(cx) {
+            return format!("{suggestion}  (Tab)");
+        }
+        DEFAULT_PLACEHOLDER.to_owned()
     }
 
     /// Placeholder and disabled state follow what the agent waits on; written only on change.
@@ -56,10 +59,10 @@ impl Composer {
                 !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx)
             })
             || self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer());
-        if self.input_state == Some((placeholder, disabled)) {
+        if self.input_state.as_ref() == Some(&(placeholder.clone(), disabled)) {
             return;
         }
-        self.input_state = Some((placeholder, disabled));
+        self.input_state = Some((placeholder.clone(), disabled));
         self.input.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx);
             input.set_disabled(disabled, cx);
@@ -215,7 +218,11 @@ impl Composer {
         if running && !has_text && !editing_queued {
             return stop().into_any_element();
         }
-        let attachment_block = t3_core::composer::attachments::send_block_reason(&self.staged_attachments());
+        let attachment_block = if self.snapshot.pending.approvals.is_empty() {
+            t3_core::composer::attachments::send_block_reason(&self.staged_attachments())
+        } else {
+            t3_core::composer::attachments::approval_redirect_block_reason(&self.staged_attachments())
+        };
         let settings = self.state.read(cx).client_settings;
         let follow_up = if self.snapshot.pending.approvals.is_empty() { settings.follow_up_behavior } else { rules::FollowUpBehavior::Steer };
         let can_steer = !self.snapshot.compacting;
@@ -264,6 +271,7 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.question_markdown.begin_frame();
         self.sync_input_state(window, cx);
+        self.sync_rich_decorations(cx);
         let resolved = self.resolve(cx);
         let rewinding = self.is_rewinding(cx);
         let p = palette(cx);
@@ -314,12 +322,49 @@ impl Render for Composer {
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                    if this.menu_key(MenuKey::Accept, window, cx) {
+                    if this.menu_key(MenuKey::Accept, window, cx)
+                        || this.accept_prompt_suggestion(window, cx)
+                        || this.indent_list_or_code(window, cx)
+                    {
                         cx.stop_propagation();
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                    if this.workspace_key(MenuKey::Dismiss, window, cx) || this.stash_key(MenuKey::Dismiss, window, cx) || this.menu_key(MenuKey::Dismiss, window, cx) {
+                    if this.workspace_key(MenuKey::Dismiss, window, cx)
+                        || this.stash_key(MenuKey::Dismiss, window, cx)
+                        || this.menu_key(MenuKey::Dismiss, window, cx)
+                        || this.dismiss_prompt_suggestion(cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
+                .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    let mod_key = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+                    if mod_key
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.shift
+                        && event.keystroke.key == "backspace"
+                        && this.stash_key(MenuKey::Delete, window, cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
+                // Formatting shortcuts run in bubble phase so app keybindings (like Mod+B sidebar
+                // toggle) always take precedence first (#29445, #34493).
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    let mod_key = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
+                    if !mod_key || event.keystroke.modifiers.alt || !this.input.read(cx).focus_handle(cx).is_focused(window) {
+                        return;
+                    }
+                    let format = match (event.keystroke.key.as_str(), event.keystroke.modifiers.shift) {
+                        ("b", false) => Some(t3_core::composer::rich_text::InlineFormat::Bold),
+                        ("i", false) => Some(t3_core::composer::rich_text::InlineFormat::Italic),
+                        ("e", false) => Some(t3_core::composer::rich_text::InlineFormat::Code),
+                        ("x", true) => Some(t3_core::composer::rich_text::InlineFormat::Strike),
+                        _ => None,
+                    };
+                    if let Some(format) = format {
+                        this.toggle_inline_format(format, window, cx);
                         cx.stop_propagation();
                     }
                 }))
@@ -355,6 +400,7 @@ impl Render for Composer {
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))) && self.fixed.is_none(), |this| this.child(self.limit_recovery.clone()))
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))), |this| this.children(self.render_branch_mismatch_banner(cx)))
                 .when(!matches!(self.snapshot.target, Some(Target::Draft(_))), |this| this.children(self.render_usage_limits_banner(false, cx)))
+                .children(self.render_fresh_session_banner(cx))
                 .when_some(question, |this, input| this.child(self.render_question(&input, cx)))
                 .when(self.active_input().is_none(), |this| {
                     this.children(self.render_reply_banner(cx))
@@ -393,7 +439,8 @@ impl Render for Composer {
                                 .children(self.render_attachments(cx))
                                 .children(self.render_context_chips(cx))
                                 .children(self.render_citation_chips(cx))
-                                .child(Textarea::new(&self.input).appearance(false)
+                                .child(Editor::new(&self.input).appearance(false)
+                                    .h(px(self.composer_editor_height(cx)))
                                     .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Prompt, cx))
                                     .text_size(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx)))
                                     .line_height(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx) * 1.625))),

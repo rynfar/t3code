@@ -396,3 +396,46 @@ fn model_mentions_match_word_boundaries_skip_legacy_and_format_prompt_ref() {
     assert_eq!(sonnet[0].label, "Claude Sonnet 4.6");
     assert!(model_items(&entries, &config.settings, &[], "local").is_empty());
 }
+
+#[test]
+fn slash_clear_respects_fresh_session_capability_and_prompt_start() {
+    let provider_clear = ProviderSlashCommand { name: "clear".into(), description: Some("Provider clear".into()), input: None };
+    let at_start = Trigger { kind: TriggerKind::SlashCommand, query: "cl".into(), range_start: 0, range_end: 3 };
+    let offered = slash_items(&at_start, "codex", &[], std::slice::from_ref(&provider_clear), SlashMenuOptions { fresh_session: true, ..Default::default() });
+    assert_eq!(offered.len(), 1);
+    assert_eq!(offered[0].action, MenuAction::Slash(SlashCommand::Clear));
+
+    let mid_prompt = Trigger { kind: TriggerKind::SlashCommand, query: "cl".into(), range_start: 4, range_end: 7 };
+    assert!(slash_items(&mid_prompt, "codex", &[], &[provider_clear], SlashMenuOptions { fresh_session: true, ..Default::default() }).is_empty());
+}
+
+#[test]
+fn pull_request_items_prioritize_linked_and_exact_number_and_build_valid_record() {
+    let pr = |number: u64, title: &str| ComposerPullRequest {
+        number,
+        title: title.into(),
+        url: format!("https://github.com/acme/repo/pull/{number}"),
+        head_branch: format!("feat-{number}"),
+        base_branch: "main".into(),
+        state: crate::pull_requests::wire::PrState::Open,
+        is_draft: false,
+        host: "github.com".into(),
+        repository: "acme/repo".into(),
+        project_id: "p1".into(),
+        author_login: Some("alice".into()),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    let linked = vec![pr(12, "Linked PR")];
+    let listed = vec![pr(42, "Fix 12 regression"), pr(12, "Linked PR"), pr(7, "Other")];
+    let bare = pull_request_items(&listed, &linked, "");
+    assert_eq!(bare.len(), 3);
+    assert_eq!(bare[0].label, "#12", "linked PR comes first and is deduplicated");
+
+    let exact = pull_request_items(&listed, &linked, "42");
+    assert_eq!(exact[0].label, "#42");
+
+    let record = build_pull_request_reference_record(&listed[0]);
+    assert!(super::super::records::pull_request(&record));
+    assert_eq!(super::super::records::label(&record), "#42");
+    assert!(super::super::records::reference(&record).unwrap().starts_with("[#42](t3-context://v1/review-comment/"));
+}

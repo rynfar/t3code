@@ -22,7 +22,7 @@ use crate::toast::{Toast, ToastKind};
 #[derive(Default)]
 pub(super) struct Stashed {
     store: Stash,
-    open: bool,
+    pub(super) open: bool,
     highlighted: Option<String>,
     /// The history entry the prompt shows, for the target it was recalled in.
     history: Option<(Target, HistoryPosition)>,
@@ -70,9 +70,10 @@ impl Composer {
         if self.editing_queued().is_some() || self.sending || self.is_rewinding(cx) {
             return;
         }
-        let prompt = self.prompt(cx).trim().to_owned();
+        let raw_prompt = self.prompt(cx);
+        let prompt = rules::stash_prompt_text(&raw_prompt);
         let attachments = self.staged_attachments();
-        if prompt.is_empty() && attachments.is_empty() {
+        if prompt.is_empty() && !self.has_non_prompt_content(&raw_prompt, &attachments) {
             match self.stash_state.store.entries.as_slice() {
                 [only] => {
                     let id = only.id.clone();
@@ -87,13 +88,14 @@ impl Composer {
             return;
         }
         let entry = StashEntry {
-            context_records: t3_core::composer::records::referenced_shared(&prompt,self.records_for(&target)),
+            context_records: t3_core::composer::records::referenced_shared(&prompt, self.records_for(&target)),
             id: uuid_v4(),
             created_at: now_ms(),
             threads: Draft::saved_threads(self.mentions(&target), &prompt),
             terminals: Draft::saved_terminals(self.terminals_for(&target), &prompt),
             review_comments: t3_core::composer::review::referenced(&prompt, self.reviews_for(&target)).into_iter().cloned().collect(),
             attachments: attachments.iter().filter_map(SavedAttachment::of).collect(),
+            reply_to: self.take_reply_to(&target),
             prompt,
         };
         if let Some(evicted) = self.stash_state.store.push(entry) {
@@ -133,10 +135,22 @@ impl Composer {
         let Some(plan)=super::imports::prepare(&entry.prompt,incoming,&self.all_context_records(),&self.environment_id(cx),super::imports::ImportMode::Move,uuid_v4) else {return};
         let prompt=rules::merge_prompt(&self.prompt(cx),&plan.text);
         self.apply_import(&target,plan,cx);
+        if let Some(reply_to) = entry.reply_to
+            && self.reply_to_for(&target).is_none()
+            && let Some(cite) = t3_core::composer::records::response_citation(&reply_to)
+            && cite.environment_id == self.environment_id(cx)
+            && match &target {
+                Target::Thread(id) => cite.thread_id == *id,
+                _ => true,
+            }
+        {
+            self.seed_reply_to(&target, Some(reply_to));
+        }
         self.set_prompt(&prompt, window, cx);
         let end = prompt.len();
         self.input.update(cx, |input, cx| input.set_selected_range(end..end, cx));
         self.stash_state.open = false;
+        self.stash_state.highlighted = None;
         self.draft_changed(cx);
         self.focus(window, cx);
         cx.notify();
@@ -144,14 +158,22 @@ impl Composer {
 
     fn delete_stash_entry(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.is_rewinding(cx) { return; }
+        let removed_index = self.stash_state.store.entries.iter().position(|entry| entry.id == id);
         if let Some(entry) = self.stash_state.store.take(id) {
             self.release_saved(&entry.attachments, cx);
             self.save_stash();
+            if self.stash_state.store.entries.is_empty() {
+                self.stash_state.open = false;
+                self.stash_state.highlighted = None;
+            } else if self.stash_state.highlighted.as_deref() == Some(id) {
+                let next_index = removed_index.unwrap_or(0).min(self.stash_state.store.entries.len() - 1);
+                self.stash_state.highlighted = Some(self.stash_state.store.entries[next_index].id.clone());
+            }
             cx.notify();
         }
     }
 
-    /// The open stash list's keys: Up and Down move, Enter restores, Escape closes.
+    /// The open stash list's keys: Up and Down move, Enter restores, Mod+Backspace deletes, Escape closes.
     pub(super) fn stash_key(&mut self, key: MenuKey, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.stash_state.open || self.menu_open() {
             return false;
@@ -159,7 +181,10 @@ impl Composer {
         let entries = &self.stash_state.store.entries;
         let current = self.stash_state.highlighted.as_ref().and_then(|id| entries.iter().position(|entry| entry.id == *id));
         match key {
-            MenuKey::Dismiss => self.stash_state.open = false,
+            MenuKey::Dismiss => {
+                self.stash_state.open = false;
+                self.stash_state.highlighted = None;
+            }
             MenuKey::Up | MenuKey::Down if !entries.is_empty() => {
                 let count = entries.len();
                 let next = match (current, key == MenuKey::Down) {
@@ -173,6 +198,10 @@ impl Composer {
             MenuKey::Accept => {
                 let Some(id) = current.or((!entries.is_empty()).then_some(0)).map(|index| entries[index].id.clone()) else { return false };
                 self.restore_stash_entry(&id, window, cx);
+            }
+            MenuKey::Delete => {
+                let Some(id) = current.or((!entries.is_empty()).then_some(0)).map(|index| entries[index].id.clone()) else { return false };
+                self.delete_stash_entry(&id, cx);
             }
             _ => return false,
         }
@@ -271,7 +300,8 @@ impl Composer {
                 .children(entries.iter().map(|entry| {
                     let highlighted = self.stash_state.highlighted.as_deref() == Some(entry.id.as_str());
                     let (restore_id, delete_id, hover_id) = (entry.id.clone(), entry.id.clone(), entry.id.clone());
-                    let files = entry.attachments.len();
+                    let images = entry.attachments.iter().filter(|attachment| attachment.image).count();
+                    let files = entry.attachments.len() - images;
                     h_flex()
                         .id(SharedString::from(format!("stash-{}", entry.id)))
                         .h(px(28.))
@@ -289,10 +319,19 @@ impl Composer {
                         .on_click(cx.listener(move |this, _, window, cx| this.restore_stash_entry(&restore_id, window, cx)))
                         .child(div().w(px(24.)).flex().justify_center().child(Icon::FileText.render(px(16.), hsla(p.icon_muted))))
                         .child(div().flex_1().min_w_0().truncate().text_color(hsla(p.foreground).opacity(0.8)).child(entry.snippet()))
+                        .when(images > 0, |this| {
+                            this.child(
+                                h_flex()
+                                    .gap(px(3.))
+                                    .text_color(hsla(p.muted_foreground))
+                                    .child(Icon::Image.render(px(12.), hsla(p.muted_foreground)))
+                                    .child(images.to_string()),
+                            )
+                        })
                         .when(files > 0, |this| {
                             this.child(
                                 h_flex()
-                                    .gap(px(4.))
+                                    .gap(px(3.))
                                     .text_color(hsla(p.muted_foreground))
                                     .child(Icon::File.render(px(12.), hsla(p.muted_foreground)))
                                     .child(files.to_string()),

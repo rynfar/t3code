@@ -1,8 +1,9 @@
 use super::*;
+use crate::composer::attachments::ATTACHMENT_ONLY_PROMPT;
 use serde_json::json;
 
 fn entry(id: &str, prompt: &str) -> StashEntry {
-    StashEntry { id: id.into(), created_at: 1, prompt: prompt.into(), attachments: vec![], threads: vec![], terminals: vec![], review_comments: vec![], context_records: vec![] }
+    StashEntry { id: id.into(), created_at: 1, prompt: prompt.into(), attachments: vec![], threads: vec![], terminals: vec![], review_comments: vec![], context_records: vec![], reply_to: None }
 }
 
 fn saved(image: bool) -> SavedAttachment {
@@ -126,4 +127,52 @@ fn history_recalls_only_what_the_user_typed() {
     let entries = history_entries(&projection);
     let rows: Vec<(&str, &str)> = entries.iter().map(|entry| (entry.id.as_str(), entry.prompt.as_str())).collect();
     assert_eq!(rows, [("m-2", "first"), ("m-7", "second")]);
+}
+
+#[test]
+fn stash_prompt_text_preserves_trailing_space_after_inline_chip() {
+    let chip = format!("[main.rs](t3-context://v1/file/{})", super::super::menu::kind_scoped_context_id("file", "main.rs"));
+    assert_eq!(stash_prompt_text(&format!("  see {chip}  ")), format!("see {chip} "));
+    assert_eq!(stash_prompt_text("  check model:codex/gpt-5.4  "), "check model:codex/gpt-5.4 ");
+    assert_eq!(stash_prompt_text("  plain text   "), "plain text");
+    assert_eq!(stash_prompt_text("   "), "");
+}
+
+#[test]
+fn snippet_strips_inline_assistant_citations_and_round_trips_reply_to() {
+    let mut item = entry("c", "Explain [\"quoted\"]() please");
+    let cite = crate::assistant_citations::Citation {
+        version: 1,
+        environment_id: "env".into(),
+        thread_id: "t1".into(),
+        message_id: "m1".into(),
+        text: "foo".into(),
+        start: 0,
+        end: 3,
+        prefix: "".into(),
+        suffix: "".into(),
+        comment: Some("why?".into()),
+    };
+    item.prompt = format!("Explain {} please", cite.serialize());
+    let snip = item.snippet();
+    assert!(!snip.contains("t3-citation://"), "snippet must strip citation href: {snip}");
+    assert!(snip.contains("Explain") && snip.contains("please"), "snippet keeps surrounding text: {snip}");
+
+    item.reply_to = Some(json!({"kind": "response", "contextId": "r1"}));
+    let mut stash = Stash::default();
+    stash.push(item.clone());
+    let restored = Stash::from_value(Some(&stash.to_value()));
+    assert_eq!(restored.entries[0].reply_to, item.reply_to);
+}
+
+#[test]
+fn recallable_prompt_strips_trailing_review_and_legacy_context_blocks() {
+    assert_eq!(
+        recallable_prompt("fix\n\n<review_comment file=\"a.rs\">x</review_comment>"),
+        "fix"
+    );
+    assert_eq!(
+        recallable_prompt("check @term:1-2\n\n<terminal_context>\n- Term lines 1-2:\n  err\n</terminal_context>"),
+        "check"
+    );
 }

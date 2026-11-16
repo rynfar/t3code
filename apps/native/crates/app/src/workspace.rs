@@ -357,7 +357,7 @@ impl Render for Workspace {
                 this.sidebar.update(cx, |sidebar, cx| sidebar.set_modifiers(event.modifiers, cx));
                 this.pull_requests.update(cx, |page, cx| page.set_modifiers(event.modifiers, cx));
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     let overlay_open = this.menu.read(cx).is_open()
                         || this.dialog.read(cx).is_open()
@@ -372,6 +372,27 @@ impl Render for Workspace {
                         cx.stop_propagation();
                     } else if this.state.read(cx).sidebar_sheet.is_open() && !overlay_open {
                         this.state.update(cx, |state, cx| state.close_sidebar_sheet(cx));
+                        cx.stop_propagation();
+                    }
+                } else if !event.keystroke.modifiers.platform
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt
+                    && !on_pull_requests
+                    && !composer_replaced
+                    && !maximized
+                    && (has_thread || has_draft)
+                    && let Some(ch) = event.keystroke.key_char.as_deref().filter(|s| !s.is_empty() && !s.chars().all(char::is_whitespace))
+                {
+                    let overlay_open = this.menu.read(cx).is_open()
+                        || this.dialog.read(cx).is_open()
+                        || this.snooze.read(cx).is_open()
+                        || this.palette.read(cx).is_open()
+                        || crate::updates::overlay(cx).is_some()
+                        || this.welcome.read(cx).is_open()
+                        || crate::settings::overlay(window, cx).is_some()
+                        || crate::usage::overlay(window, cx).is_some()
+                        || crate::theme_editor::overlay(window, cx).is_some();
+                    if !overlay_open && this.composer.update(cx, |composer, cx| composer.redirect_printable_key(ch, window, cx)) {
                         cx.stop_propagation();
                     }
                 }

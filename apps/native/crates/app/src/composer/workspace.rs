@@ -182,6 +182,7 @@ impl Composer {
                 2 if previous => self.use_previous_worktree(window, cx),
                 _ => self.sync_workspace(true, cx),
             },
+            MenuKey::Delete => return false,
         }
         cx.notify();
         true

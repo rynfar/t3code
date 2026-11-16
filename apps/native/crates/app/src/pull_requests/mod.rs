@@ -4,7 +4,7 @@
 //! `t3_core::pull_requests`; reads are decoded on the network runtime.
 
 mod code;
-mod controls;
+pub(crate) mod controls;
 mod detail;
 mod link_dialog;
 mod mutations;

@@ -170,3 +170,13 @@ fn image_totals_cap_at_80_mib() {
     assert_eq!(limit_error(&vec![big.clone(); 8]), None);
     assert!(limit_error(&vec![big; 9]).unwrap().starts_with("Images can total up to 80 MiB"));
 }
+
+#[test]
+fn approval_redirect_blocks_uploading_or_failed_attachments() {
+    let uploading = staged(AttachmentKind::File, Upload::Uploading);
+    assert!(approval_redirect_block_reason(&[uploading]).is_some());
+    let failed = staged(AttachmentKind::File, Upload::Failed { reason: "boom".into() });
+    assert!(approval_redirect_block_reason(&[failed]).is_some());
+    let ready = staged(AttachmentKind::File, Upload::Ready { attachment_id: "id".into() });
+    assert_eq!(approval_redirect_block_reason(&[ready]), None);
+}

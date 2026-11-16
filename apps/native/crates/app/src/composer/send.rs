@@ -22,6 +22,18 @@ use crate::toast::{Toast, ToastKind};
 
 const NO_PROVIDER: &str = "Enable a provider in Settings to send a message";
 
+async fn with_dispatch_timeout<T>(
+    executor: &gpui::BackgroundExecutor,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, &'static str> {
+    let timer = executor.timer(std::time::Duration::from_millis(rules::MESSAGE_DISPATCH_TIMEOUT_MS));
+    futures::pin_mut!(fut, timer);
+    match futures::future::select(fut, timer).await {
+        futures::future::Either::Left((value, _)) => Ok(value),
+        futures::future::Either::Right((_, _)) => Err(rules::MESSAGE_DISPATCH_TIMEOUT_MSG),
+    }
+}
+
 /// What a send took from the composer, put back if it fails.
 pub(super) struct Taken {
     target: Target,
@@ -107,7 +119,12 @@ impl Composer {
             return;
         }
         let text = terminals.text;
-        if let Some(reason) = attachments::send_block_reason(&staged) {
+        let block_reason = if self.snapshot.pending.approvals.is_empty() {
+            attachments::send_block_reason(&staged)
+        } else {
+            attachments::approval_redirect_block_reason(&staged)
+        };
+        if let Some(reason) = block_reason {
             self.error = Some(reason);
             cx.notify();
             return;
@@ -342,8 +359,16 @@ impl Composer {
                 });
                 Ok::<_, String>((thread_id, worktree_launch, this.state.read(cx).rpc(method::LAUNCH_THREAD, payload)))
             });
+            let executor = cx.background_executor().clone();
             let (result, worktree_launch) = match launch {
-                Ok(Ok((thread_id, worktree_launch, request))) => (request.await.map(|_| thread_id).map_err(|error| error.to_string()), worktree_launch),
+                Ok(Ok((thread_id, worktree_launch, request))) => (
+                    match with_dispatch_timeout(&executor, request).await {
+                        Ok(Ok(_)) => Ok(thread_id),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(timeout) => Err(timeout.to_owned()),
+                    },
+                    worktree_launch,
+                ),
                 Ok(Err(error)) => (Err(error), None),
                 Err(_) => return,
             };
@@ -466,25 +491,30 @@ impl Composer {
                     .collect::<Vec<_>>();
                 Ok::<_, String>(rpcs)
             });
+            let executor = cx.background_executor().clone();
             let (started_count, failed_selections, failure_msg) = match requests {
                 Ok(Ok(rpcs)) => {
                     let (raws, futs): (Vec<_>, Vec<_>) = rpcs.into_iter().unzip();
-                    let outcomes = futures::future::join_all(futs).await;
-                    let mut started = 0usize;
-                    let mut failed = Vec::new();
-                    let mut first_error = None;
-                    for (raw, outcome) in raws.into_iter().zip(outcomes) {
-                        match outcome {
-                            Ok(_) => started += 1,
-                            Err(err) => {
-                                if first_error.is_none() {
-                                    first_error = Some(err.to_string());
+                    match with_dispatch_timeout(&executor, futures::future::join_all(futs)).await {
+                        Ok(outcomes) => {
+                            let mut started = 0usize;
+                            let mut failed = Vec::new();
+                            let mut first_error = None;
+                            for (raw, outcome) in raws.into_iter().zip(outcomes) {
+                                match outcome {
+                                    Ok(_) => started += 1,
+                                    Err(err) => {
+                                        if first_error.is_none() {
+                                            first_error = Some(err.to_string());
+                                        }
+                                        failed.push(raw);
+                                    }
                                 }
-                                failed.push(raw);
                             }
+                            (started, failed, first_error)
                         }
+                        Err(timeout) => (0, raws, Some(timeout.to_owned())),
                     }
-                    (started, failed, first_error)
                 }
                 Ok(Err(error)) => {
                     let failed = dispatch_selections.into_iter().map(|(raw, _)| raw).collect();
@@ -598,7 +628,14 @@ impl Composer {
         let target = Target::Thread(thread_id);
         let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
         cx.spawn_in(window, async move |this, cx| {
-            let failure = request.await.err().map(|(index, error)| format!("{} {error}", failures.get(index).copied().unwrap_or("Failed to send message.")));
+            let executor = cx.background_executor().clone();
+            let failure = match with_dispatch_timeout(&executor, request).await {
+                Ok(Ok(())) => None,
+                Ok(Err((index, error))) => {
+                    Some(format!("{} {error}", failures.get(index).copied().unwrap_or("Failed to send message.")))
+                }
+                Err(timeout) => Some(timeout.to_owned()),
+            };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 if let Some(error) = failure {

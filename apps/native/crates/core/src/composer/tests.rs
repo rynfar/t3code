@@ -248,3 +248,21 @@ fn triage_prompt_rewrites_only_the_playbook_link() {
     assert_eq!(replace_triage_playbook_link(plain, &app_prompt(machine_b)), plain);
     assert_eq!(replace_triage_playbook_link(&app_prompt(machine_a), "Read the playbook."), app_prompt(machine_a));
 }
+
+#[test]
+fn offered_prompt_suggestion_gates_on_run_match_status_and_clean_composer() {
+    let suggestion = PromptSuggestion { run_id: "run-2".into(), text: "Run the unit tests".into() };
+    let ready = PromptSuggestionOfferInput {
+        latest_run_id: Some("run-2"),
+        latest_run_status: Some("completed"),
+        prompt_empty: true,
+        ..Default::default()
+    };
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), ready), Some("Run the unit tests"));
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { latest_run_id: Some("run-1"), ..ready }), None);
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { latest_run_status: Some("steered"), ..ready }), None);
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { latest_run_status: Some("cancelled"), ..ready }), None);
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { prompt_empty: false, ..ready }), None);
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { fresh_session_armed: true, ..ready }), None);
+    assert_eq!(offered_prompt_suggestion(Some(&suggestion), PromptSuggestionOfferInput { dismissed: true, ..ready }), None);
+}

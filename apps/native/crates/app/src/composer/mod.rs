@@ -25,6 +25,7 @@ mod model_picker;
 mod pending;
 pub(crate) mod prompt_links;
 mod queue;
+mod rich_text;
 mod send;
 mod stash;
 pub(crate) use pending::{banner_surface, banner_surface_card};
@@ -34,8 +35,9 @@ mod workspace;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use gpui::{App, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, KeyBinding, Subscription, Task, Window, actions, prelude::*};
-use gpui_component::input::{InputEvent, OutdentInline, TextareaState};
+use gpui::{App, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontWeight, KeyBinding, Subscription, Task, Window, actions, div, prelude::*, px};
+use gpui_component::h_flex;
+use gpui_component::input::{EditorState, InputEvent, OutdentInline};
 use t3_core::composer::{self as rules, EnterKey};
 use t3_core::lists;
 use t3_core::model::ModelSelection;
@@ -179,9 +181,26 @@ struct Answers {
     index: usize,
 }
 
+struct PromptSuggestionWatcher {
+    thread_id: String,
+    environment: String,
+    connection_id: Option<u64>,
+    generation: Option<u64>,
+    suggestion: Option<rules::PromptSuggestion>,
+    _net: tokio::task::JoinHandle<()>,
+    _ui: Task<()>,
+}
+
+impl Drop for PromptSuggestionWatcher {
+    fn drop(&mut self) {
+        self._net.abort();
+    }
+}
+
 pub struct Composer {
     state: Entity<AppState>,
-    input: Entity<TextareaState>,
+    input: Entity<EditorState>,
+    rich_text: rich_text::RichTextState,
     picker: Entity<ModelPicker>,
     picker_open: bool,
     permissions_open: bool,
@@ -212,7 +231,7 @@ pub struct Composer {
     enter_repeat: bool,
     picker_dismissed: Option<Instant>,
     menu_dismissed: Option<Instant>,
-    input_state: Option<(&'static str, bool)>,
+    input_state: Option<(String, bool)>,
     /// The question banner takes focus for its digit shortcuts while the prompt cannot type.
     question_focus: FocusHandle,
     limit_recovery: Entity<crate::thread_view::LimitRecoveryBanner>,
@@ -220,6 +239,9 @@ pub struct Composer {
     checkout_vcs: Option<branch_mismatch::CheckoutWatcher>,
     revealed_branch_mismatch_key: Option<String>,
     restoring_branch_threads: HashSet<String>,
+    fresh_session_armed: HashSet<Target>,
+    prompt_suggestion: Option<PromptSuggestionWatcher>,
+    dismissed_prompt_suggestions: HashSet<(String, String)>,
     /// A side chat's own thread, in the right panel; `None` follows the selection and draft.
     pub(super) fixed: Option<String>,
     /// The `@`, `/` and `$` menus.
@@ -340,11 +362,17 @@ impl Composer {
 
     fn new_for(state: Entity<AppState>, fixed: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(2, 9)
+            EditorState::new(window, cx)
+                .searchable(false)
+                .line_number(false)
+                .indent_guides(false)
+                .folding(false)
+                .soft_wrap(true)
+                .scroll_beyond_last_line(Some(0))
                 .placeholder(rules_placeholder())
                 .submit_on_enter(true)
         });
+        let decorations = input.update(cx, |input, cx| input.create_decorations_collection(Vec::new(), cx));
         let picker = cx.new(|cx| ModelPicker::new(state.clone(), window, cx));
         let setup = fixed.is_none().then(|| crate::worktree_setup::store(&state, cx));
         let mut subscriptions = vec![
@@ -443,7 +471,10 @@ impl Composer {
             }),
             cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| this.on_picker(event, window, cx)),
             // Caret moves change the token under it; blinks find the caret unchanged and stop.
-            cx.observe(&input, |this, _, cx| this.sync_menu(false, cx)),
+            cx.observe(&input, |this, _, cx| {
+                this.sync_menu(false, cx);
+                this.sync_rich_decorations(cx);
+            }),
         ];
         if let Some(setup) = &setup {
             subscriptions.push(cx.subscribe_in(setup, window, |this, _, _: &crate::worktree_setup::SetupEvent, window, cx| this.refresh(false, window, cx)));
@@ -457,6 +488,7 @@ impl Composer {
             restoring_branch_threads: HashSet::new(),
             state,
             input,
+            rich_text: rich_text::RichTextState::new(decorations),
             picker,
             picker_open: false,
             permissions_open: false,
@@ -485,6 +517,9 @@ impl Composer {
             menu_dismissed: None,
             input_state: None,
             question_focus: cx.focus_handle(),
+            fresh_session_armed: HashSet::new(),
+            prompt_suggestion: None,
+            dismissed_prompt_suggestions: HashSet::new(),
             fixed,
             menu: Menu::default(),
             attachments: Default::default(),
@@ -583,7 +618,9 @@ impl Composer {
             self.error = None;
             self.prompt_length_error = None;
             self.auto_advance = None;
-            if matches!(next.target, Some(Target::Draft(_))) {
+            if matches!(next.target, Some(Target::Draft(_)))
+                || (!cfg!(test) && self.fixed.is_none() && matches!(next.target, Some(Target::Thread(_))))
+            {
                 self.focus(window, cx);
             }
         }
@@ -598,6 +635,7 @@ impl Composer {
             if self.provider_target.connection != self.state.read(cx).connection_id() { self.sync_provider_target(cx); }
             self.sync_checkout_vcs(cx);
             self.sync_branch_mismatch(cx);
+            self.sync_prompt_suggestion(cx);
             if self.finish_prepared_reads(cx) || pruned || returned_answers { cx.notify(); }
             return;
         }
@@ -632,6 +670,7 @@ impl Composer {
         self.sync_usage_limits(cx);
         self.sync_checkout_vcs(cx);
         self.sync_branch_mismatch(cx);
+        self.sync_prompt_suggestion(cx);
         self.finish_prepared_reads(cx);
         #[cfg(feature = "snapshot")]
         self.attachment_fixture(cx);
@@ -968,17 +1007,20 @@ impl Composer {
         cx.notify();
     }
 
-    /// Shift+Tab: outdent the list item under the caret, else dispatch `OutdentInline`.
+    /// Shift+Tab: outdent a fenced code block or list item under the caret, else dispatch `OutdentInline`.
     fn outdent_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_rewinding(cx) {
             return;
         }
-        let edit = {
+        let (value, range) = {
             let input = self.input.read(cx);
-            let range = input.selected_range();
-            lists::outdent_for_tab(&input.value(), range.start, range.end)
+            (input.value().to_string(), input.selected_range())
         };
-        if let Some(edit) = edit {
+        if let Some(edit) = rules::rich_text::code_block_indent(&value, range.start, range.end, true) {
+            self.apply_rich_edit(edit, window, cx);
+            return;
+        }
+        if let Some(edit) = lists::outdent_for_tab(&value, range.start, range.end) {
             self.input.update(cx, |input, cx| {
                 input.set_selected_range(edit.start..edit.end, cx);
                 input.replace(edit.replacement, window, cx);
@@ -1038,14 +1080,39 @@ impl Composer {
         if self.workspace.open && self.workspace_enabled() {return;}
         let composing = self.input.update(cx, |input, cx| input.marked_text_range(window, cx).is_some());
         let key = EnterKey { modifier, repeat: std::mem::take(&mut self.enter_repeat), composing };
-        let prompt = self.prompt(cx);
+        let (prompt, sel) = {
+            let input = self.input.read(cx);
+            (input.value().to_string(), input.selected_range())
+        };
+        if !composing
+            && !modifier
+            && self.answering.is_none()
+            && let Some(edit) = rules::rich_text::code_block_enter(&prompt, sel.start, sel.end)
+        {
+            self.apply_rich_edit(edit, window, cx);
+            return;
+        }
         let settings = self.state.read(cx).client_settings;
         let draft = matches!(self.snapshot.target, Some(Target::Draft(_)));
         match rules::submit_intent(key, self.snapshot.running, draft, settings.send_shortcut, &prompt) {
             Some(intent) => self.submit(intent, window, cx),
             // The input method commits its composition on Enter.
             None if composing => {}
-            None => self.input.update(cx, |input, cx| input.insert("\n", window, cx)),
+            None => {
+                if !modifier
+                    && self.answering.is_none()
+                    && sel.start == sel.end
+                    && let Some(edit) = lists::continuation_for_enter(&prompt, sel.start)
+                {
+                    self.input.update(cx, |input, cx| {
+                        input.set_selected_range(edit.start..edit.end, cx);
+                        input.replace(edit.replacement, window, cx);
+                        input.set_selected_range(edit.cursor_after..edit.cursor_after, cx);
+                    });
+                } else {
+                    self.input.update(cx, |input, cx| input.insert("\n", window, cx));
+                }
+            }
         }
     }
 
@@ -1107,6 +1174,256 @@ impl Composer {
             Some(Target::Thread(id)) => Some(id.clone()),
             _ => None,
         }
+    }
+
+    pub(super) fn fresh_session_available(&self, cx: &App) -> bool {
+        let Some(Target::Thread(thread_id)) = &self.snapshot.target else { return false };
+        if !self.snapshot.loaded
+            || !self.snapshot.pending.approvals.is_empty()
+            || !self.snapshot.pending.user_inputs.is_empty()
+        {
+            return false;
+        }
+        let state = self.state.read(cx);
+        let cap = state.server_config.config.as_ref().and_then(|c| c.environment.capabilities.fresh_context) == Some(true);
+        if !cap {
+            return false;
+        }
+        state
+            .thread_state(thread_id)
+            .projection
+            .as_ref()
+            .filter(|p| p.thread.id == *thread_id)
+            .is_some_and(|p| !p.messages.is_empty() || !p.visible_turn_items.is_empty())
+    }
+
+    pub(super) fn is_fresh_session_armed(&self, cx: &App) -> bool {
+        let Some(target) = self.snapshot.target.as_ref() else { return false };
+        self.fresh_session_armed.contains(target) && self.fresh_session_available(cx)
+    }
+
+    pub(super) fn arm_fresh_session(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.snapshot.target.clone() else { return };
+        if self.fresh_session_available(cx) && self.fresh_session_armed.insert(target) {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn disarm_fresh_session(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.snapshot.target.as_ref() else { return };
+        if self.fresh_session_armed.remove(target) {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn render_fresh_session_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.is_fresh_session_armed(cx) {
+            return None;
+        }
+        let p = palette(cx);
+        let dismiss = div()
+            .id("fresh-session-dismiss")
+            .px(px(6.))
+            .h(px(22.))
+            .rounded(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .text_xs()
+            .text_color(hsla(p.muted_foreground))
+            .cursor_pointer()
+            .hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
+            .child("Keep the current session")
+            .child(Icon::X.render(px(12.), hsla(p.muted_foreground)))
+            .on_click(cx.listener(|this, _, _, cx| this.disarm_fresh_session(cx)));
+        let content = h_flex()
+            .w_full()
+            .min_h(px(24.))
+            .gap(px(6.))
+            .child(div().flex_none().w(px(24.)).flex().justify_center().child(Icon::RefreshCw.render(px(12.), hsla(p.info))))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .child(div().font_weight(FontWeight::MEDIUM).child("Your next message starts a fresh session"))
+                    .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child("The agent won't see earlier messages in this thread.")),
+            )
+            .child(div().flex_none().ml_auto().child(dismiss));
+        Some(banner_surface(false, content, cx).id("fresh-session-banner").into_any_element())
+    }
+
+    fn sync_prompt_suggestion(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let enabled = state
+            .server_config
+            .config
+            .as_ref()
+            .is_some_and(|c| c.settings.prompt_suggestions_enabled);
+        let Some(Target::Thread(thread_id)) = self.snapshot.target.as_ref().filter(|_| enabled && self.fixed.is_none()) else {
+            self.prompt_suggestion = None;
+            return;
+        };
+        let Some(client) = state.client_handle() else {
+            self.prompt_suggestion = None;
+            return;
+        };
+        let environment = self.environment_id(cx);
+        let connection_id = state.connection_id();
+        let generation = Some(*client.connection_generation().borrow());
+        let same = self.prompt_suggestion.as_ref().is_some_and(|w| {
+            w.thread_id == *thread_id
+                && w.environment == environment
+                && w.connection_id == connection_id
+                && w.generation == generation
+        });
+        if same {
+            return;
+        }
+        let runtime = state.runtime().clone();
+        let watched_thread = thread_id.clone();
+        let watched_env = environment.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<rules::PromptSuggestion>>();
+        let net = runtime.spawn(async move {
+            let payload = serde_json::json!({ "threadId": watched_thread });
+            let mut delay = std::time::Duration::from_secs(1);
+            loop {
+                if let Ok(mut stream) = client.stream(rules::SUBSCRIBE_PROMPT_SUGGESTION, payload.clone()).await {
+                    while let Some(item) = stream.receiver.recv().await {
+                        match item {
+                            Ok(value) => {
+                                if let Ok(suggestion) = serde_json::from_value::<Option<rules::PromptSuggestion>>(value) {
+                                    delay = std::time::Duration::from_secs(1);
+                                    if tx.send(suggestion).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(t3_client::session::RpcError::Closed) => break,
+                            Err(_) => {}
+                        }
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(15));
+            }
+        });
+        let thread_key = thread_id.clone();
+        let ui = cx.spawn(async move |this, cx| {
+            while let Some(suggestion) = rx.recv().await {
+                let keep = this.update(cx, |composer, cx| {
+                    let Some(watcher) = composer.prompt_suggestion.as_mut() else { return false };
+                    if watcher.thread_id != thread_key || watcher.environment != watched_env {
+                        return false;
+                    }
+                    if watcher.suggestion != suggestion {
+                        watcher.suggestion = suggestion;
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+            }
+        });
+        self.prompt_suggestion = Some(PromptSuggestionWatcher {
+            thread_id: thread_id.clone(),
+            environment,
+            connection_id,
+            generation,
+            suggestion: None,
+            _net: net,
+            _ui: ui,
+        });
+    }
+
+    pub(super) fn offered_prompt_suggestion(&self, cx: &App) -> Option<&str> {
+        let Target::Thread(thread_id) = self.snapshot.target.as_ref()? else { return None };
+        let watcher = self.prompt_suggestion.as_ref().filter(|w| w.thread_id == *thread_id)?;
+        let suggestion = watcher.suggestion.as_ref()?;
+        let state = self.state.read(cx);
+        let latest_run = state
+            .thread_state(thread_id)
+            .projection
+            .as_ref()
+            .and_then(|p| p.runs.last());
+        let dismissed = self
+            .dismissed_prompt_suggestions
+            .contains(&(watcher.environment.clone(), suggestion.run_id.clone()));
+        let prompt_empty = !self.has_text;
+        let has_non_prompt_content = !self.staged().is_empty()
+            || self.has_context_records(&self.prompt(cx))
+            || self.current_reply_to().is_some();
+        rules::offered_prompt_suggestion(
+            Some(suggestion),
+            rules::PromptSuggestionOfferInput {
+                latest_run_id: latest_run.map(|r| r.id.as_str()),
+                latest_run_status: latest_run.map(|r| r.status.as_str()),
+                prompt_empty,
+                has_non_prompt_content,
+                has_pending_approvals: !self.snapshot.pending.approvals.is_empty(),
+                has_pending_inputs: !self.snapshot.pending.user_inputs.is_empty(),
+                running: self.snapshot.running,
+                sending: self.sending,
+                fresh_session_armed: self.is_fresh_session_armed(cx),
+                dismissed,
+            },
+        )
+    }
+
+    pub(super) fn accept_prompt_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.menu_open() || self.stash_state.open || self.workspace.open || self.is_rewinding(cx) {
+            return false;
+        }
+        let Some(suggestion) = self.offered_prompt_suggestion(cx).map(str::to_owned) else {
+            return false;
+        };
+        self.set_prompt(&suggestion, window, cx);
+        let end = suggestion.len();
+        self.input.update(cx, |input, cx| input.set_selected_range(end..end, cx));
+        self.draft_changed(cx);
+        self.focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    pub(super) fn dismiss_prompt_suggestion(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(Target::Thread(thread_id)) = self.snapshot.target.as_ref() else { return false };
+        let Some(watcher) = self.prompt_suggestion.as_ref().filter(|w| w.thread_id == *thread_id) else {
+            return false;
+        };
+        if self.offered_prompt_suggestion(cx).is_none() {
+            return false;
+        }
+        let Some(suggestion) = watcher.suggestion.as_ref() else { return false };
+        if self
+            .dismissed_prompt_suggestions
+            .insert((watcher.environment.clone(), suggestion.run_id.clone()))
+        {
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn redirect_printable_key(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.is_rewinding(cx)
+            || self.picker_open
+            || self.permissions_open
+            || self.workspace.open
+            || self.stash_state.open
+            || self.answering.is_some()
+            || self.snapshot.target.is_none()
+            || self.input.read(cx).focus_handle(cx).is_focused(window)
+        {
+            return false;
+        }
+        self.focus(window, cx);
+        self.input.update(cx, |input, cx| {
+            input.replace(text.to_owned(), window, cx);
+        });
+        true
     }
 
     pub(super) fn has_non_prompt_content(&self, prompt: &str, staged: &[t3_core::composer::attachments::Attachment]) -> bool {
