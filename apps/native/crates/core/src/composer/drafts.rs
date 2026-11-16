@@ -154,16 +154,21 @@ pub struct DraftStore {
 }
 
 impl DraftStore {
-    /// Reads the saved document; a draft that does not decode is dropped alone.
+    /// Reads the saved document; a draft that does not decode is dropped alone, and bad fields
+    /// within a draft degrade individually rather than wiping valid prompt/draft state (`#225`).
     pub fn from_value(value: Option<&Value>) -> DraftStore {
+        let valid_version = value
+            .and_then(|value| value.get("version"))
+            .and_then(Value::as_u64)
+            .is_some_and(|version| version == u64::from(VERSION) || (3..=6).contains(&version));
         let drafts = value
-            .filter(|value| value.get("version").and_then(Value::as_u64) == Some(u64::from(VERSION)))
+            .filter(|_| valid_version)
             .and_then(|value| value.get("drafts"))
             .and_then(Value::as_object)
             .map(|entries| {
                 entries
                     .iter()
-                    .filter_map(|(key, draft)| Some((key.clone(), serde_json::from_value::<Draft>(draft.clone()).ok()?)))
+                    .filter_map(|(key, draft)| Some((key.clone(), decode_draft(draft)?)))
                     .filter(|(_, draft)| !draft.is_empty())
                     .collect()
             })
@@ -242,6 +247,104 @@ impl DraftStore {
 /// Equal apart from when it was written, so re-saving an unchanged draft writes nothing.
 fn same_content(left: &Draft, right: &Draft) -> bool {
     Draft { updated_at: 0, ..left.clone() } == Draft { updated_at: 0, ..right.clone() }
+}
+
+fn decode_lenient_vec<T: serde::de::DeserializeOwned>(value: Option<&Value>) -> Vec<T> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(|item| serde_json::from_value(item.clone()).ok()).collect())
+        .unwrap_or_default()
+}
+
+fn trimmed_str(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Decodes a persisted `modelSelection` entry, upgrading legacy `provider` and object-shaped
+/// `options` (`#225`) while preserving instance-scoped custom slugs verbatim (`#226`).
+fn decode_model_selection_value(value: &Value, fallback_provider: Option<&str>) -> Option<ModelSelection> {
+    let obj = value.as_object()?;
+    let model = trimmed_str(obj.get("model"))?;
+    let instance_id = trimmed_str(obj.get("instanceId"))
+        .or_else(|| trimmed_str(obj.get("provider")))
+        .or(fallback_provider.map(str::trim).filter(|s| !s.is_empty()))?;
+    let selections = crate::traits::selections(obj.get("options"));
+    Some(crate::traits::model_selection(instance_id, model, &selections))
+}
+
+fn decode_draft_model_selection(obj: &serde_json::Map<String, Value>) -> Option<ModelSelection> {
+    if let Some(raw) = obj.get("modelSelection").filter(|v| !v.is_null())
+        && let Some(selection) = decode_model_selection_value(raw, None)
+    {
+        return Some(selection);
+    }
+    if let Some(active) = trimmed_str(obj.get("activeProvider"))
+        && let Some(by_provider) = obj.get("modelSelectionByProvider").and_then(Value::as_object)
+        && let Some(raw) = by_provider.get(active)
+        && let Some(selection) = decode_model_selection_value(raw, Some(active))
+    {
+        return Some(selection);
+    }
+    let provider = trimmed_str(obj.get("provider"))?;
+    let model = trimmed_str(obj.get("model"))?;
+    let mut selections = crate::traits::selections(
+        obj.get("modelOptions").and_then(Value::as_object).and_then(|map| map.get(provider)),
+    );
+    let mut push_if_missing = |id: &str, raw: Option<&Value>| {
+        if selections.iter().any(|s| s.id == id) {
+            return;
+        }
+        if let Some(value) = raw.and_then(crate::traits::OptionValue::from_json) {
+            selections.push(crate::traits::OptionSelection { id: id.to_owned(), value });
+        }
+    };
+    if provider == "codex" {
+        let effort = obj.get("effort").filter(|value| value.as_str().is_none_or(|s| !s.is_empty()));
+        push_if_missing("reasoningEffort", effort);
+        let fast = obj.get("codexFastMode").and_then(Value::as_bool) == Some(true)
+            || obj.get("serviceTier").and_then(Value::as_str) == Some("fast");
+        if fast {
+            push_if_missing("fastMode", Some(&Value::Bool(true)));
+        }
+    }
+    Some(crate::traits::model_selection(provider, model, &selections))
+}
+
+fn decode_draft(value: &Value) -> Option<Draft> {
+    let obj = value.as_object()?;
+    let prompt = obj.get("prompt").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let model_selection = decode_draft_model_selection(obj);
+    let workspace = obj.get("workspace").and_then(|v| serde_json::from_value(v.clone()).ok());
+    let runtime_mode = obj.get("runtimeMode").and_then(|v| serde_json::from_value(v.clone()).ok());
+    let interaction_mode = obj.get("interactionMode").and_then(|v| serde_json::from_value(v.clone()).ok());
+    let threads = decode_lenient_vec(obj.get("threads"));
+    let terminals = decode_lenient_vec(obj.get("terminals"));
+    let review_comments = decode_lenient_vec(obj.get("reviewComments"));
+    let attachments = decode_lenient_vec(obj.get("attachments"));
+    let context_records = obj
+        .get("contextRecords")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter(|item| item.is_object()).cloned().map(std::sync::Arc::new).collect())
+        .unwrap_or_default();
+    let reply_to = obj.get("replyTo").filter(|v| v.is_object()).cloned();
+    let updated_at = obj.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+    let created_at = obj.get("createdAt").and_then(Value::as_i64);
+    Some(Draft {
+        prompt,
+        model_selection,
+        workspace,
+        runtime_mode,
+        interaction_mode,
+        threads,
+        terminals,
+        review_comments,
+        attachments,
+        context_records,
+        reply_to,
+        pending_attachment_count: 0,
+        updated_at,
+        created_at,
+    })
 }
 
 #[cfg(test)]

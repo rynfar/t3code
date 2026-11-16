@@ -26,7 +26,7 @@ impl OptionValue {
         }
     }
 
-    fn from_json(value: &Value) -> Option<OptionValue> {
+    pub fn from_json(value: &Value) -> Option<OptionValue> {
         match value {
             Value::String(text) => Some(text.trim()).filter(|text| !text.is_empty()).map(|text| OptionValue::Str(text.to_owned())),
             Value::Bool(flag) => Some(OptionValue::Bool(*flag)),

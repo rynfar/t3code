@@ -566,6 +566,9 @@ pub struct EnvironmentCapabilities {
     /// Supports `bootstrap.prepareWorktree` (`useMultipleModelSend`).
     #[serde(default)]
     pub required_worktree_bootstrap: Option<bool>,
+    /// Supports `freshSession` (`/clear` fresh provider context).
+    #[serde(default)]
+    pub fresh_context: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -680,6 +683,8 @@ pub struct ServerSettings {
     pub environment_icon: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub enable_agent_browser_access: Option<bool>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub prompt_suggestions_enabled: bool,
     /// Missing on older hosts; the Maintenance UI default does not prove restart continuation.
     #[serde(skip)]
     pub update_continuation_advertised: bool,

@@ -186,3 +186,99 @@ fn clearing_thread_draft_content_keeps_choices_and_allows_undo_restore() {
     assert_eq!(store.get(&key).unwrap().prompt, "unsent reply");
     assert!(!store.clear_content(&thread_key("missing"), 30));
 }
+
+#[test]
+fn decodes_legacy_v3_to_v5_model_selections_without_wiping_valid_drafts() {
+    let raw = json!({
+        "version": 5,
+        "drafts": {
+            "thread:v4-obj-options": {
+                "prompt": "keep my prompt",
+                "modelSelection": {
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "options": { "reasoningEffort": "high", "fastMode": true, "ignored": [1, 2] }
+                },
+                "runtimeMode": "not-a-valid-mode",
+                "attachments": [
+                    { "id": "ok", "image": false, "name": "a.txt", "mimeType": "text/plain", "sizeBytes": 12, "attachmentId": "att-1" },
+                    { "corrupt": true }
+                ],
+                "updatedAt": 100
+            },
+            "thread:v3-by-provider": {
+                "prompt": "from v3",
+                "activeProvider": "claudeAgent",
+                "modelSelectionByProvider": {
+                    "claudeAgent": { "model": "claude-opus-4-6", "options": { "effort": "max" } }
+                },
+                "updatedAt": 90
+            },
+            "thread:v3-top-level": {
+                "prompt": "top level legacy",
+                "provider": "codex",
+                "model": "gpt-5.4",
+                "effort": "medium",
+                "serviceTier": "fast",
+                "updatedAt": 80
+            },
+            "thread:corrupt-model-selection": {
+                "prompt": "still salvageable",
+                "modelSelection": "broken",
+                "updatedAt": 70
+            }
+        }
+    });
+    let store = DraftStore::from_value(Some(&raw));
+
+    let obj_draft = store.get("thread:v4-obj-options").expect("draft salvaged despite invalid runtimeMode/attachment");
+    assert_eq!(obj_draft.prompt, "keep my prompt");
+    assert_eq!(obj_draft.runtime_mode, None);
+    assert_eq!(obj_draft.attachments.len(), 1);
+    let sel = obj_draft.model_selection.as_ref().expect("modelSelection upgraded");
+    assert_eq!(sel.instance_id, "codex");
+    assert_eq!(sel.model, "gpt-5.4");
+    assert!(sel.options.as_ref().is_some_and(Value::is_array), "legacy object options normalized to canonical array");
+    let parsed_opts = crate::traits::selections(sel.options.as_ref());
+    assert_eq!(parsed_opts.len(), 2);
+
+    let v3_draft = store.get("thread:v3-by-provider").expect("v3 map draft decoded");
+    let v3_sel = v3_draft.model_selection.as_ref().unwrap();
+    assert_eq!(v3_sel.instance_id, "claudeAgent");
+    assert_eq!(v3_sel.model, "claude-opus-4-6");
+
+    let top_draft = store.get("thread:v3-top-level").expect("top-level legacy decoded");
+    let top_sel = top_draft.model_selection.as_ref().unwrap();
+    assert_eq!(top_sel.instance_id, "codex");
+    assert_eq!(top_sel.model, "gpt-5.4");
+    let top_opts = crate::traits::selections(top_sel.options.as_ref());
+    assert_eq!(top_opts.len(), 2);
+    assert!(top_opts.iter().any(|opt| opt.id == "reasoningEffort" && matches!(&opt.value, crate::traits::OptionValue::Str(s) if s == "medium")));
+    assert!(top_opts.iter().any(|opt| opt.id == "fastMode" && opt.value == crate::traits::OptionValue::Bool(true)));
+    assert!(!top_opts.iter().any(|opt| opt.id == "effort" || opt.id == "serviceTier"));
+
+    let salvaged = store.get("thread:corrupt-model-selection").expect("corrupt modelSelection does not wipe prompt");
+    assert_eq!(salvaged.prompt, "still salvageable");
+    assert_eq!(salvaged.model_selection, None);
+}
+
+#[test]
+fn preserves_instance_scoped_custom_model_slugs_verbatim() {
+    let raw = json!({
+        "version": 1,
+        "drafts": {
+            "thread:custom": {
+                "prompt": "hello",
+                "modelSelection": {
+                    "instanceId": "provider-instance:custom-openai",
+                    "model": "gpt-5.3"
+                },
+                "updatedAt": 12
+            }
+        }
+    });
+    let store = DraftStore::from_value(Some(&raw));
+    let sel = store.get("thread:custom").unwrap().model_selection.as_ref().unwrap();
+    assert_eq!(sel.instance_id, "provider-instance:custom-openai");
+    assert_eq!(sel.model, "gpt-5.3");
+}

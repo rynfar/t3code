@@ -14,6 +14,7 @@ pub mod review;
 pub mod drafts;
 pub mod menu;
 pub mod queue;
+pub mod rich_text;
 pub mod stash;
 
 use serde::Deserialize;
@@ -42,6 +43,70 @@ pub enum FollowUpBehavior {
 
 /// `PROVIDER_SEND_TURN_MAX_INPUT_CHARS` (`packages/contracts/src/provider.ts`).
 pub const MAX_PROMPT_LENGTH: usize = 120_000;
+
+/// How long an explicit send or thread-launch RPC waits before timing out (`pingdotgg/t3code#35076`).
+pub const MESSAGE_DISPATCH_TIMEOUT_MS: u64 = 60_000;
+pub const MESSAGE_DISPATCH_TIMEOUT_MSG: &str = "Timed out after 60s waiting for the server to accept this message.";
+pub const SUBSCRIBE_PROMPT_SUGGESTION: &str = "orchestration.subscribePromptSuggestion";
+
+/// Unpersisted predicted next prompt (`OrchestrationV2PromptSuggestion`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSuggestion {
+    pub run_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromptSuggestionOfferInput<'a> {
+    pub latest_run_id: Option<&'a str>,
+    pub latest_run_status: Option<&'a str>,
+    pub prompt_empty: bool,
+    pub has_non_prompt_content: bool,
+    pub has_pending_approvals: bool,
+    pub has_pending_inputs: bool,
+    pub running: bool,
+    pub sending: bool,
+    pub fresh_session_armed: bool,
+    pub dismissed: bool,
+}
+
+/// `offeredPromptSuggestion` (`ChatComposer.tsx` + `usePromptSuggestion.ts`).
+pub fn offered_prompt_suggestion<'a>(
+    suggestion: Option<&'a PromptSuggestion>,
+    input: PromptSuggestionOfferInput<'_>,
+) -> Option<&'a str> {
+    let suggestion = suggestion?;
+    if !input.prompt_empty
+        || input.has_non_prompt_content
+        || input.has_pending_approvals
+        || input.has_pending_inputs
+        || input.running
+        || input.sending
+        || input.fresh_session_armed
+        || input.dismissed
+    {
+        return None;
+    }
+    if input.latest_run_id != Some(suggestion.run_id.as_str()) || input.latest_run_status != Some("completed") {
+        return None;
+    }
+    (!suggestion.text.trim().is_empty()).then_some(suggestion.text.as_str())
+}
+
+/// `announcedRun` (`usePromptSuggestion.ts`): skips queued and unstarted cancelled runs while
+/// refusing to fall back to an older run if the shell's `latestRunId` has not arrived in `runs`.
+pub fn resolve_prompt_suggestion_run<'a>(
+    shell_latest_run_id: Option<&str>,
+    runs: &'a [crate::thread::Run],
+) -> Option<(&'a str, &'a str)> {
+    if let Some(shell_id) = shell_latest_run_id
+        && !runs.iter().any(|run| run.id == shell_id)
+    {
+        return None;
+    }
+    crate::announcements::latest_executed_run(runs).map(|run| (run.id.as_str(), run.status.as_str()))
+}
 
 /// `getComposerPromptLengthValidationMessage` (`apps/web/src/components/chat/composerSubmission.ts`).
 pub fn prompt_length_validation_message(prompt: &str, provider_input: Option<&str>) -> Option<String> {

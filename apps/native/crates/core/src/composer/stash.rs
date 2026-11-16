@@ -6,10 +6,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::attachments::ATTACHMENT_ONLY_PROMPT;
 use super::context::TerminalContext;
 use super::drafts::{SavedAttachment, SavedThread};
-use super::menu::context_references;
 use crate::thread::ThreadProjection;
 use crate::turn_item::TurnItemKind;
 
@@ -36,12 +34,15 @@ pub struct StashEntry {
     pub review_comments: Vec<super::review::ReviewComment>,
     #[serde(default)]
     pub context_records: Vec<std::sync::Arc<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Value>,
 }
 
 impl StashEntry {
     /// `stashEntrySnippet`.
     pub fn snippet(&self) -> String {
-        let trimmed = self.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let plain = crate::assistant_citations::to_plain_text(&self.prompt);
+        let trimmed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
         if !trimmed.is_empty() {
             let chars: Vec<char> = trimmed.chars().collect();
             return if chars.len() > SNIPPET_MAX_CHARS { format!("{}…", chars[..SNIPPET_MAX_CHARS].iter().collect::<String>()) } else { trimmed };
@@ -99,11 +100,29 @@ pub fn merge_prompt(current: &str, restored: &str) -> String {
     }
 }
 
-// --- Prompt history (`composerPromptHistory.ts`) ---
+/// Normalizes a prompt for stashing: trims outer whitespace while keeping a trailing space after
+/// an inline context or citation link so restoring doesn't glue text onto the chip (`useComposerStash.ts`).
+pub fn stash_prompt_text(raw: &str) -> String {
+    let trimmed_end = raw.trim_end();
+    let trimmed = trimmed_end.trim_start();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let ends_with_token = super::rich_text::collect_inline_tokens(raw, &[])
+        .last()
+        .is_some_and(|token| token.range.end == trimmed_end.len())
+        || (trimmed.ends_with(')')
+            && trimmed
+                .rfind("](file://")
+                .is_some_and(|idx| !trimmed[idx..trimmed.len() - 1].contains(['\n', '\r', ' '])));
+    if ends_with_token {
+        format!("{trimmed} ")
+    } else {
+        trimmed.to_owned()
+    }
+}
 
-const ULTRATHINK_PREFIX: &str = "Ultrathink:\n";
-/// `PLAN_IMPLEMENTATION_PROMPT_PREFIX` (`web/src/proposedPlan.ts`).
-const PLAN_IMPLEMENTATION_PREFIX: &str = "PLEASE IMPLEMENT THIS PLAN:\n";
+// --- Prompt history (`composerPromptHistory.ts`) ---
 
 /// One recallable prompt and the message it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,27 +145,9 @@ pub struct HistoryStep {
 }
 
 /// `recallableComposerPrompt`: the words the user typed, without links whose records are gone,
-/// the ultrathink prefix, or the prompts the app writes itself.
+/// the ultrathink prefix, trailing review/legacy context blocks, or the prompts the app writes itself.
 pub fn recallable_prompt(text: &str) -> String {
-    let mut prompt = text.trim();
-    if let Some(rest) = prompt.strip_prefix(ULTRATHINK_PREFIX) {
-        prompt = rest;
-    }
-    let mut out = prompt.to_owned();
-    for reference in context_references(prompt).into_iter().rev() {
-        let (mut start, mut end) = (reference.start, reference.end);
-        if out.as_bytes().get(end) == Some(&b' ') {
-            end += 1;
-        } else if start > 0 && out.as_bytes().get(start - 1) == Some(&b' ') {
-            start -= 1;
-        }
-        out.replace_range(start..end, "");
-    }
-    let trimmed = out.trim();
-    if trimmed == ATTACHMENT_ONLY_PROMPT || trimmed.starts_with(PLAN_IMPLEMENTATION_PREFIX) {
-        return String::new();
-    }
-    trimmed.to_owned()
+    crate::timeline::recallable_prompt(text)
 }
 
 /// `buildComposerPromptHistoryEntries` from the thread's user messages: only what the user

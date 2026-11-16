@@ -297,6 +297,18 @@ pub fn send_block_reason(attachments: &[Attachment]) -> Option<String> {
     limit_error(attachments)
 }
 
+/// While an approval redirect owns the composer, wait/block if any attachment is still uploading
+/// or failed (`pingdotgg/t3code#33092`).
+pub fn approval_redirect_block_reason(attachments: &[Attachment]) -> Option<String> {
+    if attachments.iter().any(|a| matches!(a.upload, Upload::Uploading)) {
+        return Some("Wait for attachment uploads before answering the approval.".to_owned());
+    }
+    if attachments.iter().any(|a| matches!(a.upload, Upload::Failed { .. })) {
+        return Some("Remove or retry failed attachments before answering the approval.".to_owned());
+    }
+    limit_error(attachments)
+}
+
 /// `useComposerSend`: one retry per failed attachment for each explicit Send.
 pub fn retry_on_send(attachments: &[Attachment]) -> Vec<String> {
     attachments.iter().filter(|attachment| matches!(attachment.upload, Upload::Failed { .. })).map(|attachment| attachment.id.clone()).collect()

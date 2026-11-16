@@ -36,3 +36,26 @@ fn task_items_outdent_like_bullets() {
     let value = "- [ ] a\n  - [x] b";
     assert_eq!(outdent(value, value.len()).map(|(text, _)| text), Some("- [ ] a\n- [x] b".into()));
 }
+
+#[test]
+fn continuation_for_enter_continues_renumbers_and_lifts_empty_items() {
+    let edit = continuation_for_enter("1. first\n2. third", 8).unwrap();
+    assert_eq!(apply("1. first\n2. third", &edit), "1. first\n2. \n3. third");
+    assert_eq!(edit.cursor_after, 12);
+
+    let bullet = continuation_for_enter("- one\n- ", 8).unwrap();
+    assert_eq!(apply("- one\n- ", &bullet), "- one\n");
+    assert_eq!(bullet.cursor_after, 6);
+
+    let nested_empty = continuation_for_enter("1. a\n   - ", 10).unwrap();
+    assert_eq!(apply("1. a\n   - ", &nested_empty), "1. a\n2. ");
+}
+
+#[test]
+fn indent_for_tab_nests_ordered_and_bullet_items() {
+    let edit = indent_for_tab("- a\n- b", 7, 7).unwrap();
+    assert_eq!(apply("- a\n- b", &edit), "- a\n  - b");
+
+    let ordered = indent_for_tab("1. a\n2. b", 9, 9).unwrap();
+    assert_eq!(apply("1. a\n2. b", &ordered), "1. a\n   1. b");
+}
