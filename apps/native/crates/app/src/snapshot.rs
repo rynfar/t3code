@@ -25,7 +25,7 @@ use crate::app_state::AppState;
 const USAGE: &str = "usage: t3-native --snapshot <out.png> [--thread <id>] [--right-panel <surface>] \
 [--open-url <url>] [--prompt-link-repository <owner/name>] [--prompt-link-fixture <json>] [--clipboard-output <path>] [--settings <section>[:<project id>[:add-action]]] [--palette] [--new-thread] [--attach <file>]... [--prompt <text>] \
 [--pull-requests] [--pull-request <number> [--pull-request-tab code]] \
-[--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--context-meter] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
+[--connect] [--cloud-fixture <json>] [--usage <cost|tokens|limits>] [--usage-period <day|week|month|quarter>] [--usage-model] [--welcome [connect|agents]] [--welcome-terminal-fixture <json>] \
 [--question-request-fixture <json>] [--question-staged-fixture <json>] [--question-command-output <json>] [--staged-attachments-fixture <json>] [--environment-attach-fixture] [--notification-fixture visible|hidden|background] [--project-grouping-fixture <json>] [--sidebar-fixture <json>] [--provider-refresh-pending] [--turn-items-fixture <json>] [--no-command-output-streaming] [--chatgpt-fixture <json>] [--provider-fixture <json>] [--resource-telemetry-fixture <json>] [--managed-policy-fixture <json>] [--announcement-fixture <json>] [--updates-fixture <json>] [--worktree-setup <snapshot.json>] [--draft-workspace-fixture <json>] [--composer-recovery-fixture] [--workspace-availability-fixture] [--composer-audit <json>] \
 [--click|--press|--double-click|--triple-click|--shift-click|--right-click|--hover <x>,<y>]... [--drag <x1>,<y1>,<x2>,<y2>]... \
 [--scroll <x>,<y>,<dy>]... [--pause <seconds>]... [--gesture-wait <seconds>] [--render-counts-output <path>] [--media-audit <json>] [--media-profile-prefix <path>] [--media-select-all] [--media-cache-budget <bytes>] [--motion-frames <directory>] [--focus <element-id>] [--keys <keystrokes> | --key-up <keystrokes>]... [--type <text>]... [--html-fixture <page.html>] [--markdown-file-fixture <json>] [--document-fixture <json>] [--width 1440] [--height 900] [--dark|--light] [--font-size <px>] [--resize-font <px>] [--wait 6]";
@@ -298,7 +298,6 @@ pub struct Options {
     usage: Option<String>,
     usage_period: Option<String>,
     usage_model: bool,
-    context_meter: bool,
     /// Opens the welcome wizard at a step whatever the first-run gate decides.
     welcome: Option<crate::onboarding::Step>,
     welcome_terminal_fixture: Option<PathBuf>,
@@ -368,7 +367,6 @@ impl Options {
             usage: flag("--usage"),
             usage_period: flag("--usage-period"),
             usage_model: has("--usage-model"),
-            context_meter: has("--context-meter"),
             welcome: has("--welcome").then(|| match flag("--welcome").as_deref() {
                 Some("agents") => crate::onboarding::Step::Agents,
                 _ => crate::onboarding::Step::Connection,
@@ -582,9 +580,6 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             }
         });
         pump(&mut cx, 1., |_| false);
-    }
-    if options.context_meter {
-        state.update(&mut cx, |state, _| state.client_settings.context_window_meter = true);
     }
     if let Some(repo) = &options.prompt_link_repository {
         state.update(&mut cx, |state, cx| {

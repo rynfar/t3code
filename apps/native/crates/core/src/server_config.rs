@@ -389,6 +389,10 @@ pub struct ProviderSkill {
 pub struct WorkspaceSnapshot {
     pub cwd: String,
     pub checked_at: String,
+    #[serde(default, deserialize_with = "lenient_option_vec")]
+    pub models: Option<Vec<ProviderModel>>,
+    #[serde(default)]
+    pub models_pending: Option<bool>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub slash_commands: Vec<ProviderSlashCommand>,
     #[serde(default)]
@@ -556,6 +560,12 @@ pub struct EnvironmentCapabilities {
     /// The server answers `orchestration.subscribeCommandOutput`; older servers never send it.
     #[serde(default)]
     pub command_output_streaming: Option<bool>,
+    /// Honors `modelCatalogOnly`; older servers drop the field and probe every provider.
+    #[serde(default)]
+    pub model_catalog_refresh: Option<bool>,
+    /// Supports `bootstrap.prepareWorktree` (`useMultipleModelSend`).
+    #[serde(default)]
+    pub required_worktree_bootstrap: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

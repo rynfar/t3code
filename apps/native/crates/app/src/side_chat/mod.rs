@@ -231,7 +231,6 @@ impl AppState {
             &parent_thread,
             choice_model.as_ref(),
             choice_runtime,
-            self.client_settings.plan_mode_enabled,
         );
         let target = uuid_v4();
         let prompt = prompt.map(|text| text.trim().to_owned()).filter(|text| !text.is_empty());

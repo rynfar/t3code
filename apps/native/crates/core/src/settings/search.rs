@@ -249,8 +249,6 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("app-version", "Version", About, &["about check for updates download install upgrade release"]),
         SearchItem::new("telemetry-export", "OpenTelemetry export", Diagnostics, &["OTel OTLP telemetry export endpoints logs traces metrics Grafana"]),
         SearchItem::new("diagnostics", "Diagnostics", Maintenance, &["logs traces processes resource history failures spans cpu memory"]),
-        SearchItem::new("legacy-plan-mode", "Plan mode (legacy)", Labs, &["build plan composer old"]),
-        SearchItem::new("legacy-context-window-indicator", "Context window indicator (legacy)", Labs, &["composer meter usage tokens circle old"]),
         SearchItem::new("keybindings", "Keybindings", Keybindings, &["keyboard shortcuts hotkeys commands bindings json"]),
         SearchItem::new("providers", "Providers", Providers, &["agents cli codex claude cursor grok fx kiro opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory codex_home shadow home endpoint arguments environment variables display name accent color custom favorite hidden auto compact native sessions import resume"]),
         SearchItem::new("provider-health-check-interval", "Health check interval", Providers, &["refresh availability versions auth state models background probes seconds off"]),

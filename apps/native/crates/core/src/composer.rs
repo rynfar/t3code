@@ -40,21 +40,35 @@ pub enum FollowUpBehavior {
     Steer,
 }
 
+pub const MAX_PROMPT_LENGTH: usize = crate::prompt_links::MAX_PROMPT_LENGTH;
+
+/// `getComposerPromptLengthValidationMessage` (`apps/web/src/components/chat/composerSubmission.ts`).
+pub fn prompt_length_validation_message(prompt: &str, provider_input: Option<&str>) -> Option<String> {
+    let trimmed = prompt.trim();
+    let input_len = trimmed.encode_utf16().count().max(provider_input.map_or(0, |text| text.trim().encode_utf16().count()));
+    let excess = input_len.saturating_sub(MAX_PROMPT_LENGTH);
+    if excess == 0 {
+        return None;
+    }
+    let label = if excess == 1 { "character" } else { "characters" };
+    Some(format!(
+        "Prompt is {} {label} over the {}-character limit. Shorten or split it before sending.",
+        crate::usage::format::format_count(excess as f64),
+        crate::usage::format::format_count(MAX_PROMPT_LENGTH as f64),
+    ))
+}
+
 /// The `ClientSettingsSchema` keys the composer reads. They are per-device on the web, so the
 /// native client keeps its own copy with the web's names and defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientSettings {
     pub send_shortcut: SendShortcut,
     pub follow_up_behavior: FollowUpBehavior,
-    /// Legacy Build/Plan toggle and Shift+Tab. Off sends every turn in build mode.
-    pub plan_mode_enabled: bool,
     pub notification_mode: crate::notifications::NotificationMode,
     /// Toasts for other threads while the window is focused.
     pub in_app_notifications_enabled: bool,
     /// Skills also show in the `/` menu as `/skill:name`.
     pub show_skills_in_slash_menu: bool,
-    /// Legacy context window indicator beside Send.
-    pub context_window_meter: bool,
 }
 
 impl Default for ClientSettings {
@@ -62,11 +76,9 @@ impl Default for ClientSettings {
         ClientSettings {
             send_shortcut: SendShortcut::default(),
             follow_up_behavior: FollowUpBehavior::default(),
-            plan_mode_enabled: false,
             notification_mode: Default::default(),
             in_app_notifications_enabled: false,
             show_skills_in_slash_menu: true,
-            context_window_meter: false,
         }
     }
 }
@@ -85,9 +97,6 @@ impl ClientSettings {
         if let Some(value) = field("followUpBehavior").and_then(|v| serde_json::from_value(v).ok()) {
             settings.follow_up_behavior = value;
         }
-        if let Some(value) = field("planModeEnabled").and_then(|v| v.as_bool()) {
-            settings.plan_mode_enabled = value;
-        }
         if let Some(value) = field("notificationMode").and_then(|v| serde_json::from_value(v).ok()) {
             settings.notification_mode = value;
         }
@@ -96,9 +105,6 @@ impl ClientSettings {
         }
         if let Some(value) = field("showSkillsInSlashMenu").and_then(|v| v.as_bool()) {
             settings.show_skills_in_slash_menu = value;
-        }
-        if let Some(value) = field("contextWindowMeterEnabled").and_then(|v| v.as_bool()) {
-            settings.context_window_meter = value;
         }
         settings
     }
@@ -199,13 +205,6 @@ pub fn compatible_runtime_modes(mode: RuntimeMode, provider: Option<&ServerProvi
     };
     let effective = if modes.contains(&mode) { mode } else { modes.first().copied().unwrap_or(mode) };
     (modes, effective)
-}
-
-/// `resolveComposerInteractionMode`: plan mode needs the legacy setting and a provider that
-/// shows the toggle; otherwise every turn is build mode.
-pub fn interaction_mode(plan_mode_enabled: bool, provider: Option<&ServerProvider>, mode: InteractionMode) -> (bool, InteractionMode) {
-    let enabled = plan_mode_enabled && provider.is_some_and(|provider| provider.show_interaction_mode_toggle != Some(false));
-    (enabled, if enabled { mode } else { InteractionMode::Default })
 }
 
 /// `deriveThreadTitleSeed` for a text-only prompt.

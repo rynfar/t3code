@@ -15,12 +15,14 @@ use t3_core::composer::menu::{
     TriggerState,
 };
 use t3_core::palette::PaletteThread;
-use t3_core::server_config::{InteractionMode, WorkspaceSnapshot};
+use t3_core::providers as provider_rules;
+use t3_core::server_config::{ServerProvider, WorkspaceSnapshot};
 use t3_core::sidebar::time::format_iso;
 
 use super::{Composer, Target};
 use crate::app_state::AppState;
 use crate::icons::Icon;
+use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
 
@@ -106,6 +108,50 @@ impl Composer {
         Some(t3_core::workspace::draft_cwd(self.selected_workspace().as_ref(), state.environments.active.as_deref().unwrap_or_default(), root).to_owned())
     }
 
+    pub(super) fn workspace_snapshot_for<'a>(&'a self, provider: &'a ServerProvider, cwd: Option<&str>) -> Option<&'a WorkspaceSnapshot> {
+        let fetched = cwd.and_then(|cwd| self.menu.snapshots.get(&(provider.instance_id.clone(), cwd.to_owned())));
+        rules::workspace_snapshot(provider, fetched, cwd)
+    }
+
+    pub(super) fn workspace_snapshots_for_cwd(&self, cwd: Option<&str>) -> Vec<(String, WorkspaceSnapshot)> {
+        let Some(cwd) = cwd else { return Vec::new() };
+        self.menu
+            .snapshots
+            .iter()
+            .filter(|((_, snap_cwd), _)| snap_cwd == cwd)
+            .map(|((instance_id, _), snapshot)| (instance_id.clone(), snapshot.clone()))
+            .collect()
+    }
+
+    pub(super) fn workspace_scanning_for_cwd(&self, cwd: Option<&str>) -> Vec<String> {
+        let Some(cwd) = cwd else { return Vec::new() };
+        self.menu
+            .scanning
+            .iter()
+            .filter(|(_, scan_cwd)| scan_cwd == cwd)
+            .map(|(instance_id, _)| instance_id.clone())
+            .collect()
+    }
+
+    pub(super) fn ensure_workspace_snapshot(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        let Some(cwd) = self.menu_cwd(cx) else { return };
+        let snapshot = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|config| config.provider(instance_id))
+            .and_then(|provider| self.workspace_snapshot_for(provider, Some(&cwd)));
+        if !rules::snapshot_is_current(snapshot, now_ms()) {
+            self.refresh_snapshot((instance_id.to_owned(), cwd), now_ms(), cx);
+            if self.picker_open {
+                let input = self.picker_input(cx);
+                self.picker.update(cx, |picker, cx| picker.update_input(input, false, cx));
+            }
+        }
+    }
+
     fn sync_menu_scope(&mut self, cx: &App) -> bool {
         let scope = self.state.read(cx).environments.active.clone().zip(self.menu_cwd(cx));
         if self.menu.scope == scope {return false;}
@@ -184,6 +230,17 @@ impl Composer {
             self.state.read(cx).environments.environments.iter().filter_map(|e| Some((e.environment_id.as_deref()?, e.label.as_str()))),
             &environment_id, &query,
         ));
+        if let Some(config) = self.state.read(cx).server_config.config.as_ref() {
+            let entries = provider_rules::entries(config, self.target_project());
+            let snapshots: Vec<(String, WorkspaceSnapshot)> = entries
+                .iter()
+                .filter_map(|entry| {
+                    self.workspace_snapshot_for(entry.provider, cwd.as_deref())
+                        .map(|snapshot| (entry.instance_id().to_owned(), snapshot.clone()))
+                })
+                .collect();
+            items.extend(rules::model_items(&entries, &config.settings, &snapshots, &trigger.query));
+        }
         let Some(cwd) = cwd.filter(|_| !query.is_empty()) else {
             self.menu.path_search = None;
             return (items, false);
@@ -241,7 +298,6 @@ impl Composer {
         let items = match trigger.kind {
             TriggerKind::SlashCommand => {
                 let options = SlashMenuOptions {
-                    plan_mode: resolved.plan_enabled,
                     side_chat: self.fixed.is_none() && state.side_chats_offered(),
                     side_chat_disabled: self.side_chat_disabled_reason(cx),
                     compact: self.compact_available(trigger, cx),
@@ -284,6 +340,11 @@ impl Composer {
                 }
                 if this.menu_open() {
                     this.refresh_menu(cx);
+                    cx.notify();
+                }
+                if this.picker_open {
+                    let input = this.picker_input(cx);
+                    this.picker.update(cx, |picker, cx| picker.update_input(input, true, cx));
                     cx.notify();
                 }
             });
@@ -405,17 +466,6 @@ impl Composer {
                     self.toggle_picker(window, cx);
                 }
             }
-            MenuAction::Slash(command @ (SlashCommand::Plan | SlashCommand::Default)) => {
-                if !self.resolve(cx).plan_enabled {
-                    return;
-                }
-                let mode = if command == SlashCommand::Plan { InteractionMode::Plan } else { InteractionMode::Default };
-                if let Some(choices) = self.choices_mut() {
-                    choices.interaction_mode = Some(mode);
-                }
-                self.replace_prompt_range(trigger.range_start, trigger.range_end, "", window, cx);
-                self.draft_changed(cx);
-            }
             MenuAction::Slash(command @ (SlashCommand::Side | SlashCommand::Btw)) => {
                 if self.side_chat_disabled_reason(cx).is_some() {
                     return;
@@ -438,6 +488,12 @@ impl Composer {
                 self.replace_trigger(&text,&trigger,&format!("{} ",t3_core::composer::records::reference(&record).unwrap_or_default()),window,cx);
                 if let Some(target)=self.snapshot.target.clone(){self.seed_records(&target,vec![record]);}
                 self.draft_changed(cx);
+            }
+            MenuAction::Model { instance_id, model, .. } => {
+                if trigger.kind != TriggerKind::Path {
+                    return;
+                }
+                self.replace_trigger(&text, &trigger, &rules::model_mention_text(&instance_id, &model), window, cx);
             }
             MenuAction::Thread { thread_id, title } => {
                 if trigger.kind != TriggerKind::Path {
@@ -609,11 +665,16 @@ impl Composer {
     fn render_menu_row(&self, index: usize, item: &MenuItem, kind: TriggerKind, active: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let muted = hsla(p.secondary_label);
-        let icon = match &item.action {
-            MenuAction::Path { kind: PathKind::Directory, .. } => Some(Icon::Folder.render(px(16.), hsla(p.muted_foreground))),
-            MenuAction::Path { .. } => Some(Icon::File.render(px(16.), hsla(p.muted_foreground))),
-            MenuAction::Environment { .. } => Some(Icon::Server.render(px(16.),muted)),
-            MenuAction::Thread { .. } => Some(Icon::MessagesSquare.render(px(16.), muted)),
+        let icon: Option<AnyElement> = match &item.action {
+            MenuAction::Path { kind: PathKind::Directory, .. } => Some(Icon::Folder.render(px(16.), hsla(p.muted_foreground)).into_any_element()),
+            MenuAction::Path { .. } => Some(Icon::File.render(px(16.), hsla(p.muted_foreground)).into_any_element()),
+            MenuAction::Environment { .. } => Some(Icon::Server.render(px(16.), muted).into_any_element()),
+            MenuAction::Thread { .. } => Some(Icon::MessagesSquare.render(px(16.), muted).into_any_element()),
+            MenuAction::Model { instance_id, .. } => self.state.read(cx).server_config.config.as_ref().and_then(|config| {
+                let entries = provider_rules::entries(config, self.target_project());
+                let entry = entries.iter().find(|entry| entry.instance_id() == instance_id)?;
+                Some(ProviderIcon::new(ProviderMark::of(entry, &entries)).size(px(16.)).badge(BadgeSize::Compact, hsla(p.popover)).into_any_element())
+            }),
             _ => None,
         };
         let label: AnyElement = match (&item.action, kind) {

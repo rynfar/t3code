@@ -107,7 +107,7 @@ pub(super) fn target(key: &str) -> Option<Target> {
 
 impl Composer {
     pub(super) fn restore_draft_choices(&mut self, target: &Target, draft: &Draft, cx: &mut Context<Self>) {
-        self.choices.insert(target.clone(), Choices { model: draft.model_selection.clone(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode });
+        self.choices.insert(target.clone(), Choices { model: draft.model_selection.clone(), multi_models: Vec::new(), runtime_mode: draft.runtime_mode, interaction_mode: draft.interaction_mode });
         if self.snapshot.target.as_ref() == Some(target) { self.sync_provider_target(cx); }
     }
 

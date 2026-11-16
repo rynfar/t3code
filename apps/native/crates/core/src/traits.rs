@@ -98,20 +98,46 @@ fn resolve_choice(select: &SelectDescriptor, raw: Option<&str>) -> Option<String
     if offered { Some(raw.to_owned()) } else { fallback() }
 }
 
+/// `withLegacyUltracodeEffort`: legacy `effort = "ultracode"` normalizes to `effort = "xhigh"` plus
+/// `ultracode = true` when the model offers an independent `ultracode` boolean descriptor, while
+/// preserving an explicit `ultracode = false` and leaving older servers untouched.
+pub fn with_legacy_ultracode_effort(descriptors: &[OptionDescriptor], selections: &[OptionSelection]) -> Vec<OptionSelection> {
+    let has_ultracode_toggle = descriptors.iter().any(|d| matches!(d, OptionDescriptor::Boolean(b) if b.id == "ultracode"));
+    let legacy_effort = matches!(raw_value(selections, "effort"), Some(OptionValue::Str(value)) if value == "ultracode");
+    if !legacy_effort || !has_ultracode_toggle {
+        return selections.to_vec();
+    }
+    let mut normalized: Vec<OptionSelection> = selections
+        .iter()
+        .map(|selection| {
+            if selection.id == "effort" && selection.value == OptionValue::Str("ultracode".into()) {
+                OptionSelection { id: "effort".into(), value: OptionValue::Str("xhigh".into()) }
+            } else {
+                selection.clone()
+            }
+        })
+        .collect();
+    if raw_value(selections, "ultracode").is_none() {
+        normalized.push(OptionSelection { id: "ultracode".into(), value: OptionValue::Bool(true) });
+    }
+    normalized
+}
+
 /// `getProviderOptionDescriptors`: the model's descriptors with current values from `selections`.
 pub fn resolve_descriptors(descriptors: &[OptionDescriptor], selections: &[OptionSelection]) -> Vec<OptionDescriptor> {
+    let normalized = with_legacy_ultracode_effort(descriptors, selections);
     descriptors
         .iter()
         .map(|descriptor| match descriptor {
             OptionDescriptor::Boolean(boolean) => {
                 let mut boolean = boolean.clone();
-                if let Some(OptionValue::Bool(value)) = raw_value(selections, &boolean.id) {
+                if let Some(OptionValue::Bool(value)) = raw_value(&normalized, &boolean.id) {
                     boolean.current_value = Some(*value);
                 }
                 OptionDescriptor::Boolean(boolean)
             }
             OptionDescriptor::Select(select) => {
-                let raw = match raw_value(selections, &select.id) {
+                let raw = match raw_value(&normalized, &select.id) {
                     Some(OptionValue::Str(value)) => Some(value.as_str()),
                     _ => select.current_value.as_deref(),
                 };
@@ -157,9 +183,10 @@ pub fn build_selections(descriptors: &[OptionDescriptor]) -> Vec<OptionSelection
 /// `buildExplicitProviderOptionSelectionsFromDescriptors`: what a send carries, which is only the
 /// options the user chose, each normalized against the model's descriptors.
 pub fn explicit_selections(resolved: &[OptionDescriptor], explicit: &[OptionSelection]) -> Vec<OptionSelection> {
+    let normalized = with_legacy_ultracode_effort(resolved, explicit);
     build_selections(resolved)
         .into_iter()
-        .filter(|selection| explicit.iter().any(|chosen| chosen.id == selection.id))
+        .filter(|selection| normalized.iter().any(|chosen| chosen.id == selection.id))
         .collect()
 }
 
@@ -205,19 +232,19 @@ pub struct ComposerOptions {
 }
 
 /// `model` is the catalog entry for the chosen slug, if the provider lists it.
-pub fn composer_options(driver: &str, model: Option<&ProviderModel>, plan_mode_enabled: bool, explicit: &[OptionSelection]) -> ComposerOptions {
+pub fn composer_options(driver: &str, model: Option<&ProviderModel>, include_plan_agent: bool, explicit: &[OptionSelection]) -> ComposerOptions {
     if driver == "opencode" && model.is_none() {
         // A model outside OpenCode's catalog has no descriptors to normalize against, so the
         // options it was given go out as they are.
         let dispatch = explicit
             .iter()
-            .filter(|selection| plan_mode_enabled || !(selection.id == "agent" && selection.value == OptionValue::Str("plan".into())))
+            .filter(|selection| include_plan_agent || !(selection.id == "agent" && selection.value == OptionValue::Str("plan".into())))
             .cloned()
             .collect();
         return ComposerOptions { descriptors: Vec::new(), dispatch };
     }
     let caps = model.and_then(|model| model.capabilities.as_ref()).map(|caps| caps.option_descriptors.as_slice()).unwrap_or_default();
-    let caps = if plan_mode_enabled { caps.to_vec() } else { without_plan_agent(caps) };
+    let caps = if include_plan_agent { caps.to_vec() } else { without_plan_agent(caps) };
     let selections = with_implicit_fast_mode(&caps, explicit);
     let descriptors = resolve_descriptors(&caps, &selections);
     let dispatch = explicit_selections(&descriptors, &selections);
@@ -267,19 +294,21 @@ pub enum Speed<'a> {
 }
 
 /// How the model picker lays out a model's descriptors: the reasoning control heads the effort
-/// column, the other options sit below it, and speed goes to the footer.
+/// column, the other options sit below it, and speed + ultracode go to the footer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TraitLayout<'a> {
     pub effort: Option<&'a OptionDescriptor>,
     pub others: Vec<&'a OptionDescriptor>,
     pub speed: Option<Speed<'a>>,
+    pub ultracode: Option<&'a BooleanDescriptor>,
 }
 
-pub fn layout<'a>(driver: &str, descriptors: &'a [OptionDescriptor]) -> TraitLayout<'a> {
+pub fn layout<'a>(_driver: &str, descriptors: &'a [OptionDescriptor]) -> TraitLayout<'a> {
     let is_speed = |descriptor: &OptionDescriptor| match descriptor {
-        OptionDescriptor::Select(select) => driver == "codex" && select.id == "serviceTier",
+        OptionDescriptor::Select(select) => select.id == "serviceTier",
         OptionDescriptor::Boolean(boolean) => boolean.id == "fastMode",
     };
+    let is_ultracode = |descriptor: &OptionDescriptor| matches!(descriptor, OptionDescriptor::Boolean(boolean) if boolean.id == "ultracode");
     let speed = descriptors
         .iter()
         .find(|d| matches!(d, OptionDescriptor::Select(_)) && is_speed(d))
@@ -288,25 +317,30 @@ pub fn layout<'a>(driver: &str, descriptors: &'a [OptionDescriptor]) -> TraitLay
             OptionDescriptor::Select(select) => Speed::Tier(select),
             OptionDescriptor::Boolean(boolean) => Speed::FastMode(boolean),
         });
+    let ultracode = descriptors.iter().find_map(|descriptor| match descriptor {
+        OptionDescriptor::Boolean(boolean) if boolean.id == "ultracode" => Some(boolean),
+        _ => None,
+    });
     // Selects lead the column, then switches, as `columnControls` orders them.
     let column: Vec<&OptionDescriptor> = descriptors
         .iter()
         .filter(|d| matches!(d, OptionDescriptor::Select(_)))
         .chain(descriptors.iter().filter(|d| matches!(d, OptionDescriptor::Boolean(_))))
-        .filter(|descriptor| !is_speed(descriptor))
+        .filter(|descriptor| !is_speed(descriptor) && !is_ultracode(descriptor))
         .collect();
     let effort = column.iter().copied().find(|descriptor| is_reasoning_control(descriptor));
     let others = column.into_iter().filter(|descriptor| !effort.is_some_and(|effort| std::ptr::eq(effort, *descriptor))).collect();
-    TraitLayout { effort, others, speed }
+    TraitLayout { effort, others, speed, ultracode }
 }
 
 /// What the model trigger shows after the model name (`describeComposerEffort` with the default
-/// "label" effort display): the reasoning level's name and whether a fast speed is on.
+/// "label" effort display): the reasoning level's name and whether a fast speed or ultracode is on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffortSuffix {
     pub word: Option<String>,
     pub fast: bool,
     pub ultrafast: bool,
+    pub ultracode: bool,
 }
 
 pub fn effort_suffix(driver: &str, descriptors: &[OptionDescriptor]) -> EffortSuffix {
@@ -318,18 +352,19 @@ pub fn effort_suffix(driver: &str, descriptors: &[OptionDescriptor]) -> EffortSu
         OptionDescriptor::Select(_) => current_label(descriptor),
     });
     let speed = speed_label(driver, descriptors);
-    EffortSuffix { word, fast: speed == Some("Fast"), ultrafast: speed == Some("Ultrafast") }
+    let ultracode = layout.ultracode.is_some_and(|boolean| boolean.current_value == Some(true));
+    EffortSuffix { word, fast: speed == Some("Fast"), ultrafast: speed == Some("Ultrafast"), ultracode }
 }
 
 /// The speed half of `buildTraitsTriggerDisplay`: "Fast" or "Ultrafast" when a speed is on.
-fn speed_label(driver: &str, descriptors: &[OptionDescriptor]) -> Option<&'static str> {
+fn speed_label(_driver: &str, descriptors: &[OptionDescriptor]) -> Option<&'static str> {
     let mut speed = None;
     for descriptor in descriptors {
         match descriptor {
             OptionDescriptor::Boolean(boolean) if boolean.id == "fastMode" => {
                 speed = (boolean.current_value == Some(true)).then_some("Fast");
             }
-            OptionDescriptor::Select(select) if driver == "codex" && select.id == "serviceTier" => {
+            OptionDescriptor::Select(select) if select.id == "serviceTier" => {
                 let current = select_value(select);
                 let tier = |label: &str| select.options.iter().find(|option| option.label == label).map(|option| &option.id);
                 speed = match (current.as_ref(), tier("Fast"), tier("Ultrafast")) {

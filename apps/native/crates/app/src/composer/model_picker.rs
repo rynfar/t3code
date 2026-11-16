@@ -12,8 +12,8 @@ use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::composer::{runtime_mode_description, runtime_mode_label};
 use t3_core::model::ModelSelection;
-use t3_core::providers::{self, ProviderEntry};
-use t3_core::server_config::{OptionDescriptor, RuntimeMode, SelectDescriptor};
+use t3_core::providers::{self, ProviderEntry, RefreshProviders};
+use t3_core::server_config::{OptionDescriptor, RuntimeMode, SelectDescriptor, ServerProvider, WorkspaceSnapshot};
 use t3_core::traits::{self, OptionSelection, OptionValue, Speed};
 
 use super::controls::{Float, Segment, floating, menu_surface, segmented_track};
@@ -23,7 +23,7 @@ use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
-actions!(model_picker, [HighlightPrevious, HighlightNext, PickHighlighted]);
+actions!(model_picker, [HighlightPrevious, HighlightNext, PickHighlighted, ToggleHighlighted]);
 
 const CONTEXT: &str = "ModelPicker";
 const RAIL_WIDTH: f32 = 44.;
@@ -38,6 +38,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", HighlightPrevious, context),
         KeyBinding::new("down", HighlightNext, context),
         KeyBinding::new("enter", PickHighlighted, context),
+        KeyBinding::new("shift-enter", ToggleHighlighted, context),
     ]);
 }
 
@@ -45,7 +46,12 @@ pub fn init(cx: &mut App) {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PickerInput {
     pub project_id: Option<String>,
+    pub cwd: Option<String>,
+    pub workspace_snapshots: Vec<(String, WorkspaceSnapshot)>,
+    pub workspace_scanning: Vec<String>,
     pub selection: Option<ModelSelection>,
+    pub multi_models_enabled: bool,
+    pub selected_models: Vec<ModelSelection>,
     pub driver: String,
     pub descriptors: Vec<OptionDescriptor>,
     pub runtime_mode: RuntimeMode,
@@ -56,6 +62,8 @@ pub struct PickerInput {
 
 pub enum PickerEvent {
     Model { instance_id: String, model: String },
+    ToggleModel { instance_id: String, model: String },
+    InspectInstance(String),
     Options(Vec<OptionSelection>),
     RuntimeMode(RuntimeMode),
     Dismiss,
@@ -134,13 +142,40 @@ impl ModelPicker {
 
     /// Resets the picker for a fresh open: search cleared, Favorites first when there are some.
     pub fn open(&mut self, input: PickerInput, window: &mut Window, cx: &mut Context<Self>) {
-        let has_favorites = self
-            .state
-            .read(cx)
-            .server_config
-            .config
-            .as_ref()
-            .is_some_and(|config| !providers::favorites(&config.settings).is_empty());
+        let (has_favorites, refresh_catalog) = {
+            let state = self.state.read(cx);
+            let config = state.server_config.config.as_ref();
+            let has_favorites = config.is_some_and(|config| !providers::favorites(&config.settings).is_empty());
+            let should_refresh = config.is_some_and(|config| config.environment.capabilities.model_catalog_refresh == Some(true));
+            let refresh_catalog = should_refresh.then(|| {
+                let conn = state.connection_id();
+                let rpc = state.rpc(t3_core::composer::menu::REFRESH_PROVIDERS, RefreshProviders::ModelCatalog.payload());
+                (conn, rpc)
+            });
+            (has_favorites, refresh_catalog)
+        };
+        if let Some((connection, rpc)) = refresh_catalog {
+            cx.spawn(async move |this, cx| {
+                let Ok(reply) = rpc.await else { return };
+                let Some(providers) = reply
+                    .get("providers")
+                    .and_then(|value| serde_json::from_value::<Vec<ServerProvider>>(value.clone()).ok())
+                else {
+                    return;
+                };
+                let _ = this.update(cx, |this, cx| {
+                    // `modelCatalogOnly: true` pushes updates on the `ServerConfig` stream and returns `providers: []`.
+                    if !providers.is_empty() {
+                        this.state.update(cx, |state, cx| {
+                            if state.connection_id() == connection && state.server_config.apply_providers(providers) {
+                                cx.emit(crate::app_state::AppEvent::ServerConfig);
+                            }
+                        });
+                    }
+                });
+            })
+            .detach();
+        }
         let active = input.selection.as_ref().map(|selection| selection.instance_id.clone()).unwrap_or_default();
         self.tab = if has_favorites && input.locked_instance.is_none() { Tab::Favorites } else { Tab::Instance(active) };
         self.input = input;
@@ -154,6 +189,11 @@ impl ModelPicker {
         self.highlighted = self.rows.iter().position(|row| matches!(row, Row::Model { selected: true, .. })).or_else(|| self.first_enabled());
         if let Some(index) = self.highlighted {
             self.scroll.scroll_to_item(index, ScrollStrategy::Center);
+        }
+        if let Tab::Instance(id) = &self.tab
+            && !id.is_empty()
+        {
+            cx.emit(PickerEvent::InspectInstance(id.clone()));
         }
         cx.notify();
     }
@@ -176,6 +216,11 @@ impl ModelPicker {
         self.rows.iter().position(|row| matches!(row, Row::Model { disabled: None, .. }) || matches!(row, Row::Legacy { .. }))
     }
 
+    fn snapshot_for<'a>(&'a self, provider: &'a ServerProvider) -> Option<&'a WorkspaceSnapshot> {
+        let fetched = self.input.workspace_snapshots.iter().find(|(id, _)| id == &provider.instance_id).map(|(_, snapshot)| snapshot);
+        t3_core::composer::menu::workspace_snapshot(provider, fetched, self.input.cwd.as_deref())
+    }
+
     fn refresh_rows(&mut self, cx: &App) {
         let query = self.query(cx);
         let state = self.state.read(cx);
@@ -185,6 +230,7 @@ impl ModelPicker {
         };
         let entries = providers::entries(config, self.input.project_id.as_deref());
         let selected = self.input.selection.as_ref();
+        let multi = &self.input.selected_models;
         let row = |entry: &ProviderEntry, model: &t3_core::server_config::ProviderModel| {
             let favorite = providers::is_favorite(&config.settings, entry.instance_id(), &model.slug);
             let disabled = self
@@ -193,6 +239,11 @@ impl ModelPicker {
                 .as_deref()
                 .filter(|locked| *locked != entry.instance_id())
                 .map(|_| SharedString::from(LOCKED_REASON));
+            let is_selected = if !multi.is_empty() {
+                multi.iter().any(|s| s.instance_id == entry.instance_id() && s.model == model.slug)
+            } else {
+                selected.is_some_and(|s| s.instance_id == entry.instance_id() && s.model == model.slug)
+            };
             Row::Model {
                 instance_id: entry.instance_id().to_owned(),
                 slug: model.slug.clone(),
@@ -201,7 +252,7 @@ impl ModelPicker {
                 mark: ProviderMark::of(entry, &entries),
                 badge_new: model.badge.as_deref() == Some("new"),
                 favorite,
-                selected: selected.is_some_and(|s| s.instance_id == entry.instance_id() && s.model == model.slug),
+                selected: is_selected,
                 disabled,
             }
         };
@@ -209,7 +260,7 @@ impl ModelPicker {
         if !query.is_empty() {
             let mut ranked: Vec<(i64, usize, Row)> = Vec::new();
             for entry in entries.iter().filter(|entry| entry.is_ready()) {
-                for model in providers::model_options(&config.settings, entry.provider) {
+                for model in providers::model_options_for_cwd(&config.settings, entry.provider, self.snapshot_for(entry.provider)) {
                     let favorite = providers::is_favorite(&config.settings, entry.instance_id(), &model.slug);
                     if let Some(score) = providers::search_score(model, entry, favorite, &query) {
                         ranked.push((score, ranked.len(), row(entry, model)));
@@ -225,14 +276,15 @@ impl ModelPicker {
                         let Some(entry) = entries.iter().find(|entry| entry.instance_id() == favorite.provider && entry.is_ready()) else {
                             continue;
                         };
-                        if let Some(model) = entry.provider.models.iter().find(|model| model.slug == favorite.model) {
+                        let models = providers::models_for_cwd(entry.provider, self.snapshot_for(entry.provider));
+                        if let Some(model) = models.iter().find(|model| model.slug == favorite.model) {
                             rows.push(row(entry, model));
                         }
                     }
                 }
                 Tab::Instance(instance_id) => {
                     if let Some(entry) = entries.iter().find(|entry| entry.instance_id() == instance_id).filter(|e| e.is_ready()) {
-                        let models = providers::model_options(&config.settings, entry.provider);
+                        let models = providers::model_options_for_cwd(&config.settings, entry.provider, self.snapshot_for(entry.provider));
                         let favorite = |slug: &str| providers::is_favorite(&config.settings, entry.instance_id(), slug);
                         let (mut current, legacy): (Vec<_>, Vec<_>) =
                             models.into_iter().partition(|model| !model.is_legacy || favorite(&model.slug));
@@ -260,18 +312,27 @@ impl ModelPicker {
             Tab::Instance(id) => self.state.read(cx).server_config.config.as_ref().and_then(|c| c.provider(id)).map(providers::display_name).unwrap_or_else(|| id.clone()),
         };
         self.state.update(cx, |state, cx| state.announce(message, Some("model-picker"), cx));
-        self.tab = tab;
+        self.tab = tab.clone();
         self.legacy_expanded = false;
         self.refresh_rows(cx);
         self.highlighted = self.first_enabled();
+        if let Tab::Instance(id) = tab
+            && !id.is_empty()
+        {
+            cx.emit(PickerEvent::InspectInstance(id));
+        }
         cx.notify();
     }
 
-    fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn activate(&mut self, index: usize, toggle: bool, cx: &mut Context<Self>) {
         match self.rows.get(index).cloned() {
             Some(Row::Model { instance_id, slug, name, disabled: None, .. }) => {
-                self.state.update(cx, |state, cx| state.announce(format!("Model: {name}"), Some("model-picker"), cx));
-                cx.emit(PickerEvent::Model { instance_id, model: slug });
+                if toggle && self.input.multi_models_enabled {
+                    cx.emit(PickerEvent::ToggleModel { instance_id, model: slug });
+                } else {
+                    self.state.update(cx, |state, cx| state.announce(format!("Model: {name}"), Some("model-picker"), cx));
+                    cx.emit(PickerEvent::Model { instance_id, model: slug });
+                }
             }
             Some(Row::Legacy { expanded }) => {
                 self.legacy_expanded = !expanded;
@@ -378,7 +439,7 @@ impl ModelPicker {
                 .text_color(hsla(p.muted_foreground))
                 .child(div().flex_1().child(if *expanded { "Show less" } else { "Show more" }))
                 .child(if *expanded { Icon::ChevronUp } else { Icon::ChevronDown }.render(px(14.), hsla(p.muted_foreground)))
-                .on_click(cx.listener(move |this, _, _, cx| this.activate(index, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| this.activate(index, false, cx)))
                 .into_any_element(),
             Row::Model { instance_id, slug, name, sub_provider, mark, badge_new, favorite, selected, disabled } => {
                 let star_id = (instance_id.clone(), slug.clone(), *favorite);
@@ -449,7 +510,7 @@ impl ModelPicker {
                     .when_some(disabled.clone(), |this, reason| {
                         this.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| this.activate(index, cx)))
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| this.activate(index, event.modifiers().shift, cx)))
                     .into_any_element()
             }
         }
@@ -546,13 +607,13 @@ impl ModelPicker {
             .child(div().size(px(14.)).flex_none().when(checked, |this| this.child(Icon::Check.render(px(14.), hsla(p.foreground)))))
     }
 
-    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let layout = traits::layout(&self.input.driver, &self.input.descriptors);
         let speed = layout.speed.map(|speed| match speed {
             Speed::Tier(select) => {
                 let current = traits::select_value(select);
-                segmented_track(cx).children(traits::selectable_choices(select).map(|choice| {
+                segmented_track(cx).debug_selector(|| "speed-track".to_owned()).children(traits::selectable_choices(select).map(|choice| {
                     let (id, value) = (select.id.clone(), choice.id.clone());
                     let mut segment = Segment::new(SharedString::from(format!("speed-{}", choice.id)), current.as_deref() == Some(&choice.id))
                         .label(choice.label.clone())
@@ -577,6 +638,16 @@ impl ModelPicker {
                 }))
             }
         });
+        let ultracode = layout.ultracode.map(|boolean| {
+            let on = boolean.current_value == Some(true);
+            let id = boolean.id.clone();
+            segmented_track(cx).debug_selector(|| "ultracode-toggle".to_owned()).child(
+                Segment::new("ultracode-toggle", on)
+                    .icon(Icon::Workflow)
+                    .label(boolean.label.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| this.change_option(&id, OptionValue::Bool(!on), cx))),
+            )
+        });
         let mode = self.input.runtime_mode;
         h_flex()
             .flex_wrap()
@@ -587,6 +658,7 @@ impl ModelPicker {
             .border_color(hsla(p.border).opacity(0.7))
             .bg(hsla(p.muted).opacity(0.4))
             .children(speed)
+            .children(ultracode)
             .child(
                 div().ml_auto().relative().child(
                     h_flex()
@@ -690,20 +762,26 @@ impl Render for ModelPicker {
                 .selection
                 .as_ref()
                 .and_then(|selection| {
-                    let model = config?.provider(&selection.instance_id)?.models.iter().find(|m| m.slug == selection.model)?;
+                    let provider = config?.provider(&selection.instance_id)?;
+                    let model = providers::models_for_cwd(provider, self.snapshot_for(provider)).iter().find(|m| m.slug == selection.model)?;
                     Some(providers::trigger_model_name(model).to_owned())
                 })
                 .unwrap_or_default()
                 .into();
             let empty_message: SharedString = match (&self.tab, config) {
                 (_, None) => "Loading providers…".into(),
+                (Tab::Favorites, Some(_)) if !searching => "No favorites yet".into(),
                 (Tab::Instance(id), Some(config)) if !searching => entries
                     .iter()
                     .find(|entry| entry.instance_id() == id && !entry.is_ready())
                     .map(|entry| entry.provider.message.clone().unwrap_or_else(|| format!("{} is not ready.", entry.display_name)))
                     .unwrap_or_else(|| {
-                        let _ = config;
-                        "No models found".to_owned()
+                        let scanning = self.input.workspace_scanning.iter().any(|s| s == id)
+                            || config
+                                .provider(id)
+                                .and_then(|provider| self.snapshot_for(provider))
+                                .is_some_and(|snapshot| snapshot.models_pending == Some(true));
+                        if scanning { "Searching project models...".to_owned() } else { "No models found".to_owned() }
                     })
                     .into(),
                 _ => "No models found".into(),
@@ -726,7 +804,12 @@ impl Render for ModelPicker {
             .on_action(cx.listener(|this, _: &HighlightNext, _, cx| this.move_highlight(1, cx)))
             .on_action(cx.listener(|this, _: &PickHighlighted, _, cx| {
                 if let Some(index) = this.highlighted {
-                    this.activate(index, cx);
+                    this.activate(index, false, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleHighlighted, _, cx| {
+                if let Some(index) = this.highlighted {
+                    this.activate(index, true, cx);
                 }
             }))
             .on_action(cx.listener(|_, _: &Escape, _, cx| cx.emit(PickerEvent::Dismiss)))

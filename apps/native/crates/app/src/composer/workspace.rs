@@ -42,6 +42,10 @@ impl Composer {
         self.drafts.store.get(&drafts::key(&Target::Draft(scope.project.clone())))?.workspace.as_ref().filter(|choice| choice.in_scope(&scope.environment, &scope.root) && choice.destination.as_ref().is_none_or(|destination| destination == &scope.destination))
     }
 
+    pub(super) fn workspace_is_repo(&self) -> bool {
+        self.workspace.is_repo
+    }
+
     pub(super) fn selected_workspace(&self) -> Option<DraftWorkspace> {
         self.workspace_choice().cloned()
     }
@@ -195,7 +199,7 @@ impl Composer {
     }
 
     fn choose_workspace(&mut self, mode: ThreadEnvMode, previous: Option<PreviousWorktreeSeed>, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.workspace_enabled() {
+        if !self.workspace_enabled() || self.has_multiple_models(cx) {
             return;
         }
         let Some(scope) = self.workspace.scope.clone() else {
@@ -236,17 +240,22 @@ impl Composer {
         let p = palette(cx);
         let choice = self.workspace_choice();
         let previous = choice.and_then(|choice| choice.previous.as_ref());
-        let mode = choice.map_or(self.workspace.default_mode.unwrap_or(ThreadEnvMode::Local), |choice| choice.mode);
-        let label = if previous.is_some() {
+        let multi_models = self.has_multiple_models(cx);
+        let mode = if multi_models { ThreadEnvMode::Worktree } else { choice.map_or(self.workspace.default_mode.unwrap_or(ThreadEnvMode::Local), |choice| choice.mode) };
+        let label = if previous.is_some() && !multi_models {
             "Current worktree"
         } else if mode == ThreadEnvMode::Worktree {
             "New worktree"
         } else {
             "Current checkout"
         };
-        let tooltip = previous.map(|seed| seed.branch.as_deref().unwrap_or(&seed.worktree_path)).unwrap_or(label);
-        let tooltip = crate::keymap::label("composer.workspace", cx).map_or(tooltip.to_owned(), |shortcut| format!("{tooltip} · {shortcut}"));
-        let enabled = self.workspace_enabled() && !self.is_rewinding(cx);
+        let tooltip = if multi_models {
+            "Multiple models each launch in their own new worktree.".to_owned()
+        } else {
+            let base = previous.map(|seed| seed.branch.as_deref().unwrap_or(&seed.worktree_path)).unwrap_or(label);
+            crate::keymap::label("composer.workspace", cx).map_or(base.to_owned(), |shortcut| format!("{base} · {shortcut}"))
+        };
+        let enabled = self.workspace_enabled() && !multi_models && !self.is_rewinding(cx);
         let mut popup = menu_surface(cx)
             .w(px(336.))
             .occlude()

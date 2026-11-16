@@ -6,7 +6,7 @@
 //! `web/src/components/chat/modelPickerSearch.ts`.
 
 use crate::model::ModelSelection;
-use crate::server_config::{ProviderInstanceConfig, ProviderModel, ServerConfig, ServerProvider, ServerSettings, UsageWindow};
+use crate::server_config::{ProviderInstanceConfig, ProviderModel, ServerConfig, ServerProvider, ServerSettings, UsageWindow, WorkspaceSnapshot};
 use crate::sidebar::time::parse_iso;
 
 /// Refresh inputs from `ProviderStatusBanner.tsx`, provider settings, Usage and composer menus.
@@ -15,6 +15,7 @@ pub enum RefreshProviders<'a> {
     Status(&'a str),
     Settings,
     Limits,
+    ModelCatalog,
     Workspace { instance_id: &'a str, cwd: &'a str },
 }
 
@@ -33,6 +34,9 @@ impl RefreshProviders<'_> {
             Self::Settings => {
                 payload["refreshModels"] = json!(true);
                 payload["reloadSecrets"] = json!(true);
+            }
+            Self::ModelCatalog => {
+                payload["modelCatalogOnly"] = json!(true);
             }
             Self::Workspace { instance_id, cwd } => {
                 payload["instanceId"] = json!(instance_id);
@@ -322,17 +326,41 @@ pub fn project_default_selection(entries: &[ProviderEntry]) -> Option<ModelSelec
     Some(ModelSelection { instance_id: entry.instance_id().to_owned(), model: model.to_owned(), options: None })
 }
 
+/// A project's own provider config can add models that only its workspace snapshot lists
+/// (`resolveProviderModelsForCwd`).
+pub fn models_for_cwd<'a>(provider: &'a ServerProvider, snapshot: Option<&'a WorkspaceSnapshot>) -> &'a [ProviderModel] {
+    snapshot.and_then(|snapshot| snapshot.models.as_deref()).unwrap_or(&provider.models)
+}
+
 /// `getAppModelOptionsForInstance` without custom models: hidden models drop out (custom ones
 /// never hide) and the user's model order leads, then the server's order.
-pub fn model_options<'a>(settings: &ServerSettings, provider: &'a ServerProvider) -> Vec<&'a ProviderModel> {
+pub fn model_options_for_cwd<'a>(
+    settings: &ServerSettings,
+    provider: &'a ServerProvider,
+    snapshot: Option<&'a WorkspaceSnapshot>,
+) -> Vec<&'a ProviderModel> {
     let preferences = settings.provider_model_preferences.as_ref().and_then(|prefs| prefs.get(&provider.instance_id));
     let hidden = |model: &ProviderModel| preferences.is_some_and(|prefs| prefs.hidden_models.contains(&model.slug));
-    let mut options: Vec<&ProviderModel> = provider.models.iter().filter(|model| model.is_custom || !hidden(model)).collect();
+    let mut options: Vec<&ProviderModel> =
+        models_for_cwd(provider, snapshot).iter().filter(|model| model.is_custom || !hidden(model)).collect();
     if let Some(order) = preferences.map(|prefs| &prefs.model_order).filter(|order| !order.is_empty()) {
         let rank = |model: &ProviderModel| order.iter().position(|slug| *slug == model.slug).unwrap_or(usize::MAX);
         options.sort_by_key(|model| rank(model));
     }
     options
+}
+
+pub fn model_options<'a>(settings: &ServerSettings, provider: &'a ServerProvider) -> Vec<&'a ProviderModel> {
+    model_options_for_cwd(settings, provider, None)
+}
+
+/// Trigger summary label when multi-model mode has selections (`ProviderModelPicker.tsx`).
+pub fn format_multiple_model_label(selections: &[ModelSelection], resolve_name: impl Fn(&ModelSelection) -> String) -> String {
+    if selections.is_empty() {
+        return "Choose models".to_owned();
+    }
+    let head = selections.iter().take(2).map(resolve_name).collect::<Vec<_>>().join(", ");
+    if selections.len() > 2 { format!("{head}, {} more", selections.len() - 2) } else { head }
 }
 
 /// The favorites list: server settings once migrated, else none (the native client never held

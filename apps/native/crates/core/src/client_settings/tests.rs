@@ -96,11 +96,9 @@ fn composer_view_follows_the_same_file() {
     let mut doc = ClientSettingsDoc::default();
     doc.apply(&ClientSettingChange::SendShortcut(SendShortcut::ModEnterMultiline));
     doc.apply(&ClientSettingChange::FollowUpBehavior(FollowUpBehavior::Queue));
-    doc.apply(&ClientSettingChange::PlanMode(true));
     let composer = doc.composer();
     assert_eq!(composer.send_shortcut, SendShortcut::ModEnterMultiline);
     assert_eq!(composer.follow_up_behavior, FollowUpBehavior::Queue);
-    assert!(composer.plan_mode_enabled);
 }
 
 #[test]

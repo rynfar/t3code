@@ -529,3 +529,73 @@ fn context_tokens_and_percentages_read_compactly() {
     assert_eq!(context_window::format_meter_percentage(Some(9.96)).as_deref(), Some("10%"));
     assert_eq!(context_window::format_meter_percentage(Some(42.5)).as_deref(), Some("43%"));
 }
+
+#[test]
+fn context_window_reads_inherited_fork_usage_before_first_turn() {
+    let forked = projection(json!({
+        "thread": {
+            "id": "t-fork",
+            "projectId": "p1",
+            "title": "Forked",
+            "providerInstanceId": "codex",
+            "modelSelection": {"instanceId": "codex", "model": "gpt"},
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "branch": null,
+            "worktreePath": null,
+            "lineage": {"parentThreadId": "t1", "relationshipToParent": "fork", "rootThreadId": "t1"},
+            "forkedFrom": {"type": "run", "threadId": "t1", "runId": "r1"},
+            "activeProviderThreadId": null,
+            "createdAt": NOW,
+            "updatedAt": NOW,
+            "archivedAt": null
+        },
+        "contextTransfers": [{
+            "id": "ct-1",
+            "type": "fork",
+            "targetThreadId": "t-fork",
+            "sourceThreadId": "t1",
+            "sourcePoint": {"type": "run", "runId": "r1"},
+            "sourceProviderInstanceId": "codex",
+            "status": "pending",
+            "sourceTokenUsage": {"usedTokens": 60000, "maxTokens": 200000, "updatedAt": "2026-09-03T12:00:00.000Z"}
+        }]
+    }));
+    let snapshot = context_window_snapshot(&forked).expect("inherited fork usage should surface before first turn");
+    assert_eq!(snapshot.used_tokens, 60000.);
+    assert_eq!(snapshot.used_percentage, Some(30.));
+    assert_eq!(snapshot.max_tokens, Some(200000.));
+
+    // Handled handoff / mismatched strategy when already settled without native_fork is ignored.
+    let handed_off = projection(json!({
+        "thread": {
+            "id": "t-fork",
+            "projectId": "p1",
+            "title": "Forked",
+            "providerInstanceId": "codex",
+            "modelSelection": {"instanceId": "codex", "model": "gpt"},
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "branch": null,
+            "worktreePath": null,
+            "lineage": {"parentThreadId": "t1", "relationshipToParent": "fork", "rootThreadId": "t1"},
+            "forkedFrom": {"type": "run", "threadId": "t1", "runId": "r1"},
+            "activeProviderThreadId": null,
+            "createdAt": NOW,
+            "updatedAt": NOW,
+            "archivedAt": null
+        },
+        "contextTransfers": [{
+            "id": "ct-1",
+            "type": "fork",
+            "targetThreadId": "t-fork",
+            "sourceThreadId": "t1",
+            "sourcePoint": {"type": "run", "runId": "r1"},
+            "sourceProviderInstanceId": "codex",
+            "status": "resolved",
+            "resolution": {"strategy": "summary"},
+            "sourceTokenUsage": {"usedTokens": 60000, "maxTokens": 200000, "updatedAt": "2026-09-03T12:00:00.000Z"}
+        }]
+    }));
+    assert!(context_window_snapshot(&handed_off).is_none());
+}

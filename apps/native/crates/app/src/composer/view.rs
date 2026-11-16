@@ -13,12 +13,11 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::ComposerDispatch;
 use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_label};
 use t3_core::requests;
-use t3_core::server_config::InteractionMode;
 use t3_core::traits;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, ComposerControl, Float, Pill, RoundButton, RoundKind, floating, menu_surface};
 use super::model_picker::permissions_section;
-use super::{Composer, MenuKey, OpenPermissions, PasteAsText, Resolved, StashPrompt, Target, ToggleModelPicker, TogglePlanMode, runtime_mode_icon};
+use super::{Composer, MenuKey, OpenPermissions, OutdentList, PasteAsText, Resolved, StashPrompt, Target, ToggleModelPicker, runtime_mode_icon};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{hsla, palette};
@@ -71,19 +70,30 @@ impl Composer {
         dismissed.take().is_some_and(|at| at.elapsed() < REOPEN_GUARD)
     }
 
-    fn render_model_trigger(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_model_trigger(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let multi = !resolved.multi_models.is_empty();
         let suffix = traits::effort_suffix(&resolved.driver, &resolved.descriptors);
         let surface = hsla(if cx.theme().is_dark() { p.surface_raised } else { p.card });
         let mark = resolved.mark.clone().map(|mark| ProviderIcon::new(mark).badge(BadgeSize::Compact, surface));
-        let label = if resolved.model_label.is_empty() { "Choose model".to_owned() } else { resolved.model_label.clone() };
+        let label = if let Some(multi_label) = &resolved.multi_model_label {
+            multi_label.clone()
+        } else if resolved.model_label.is_empty() {
+            "Choose model".to_owned()
+        } else {
+            resolved.model_label.clone()
+        };
         let suffix_color = if self.picker_open { hsla(p.foreground) } else { hsla(p.muted_foreground) };
         let suffix = h_flex()
             .gap(px(6.))
             .text_color(suffix_color)
-            .children(suffix.word.map(|word| div().max_w(px(96.)).truncate().child(word)))
-            .when(suffix.fast || suffix.ultrafast, |this| this.child(Icon::ZapFill.render(px(12.), suffix_color)));
-        let tooltip = [Some(label.clone()), Some("⌘⇧M".to_owned())].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+            .when(!multi, |this| {
+                this.children(suffix.word.map(|word| div().max_w(px(96.)).truncate().child(word)))
+                    .when(suffix.fast || suffix.ultrafast, |this| this.child(Icon::ZapFill.render(px(12.), suffix_color)))
+                    .when(suffix.ultracode, |this| this.child(Icon::Workflow.render(px(12.), suffix_color)))
+            });
+        let tooltip_label = resolved.multi_model_tooltip.as_deref().unwrap_or(&label);
+        let tooltip = [Some(tooltip_label.to_owned()), Some("⌘⇧M".to_owned())].into_iter().flatten().collect::<Vec<_>>().join(" · ");
         div()
             .relative()
             .min_w(px(52.))
@@ -161,19 +171,6 @@ impl Composer {
             .into_any_element()
     }
 
-    fn render_plan_toggle(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
-        let plan = resolved.interaction_mode == InteractionMode::Plan;
-        let tooltip = if plan { "Plan mode. Click to return to normal build mode" } else { "Default mode. Click to enter plan mode" };
-        ComposerControl::new("interaction-mode")
-            .icon(if plan { Icon::PencilRuler } else { Icon::Bot })
-            .label(if plan { "Plan" } else { "Build" })
-            .emphasized(plan)
-            .disabled(self.is_rewinding(cx))
-            .tooltip(tooltip)
-            .on_click(cx.listener(|this, _, window, cx| this.toggle_plan_mode(window, cx)))
-            .into_any_element()
-    }
-
     fn render_primary(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
         let running = self.snapshot.running;
         let rewinding = self.is_rewinding(cx);
@@ -230,8 +227,8 @@ impl Composer {
             _ => (RoundKind::Send, "Submit message"),
         };
         let blocked = self.snapshot.setup_blocks_send || self.is_rewinding(cx);
-        let disabled = self.sending || !has_text || resolved.model.is_none() || attachment_block.is_some() || blocked;
-        let tooltip: SharedString = if resolved.model.is_none() {
+        let disabled = self.sending || !has_text || (resolved.model.is_none() && resolved.multi_models.is_empty()) || attachment_block.is_some() || blocked;
+        let tooltip: SharedString = if resolved.model.is_none() && resolved.multi_models.is_empty() {
             "No provider available".into()
         } else if self.is_rewinding(cx) {
             "Reverting checkpoint...".into()
@@ -286,7 +283,7 @@ impl Render for Composer {
                         this.enter_repeat = event.is_held;
                     }
                 }))
-                .on_action(cx.listener(|this, _: &TogglePlanMode, window, cx| this.toggle_plan_mode(window, cx)))
+                .on_action(cx.listener(|this, _: &OutdentList, window, cx| this.outdent_list(window, cx)))
                 // Each composer takes its own shortcuts, so a side chat's never reach the open thread's.
                 .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| this.toggle_picker(window, cx)))
                 .on_action(cx.listener(|this, _: &super::OpenWorkspace, window, cx| this.open_workspace(window, cx)))
@@ -400,6 +397,20 @@ impl Render for Composer {
                                     .text_size(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx)))
                                     .line_height(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx) * 1.625))),
                         )
+                        .when(self.answering.is_none(), |this| {
+                            this.when_some(self.prompt_length_error.clone(), |this, message| {
+                                this.child(
+                                    div()
+                                        .id("prompt-length-validation")
+                                        .debug_selector(|| "prompt-length-validation".to_owned())
+                                        .px(px(16.))
+                                        .pb(px(8.))
+                                        .text_xs()
+                                        .text_color(hsla(p.destructive))
+                                        .child(message),
+                                )
+                            })
+                        })
                         .child(
                             h_flex()
                                 .px(px(8.))
@@ -418,9 +429,7 @@ impl Render for Composer {
                                 })
                                 .child(self.render_model_trigger(&resolved, cx))
                                 .when(show_permissions, |this| this.child(self.render_permissions_chip(&resolved, cx)))
-                                .when(resolved.plan_enabled, |this| this.child(self.render_plan_toggle(&resolved, cx)))
                                 .child(div().flex_1().min_w(px(8.)))
-                                .children(crate::usage::meter::context_meter(&self.state, window, cx))
                                 .child(self.render_primary(&resolved, cx)),
                         ),
                     ),
