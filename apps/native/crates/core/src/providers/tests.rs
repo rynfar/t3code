@@ -251,3 +251,61 @@ fn status_refresh_ignores_old_completions_even_after_returning_to_the_same_targe
     assert!(!refresh.finish(&current));
     assert!(refresh.start(Some(&read)).is_some(), "success or failure may be retried");
 }
+
+#[test]
+fn custom_model_slugs_matching_aliases_stay_exact_and_cwd_snapshots_override_models() {
+    use crate::composer::effective_selection;
+    use crate::model::ModelSelection;
+    use crate::server_config::WorkspaceSnapshot;
+
+    // #226 (`pingdotgg/t3code#29789`): custom models whose slug looks like a driver alias keep their exact slug.
+    let config = config(
+        json!([provider("codex", "codex", "ready", json!([
+            model("gpt-5.4", json!({"isDefault": true})),
+            model("5.3", json!({"isCustom": true})),
+            model("gpt-5-codex", json!({"isCustom": true}))
+        ]))]),
+        json!({}),
+    );
+    let entries = entries(&config, None);
+    for custom_slug in ["5.3", "gpt-5-codex"] {
+        let picked = ModelSelection { instance_id: "codex".into(), model: custom_slug.into(), options: None };
+        let resolved = effective_selection(&entries, Some(&picked)).unwrap();
+        assert_eq!(resolved.model, custom_slug);
+        assert!(model_options(&config.settings, entries[0].provider).iter().any(|m| m.slug == custom_slug));
+    }
+
+    // #33511: modelCatalogOnly refresh payload.
+    assert_eq!(
+        RefreshProviders::ModelCatalog.payload(),
+        json!({
+            "modelCatalogOnly": true,
+            "workspaceSnapshotsOnDemand": true,
+            "usageLimitsCommand": true,
+        })
+    );
+
+    // #24585: workspace snapshot models override machine models for that cwd.
+    let opencode: ServerProvider = serde_json::from_value(provider("opencode", "opencode", "ready", json!([model("global-only", json!({}))]))).unwrap();
+    let snap: WorkspaceSnapshot = serde_json::from_value(json!({
+        "cwd": "/repo/proj",
+        "checkedAt": "2026-11-02T00:00:00.000Z",
+        "models": [model("proj/custom", json!({}))],
+        "modelsPending": true,
+        "slashCommands": [],
+        "skills": []
+    }))
+    .unwrap();
+    assert_eq!(models_for_cwd(&opencode, None).iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(), ["global-only"]);
+    assert_eq!(models_for_cwd(&opencode, Some(&snap)).iter().map(|m| m.slug.as_str()).collect::<Vec<_>>(), ["proj/custom"]);
+    assert_eq!(snap.models_pending, Some(true));
+
+    // Multi-model trigger summary formats 2 names cleanly and summarizes 3+.
+    let picks = [
+        ModelSelection { instance_id: "codex".into(), model: "a".into(), options: None },
+        ModelSelection { instance_id: "claudeAgent".into(), model: "b".into(), options: None },
+        ModelSelection { instance_id: "cursor".into(), model: "c".into(), options: None },
+    ];
+    assert_eq!(format_multiple_model_label(&picks[..2], |s| s.model.clone()), "a, b");
+    assert_eq!(format_multiple_model_label(&picks, |s| s.model.clone()), "a, b, 1 more");
+}

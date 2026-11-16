@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let snapshot_for_cwd = menu::workspace_snapshot(provider, fetched.as_ref(), Some(&project.workspace_root));
     let (skills, slash_commands) = menu::skills_and_commands(provider, snapshot_for_cwd);
     println!("{} ({}): {} skills, {} commands, snapshot {}", provider.instance_id, provider.driver, skills.len(), slash_commands.len(), snapshot_for_cwd.is_some());
-    let options = SlashMenuOptions { plan_mode: true, show_skills: true, ..Default::default() };
+    let options = SlashMenuOptions { show_skills: true, ..Default::default() };
     let slash = menu::slash_items(&trigger_for("/"), &provider.driver, &skills, &slash_commands, options);
     println!("/: {}", slash.iter().map(|item| item.label.as_str()).collect::<Vec<_>>().join("  "));
     let dollar = menu::skill_items(&trigger_for("$"), &provider.driver, &skills);

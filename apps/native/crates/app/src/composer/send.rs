@@ -9,10 +9,10 @@ use serde_json::Value;
 use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
 use t3_core::composer::attachments::{self, Attachment};
 use t3_core::composer::context::{ExpiredNotice, TerminalContext, TerminalSend, expired_toast_copy};
-use t3_core::composer::menu::{SlashCommand, ThreadContext};
+use t3_core::composer::menu::ThreadContext;
 use t3_core::composer::{self as rules, FollowUpBehavior, SubmitIntent};
 use t3_core::model::ModelSelection;
-use t3_core::server_config::{InteractionMode, ThreadEnvMode};
+use t3_core::server_config::ThreadEnvMode;
 use t3_core::traits;
 use t3_core::workspace::{self, VcsRefs};
 
@@ -36,14 +36,14 @@ pub(super) struct Taken {
 }
 
 /// What one send carries, resolved before the prompt clears.
-struct Outgoing {
+pub(super) struct Outgoing {
     /// The prompt as typed, put back if the send fails.
-    prompt: String,
+    pub(super) prompt: String,
     /// What the message says: the prompt, or the attachment-only prompt.
-    text: String,
-    title: String,
-    context: Option<Value>,
-    attachments: Vec<Value>,
+    pub(super) text: String,
+    pub(super) title: String,
+    pub(super) context: Option<Value>,
+    pub(super) attachments: Vec<Value>,
 }
 
 impl Composer {
@@ -116,21 +116,13 @@ impl Composer {
             self.await_uploads(intent, window, cx);
             return;
         }
-        // `/plan` or `/default` alone switches the mode instead of sending.
-        if let Some(command) = t3_core::composer::menu::parse_standalone_slash_command(&text)
-            && staged.is_empty()
-            && self.resolve(cx).plan_enabled
-        {
-            let mode = if command == SlashCommand::Plan { InteractionMode::Plan } else { InteractionMode::Default };
-            if let Some(choices) = self.choices_mut() {
-                choices.interaction_mode = Some(mode);
-            }
-            self.set_prompt("", window, cx);
-            self.draft_changed(cx);
+        let outgoing = self.outgoing(text.clone(), &staged);
+        if let Some(validation_message) = rules::prompt_length_validation_message(&text, Some(&outgoing.text)) {
+            self.prompt_length_error = Some(validation_message);
             cx.notify();
             return;
         }
-        let outgoing = self.outgoing(text, &staged);
+        self.prompt_length_error = None;
         if terminals.expired > 0 {
             self.expired_toast(terminals.expired, ExpiredNotice::Omitted, cx);
         }
@@ -224,7 +216,7 @@ impl Composer {
         }).detach();
     }
 
-    fn outgoing(&self, prompt: String, staged: &[Attachment]) -> Outgoing {
+    pub(super) fn outgoing(&self, prompt: String, staged: &[Attachment]) -> Outgoing {
         let prompt_for_send = match self.current_reply_to() {
             Some(reply) => {
                 let cid = t3_core::composer::records::field(reply, "contextId");
@@ -256,6 +248,10 @@ impl Composer {
 
     fn launch(&mut self, project_id: String, outgoing: Outgoing, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
         let resolved = self.resolve(cx);
+        if !resolved.multi_models.is_empty() {
+            self.launch_multiple(project_id, resolved, outgoing, window, cx);
+            return;
+        }
         let Some(selection) = Self::dispatch_selection(&resolved) else {
             self.error = Some(NO_PROVIDER.into());
             cx.notify();
@@ -357,6 +353,174 @@ impl Composer {
                     this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
                 }
                 this.finish_launch(intent, (result, worktree_launch), taken, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn launch_multiple(&mut self, project_id: String, resolved: Resolved, outgoing: Outgoing, window: &mut Window, cx: &mut Context<Self>) {
+        let (supports_bootstrap, root, start_from_origin, star_origin, origin, destination, dispatch_selections) = {
+            let state = self.state.read(cx);
+            let config = state.server_config.config.as_ref();
+            let supports_bootstrap = config.is_some_and(|c| c.environment.capabilities.required_worktree_bootstrap == Some(true));
+            let root = state.shell.project(&project_id).map(|project| project.workspace_root.clone());
+            let start_from_origin = config.is_some_and(|c| workspace::start_from_origin(&c.settings, &project_id, ThreadEnvMode::Worktree));
+            let star_origin = state.star_prompt_origin();
+            let origin = (
+                state.connection_id(),
+                state.client_handle().map(|client| *client.connection_generation().borrow()),
+                state.environment().map(str::to_owned),
+            );
+            let destination = (
+                state.environments.active.clone(),
+                config.map(|config| config.environment.environment_id.clone()),
+                state.shell.project(&project_id).map(|project| project.created_at.clone()),
+            );
+            let cwd = self.menu_cwd(cx);
+            let dispatch_selections: Vec<(ModelSelection, ModelSelection)> = resolved
+                .multi_models
+                .iter()
+                .map(|raw| {
+                    let dispatch = config
+                        .and_then(|config| config.provider(&raw.instance_id))
+                        .map(|provider| {
+                            let snapshot = self.workspace_snapshot_for(provider, cwd.as_deref());
+                            let provider_model =
+                                t3_core::providers::models_for_cwd(provider, snapshot).iter().find(|m| m.slug == raw.model);
+                            let explicit = traits::selections(raw.options.as_ref());
+                            let options = traits::composer_options(&provider.driver, provider_model, false, &explicit);
+                            traits::model_selection(&raw.instance_id, &raw.model, &options.dispatch)
+                        })
+                        .unwrap_or_else(|| raw.clone());
+                    (raw.clone(), dispatch)
+                })
+                .collect();
+            (supports_bootstrap, root, start_from_origin, star_origin, origin, destination, dispatch_selections)
+        };
+        if !supports_bootstrap {
+            self.error = Some("Update this server before starting multiple models.".into());
+            cx.notify();
+            return;
+        }
+        let Some(cwd) = root.filter(|_| self.workspace_is_repo()) else {
+            let toast = Toast::new(ToastKind::Warning, "Choose models and a base branch")
+                .description("Multiple models need a new thread in a Git project. Each gets its own worktree.");
+            self.state.update(cx, |state, cx| state.show_toast(toast, cx));
+            return;
+        };
+        let target = Target::Draft(project_id.clone());
+        let refs = self.state.read(cx).request(
+            method::VCS_LIST_REFS,
+            workspace::list_refs_request(&cwd),
+            |value| serde_json::from_value::<VcsRefs>(value).map_err(|error| error.to_string()),
+        );
+        self.record_draft(&target, cx);
+        let taken = self.begin_send(&target, &outgoing.prompt, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let refs = match refs {
+                Some(task) => task.await.ok().and_then(Result::ok),
+                None => None,
+            };
+            let strategy = workspace::launch_strategy(ThreadEnvMode::Worktree, refs.as_ref(), start_from_origin).map_err(str::to_owned);
+            let requests = this.update_in(cx, |this, _, cx| {
+                let state = this.state.read(cx);
+                let current = (
+                    state.connection_id(),
+                    state.client_handle().map(|client| *client.connection_generation().borrow()),
+                    state.environment().map(str::to_owned),
+                );
+                let current_destination = (
+                    state.environments.active.clone(),
+                    state.server_config.config.as_ref().map(|config| config.environment.environment_id.clone()),
+                    state.shell.project(&project_id).map(|project| project.created_at.clone()),
+                );
+                if current_destination != destination
+                    || current != origin
+                    || state.selected_thread.is_some()
+                    || state.draft_project.as_deref() != Some(project_id.as_str())
+                    || this.snapshot.target.as_ref() != Some(&target)
+                {
+                    return Err("The destination changed before launch. Select the workspace again.".to_owned());
+                }
+                let strategy = strategy?;
+                let rpcs = dispatch_selections
+                    .iter()
+                    .map(|(raw, dispatch)| {
+                        let (thread_id, command_id, message_id) = (uuid_v4(), uuid_v4(), uuid_v4());
+                        let payload = commands::launch_thread(&LaunchThread {
+                            command_id: &command_id,
+                            thread_id: &thread_id,
+                            project_id: &project_id,
+                            title: &outgoing.title,
+                            model_selection: dispatch,
+                            runtime_mode: resolved.runtime_mode,
+                            interaction_mode: resolved.interaction_mode,
+                            workspace: &strategy,
+                            message_id: &message_id,
+                            text: &outgoing.text,
+                            context: outgoing.context.as_ref(),
+                            attachments: &outgoing.attachments,
+                        });
+                        (raw.clone(), state.rpc(method::LAUNCH_THREAD, payload))
+                    })
+                    .collect::<Vec<_>>();
+                Ok::<_, String>(rpcs)
+            });
+            let (started_count, failed_selections, failure_msg) = match requests {
+                Ok(Ok(rpcs)) => {
+                    let (raws, futs): (Vec<_>, Vec<_>) = rpcs.into_iter().unzip();
+                    let outcomes = futures::future::join_all(futs).await;
+                    let mut started = 0usize;
+                    let mut failed = Vec::new();
+                    let mut first_error = None;
+                    for (raw, outcome) in raws.into_iter().zip(outcomes) {
+                        match outcome {
+                            Ok(_) => started += 1,
+                            Err(err) => {
+                                if first_error.is_none() {
+                                    first_error = Some(err.to_string());
+                                }
+                                failed.push(raw);
+                            }
+                        }
+                    }
+                    (started, failed, first_error)
+                }
+                Ok(Err(error)) => {
+                    let failed = dispatch_selections.into_iter().map(|(raw, _)| raw).collect();
+                    (0, failed, Some(error))
+                }
+                Err(_) => return,
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.sending = false;
+                if started_count > 0 {
+                    this.clear_usage_limits_for(&taken.target);
+                    this.state.update(cx, |state, cx| {
+                        state.record_prompt_sent(star_origin, cx);
+                        let noun = if started_count == 1 { "thread" } else { "threads" };
+                        state.show_toast(Toast::new(ToastKind::Success, format!("Started {started_count} {noun} in background")), cx);
+                    });
+                }
+                if failed_selections.is_empty() {
+                    if !this.current_draft(&taken.target, cx).has_user_content() {
+                        this.discard_draft(&taken.target, cx);
+                    }
+                    if let Some(choices) = this.choices.get_mut(&taken.target) {
+                        choices.multi_models.clear();
+                    }
+                } else {
+                    if let Some(choices) = this.choices.get_mut(&taken.target) {
+                        if failed_selections.len() > 1 {
+                            choices.multi_models = failed_selections;
+                        } else {
+                            choices.multi_models.clear();
+                            choices.model = failed_selections.into_iter().next();
+                        }
+                    }
+                    this.restore(taken, failure_msg.unwrap_or_else(|| "Failed to send messages.".to_owned()), window, cx);
+                }
+                cx.notify();
             });
         })
         .detach();

@@ -1,8 +1,7 @@
-//! The composer's context window meter: `web/src/lib/contextWindow.ts` and
-//! `web/src/components/chat/ContextWindowMeter.logic.ts`. The newest provider turn's token usage
-//! wins, then the active provider thread's reported context, then the last compaction. A fork's
-//! inherited usage before its first turn (`contextTransfers`) is not read: the thread projection
-//! does not decode `forkedFrom`.
+//! The thread's context window snapshot (`packages/client-runtime/src/state/contextWindow.ts`).
+//! The newest provider turn's token usage wins, then the active provider thread's reported
+//! context, then a fork's inherited usage before its first turn (`contextTransfers`), then the
+//! last compaction.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -91,9 +90,42 @@ fn active_provider_thread(projection: &ThreadProjection) -> Option<&Value> {
     projection.provider_threads.iter().find(|thread| thread.id == id).map(|thread| &thread.value)
 }
 
+fn inherited_fork_usage(projection: &ThreadProjection) -> Option<TurnTokenUsage> {
+    let forked_from = projection.thread.forked_from.as_ref()?;
+    if forked_from.get("type").and_then(Value::as_str) != Some("run") {
+        return None;
+    }
+    let source_thread_id = forked_from.get("threadId").and_then(Value::as_str)?;
+    let source_run_id = forked_from.get("runId").and_then(Value::as_str)?;
+    let target_thread_id = projection.thread.id.as_str();
+    let instance_id = projection.thread.model_selection.instance_id.as_str();
+    projection.context_transfers.iter().find_map(|transfer| {
+        let value = &transfer.value;
+        let matches_transfer = value.get("type").and_then(Value::as_str) == Some("fork")
+            && value.get("targetThreadId").and_then(Value::as_str) == Some(target_thread_id)
+            && value.get("sourceThreadId").and_then(Value::as_str) == Some(source_thread_id)
+            && value.get("sourcePoint").and_then(|p| p.get("runId")).and_then(Value::as_str) == Some(source_run_id)
+            && value.get("sourceProviderInstanceId").and_then(Value::as_str) == Some(instance_id)
+            && (value.get("status").and_then(Value::as_str) == Some("pending")
+                || value.get("resolution").and_then(|r| r.get("strategy")).and_then(Value::as_str) == Some("native_fork"));
+        if !matches_transfer {
+            return None;
+        }
+        let usage = value.get("sourceTokenUsage").filter(|usage| !usage.is_null())?;
+        serde_json::from_value::<TurnTokenUsage>(usage.clone()).ok()
+    })
+}
+
 /// `deriveLatestContextWindowSnapshot` over the open thread.
 pub fn context_window_snapshot(projection: &ThreadProjection) -> Option<ContextWindowSnapshot> {
-    if let Some(live) = latest_turn_usage(&projection.provider_turns) {
+    let provider_thread = active_provider_thread(projection);
+    let provider_usage = provider_thread
+        .and_then(|thread| thread.get("contextUsage"))
+        .filter(|usage| !usage.is_null())
+        .and_then(|usage| serde_json::from_value::<ContextUsage>(usage.clone()).ok());
+    let live = latest_turn_usage(&projection.provider_turns)
+        .or_else(|| if provider_usage.is_none() { inherited_fork_usage(projection) } else { None });
+    if let Some(live) = live {
         let used = live.used_tokens.max(0.);
         return Some(ContextWindowSnapshot {
             used_tokens: used,
@@ -106,11 +138,6 @@ pub fn context_window_snapshot(projection: &ThreadProjection) -> Option<ContextW
             updated_at: live.updated_at,
         });
     }
-    let provider_thread = active_provider_thread(projection);
-    let provider_usage = provider_thread
-        .and_then(|thread| thread.get("contextUsage"))
-        .filter(|usage| !usage.is_null())
-        .and_then(|usage| serde_json::from_value::<ContextUsage>(usage.clone()).ok());
     let updated_at = provider_thread.and_then(|thread| thread.get("updatedAt")).and_then(Value::as_str);
     if let (Some(usage), Some(updated_at)) = (provider_usage, updated_at) {
         let max = finite(usage.max_tokens);

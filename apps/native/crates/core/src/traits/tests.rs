@@ -68,7 +68,7 @@ fn layout_puts_reasoning_in_the_column_and_speed_in_the_footer() {
 #[test]
 fn effort_suffix_names_the_level_and_flags_fast() {
     let fast = resolve_descriptors(&descriptors(), &selections(Some(&json!([{"id": "fastMode", "value": true}]))));
-    assert_eq!(effort_suffix("claudeAgent", &fast), EffortSuffix { word: Some("High".into()), fast: true, ultrafast: false });
+    assert_eq!(effort_suffix("claudeAgent", &fast), EffortSuffix { word: Some("High".into()), fast: true, ultrafast: false, ultracode: false, context_window: None });
     let tiers: Vec<OptionDescriptor> = serde_json::from_value(json!([
         {"id": "serviceTier", "label": "Speed", "type": "select", "currentValue": "flex",
          "options": [{"id": "default", "label": "Standard"}, {"id": "flex", "label": "Ultrafast"}]}
@@ -76,6 +76,21 @@ fn effort_suffix_names_the_level_and_flags_fast() {
     .unwrap();
     assert!(effort_suffix("codex", &tiers).ultrafast);
     assert_eq!(effort_suffix("codex", &tiers).word, None);
+    // #33177: Pi and other drivers offering `serviceTier` render speed tiers in the footer and suffix too.
+    assert!(effort_suffix("pi", &tiers).ultrafast);
+    assert_eq!(effort_suffix("pi", &tiers).word, None);
+    assert!(matches!(layout("pi", &tiers).speed, Some(Speed::Tier(_))));
+
+    let with_window: Vec<OptionDescriptor> = serde_json::from_value(json!([
+        {"id": "effort", "label": "Effort", "type": "select", "options": [{"id": "high", "label": "High", "isDefault": true}]},
+        {"id": "contextWindow", "label": "Context window", "type": "select", "currentValue": "1m",
+         "options": [{"id": "200k", "label": "200k"}, {"id": "1m", "label": "1M"}]}
+    ]))
+    .unwrap();
+    assert_eq!(
+        effort_suffix("claudeAgent", &with_window),
+        EffortSuffix { word: Some("High".into()), fast: false, ultrafast: false, ultracode: false, context_window: Some("1M".into()) }
+    );
 }
 
 #[test]
@@ -121,4 +136,60 @@ fn uncatalogued_opencode_models_keep_their_options() {
     assert_eq!(off.dispatch, vec![OptionSelection { id: "variant".into(), value: OptionValue::Str("high".into()) }]);
     assert!(off.descriptors.is_empty());
     assert_eq!(composer_options("opencode", None, true, &kept).dispatch.len(), 2);
+}
+
+#[test]
+fn ultracode_boolean_normalizes_legacy_effort_and_layouts_in_footer() {
+    let modern: Vec<OptionDescriptor> = serde_json::from_value(json!([
+        {"id": "effort", "label": "Effort", "type": "select", "options": [
+            {"id": "high", "label": "High", "isDefault": true},
+            {"id": "xhigh", "label": "XHigh"}
+        ]},
+        {"id": "ultracode", "label": "Ultracode", "type": "boolean", "currentValue": false}
+    ]))
+    .unwrap();
+    let legacy = selections(Some(&json!([{"id": "effort", "value": "ultracode"}])));
+    let resolved = resolve_descriptors(&modern, &legacy);
+    assert_eq!(current_label(&resolved[0]).as_deref(), Some("XHigh"));
+    assert_eq!(current_value(&resolved[1]), Some(OptionValue::Bool(true)));
+    assert_eq!(
+        explicit_selections(&resolved, &legacy),
+        vec![
+            OptionSelection { id: "effort".into(), value: OptionValue::Str("xhigh".into()) },
+            OptionSelection { id: "ultracode".into(), value: OptionValue::Bool(true) },
+        ]
+    );
+
+    // Explicit `ultracode: false` is preserved even alongside legacy `effort: ultracode`.
+    let explicit_off = selections(Some(&json!([{"id": "effort", "value": "ultracode"}, {"id": "ultracode", "value": false}])));
+    let resolved_off = resolve_descriptors(&modern, &explicit_off);
+    assert_eq!(current_label(&resolved_off[0]).as_deref(), Some("XHigh"));
+    assert_eq!(current_value(&resolved_off[1]), Some(OptionValue::Bool(false)));
+    assert_eq!(
+        explicit_selections(&resolved_off, &explicit_off),
+        vec![
+            OptionSelection { id: "effort".into(), value: OptionValue::Str("xhigh".into()) },
+            OptionSelection { id: "ultracode".into(), value: OptionValue::Bool(false) },
+        ]
+    );
+
+    // Older servers without the `ultracode` boolean retain legacy `effort: ultracode`.
+    let old_server: Vec<OptionDescriptor> = serde_json::from_value(json!([
+        {"id": "effort", "label": "Effort", "type": "select", "options": [
+            {"id": "high", "label": "High", "isDefault": true},
+            {"id": "ultracode", "label": "Ultracode"}
+        ]}
+    ]))
+    .unwrap();
+    let old_resolved = resolve_descriptors(&old_server, &legacy);
+    assert_eq!(current_label(&old_resolved[0]).as_deref(), Some("Ultracode"));
+    assert_eq!(explicit_selections(&old_resolved, &legacy), legacy);
+
+    // Independent effort + ultracode places ultracode in footer layout & suffix flag without hiding effort.
+    let both = resolve_descriptors(&modern, &selections(Some(&json!([{"id": "effort", "value": "high"}, {"id": "ultracode", "value": true}]))));
+    let parts = layout("claudeAgent", &both);
+    assert_eq!(parts.effort.map(OptionDescriptor::id), Some("effort"));
+    assert!(parts.others.is_empty());
+    assert_eq!(parts.ultracode.map(|u| (u.id.as_str(), u.current_value)), Some(("ultracode", Some(true))));
+    assert_eq!(effort_suffix("claudeAgent", &both), EffortSuffix { word: Some("High".into()), fast: false, ultrafast: false, ultracode: true, context_window: None });
 }

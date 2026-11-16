@@ -240,8 +240,6 @@ pub enum ClientSettingChange {
     SendShortcut(crate::composer::SendShortcut),
     FollowUpBehavior(crate::composer::FollowUpBehavior),
     ShowSkillsInSlashMenu(bool),
-    PlanMode(bool),
-    ContextWindowMeter(bool),
     /// `setTheme`: replaces the theme and keeps the current appearance mode.
     Theme(ThemePreference),
     AppearanceMode(AppearanceMode),
@@ -319,8 +317,6 @@ impl ClientSettingChange {
                 }),
             ),
             ClientSettingChange::ShowSkillsInSlashMenu(on) => ("showSkillsInSlashMenu", Value::Bool(*on)),
-            ClientSettingChange::PlanMode(on) => ("planModeEnabled", Value::Bool(*on)),
-            ClientSettingChange::ContextWindowMeter(on) => ("contextWindowMeterEnabled", Value::Bool(*on)),
             ClientSettingChange::Theme(theme) => (THEME_KEY, text(theme.as_str())),
             ClientSettingChange::AppearanceContrast(value) => ("appearanceContrast", Value::from((*value).clamp(50,200))),
             ClientSettingChange::GlassOpacity(value) => ("glassOpacity", Value::from((*value).clamp(40,100))),

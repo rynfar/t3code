@@ -209,6 +209,7 @@ icons! {
     UserRound => "icons/lucide/user-round.svg",
     UserRoundX => "icons/lucide/user-round-x.svg",
     Users => "icons/lucide/users.svg",
+    Workflow => "icons/lucide/workflow.svg",
     Wrench => "icons/lucide/wrench.svg",
     X => "icons/lucide/x.svg",
     ZapFill => "icons/composer/zap-fill.svg",

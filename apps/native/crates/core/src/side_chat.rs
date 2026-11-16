@@ -6,10 +6,10 @@
 use serde_json::{Value, json};
 
 use crate::commands::CREATION_SOURCE;
-use crate::composer::{compatible_runtime_modes, effective_selection, interaction_mode};
+use crate::composer::{compatible_runtime_modes, effective_selection};
 use crate::model::ModelSelection;
 use crate::providers;
-use crate::server_config::{InteractionMode, RuntimeMode, ServerConfig};
+use crate::server_config::{RuntimeMode, ServerConfig};
 use crate::shell::ThreadShell;
 use crate::thread::Run;
 use crate::traits;
@@ -23,7 +23,6 @@ pub fn resolve_parent_settings(
     parent: &ThreadShell,
     choice_model: Option<&ModelSelection>,
     choice_runtime_mode: Option<RuntimeMode>,
-    plan_mode_enabled: bool,
 ) -> (RuntimeMode, Option<ModelSelection>) {
     let chosen = choice_model.cloned().or_else(|| Some(parent.model_selection.clone()));
     let entries = config.map(|config| providers::entries(config, Some(&parent.project_id))).unwrap_or_default();
@@ -37,10 +36,8 @@ pub fn resolve_parent_settings(
     let model_selection = match driver_provider {
         Some(provider) => {
             let provider_model = model.as_ref().and_then(|selection| provider.models.iter().find(|m| m.slug == selection.model));
-            let parent_interaction = InteractionMode::parse(&parent.interaction_mode).unwrap_or(InteractionMode::Default);
-            let (plan_enabled, _) = interaction_mode(plan_mode_enabled, Some(provider), parent_interaction);
             let explicit = traits::selections(model.as_ref().and_then(|model| model.options.as_ref()));
-            let options = traits::composer_options(&provider.driver, provider_model, plan_enabled, &explicit);
+            let options = traits::composer_options(&provider.driver, provider_model, false, &explicit);
             model.map(|model| traits::model_selection(&model.instance_id, &model.model, &options.dispatch))
         }
         None => model,

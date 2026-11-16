@@ -10,7 +10,6 @@ mod data;
 mod dialog;
 mod header;
 mod limits;
-pub mod meter;
 mod overview;
 
 use gpui::{

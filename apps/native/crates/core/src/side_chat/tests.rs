@@ -117,14 +117,14 @@ fn resolve_parent_settings_uses_composer_choices_over_thread_shell() {
         "options": [{ "id": "reasoningEffort", "value": "xhigh" }]
     }))
     .unwrap();
-    let (mode, selection) = resolve_parent_settings(None, &parent, Some(&choice_model), Some(RuntimeMode::ApprovalRequired), false);
+    let (mode, selection) = resolve_parent_settings(None, &parent, Some(&choice_model), Some(RuntimeMode::ApprovalRequired));
     assert_eq!(mode, RuntimeMode::ApprovalRequired);
     assert_eq!(selection.as_ref().map(|m| m.model.as_str()), Some("gpt-5.4"));
     assert_eq!(
         selection.as_ref().and_then(|m| m.options.as_ref()).and_then(|opts| opts.as_array().map(|a| a.len())),
         Some(1)
     );
-    let (fallback_mode, fallback_selection) = resolve_parent_settings(None, &parent, None, None, false);
+    let (fallback_mode, fallback_selection) = resolve_parent_settings(None, &parent, None, None);
     assert_eq!(fallback_mode, RuntimeMode::FullAccess);
     assert_eq!(fallback_selection.as_ref().map(|m| m.model.as_str()), Some("gpt-5.4"));
 }

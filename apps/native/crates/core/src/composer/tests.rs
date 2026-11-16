@@ -51,17 +51,37 @@ fn client_settings_read_web_keys_and_ignore_bad_values() {
         ClientSettings {
             send_shortcut: SendShortcut::ModEnter,
             follow_up_behavior: FollowUpBehavior::Queue,
-            plan_mode_enabled: true,
             notification_mode: crate::notifications::NotificationMode::NotificationsAndSound,
             in_app_notifications_enabled: true,
             show_skills_in_slash_menu: false,
-            context_window_meter: true,
         }
     );
-    let partial = ClientSettings::from_json(r#"{"sendShortcut": "shift-enter", "planModeEnabled": "yes"}"#);
+    let partial = ClientSettings::from_json(r#"{"sendShortcut": "shift-enter"}"#);
     assert_eq!(partial, ClientSettings::default());
     assert_eq!(ClientSettings::from_json("not json"), ClientSettings::default());
     assert!(ClientSettings::default().show_skills_in_slash_menu, "the web shows skills in the / menu by default");
+}
+
+#[test]
+fn prompt_length_validation_counts_trimmed_utf16_units_and_provider_input() {
+    let exact = "a".repeat(MAX_PROMPT_LENGTH);
+    assert_eq!(prompt_length_validation_message(&format!("  {exact}\n"), None), None);
+    let one_over = format!("{exact}x");
+    assert_eq!(
+        prompt_length_validation_message(&one_over, None).as_deref(),
+        Some("Prompt is 1 character over the 120,000-character limit. Shorten or split it before sending.")
+    );
+    // Surrogate pairs take 2 UTF-16 code units, matching TypeScript `.length`.
+    let emoji_over = format!("{exact}🚀");
+    assert_eq!(
+        prompt_length_validation_message(&emoji_over, None).as_deref(),
+        Some("Prompt is 2 characters over the 120,000-character limit. Shorten or split it before sending.")
+    );
+    let expanded = "b".repeat(MAX_PROMPT_LENGTH + 12);
+    assert_eq!(
+        prompt_length_validation_message("short", Some(&expanded)).as_deref(),
+        Some("Prompt is 12 characters over the 120,000-character limit. Shorten or split it before sending.")
+    );
 }
 
 fn provider(value: serde_json::Value) -> ServerProvider {
@@ -81,16 +101,6 @@ fn runtime_modes_narrow_to_what_the_provider_supports() {
     assert_eq!(modes, vec![RuntimeMode::ApprovalRequired, RuntimeMode::FullAccess]);
     assert_eq!(mode, RuntimeMode::ApprovalRequired);
     assert_eq!(runtime_mode_label(RuntimeMode::ApprovalRequired), "Supervised");
-}
-
-#[test]
-fn plan_mode_needs_the_setting_and_a_provider_toggle() {
-    let shows = provider(json!({}));
-    let hides = provider(json!({"showInteractionModeToggle": false}));
-    assert_eq!(interaction_mode(false, Some(&shows), InteractionMode::Plan), (false, InteractionMode::Default));
-    assert_eq!(interaction_mode(true, Some(&shows), InteractionMode::Plan), (true, InteractionMode::Plan));
-    assert_eq!(interaction_mode(true, Some(&hides), InteractionMode::Plan), (false, InteractionMode::Default));
-    assert_eq!(interaction_mode(true, None, InteractionMode::Plan), (false, InteractionMode::Default));
 }
 
 #[test]

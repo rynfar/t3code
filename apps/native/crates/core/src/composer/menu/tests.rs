@@ -83,14 +83,6 @@ fn escape_keeps_its_trigger_closed_until_the_token_changes() {
 }
 
 #[test]
-fn standalone_mode_commands_switch_instead_of_sending() {
-    assert_eq!(parse_standalone_slash_command(" /plan "), Some(SlashCommand::Plan));
-    assert_eq!(parse_standalone_slash_command("/DEFAULT"), Some(SlashCommand::Default));
-    assert_eq!(parse_standalone_slash_command("/plan this"), None);
-    assert_eq!(parse_standalone_slash_command("/model"), None);
-}
-
-#[test]
 fn side_commands_carry_their_prompt() {
     assert_eq!(parse_side_chat_command(" /side why is this slow? ").as_deref(), Some("why is this slow?"));
     assert_eq!(parse_side_chat_command("/BTW\nsecond line").as_deref(), Some("second line"));
@@ -122,15 +114,15 @@ fn file_mentions_are_markdown_links_with_encoded_paths() {
 fn slash_menu_lists_builtins_commands_then_skills() {
     let skills = [skill("review"), ProviderSkill { enabled: false, ..skill("off") }, skill("compact")];
     let commands = [command("compact", Some("Compact the thread")), command("init", None), command("review", None)];
-    let options = SlashMenuOptions { plan_mode: true, compact: true, show_skills: true, ..Default::default() };
+    let options = SlashMenuOptions { compact: true, show_skills: true, ..Default::default() };
     let items = slash_items(&at_end("/").unwrap(), "codex", &skills, &commands, options);
     // A command named like a visible skill shows as the skill.
-    assert_eq!(labels(&items), ["/model", "/plan", "/default", "/init", "/skill:review", "/skill:compact"]);
+    assert_eq!(labels(&items), ["/model", "/init", "/skill:review", "/skill:compact"]);
     let options = SlashMenuOptions { show_skills: false, ..options };
     let items = slash_items(&at_end("/").unwrap(), "codex", &skills, &commands, options);
-    assert_eq!(labels(&items), ["/model", "/plan", "/default", "/compact", "/init", "/review"]);
-    assert_eq!(items[4].description, "Run provider command");
-    let options = SlashMenuOptions { compact: false, plan_mode: false, ..options };
+    assert_eq!(labels(&items), ["/model", "/compact", "/init", "/review"]);
+    assert_eq!(items[2].description, "Run provider command");
+    let options = SlashMenuOptions { compact: false, ..options };
     let items = slash_items(&at_end("/").unwrap(), "codex", &skills, &commands, options);
     assert_eq!(labels(&items), ["/model", "/init", "/review"]);
     let options = SlashMenuOptions { side_chat: true, side_chat_disabled: Some("Side chats start after the first message."), ..options };
@@ -141,18 +133,18 @@ fn slash_menu_lists_builtins_commands_then_skills() {
 
 #[test]
 fn slash_menu_mid_prompt_offers_only_builtins_and_skills() {
-    let options = SlashMenuOptions { plan_mode: true, side_chat: true, compact: true, show_skills: true, ..Default::default() };
+    let options = SlashMenuOptions { side_chat: true, compact: true, show_skills: true, ..Default::default() };
     let items = slash_items(&at_end("fix this /").unwrap(), "codex", &[skill("review")], &[command("init", None)], options);
-    assert_eq!(labels(&items), ["/model", "/plan", "/default", "/skill:review"]);
+    assert_eq!(labels(&items), ["/model", "/skill:review"]);
 }
 
 #[test]
 fn slash_queries_rank_names_before_descriptions() {
-    let options = SlashMenuOptions { plan_mode: true, show_skills: true, ..Default::default() };
+    let options = SlashMenuOptions { show_skills: true, ..Default::default() };
     let commands = [command("permissions", Some("Manage plan approvals")), command("plugins", None)];
     let items = slash_items(&at_end("/pl").unwrap(), "claude", &[skill("planner")], &commands, options);
     // Equal scores fall back to the kind: commands before skills.
-    assert_eq!(labels(&items), ["/plan", "/plugins", "/skill:planner", "/permissions"]);
+    assert_eq!(labels(&items), ["/plugins", "/skill:planner", "/permissions"]);
     let items = slash_items(&at_end("/skill").unwrap(), "claude", &[skill("planner")], &commands, options);
     assert_eq!(labels(&items), ["/skill:planner"]);
     let items = slash_items(&at_end("/skill:pla").unwrap(), "claude", &[skill("planner")], &commands, options);
@@ -329,5 +321,78 @@ fn titles_read_links_as_labels() {
     assert_eq!(title_text("![a](t3-context://v1/image/i1) ![b](t3-context://v1/image/i2)"), "Attached images");
     let cite = crate::assistant_citations::Citation::from_selection("e".into(), "t".into(), "m".into(), "quoted text", 0..11).unwrap().with_comment("fix this");
     assert_eq!(title_text(&format!("Check {}", cite.serialize())), "Check quoted text Comment: fix this");
+    assert_eq!(
+        title_text("ask model:codex/gpt-5.3-codex and model:claudeAgent/claude-sonnet-4-6"),
+        "ask gpt-5.3-codex and claude-sonnet-4-6"
+    );
     assert_eq!(title_text("  "), "");
+}
+
+#[test]
+fn model_mentions_match_word_boundaries_skip_legacy_and_format_prompt_ref() {
+    use crate::providers;
+    use crate::server_config::ServerConfig;
+
+    let config: ServerConfig = serde_json::from_value(json!({
+        "providers": [
+            {
+                "instanceId": "codex",
+                "driver": "codex",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "auth": {"status": "authenticated"},
+                "models": [
+                    {"slug": "gpt-5.4", "name": "GPT-5.4", "isCustom": false},
+                    {"slug": "gpt-legacy", "name": "GPT-4o", "isCustom": false, "isLegacy": true}
+                ]
+            },
+            {
+                "instanceId": "claudeAgent",
+                "driver": "claudeAgent",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "auth": {"status": "authenticated"},
+                "models": [
+                    {"slug": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "shortName": "Sonnet 4.6", "isCustom": false}
+                ]
+            },
+            {
+                "instanceId": "opencode",
+                "driver": "opencode",
+                "enabled": true,
+                "installed": true,
+                "status": "error",
+                "auth": {"status": "authenticated"},
+                "models": [
+                    {"slug": "proj/local", "name": "Local Project Model", "isCustom": false}
+                ]
+            }
+        ],
+        "settings": {}
+    }))
+    .unwrap();
+    let entries = providers::entries(&config, None);
+    // Single-character `@` queries stay empty to keep `@` menus focused on files.
+    assert!(model_items(&entries, &config.settings, &[], "g").is_empty());
+    // Legacy models are omitted even when matching `@gpt`.
+    let gpt = model_items(&entries, &config.settings, &[], "gpt");
+    assert_eq!(gpt.len(), 1);
+    assert_eq!(gpt[0].label, "GPT-5.4");
+    assert_eq!(
+        gpt[0].action,
+        MenuAction::Model {
+            instance_id: "codex".into(),
+            model: "gpt-5.4".into(),
+            driver: "codex".into(),
+            display_name: "Codex".into(),
+        }
+    );
+    assert_eq!(model_mention_text("codex", "gpt-5.4"), "model:codex/gpt-5.4 ");
+    // Punctuation-separated queries (`:` / `-`) match across words, and unready providers are excluded.
+    let sonnet = model_items(&entries, &config.settings, &[], "claude:sonnet-4");
+    assert_eq!(sonnet.len(), 1);
+    assert_eq!(sonnet[0].label, "Claude Sonnet 4.6");
+    assert!(model_items(&entries, &config.settings, &[], "local").is_empty());
 }

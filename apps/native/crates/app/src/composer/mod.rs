@@ -56,13 +56,13 @@ use crate::toast::{Toast, ToastKind};
 use menu::{Menu, MenuKey};
 use model_picker::{ModelPicker, PickerEvent, PickerInput};
 
-actions!(composer, [TogglePlanMode, ToggleModelPicker, OpenPermissions, PasteAsText, StashPrompt, FocusPrompt, OpenWorkspace, UsePreviousWorktree]);
+actions!(composer, [OutdentList, ToggleModelPicker, OpenPermissions, PasteAsText, StashPrompt, FocusPrompt, OpenWorkspace, UsePreviousWorktree]);
 
 pub fn init(cx: &mut App) {
     // `modelPicker.toggle`, `composer.effort` and `composer.mode` bind through the keymap.
     cx.bind_keys([
         KeyBinding::new("cmd-c", gpui_component::input::Copy, Some("ContextChip")),
-        KeyBinding::new("shift-tab", TogglePlanMode, Some("Composer > Input")),
+        KeyBinding::new("shift-tab", OutdentList, Some("Composer > Input")),
         // Keeps a large paste inline instead of attaching it (`isPasteAsTextShortcut`).
         KeyBinding::new("cmd-shift-v", PasteAsText, Some("Composer > Input")),
     ]);
@@ -91,6 +91,7 @@ enum Target {
 #[derive(Debug, Clone, Default)]
 struct Choices {
     model: Option<ModelSelection>,
+    multi_models: Vec<ModelSelection>,
     runtime_mode: Option<RuntimeMode>,
     interaction_mode: Option<InteractionMode>,
 }
@@ -147,6 +148,10 @@ impl EventEmitter<ProviderTarget> for Composer {}
 #[derive(Debug, Clone, Default)]
 struct Resolved {
     model: Option<ModelSelection>,
+    multi_models: Vec<ModelSelection>,
+    multi_models_enabled: bool,
+    multi_model_label: Option<String>,
+    multi_model_tooltip: Option<String>,
     model_label: String,
     driver: String,
     mark: Option<ProviderMark>,
@@ -156,7 +161,6 @@ struct Resolved {
     runtime_modes: Vec<RuntimeMode>,
     runtime_mode: RuntimeMode,
     default_runtime_mode: RuntimeMode,
-    plan_enabled: bool,
     interaction_mode: InteractionMode,
     locked_instance: Option<String>,
 }
@@ -201,6 +205,7 @@ pub struct Composer {
     send_connection: Option<(Option<u64>, Option<u64>, crate::app_state::Phase)>,
     has_text: bool,
     error: Option<String>,
+    prompt_length_error: Option<String>,
     auto_advance: Option<Task<()>>,
     /// Whether the last Enter key-down was an OS key repeat. Recorded by the key listener, which
     /// runs before the textarea's `PressEnter` event reaches the composer.
@@ -473,6 +478,7 @@ impl Composer {
             send_connection: None,
             has_text: false,
             error: None,
+            prompt_length_error: None,
             auto_advance: None,
             enter_repeat: false,
             picker_dismissed: None,
@@ -575,6 +581,7 @@ impl Composer {
             self.picker_open = false;
             self.permissions_open = false;
             self.error = None;
+            self.prompt_length_error = None;
             self.auto_advance = None;
             if matches!(next.target, Some(Target::Draft(_))) {
                 self.focus(window, cx);
@@ -682,6 +689,7 @@ impl Composer {
         };
         let chosen = choices
             .model
+            .clone()
             .or_else(|| self.snapshot.thread_model.clone())
             .or_else(|| draft.as_ref().and_then(|draft| draft.model_selection.clone()));
         let entries = config.map(|config| providers::entries(config, self.target_project())).unwrap_or_default();
@@ -689,27 +697,57 @@ impl Composer {
             Some(_) => rules::effective_selection(&entries, chosen.as_ref()),
             None => chosen,
         };
-        let mark = model
-            .as_ref()
+        let cwd = self.menu_cwd(cx);
+        let multi_models_enabled = matches!(self.snapshot.target, Some(Target::Draft(_)))
+            && self.fixed.is_none()
+            && config.is_some_and(|config| config.environment.capabilities.required_worktree_bootstrap == Some(true));
+        let multi_models = if multi_models_enabled && choices.multi_models.len() > 1 {
+            choices.multi_models.clone()
+        } else {
+            Vec::new()
+        };
+        let resolve_model_entry = |selection: &ModelSelection| {
+            let provider = config?.provider(&selection.instance_id)?;
+            let snapshot = self.workspace_snapshot_for(provider, cwd.as_deref());
+            providers::models_for_cwd(provider, snapshot).iter().find(|m| m.slug == selection.model)
+        };
+        let (multi_model_label, multi_model_tooltip) = if !multi_models.is_empty() {
+            let label = providers::format_multiple_model_label(&multi_models, |selection| {
+                resolve_model_entry(selection)
+                    .map(|m| providers::trigger_model_name(m).to_owned())
+                    .unwrap_or_else(|| selection.model.clone())
+            });
+            let tooltip = multi_models
+                .iter()
+                .map(|selection| {
+                    resolve_model_entry(selection)
+                        .map(|m| providers::model_name(m).to_owned())
+                        .unwrap_or_else(|| selection.model.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            (Some(label), Some(tooltip))
+        } else {
+            (None, None)
+        };
+        let mark_model = multi_models.first().or(model.as_ref());
+        let mark = mark_model
             .and_then(|model| entries.iter().find(|entry| entry.instance_id() == model.instance_id))
             .map(|entry| ProviderMark::of(entry, &entries));
         let provider = model.as_ref().and_then(|model| config?.provider(&model.instance_id));
-        let provider_model = model.as_ref().and_then(|selection| provider?.models.iter().find(|m| m.slug == selection.model));
+        let snapshot = provider.and_then(|provider| self.workspace_snapshot_for(provider, cwd.as_deref()));
+        let provider_model = model
+            .as_ref()
+            .and_then(|selection| providers::models_for_cwd(provider?, snapshot).iter().find(|m| m.slug == selection.model));
         let runtime = choices
             .runtime_mode
             .or(self.snapshot.thread_runtime)
             .or_else(|| draft.as_ref().map(|draft| draft.runtime_mode))
             .unwrap_or_default();
         let (runtime_modes, runtime_mode) = rules::compatible_runtime_modes(runtime, provider);
-        let interaction = choices
-            .interaction_mode
-            .or(self.snapshot.thread_interaction)
-            .or_else(|| draft.as_ref().map(|draft| draft.interaction_mode))
-            .unwrap_or_default();
-        let (plan_enabled, interaction_mode) = rules::interaction_mode(state.client_settings.plan_mode_enabled, provider, interaction);
         let driver = provider.map(|p| p.driver.clone()).unwrap_or_default();
         let explicit = traits::selections(model.as_ref().and_then(|m| m.options.as_ref()));
-        let options = traits::composer_options(&driver, provider_model, plan_enabled, &explicit);
+        let options = traits::composer_options(&driver, provider_model, false, &explicit);
         let default_runtime_mode = config
             .map(|config| {
                 self.target_project()
@@ -726,13 +764,16 @@ impl Composer {
             driver,
             mark,
             model,
+            multi_models,
+            multi_models_enabled,
+            multi_model_label,
+            multi_model_tooltip,
             descriptors: options.descriptors,
             dispatch_options: options.dispatch,
             runtime_modes,
             runtime_mode,
             default_runtime_mode,
-            plan_enabled,
-            interaction_mode,
+            interaction_mode: InteractionMode::Default,
             locked_instance,
         }
     }
@@ -741,11 +782,21 @@ impl Composer {
         self.resolve(cx).model.map(|model| model.instance_id)
     }
 
+    pub(super) fn has_multiple_models(&self, cx: &App) -> bool {
+        !self.resolve(cx).multi_models.is_empty()
+    }
+
     fn picker_input(&self, cx: &App) -> PickerInput {
         let resolved = self.resolve(cx);
+        let cwd = self.menu_cwd(cx);
         PickerInput {
             project_id: self.snapshot.project_id.clone(),
+            cwd: cwd.clone(),
+            workspace_snapshots: self.workspace_snapshots_for_cwd(cwd.as_deref()),
+            workspace_scanning: self.workspace_scanning_for_cwd(cwd.as_deref()),
             selection: resolved.model,
+            multi_models_enabled: resolved.multi_models_enabled,
+            selected_models: resolved.multi_models,
             driver: resolved.driver,
             descriptors: resolved.descriptors,
             runtime_mode: resolved.runtime_mode,
@@ -784,6 +835,37 @@ impl Composer {
         }
     }
 
+    fn persist_thread_model_pick(&mut self, thread_id: &str, selection: &ModelSelection, cx: &mut Context<Self>) {
+        if self.snapshot.thread_model.as_ref().is_none_or(|current| current.instance_id != selection.instance_id) {
+            return;
+        }
+        let thread_id = thread_id.to_owned();
+        let selection = selection.clone();
+        let target = Target::Thread(thread_id.clone());
+        let command = t3_core::commands::set_model_selection(&crate::app_state::uuid_v4(), &thread_id, &selection);
+        let dispatch = self.state.read(cx).dispatch_in_order(vec![command]);
+        cx.spawn(async move |this, cx| {
+            let result = dispatch.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    if let Some(choices) = this.choices.get_mut(&target)
+                        && choices.model.as_ref() == Some(&selection)
+                    {
+                        choices.model = None;
+                        this.draft_changed(cx);
+                        cx.notify();
+                    }
+                }
+                Err((_, error)) => {
+                    let toast = Toast::new(ToastKind::Error, "Could not apply model selection")
+                        .description(format!("This model pick was not saved. {error}"));
+                    this.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                }
+            });
+        })
+        .detach();
+    }
+
     fn on_picker(&mut self, event: &PickerEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_rewinding(cx) {
             self.picker_open = false;
@@ -791,16 +873,68 @@ impl Composer {
         }
         match event {
             PickerEvent::Model { instance_id, model } => {
-                let selection = ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None };
+                let resolved = self.resolve(cx);
+                let same_shown = resolved.multi_models.is_empty()
+                    && resolved
+                        .model
+                        .as_ref()
+                        .is_some_and(|current| current.instance_id == *instance_id && current.model == *model);
+                let selection = if same_shown {
+                    resolved.model.unwrap_or_else(|| ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None })
+                } else {
+                    ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None }
+                };
+                if !same_shown && let Some(choices) = self.choices_mut() {
+                    choices.multi_models.clear();
+                    choices.model = Some(selection.clone());
+                }
+                if !same_shown {
+                    self.draft_changed(cx);
+                    self.sync_usage_limits(cx);
+                }
+                if let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() {
+                    self.persist_thread_model_pick(&thread_id, &selection, cx);
+                }
+            }
+            PickerEvent::ToggleModel { instance_id, model } => {
+                let resolved = self.resolve(cx);
+                if !resolved.multi_models_enabled {
+                    return;
+                }
+                let mut current = if !resolved.multi_models.is_empty() {
+                    resolved.multi_models
+                } else {
+                    resolved.model.into_iter().collect()
+                };
+                if let Some(pos) = current.iter().position(|item| item.instance_id == *instance_id && item.model == *model) {
+                    current.remove(pos);
+                } else {
+                    current.push(ModelSelection { instance_id: instance_id.clone(), model: model.clone(), options: None });
+                }
                 if let Some(choices) = self.choices_mut() {
-                    choices.model = Some(selection);
+                    if current.len() > 1 {
+                        choices.multi_models = current;
+                    } else {
+                        choices.multi_models.clear();
+                        if let Some(remaining) = current.into_iter().next() {
+                            choices.model = Some(remaining);
+                        }
+                    }
                 }
                 self.draft_changed(cx);
                 self.sync_usage_limits(cx);
             }
+            PickerEvent::InspectInstance(instance_id) => {
+                self.ensure_workspace_snapshot(instance_id, cx);
+            }
             PickerEvent::Options(selections) => {
                 self.set_options(selections, cx);
                 self.draft_changed(cx);
+                if let Some(Target::Thread(thread_id)) = self.snapshot.target.clone()
+                    && let Some(selection) = self.resolve(cx).model
+                {
+                    self.persist_thread_model_pick(&thread_id, &selection, cx);
+                }
             }
             PickerEvent::RuntimeMode(mode) => self.set_runtime_mode(*mode, cx),
             PickerEvent::Dismiss => {
@@ -834,8 +968,8 @@ impl Composer {
         cx.notify();
     }
 
-    /// Shift+Tab: outdent the list item under the caret, else toggle plan mode.
-    fn toggle_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Shift+Tab: outdent the list item under the caret, else dispatch `OutdentInline`.
+    fn outdent_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_rewinding(cx) {
             return;
         }
@@ -852,20 +986,7 @@ impl Composer {
             });
             return;
         }
-        let resolved = self.resolve(cx);
-        if !resolved.plan_enabled {
-            window.dispatch_action(Box::new(OutdentInline), cx);
-            return;
-        }
-        let next = match resolved.interaction_mode {
-            InteractionMode::Plan => InteractionMode::Default,
-            InteractionMode::Default => InteractionMode::Plan,
-        };
-        if let Some(choices) = self.choices_mut() {
-            choices.interaction_mode = Some(next);
-        }
-        self.draft_changed(cx);
-        cx.notify();
+        window.dispatch_action(Box::new(OutdentInline), cx);
     }
 
     pub(crate) fn prompt_text(&self, cx: &App) -> String {
@@ -880,8 +1001,11 @@ impl Composer {
         self.input.read(cx).value().to_string()
     }
 
-    fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.cancel_pending_send() { cx.notify(); }
+        if text.is_empty() {
+            self.prompt_length_error = None;
+        }
         self.close_citation_comment("prompt-replaced", window, cx);
         self.has_text = !text.trim().is_empty();
         self.input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
@@ -935,6 +1059,15 @@ impl Composer {
             self.draft_changed(cx);
         }
         let text = self.prompt(cx);
+        let mut validation_changed = false;
+        if self.prompt_length_error.is_some() {
+            let outgoing = self.outgoing(text.clone(), &self.staged_attachments());
+            let next_error = rules::prompt_length_validation_message(&text, Some(&outgoing.text));
+            if next_error != self.prompt_length_error {
+                self.prompt_length_error = next_error;
+                validation_changed = true;
+            }
+        }
         self.sync_citation_comment(&text, cx);
         self.sync_context_chips(&text, cx);
         self.sync_branch_mismatch(cx);
@@ -948,7 +1081,7 @@ impl Composer {
             let next = requests::set_custom_answer(question, answers.drafts.get(&question.id), &text);
             answers.drafts.insert(question.id.clone(), next);
         }
-        if answering.is_some() || has_text != self.has_text {
+        if answering.is_some() || has_text != self.has_text || validation_changed {
             self.has_text = has_text;
             cx.notify();
         }
@@ -2055,6 +2188,193 @@ mod stream_error_tests {
             assert_eq!(composer.prompt(cx), answer_with_chip);
             let mentions = composer.mentions(&Target::Thread("t-q".to_owned()));
             assert!(mentions.iter().any(|m| m.thread_id == "t-ref"));
+        });
+    }
+
+    #[gpui::test]
+    fn prompt_length_validation_blocks_oversized_send_and_clears_on_edit(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let snapshot: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+            "kind": "snapshot", "snapshotSequence": 1, "hasMoreHistory": false, "historyCursor": null,
+            "projection": {
+                "thread": {
+                    "id": "t-len", "projectId": "checkout-a", "title": "Length",
+                    "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                    "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                    "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                    "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t-len"}
+                },
+                "runs": [], "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                "providerThreads": [], "providerTurns": [], "runtimeRequests": [],
+                "messages": [], "plans": [], "turnItems": [], "checkpointScopes": [],
+                "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                "visibleTurnItems": [], "updatedAt": "2026-04-01T00:00:05.000Z"
+            }
+        }"#).unwrap();
+        state.update(cx, |state, cx| {
+            state.select_thread("t-len", cx);
+            state.thread.apply(snapshot);
+            cx.emit(AppEvent::Thread);
+        });
+        let (composer, vcx) = cx.add_window_view(|window, cx| Composer::new(state.clone(), window, cx));
+        vcx.update(|window, cx| {
+            let over = "x".repeat(rules::MAX_PROMPT_LENGTH + 3);
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt(&over, window, cx);
+                composer.submit(rules::SubmitIntent::Foreground, window, cx);
+                assert!(!composer.sending);
+                assert_eq!(
+                    composer.prompt_length_error.as_deref(),
+                    Some("Prompt is 3 characters over the 120,000-character limit. Shorten or split it before sending.")
+                );
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("prompt-length-validation").is_some());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("short now", window, cx);
+                composer.on_prompt_change(cx);
+                assert_eq!(composer.prompt_length_error, None);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("prompt-length-validation").is_none());
+    }
+
+    #[gpui::test]
+    fn picker_renders_ultracode_and_pi_tiers_and_toggles_multi_model_draft(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        state.update(cx, |state, cx| {
+            let config = state.server_config.config.as_mut().unwrap();
+            config.environment.capabilities.required_worktree_bootstrap = Some(true);
+            config.settings.provider_instances = serde_json::from_value(serde_json::json!({
+                "pi": { "driver": "pi", "enabled": true }
+            }))
+            .unwrap();
+            config.providers = serde_json::from_value(serde_json::json!([
+                {
+                    "instanceId": "claudeAgent",
+                    "driver": "claudeAgent",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "auth": { "status": "authenticated" },
+                    "models": [{
+                        "slug": "claude-sonnet-4-6",
+                        "name": "Claude Sonnet 4.6",
+                        "shortName": "Sonnet 4.6",
+                        "isDefault": true,
+                        "capabilities": {
+                            "optionDescriptors": [
+                                { "id": "effort", "label": "Effort", "type": "select", "options": [
+                                    { "id": "high", "label": "High", "isDefault": true },
+                                    { "id": "xhigh", "label": "XHigh" }
+                                ]},
+                                { "id": "ultracode", "label": "Ultracode", "type": "boolean", "currentValue": false }
+                            ]
+                        }
+                    }]
+                },
+                {
+                    "instanceId": "pi",
+                    "driver": "pi",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "auth": { "status": "authenticated" },
+                    "models": [{
+                        "slug": "pi-fast",
+                        "name": "Pi Fast",
+                        "capabilities": {
+                            "optionDescriptors": [
+                                { "id": "serviceTier", "label": "Speed", "type": "select", "currentValue": "flex", "options": [
+                                    { "id": "default", "label": "Standard" },
+                                    { "id": "fast", "label": "Fast" },
+                                    { "id": "flex", "label": "Ultrafast" }
+                                ]}
+                            ]
+                        }
+                    }]
+                }
+            ]))
+            .unwrap();
+            state.start_draft("checkout-a", cx);
+            cx.emit(AppEvent::ServerConfig);
+        });
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let picker = self.0.read(cx).picker.clone();
+                let footer = picker.update(cx, |picker, cx| picker.render_footer(cx).into_any_element());
+                let trigger = self.0.update(cx, |composer, cx| {
+                    let resolved = composer.resolve(cx);
+                    composer.render_model_trigger(&resolved, cx)
+                });
+                gpui_component::v_flex().w(gpui::px(720.)).child(trigger).child(footer)
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                let input = composer.picker_input(cx);
+                composer.picker.update(cx, |picker, cx| picker.update_input(input, false, cx));
+                composer.on_picker(&PickerEvent::Options(vec![
+                    traits::OptionSelection { id: "effort".into(), value: traits::OptionValue::Str("high".into()) },
+                    traits::OptionSelection { id: "ultracode".into(), value: traits::OptionValue::Bool(true) },
+                ]), window, cx);
+                let input = composer.picker_input(cx);
+                composer.picker.update(cx, |picker, cx| picker.update_input(input, false, cx));
+                let resolved = composer.resolve(cx);
+                let suffix = traits::effort_suffix(&resolved.driver, &resolved.descriptors);
+                assert!(suffix.ultracode);
+                assert_eq!(suffix.word.as_deref(), Some("High"));
+                // Re-picking the active model preserves its options (`useComposerSelection.ts`).
+                composer.on_picker(
+                    &PickerEvent::Model { instance_id: "claudeAgent".into(), model: "claude-sonnet-4-6".into() },
+                    window,
+                    cx,
+                );
+                let repicked = composer.resolve(cx);
+                assert!(repicked.model.as_ref().and_then(|m| m.options.as_ref()).is_some());
+                assert!(traits::effort_suffix(&repicked.driver, &repicked.descriptors).ultracode);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("ultracode-toggle").is_some());
+
+        // Switch to Pi model -> footer exposes Pi's `serviceTier` speed track and suffix reflects Ultrafast.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.on_picker(&PickerEvent::Model { instance_id: "pi".into(), model: "pi-fast".into() }, window, cx);
+                let input = composer.picker_input(cx);
+                composer.picker.update(cx, |picker, cx| picker.update_input(input, false, cx));
+                let resolved = composer.resolve(cx);
+                let suffix = traits::effort_suffix(&resolved.driver, &resolved.descriptors);
+                assert!(suffix.ultrafast);
+            });
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("speed-track").is_some());
+
+        // Shift-toggle adds a second model into multi-model mode and keeps both selected until single-picked.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.on_picker(
+                    &PickerEvent::ToggleModel { instance_id: "claudeAgent".into(), model: "claude-sonnet-4-6".into() },
+                    window,
+                    cx,
+                );
+                let resolved = composer.resolve(cx);
+                assert_eq!(resolved.multi_models.len(), 2);
+                assert_eq!(resolved.multi_model_label.as_deref(), Some("Pi Fast, Sonnet 4.6"));
+            });
+            window.draw(cx).clear();
         });
     }
 }

@@ -309,24 +309,8 @@ impl SettingsView {
         ]
     }
 
-    pub(super) fn labs(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
-        let composer = self.doc(cx).composer();
-        let legacy = section(
-            "Legacy",
-            vec![
-                Row::new("legacy-plan-mode", "Plan mode (legacy)")
-                    .description("Restore Build/Plan, /plan, /default, and Shift+Tab. Off uses build mode.")
-                    .highlighted(self.is_target("legacy-plan-mode"))
-                    .control(switch(&self.state, "legacy-plan-mode-switch", composer.plan_mode_enabled, ClientSettingChange::PlanMode))
-                    .into_any_element(),
-                Row::new("legacy-context-window-indicator", "Context window indicator (legacy)")
-                    .description("Shows context window usage as a circular indicator in the composer.")
-                    .highlighted(self.is_target("legacy-context-window-indicator"))
-                    .control(switch(&self.state, "legacy-context-window-switch", composer.context_window_meter, ClientSettingChange::ContextWindowMeter))
-                    .into_any_element(),
-            ],
-            cx,
-        );
-        vec![Block::new(&["legacy-features", "legacy-plan-mode", "legacy-context-window-indicator"], legacy)]
+    pub(super) fn labs(&mut self, _cx: &mut Context<Self>) -> Vec<Block> {
+        // #33131: legacy plan mode and context window meter toggles were removed.
+        Vec::new()
     }
 }

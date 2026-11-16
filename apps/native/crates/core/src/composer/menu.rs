@@ -16,13 +16,15 @@
 use serde_json::{Value, json};
 
 use crate::palette::{PaletteThread, thread_search_subject};
+use crate::providers::{self, ProviderEntry};
 use crate::search::{ThreadSearchOptions, fold_search_query, rank_search_items, score_thread_search};
-use crate::server_config::{ProviderSkill, ProviderSlashCommand, ServerProvider, WorkspaceSnapshot};
+use crate::server_config::{ProviderSkill, ProviderSlashCommand, ServerProvider, ServerSettings, WorkspaceSnapshot};
 
 /// `COMPOSER_PATH_SEARCH_LIMIT` and `PROJECT_PATH_SEARCH_DEBOUNCE_MS` (`web/src/state/queries.ts`).
 pub const PATH_SEARCH_LIMIT: usize = 80;
 pub const PATH_SEARCH_DEBOUNCE_MS: u64 = 120;
 const THREAD_RESULT_LIMIT: usize = 5;
+const MODEL_MENTION_LIMIT: usize = 8;
 /// `PROVIDER_WORKSPACE_SNAPSHOT_TTL_MS`.
 pub const WORKSPACE_SNAPSHOT_TTL_MS: i64 = 5 * 60_000;
 
@@ -188,17 +190,6 @@ pub fn parse_side_chat_command(text: &str) -> Option<String> {
     let rest = text.trim().strip_prefix('/')?;
     let (name, prompt) = rest.split_at(rest.find(char::is_whitespace).unwrap_or(rest.len()));
     (name.eq_ignore_ascii_case("side") || name.eq_ignore_ascii_case("btw")).then(|| prompt.trim().to_owned())
-}
-
-/// `parseStandaloneComposerSlashCommand`: `/plan` or `/default` as the whole message switches
-/// the mode instead of sending.
-pub fn parse_standalone_slash_command(text: &str) -> Option<SlashCommand> {
-    let command = text.trim().strip_prefix('/')?.trim_end();
-    match command.to_lowercase().as_str() {
-        "plan" => Some(SlashCommand::Plan),
-        "default" => Some(SlashCommand::Default),
-        _ => None,
-    }
 }
 
 /// `replaceTextRange`: the new prompt and the caret after the replacement.
@@ -406,10 +397,14 @@ pub fn skills_and_commands(provider: &ServerProvider, snapshot: Option<&Workspac
     }
 }
 
+pub fn snapshot_is_pending(snapshot: Option<&WorkspaceSnapshot>) -> bool {
+    snapshot.is_some_and(|snapshot| snapshot.slash_commands_pending == Some(true) || snapshot.models_pending == Some(true))
+}
+
 /// Whether a snapshot for `cwd` is complete and inside the TTL, so no scan is due.
 pub fn snapshot_is_current(snapshot: Option<&WorkspaceSnapshot>, now_ms: i64) -> bool {
     snapshot.is_some_and(|snapshot| {
-        snapshot.slash_commands_pending != Some(true)
+        !snapshot_is_pending(Some(snapshot))
             && crate::sidebar::time::parse_iso(&snapshot.checked_at).is_some_and(|at| now_ms - at < WORKSPACE_SNAPSHOT_TTL_MS)
     })
 }
@@ -470,8 +465,6 @@ pub fn search_skills(skills: &[ProviderSkill], query: &str) -> Vec<ProviderSkill
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
     Model,
-    Plan,
-    Default,
     Side,
     Btw,
 }
@@ -480,8 +473,6 @@ impl SlashCommand {
     pub fn name(self) -> &'static str {
         match self {
             SlashCommand::Model => "model",
-            SlashCommand::Plan => "plan",
-            SlashCommand::Default => "default",
             SlashCommand::Side => "side",
             SlashCommand::Btw => "btw",
         }
@@ -527,6 +518,7 @@ pub enum MenuAction {
     Skill { name: String, source: SkillSource },
     Thread { thread_id: String, title: String },
     Environment { environment_id: String, label: String },
+    Model { instance_id: String, model: String, driver: String, display_name: String },
 }
 
 /// `ComposerCommandItem`: one row.
@@ -541,7 +533,6 @@ pub struct MenuItem {
 /// What the `/` menu offers besides the provider's commands and skills.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SlashMenuOptions {
-    pub plan_mode: bool,
     pub side_chat: bool,
     /// `sideChatDisabledReason`: replaces the `/side` and `/btw` descriptions.
     pub side_chat_disabled: Option<&'static str>,
@@ -617,10 +608,6 @@ pub fn slash_items(
     options: SlashMenuOptions,
 ) -> Vec<MenuItem> {
     let mut items = vec![builtin_item(SlashCommand::Model, "Switch response model for this thread")];
-    if options.plan_mode {
-        items.push(builtin_item(SlashCommand::Plan, "Switch this thread into plan mode"));
-        items.push(builtin_item(SlashCommand::Default, "Switch this thread back to normal build mode"));
-    }
     if options.side_chat {
         items.push(builtin_item(SlashCommand::Side, options.side_chat_disabled.unwrap_or("Ask a side question in a new side chat")));
         items.push(builtin_item(SlashCommand::Btw, options.side_chat_disabled.unwrap_or("Same as /side")));
@@ -703,6 +690,96 @@ pub fn thread_items(threads: &[PaletteThread], environment_id: &str, exclude: Op
         }
     })
     .collect()
+}
+
+/// Prompt text naming a provider instance and model (`formatComposerModelMention`).
+pub fn format_model_mention(instance_id: &str, model: &str) -> String {
+    format!("model:{instance_id}/{model}")
+}
+
+/// What picking an `@model` row inserts into the prompt (`formatComposerModelMention` + trailing space).
+pub fn model_mention_text(instance_id: &str, model: &str) -> String {
+    format!("{} ", format_model_mention(instance_id, model))
+}
+
+fn contains_word_prefix(haystack: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    for (index, _) in haystack.match_indices(token) {
+        let at_word_start = haystack[..index].chars().next_back().is_none_or(|ch| !ch.is_alphanumeric());
+        if at_word_start {
+            return true;
+        }
+    }
+    false
+}
+
+/// `matchComposerModelItems` (`composerModelMentions.ts`): ready non-legacy models matching `@`
+/// queries of >= 2 non-whitespace characters at word boundaries, ranked via `providers::search_score`.
+pub fn model_items(
+    entries: &[ProviderEntry],
+    settings: &ServerSettings,
+    snapshots: &[(String, WorkspaceSnapshot)],
+    query: &str,
+) -> Vec<MenuItem> {
+    let spaced = query.replace([':', '/'], " ").trim().to_owned();
+    let unhyphenated = spaced.replace('-', " ").trim().to_owned();
+    if unhyphenated.chars().filter(|ch| !ch.is_whitespace()).count() < 2 {
+        return Vec::new();
+    }
+    let queries: Vec<&str> = if unhyphenated == spaced { vec![spaced.as_str()] } else { vec![spaced.as_str(), unhyphenated.as_str()] };
+    let mut candidates = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.is_ready()) {
+        let snapshot = snapshots.iter().find(|(id, _)| id == entry.instance_id()).map(|(_, s)| s);
+        for model in providers::model_options_for_cwd(settings, entry.provider, snapshot) {
+            if !model.is_legacy {
+                candidates.push((entry, model));
+            }
+        }
+    }
+    for words in queries {
+        let tokens: Vec<String> = words.split_whitespace().map(|token| token.to_lowercase()).collect();
+        let mut matched: Vec<(i64, usize, &ProviderEntry, &crate::server_config::ProviderModel)> = candidates
+            .iter()
+            .filter(|(entry, model)| {
+                let haystack = [
+                    model.name.as_str(),
+                    model.short_name.as_deref().unwrap_or(""),
+                    model.sub_provider.as_deref().unwrap_or(""),
+                    entry.driver(),
+                    entry.display_name.as_str(),
+                ]
+                .join(" ")
+                .to_lowercase();
+                tokens.iter().all(|token| contains_word_prefix(&haystack, token))
+            })
+            .enumerate()
+            .filter_map(|(order, (entry, model))| {
+                let score = providers::search_score(model, entry, false, words)?;
+                Some((score, order, *entry, *model))
+            })
+            .collect();
+        if !matched.is_empty() {
+            matched.sort_by_key(|(score, order, _, _)| (*score, *order));
+            return matched
+                .into_iter()
+                .take(MODEL_MENTION_LIMIT)
+                .map(|(_, _, entry, model)| MenuItem {
+                    id: format!("model:{}:{}", entry.instance_id(), model.slug),
+                    label: providers::model_name(model).to_owned(),
+                    description: model.sub_provider.clone().unwrap_or_else(|| entry.display_name.clone()),
+                    action: MenuAction::Model {
+                        instance_id: entry.instance_id().to_owned(),
+                        model: model.slug.clone(),
+                        driver: entry.driver().to_owned(),
+                        display_name: entry.display_name.clone(),
+                    },
+                })
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 /// The workspace rows of the `@` menu, in the server's order.
@@ -939,6 +1016,20 @@ pub fn title_text(text: &str) -> String {
         cursor = reference.end;
     }
     prose.push_str(&text[cursor..]);
+    let mentions = crate::markdown::mentions::collect_composer_model_mentions(&prose);
+    let prose = if mentions.is_empty() {
+        prose
+    } else {
+        let mut rewritten = String::with_capacity(prose.len());
+        let mut mention_cursor = 0;
+        for mention in mentions {
+            rewritten.push_str(&prose[mention_cursor..mention.start]);
+            rewritten.push_str(mention.model);
+            mention_cursor = mention.end;
+        }
+        rewritten.push_str(&prose[mention_cursor..]);
+        rewritten
+    };
     let prose = crate::assistant_citations::to_plain_text(&prose);
     let normalized = prose.split_whitespace().collect::<Vec<_>>().join(" ");
     match (normalized.is_empty(), images.len()) {
