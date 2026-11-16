@@ -1,5 +1,5 @@
 //! The HTML host's ownership, activity and controller boundary (`BrowserDocumentFrame.tsx`).
-use super::host::{self, ImageRequest, KeyDown, LinkRequest};
+use super::host::{self, ImageEntry, ImageRequest, KeyDown, LinkRequest};
 use crate::keybindings::{ResolvedKeybindingRule, ShortcutMatchContext};
 use crate::pull_requests::target::{Project, Target};
 
@@ -27,7 +27,7 @@ pub enum Action {
     External(String),
     Preview { owner: PageOrigin, url: String },
     ChangeRequest { owner: PageOrigin, target: Target },
-    OpenImage { src: String, name: String },
+    OpenImage { images: Vec<ImageEntry>, index: usize },
     Shortcut(String),
 }
 
@@ -72,7 +72,11 @@ pub fn route(event: &Event, context: &Context<'_>) -> Option<Action> {
             }
         }
         Event::Image(image) => {
-            host::image_src(&image.src).then(|| Action::OpenImage { src: image.src.clone(), name: image.name.clone() })
+            let index = (image.index < image.images.len()).then_some(image.index)?;
+            host::image_src(&image.images[index].src).then(|| Action::OpenImage {
+                images: image.images.clone(),
+                index,
+            })
         }
         Event::Key(key) => host::shortcut_command(key, context.keybindings, context.shortcut_context, context.mac).map(|command| Action::Shortcut(command.into())),
     }
@@ -126,7 +130,7 @@ mod tests {
         let key = Event::Key(host::read_key(&json!({"jsonrpc":"2.0","method":"t3/notifications/keydown","params":{"key":"k","code":"KeyK","metaKey":true}})).unwrap());
         assert_eq!(route(&key, &context), Some(Action::Shortcut("commandPalette.toggle".into())));
         let image = Event::Image(host::read_image(&json!({"jsonrpc":"2.0","method":"t3/notifications/open-image","params":{"src":"https://example.com/diagram.png","name":"Diagram"}})).unwrap());
-        assert_eq!(route(&image, &context), Some(Action::OpenImage { src: "https://example.com/diagram.png".into(), name: "Diagram".into() }));
+        assert_eq!(route(&image, &context), Some(Action::OpenImage { images: vec![ImageEntry { src: "https://example.com/diagram.png".into(), name: "Diagram".into() }], index: 0 }));
         context.focused = false;
         assert_eq!(route(&key, &context), None);
         assert_eq!(route(&image, &context), None);

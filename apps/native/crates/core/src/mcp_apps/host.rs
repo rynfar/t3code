@@ -111,7 +111,8 @@ impl Host {
                 vec![]
             };
         };
-        let params = &data["params"];
+        let empty = json!({});
+        let params = data.get("params").filter(|v| v.is_object()).unwrap_or(&empty);
         let Some(id) = id else {
             return match method {
                 "ui/notifications/initialized" if !self.initialized => {

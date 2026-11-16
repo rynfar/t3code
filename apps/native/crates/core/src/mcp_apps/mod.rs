@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 mod tests;
 
 pub const PROTOCOL_VERSION: &str = "2026-01-26";
+pub const COLOR_SCHEME_PARAM: &str = "t3-color-scheme";
 pub const DEFAULT_HEIGHT: u32 = 320;
 pub const MAX_HEIGHT: u32 = 2000;
 pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
@@ -93,12 +94,61 @@ pub fn download_name(uri: Option<&str>, name: Option<&str>) -> String {
             None => "download",
         },
     };
-    let sanitized: String = raw
-        .chars()
-        .map(|c| if "\\/:*?\"<>|".contains(c) || (c as u32) < 32 { '-' } else { c })
-        .take(MAX_DOWNLOAD_NAME)
-        .collect();
+    let mut sanitized = String::new();
+    let mut utf16_len = 0;
+    for ch in raw.chars() {
+        let next = if "\\/:*?\"<>|".contains(ch) || (ch as u32) < 32 { '-' } else { ch };
+        let next_utf16 = next.len_utf16();
+        if utf16_len + next_utf16 > MAX_DOWNLOAD_NAME {
+            break;
+        }
+        sanitized.push(next);
+        utf16_len += next_utf16;
+    }
     if sanitized.is_empty() { "download".into() } else { sanitized }
+}
+
+/// Inserts `<meta name="color-scheme" content="dark|light">` into `<head>` (or `<html>`, or
+/// prepends for fragments) outside quoted attributes so unstyled apps paint with the right
+/// scheme before `ui/initialize`.
+pub fn inject_color_scheme_meta(html: &str, dark: bool) -> String {
+    let scheme = if dark { "dark" } else { "light" };
+    let meta = format!(r#"<meta name="color-scheme" content="{scheme}">"#);
+    if let Some(at) = find_opening_tag_end(html, "head") {
+        return format!("{}{meta}{}", &html[..at], &html[at..]);
+    }
+    if let Some(at) = find_opening_tag_end(html, "html") {
+        return format!("{}<head>{meta}</head>{}", &html[..at], &html[at..]);
+    }
+    format!("{meta}{html}")
+}
+
+fn find_opening_tag_end(html: &str, tag: &str) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i + 1 + tag.len() <= bytes.len() {
+        if bytes[i] == b'<'
+            && bytes[i + 1..].get(..tag.len()).is_some_and(|head| head.eq_ignore_ascii_case(tag.as_bytes()))
+            && bytes.get(i + 1 + tag.len()).is_some_and(|next| *next == b'>' || next.is_ascii_whitespace())
+        {
+            let mut j = i + 1 + tag.len();
+            let mut quote: Option<u8> = None;
+            while j < bytes.len() {
+                let b = bytes[j];
+                match quote {
+                    Some(q) if b == q => quote = None,
+                    Some(_) => {}
+                    None if b == b'"' || b == b'\'' => quote = Some(b),
+                    None if b == b'>' => return Some(j + 1),
+                    None => {}
+                }
+                j += 1;
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
 }
 
 pub fn resource_bytes(content: &Value) -> Option<Vec<u8>> {

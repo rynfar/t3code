@@ -856,6 +856,9 @@ pub struct ServerConfig {
     pub secret_provider_settings: Option<bool>,
     #[serde(default)]
     pub secret_references: bool,
+    /// `secrets.answerRequest` accepts `{ type: "reference", reference }`.
+    #[serde(default)]
+    pub secret_request_references: bool,
     /// `orchestration.getThreadLinkMetadata` is supported.
     #[serde(default)]
     pub thread_link_metadata: Option<bool>,

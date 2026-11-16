@@ -91,16 +91,15 @@ fn on_page_event(state: &Entity<AppState>, owner: &PageOwner, view: &WebView, ev
             previews.update(cx, |p, cx| p.open_link(owner.thread, url, cx));
         },
         Action::ChangeRequest { target, .. } => crate::pull_requests::open_resolved_link(state, target, cx),
-        Action::OpenImage { src, name } => {
+        Action::OpenImage { images, index } => {
             view.release_focus();
             if let Some(thread_view) = owner.view.upgrade() {
+                let items = images
+                    .into_iter()
+                    .map(|image| crate::media::ViewerItem::image(MediaSource::Direct(image.src), image.name))
+                    .collect();
                 thread_view.update(cx, |thread_view, cx| {
-                    thread_view.open_media(
-                        vec![crate::media::ViewerItem::image(MediaSource::Direct(src), name)],
-                        0,
-                        window,
-                        cx,
-                    );
+                    thread_view.open_media(items, index, window, cx);
                 });
             }
         }
@@ -498,9 +497,9 @@ pub fn frame_row(row_id: &str, entry: &HtmlRenderEntry, thread: Option<&str>, cx
     };
     let hovered = store.read(cx).inline_hovered(&key, owner, &page_owner.origin);
     let expand = frame.html.clone().filter(|_| hovered != Some(false)).map(|html| {
-        let (store, title) = (store.clone(), SharedString::from(reference.title.clone()));
+        let (store, reference) = (store.clone(), reference.clone());
         let page_owner = page_owner.clone();
-        let open = move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| open_fullscreen(&store, page_owner.clone(), title.clone(), html.clone(), window, cx);
+        let open = move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| open_fullscreen(&store, page_owner.clone(), reference.clone(), html.clone(), window, cx);
         let button = tooltip_icon_button(SharedString::from(format!("html-render-expand-{row_id}")), Icon::Maximize2, "Open full screen", false, open, cx);
         div()
             .id(SharedString::from(format!("html-render-expand-wrap-{row_id}")))
@@ -616,7 +615,7 @@ fn page_card(reference: &HtmlRenderReference, cx: &App) -> AnyElement {
 fn open_fullscreen(
     store: &Entity<HtmlFrames>,
     owner: PageOwner,
-    title: SharedString,
+    reference: HtmlRenderReference,
     html: Arc<str>,
     window: &mut Window,
     cx: &mut App,
@@ -624,8 +623,9 @@ fn open_fullscreen(
     let restore = window.focused(cx);
     let view = cx.new(|cx| HtmlFullscreen {
         owner,
-        title,
+        reference,
         html,
+        content_height: None,
         zoom: 1.,
         view: None,
         revision: 0,
@@ -671,14 +671,15 @@ pub fn fullscreen(_: &mut Window, cx: &mut App) -> Option<AnyElement> {
     Some(view.into_any_element())
 }
 
-/// `HtmlRenderDialog`: the page at 92% of the window over a dimmed backdrop, its title, and zoom
+/// `HtmlRenderDialog`: the page at `min(92vw, 1176px)` over a dimmed backdrop, its title, and zoom
 /// from 50% to 200%. Drawn in the base plane so the page's view can sit above it; the backdrop
 /// keeps inline pages out of sight while it is open.
 pub struct HtmlFullscreen {
     owner: PageOwner,
     state: Entity<AppState>,
-    title: SharedString,
+    reference: HtmlRenderReference,
     html: Arc<str>,
+    content_height: Option<f32>,
     zoom: f32,
     view: Option<Rc<WebView>>,
     revision: usize,
@@ -745,12 +746,24 @@ impl HtmlFullscreen {
         let state = self.state.clone();
         let owner = self.owner.clone();
         let handle = window.window_handle();
-        self._events = Some(cx.spawn(async move |_, cx| {
+        self._events = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = received.next().await {
                 let Some(view) = event_view.as_ref().and_then(Weak::upgrade) else { return };
                 let _ = cx.update_window(handle, |_, window, cx| match event {
                     WebEvent::OpenUrl(url) => { on_page_event(&state, &owner, &view, Event::RawNavigation(url), window, cx); },
-                    WebEvent::Message(text) => if let Ok(message) = serde_json::from_str(&text) { on_page_message(&state, &owner, &view, &message, window, cx); },
+                    WebEvent::Message(text) => if let Ok(message) = serde_json::from_str(&text) {
+                        if let Some(height) = html_render::read_content_height(&message) {
+                            let height = height as f32;
+                            let _ = this.update(cx, |fullscreen, cx| {
+                                if fullscreen.content_height != Some(height) {
+                                    fullscreen.content_height = Some(height);
+                                    cx.notify();
+                                }
+                            });
+                        } else {
+                            on_page_message(&state, &owner, &view, &message, window, cx);
+                        }
+                    },
                 });
             }
         }));
@@ -812,7 +825,14 @@ impl Render for HtmlFullscreen {
         let p = palette(cx);
         let viewport = window.viewport_size();
         let (width, height) = (f32::from(viewport.width), f32::from(viewport.height));
+        let box_width = (width * 0.92).min(1176.);
         let box_height = (height * 0.86).min(height - 160.).max(120.);
+        let pad = f32::from(rem(16.).to_pixels(window.rem_size()));
+        let inner_width = (box_width - 2. * pad).max(1.);
+        let inner_max_height = (box_height - 2. * pad).max(1.);
+        let zoom = self.zoom;
+        let page_height = html_render::frame_height(&self.reference, inner_width / zoom, self.content_height) as f32;
+        let frame_height = (page_height * zoom).clamp(1., inner_max_height);
         let page = match &self.view {
             Some(view) => webview::web_view("html-render-fullscreen-page", view.clone(), dark).into_any_element(),
             None => div()
@@ -825,7 +845,6 @@ impl Render for HtmlFullscreen {
                 .child(if self.unavailable { "Page unavailable" } else { "" })
                 .into_any_element(),
         };
-        let zoom = self.zoom;
         let zoom_out = zoom > ZOOM_RANGE.0;
         let zoom_in = zoom < ZOOM_RANGE.1;
         let controls = div()
@@ -878,19 +897,19 @@ impl Render for HtmlFullscreen {
             .child(
                 div()
                     .relative()
-                    .w(px(width * 0.92))
+                    .w(px(box_width))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(close)
                     .child(
                         div()
-                            .h(px(box_height))
+                            .max_h(px(box_height))
                             .p(rem(16.))
                             .rounded(rem(8.))
                             .bg(hsla(p.background))
                             .border_1()
                             .border_color(hsla(p.border).opacity(0.7))
                             .shadow_2xl()
-                            .child(page),
+                            .child(div().w_full().h(px(frame_height)).child(page)),
                     )
                     .child(
                         div()
@@ -902,7 +921,7 @@ impl Render for HtmlFullscreen {
                             .gap(rem(12.))
                             .text_xs()
                             .text_color(white(0.8))
-                            .child(div().min_w_0().truncate().child(self.title.clone()))
+                            .child(div().min_w_0().truncate().child(self.reference.title.clone()))
                             .child(controls),
                     ),
             )

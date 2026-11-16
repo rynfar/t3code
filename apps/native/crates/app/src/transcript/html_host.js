@@ -76,6 +76,18 @@
     },
     true,
   );
+  document.addEventListener(
+    "click",
+    (e) => {
+      const t = e.composedPath()[0];
+      const l = t && t.closest ? t.closest("label,a[href],button,input,select,textarea") : null;
+      const c = l && l.tagName === "LABEL" ? l.control : null;
+      if (e.isTrusted && c && document.activeElement !== c) {
+        c.focus({ preventScroll: true });
+      }
+    },
+    true,
+  );
   window.addEventListener("click", (e) => {
     const t = e.composedPath()[0];
     if (
@@ -95,7 +107,20 @@
     if (!src) return;
     setTimeout(() => {
       if (!e.defaultPrevented) {
-        post("t3/notifications/open-image", { src, name: t.alt || t.title || "" });
+        const images = [];
+        let index = -1;
+        Array.prototype.forEach.call(document.images, (m) => {
+          const v = m.currentSrc || m.src;
+          if (!v || m.closest("a[href],button")) return;
+          if (m === t) index = images.length;
+          images.push({ src: v, name: m.alt || m.title || "" });
+        });
+        post("t3/notifications/open-image", {
+          src,
+          name: t.alt || t.title || "",
+          images,
+          index,
+        });
       }
     });
   });

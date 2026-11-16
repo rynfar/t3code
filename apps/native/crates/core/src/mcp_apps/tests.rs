@@ -357,3 +357,22 @@ fn parses_permissions_and_forwards_message_context_download_and_display_modes() 
         vec![Action::ExitFullscreen]
     );
 }
+
+#[test]
+fn download_name_caps_utf16_length_without_splitting_emoji_and_color_scheme_meta_injects() {
+    assert_eq!(COLOR_SCHEME_PARAM, "t3-color-scheme");
+    let emoji_name = format!("{}😀.csv", "a".repeat(199));
+    let capped = download_name(Some("ui://todos/export"), Some(&emoji_name));
+    assert_eq!(capped, "a".repeat(199));
+    assert!(capped.encode_utf16().count() <= MAX_DOWNLOAD_NAME);
+
+    let html = "<!doctype html><html><head><title>App</title></head><body>Hi</body></html>";
+    let injected = inject_color_scheme_meta(html, true);
+    assert!(injected.contains(r#"<meta name="color-scheme" content="dark">"#), "{injected}");
+    assert_eq!(
+        inject_color_scheme_meta("<html><head data-x='1'></head><body></body></html>", false),
+        r#"<html><head data-x='1'><meta name="color-scheme" content="light"></head><body></body></html>"#
+    );
+    let frag = inject_color_scheme_meta("<div>bare</div>", true);
+    assert!(frag.starts_with(r#"<meta name="color-scheme" content="dark">"#), "{frag}");
+}

@@ -47,7 +47,7 @@ struct UserFoldState {
 }
 
 /// Single newlines are line breaks in a user message (`lineBreaks`), so they become hard breaks.
-fn with_line_breaks(text: &str) -> String {
+pub(crate) fn with_line_breaks(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
     let mut fenced = false;
     for (index, line) in text.split('\n').enumerate() {

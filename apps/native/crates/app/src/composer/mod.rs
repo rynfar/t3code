@@ -161,6 +161,13 @@ struct Resolved {
     locked_instance: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct DisplacedAnswer {
+    draft: String,
+    key: String,
+    text: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Answers {
     thread_id: String,
@@ -182,6 +189,7 @@ pub struct Composer {
     provider_choice: Option<String>,
     responding: HashSet<String>,
     answers: HashMap<String, Answers>,
+    displaced_answers: Vec<DisplacedAnswer>,
     /// The request whose active question the prompt edits, and the prompt it set aside.
     answering: Option<String>,
     question_collapsed: Option<String>,
@@ -454,6 +462,7 @@ impl Composer {
             provider_choice: None,
             responding: HashSet::new(),
             answers: HashMap::new(),
+            displaced_answers: Vec::new(),
             answering: None,
             question_collapsed: None,
             question_markdown: crate::transcript::markdown::MarkdownStore::new(cx.entity_id()),
@@ -553,19 +562,8 @@ impl Composer {
     fn refresh(&mut self, config_changed: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.watch_question_grants(cx);
         let next = self.read_snapshot(cx);
-        let pruned = self.prune_question_attachments(&next.environment, cx);
-        if self.pending_send.is_pending() && self.question_revision(cx) != self.pending_questions && self.cancel_pending_send() { cx.notify(); }
-        if next.target != self.snapshot.target || next.pending.user_inputs != self.snapshot.pending.user_inputs {
-            self.cancel_pending_send();
-        }
-        if next == self.snapshot && !config_changed {
-            if self.provider_target.connection != self.state.read(cx).connection_id() { self.sync_provider_target(cx); }
-            self.sync_checkout_vcs(cx);
-            self.sync_branch_mismatch(cx);
-            if self.finish_prepared_reads(cx) || pruned { cx.notify(); }
-            return;
-        }
-        if next.target != self.snapshot.target || next.environment != self.snapshot.environment {
+        let switched = next.target != self.snapshot.target || next.environment != self.snapshot.environment;
+        if switched {
             if matches!(next.target, Some(Target::Draft(_))) && matches!(self.snapshot.target, Some(Target::Thread(_))) {
                 let resolved = self.resolve(cx);
                 self.carry = (resolved.model, Some(resolved.interaction_mode));
@@ -582,14 +580,40 @@ impl Composer {
                 self.focus(window, cx);
             }
         }
-        // `pruneResolvedUserInputDrafts`: only this thread's resolved drafts go; others wait.
-        let pending_ids: Vec<&String> = next.pending.user_inputs.iter().map(|input| &input.request_id).collect();
-        if let (Some(Target::Thread(thread_id)), true) = (&next.target, next.loaded) {
-            self.answers.retain(|key, answers| {
-                let same_environment = serde_json::from_str::<Vec<String>>(key).ok().is_some_and(|parts| parts.first() == Some(&next.environment));
-                !same_environment || answers.thread_id != *thread_id || pending_ids.iter().any(|id| key == &Self::answer_key_for(&next.environment, thread_id, id))
-            });
+        // Return unsent answers + referenced thread chips from cancelled/expired requests BEFORE pruning.
+        let returned_answers = self.return_unanswered_user_inputs(&next.environment, &next.target, window, cx);
+        let pruned = self.prune_question_attachments(&next.environment, cx);
+        if self.pending_send.is_pending() && self.question_revision(cx) != self.pending_questions && self.cancel_pending_send() { cx.notify(); }
+        if next.target != self.snapshot.target || next.pending.user_inputs != self.snapshot.pending.user_inputs {
+            self.cancel_pending_send();
         }
+        if next == self.snapshot && !config_changed {
+            if self.provider_target.connection != self.state.read(cx).connection_id() { self.sync_provider_target(cx); }
+            self.sync_checkout_vcs(cx);
+            self.sync_branch_mismatch(cx);
+            if self.finish_prepared_reads(cx) || pruned || returned_answers { cx.notify(); }
+            return;
+        }
+        // `pruneResolvedUserInputDrafts`: prune any loaded thread on this environment; unloaded threads wait.
+        let pending_ids: Vec<&String> = next.pending.user_inputs.iter().map(|input| &input.request_id).collect();
+        self.answers.retain(|key, answers| {
+            let Ok(parts) = serde_json::from_str::<Vec<String>>(key) else { return true };
+            if parts.first() != Some(&next.environment) {
+                return true;
+            }
+            let thread_id = &answers.thread_id;
+            if next.target.as_ref() == Some(&Target::Thread(thread_id.clone())) && next.loaded {
+                return pending_ids.iter().any(|id| key == &Self::answer_key_for(&next.environment, thread_id, id));
+            }
+            let Some(projection) = self.state.read(cx).thread_state(thread_id).projection.as_ref().filter(|p| p.thread.id == *thread_id) else {
+                return true;
+            };
+            projection
+                .runtime_requests
+                .iter()
+                .filter(|req| req.value.get("status").and_then(serde_json::Value::as_str) == Some("pending"))
+                .any(|req| key == &Self::answer_key_for(&next.environment, thread_id, &req.id))
+        });
         self.responding.retain(|request_id| {
             if let Ok(parts) = serde_json::from_str::<Vec<String>>(request_id) {
                 return parts.len() == 3 && (!next.loaded || parts[0] != next.environment || Some(&parts[1]) != next.target.as_ref().and_then(|target| if let Target::Thread(id) = target { Some(id) } else { None }) || pending_ids.iter().any(|id| **id == parts[2]));
@@ -917,6 +941,7 @@ impl Composer {
         let has_text = !text.trim().is_empty();
         let answering = self.active_question();
         if let Some((request_id, question)) = &answering {
+            self.withdraw_restored_answer(request_id, &question.id, &text, cx);
             let thread_id = self.thread_id().unwrap_or_default();
             let answer_key = self.answer_key(request_id);
             let answers = self.answers.entry(answer_key).or_insert_with(|| Answers { thread_id, ..Answers::default() });
@@ -1897,7 +1922,12 @@ mod stream_error_tests {
                             "header": "Mode",
                             "question": "Pick **mode** with `Markdown`?",
                             "multiSelect": false,
-                            "options": [{"label": "Fast", "value": "fast", "description": "Use fast mode"}]
+                            "options": [{
+                                "label": "Fast",
+                                "value": "fast",
+                                "description": "Use fast mode",
+                                "preview": "Line 1 preview\nLine 2 preview"
+                            }]
                         }],
                         "answers": null
                     }],
@@ -1955,15 +1985,76 @@ mod stream_error_tests {
         });
         assert!(vcx.debug_bounds("question-body").is_some());
 
-        // Typing custom text then picking an option displaces the text and emits the info toast.
+        // Typing custom text then picking an option displaces the text and emits the info toast;
+        // restoring that text as a custom answer (undo) withdraws it from the stash so it isn't double-submitted.
         vcx.update(|window, cx| {
             composer.update(cx, |composer, cx| {
                 composer.set_prompt("my typed answer", window, cx);
                 composer.on_prompt_change(cx);
                 assert!(composer.pick_by_digit(1, window, cx));
+                assert_eq!(composer.stash.as_deref(), Some("my typed answer"));
+                composer.set_prompt("my typed answer", window, cx);
+                composer.on_prompt_change(cx);
+                assert_eq!(composer.stash.as_deref(), Some(""));
             });
         });
         let toast_title = state.read_with(vcx, |state, _| state.toasts.latest().map(|t| t.title.to_string()));
         assert_eq!(toast_title.as_deref(), Some("Your typed text was set aside"));
+
+        // Cancelling the pending request restores unsent custom answer text + thread chip to the thread draft.
+        let thread_ctx = t3_core::composer::menu::ThreadContext::new("env-1", "t-ref", "RefThread");
+        let answer_with_chip = format!("unsent answer {}", thread_ctx.reference());
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt(&answer_with_chip, window, cx);
+                composer.seed_mentions(&Target::Thread("t-q".to_owned()), vec![thread_ctx.clone()]);
+                composer.on_prompt_change(cx);
+            });
+        });
+        state.update(vcx, |state, cx| {
+            let cancelled: t3_core::thread::ThreadStreamItem = serde_json::from_str(r#"{
+                "kind": "snapshot",
+                "snapshotSequence": 2,
+                "hasMoreHistory": false,
+                "projection": {
+                    "thread": {
+                        "id": "t-q", "projectId": "checkout-a", "title": "Question Thread",
+                        "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:06.000Z",
+                        "archivedAt": null, "branch": null, "worktreePath": null, "lastVisitedAt": null,
+                        "providerInstanceId": "replay", "modelSelection": {"instanceId":"replay","model":"replay"},
+                        "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t-q"}
+                    },
+                    "runs": [{
+                        "id": "r1", "ordinal": 1, "providerInstanceId": "replay",
+                        "modelSelection": {"instanceId": "replay", "model": "replay"},
+                        "userMessageId": "m0", "rootNodeId": null, "status": "cancelled",
+                        "requestedAt": "2026-04-01T00:00:01.000Z", "startedAt": "2026-04-01T00:00:01.000Z",
+                        "completedAt": "2026-04-01T00:00:06.000Z"
+                    }],
+                    "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+                    "providerThreads": [], "providerTurns": [],
+                    "runtimeRequests": [{
+                        "id": "q-req-1",
+                        "kind": "user_input",
+                        "status": "cancelled",
+                        "responseCapability": { "type": "live" },
+                        "createdAt": "2026-04-01T00:00:02.000Z"
+                    }],
+                    "messages": [], "plans": [], "turnItems": [],
+                    "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+                    "visibleTurnItems": [],
+                    "updatedAt": "2026-04-01T00:00:06.000Z"
+                }
+            }"#).unwrap();
+            state.thread.apply(cancelled);
+            cx.emit(AppEvent::Thread);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear());
+        composer.read_with(vcx, |composer, cx| {
+            assert_eq!(composer.prompt(cx), answer_with_chip);
+            let mentions = composer.mentions(&Target::Thread("t-q".to_owned()));
+            assert!(mentions.iter().any(|m| m.thread_id == "t-ref"));
+        });
     }
 }

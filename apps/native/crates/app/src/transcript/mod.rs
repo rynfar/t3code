@@ -10,7 +10,7 @@ mod inspector;
 pub mod markdown;
 mod media;
 pub(crate) use media::{markdown_extensions, media_document, MediaDocument};
-mod messages;
+pub(crate) mod messages;
 mod notices;
 mod parts;
 mod timer;

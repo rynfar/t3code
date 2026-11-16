@@ -1,10 +1,170 @@
 //! Display and resolution helpers for secret requests, link requests, and context handoffs.
 //! Ports `packages/client-runtime/src/{secretRequest,linkRequest,handoff}.ts`.
 
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+use regex::Regex;
 use serde_json::Value;
 
 use crate::auth::{ACCESS_WRITE_SCOPE, AuthSessionState};
 use crate::providers::ProviderEntry;
+use crate::settings::providers::form::{valid_one_password_reference, valid_reference};
+use crate::settings::secrets::{Classified, SecretProviders, classify};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRequestSource {
+    pub id: String,
+    pub label: String,
+    pub one_password: bool,
+    pub reference_placeholder: &'static str,
+    pub invalid_reference_message: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRequestLink {
+    pub href: String,
+    pub host: String,
+}
+
+/// Empty unless `secret_request_references` is enabled on the server; unsupported providers are omitted.
+pub fn secret_request_sources(secret_request_references: bool, providers: &SecretProviders) -> Vec<SecretRequestSource> {
+    if !secret_request_references {
+        return Vec::new();
+    }
+    providers
+        .0
+        .iter()
+        .filter_map(|provider| match classify(provider) {
+            Classified::OnePassword { .. } => Some(SecretRequestSource {
+                id: provider.id.clone(),
+                label: provider.label.clone(),
+                one_password: true,
+                reference_placeholder: "op://vault/item/field",
+                invalid_reference_message: "Use a 1Password reference like op://vault/item/field.",
+            }),
+            Classified::Unsupported => None,
+        })
+        .collect()
+}
+
+/// Validates and normalizes `text` against `source`'s reference syntax.
+pub fn secret_request_reference<'a>(source: &'a SecretRequestSource, text: &str) -> Option<(&'a str, String)> {
+    let trimmed = text.trim();
+    if !valid_reference(trimmed) {
+        return None;
+    }
+    if source.one_password && !valid_one_password_reference(trimmed) {
+        return None;
+    }
+    Some((source.id.as_str(), trimmed.to_owned()))
+}
+
+/// `secretRequestPageUrl`: allows only `http` / `https` URLs with a non-empty host.
+pub fn secret_request_page_url(value: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(value.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str().filter(|h| !h.is_empty())?;
+    let authority_host = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    Some((parsed.to_string(), authority_host))
+}
+
+fn trim_punctuation(link: &str) -> &str {
+    let mut end = link.len();
+    while end > 0 {
+        let ch = link[..end].chars().next_back().unwrap();
+        if !matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | ')') {
+            break;
+        }
+        let kept = &link[..end];
+        if ch == ')' && kept.bytes().filter(|&b| b == b'(').count() > kept.bytes().filter(|&b| b == b')').count().saturating_sub(1) {
+            break;
+        }
+        end -= ch.len_utf8();
+    }
+    &link[..end]
+}
+
+fn trailing_emphasis_run(link: &str) -> Option<&str> {
+    let last = link.bytes().next_back()?;
+    if last != b'*' && last != b'_' {
+        return None;
+    }
+    let count = link.bytes().rev().take_while(|&b| b == last).take(3).count();
+    Some(&link[link.len() - count..])
+}
+
+fn trim_emphasis<'a>(link: &'a str, before: &str) -> &'a str {
+    let Some(run) = trailing_emphasis_run(link) else {
+        return link;
+    };
+    let mut opener_end = None;
+    for (idx, _) in before.match_indices(run) {
+        let prev_ok = idx == 0 || before[..idx].chars().next_back().is_some_and(|c| c.is_whitespace() || matches!(c, '(' | '*' | '_'));
+        let after_idx = idx + run.len();
+        let next_ok = after_idx == before.len() || before[after_idx..].chars().next().is_some_and(|c| !c.is_whitespace());
+        if prev_ok && next_ok {
+            opener_end = Some(after_idx);
+        }
+    }
+    let Some(after_opener) = opener_end.map(|end| &before[end..]) else {
+        return link;
+    };
+    let closed = after_opener.match_indices(run).any(|(idx, _)| {
+        let prev_ok = idx > 0 && after_opener[..idx].chars().next_back().is_some_and(|c| !c.is_whitespace());
+        let after_idx = idx + run.len();
+        let next_ok = after_idx == after_opener.len()
+            || after_opener[after_idx..].chars().next().is_some_and(|c| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')'));
+        prev_ok && next_ok
+    });
+    if closed { link } else { trim_punctuation(&link[..link.len() - run.len()]) }
+}
+
+fn reason_link(reason: &str) -> Option<String> {
+    static REASON_LINK: OnceLock<Regex> = OnceLock::new();
+    let re = REASON_LINK.get_or_init(|| {
+        Regex::new(r#"(?i)`(https?://[^`\s]+)`|<(https?://[^>\s]+)>|\]\((https?://(?:[^()\s]|\([^()\s]*\))+)\)|(https?://[^\s<>"'`\[\]]+)"#)
+            .expect("valid REASON_LINK regex")
+    });
+    let mut links = HashSet::new();
+    for caps in re.captures_iter(reason) {
+        let candidate = if let Some(bare) = caps.get(4) {
+            let before = &reason[..caps.get(0).map_or(0, |m| m.start())];
+            let mut link = trim_punctuation(bare.as_str());
+            loop {
+                let next = trim_emphasis(link, before);
+                if next == link {
+                    break;
+                }
+                link = next;
+            }
+            link
+        } else {
+            caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(3)).map_or("", |m| m.as_str())
+        };
+        if candidate.is_empty() {
+            continue;
+        }
+        let normalized = secret_request_page_url(candidate).map(|(href, _)| href).unwrap_or_else(|| candidate.to_owned());
+        links.insert(normalized);
+        if links.len() > 1 {
+            return None;
+        }
+    }
+    links.into_iter().next()
+}
+
+/// Only http(s), preferring explicit `url` over a single unambiguous link in `reason`.
+pub fn secret_request_link(url: Option<&str>, reason: &str) -> Option<SecretRequestLink> {
+    let raw = url.map(str::to_owned).or_else(|| reason_link(reason))?;
+    let (href, host) = secret_request_page_url(&raw)?;
+    Some(SecretRequestLink { href, host })
+}
 
 /// Display model for a `secret_request` timeline item (`secretRequestDisplay`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +197,7 @@ pub fn secret_request_display(secret_status: &str, label: &str, can_answer_here:
         "saved" => SecretRequestDisplay {
             tone: SecretTone::Saved,
             label: format!("Saved {trimmed}"),
-            detail: "Stored securely. You can replace it in Settings -> Connections.".to_owned(),
+            detail: "Saved securely and kept private.".to_owned(),
         },
         "declined" => SecretRequestDisplay {
             tone: SecretTone::Declined,
@@ -123,7 +283,13 @@ pub fn link_request_display(
     failure: Option<&str>,
     can_answer_here: bool,
 ) -> LinkRequestDisplay {
-    let target = linked_label.or(label).or(url).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("machine");
+    let target = linked_label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| url.map(str::trim).filter(|s| !s.is_empty()).map(link_destination))
+        .or_else(|| label.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
+        .unwrap_or_else(|| "machine".to_owned());
     match link_status {
         "linked" => {
             let access_note = linked_access.map(link_access_label).map(|a| format!(" ({a})")).unwrap_or_default();
@@ -241,6 +407,99 @@ pub struct LinkableMachine {
     pub reachable: bool,
 }
 
+pub const ANOTHER_ADDRESS: &str = "another-address";
+
+/// The http or https origin of an address (`originOf`).
+pub fn origin_of(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some_and(|h| !h.is_empty()) {
+        Some(parsed.origin().ascii_serialization())
+    } else {
+        None
+    }
+}
+
+/// Where a link to `address` sends its pairing code (`linkDestination`).
+pub fn link_destination(address: &str) -> String {
+    origin_of(address).unwrap_or_else(|| address.trim().to_owned())
+}
+
+/// What the card calls the other environment: where `url` leads, never a supplied label.
+pub fn link_request_target_name(url: Option<&str>) -> String {
+    url.map(link_destination).filter(|s| !s.is_empty()).unwrap_or_else(|| "a machine".to_owned())
+}
+
+/// A loopback address names whichever machine opens it, never a peer reachable over the network.
+pub fn is_loopback_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw.trim()) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => {
+            let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+            normalized == "localhost" || normalized.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        None => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkRequestTarget {
+    None,
+    Machine {
+        environment_id: String,
+        label: String,
+        urls: Vec<String>,
+        linked: bool,
+    },
+    Address,
+}
+
+pub fn link_request_target(
+    environment_id: Option<&str>,
+    url: Option<&str>,
+    machines: &[LinkableMachine],
+    choice: Option<&str>,
+) -> LinkRequestTarget {
+    let chosen = if let Some(asked_url) = url.map(str::trim).filter(|u| !u.is_empty()) {
+        let asked_origin = origin_of(asked_url);
+        let mut matched = asked_origin.as_ref().map_or_else(Vec::new, |asked| {
+            machines
+                .iter()
+                .filter(|machine| machine.urls.iter().any(|u| origin_of(u).as_ref() == Some(asked)))
+                .collect::<Vec<_>>()
+        });
+        if matched.len() == 1 {
+            matched.pop().map(|m| m.id.as_str()).unwrap_or(ANOTHER_ADDRESS)
+        } else {
+            ANOTHER_ADDRESS
+        }
+    } else if let Some(id) = environment_id.or(choice) {
+        id
+    } else {
+        return LinkRequestTarget::None;
+    };
+    if chosen == ANOTHER_ADDRESS {
+        return LinkRequestTarget::Address;
+    }
+    match machines.iter().find(|candidate| candidate.id == chosen) {
+        Some(machine) => LinkRequestTarget::Machine {
+            environment_id: machine.id.clone(),
+            label: machine.label.clone(),
+            urls: machine.urls.clone(),
+            linked: machine.existing_link_environment_id.is_some(),
+        },
+        None => LinkRequestTarget::Machine {
+            environment_id: chosen.to_owned(),
+            label: link_request_target_name(url),
+            urls: Vec::new(),
+            linked: false,
+        },
+    }
+}
+
 pub fn linkable_machines(
     environments: &[MachineCandidate],
     linked: &[ExistingPeerLink],
@@ -253,10 +512,17 @@ pub fn linkable_machines(
             let existing = linked
                 .iter()
                 .find(|l| l.environment_id == env.id || l.label.eq_ignore_ascii_case(&env.label));
+            let mut urls = Vec::new();
+            for url in &env.urls {
+                let trimmed = url.trim();
+                if !trimmed.is_empty() && !is_loopback_url(trimmed) && !urls.iter().any(|u| u == trimmed) {
+                    urls.push(trimmed.to_owned());
+                }
+            }
             LinkableMachine {
                 id: env.id.clone(),
                 label: env.label.clone(),
-                urls: env.urls.clone(),
+                urls,
                 existing_link_environment_id: existing.map(|l| l.environment_id.clone()),
                 reachable: env.reachable,
             }
@@ -454,5 +720,146 @@ mod tests {
         assert!(machines.iter().any(|m| m.id == "cloud-relay" && m.urls.is_empty()));
         let ranked = rank_machines_by_hint(machines, Some("gpu"), None, None);
         assert_eq!(ranked[0].id, "b");
+    }
+
+    #[test]
+    fn secret_request_saved_display_uses_sharing_and_access_wording() {
+        let display = secret_request_display("saved", "OPENAI_API_KEY", true);
+        assert!(!display.detail.contains("Connections"), "detail should not reference Settings -> Connections: {}", display.detail);
+    }
+
+    #[test]
+    fn linkable_machines_filters_loopback_urls_and_display_ignores_untrusted_label_for_url() {
+        let candidates = vec![MachineCandidate {
+            id: "peer-1".into(),
+            label: "Studio".into(),
+            urls: vec!["http://127.0.0.1:3773".into(), "http://localhost:3773".into(), "https://studio.ts.net".into()],
+            reachable: true,
+        }];
+        let machines = linkable_machines(&candidates, &[], Some("host"));
+        assert_eq!(machines[0].urls, vec!["https://studio.ts.net".to_owned()]);
+
+        let pending_url = link_request_display("pending", Some("Spoofed Name"), Some("https://user:pass@box.local:8443/path"), None, None, None, true);
+        assert_eq!(pending_url.label, "Link https://box.local:8443");
+    }
+
+    #[test]
+    fn secret_request_sources_and_reference_validation() {
+        let providers: SecretProviders = serde_json::from_value(serde_json::json!({
+            "op-work": { "kind": "one_password", "label": "Work 1Password", "config": { "account": "work.1password.com" } },
+            "legacy": { "kind": "custom_vault", "label": "Unsupported", "config": {} },
+        }))
+        .expect("providers");
+        assert!(secret_request_sources(false, &providers).is_empty());
+        let sources = secret_request_sources(true, &providers);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "op-work");
+        assert_eq!(sources[0].label, "Work 1Password");
+        assert_eq!(
+            secret_request_reference(&sources[0], "  op://Private/API Key/credential  "),
+            Some(("op-work", "op://Private/API Key/credential".to_owned()))
+        );
+        assert_eq!(secret_request_reference(&sources[0], "not-op-ref"), None);
+    }
+
+    #[test]
+    fn secret_request_link_prefers_safe_url_and_parses_single_reason_link() {
+        assert_eq!(
+            secret_request_link(Some("https://accounts.google.com/o/oauth2/auth?x=1"), "fallback https://other.dev"),
+            Some(SecretRequestLink {
+                href: "https://accounts.google.com/o/oauth2/auth?x=1".to_owned(),
+                host: "accounts.google.com".to_owned(),
+            })
+        );
+        assert_eq!(secret_request_link(Some("javascript:alert(1)"), "visit https://safe.example/keys"), None);
+        assert_eq!(
+            secret_request_link(None, "Create a token at **https://example.com/tokens_(v2)**."),
+            Some(SecretRequestLink {
+                href: "https://example.com/tokens_(v2)".to_owned(),
+                host: "example.com".to_owned(),
+            })
+        );
+        assert_eq!(
+            secret_request_link(None, "See [docs](https://a.dev) or `https://a.dev/`."),
+            Some(SecretRequestLink { href: "https://a.dev/".to_owned(), host: "a.dev".to_owned() })
+        );
+        assert_eq!(secret_request_link(None, "Compare https://a.dev and https://b.dev"), None);
+    }
+
+    #[test]
+    fn link_request_target_matches_unique_origin_and_never_trusts_spoofed_env() {
+        let machines = vec![
+            LinkableMachine {
+                id: "env-a".into(),
+                label: "Box A".into(),
+                urls: vec!["https://box-a.ts.net".into()],
+                existing_link_environment_id: None,
+                reachable: true,
+            },
+            LinkableMachine {
+                id: "env-b".into(),
+                label: "Box B".into(),
+                urls: vec!["http://10.0.0.5:3773".into()],
+                existing_link_environment_id: None,
+                reachable: true,
+            },
+            LinkableMachine {
+                id: "env-c".into(),
+                label: "Box C".into(),
+                urls: vec!["http://10.0.0.5:3773".into()],
+                existing_link_environment_id: None,
+                reachable: true,
+            },
+        ];
+        assert_eq!(
+            link_request_target(Some("env-b"), Some("https://box-a.ts.net/pair?x=1"), &machines, None),
+            LinkRequestTarget::Machine {
+                environment_id: "env-a".into(),
+                label: "Box A".into(),
+                urls: vec!["https://box-a.ts.net".into()],
+                linked: false,
+            }
+        );
+        // Ambiguous shared private IP -> requires manual address confirmation.
+        assert_eq!(link_request_target(None, Some("http://10.0.0.5:3773/pair"), &machines, None), LinkRequestTarget::Address);
+        // Unknown URL ignores spoofed environment_id.
+        assert_eq!(link_request_target(Some("env-a"), Some("https://evil.example"), &machines, None), LinkRequestTarget::Address);
+        assert_eq!(link_request_target(None, None, &machines, None), LinkRequestTarget::None);
+    }
+
+    #[test]
+    fn secret_request_wire_contracts_round_trip_url_flag_and_reference_command() {
+        let item: crate::turn_item::TurnItemKind = serde_json::from_value(serde_json::json!({
+            "type": "secret_request",
+            "label": "OPENAI_API_KEY",
+            "reason": "Need key",
+            "secretStatus": "pending",
+            "url": "https://platform.openai.com/api-keys"
+        }))
+        .expect("secret request turn item");
+        match item {
+            crate::turn_item::TurnItemKind::SecretRequest { url, .. } => {
+                assert_eq!(url.as_deref(), Some("https://platform.openai.com/api-keys"));
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        let cfg: crate::server_config::ServerConfig = serde_json::from_value(serde_json::json!({
+            "secretRequestReferences": true
+        }))
+        .expect("server config");
+        assert!(cfg.secret_request_references);
+
+        assert_eq!(
+            crate::commands::secret_request_answer_reference("t1", "i1", "op-work", "op://vault/item/field"),
+            serde_json::json!({
+                "threadId": "t1",
+                "turnItemId": "i1",
+                "answer": {
+                    "type": "reference",
+                    "reference": { "provider": "op-work", "reference": "op://vault/item/field" }
+                }
+            })
+        );
     }
 }
