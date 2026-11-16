@@ -373,7 +373,11 @@ impl Composer {
                 let open = self.context.open.as_deref() == Some(context_id.as_str());
                 let toggle_id = context_id.clone();
                 let shell = self.with_context_copy(chip_shell(&context_id, Icon::MessageCircle, comment.label(), ink, true, cx), &context_id, cx)
+                    .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if Self::guard_reopen(&mut this.context.dismissed) {
+                            return;
+                        }
                         this.context.open = if this.context.open.as_deref() == Some(&toggle_id) { None } else { Some(toggle_id.clone()) };
                         cx.notify();
                     }));
@@ -416,12 +420,26 @@ impl Composer {
                 let open = self.context.open.as_deref() == Some(&context_id);
                 let toggle_id = context_id.clone();
                 let shell = if crate::context_chip::has_details(&record) {
-                    shell.on_click(cx.listener(move |this, _, _, cx| {
-                        this.context.open = if this.context.open.as_deref() == Some(&toggle_id) {None} else {Some(toggle_id.clone())}; cx.notify();
+                    shell.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                        if Self::guard_reopen(&mut this.context.dismissed) {
+                            return;
+                        }
+                        this.context.open = if this.context.open.as_deref() == Some(&toggle_id) { None } else { Some(toggle_id.clone()) };
+                        cx.notify();
                     }))
                 } else {shell};
                 div().relative().child(self.with_remove(shell, &context_id, ink, cx))
-                    .when(open, |this| this.child(floating(Float::AboveStart, crate::context_chip::details(&record, cx))))
+                    .when(open, |this| {
+                        let popover = crate::context_chip::details(&record, cx)
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                if this.context.open.take().is_some() {
+                                    this.context.dismissed = Some(Instant::now());
+                                    cx.notify();
+                                }
+                            }))
+                            .into_any_element();
+                        this.child(floating(Float::AboveStart, popover))
+                    })
                     .into_any_element()
             }
             Chip::Unresolved { label, .. } => {
@@ -463,13 +481,39 @@ impl Composer {
 
     fn review_popover(&self, comment: &ReviewComment, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        v_flex().id("review-comment-details").w(px(384.)).max_w_full().p(px(12.)).gap(px(8.))
-            .rounded(px(8.)).border_1().border_color(hsla(p.border).opacity(0.7)).bg(hsla(p.popover))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| { this.context.open = None; cx.notify(); }))
-            .child(div().text_size(px(12.)).child(comment.file_path.clone()))
+        v_flex()
+            .id("review-comment-details")
+            .occlude()
+            .w(px(384.))
+            .max_w_full()
+            .p(px(12.))
+            .gap(px(8.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(hsla(p.dropdown_border))
+            .bg(hsla(p.popover))
+            .text_color(hsla(p.popover_foreground))
+            .shadow(floating_shadow(cx.theme().is_dark()))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if this.context.open.take().is_some() {
+                    this.context.dismissed = Some(Instant::now());
+                    cx.notify();
+                }
+            }))
+            .child(div().text_size(px(12.)).font_weight(gpui::FontWeight::MEDIUM).child(comment.file_path.clone()))
             .child(div().text_size(px(11.)).text_color(hsla(p.secondary_label)).child(format!("{} · {}", comment.section_title, comment.range_label)))
-            .child(div().text_size(px(14.)).child(SharedString::from(comment.text.clone())))
-            .child(div().id("review-comment-excerpt").max_h(px(256.)).overflow_y_scroll().font_family(cx.theme().mono_font_family.clone()).text_size(px(11.)).child(SharedString::from(comment.diff.clone())))
+            .when(!comment.text.trim().is_empty(), |this| {
+                this.child(div().text_size(px(14.)).child(SharedString::from(comment.text.clone())))
+            })
+            .when(!comment.diff.trim().is_empty(), |this| {
+                this.child(
+                    div()
+                        .id("review-comment-excerpt")
+                        .max_h(px(256.))
+                        .overflow_y_scroll()
+                        .child(crate::context_chip::render_diff_lines(&comment.diff, cx)),
+                )
+            })
             .into_any_element()
     }
 

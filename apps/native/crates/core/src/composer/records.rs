@@ -175,6 +175,56 @@ pub fn clipboard_records(markdown: &str, records: &[Value]) -> Vec<Value> {
     selected
 }
 
+/// Normalizes pasted line endings (`readPastedPlainText` in `composerInlineTokenPaste.ts`).
+pub fn normalize_pasted_plain_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Synthesizes `ThreadContextRecord`s for hosted/`t3-thread://v2` links pasted outside code when no
+/// clipboard fragment already carried them (`threadLinkContextReferences`).
+pub fn paste_thread_link_records(
+    markdown: &str,
+    copied: &[Value],
+    mut title_for: impl FnMut(&str, &str) -> Option<String>,
+) -> Vec<Value> {
+    let mut records = Vec::new();
+    for link in crate::thread_actions::thread_reference::hosted_references(markdown) {
+        let record = copied
+            .iter()
+            .find(|r| hosted_record(r, &link))
+            .cloned()
+            .unwrap_or_else(|| {
+                let title = title_for(&link.environment, &link.thread)
+                    .or_else(|| {
+                        link.label
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "Thread".to_owned());
+                super::menu::ThreadContext::new(&link.environment, &link.thread, &title).to_record()
+            });
+        let id = field(&record, "contextId");
+        if !records.iter().any(|existing| field(existing, "contextId") == id) {
+            records.push(record);
+        }
+    }
+    records
+}
+
 pub fn copy_fragment(
     markdown: &str,
     records: &[Value],

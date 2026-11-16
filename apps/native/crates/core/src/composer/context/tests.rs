@@ -239,3 +239,23 @@ fn a_new_prompt_history_drops_unlinked_records() {
     reset_history(&mut threads, "no links");
     assert!(threads.is_empty());
 }
+
+#[test]
+fn terminal_record_clamps_long_text_without_splitting_surrogate_pairs() {
+    let marker_units = "\n… truncated …".encode_utf16().count();
+    let budget = TERMINAL_TEXT_MAX_CHARS - marker_units;
+    let exact = "a".repeat(TERMINAL_TEXT_MAX_CHARS);
+    assert_eq!(context("exact", 1, 1, &exact).record()["text"], exact);
+
+    let mut straddling = "a".repeat(budget - 1);
+    straddling.push('🦀');
+    straddling.push_str(&"x".repeat(marker_units + 5));
+    let clamped = context("over", 1, 1, &straddling).record()["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(clamped.ends_with("\n… truncated …"));
+    assert!(!clamped.contains('🦀'));
+    assert!(!clamped.contains('\u{FFFD}'));
+    assert_eq!(clamped.encode_utf16().count(), TERMINAL_TEXT_MAX_CHARS - 1);
+}

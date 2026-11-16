@@ -1004,6 +1004,35 @@ impl UploadQueue {
         effects
     }
 
+    /// Retires a sent attachment job from queue tracking without deleting its server asset.
+    pub fn retire(&mut self, job_key: &str) -> Vec<QueueEffect> {
+        let mut effects = Vec::new();
+        self.pending_order.retain(|k| k != job_key);
+        let Some(job) = self.jobs.remove(job_key) else {
+            return effects;
+        };
+        if job.phase == JobPhase::Active {
+            self.retired_jobs.insert(
+                job.token,
+                RetiredJob {
+                    environment_id: job.environment_id.clone(),
+                    deleted_mint_id: None,
+                },
+            );
+            effects.push(QueueEffect::AbortActive {
+                job_token: job.token,
+                job_key: job.job_key.clone(),
+                environment_id: job.environment_id.clone(),
+            });
+            effects.push(QueueEffect::Settled {
+                job_key: job.job_key,
+                environment_id: job.environment_id,
+            });
+            effects.extend(self.pump());
+        }
+        effects
+    }
+
     /// Moves/adopts a live or settled attachment job to a new `DraftTarget` without aborting the
     /// upload or deleting its server asset.
     pub fn adopt_target(&mut self, old_job_key: &str, new_job_key: String, new_target: DraftTarget) -> bool {
@@ -1395,6 +1424,45 @@ mod tests {
         assert!(fail_then_retry.iter().any(|e| matches!(
             e,
             QueueEffect::StartUpload { job_key, .. } if job_key == "j-inflight"
+        )));
+    }
+
+    #[test]
+    fn retire_removes_ready_job_without_deleting_server_asset_or_sibling_jobs() {
+        let mut queue = UploadQueue::new();
+        let (tok_sent, _) = queue.start(
+            "d1::sent".into(),
+            target("d1", "sent"),
+            "env-1".into(),
+            true,
+            None,
+            None,
+        );
+        let _ = queue.complete_cycle(
+            tok_sent.unwrap(),
+            UploadCycleOutcome::Uploaded {
+                attachment_id: "srv-sent".into(),
+            },
+        );
+        let (_tok_keep, _) = queue.start(
+            "d1::keep".into(),
+            target("d1", "keep"),
+            "env-1".into(),
+            true,
+            None,
+            None,
+        );
+
+        let retire_effects = queue.retire("d1::sent");
+        assert!(retire_effects.is_empty(), "retire must not delete sent server asset");
+        assert!(queue.state("d1::sent").is_none());
+        assert!(queue.state("d1::keep").is_some());
+
+        // Later draft release deletes only the remaining unsent job, never srv-sent.
+        let release_effects = queue.release_draft("d1");
+        assert!(!release_effects.iter().any(|e| matches!(
+            e,
+            QueueEffect::DeletePendingAttachment { attachment_id, .. } if attachment_id == "srv-sent"
         )));
     }
 }

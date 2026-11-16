@@ -139,7 +139,7 @@ impl Composer {
                     let records = self.answer_context_records(&input.request_id, question_id);
                     *value = requests::project_pending_user_input_answer(std::mem::take(value), &records);
                 }
-                self.submit_answers(input.request_id, built, cx);
+                self.submit_answers(input.request_id, built, window, cx);
             }
             return;
         }
@@ -214,18 +214,141 @@ impl Composer {
         cx.notify();
     }
 
-    fn submit_answers(&mut self, request_id: String, answers: serde_json::Map<String, serde_json::Value>, cx: &mut Context<Self>) {
-        if self.is_rewinding(cx) {
+    fn dispatch_question_answers(
+        &mut self,
+        thread_id: &str,
+        request_id: &str,
+        answers: serde_json::Map<String, serde_json::Value>,
+        attachments: serde_json::Map<String, serde_json::Value>,
+        retire_keys: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.answer_key(request_id);
+        self.responding.insert(key.clone());
+        let command = commands::respond_to_user_input_with_attachments(&uuid_v4(), thread_id, request_id, answers, attachments);
+        self.run_question_request(key, command, retire_keys, "Failed to submit user input.", cx);
+    }
+
+    fn submit_answers(&mut self, request_id: String, answers: serde_json::Map<String, serde_json::Value>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) || self.sending {
             return;
         }
         let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
         let Some(input) = self.active_input().filter(|input| input.request_id == request_id && input.can_respond()).cloned() else { return };
         if !self.can_answer(cx) || self.question_responding(&request_id, cx) { return; }
-        let Some(attachments) = self.question_response_attachments(&input, cx) else { return };
-        let key = self.answer_key(&request_id);
-        self.responding.insert(key.clone());
-        let command = commands::respond_to_user_input_with_attachments(&uuid_v4(), &thread_id, &request_id, answers, attachments);
-        self.run_question_request(key, command, "Failed to submit user input.", cx);
+        let question_targets: Vec<Target> = input
+            .questions
+            .iter()
+            .filter_map(|q| self.question_target(&request_id, &q.id))
+            .collect();
+        for target in &question_targets {
+            self.sync_upload_states_for(target, cx);
+        }
+        if question_targets.iter().any(|t| self.staged_for(t).iter().any(|s| s.needs_reattach)) {
+            self.error = Some("Attach the interrupted file again or remove it".into());
+            cx.notify();
+            return;
+        }
+        let drafts = self.question_answer_drafts(&input, cx);
+        if requests::build_answers(&input.questions, &drafts).is_none() {
+            return;
+        }
+        match self.question_response_attachments(&input, cx) {
+            Ok(attachments) => {
+                let retire_keys = self.question_job_keys(&input);
+                self.dispatch_question_answers(&thread_id, &request_id, answers, attachments, retire_keys, cx);
+            }
+            Err(requests::attachments::QuestionResponseAttachmentError::UploadsIncomplete { message, .. }) => {
+                self.await_question_uploads(request_id, answers, message, window, cx);
+            }
+            Err(err) => {
+                self.error = Some(err.message().to_owned());
+                cx.notify();
+            }
+        }
+    }
+
+    fn await_question_uploads(
+        &mut self,
+        request_id: String,
+        answers: serde_json::Map<String, serde_json::Value>,
+        fallback_message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.active_input().filter(|input| input.request_id == request_id && input.can_respond()).cloned() else { return };
+        let mut wait_tasks = Vec::new();
+        for question in &input.questions {
+            let Some(target) = self.question_target(&request_id, &question.id) else { continue };
+            let staged: Vec<_> = self.staged_for(&target).iter().map(|s| s.attachment.clone()).collect();
+            let retry_ids = t3_core::composer::attachments::retry_on_send(&staged);
+            if let Some(task) = self.await_target_uploads(&target, &retry_ids, cx) {
+                wait_tasks.push(task);
+            }
+        }
+        if wait_tasks.is_empty() {
+            self.error = Some(fallback_message);
+            cx.notify();
+            return;
+        }
+        let connection = self.state.read(cx).connection_id();
+        let transport = self.state.read(cx).client_handle().map(|client| *client.connection_generation().borrow());
+        self.send_connection = Some((connection, transport, self.state.read(cx).phase.clone()));
+        self.pending_questions = self.question_revision(cx);
+        let generation = self.pending_send.begin();
+        self.sending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            futures::future::join_all(wait_tasks).await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                if !this.pending_send.finish(generation) { return; }
+                this.sending = false;
+                if this.is_rewinding(cx) {
+                    cx.notify();
+                    return;
+                }
+                let Some(Target::Thread(thread_id)) = this.snapshot.target.clone() else {
+                    cx.notify();
+                    return;
+                };
+                let Some(input) = this.active_input().filter(|i| i.request_id == request_id && i.can_respond()).cloned() else {
+                    cx.notify();
+                    return;
+                };
+                for question in &input.questions {
+                    if let Some(target) = this.question_target(&request_id, &question.id) {
+                        this.sync_upload_states_for(&target, cx);
+                    }
+                }
+                let same_connection = matches!(this.state.read(cx).phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected))
+                    && this.question_revision(cx) == this.pending_questions
+                    && this.state.read(cx).connection_id() == connection
+                    && this.state.read(cx).client_handle().map(|client| *client.connection_generation().borrow()) == transport;
+                if same_connection {
+                    if !this.can_answer(cx) || this.question_responding(&request_id, cx) {
+                        cx.notify();
+                        return;
+                    }
+                    let drafts = this.question_answer_drafts(&input, cx);
+                    if requests::build_answers(&input.questions, &drafts).is_none() {
+                        cx.notify();
+                        return;
+                    }
+                    match this.question_response_attachments(&input, cx) {
+                        Ok(attachments) => {
+                            let retire_keys = this.question_job_keys(&input);
+                            this.dispatch_question_answers(&thread_id, &request_id, answers, attachments, retire_keys, cx);
+                        }
+                        Err(err) => {
+                            this.error = Some(err.message().to_owned());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn dismiss(&mut self, request_id: String, cx: &mut Context<Self>) {
@@ -237,7 +360,7 @@ impl Composer {
         let key = self.answer_key(&request_id);
         self.responding.insert(key.clone());
         let command = commands::dismiss_user_input(&uuid_v4(), &thread_id, &request_id);
-        self.run_question_request(key, command, "Failed to dismiss the question.", cx);
+        self.run_question_request(key, command, Vec::new(), "Failed to dismiss the question.", cx);
     }
 
     fn is_question_collapsed(&self, input: &PendingUserInput) -> bool {

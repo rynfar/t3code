@@ -70,19 +70,32 @@ fn decode(segment: &str) -> Option<String> {
     identity(&id).then_some(id)
 }
 
+const V2_PREFIX: &str = "t3-thread://v2/";
+
 pub(crate) struct HostedReference {
     pub start: usize,
     pub end: usize,
     pub environment: String,
     pub thread: String,
+    pub label: Option<String>,
 }
 
-// Rust regex has no backreferences; consume code delimiters before searching for more links.
+fn parse_link_target(href: &str) -> Option<(String, String)> {
+    if let Some(rest) = href.strip_prefix(PREFIX) {
+        let (env, thread) = rest.split_once('/')?;
+        return Some((decode(env)?, decode(thread)?));
+    }
+    let rest = href.strip_prefix(V2_PREFIX)?;
+    let (env, thread) = rest.split_once('/')?;
+    (identity(env) && identity(thread)).then(|| (env.to_owned(), thread.to_owned()))
+}
+
+// Rust regex has no backreferences; consume escapes, code delimiters, and non-thread links first.
 pub(crate) fn hosted_references(text: &str) -> Vec<HostedReference> {
     use std::sync::LazyLock;
     static TOKENS: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
-        r"(?P<code>`+|~{3,})|\[[^\]\n]*\]\((?P<link>https://app\.t3\.codes/threads/[A-Za-z0-9_%-]+/[A-Za-z0-9_%-]+)\)|<(?P<auto>https://app\.t3\.codes/threads/[A-Za-z0-9_%-]+/[A-Za-z0-9_%-]+)>|(?P<bare>https://app\.t3\.codes/threads/[A-Za-z0-9_%-]+/[A-Za-z0-9_%-]+)"
+        r"(?P<escape>\\[!-/:-@\\\[-\x60{-~])|(?P<code>`+|~{3,})|\[(?P<label>[^\[\]\n]*)\]\((?:<(?P<angleLink>(?:https://app\.t3\.codes/threads/|t3-thread://v2/)[^\s<>]+)>|(?P<link>(?:https://app\.t3\.codes/threads/[A-Za-z0-9_%-]+/[A-Za-z0-9_%-]+|t3-thread://v2/[^\s>)]+)))\)|\[[^\[\]\n]*\]\((?:<[^<>\n]*>|[^\s()]*(?:\([^\s()]*\)[^\s()]*)*)(?:[ \t]+(?:\x22[^\x22\n]*\x22|'[^'\n]*'))?\)|<(?P<auto>(?:https://app\.t3\.codes/threads/[A-Za-z0-9_%-]+/[A-Za-z0-9_%-]+|t3-thread://v2/[^\s<>]+))>|(?P<bare>https://app\.t3\.codes/threads/[A-Za-z0-9_%-]+/[A-Za-z0-9_%-]+)"
     ).expect("hosted thread pattern")
     });
     let mut offset = 0;
@@ -92,6 +105,9 @@ pub(crate) fn hosted_references(text: &str) -> Vec<HostedReference> {
         let start = offset + whole.start();
         let end = offset + whole.end();
         offset = end;
+        if captures.name("escape").is_some() {
+            continue;
+        }
         if let Some(code) = captures.name("code") {
             let remaining = &text[end..];
             let fence = code.as_str().len() >= 3;
@@ -104,25 +120,33 @@ pub(crate) fn hosted_references(text: &str) -> Vec<HostedReference> {
             }
             continue;
         }
-        if captures.name("bare").is_some()
-            && text[end..]
+        if captures.name("bare").is_some() {
+            if start > 0
+                && text[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || "%/?#=&@+-".contains(c))
+            {
+                continue;
+            }
+            if text[end..]
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_' || "%/?#-".contains(c))
-        {
-            continue;
+            {
+                continue;
+            }
         }
-        let href = captures
-            .name("link")
+        let Some(href) = captures
+            .name("angleLink")
+            .or_else(|| captures.name("link"))
             .or_else(|| captures.name("auto"))
             .or_else(|| captures.name("bare"))
-            .expect("link token")
-            .as_str();
-        let Some((environment, thread)) = href
-            .strip_prefix(PREFIX)
-            .and_then(|p| p.split_once('/'))
-            .and_then(|(e, t)| Some((decode(e)?, decode(t)?)))
+            .map(|m| m.as_str())
         else {
+            continue;
+        };
+        let Some((environment, thread)) = parse_link_target(href) else {
             continue;
         };
         found.push(HostedReference {
@@ -130,6 +154,7 @@ pub(crate) fn hosted_references(text: &str) -> Vec<HostedReference> {
             end,
             environment,
             thread,
+            label: captures.name("label").map(|m| m.as_str().to_owned()),
         });
     }
     found

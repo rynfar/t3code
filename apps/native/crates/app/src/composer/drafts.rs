@@ -124,7 +124,7 @@ impl Composer {
         self.seed_reviews(&target, draft.review_comments.clone());
             self.seed_reply_to(&target, draft.reply_to.clone());
             self.publish_review_comments(&target, &draft.prompt, cx);
-            self.seed_attachments(&target, draft.attachments.iter().map(SavedAttachment::restore).collect());
+            self.seed_attachments(&target, draft.attachments.iter().map(SavedAttachment::restore).collect(), true, cx);
         }
         self.drafts.store = store;
     }
@@ -255,6 +255,7 @@ impl Composer {
 }
 
 pub(crate) struct DiscardedDraft {
+    target: Target,
     draft: Draft,
     attachments: Vec<super::attachments::Staged>,
 }
@@ -293,7 +294,7 @@ impl Composer {
         self.take_reply_to(target);
         if self.snapshot.target.as_ref() == Some(target) { self.set_prompt("", window, cx); }
         cx.notify();
-        Some(DiscardedDraft { draft, attachments })
+        Some(DiscardedDraft { target: target.clone(), draft, attachments })
     }
 
     pub(crate) fn restore_sidebar_draft(&mut self, project: &str, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
@@ -305,10 +306,10 @@ impl Composer {
     }
 
     fn restore_target_draft(&mut self, target: &Target, discarded: DiscardedDraft, window: &mut Window, cx: &mut Context<Self>) {
-        let DiscardedDraft { draft, attachments } = discarded;
+        let DiscardedDraft { target: discarded_target, draft, attachments } = discarded;
         let live = self.current_draft(target, cx);
         if !self.mutate_drafts(cx, |store| store.restore(&key(target), draft.clone(), &live)) {
-            self.commit_sidebar_discard(DiscardedDraft { draft, attachments }, cx);
+            self.commit_sidebar_discard(DiscardedDraft { target: discarded_target, draft, attachments }, cx);
             self.error = Some("Failed to restore draft: The draft has new content.".into());
             cx.notify();
             return;
@@ -319,7 +320,7 @@ impl Composer {
         self.seed_terminals(target, draft.terminals.clone());
         self.seed_reviews(target, draft.review_comments.clone());
         self.seed_reply_to(target, draft.reply_to.clone());
-        self.restore_draft_attachments(target, attachments, cx);
+        self.restore_draft_attachments(target, None, attachments, cx);
         if self.snapshot.target.as_ref() == Some(target) { self.set_prompt(&draft.restored_prompt(), window, cx); }
         self.schedule_draft_save(target, cx);
         cx.notify();
@@ -357,13 +358,13 @@ impl Composer {
             self.take_draft_attachments(&from)
         } else {
             let dropped = self.take_draft_attachments(&from);
-            self.commit_sidebar_discard(DiscardedDraft { draft: Draft::default(), attachments: dropped }, cx);
+            self.commit_sidebar_discard(DiscardedDraft { target: from.clone(), draft: Draft::default(), attachments: dropped }, cx);
             draft.attachments.clear();
             draft.pending_attachment_count = 0;
             Vec::new()
         };
         let old_to = self.take_draft_attachments(&to);
-        self.commit_sidebar_discard(DiscardedDraft { draft: Draft::default(), attachments: old_to }, cx);
+        self.commit_sidebar_discard(DiscardedDraft { target: to.clone(), draft: Draft::default(), attachments: old_to }, cx);
         self.discard_draft(&from, cx);
         self.clear_mentions(&from);
         self.context.records.remove(&from);
@@ -384,7 +385,7 @@ impl Composer {
         if self.mutate_drafts(cx, |store| store.set(&key(&to), draft.clone())) {
             self.schedule_draft_save(&to, cx);
         }
-        self.restore_draft_attachments(&to, attachments, cx);
+        self.restore_draft_attachments(&to, keep_attachments.then_some(&from), attachments, cx);
         if self.snapshot.target.as_ref() == Some(&to) {
             self.set_prompt(&draft.restored_prompt(), window, cx);
         }
@@ -395,9 +396,7 @@ impl Composer {
 
 impl Composer {
     pub(crate) fn commit_sidebar_discard(&mut self, discarded: DiscardedDraft, cx: &mut Context<Self>) {
-        for attachment in discarded.attachments {
-            if let Some(id) = attachment.attachment.attachment_id() { self.release_upload(id, cx); }
-        }
+        self.release_discarded_attachments(&discarded.target, &discarded.attachments, cx);
     }
 
     pub(crate) fn clear_deleted_drafts(&mut self, thread_ids: &[String], cx: &mut Context<Self>) {
@@ -406,8 +405,10 @@ impl Composer {
             let target = Target::Thread(id.clone());
             let attachments = self.take_draft_attachments(&target);
             if !attachments.is_empty() {
-                self.commit_sidebar_discard(DiscardedDraft { draft: Draft::default(), attachments }, cx);
+                self.commit_sidebar_discard(DiscardedDraft { target: target.clone(), draft: Draft::default(), attachments }, cx);
                 changed = true;
+            } else {
+                self.release_target_uploads(&target, cx);
             }
             let storage_key = key(&target);
             let had_draft = self.drafts.store.get(&storage_key).is_some();

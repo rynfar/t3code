@@ -153,28 +153,29 @@ impl Composer {
         &self,
         input: &PendingUserInput,
         cx: &App,
-    ) -> Option<Map<String, Value>> {
-        let drafts = self.question_answer_drafts(input, cx);
-        t3_core::requests::build_answers(&input.questions, &drafts)?;
-        let mut by_question = Map::new();
+    ) -> Result<Map<String, Value>, rules::QuestionResponseAttachmentError> {
+        let mut by_question = std::collections::BTreeMap::new();
+        let mut preparing = std::collections::BTreeMap::new();
         for question in &input.questions {
             let attachments = self.question_attachments(input, &question.id);
-            if attachments.is_empty() {
-                continue;
+            if !attachments.is_empty() {
+                by_question.insert(question.id.clone(), attachments);
             }
-            let Target::Question(key) = self.question_target(&input.request_id, &question.id)?
-            else {
-                return None;
-            };
-            if !self.question_can_attach(&key, cx, rules::IntakePhase::Start) {
-                return None;
+            let prep = self
+                .question_target(&input.request_id, &question.id)
+                .map_or(0, |target| {
+                    self.attachments.preparations.count(&drafts::key(&target))
+                });
+            if prep > 0 {
+                preparing.insert(question.id.clone(), prep);
             }
-            by_question.insert(
-                question.id.clone(),
-                Value::Array(attachments::chat_attachments(&attachments)?),
-            );
         }
-        Some(by_question)
+        rules::build_question_response_attachments(
+            input,
+            &by_question,
+            &preparing,
+            self.supports_question_attachments(cx),
+        )
     }
 
     pub(super) fn prune_question_attachments(
@@ -227,11 +228,8 @@ impl Composer {
             self.answers.remove(&question.request_key());
             self.responding.remove(&question.request_key());
             let target = Target::Question(question.clone());
-            for staged in self.take_draft_attachments(&target) {
-                if let Some(id) = staged.attachment.attachment_id() {
-                    self.release_upload(id, cx);
-                }
-            }
+            let staged = self.take_draft_attachments(&target);
+            self.release_discarded_attachments(&target, &staged, cx);
             self.discard_draft(&target, cx);
         }
         changed
@@ -262,10 +260,21 @@ impl Composer {
         ));
     }
 
+    pub(super) fn question_job_keys(&self, input: &PendingUserInput) -> Vec<String> {
+        let mut keys = Vec::new();
+        for question in &input.questions {
+            if let Some(target) = self.question_target(&input.request_id, &question.id) {
+                keys.extend(self.target_job_keys(&target));
+            }
+        }
+        keys
+    }
+
     pub(super) fn run_question_request(
         &mut self,
         key: String,
         command: Value,
+        retire_keys: Vec<String>,
         failure: &'static str,
         cx: &mut Context<Self>,
     ) {
@@ -299,6 +308,8 @@ impl Composer {
                     {
                         this.error = Some(format!("{failure} {error}"));
                     }
+                } else if !retire_keys.is_empty() {
+                    this.state.read(cx).uploads.retire_sent(&retire_keys);
                 }
                 cx.notify();
             });
@@ -358,6 +369,8 @@ impl Composer {
                     pasted_text: false,
                     upload,
                 }],
+                false,
+                cx,
             );
             self.record_draft(&target, cx);
         }

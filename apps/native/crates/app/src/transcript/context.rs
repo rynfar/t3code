@@ -203,7 +203,13 @@ pub(super) fn chips(
         let element = div().relative().flex_shrink_0().max_w_full().child(shell).when(open, |s| {
             s.child(crate::composer::controls::floating(
                 crate::composer::controls::Float::AboveStart,
-                context_chip::details(&record, cx),
+                crate::context_chip::details(&record, cx)
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        if this.ui.open_context.take().is_some() {
+                            cx.notify();
+                        }
+                    }))
+                    .into_any_element(),
             ))
         });
         chip_elements.push(element.into_any_element());

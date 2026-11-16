@@ -89,6 +89,9 @@ impl Composer {
             self.save_queued_edit(window, cx);
             return;
         }
+        if let Some(target) = self.snapshot.target.clone() {
+            self.sync_upload_states_for(&target, cx);
+        }
         let prompt = self.prompt(cx);
         let staged = self.staged_attachments();
         if t3_core::usage::limits::UsageLimitsReport::is_command(&prompt)
@@ -119,6 +122,38 @@ impl Composer {
             return;
         }
         let text = terminals.text;
+        if let Some(target) = self.attachment_target()
+            && self.attachments.preparations.count(&super::drafts::key(&target)) > 0
+        {
+            self.error = Some("Wait for attachments to finish preparing before sending.".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.staged_needs_reattach() {
+            self.error = Some("Attach the interrupted file again or remove it".to_owned());
+            cx.notify();
+            return;
+        }
+        let file_refs: Vec<(&str, u64)> = staged
+            .iter()
+            .filter(|a| a.kind == t3_core::composer::attachments::AttachmentKind::File)
+            .map(|a| (a.name.as_str(), a.size_bytes))
+            .collect();
+        if !file_refs.is_empty() {
+            let config = self.state.read(cx).server_config.config.as_ref();
+            let capability_known = config.is_some();
+            let file_cap = config.and_then(|c| c.environment.capabilities.file_attachments);
+            if let Some(reason) = attachments::image::file_attachment_capability_block_reason(
+                capability_known,
+                file_cap.is_some(),
+                file_cap.map(|c| c.max_upload_bytes),
+                &file_refs,
+            ) {
+                self.error = Some(reason);
+                cx.notify();
+                return;
+            }
+        }
         let block_reason = if self.snapshot.pending.approvals.is_empty() {
             attachments::send_block_reason(&staged)
         } else {
@@ -200,17 +235,17 @@ impl Composer {
         let connection = self.state.read(cx).connection_id();
         let transport = self.state.read(cx).client_handle().map(|client| *client.connection_generation().borrow());
         self.send_connection = Some((connection, transport, self.state.read(cx).phase.clone()));
-        for id in attachments::retry_on_send(&self.staged_attachments()) {
-            self.start_upload(target.clone(), id, cx);
-        }
-        let settled = self.wait_for_uploads(&target);
+        let retry_ids = attachments::retry_on_send(&self.staged_attachments());
+        let wait_task = self.await_target_uploads(&target, &retry_ids, cx);
         self.pending_questions = self.question_revision(cx);
         let generation = self.pending_send.begin();
         self.sending = true;
         self.error = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            futures::future::join_all(settled).await;
+            if let Some(wait_task) = wait_task {
+                wait_task.await;
+            }
             let _ = this.update_in(cx, |this, window, cx| {
                 if !this.pending_send.finish(generation) { return; }
                 this.sending = false;
@@ -218,14 +253,19 @@ impl Composer {
                     cx.notify();
                     return;
                 }
+                this.sync_upload_states_for(&target, cx);
                 let same_connection = matches!(this.state.read(cx).phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected))
                     && this.question_revision(cx) == this.pending_questions
                     && this.state.read(cx).connection_id() == connection
                     && this.state.read(cx).client_handle().map(|client| *client.connection_generation().borrow()) == transport;
                 if same_connection {
-                    match attachments::uploaded_for_send(&this.staged_attachments()) {
-                        Ok(_) => this.submit(intent, window, cx),
-                        Err(reason) => this.error = Some(reason.into()),
+                    if this.staged_needs_reattach() {
+                        this.error = Some("Attach the interrupted file again or remove it".into());
+                    } else {
+                        match attachments::uploaded_for_send(&this.staged_attachments()) {
+                            Ok(_) => this.submit(intent, window, cx),
+                            Err(reason) => this.error = Some(reason.into()),
+                        }
                     }
                 }
                 cx.notify();
@@ -525,6 +565,7 @@ impl Composer {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.sending = false;
                 if started_count > 0 {
+                    this.retire_sent_attachments(&taken.target, &taken.attachments, cx);
                     this.clear_usage_limits_for(&taken.target);
                     this.state.update(cx, |state, cx| {
                         state.record_prompt_sent(star_origin, cx);
@@ -562,6 +603,7 @@ impl Composer {
         match result {
             Err(error) => self.restore(taken, error, window, cx),
             Ok(thread_id) => {
+                self.retire_sent_attachments(&taken.target, &taken.attachments, cx);
                 if intent != SubmitIntent::Background && !self.current_draft(&taken.target, cx).has_user_content() { self.discard_draft(&taken.target, cx); }
                 if shown && intent != SubmitIntent::Background {
                     if let (Some(launch), Some(setup)) = (worktree_launch, self.setup.clone()) {
@@ -641,6 +683,7 @@ impl Composer {
                 if let Some(error) = failure {
                     this.restore(taken, error, window, cx);
                 } else {
+                    this.retire_sent_attachments(&taken.target, &taken.attachments, cx);
                     this.clear_usage_limits_for(&taken.target);
                     if sends_prompt {
                         this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
@@ -706,7 +749,7 @@ impl Composer {
             let text = format!("recover original {}", mention.reference());
             self.set_prompt(&text, window, cx);
             self.seed_mentions(&original, vec![mention]);
-            self.seed_attachments(&original, vec![Attachment {id: "fixture-attachment".into(), kind: AttachmentKind::File, name: "notes.md".into(), mime_type: "text/markdown".into(), size_bytes: 12, pasted_text: false, upload: Upload::Ready {attachment_id: "fixture-upload".into()}}]);
+            self.seed_attachments(&original, vec![Attachment {id: "fixture-attachment".into(), kind: AttachmentKind::File, name: "notes.md".into(), mime_type: "text/markdown".into(), size_bytes: 12, pasted_text: false, upload: Upload::Ready {attachment_id: "fixture-upload".into()}}], false, cx);
             self.record_draft(&original, cx);
             let sent = self.drafts.store.get(&super::drafts::key(&original)).unwrap().clone();
             let taken = self.begin_send(&original, &text, window, cx);

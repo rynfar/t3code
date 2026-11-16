@@ -7,10 +7,10 @@ use crate::{
     theme::{hsla, palette},
 };
 use gpui::{
-    App, Entity, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    App, Entity, ParentElement, SharedString, StatefulInteractiveElement, Styled,
     div, prelude::*, px,
 };
-use gpui_component::{ActiveTheme, tooltip::Tooltip, v_flex};
+use gpui_component::{ActiveTheme, h_flex, tooltip::Tooltip, v_flex};
 use serde_json::Value;
 use t3_core::composer::records::{self as rules, field};
 
@@ -45,10 +45,11 @@ fn accent(kind: &str, cx: &App) -> u32 {
 }
 
 pub(crate) fn has_details(record: &Value) -> bool {
-    matches!(
-        field(record, "kind"),
-        "terminal" | "element" | "preview-annotation" | "review-comment"
-    ) && !rules::pull_request(record)
+    let kind = field(record, "kind");
+    (matches!(kind, "terminal" | "element" | "preview-annotation" | "review-comment")
+        && !rules::pull_request(record))
+        || (kind == "skill"
+            && (!field(record, "description").is_empty() || !field(record, "path").is_empty()))
 }
 pub(crate) fn shell(
     record: &Value,
@@ -72,6 +73,8 @@ pub(crate) fn shell(
     };
     let mut tooltip = if kind == "unresolved" {
         "This context is no longer available.".into()
+    } else if kind == "mention" {
+        field(record, "path").to_owned()
     } else {
         String::new()
     };
@@ -207,11 +210,58 @@ pub(crate) fn shell(
 }
 
 pub(crate) fn attachment_shell(record: &Value, attachment: &Value, state: &Entity<AppState>, cx: &mut App) -> gpui::Stateful<gpui::Div> {
-    let (mut shell, _) = shell(record, state, false, cx);
+    let kind = field(record, "kind");
+    let is_video = kind == "file" && t3_core::media::is_video_attachment(attachment);
+    let downloadable = attachment.get("downloadable").and_then(Value::as_bool) != Some(false);
+    let disabled = kind == "file" && !downloadable && !is_video;
+    let display_name = if kind == "file" {
+        t3_core::timeline::user_message_file_label(attachment)
+    } else {
+        field(record, "name").to_owned()
+    };
+    let mut record_for_shell = record.clone();
+    if kind == "file" && !display_name.is_empty() {
+        record_for_shell["label"] = serde_json::json!(display_name);
+    }
+    let (mut shell, _) = shell(&record_for_shell, state, false, cx);
+    if is_video {
+        shell = shell.text_color(hsla(accent("video", cx)));
+    }
     if let Some(size) = t3_core::media::attachment_size_label(record, attachment) {
-        let tooltip = format!("{}\n{size}", field(record, "name"));
+        let tooltip = format!("{display_name}\n{size}");
         shell = shell.child(div().flex_shrink_0().text_size(crate::theme::rem(crate::theme::metrics::TEXT_3XS)).child(size))
             .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
+    }
+    let record_attachment_id = field(record, "attachmentId");
+    let attachment_id = if record_attachment_id.is_empty() {
+        field(attachment, "id").to_owned()
+    } else {
+        record_attachment_id.to_owned()
+    };
+    if disabled {
+        shell = shell.opacity(0.6);
+    } else if !attachment_id.is_empty() {
+        let is_image = kind == "image";
+        let name = display_name;
+        shell = shell.cursor_pointer().on_click(move |_, window, cx| {
+            let resource = t3_core::media::AssetResource::Attachment { attachment_id: attachment_id.clone() };
+            if (is_image || is_video)
+                && let Some(viewer) = cx
+                    .try_global::<crate::media::Media>()
+                    .and_then(|media| media.scope.as_ref().and_then(|scope| scope.viewer.upgrade()))
+            {
+                let scope = cx.try_global::<crate::media::Media>().and_then(|media| media.scope.clone());
+                let source = t3_core::media::MediaSource::Asset(resource);
+                let item = if is_video {
+                    crate::media::ViewerItem::video(source, name.clone())
+                } else {
+                    crate::media::ViewerItem::image(source, name.clone())
+                };
+                viewer.update(cx, |viewer, cx| viewer.open_with_scope(vec![item], 0, scope, window, cx));
+                return;
+            }
+            crate::media::open_asset(&resource, cx);
+        });
     }
     shell
 }
@@ -221,23 +271,81 @@ pub(crate) fn copyable_unresolved(shell: gpui::Stateful<gpui::Div>, record: &Val
     shell.on_action(move|_: &gpui_component::input::Copy,_,cx| {crate::composer::clipboard::write(text.clone(),String::new(),cx);cx.stop_propagation();})
 }
 
-pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
+pub(crate) fn render_diff_lines(diff: &str, cx: &App) -> gpui::Div {
+    let p = palette(cx);
+    let mono = cx.theme().mono_font_family.clone();
+    let lines: Vec<_> = diff
+        .lines()
+        .map(|line| {
+            let (fg, bg) = if line.starts_with('+') {
+                (hsla(p.diff_addition_foreground), hsla(p.diff_addition_foreground).opacity(0.15))
+            } else if line.starts_with('-') {
+                (hsla(p.diff_deletion_foreground), hsla(p.diff_deletion_foreground).opacity(0.15))
+            } else {
+                (hsla(p.muted_foreground), gpui::transparent_black())
+            };
+            div()
+                .px(px(4.))
+                .bg(bg)
+                .text_color(fg)
+                .font_family(mono.clone())
+                .text_size(px(11.))
+                .child(line.to_owned())
+        })
+        .collect();
+    v_flex()
+        .p(px(6.))
+        .rounded(px(6.))
+        .bg(hsla(p.secondary).opacity(0.45))
+        .children(lines)
+}
+
+fn page_url_field(record: &Value) -> &str {
+    let page_url = field(record, "pageUrl");
+    if !page_url.is_empty() { page_url } else { field(record, "url") }
+}
+
+fn source_label(record: &Value) -> Option<String> {
+    let source = record.get("source")?.as_object()?;
+    let file_name = source.get("fileName").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    match source.get("lineNumber").and_then(Value::as_u64) {
+        Some(line) => Some(format!("{file_name}:{line}")),
+        None => Some(file_name.to_owned()),
+    }
+}
+
+fn terminal_line_caption(record: &Value) -> String {
+    let start = &record["lineStart"];
+    let end = &record["lineEnd"];
+    if start == end {
+        format!("Line {start}")
+    } else {
+        format!("Lines {start}–{end}")
+    }
+}
+
+pub(crate) fn details(record: &Value, cx: &App) -> gpui::Stateful<gpui::Div> {
     let p = palette(cx);
     let kind = field(record, "kind");
+    let page_url = page_url_field(record);
     let heading = match kind {
         "terminal" => field(record, "terminalLabel").to_owned(),
         "preview-annotation" => {
-            let title = field(record, "pageTitle");
-            if !title.is_empty() { title.to_owned() } else if !field(record, "url").is_empty() { field(record, "url").to_owned() } else { "Browser annotation".to_owned() }
+            let title = field(record, "pageTitle").trim();
+            if !title.is_empty() { title.to_owned() } else if !page_url.is_empty() { page_url.to_owned() } else { "Preview annotation".to_owned() }
         }
         "element" => {
-            let title = field(record, "pageTitle");
-            if !title.is_empty() { title.to_owned() } else if !field(record, "url").is_empty() { field(record, "url").to_owned() } else { "Selected element".to_owned() }
+            let title = field(record, "pageTitle").trim();
+            if !title.is_empty() { title.to_owned() } else if !page_url.is_empty() { page_url.to_owned() } else { "Selected element".to_owned() }
+        }
+        "skill" => {
+            let label = field(record, "label");
+            if !label.is_empty() { label.to_owned() } else { field(record, "name").to_owned() }
         }
         _ => field(record, "filePath").to_owned(),
     };
     let subtitle = match kind {
-        "terminal" => format!("Lines {}–{}", record["lineStart"], record["lineEnd"]),
+        "terminal" => terminal_line_caption(record),
         "review-comment" => {
             let section = field(record, "sectionTitle");
             let range = field(record, "rangeLabel");
@@ -251,26 +359,42 @@ pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
         }
         "preview-annotation" | "element" => {
             let selector = field(record, "selector");
-            let url = field(record, "url");
-            if !selector.is_empty() && !url.is_empty() {
-                format!("{selector} · {url}")
+            if !selector.is_empty() && !page_url.is_empty() {
+                format!("{selector} · {page_url}")
             } else if !selector.is_empty() {
                 selector.to_owned()
             } else {
-                url.to_owned()
+                page_url.to_owned()
             }
         }
+        "skill" => field(record, "path").to_owned(),
         _ => field(record, "rangeLabel").to_owned(),
     };
     let text = match kind {
         "preview-annotation" => field(record, "comment"),
         "element" => "",
+        "skill" => field(record, "description"),
         _ => field(record, "text"),
     };
     let html_preview = if kind == "element" { field(record, "htmlPreview") } else { "" };
+    let styles = if kind == "element" { field(record, "styles").trim() } else { "" };
+    let target_summary = if kind == "preview-annotation" { field(record, "targetSummary") } else { "" };
+    let style_change_count = if kind == "preview-annotation" {
+        record.get("styleChanges").and_then(Value::as_array).map_or(0, Vec::len)
+    } else {
+        0
+    };
+    let annotation_elements: Vec<&Value> = if kind == "preview-annotation" {
+        record.get("elements").and_then(Value::as_array).map(|arr| arr.iter().collect()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let element_source = (kind == "element").then(|| source_label(record)).flatten();
     let diff = field(record, "diff");
     let has_screenshot = kind == "preview-annotation"
-        && (!field(record, "attachmentId").is_empty() || !field(&record["attachment"], "id").is_empty());
+        && (!field(record, "attachmentId").is_empty()
+            || !field(&record["attachment"], "id").is_empty()
+            || !field(record, "screenshotContextId").is_empty());
     let mono = cx.theme().mono_font_family.clone();
     v_flex()
         .id(SharedString::from(format!(
@@ -289,6 +413,7 @@ pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
         .border_color(hsla(p.dropdown_border))
         .bg(hsla(p.popover))
         .text_color(hsla(p.popover_foreground))
+        .shadow(crate::composer::controls::floating_shadow(cx.theme().is_dark()))
         .child(
             div()
                 .text_size(px(12.))
@@ -303,6 +428,9 @@ pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
                     .child(subtitle),
             )
         })
+        .when_some(element_source, |s, src| {
+            s.child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(src))
+        })
         .when(has_screenshot, |s| {
             s.child(
                 div()
@@ -316,6 +444,62 @@ pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
             )
         })
         .when(!text.is_empty(), |s| s.child(div().text_size(px(13.)).child(text.to_owned())))
+        .when(!target_summary.is_empty() || style_change_count > 0, |s| {
+            s.child(
+                h_flex()
+                    .gap(px(8.))
+                    .text_size(px(11.))
+                    .text_color(hsla(p.secondary_label))
+                    .when(!target_summary.is_empty(), |row| row.child(div().min_w_0().truncate().child(target_summary.to_owned())))
+                    .when(style_change_count > 0, |row| row.child(format!("{style_change_count} style changes"))),
+            )
+        })
+        .when(!annotation_elements.is_empty(), |s| {
+            let mono = mono.clone();
+            s.child(
+                v_flex()
+                    .gap(px(6.))
+                    .pt(px(6.))
+                    .border_t_1()
+                    .border_color(hsla(p.border).opacity(0.6))
+                    .children(annotation_elements.into_iter().map(move |el| {
+                        let selector = field(el, "selector");
+                        let tag = field(el, "tagName");
+                        let name = if !selector.is_empty() {
+                            selector.to_owned()
+                        } else if !tag.is_empty() {
+                            format!("<{tag}>")
+                        } else {
+                            "element".to_owned()
+                        };
+                        let el_source = source_label(el);
+                        let el_html = field(el, "htmlPreview").trim().to_owned();
+                        v_flex()
+                            .gap(px(4.))
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap(px(8.))
+                                    .text_size(px(11.))
+                                    .child(div().min_w_0().truncate().font_family(mono.clone()).child(name))
+                                    .when_some(el_source, |row, src| {
+                                        row.child(div().ml_auto().flex_shrink_0().text_color(hsla(p.secondary_label)).child(src))
+                                    }),
+                            )
+                            .when(!el_html.is_empty(), |box_div| {
+                                box_div.child(
+                                    div()
+                                        .p(px(6.))
+                                        .rounded(px(4.))
+                                        .bg(hsla(p.secondary).opacity(0.5))
+                                        .font_family(mono.clone())
+                                        .text_size(px(10.))
+                                        .child(el_html),
+                                )
+                            })
+                    })),
+            )
+        })
         .when(!html_preview.is_empty(), |s| {
             s.child(
                 div()
@@ -327,35 +511,18 @@ pub(crate) fn details(record: &Value, cx: &App) -> gpui::AnyElement {
                     .child(html_preview.to_owned()),
             )
         })
-        .when(!diff.is_empty(), |s| {
-            let lines: Vec<_> = diff
-                .lines()
-                .map(|line| {
-                    let (fg, bg) = if line.starts_with('+') {
-                        (hsla(p.diff_addition_foreground), hsla(p.diff_addition_foreground).opacity(0.15))
-                    } else if line.starts_with('-') {
-                        (hsla(p.diff_deletion_foreground), hsla(p.diff_deletion_foreground).opacity(0.15))
-                    } else {
-                        (hsla(p.muted_foreground), gpui::transparent_black())
-                    };
-                    div()
-                        .px(px(4.))
-                        .bg(bg)
-                        .text_color(fg)
-                        .font_family(mono.clone())
-                        .text_size(px(11.))
-                        .child(line.to_owned())
-                })
-                .collect();
+        .when(!styles.is_empty(), |s| {
             s.child(
-                v_flex()
-                    .p(px(6.))
+                div()
+                    .p(px(8.))
                     .rounded(px(6.))
                     .bg(hsla(p.secondary).opacity(0.45))
-                    .children(lines),
+                    .font_family(mono.clone())
+                    .text_size(px(11.))
+                    .child(styles.to_owned()),
             )
         })
-        .into_any_element()
+        .when(!diff.is_empty(), |s| s.child(render_diff_lines(diff, cx)))
 }
 
 pub(crate) fn copyable_message(
@@ -385,4 +552,38 @@ pub(crate) fn copyable_message(
             crate::composer::clipboard::write(text,fragment,cx);cx.stop_propagation();
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn has_details_and_skill_element_preview_annotation_fields() {
+        assert!(has_details(&json!({"kind": "terminal"})));
+        assert!(has_details(&json!({"kind": "preview-annotation"})));
+        assert!(has_details(&json!({"kind": "element"})));
+        assert!(has_details(&json!({"kind": "review-comment"})));
+        assert!(!has_details(&json!({"kind": "review-comment", "pullRequest": {"number": 12}})));
+        assert!(has_details(&json!({"kind": "skill", "name": "deploy", "description": "Ship build"})));
+        assert!(!has_details(&json!({"kind": "skill", "name": "empty"})));
+
+        assert_eq!(
+            page_url_field(&json!({"pageUrl": "https://localhost:3000/home"})),
+            "https://localhost:3000/home"
+        );
+        assert_eq!(
+            source_label(&json!({"source": {"fileName": "App.tsx", "lineNumber": 42}})).as_deref(),
+            Some("App.tsx:42")
+        );
+        assert_eq!(
+            terminal_line_caption(&json!({"lineStart": 7, "lineEnd": 7})),
+            "Line 7"
+        );
+        assert_eq!(
+            terminal_line_caption(&json!({"lineStart": 7, "lineEnd": 10})),
+            "Lines 7–10"
+        );
+    }
 }

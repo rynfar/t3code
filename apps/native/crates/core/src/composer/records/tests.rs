@@ -417,3 +417,21 @@ fn hosted_import_leaves_code_invalid_urls_and_unreferenced_fragments_untouched()
     );
     assert_eq!(held.len(), 1);
 }
+
+#[test]
+fn plain_pasted_hosted_thread_links_synthesize_local_records_and_keep_foreign_urls() {
+    let text = "Check https://app.t3.codes/threads/env-1/thr-a and [Remote](https://app.t3.codes/threads/env-2/thr-b) plus [V2](t3-thread://v2/env-1/thr-c) and [skip](https://other.test?next=https://app.t3.codes/threads/env-1/thr-x)";
+    let candidates = paste_thread_link_records(text, &[], |env, thread| {
+        (env == "env-1" && thread == "thr-a").then(|| "Alpha Thread".to_owned())
+    });
+    assert_eq!(candidates.len(), 3);
+
+    let mut held = Vec::new();
+    let rewritten = import_records(text, candidates, &mut held, "env-1", "env-1", || panic!("no collision")).unwrap();
+    assert!(rewritten.contains("[Alpha Thread](t3-context://v1/thread/thread_thr-a)"));
+    assert!(rewritten.contains("[V2](t3-context://v1/thread/thread_thr-c)"));
+    assert!(rewritten.contains("[Remote](https://app.t3.codes/threads/env-2/thr-b)"));
+    assert!(rewritten.contains("https://other.test?next=https://app.t3.codes/threads/env-1/thr-x"));
+    assert_eq!(held.len(), 2);
+    assert_eq!(normalize_pasted_plain_text("a\r\nb\rc\n"), "a\nb\nc\n");
+}

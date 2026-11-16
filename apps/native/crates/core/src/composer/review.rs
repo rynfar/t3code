@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::context::{Linked, format_reference};
+use super::context::{Linked, clamp_context_text, format_reference};
 use super::menu::{context_references, kind_scoped_context_id, sanitize_context_label};
 use crate::diff::{DiffLine, DiffRow, FileDiff, Layout, LineKind};
 
@@ -236,7 +236,7 @@ impl ReviewComment {
         format_reference(KIND, &self.context_id(), &self.label())
     }
     pub fn record(&self) -> Value {
-        let mut record = json!({ "version":1, "contextId":self.context_id(), "kind":KIND, "label":sanitize_context_label(&self.label(), KIND), "sectionId":self.section_id, "sectionTitle":self.section_title, "filePath":self.file_path, "startIndex":self.start_index, "endIndex":self.end_index, "rangeLabel":self.range_label, "text":clamp_text(&self.text, 16_000), "diff":clamp_text(&self.diff, 32_000) });
+        let mut record = json!({ "version":1, "contextId":self.context_id(), "kind":KIND, "label":sanitize_context_label(&self.label(), KIND), "sectionId":self.section_id, "sectionTitle":self.section_title, "filePath":self.file_path, "startIndex":self.start_index, "endIndex":self.end_index, "rangeLabel":self.range_label, "text":clamp_context_text(&self.text, 16_000), "diff":clamp_context_text(&self.diff, 32_000) });
         if let Some(language) = &self.fence_language {
             record["fenceLanguage"] = json!(language);
         }
@@ -278,15 +278,6 @@ pub fn referenced<'a>(prompt: &str, comments: &'a [ReviewComment]) -> Vec<&'a Re
         }
     }
     found
-}
-
-fn clamp_text(value: &str, max: usize) -> String {
-    const MARKER: &str = "\n… truncated …";
-    if value.encode_utf16().count() <= max {
-        return value.into();
-    }
-    let units: Vec<_> = value.encode_utf16().take(max - MARKER.encode_utf16().count()).collect();
-    format!("{}{MARKER}", String::from_utf16_lossy(&units))
 }
 
 pub fn format_fence(language: &str, contents: &str) -> String {

@@ -83,6 +83,13 @@ pub fn data_url_length(mime_type: &str, byte_length: usize) -> usize {
     prefix_len + byte_length.div_ceil(3) * 4
 }
 
+/// Encodes `bytes` as a base64 `data:<mime_type>;base64,...` URL.
+pub fn data_url(mime_type: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("data:{mime_type};base64,{encoded}")
+}
+
 /// Encoded data-URL character budget matching `(maxBytes / 3) * 4` in `imageCompression.ts`.
 pub fn compression_budget_chars(max_bytes: u64) -> usize {
     usize::try_from((max_bytes / 3) * 4).unwrap_or(usize::MAX)

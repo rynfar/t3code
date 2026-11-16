@@ -146,9 +146,33 @@ impl TerminalContext {
             "terminalLabel": self.terminal_label,
             "lineStart": self.line_start,
             "lineEnd": self.line_end,
-            "text": normalize_text(&self.text),
+            "text": clamp_context_text(&normalize_text(&self.text), TERMINAL_TEXT_MAX_CHARS),
         })
     }
+}
+
+pub const TERMINAL_TEXT_MAX_CHARS: usize = 64_000;
+
+/// Clamps text to at most `max_utf16` UTF-16 code units with `"\n… truncated …"`, never
+/// splitting a Unicode scalar or UTF-16 surrogate pair (`clampContextText`).
+pub(crate) fn clamp_context_text(value: &str, max_utf16: usize) -> String {
+    const MARKER: &str = "\n… truncated …";
+    if value.encode_utf16().count() <= max_utf16 {
+        return value.to_owned();
+    }
+    let budget = max_utf16.saturating_sub(MARKER.encode_utf16().count());
+    let mut out = String::with_capacity(value.len().min(budget.saturating_mul(3) + MARKER.len()));
+    let mut units = 0usize;
+    for ch in value.chars() {
+        let len = ch.len_utf16();
+        if units + len > budget {
+            break;
+        }
+        units += len;
+        out.push(ch);
+    }
+    out.push_str(MARKER);
+    out
 }
 
 /// A record a prompt links by context id: a terminal excerpt or a mentioned thread.

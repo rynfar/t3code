@@ -77,6 +77,8 @@ pub enum AppEvent {
     ThreadFind,
     /// An SSH password prompt arrived or was answered (`ssh_prompts`).
     SshPrompt,
+    /// Queued attachment uploads progressed, completed, failed, or reported a missing persisted file.
+    AttachmentUpload,
 }
 
 /// Attachment payload handed back to the composer when rewinding a turn.
@@ -170,6 +172,10 @@ pub struct AppState {
     pending_thread_find: Option<(t3_core::sidebar::tag_filter::ThreadKey, t3_core::timeline::PendingThreadFind)>,
     pending_composer_file_drop: Option<(t3_core::sidebar::tag_filter::ThreadKey, Vec<std::path::PathBuf>)>,
     client: Option<ClientHandle>,
+    pub(crate) uploads: t3_client::upload::AttachmentUploadQueueClient,
+    upload_events: VecDeque<(u64, t3_client::upload::QueueEvent)>,
+    upload_event_seq: u64,
+    _upload_pump: Option<Task<()>>,
     /// Counts clients started, so state tied to one never outlives a switch to the next.
     connection: u64,
     runtime: tokio::runtime::Handle,
@@ -231,6 +237,18 @@ impl AppState {
                 if this.update(cx, |state, cx| state.apply_environment_event(event, cx)).is_err() { return; }
             }
         });
+        let (uploads, mut upload_events_rx) = t3_client::upload::AttachmentUploadQueueClient::new(runtime.clone());
+        let upload_pump = cx.spawn(async move |this, cx| {
+            while let Some(event) = upload_events_rx.recv().await {
+                let mut batch = vec![event];
+                while let Ok(more) = upload_events_rx.try_recv() {
+                    batch.push(more);
+                }
+                if this.update(cx, |state, cx| state.push_upload_events(batch, cx)).is_err() {
+                    return;
+                }
+            }
+        });
         let mut state = AppState {
             announcements: crate::announcements::Announcements::new(cx),
             github_star: crate::github_star_prompt::GitHubStarPrompt::new(cx),
@@ -282,6 +300,10 @@ impl AppState {
             pending_thread_find: None,
             pending_composer_file_drop: None,
             client: None,
+            uploads,
+            upload_events: VecDeque::new(),
+            upload_event_seq: 0,
+            _upload_pump: Some(upload_pump),
             connection: 0,
             runtime,
             ssh: SshEnvironments::new(Some(prompts)),
@@ -333,6 +355,11 @@ impl AppState {
     /// Drops the client and everything that belonged to its environment.
     pub(crate) fn clear_connection_state(&mut self, cx: &mut Context<Self>) {
         self.reset_environment_announcements();
+        if matches!(self.phase, Phase::Online(ConnectionStatus::Connected))
+            && let Some(env_id) = self.environment().map(str::to_owned)
+        {
+            self.uploads.notify_connection_transition(&env_id, true, false);
+        }
         if let Some(client) = &self.client { client.close_all_threads(); }
         self.client = None;
         self.shell = ShellState::default();
@@ -443,6 +470,9 @@ impl AppState {
     }
 
     pub(crate) fn install_active_environment(&mut self, client: ClientHandle, shell: ShellState, config: ServerConfigState, status: ConnectionStatus, cx: &mut Context<Self>) {
+        self.uploads.register_client(client.clone());
+        let env_id = client.environment().to_owned();
+        let connected = matches!(status, ConnectionStatus::Connected);
         self.client = Some(client);
         self.connection += 1;
         self.rewinds.clear();
@@ -453,6 +483,7 @@ impl AppState {
         self.panels = crate::right_panel::PanelState::load(self.environments.active.as_deref());
         cx.emit(AppEvent::RightPanel);
         self.set_phase(Phase::Online(status), cx);
+        self.uploads.notify_connection_transition(&env_id, false, connected);
         cx.emit(AppEvent::Phase);
         self.sync_server_config(cx);
         self.sync_shell_views(true, true, self.shell.synchronized, cx);
@@ -707,7 +738,14 @@ impl AppState {
 
     pub(crate) fn set_phase(&mut self, phase: Phase, cx: &mut Context<Self>) {
         if self.phase != phase {
+            let was_connected = matches!(self.phase, Phase::Online(ConnectionStatus::Connected));
+            let is_connected = matches!(phase, Phase::Online(ConnectionStatus::Connected));
             self.phase = phase;
+            if was_connected != is_connected
+                && let Some(env_id) = self.environment().map(str::to_owned)
+            {
+                self.uploads.notify_connection_transition(&env_id, was_connected, is_connected);
+            }
             self.sync_visit_session_generation(false);
             self.sync_notification_state(cx);
             cx.emit(AppEvent::Phase);
@@ -720,6 +758,31 @@ impl AppState {
                 self.track_visit(cx);
             }
         }
+    }
+
+    fn push_upload_events(&mut self, batch: Vec<t3_client::upload::QueueEvent>, cx: &mut Context<Self>) {
+        if batch.is_empty() {
+            return;
+        }
+        for event in batch {
+            self.upload_event_seq += 1;
+            self.upload_events.push_back((self.upload_event_seq, event));
+        }
+        while self.upload_events.len() > 512 {
+            self.upload_events.pop_front();
+        }
+        cx.emit(AppEvent::AttachmentUpload);
+    }
+
+    pub(crate) fn upload_events_since(&self, cursor: &mut u64) -> Vec<t3_client::upload::QueueEvent> {
+        let mut out = Vec::new();
+        for (seq, event) in &self.upload_events {
+            if *seq > *cursor {
+                *cursor = *seq;
+                out.push(event.clone());
+            }
+        }
+        out
     }
 
     pub fn select_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {

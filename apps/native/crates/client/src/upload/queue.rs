@@ -266,6 +266,23 @@ impl AttachmentUploadQueueClient {
         self.apply_effects(effects);
     }
 
+    /// Retires already-sent attachment jobs (`job_keys`) without deleting their server assets.
+    pub fn retire_sent(&self, job_keys: &[String]) {
+        if job_keys.is_empty() {
+            return;
+        }
+        let effects = {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut effects = Vec::new();
+            for key in job_keys {
+                inner.payloads.remove(key);
+                effects.extend(inner.queue.retire(key));
+            }
+            effects
+        };
+        self.apply_effects(effects);
+    }
+
     /// Adopts an existing live or settled upload under a new `job_key` and `DraftTarget` without
     /// aborting the upload or deleting server assets.
     pub fn adopt_target(&self, old_job_key: &str, new_job_key: String, new_target: DraftTarget) -> bool {

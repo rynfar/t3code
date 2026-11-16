@@ -390,6 +390,10 @@ impl Composer {
                         this.send_connection = Some(connection);
                         if this.cancel_pending_send() { cx.notify(); }
                     }
+                    this.retry_offline_staged_uploads(cx);
+                }
+                if *event == AppEvent::AttachmentUpload {
+                    this.apply_upload_events(cx);
                 }
                 if matches!(event, AppEvent::Thread | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::SideThread | AppEvent::Phase) {
                     this.refresh(*event == AppEvent::ServerConfig, window, cx);
@@ -671,6 +675,9 @@ impl Composer {
         self.sync_checkout_vcs(cx);
         self.sync_branch_mismatch(cx);
         self.sync_prompt_suggestion(cx);
+        if config_changed {
+            self.reconcile_upload_capabilities(cx);
+        }
         self.finish_prepared_reads(cx);
         #[cfg(feature = "snapshot")]
         self.attachment_fixture(cx);
@@ -2742,6 +2749,162 @@ mod stream_error_tests {
                 assert!(!composer.fresh_session_available(cx));
             });
         });
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn paste_context_imports_local_thread_urls_and_image_preparation_downscales(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+
+        // Plain hosted thread link paste without clipboard metadata imports matching env thread and leaves foreign links intact.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                let local_env = composer.environment_id(cx);
+                let raw = format!(
+                    "See https://app.t3.codes/threads/{local_env}/menu-thread and https://app.t3.codes/threads/foreign-env/other"
+                );
+                assert!(composer.paste_context(&raw, "", window, cx));
+                let prompt = composer.prompt(cx);
+                assert!(prompt.contains("t3-context://v1/thread/thread_menu-thread"), "local thread rewritten: {prompt}");
+                assert!(prompt.contains("https://app.t3.codes/threads/foreign-env/other"), "foreign link kept: {prompt}");
+
+                // Capability loss releases unpersisted uploads/images while preserving ready persisted files.
+                composer.seed_attachments(
+                    &Target::Thread("menu-thread".into()),
+                    vec![
+                        t3_core::composer::attachments::Attachment {
+                            id: "file-ready".into(),
+                            kind: t3_core::composer::attachments::AttachmentKind::File,
+                            name: "spec.md".into(),
+                            mime_type: "text/markdown".into(),
+                            size_bytes: 64,
+                            pasted_text: false,
+                            upload: t3_core::composer::attachments::Upload::Ready { attachment_id: "srv-file".into() },
+                        },
+                        t3_core::composer::attachments::Attachment {
+                            id: "img-ready".into(),
+                            kind: t3_core::composer::attachments::AttachmentKind::Image,
+                            name: "shot.png".into(),
+                            mime_type: "image/png".into(),
+                            size_bytes: 64,
+                            pasted_text: false,
+                            upload: t3_core::composer::attachments::Upload::Ready { attachment_id: "srv-img".into() },
+                        },
+                    ],
+                    false,
+                    cx,
+                );
+                assert_eq!(composer.staged_for(&Target::Thread("menu-thread".into())).len(), 2);
+            });
+        });
+
+        vcx.update(|window, cx| {
+            state.update(cx, |state, _| {
+                if let Some(config) = state.server_config.config.as_mut() {
+                    config.environment.capabilities.file_attachments = None;
+                }
+            });
+            composer.update(cx, |composer, cx| {
+                composer.reconcile_upload_capabilities(cx);
+                let remaining = composer.staged_for(&Target::Thread("menu-thread".into()));
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].attachment.id, "file-ready");
+                let _ = window;
+            });
+        });
+
+        // Oversized > 2000px image compresses cleanly within IMAGE_ATTACHMENT_MAX_EDGE.
+        let large_img = ::image::DynamicImage::new_rgb8(2400, 1200);
+        let mut png_bytes = Vec::new();
+        large_img.write_to(&mut std::io::Cursor::new(&mut png_bytes), ::image::ImageFormat::Png).unwrap();
+        let prepared = attachments::prepare_image_bytes("big.png".into(), "image/png".into(), png_bytes, false).unwrap();
+        let dims = t3_core::composer::attachments::image::read_image_dimensions(&prepared.bytes).unwrap();
+        assert_eq!(dims, (2000, 1000));
+
+        // 1. Offline-staged attachment fails with "Not connected", then await_target_uploads (retry_on_send)
+        //    enqueues it when client is available, and sync_upload_states_for reconciles settled queue state immediately.
+        let target = Target::Thread("menu-thread".into());
+        vcx.update(|_, cx| {
+            composer.update(cx, |composer, cx| {
+                // Re-enable file attachments and simulate offline disconnect during staging.
+                composer.state.update(cx, |state, _| {
+                    if let Some(config) = state.server_config.config.as_mut() {
+                        config.environment.capabilities.file_attachments = Some(
+                            t3_core::server_config::FileAttachmentsCapability { max_upload_bytes: 10_000_000 },
+                        );
+                    }
+                });
+                let saved_config = composer.state.read(cx).server_config.clone();
+                let offline_client = composer.state.read(cx).client_handle().unwrap();
+                composer.state.update(cx, |state, cx| {
+                    state.clear_connection_state(cx);
+                    state.server_config = saved_config.clone();
+                });
+                composer.stage_picked_for_test(&target, "offline.txt".into(), "text/plain".into(), b"offline bytes".to_vec(), cx);
+                let offline_id = composer
+                    .staged_for(&target)
+                    .iter()
+                    .find(|s| s.attachment.name == "offline.txt")
+                    .map(|s| s.attachment.id.clone())
+                    .unwrap();
+                assert!(matches!(
+                    composer.staged_for(&target).iter().find(|s| s.attachment.id == offline_id).unwrap().attachment.upload,
+                    t3_core::composer::attachments::Upload::Failed { ref reason } if reason == "Not connected"
+                ));
+
+                // Restore client and mark another queue job Ready directly to verify sync_upload_states_for + retire_sent.
+                composer.state.update(cx, |state, cx| {
+                    state.install_active_environment(
+                        offline_client.clone(),
+                        t3_core::shell::ShellState::default(),
+                        saved_config,
+                        t3_client::supervisor::ConnectionStatus::Connected,
+                        cx,
+                    );
+                });
+                let wait_opt = composer.await_target_uploads(&target, std::slice::from_ref(&offline_id), cx);
+                assert!(wait_opt.is_some(), "offline-failed attachment must enqueue and yield a wait task on retry_on_send");
+                drop(wait_opt);
+                let queue_key = format!("{}::{offline_id}", drafts::key(&target));
+                assert!(composer.state.read(cx).uploads.state(&queue_key).is_some());
+
+                // Also verify pre-ready queue state syncs synchronously via sync_upload_states_for & retire_sent preserves siblings.
+                let sent_key = format!("{}::file-ready", drafts::key(&target));
+                composer.seed_queue_ready_for_test(&target, "file-ready", "srv-file", cx);
+                assert!(composer.state.read(cx).uploads.state(&sent_key).is_some());
+                let taken = composer.take_attachments(&target);
+                let (sent_only, siblings): (Vec<_>, Vec<_>) = taken.into_iter().partition(|s| s.attachment.id == "file-ready");
+                composer.restore_attachments(&target, siblings);
+                composer.retire_sent_attachments(&target, &sent_only, cx);
+                assert!(composer.state.read(cx).uploads.state(&sent_key).is_none());
+                assert!(composer.state.read(cx).uploads.state(&queue_key).is_some());
+
+                // Verify sync_upload_states_for reconciles Ready queue state onto staged synchronously without waiting for upload_pump.
+                composer.find_staged_upload_ready_sync_test(&target, "sync-test-id", "srv-synced", cx);
+                assert!(matches!(
+                    composer.staged_for(&target).iter().find(|s| s.attachment.id == "sync-test-id").unwrap().attachment.upload,
+                    t3_core::composer::attachments::Upload::Ready { ref attachment_id } if attachment_id == "srv-synced"
+                ));
+            });
+        });
+
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
             cx.shutdown();

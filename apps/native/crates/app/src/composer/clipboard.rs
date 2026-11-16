@@ -140,19 +140,40 @@ impl Composer {
         {
             return false;
         }
-        let Some(fragment) = records::decode_fragment(fragment) else {
-            return false;
-        };
+        let normalized = records::normalize_pasted_plain_text(text);
         let environment = self.environment_id(cx);
-        let mut incoming = records::clipboard_records(
-            text,
-            fragment["records"].as_array().expect("decoded records"),
-        );
-        if records::field(&fragment["source"], "environmentId") != environment {
+        let decoded = (!fragment.is_empty()).then(|| records::decode_fragment(fragment)).flatten();
+        let (source_env, fragment_records): (String, Vec<Value>) = match decoded {
+            Some(frag) => (
+                records::field(&frag["source"], "environmentId").to_owned(),
+                frag["records"].as_array().cloned().unwrap_or_default(),
+            ),
+            None => (environment.clone(), Vec::new()),
+        };
+        let has_fragment = !fragment_records.is_empty();
+        let mut incoming = records::clipboard_records(&normalized, &fragment_records);
+        let thread_links = records::paste_thread_link_records(&normalized, &fragment_records, |env, thread_id| {
+            let state = self.state.read(cx);
+            if env == environment {
+                state.thread_shell(thread_id).map(|t| t.title.clone())
+            } else {
+                None
+            }
+        });
+        for record in thread_links {
+            let id = records::field(&record, "contextId");
+            if !incoming.iter().any(|existing| records::field(existing, "contextId") == id) {
+                incoming.push(record);
+            }
+        }
+        if incoming.is_empty() {
+            return false;
+        }
+        if source_env != environment {
             incoming.retain(|r| !matches!(records::field(r, "kind"), "image" | "file"));
         }
         let Some(plan) = super::imports::prepare(
-            text,
+            &normalized,
             incoming,
             &self.all_context_records(),
             &environment,
@@ -161,6 +182,9 @@ impl Composer {
         ) else {
             return false;
         };
+        if !has_fragment && plan.records.is_empty() && plan.reviews.is_empty() && plan.attachments.is_empty() && plan.text == normalized {
+            return false;
+        }
         let text = plan.text.clone();
         self.apply_import(&target, plan, cx);
         self.input
