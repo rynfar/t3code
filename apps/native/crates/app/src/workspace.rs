@@ -18,8 +18,8 @@ use crate::context_menu::ContextMenu;
 use crate::dialog::ConfirmDialog;
 use crate::icons::Icon;
 use crate::keymap::{
-    self, CopyThreadReference, JumpToThread1, JumpToThread2, JumpToThread3, JumpToThread4, JumpToThread5, JumpToThread6, JumpToThread7, JumpToThread8,
-    JumpToThread9, NextThread, PinThread, PreviousThread, SettleThread, ToggleCommandPalette, ToggleFilePicker, ToggleProjectSearch, ToggleSidebar, UndoThreadAction, Unimplemented,
+    self, CopyThreadReference, CycleAppearance, JumpToThread1, JumpToThread2, JumpToThread3, JumpToThread4, JumpToThread5, JumpToThread6, JumpToThread7, JumpToThread8,
+    JumpToThread9, NextThread, PinThread, PreviousThread, RegenerateThreadTitle, SelectTheme, SettleThread, StopThread, ToggleCommandPalette, ToggleFilePicker, ToggleProjectSearch, ToggleSidebar, UndoThreadAction, Unimplemented,
 };
 use crate::palette::{CommandPalette, Mode as PaletteMode};
 use crate::right_panel::RightPanelView;
@@ -298,7 +298,12 @@ impl Render for Workspace {
         let running = state.is_selected_thread_running();
         let panel = state.panel_thread().as_deref().map(|thread| state.panels.panels.panel(thread));
         let right_panel_open = panel.is_some_and(|panel| panel.is_open);
+        let preview_open = panel.is_some_and(|panel| {
+            panel.is_open && matches!(panel.active().map(|surface| &surface.kind), Some(t3_core::right_panel::SurfaceKind::Preview { .. }))
+        });
         let maximized = panel.is_some_and(|panel| panel.is_open && panel.maximized);
+        let terminal_open = self.terminal.read(cx).is_open(cx);
+        let draft_thread_route = !has_thread && has_draft;
         let drawer = self.terminal.clone();
         let details_layout = thread_details::layout(&self.state, window, cx);
         let on_pull_requests = state.pull_requests_open;
@@ -352,8 +357,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.open_permissions(window, cx));
             }))
-            .key_context(keymap::root_context(right_panel_open, running))
+            .key_context(keymap::root_context_with(right_panel_open, running, terminal_open, preview_open, draft_thread_route))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.state.update(cx, |state, cx| state.toggle_sidebar_or_sheet(cx))))
+            .on_action(cx.listener(|this, _: &SelectTheme, window, cx| this.palette.update(cx, |palette, cx| palette.open_change_theme(window, cx))))
+            .on_action(cx.listener(|this, _: &CycleAppearance, _, cx| this.cycle_appearance(cx)))
+            .on_action(cx.listener(|this, _: &StopThread, _, cx| this.state.update(cx, |state, cx| state.stop_selected_thread(cx))))
+            .on_action(cx.listener(|this, _: &RegenerateThreadTitle, _, cx| this.regenerate_selected_title(cx)))
             .on_action(cx.listener(|this, _: &PreviousThread, _, cx| this.traverse(false, cx)))
             .on_action(cx.listener(|this, _: &NextThread, _, cx| this.traverse(true, cx)))
             .on_action(cx.listener(|this, _: &SettleThread, _, cx| this.settle_selected(cx)))
@@ -717,9 +726,53 @@ impl Workspace {
         });
     }
 
+    fn cycle_appearance(&mut self, cx: &mut Context<Self>) {
+        use t3_core::client_settings::{AppearanceMode, ClientSettingChange};
+        let current = crate::settings::store::client(cx).appearance_mode();
+        let next = match current {
+            AppearanceMode::System => AppearanceMode::Light,
+            AppearanceMode::Light => AppearanceMode::Dark,
+            AppearanceMode::Dark => AppearanceMode::System,
+        };
+        crate::settings::store::update_client(&self.state, ClientSettingChange::AppearanceMode(next), cx);
+        let label = match next {
+            AppearanceMode::System => "System",
+            AppearanceMode::Light => "Light",
+            AppearanceMode::Dark => "Dark",
+        };
+        self.state.update(cx, |state, cx| {
+            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Info, format!("Appearance: {label}")), cx);
+        });
+    }
+
+    fn regenerate_selected_title(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            let Some(id) = state.selected_thread.clone() else { return };
+            if !state.fleet.environments.is_empty()
+                && let Some(key) = state.active_thread_key(&id)
+            {
+                state.run_scoped_thread_action(&key, t3_core::thread_actions::ThreadAction::RegenerateTitle, &[], cx);
+                return;
+            }
+            state.run_thread_action(&id, t3_core::thread_actions::ThreadAction::RegenerateTitle, &[], cx);
+        });
+    }
+
     fn pin_selected(&mut self, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             let Some(id) = state.selected_thread.clone() else { return };
+            if !state.fleet.environments.is_empty()
+                && let Some(key) = state.active_thread_key(&id)
+                && let Some(row) = state.scoped_thread(&key).cloned()
+            {
+                let action = if row.thread.pinned {
+                    t3_core::thread_actions::ThreadAction::Unpin
+                } else {
+                    t3_core::thread_actions::ThreadAction::Pin
+                };
+                state.run_scoped_thread_action(&key, action, &[], cx);
+                return;
+            }
             match state.sidebar.model.thread(&id).map(|thread| thread.pinned) {
                 Some(true) => state.request_unpin_thread(&id, cx),
                 Some(false) => state.pin_thread(&id, None, cx),
@@ -764,12 +817,36 @@ impl Workspace {
             let Some(id) = state.selected_thread.clone() else {
                 return;
             };
-            state.run_thread_action(
-                &id,
-                t3_core::thread_actions::ThreadAction::CopyThread,
-                &[],
-                cx,
-            );
+            let pr_url = if !state.fleet.environments.is_empty() {
+                state
+                    .active_thread_key(&id)
+                    .and_then(|key| state.scoped_thread(&key))
+                    .and_then(|row| t3_core::pull_requests::link::visible_links(&row.thread.pull_requests).first().map(|link| link.url.clone()))
+            } else {
+                state
+                    .thread_shell(&id)
+                    .and_then(|shell| t3_core::pull_requests::link::visible_links(&shell.pull_requests).first().map(|link| link.url.clone()))
+            };
+            if let Some(url) = pr_url {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Success, "PR link copied").description(url), cx);
+            } else if !state.fleet.environments.is_empty()
+                && let Some(key) = state.active_thread_key(&id)
+            {
+                state.run_scoped_thread_action(
+                    &key,
+                    t3_core::thread_actions::ThreadAction::CopyThread,
+                    &[],
+                    cx,
+                );
+            } else {
+                state.run_thread_action(
+                    &id,
+                    t3_core::thread_actions::ThreadAction::CopyThread,
+                    &[],
+                    cx,
+                );
+            }
             #[cfg(feature = "snapshot")]
             if let Some(model) = fixture_model {
                 state.selected_thread = None;

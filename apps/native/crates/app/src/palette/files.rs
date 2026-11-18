@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, Styled, StyledText, Task, UniformListScrollHandle, div, prelude::*, px, uniform_list};
+use t3_core::media::FILESYSTEM_READ_SCOPE;
 use t3_core::project_search::{EntriesResult, FilePickerMatch, SEARCH_DEBOUNCE_MS, SEARCH_ENTRIES, entries_request, file_picker_matches};
 
 use super::CommandPalette;
@@ -12,6 +13,14 @@ use crate::project_files::ProjectTarget;
 use crate::theme::{hsla, palette};
 
 const ROW_HEIGHT: f32 = 32.;
+pub(super) const NO_FILE_READ_ACCESS: &str = "This connection cannot search host files.";
+
+pub(super) fn grants_filesystem_read(state: &AppState) -> bool {
+    state
+        .client_handle()
+        .and_then(|handle| handle.session_state().borrow().clone())
+        .is_none_or(|session| session.grants(FILESYSTEM_READ_SCOPE))
+}
 
 #[derive(Default)]
 pub(super) struct FileSearch {
@@ -19,7 +28,7 @@ pub(super) struct FileSearch {
     pub matches: Vec<FilePickerMatch>,
     matched_query: String,
     pending: bool,
-    error: Option<String>,
+    pub error: Option<String>,
     pub highlighted: usize,
     pub scroll: UniformListScrollHandle,
     request: Option<Task<()>>,
@@ -42,16 +51,36 @@ pub(super) fn char_ranges(text: &str, indices: &[usize]) -> Vec<std::ops::Range<
 impl FileSearch {
     pub fn start(&mut self, target: Option<ProjectTarget>, state: &Entity<AppState>, cx: &mut Context<CommandPalette>) {
         *self = FileSearch { target, ..Default::default() };
-        self.search(String::new(), state, cx);
+        self.search_with_delay(String::new(), false, state, cx);
     }
 
     pub fn search(&mut self, query: String, state: &Entity<AppState>, cx: &mut Context<CommandPalette>) {
-        let Some(target) = self.target.clone() else { return };
+        self.search_with_delay(query, true, state, cx);
+    }
+
+    fn search_with_delay(&mut self, query: String, debounce: bool, state: &Entity<AppState>, cx: &mut Context<CommandPalette>) {
+        let Some(target) = self.target.clone() else {
+            self.request = None;
+            self.pending = false;
+            self.error = None;
+            self.matches.clear();
+            return;
+        };
+        if !grants_filesystem_read(state.read(cx)) {
+            self.request = None;
+            self.pending = false;
+            self.matches.clear();
+            self.error = Some(NO_FILE_READ_ACCESS.to_owned());
+            return;
+        }
         self.pending = true;
-        let request = state.read(cx).rpc(SEARCH_ENTRIES, entries_request(&target.cwd, &query));
+        self.error = None;
+        let state = state.clone();
         self.request = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
-            let result = request.await;
+            if debounce {
+                cx.background_executor().timer(Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
+            }
+            let result = cx.update(|cx| state.read(cx).rpc(SEARCH_ENTRIES, entries_request(&target.cwd, &query))).await;
             let _ = this.update(cx, |palette, cx| {
                 let files = &mut palette.files;
                 files.pending = false;
@@ -102,7 +131,8 @@ impl FileSearch {
             return div().py(px(40.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("Open a project to search its files.").into_any_element();
         };
         if self.matches.is_empty() {
-            return div().py(px(40.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child(self.empty_message()).into_any_element();
+            let color = if self.error.is_some() { p.destructive } else { p.muted_foreground };
+            return div().py(px(40.)).px(px(24.)).flex().justify_center().text_sm().text_color(hsla(color)).child(self.empty_message()).into_any_element();
         }
         let count = self.matches.len();
         div()

@@ -719,3 +719,14 @@ fn translates_when_clauses_to_gpui_predicates() {
     assert_eq!(predicate("true"), "!__t3_never__");
     assert_eq!(predicate("false"), "!(!__t3_never__)");
 }
+
+#[test]
+fn composer_requires_modifier_shifts_send_background_as_well_as_send_alternate() {
+    let draft_ctx = [("composerFocus", true), ("draftThreadRoute", true), ("composerRequiresModifier", true)];
+    assert_eq!(resolve(ev("enter", "meta"), defaults(), &draft_ctx, MAC), None);
+    assert_eq!(resolve(ev("enter", "meta+shift"), defaults(), &draft_ctx, MAC), Some("composer.sendBackground"));
+
+    let turn_ctx = [("composerFocus", true), ("turnRunning", true), ("composerRequiresModifier", true)];
+    assert_eq!(resolve(ev("enter", "meta"), defaults(), &turn_ctx, MAC), None);
+    assert_eq!(resolve(ev("enter", "meta+shift"), defaults(), &turn_ctx, MAC), Some("composer.sendAlternate"));
+}

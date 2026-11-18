@@ -11,6 +11,8 @@ pub const SEARCH_CONTENTS: &str = "projects.searchContents";
 pub const OPEN_IN_EDITOR: &str = "shell.openInEditor";
 pub const FILE_PICKER_RESULT_LIMIT: usize = 200;
 pub const CONTENT_SEARCH_LIMIT: usize = 500;
+/// `PROJECT_SEARCH_CONTENTS_QUERY_MAX_LENGTH` (`packages/contracts/src/project.ts`).
+pub const SEARCH_QUERY_MAX_LENGTH: usize = 256;
 /// Both web queries debounce by this much.
 pub const SEARCH_DEBOUNCE_MS: u64 = 120;
 
@@ -55,9 +57,33 @@ pub struct ContentsResult {
     pub regex_fallback_error: Option<String>,
 }
 
-/// `useProjectPathSearch` for files: the query trimmed, an empty one lists files.
+fn clamp_utf16(value: &str, max_units: usize) -> &str {
+    let mut units = 0usize;
+    let mut end = 0usize;
+    for (idx, ch) in value.char_indices() {
+        let len = ch.len_utf16();
+        if units + len > max_units {
+            break;
+        }
+        units += len;
+        end = idx + ch.len_utf8();
+    }
+    &value[..end]
+}
+
+/// `useProjectPathSearch` for files: the query trimmed and bounded to 256 UTF-16 code units.
 pub fn entries_request(cwd: &str, query: &str) -> Value {
-    json!({ "cwd": cwd, "query": query.trim(), "limit": FILE_PICKER_RESULT_LIMIT, "kind": "file" })
+    json!({
+        "cwd": cwd,
+        "query": clamp_utf16(query.trim(), SEARCH_QUERY_MAX_LENGTH),
+        "limit": FILE_PICKER_RESULT_LIMIT,
+        "kind": "file",
+    })
+}
+
+/// `useProjectContentSearch`: queries longer than `SEARCH_QUERY_MAX_LENGTH` UTF-16 code units are rejected client-side.
+pub fn content_query_too_long(query: &str) -> bool {
+    query.encode_utf16().count() > SEARCH_QUERY_MAX_LENGTH
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -68,9 +94,9 @@ pub struct ContentOptions {
 }
 
 /// `useProjectContentSearch`: whitespace is significant, so the query is sent as typed; a blank
-/// one sends nothing.
+/// or over-limit one sends nothing.
 pub fn contents_request(cwd: &str, query: &str, options: ContentOptions) -> Option<Value> {
-    (!query.trim().is_empty()).then(|| {
+    (!query.trim().is_empty() && !content_query_too_long(query)).then(|| {
         json!({
             "cwd": cwd,
             "query": query,
@@ -80,6 +106,39 @@ pub fn contents_request(cwd: &str, query: &str, options: ContentOptions) -> Opti
             "useRegex": options.use_regex,
         })
     })
+}
+
+/// Converts UTF-16 code-unit `matchRanges` returned by the Node server into UTF-8 byte ranges for `text`.
+pub fn utf16_byte_ranges(text: &str, match_ranges: &[MatchRange]) -> Vec<std::ops::Range<usize>> {
+    if match_ranges.is_empty() {
+        return Vec::new();
+    }
+    let mut utf16_to_byte = Vec::with_capacity(text.len() + 1);
+    for (byte_idx, ch) in text.char_indices() {
+        for _ in 0..ch.len_utf16() {
+            utf16_to_byte.push(byte_idx);
+        }
+    }
+    utf16_to_byte.push(text.len());
+    let max_u16 = utf16_to_byte.len() - 1;
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in match_ranges {
+        let start_u16 = range.start.min(max_u16);
+        let end_u16 = range.end.min(max_u16);
+        if start_u16 >= end_u16 {
+            continue;
+        }
+        let start = utf16_to_byte[start_u16];
+        let end = utf16_to_byte[end_u16];
+        if start >= end {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if last.end == start => last.end = end,
+            _ => out.push(start..end),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,5 +343,19 @@ mod tests {
         assert_eq!(preferred_editor(&[], None), None);
         assert_eq!(editor_target("/w/", "src/a.rs", Some(12)), "/w/src/a.rs:12");
         assert_eq!(editor_target("/w", "src/a.rs", None), "/w/src/a.rs");
+    }
+
+    #[test]
+    fn clamps_entries_rejects_overlong_content_queries_and_maps_utf16_ranges() {
+        let long = "a".repeat(SEARCH_QUERY_MAX_LENGTH + 10);
+        assert_eq!(entries_request("/w", &long)["query"].as_str().unwrap().len(), SEARCH_QUERY_MAX_LENGTH);
+        let boundary = format!("{}🚀", "a".repeat(SEARCH_QUERY_MAX_LENGTH - 1));
+        assert_eq!(entries_request("/w", &boundary)["query"], "a".repeat(SEARCH_QUERY_MAX_LENGTH - 1));
+        assert!(content_query_too_long(&long));
+        assert_eq!(contents_request("/w", &long, ContentOptions::default()), None);
+        assert_eq!(
+            utf16_byte_ranges("🚀 fn é", &[MatchRange { start: 3, end: 5 }, MatchRange { start: 6, end: 7 }]),
+            [5..7, 8..10]
+        );
     }
 }

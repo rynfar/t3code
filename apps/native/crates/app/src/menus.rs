@@ -5,15 +5,27 @@ use gpui::{App, Entity, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, ac
 use gpui_component::input::{Copy, Cut, Delete, Paste, Redo, SelectAll, Undo};
 
 use crate::app_state::AppState;
-use crate::keymap::{ToggleCommandPalette, ToggleSidebar};
+use crate::composer::PasteAsText;
+use crate::keymap::{ToggleCommandPalette, ToggleFilePicker, ToggleProjectSearch, ToggleSidebar};
+use crate::new_thread::{NewThread, NewThreadWithoutProject};
 use crate::settings::OpenSettings;
+use crate::thread_view::FindInThread;
 
-actions!(t3, [Quit, SwitchEnvironment, Disconnect, Hide, HideOthers, ShowAll, CloseWindow, Minimize, Zoom, ToggleFullScreen]);
+actions!(t3, [Quit, SwitchEnvironment, Disconnect, Hide, HideOthers, ShowAll, CloseWindow, Minimize, Zoom, BringAllToFront, ToggleFullScreen]);
 
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut gpui::Window)) {
     if let Some(window) = cx.active_window() {
         let _ = window.update(cx, |_, window, _| f(window));
     }
+}
+
+fn file_menu() -> Menu {
+    Menu::new("File").items([
+        MenuItem::action("New Thread", NewThread),
+        MenuItem::action("New Thread Without a Project", NewThreadWithoutProject),
+        MenuItem::separator(),
+        MenuItem::action("Close Window", CloseWindow),
+    ])
 }
 
 fn edit_menu() -> Menu {
@@ -24,9 +36,31 @@ fn edit_menu() -> Menu {
         MenuItem::os_action("Cut", Cut, OsAction::Cut),
         MenuItem::os_action("Copy", Copy, OsAction::Copy),
         MenuItem::os_action("Paste", Paste, OsAction::Paste),
+        MenuItem::action("Paste as Text", PasteAsText),
         MenuItem::action("Delete", Delete),
         MenuItem::separator(),
         MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+    ])
+}
+
+fn view_menu() -> Menu {
+    Menu::new("View").items([
+        MenuItem::action("Toggle Sidebar", ToggleSidebar),
+        MenuItem::action("Command Palette", ToggleCommandPalette),
+        MenuItem::action("Go to File", ToggleFilePicker),
+        MenuItem::action("Search Project Contents", ToggleProjectSearch),
+        MenuItem::action("Find in Thread", FindInThread),
+        MenuItem::separator(),
+        MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+    ])
+}
+
+fn window_menu() -> Menu {
+    Menu::new("Window").items([
+        MenuItem::action("Minimize", Minimize),
+        MenuItem::action("Zoom", Zoom),
+        MenuItem::separator(),
+        MenuItem::action("Bring All to Front", BringAllToFront),
     ])
 }
 
@@ -38,6 +72,7 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
     cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
+    cx.on_action(|_: &BringAllToFront, cx| cx.activate(true));
     cx.on_action(|_: &ToggleFullScreen, cx| with_active_window(cx, |window| window.toggle_fullscreen()));
     cx.on_action({
         let state = state.clone();
@@ -67,15 +102,10 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit T3 Code", Quit),
         ]),
-        Menu::new("File").items([MenuItem::action("Close Window", CloseWindow)]),
+        file_menu(),
         edit_menu(),
-        Menu::new("View").items([
-            MenuItem::action("Toggle Sidebar", ToggleSidebar),
-            MenuItem::action("Command Palette", ToggleCommandPalette),
-            MenuItem::separator(),
-            MenuItem::action("Toggle Full Screen", ToggleFullScreen),
-        ]),
-        Menu::new("Window").items([MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)]),
+        view_menu(),
+        window_menu(),
     ]);
 }
 
@@ -115,9 +145,26 @@ mod tests {
                 ("Cut", TypeId::of::<Cut>(), Some("cut")),
                 ("Copy", TypeId::of::<Copy>(), Some("copy")),
                 ("Paste", TypeId::of::<Paste>(), Some("paste")),
+                ("Paste as Text", TypeId::of::<PasteAsText>(), None),
                 ("Delete", TypeId::of::<Delete>(), None),
                 ("Select All", TypeId::of::<SelectAll>(), Some("select_all")),
             ]
         );
+    }
+
+    #[test]
+    fn file_view_and_window_menus_match_desktop_structure() {
+        let names = |menu: Menu| -> Vec<String> {
+            menu.items
+                .into_iter()
+                .filter_map(|item| match item {
+                    MenuItem::Action { name, .. } => Some(name.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(names(file_menu()), ["New Thread", "New Thread Without a Project", "Close Window"]);
+        assert_eq!(names(view_menu()), ["Toggle Sidebar", "Command Palette", "Go to File", "Search Project Contents", "Find in Thread", "Toggle Full Screen"]);
+        assert_eq!(names(window_menu()), ["Minimize", "Zoom", "Bring All to Front"]);
     }
 }
