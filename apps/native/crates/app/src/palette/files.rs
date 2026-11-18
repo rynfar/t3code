@@ -73,6 +73,7 @@ impl FileSearch {
             self.error = Some(NO_FILE_READ_ACCESS.to_owned());
             return;
         }
+        let conn_id = state.read(cx).connection_id();
         self.pending = true;
         self.error = None;
         let state = state.clone();
@@ -80,18 +81,69 @@ impl FileSearch {
             if debounce {
                 cx.background_executor().timer(Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
             }
+            enum Preflight {
+                StaleConnection,
+                NoAccess,
+                Send,
+            }
+            let preflight = state.read_with(cx, |app, _| {
+                if app.connection_id() != conn_id {
+                    Preflight::StaleConnection
+                } else if !grants_filesystem_read(app) {
+                    Preflight::NoAccess
+                } else {
+                    Preflight::Send
+                }
+            });
+            match preflight {
+                Preflight::Send => {}
+                Preflight::NoAccess => {
+                    let _ = this.update(cx, |palette, cx| {
+                        let files = &mut palette.files;
+                        files.pending = false;
+                        files.matches.clear();
+                        files.error = Some(NO_FILE_READ_ACCESS.to_owned());
+                        cx.notify();
+                    });
+                    return;
+                }
+                Preflight::StaleConnection => {
+                    let _ = this.update(cx, |palette, cx| {
+                        palette.files.pending = false;
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
             let result = cx.update(|cx| state.read(cx).rpc(SEARCH_ENTRIES, entries_request(&target.cwd, &query))).await;
             let _ = this.update(cx, |palette, cx| {
+                let app = state.read(cx);
                 let files = &mut palette.files;
                 files.pending = false;
+                if app.connection_id() != conn_id {
+                    cx.notify();
+                    return;
+                }
+                if !grants_filesystem_read(app) {
+                    files.matches.clear();
+                    files.error = Some(NO_FILE_READ_ACCESS.to_owned());
+                    cx.notify();
+                    return;
+                }
                 match result.map(serde_json::from_value::<EntriesResult>) {
                     Ok(Ok(result)) => {
                         files.matches = file_picker_matches(&result.entries, &query);
                         files.matched_query = query;
                         files.error = None;
                     }
-                    Ok(Err(error)) => files.error = Some(error.to_string()),
-                    Err(error) => files.error = Some(error.to_string()),
+                    Ok(Err(error)) => {
+                        files.matches.clear();
+                        files.error = Some(error.to_string());
+                    }
+                    Err(error) => {
+                        files.matches.clear();
+                        files.error = Some(error.to_string());
+                    }
                 }
                 files.highlighted = 0;
                 cx.notify();
@@ -108,6 +160,9 @@ impl FileSearch {
     }
 
     pub fn highlighted_path(&self) -> Option<String> {
+        if self.pending || self.error.is_some() {
+            return None;
+        }
         self.matches.get(self.highlighted).map(|found| found.path.clone())
     }
 
@@ -130,9 +185,11 @@ impl FileSearch {
         let Some(target) = &self.target else {
             return div().py(px(40.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("Open a project to search its files.").into_any_element();
         };
+        if let Some(error) = &self.error {
+            return div().py(px(40.)).px(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.destructive)).child(error.clone()).into_any_element();
+        }
         if self.matches.is_empty() {
-            let color = if self.error.is_some() { p.destructive } else { p.muted_foreground };
-            return div().py(px(40.)).px(px(24.)).flex().justify_center().text_sm().text_color(hsla(color)).child(self.empty_message()).into_any_element();
+            return div().py(px(40.)).px(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child(self.empty_message()).into_any_element();
         }
         let count = self.matches.len();
         div()
@@ -178,6 +235,9 @@ impl FileSearch {
                 }
             }))
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                if this.files.pending || this.files.error.is_some() {
+                    return;
+                }
                 this.files.highlighted = index;
                 this.open_file(event.modifiers().platform, window, cx);
             }))

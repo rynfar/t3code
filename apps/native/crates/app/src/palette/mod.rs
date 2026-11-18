@@ -13,6 +13,7 @@ use gpui::{
     App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled,
     Subscription, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
+use gpui_component::ActiveTheme;
 use gpui_component::input::{Backspace, Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
 use t3_core::client_settings::{AppearanceMode, ClientSettingChange, ThemePreference};
 use t3_core::palette::{
@@ -138,11 +139,11 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
             state
                 .active_thread_key(&thread.id)
                 .and_then(|key| state.scoped_thread(&key))
-                .and_then(|row| t3_core::pull_requests::link::visible_links(&row.thread.pull_requests).first().map(|link| link.url.clone()))
+                .and_then(|row| t3_core::pull_requests::thread_badge::resolve_thread_current_pull_request_link(&row.thread.pull_requests).map(|link| link.url.clone()))
         } else {
             state
                 .thread_shell(&thread.id)
-                .and_then(|shell| t3_core::pull_requests::link::visible_links(&shell.pull_requests).first().map(|link| link.url.clone()))
+                .and_then(|shell| t3_core::pull_requests::thread_badge::resolve_thread_current_pull_request_link(&shell.pull_requests).map(|link| link.url.clone()))
         };
         if let Some(url) = pr_url {
             items.push(CommandPaletteItem {
@@ -201,7 +202,11 @@ fn theme_submenu_items(cx: &App) -> CommandPaletteItem {
     use std::collections::HashSet;
     let doc = crate::settings::store::client(cx);
     let current = doc.theme();
-    let active_id = current.named_id().map(str::to_owned);
+    let halves = t3_core::themes::halves(doc);
+    let dark = cx.theme().is_dark();
+    let custom = t3_core::themes::library(doc);
+    let env_themes = crate::theme::environment_themes(cx);
+    let active_id = t3_core::themes::half_theme(&current, &halves, dark, &custom, env_themes).map(|t| t.id.clone());
     let mut seen = HashSet::new();
     let mut items = vec![CommandPaletteItem {
         value: "theme:standard".to_owned(),
@@ -210,8 +215,6 @@ fn theme_submenu_items(cx: &App) -> CommandPaletteItem {
         search_terms: vec!["T3 Code".into(), "standard".into(), "default".into(), "theme".into(), "appearance".into()],
         ..Default::default()
     }];
-    let custom = t3_core::themes::library(doc);
-    let env_themes = crate::theme::environment_themes(cx);
     for theme in t3_core::themes::builtins().iter().chain(custom.iter()).chain(env_themes.iter()) {
         if !seen.insert(theme.id.clone()) {
             continue;
@@ -1046,6 +1049,8 @@ impl CommandPalette {
     fn render_content_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let options = self.content.options;
+        let can_read = files::grants_filesystem_read(self.state.read(cx));
+        let mono_font = cx.theme().mono_font_family.clone();
         let toggle = |id: &'static str, label: &'static str, on: bool, underline: bool, pick: fn(&mut t3_core::project_search::ContentOptions)| {
             div()
                 .id(id)
@@ -1054,14 +1059,17 @@ impl CommandPalette {
                 .flex()
                 .items_center()
                 .rounded(px(6.))
-                .font_family("SF Mono")
+                .font_family(mono_font.clone())
                 .text_xs()
-                .cursor_pointer()
+                .when(can_read, |this| {
+                    this.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| this.content.toggle_option(pick, &this.state.clone(), cx)))
+                })
+                .when(!can_read, |this| this.opacity(0.4))
                 .text_color(hsla(if on { p.foreground } else { p.muted_foreground }))
                 .when(on, |this| this.bg(hsla(p.input).opacity(0.72)))
                 .when(underline, |this| this.underline())
                 .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.content.toggle_option(pick, &this.state.clone(), cx)))
         };
         div()
             .flex()
@@ -1688,23 +1696,50 @@ mod visit_recency_tests {
                 palette.escape(window, cx);
                 assert!(palette.search.views.is_empty());
 
-                // Linked PR switches the copy action to "Copy PR link" (#221).
+                // Linked PR switches the copy action to "Copy PR link" and prefers open over merged PRs (`pingdotgg/t3code#26290`).
                 state.update(cx, |state, _| {
                     let thread = state.shell.snapshot.as_mut().unwrap().threads.iter_mut().find(|t| t.id == "menu-thread").unwrap();
-                    thread.pull_requests = vec![serde_json::from_value(serde_json::json!({
-                        "host": "github",
-                        "repository": "pingdotgg/t3code",
-                        "number": 26290,
-                        "url": "https://github.com/pingdotgg/t3code/pull/26290",
-                        "source": "manual",
-                        "linkedAt": "2026-04-01T00:00:00Z"
-                    })).unwrap()];
+                    thread.pull_requests = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "host": "github",
+                            "repository": "pingdotgg/t3code",
+                            "number": 100,
+                            "url": "https://github.com/pingdotgg/t3code/pull/100",
+                            "source": "manual",
+                            "linkedAt": "2026-04-02T00:00:00Z",
+                            "snapshot": { "title": "Merged PR", "state": "merged", "headBranch": "old", "baseBranch": "main", "isDraft": false }
+                        })).unwrap(),
+                        serde_json::from_value(serde_json::json!({
+                            "host": "github",
+                            "repository": "pingdotgg/t3code",
+                            "number": 26290,
+                            "url": "https://github.com/pingdotgg/t3code/pull/26290",
+                            "source": "manual",
+                            "linkedAt": "2026-04-01T00:00:00Z",
+                            "snapshot": { "title": "Open PR", "state": "open", "headBranch": "feat", "baseBranch": "main", "isDraft": false }
+                        })).unwrap(),
+                    ];
                 });
                 palette.rebuild(cx);
                 let actions = &palette.root.iter().find(|group| group.value == "actions").unwrap().items;
                 let copy = actions.iter().find(|item| item.value == "action:copy-thread").unwrap();
                 assert_eq!(copy.title, "Copy PR link");
                 assert_eq!(copy.description.as_deref(), Some("https://github.com/pingdotgg/t3code/pull/26290"));
+
+                // Half-theme override marks that half as "Current" in the theme submenu.
+                let half_key = if cx.theme().is_dark() { "dark" } else { "light" };
+                let builtin_id = t3_core::themes::builtins()[1].id.clone();
+                let mut patch = serde_json::Map::new();
+                let mut halves_map = serde_json::Map::new();
+                halves_map.insert(half_key.to_owned(), serde_json::json!(builtin_id));
+                patch.insert(t3_core::themes::HALVES_KEY.to_owned(), serde_json::Value::Object(halves_map));
+                crate::settings::store::install_committed_client(&state, patch, cx);
+                let theme_menu = theme_submenu_items(cx);
+                let CommandPaletteItemKind::Submenu(theme_view) = &theme_menu.kind else { panic!("expected submenu") };
+                let current_entry = theme_view.groups[0].items.iter().find(|item| item.value == format!("theme:palette:{builtin_id}")).unwrap();
+                assert!(current_entry.description.as_deref().is_some_and(|d| d.contains("Current")), "expected Current in {:?}", current_entry.description);
+                let standard_entry = theme_view.groups[0].items.iter().find(|item| item.value == "theme:standard").unwrap();
+                assert!(standard_entry.description.is_none());
 
                 // Overlong content query shows length error instead of pending/RPC.
                 fixture
@@ -1715,17 +1750,54 @@ mod visit_recency_tests {
                 palette.content.search("a".repeat(t3_core::project_search::SEARCH_QUERY_MAX_LENGTH + 1), &state, cx);
                 assert_eq!(palette.content.error.as_deref(), Some("Search is limited to 256 characters."));
 
-                // Without filesystem:read permission, Files and Content modes surface access denial immediately.
+                // Stale file matches are suppressed on pending/error and cleared when permission is lost.
+                palette.toggle_mode(Mode::Files, window, cx);
+                palette.files.matches = vec![t3_core::project_search::FilePickerMatch {
+                    name: "lib.rs".into(),
+                    name_match_indices: Vec::new(),
+                    path: "src/lib.rs".into(),
+                    path_match_indices: Vec::new(),
+                }];
+                assert!(palette.files.highlighted_path().is_none(), "pending file search must not expose stale highlighted path");
                 fixture
                     .grants
                     .send(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap()))
                     .unwrap();
-                palette.toggle_mode(Mode::Files, window, cx);
+                palette.files.search("lib".into(), &state, cx);
                 assert_eq!(palette.files.error.as_deref(), Some(files::NO_FILE_READ_ACCESS));
+                assert!(palette.files.matches.is_empty(), "error must clear stale file matches");
+                assert!(palette.files.highlighted_path().is_none());
                 palette.toggle_mode(Mode::Content, window, cx);
                 assert_eq!(palette.content.error.as_deref(), Some(files::NO_FILE_READ_ACCESS));
             });
         })
         .unwrap();
+
+        // Post-debounce loss of `filesystem:read` cancels FileSearch RPC before sending.
+        let mut fixture = fixture;
+        fixture.take_commands();
+        fixture
+            .grants
+            .send(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","filesystem:read"]})).unwrap()))
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let palette = cx.new(|cx| CommandPalette::new(state.clone(), composer, window, cx));
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Files, window, cx);
+                palette.files.search("app".into(), &state, cx);
+            });
+        })
+        .unwrap();
+        fixture
+            .grants
+            .send(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap()))
+            .unwrap();
+        cx.executor().advance_clock(std::time::Duration::from_millis(t3_core::project_search::SEARCH_DEBOUNCE_MS + 10));
+        cx.run_until_parked();
+        assert!(
+            !fixture.take_commands().contains(&t3_core::project_search::SEARCH_ENTRIES),
+            "post-debounce search must not dispatch SEARCH_ENTRIES when filesystem:read was revoked"
+        );
     }
 }

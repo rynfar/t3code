@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, HighlightStyle, IntoElement, ListAlignment, ListState, ParentElement, SharedString, Styled, StyledText, Task, div, list, prelude::*, px};
+use gpui_component::ActiveTheme;
 use t3_core::project_search::{
     ContentOptions, ContentsResult, MatchGroup, SEARCH_CONTENTS, SEARCH_DEBOUNCE_MS, SEARCH_QUERY_MAX_LENGTH, content_query_too_long,
     contents_request, group_matches, results_summary, split_path, utf16_byte_ranges,
@@ -92,22 +93,74 @@ impl ContentSearch {
             self.set_result(None);
             return;
         };
+        let conn_id = state.read(cx).connection_id();
         self.pending = true;
         self.error = None;
         let state = state.clone();
         self.request = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
+            enum Preflight {
+                StaleConnection,
+                NoAccess,
+                Send,
+            }
+            let preflight = state.read_with(cx, |app, _| {
+                if app.connection_id() != conn_id {
+                    Preflight::StaleConnection
+                } else if !grants_filesystem_read(app) {
+                    Preflight::NoAccess
+                } else {
+                    Preflight::Send
+                }
+            });
+            match preflight {
+                Preflight::Send => {}
+                Preflight::NoAccess => {
+                    let _ = this.update(cx, |palette, cx| {
+                        let content = &mut palette.content;
+                        content.pending = false;
+                        content.set_result(None);
+                        content.error = Some(NO_FILE_READ_ACCESS.to_owned());
+                        cx.notify();
+                    });
+                    return;
+                }
+                Preflight::StaleConnection => {
+                    let _ = this.update(cx, |palette, cx| {
+                        palette.content.pending = false;
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
             let result = cx.update(|cx| state.read(cx).rpc(SEARCH_CONTENTS, payload)).await;
             let _ = this.update(cx, |palette, cx| {
+                let app = state.read(cx);
                 let content = &mut palette.content;
                 content.pending = false;
+                if app.connection_id() != conn_id {
+                    cx.notify();
+                    return;
+                }
+                if !grants_filesystem_read(app) {
+                    content.set_result(None);
+                    content.error = Some(NO_FILE_READ_ACCESS.to_owned());
+                    cx.notify();
+                    return;
+                }
                 match result.map(serde_json::from_value::<ContentsResult>) {
                     Ok(Ok(result)) => {
                         content.error = None;
                         content.set_result(Some(result));
                     }
-                    Ok(Err(error)) => content.error = Some(error.to_string()),
-                    Err(error) => content.error = Some(error.to_string()),
+                    Ok(Err(error)) => {
+                        content.set_result(None);
+                        content.error = Some(error.to_string());
+                    }
+                    Err(error) => {
+                        content.set_result(None);
+                        content.error = Some(error.to_string());
+                    }
                 }
                 cx.notify();
             });
@@ -239,7 +292,7 @@ impl ContentSearch {
                     .items_center()
                     .gap(px(12.))
                     .px(px(12.))
-                    .font_family("SF Mono")
+                    .font_family(cx.theme().mono_font_family.clone())
                     .text_xs()
                     .cursor_pointer()
                     .when(selected, |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))

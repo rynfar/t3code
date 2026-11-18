@@ -94,6 +94,7 @@ pub(crate) struct KeybindingsState {
     saving: Option<String>,
     /// Latest `keybindings.*` config warning returned by a server keybindings reply.
     config_issue: Option<String>,
+    config_issue_connection: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -133,6 +134,7 @@ impl KeybindingsState {
             menu: None,
             saving: None,
             config_issue: None,
+            config_issue_connection: None,
             _subscriptions: subscriptions,
         }
     }
@@ -204,7 +206,7 @@ impl KeybindingsState {
 }
 
 impl SettingsView {
-    /// Closes the when builder or a row menu, or clears/blurs a focused search filter before closing Settings (#35161).
+    /// Closes the when builder or a row menu, or clears/blurs a focused search filter before closing Settings (`pingdotgg/t3code#35161`).
     pub(super) fn dismiss_keybinding_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.keybindings.menu.take().is_some() {
             cx.notify();
@@ -398,9 +400,9 @@ impl SettingsView {
     fn send_keybinding(&mut self, method: &'static str, payload: Value, command: String, done: Option<String>, failure: &'static str, cx: &mut Context<Self>) {
         store::clear_error(cx);
         self.keybindings.saving = Some(command);
-        let (sent_at, task) = {
+        let (sent_at, conn_id, task) = {
             let state = self.state.read(cx);
-            (state.server_config.keybindings_revision(), state.rpc(method, payload))
+            (state.server_config.keybindings_revision(), state.connection_id(), state.rpc(method, payload))
         };
         let state = self.state.clone();
         cx.spawn(async move |this, cx| {
@@ -410,7 +412,10 @@ impl SettingsView {
                 match result {
                     Ok(reply) => {
                         let issue = model::keybinding_issue_message(&reply);
-                        this.keybindings.config_issue = issue.clone();
+                        if this.state.read(cx).connection_id() == conn_id {
+                            this.keybindings.config_issue = issue.clone();
+                            this.keybindings.config_issue_connection = issue.as_ref().and(conn_id);
+                        }
                         state.update(cx, |state, cx| {
                             if state.server_config.apply_keybindings_reply(&reply, sent_at) {
                                 state.sync_server_config(cx);
@@ -460,6 +465,15 @@ impl SettingsView {
         preferred_editor(&config.available_editors, None).map(|(editor, _)| (path, editor))
     }
 
+    fn sync_config_issue(&mut self, cx: &App) {
+        let connected = self.connected(cx);
+        let conn_id = self.state.read(cx).connection_id();
+        if !connected || conn_id != self.keybindings.config_issue_connection {
+            self.keybindings.config_issue = None;
+            self.keybindings.config_issue_connection = None;
+        }
+    }
+
     pub(super) fn keybindings_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         static NONE: Value = Value::Null;
         let keybindings = self.state.read(cx).server_config.config.as_ref().map_or(&NONE, |config| &config.keybindings);
@@ -472,6 +486,7 @@ impl SettingsView {
             self.keybindings.armed = false;
         }
         let connected = self.connected(cx);
+        self.sync_config_issue(cx);
         let can_write = self.can_write_keybindings(cx);
         let can_open_file = self.can_open_keybindings_file(cx);
         if !can_write {
@@ -1306,7 +1321,7 @@ mod tests {
                 assert!(!view.can_write_keybindings(cx), "read-only connection cannot write keybindings");
                 assert!(!view.can_open_keybindings_file(cx), "read-only connection without operate scope cannot open file");
 
-                // #35161: Esc on focused non-empty keybindings filter clears filter without closing Settings.
+                // `pingdotgg/t3code#35161`: Esc on focused non-empty keybindings filter clears filter without closing Settings.
                 view.keybindings.filter.update(cx, |input, cx| {
                     input.set_value("sidebar", window, cx);
                     input.focus(window, cx);
@@ -1316,6 +1331,23 @@ mod tests {
                 // Once cleared, a second Esc blurs the filter and allows Settings to close.
                 assert!(!view.dismiss_keybinding_overlay(window, cx));
                 assert!(!view.keybindings.filter.read(cx).focus_handle(cx).is_focused(window));
+
+                // Config issue clears on connection change or disconnect.
+                let conn_id = state.read(cx).connection_id();
+                view.keybindings.config_issue = Some("Bad entry".to_owned());
+                view.keybindings.config_issue_connection = conn_id;
+                view.sync_config_issue(cx);
+                assert_eq!(view.keybindings.config_issue.as_deref(), Some("Bad entry"));
+                view.keybindings.config_issue_connection = Some(conn_id.unwrap_or_default().wrapping_add(1));
+                view.sync_config_issue(cx);
+                assert!(view.keybindings.config_issue.is_none());
+
+                view.keybindings.config_issue = Some("Stale".to_owned());
+                view.keybindings.config_issue_connection = conn_id;
+                state.update(cx, |state, _| state.phase = Phase::Unpaired);
+                view.sync_config_issue(cx);
+                assert!(view.keybindings.config_issue.is_none());
+                state.update(cx, |state, _| state.phase = Phase::Online(ConnectionStatus::Connected));
             });
 
             fixture

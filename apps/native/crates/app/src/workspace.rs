@@ -821,11 +821,11 @@ impl Workspace {
                 state
                     .active_thread_key(&id)
                     .and_then(|key| state.scoped_thread(&key))
-                    .and_then(|row| t3_core::pull_requests::link::visible_links(&row.thread.pull_requests).first().map(|link| link.url.clone()))
+                    .and_then(|row| t3_core::pull_requests::thread_badge::resolve_thread_current_pull_request_link(&row.thread.pull_requests).map(|link| link.url.clone()))
             } else {
                 state
                     .thread_shell(&id)
-                    .and_then(|shell| t3_core::pull_requests::link::visible_links(&shell.pull_requests).first().map(|link| link.url.clone()))
+                    .and_then(|shell| t3_core::pull_requests::thread_badge::resolve_thread_current_pull_request_link(&shell.pull_requests).map(|link| link.url.clone()))
             };
             if let Some(url) = pr_url {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
