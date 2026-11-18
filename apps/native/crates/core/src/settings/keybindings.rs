@@ -357,7 +357,7 @@ pub fn command_options(server_keybindings: &Value) -> Vec<String> {
     commands
 }
 
-const CORE_WHEN_VARIABLES: [&str; 6] = ["terminalFocus", "terminalOpen", "isWeb", "isDesktop", "true", "false"];
+const CORE_WHEN_VARIABLES: [&str; 7] = ["terminalFocus", "terminalOpen", "isWeb", "isDesktop", "true", "false", "previewOpen"];
 
 fn collect_identifiers(node: &KeybindingWhenNode, into: &mut Vec<String>) {
     match node {
@@ -749,4 +749,16 @@ fn edit_at(node: &KeybindingWhenNode, path: &[usize], edit: &WhenEdit) -> Keybin
         },
         WhenEdit::Remove => node.clone(),
     }
+}
+
+/// First `keybindings.*` configuration issue from a `server.upsertKeybinding`, `server.removeKeybinding`,
+/// or `keybindingsUpdated` payload (`KeybindingsUpdateToast.logic.ts`).
+pub fn keybinding_issue_message(payload: &Value) -> Option<String> {
+    payload
+        .get("issues")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str).is_some_and(|kind| kind.starts_with("keybindings.")))
+        .and_then(|entry| entry.get("message").and_then(Value::as_str))
+        .map(str::to_owned)
 }

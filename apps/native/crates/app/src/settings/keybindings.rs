@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, Entity, FocusHandle, FontWeight, Hsla, IntoElement, Keystroke, MouseButton, ParentElement,
+    AnyElement, App, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla, IntoElement, Keystroke, MouseButton, ParentElement,
     SharedString, Styled, Subscription, Window, div, point, prelude::*, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -16,6 +16,8 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::Value;
 use t3_client::supervisor::ConnectionStatus;
+use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
+use t3_core::device::SETTINGS_WRITE_SCOPE;
 use t3_core::keybindings::KeybindingWhenNode;
 use t3_core::project_search::{OPEN_IN_EDITOR, open_in_editor_request, preferred_editor};
 use t3_core::settings::keybindings::{self as model, BindingRow, SERVER_REMOVE_KEYBINDING, SERVER_UPSERT_KEYBINDING, WhenEdit, WhenOperator};
@@ -26,6 +28,7 @@ use crate::app_state::{AppEvent, Phase};
 use crate::composer::controls::{floating_shadow, kbd};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
+use crate::toast::{Toast, ToastKind};
 
 /// The draft id of the "New keybinding" row.
 const NEW_ROW: &str = "new";
@@ -89,6 +92,9 @@ pub(crate) struct KeybindingsState {
     menu: Option<String>,
     /// The command being saved (`savingCommand`).
     saving: Option<String>,
+    /// Latest `keybindings.*` config warning returned by a server keybindings reply.
+    config_issue: Option<String>,
+    config_issue_connection: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -127,6 +133,8 @@ impl KeybindingsState {
             when_open: None,
             menu: None,
             saving: None,
+            config_issue: None,
+            config_issue_connection: None,
             _subscriptions: subscriptions,
         }
     }
@@ -198,7 +206,7 @@ impl KeybindingsState {
 }
 
 impl SettingsView {
-    /// Closes the when builder or a row menu; true when one was open, so Escape stops there.
+    /// Closes the when builder or a row menu, or clears/blurs a focused search filter before closing Settings (`pingdotgg/t3code#35161`).
     pub(super) fn dismiss_keybinding_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.keybindings.menu.take().is_some() {
             cx.notify();
@@ -208,6 +216,14 @@ impl SettingsView {
             self.close_when(window, cx);
             return true;
         }
+        if self.keybindings.filter.read(cx).focus_handle(cx).is_focused(window) {
+            if !self.keybindings.filter.read(cx).value().is_empty() {
+                self.keybindings.filter.update(cx, |input, cx| input.set_value("", window, cx));
+                cx.notify();
+                return true;
+            }
+            self.focus.focus(window, cx);
+        }
         false
     }
 
@@ -215,9 +231,20 @@ impl SettingsView {
         matches!(self.state.read(cx).phase, Phase::Online(ConnectionStatus::Connected))
     }
 
+    fn can_write_keybindings(&self, cx: &App) -> bool {
+        self.connected(cx) && self.may(SETTINGS_WRITE_SCOPE, cx)
+    }
+
+    fn can_open_keybindings_file(&self, cx: &App) -> bool {
+        self.connected(cx) && self.may(ORCHESTRATION_OPERATE_SCOPE, cx) && self.keybindings_file_target(cx).is_some()
+    }
+
     /// `captureKeybinding`: a focused shortcut field takes every chord; Escape restores the saved
     /// one, and Tab passes once a chord is recorded. Focusing the field arms it (`onFocus`).
     fn capture_keystroke(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_write_keybindings(cx) {
+            return;
+        }
         let Some(target) = self.keybindings.focus.iter().find(|(_, focus)| focus.field.is_focused(window)).map(|(id, _)| id.clone()) else {
             return;
         };
@@ -253,6 +280,9 @@ impl SettingsView {
     }
 
     fn start_recording(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_write_keybindings(cx) {
+            return;
+        }
         self.keybindings.recording = Some(id.to_owned());
         self.keybindings.armed = true;
         self.keybindings.menu = None;
@@ -274,6 +304,9 @@ impl SettingsView {
     }
 
     fn open_when(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_write_keybindings(cx) {
+            return;
+        }
         let expression = self.keybindings.draft(id).when_expression();
         self.keybindings.when_open = Some(id.to_owned());
         self.keybindings.menu = None;
@@ -331,6 +364,9 @@ impl SettingsView {
     }
 
     fn save_binding(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.can_write_keybindings(cx) {
+            return;
+        }
         let rows = self.keybindings.rows();
         let row = rows.iter().find(|row| row.id == id);
         let Some(command) = row.map(|row| row.command.clone()).or_else(|| self.keybindings.new_command.clone()) else { return };
@@ -344,6 +380,9 @@ impl SettingsView {
 
     fn reset_binding(&mut self, row: &BindingRow, cx: &mut Context<Self>) {
         self.keybindings.menu = None;
+        if !self.can_write_keybindings(cx) {
+            return;
+        }
         if let Some(payload) = model::reset_payload(row) {
             self.send_keybinding(SERVER_UPSERT_KEYBINDING, payload, row.command.clone(), Some(row.id.clone()), "Unable to save keybinding", cx);
         }
@@ -351,6 +390,9 @@ impl SettingsView {
 
     fn remove_binding(&mut self, row: &BindingRow, cx: &mut Context<Self>) {
         self.keybindings.menu = None;
+        if !self.can_write_keybindings(cx) {
+            return;
+        }
         self.send_keybinding(SERVER_REMOVE_KEYBINDING, model::remove_payload(row), row.command.clone(), Some(row.id.clone()), "Unable to remove keybinding", cx);
     }
 
@@ -358,9 +400,9 @@ impl SettingsView {
     fn send_keybinding(&mut self, method: &'static str, payload: Value, command: String, done: Option<String>, failure: &'static str, cx: &mut Context<Self>) {
         store::clear_error(cx);
         self.keybindings.saving = Some(command);
-        let (sent_at, task) = {
+        let (sent_at, conn_id, task) = {
             let state = self.state.read(cx);
-            (state.server_config.keybindings_revision(), state.rpc(method, payload))
+            (state.server_config.keybindings_revision(), state.connection_id(), state.rpc(method, payload))
         };
         let state = self.state.clone();
         cx.spawn(async move |this, cx| {
@@ -369,10 +411,21 @@ impl SettingsView {
                 this.keybindings.saving = None;
                 match result {
                     Ok(reply) => {
+                        let issue = model::keybinding_issue_message(&reply);
+                        if this.state.read(cx).connection_id() == conn_id {
+                            this.keybindings.config_issue = issue.clone();
+                            this.keybindings.config_issue_connection = issue.as_ref().and(conn_id);
+                        }
                         state.update(cx, |state, cx| {
                             if state.server_config.apply_keybindings_reply(&reply, sent_at) {
                                 state.sync_server_config(cx);
                                 cx.emit(AppEvent::ServerConfig);
+                            }
+                            if let Some(message) = issue {
+                                state.show_toast(
+                                    Toast::new(ToastKind::Warning, "Invalid keybindings configuration").description(message),
+                                    cx,
+                                );
                             }
                         });
                         if let Some(id) = done {
@@ -393,6 +446,9 @@ impl SettingsView {
     }
 
     fn open_keybindings_file(&mut self, cx: &mut Context<Self>) {
+        if !self.can_open_keybindings_file(cx) {
+            return;
+        }
         let Some((path, editor)) = self.keybindings_file_target(cx) else { return };
         let task = self.state.read(cx).rpc(OPEN_IN_EDITOR, open_in_editor_request(&path, editor));
         cx.spawn(async move |this, cx| {
@@ -409,6 +465,15 @@ impl SettingsView {
         preferred_editor(&config.available_editors, None).map(|(editor, _)| (path, editor))
     }
 
+    fn sync_config_issue(&mut self, cx: &App) {
+        let connected = self.connected(cx);
+        let conn_id = self.state.read(cx).connection_id();
+        if !connected || conn_id != self.keybindings.config_issue_connection {
+            self.keybindings.config_issue = None;
+            self.keybindings.config_issue_connection = None;
+        }
+    }
+
     pub(super) fn keybindings_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         static NONE: Value = Value::Null;
         let keybindings = self.state.read(cx).server_config.config.as_ref().map_or(&NONE, |config| &config.keybindings);
@@ -421,15 +486,64 @@ impl SettingsView {
             self.keybindings.armed = false;
         }
         let connected = self.connected(cx);
+        self.sync_config_issue(cx);
+        let can_write = self.can_write_keybindings(cx);
+        let can_open_file = self.can_open_keybindings_file(cx);
+        if !can_write {
+            self.keybindings.adding = false;
+            self.keybindings.recording = None;
+            self.keybindings.armed = false;
+            self.keybindings.when_open = None;
+            self.keybindings.menu = None;
+        }
         let rows = self.keybindings.rows();
         // A settings-search jump to a binding clears the table filter so its row shows.
         if self.scroll_to_target && self.target.as_deref().is_some_and(|target| target.starts_with("keybinding-")) {
             self.keybindings.filter.update(cx, |input, cx| input.set_value("", window, cx));
         }
         let query = self.keybindings.filter.read(cx).value().to_string();
-        let mut blocks = vec![Block::new(&["keybindings"], self.keybindings_toolbar(connected, cx))];
-        if !connected {
-            blocks.push(Block::new(&[], div().px(r(16.)).text_xs().text_color(hsla(palette(cx).muted_foreground)).child("Connect an environment to change keybindings.")));
+        let mut blocks = vec![Block::new(&["keybindings"], self.keybindings_toolbar(can_write, can_open_file, cx))];
+        if !can_write {
+            let notice = if !connected {
+                "Connect an environment to change keybindings."
+            } else {
+                "This connection can view keybindings but cannot change them."
+            };
+            blocks.push(Block::new(&[], div().px(r(16.)).text_xs().text_color(hsla(palette(cx).muted_foreground)).child(notice)));
+        }
+        if let Some(issue) = self.keybindings.config_issue.clone() {
+            let p = palette(cx);
+            let open_view = cx.entity();
+            let warning_card = h_flex()
+                .justify_between()
+                .gap(r(12.))
+                .px(r(14.))
+                .py(r(10.))
+                .rounded(r(8.))
+                .border_1()
+                .border_color(hsla(p.warning).opacity(0.4))
+                .bg(hsla(p.warning).opacity(0.08))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(r(8.))
+                        .child(icon(Icon::TriangleAlert, 16., hsla(p.warning)))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .gap(r(2.))
+                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Invalid keybindings configuration"))
+                                .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(issue)),
+                        ),
+                )
+                .child(
+                    Button::new("keybindings-warning-open-file", ButtonVariant::Outline, ButtonSize::Sm)
+                        .label("Open keybindings.json")
+                        .disabled(!can_open_file)
+                        .on_click(move |_, _, cx| open_view.update(cx, |this, cx| this.open_keybindings_file(cx))),
+                );
+            blocks.push(Block::new(&[], warning_card));
         }
         if self.keybindings.adding {
             self.keybindings.ensure_focus(NEW_ROW, cx);
@@ -464,7 +578,7 @@ impl SettingsView {
         blocks
     }
 
-    fn keybindings_toolbar(&self, connected: bool, cx: &mut Context<Self>) -> gpui::Div {
+    fn keybindings_toolbar(&self, can_write: bool, can_open_file: bool, cx: &mut Context<Self>) -> gpui::Div {
         let p = palette(cx);
         let view = cx.entity();
         let open_view = view.clone();
@@ -491,11 +605,13 @@ impl SettingsView {
                     Button::new("keybindings-add", ButtonVariant::Outline, ButtonSize::Default)
                         .icon(Icon::Plus)
                         .label("Add keybinding")
-                        .disabled(self.keybindings.adding || !connected)
+                        .disabled(self.keybindings.adding || !can_write)
                         .on_click(move |_, _, cx| {
                             view.update(cx, |this, cx| {
-                                this.keybindings.adding = true;
-                                cx.notify();
+                                if this.can_write_keybindings(cx) {
+                                    this.keybindings.adding = true;
+                                    cx.notify();
+                                }
                             })
                         }),
                 )
@@ -503,7 +619,7 @@ impl SettingsView {
                     Button::new("keybindings-open-file", ButtonVariant::Outline, ButtonSize::Icon)
                         .icon(Icon::FileBraces)
                         .tooltip("Open keybindings.json")
-                        .disabled(!connected || self.keybindings_file_target(cx).is_none())
+                        .disabled(!can_open_file)
                         .on_click(move |_, _, cx| open_view.update(cx, |this, cx| this.open_keybindings_file(cx))),
                 )
                 .into_any_element()],
@@ -519,6 +635,7 @@ impl SettingsView {
         let draft = self.keybindings.draft_for(row);
         let when = draft.when_expression();
         let dirty = draft.dirty(row);
+        let can_write = self.can_write_keybindings(cx);
         let conflicts = if dirty { model::conflict_labels(rows, &row.id, &draft.key, &when, MAC) } else { row.conflicts.clone() };
         let saving = self.keybindings.saving.as_deref() == Some(row.command.as_str());
         let highlighted = anchor.as_deref().is_some_and(|anchor| self.is_target(anchor));
@@ -546,8 +663,8 @@ impl SettingsView {
             .justify_end()
             .gap(r(6.))
             .children(conflict_warning(&conflicts, cx))
-            .children(self.row_menu(row, saving, cx))
-            .when(dirty, |this| {
+            .children(self.row_menu(row, saving || !can_write, cx))
+            .when(dirty && can_write, |this| {
                 this.child(
                     Button::new(element_id("kb-save", &row.id), ButtonVariant::Default, ButtonSize::Sm)
                         .label(if saving { "Saving" } else { "Save" })
@@ -634,7 +751,8 @@ impl SettingsView {
     fn key_pill(&self, row: &BindingRow, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let id = row.id.clone();
-        let focus = self.keybindings.row_focus(&row.id).map(|focus| focus.pill.clone());
+        let can_write = self.can_write_keybindings(cx);
+        let focus = can_write.then(|| self.keybindings.row_focus(&row.id).map(|focus| focus.pill.clone())).flatten();
         let ring = focus.as_ref().is_some_and(|focus| focus.is_focused(window) && window.last_input_was_keyboard());
         h_flex()
             .id(element_id("kb-pill", &row.id))
@@ -647,10 +765,13 @@ impl SettingsView {
             .rounded(r(6.))
             .border_1()
             .when(!ring, |this| this.border_color(gpui::transparent_black()))
-            .cursor_pointer()
-            .hover(|this| this.border_color(hsla(p.border).opacity(0.7)).bg(hsla(p.accent)))
+            .when(can_write, |this| {
+                this.cursor_pointer()
+                    .hover(|this| this.border_color(hsla(p.border).opacity(0.7)).bg(hsla(p.accent)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_recording(&id, window, cx)))
+            })
+            .when(!can_write, |this| this.opacity(0.6))
             .children(model::key_pill_parts(&row.key, MAC).into_iter().map(|part| kbd(part, cx)))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_recording(&id, window, cx)))
             .into_any_element()
     }
 
@@ -658,9 +779,10 @@ impl SettingsView {
     fn capture_field(&self, id: &str, key: &str, width: f32, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
-        let focus = self.keybindings.row_focus(id).map(|focus| focus.field.clone());
+        let can_write = self.can_write_keybindings(cx);
+        let focus = can_write.then(|| self.keybindings.row_focus(id).map(|focus| focus.field.clone())).flatten();
         let focused = focus.as_ref().is_some_and(|focus| focus.is_focused(window));
-        let recording = self.recording_in(id, window);
+        let recording = can_write && self.recording_in(id, window);
         let (text, placeholder) = match (recording, key.is_empty()) {
             (true, _) => ("Press shortcut".to_owned(), true),
             (false, true) => ("Unassigned".to_owned(), true),
@@ -678,7 +800,8 @@ impl SettingsView {
             .border_color(if focused { hsla(p.ring) } else { hsla(p.input) })
             .bg(if dark { hsla(p.input).opacity(0.32) } else { hsla(p.background) })
             .when(focused, |this| this.shadow(focus_ring(hsla(p.ring).opacity(0.24))))
-            .cursor_text()
+            .when(can_write, |this| this.cursor_text().on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_recording(&target, window, cx))))
+            .when(!can_write, |this| this.opacity(0.6))
             .font_family(cx.theme().mono_font_family.clone())
             .text_sm()
             .text_color(if placeholder { hsla(p.muted_foreground).opacity(0.72) } else { hsla(p.foreground) })
@@ -692,20 +815,22 @@ impl SettingsView {
                     cx.notify();
                 }))
             })
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_recording(&target, window, cx)))
             .into_any_element()
     }
 
     /// `KeybindingHoverRowMenu`: Reset to default and Remove, shown on row hover.
-    fn row_menu(&self, row: &BindingRow, saving: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn row_menu(&self, row: &BindingRow, disabled: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !row.can_reset() && !row.can_remove() {
             return None;
         }
         let p = palette(cx);
-        let open = self.keybindings.menu.as_deref() == Some(row.id.as_str());
+        let open = !disabled && self.keybindings.menu.as_deref() == Some(row.id.as_str());
         let (view, id) = (cx.entity(), row.id.clone());
-        let trigger = Button::new(element_id("kb-menu", &row.id), ButtonVariant::GhostMuted, ButtonSize::IconSm).icon(Icon::Ellipsis).disabled(saving).on_click(
+        let trigger = Button::new(element_id("kb-menu", &row.id), ButtonVariant::GhostMuted, ButtonSize::IconSm).icon(Icon::Ellipsis).disabled(disabled).on_click(
             move |_, _, cx| {
+                if disabled {
+                    return;
+                }
                 view.update(cx, |this, cx| {
                     this.keybindings.menu = if open { None } else { Some(id.clone()) };
                     cx.notify();
@@ -769,9 +894,10 @@ impl SettingsView {
     /// `WhenClauseControl`: the clause (or "Always") as a micro button that opens the builder.
     fn when_control(&self, id: &str, expression: &str, draft: &Draft, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let open = self.keybindings.when_open.as_deref() == Some(id);
+        let can_write = self.can_write_keybindings(cx);
+        let open = can_write && self.keybindings.when_open.as_deref() == Some(id);
         let target = id.to_owned();
-        let focus = self.keybindings.row_focus(id).map(|focus| focus.when.clone());
+        let focus = can_write.then(|| self.keybindings.row_focus(id).map(|focus| focus.when.clone())).flatten();
         let ring = focus.as_ref().is_some_and(|focus| focus.is_focused(window) && window.last_input_was_keyboard());
         let trigger = h_flex()
             .id(element_id("kb-when", id))
@@ -785,18 +911,21 @@ impl SettingsView {
             .text_size(r(11.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(if expression.is_empty() { hsla(p.muted_foreground) } else { hsla(p.foreground) })
-            .cursor_pointer()
             .when(open, |this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
-            .hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
+            .when(can_write, |this| {
+                this.cursor_pointer()
+                    .hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        if this.keybindings.when_open.as_deref() == Some(target.as_str()) {
+                            this.close_when(window, cx);
+                        } else {
+                            this.open_when(&target, window, cx);
+                        }
+                    }))
+            })
+            .when(!can_write, |this| this.opacity(0.6))
             .child(div().min_w_0().truncate().font_family(cx.theme().mono_font_family.clone()).child(if expression.is_empty() { "Always".to_owned() } else { expression.to_owned() }))
-            .child(icon(Icon::ChevronDown, 14., hsla(p.muted_foreground).opacity(0.6)).flex_none())
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                if this.keybindings.when_open.as_deref() == Some(target.as_str()) {
-                    this.close_when(window, cx);
-                } else {
-                    this.open_when(&target, window, cx);
-                }
-            }));
+            .child(icon(Icon::ChevronDown, 14., hsla(p.muted_foreground).opacity(0.6)).flex_none());
         let popover = open.then(|| {
             let viewport = window.viewport_size();
             let backdrop = div()
@@ -1150,4 +1279,89 @@ fn indented(child: AnyElement, line: Hsla) -> AnyElement {
         .child(div().absolute().top(r(16.)).left(r(6.)).w(r(10.)).h(px(1.)).bg(line))
         .child(child)
         .into_any_element()
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use gpui::{Render, size};
+    use t3_core::settings::search::Section;
+
+    #[gpui::test]
+    fn keybindings_escape_clears_filter_before_closing_and_respects_write_scope(cx: &mut gpui::TestAppContext) {
+        struct Root;
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        fixture.grants.send(Some(crate::context_menu::project_filter_tests::session(false))).unwrap();
+        cx.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.phase = Phase::Online(ConnectionStatus::Connected);
+                if let Some(config) = state.server_config.config.as_mut() {
+                    config.keybindings_config_path = Some("/tmp/keybindings.json".to_owned());
+                    config.available_editors = vec!["vscode".to_owned()];
+                }
+                cx.notify();
+            });
+        });
+
+        let window = cx.open_window(size(px(900.), px(700.)), |_, _| Root);
+        cx.update_window(window.into(), |_, window, cx| {
+            let view = cx.new(|cx| SettingsView::new(state.clone(), Section::Keybindings, None, window, cx));
+            view.update(cx, |view, cx| {
+                assert!(!view.can_write_keybindings(cx), "read-only connection cannot write keybindings");
+                assert!(!view.can_open_keybindings_file(cx), "read-only connection without operate scope cannot open file");
+
+                // `pingdotgg/t3code#35161`: Esc on focused non-empty keybindings filter clears filter without closing Settings.
+                view.keybindings.filter.update(cx, |input, cx| {
+                    input.set_value("sidebar", window, cx);
+                    input.focus(window, cx);
+                });
+                assert!(view.dismiss_keybinding_overlay(window, cx));
+                assert_eq!(view.keybindings.filter.read(cx).value(), "");
+                // Once cleared, a second Esc blurs the filter and allows Settings to close.
+                assert!(!view.dismiss_keybinding_overlay(window, cx));
+                assert!(!view.keybindings.filter.read(cx).focus_handle(cx).is_focused(window));
+
+                // Config issue clears on connection change or disconnect.
+                let conn_id = state.read(cx).connection_id();
+                view.keybindings.config_issue = Some("Bad entry".to_owned());
+                view.keybindings.config_issue_connection = conn_id;
+                view.sync_config_issue(cx);
+                assert_eq!(view.keybindings.config_issue.as_deref(), Some("Bad entry"));
+                view.keybindings.config_issue_connection = Some(conn_id.unwrap_or_default().wrapping_add(1));
+                view.sync_config_issue(cx);
+                assert!(view.keybindings.config_issue.is_none());
+
+                view.keybindings.config_issue = Some("Stale".to_owned());
+                view.keybindings.config_issue_connection = conn_id;
+                state.update(cx, |state, _| state.phase = Phase::Unpaired);
+                view.sync_config_issue(cx);
+                assert!(view.keybindings.config_issue.is_none());
+                state.update(cx, |state, _| state.phase = Phase::Online(ConnectionStatus::Connected));
+            });
+
+            fixture
+                .grants
+                .send(Some(
+                    serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","orchestration:operate","settings:write"]}))
+                        .unwrap(),
+                ))
+                .unwrap();
+            view.update(cx, |view, cx| {
+                assert!(view.can_write_keybindings(cx));
+                assert!(view.can_open_keybindings_file(cx));
+            });
+        })
+        .unwrap();
+    }
 }

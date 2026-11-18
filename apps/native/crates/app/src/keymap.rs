@@ -36,6 +36,10 @@ actions!(
         NavigateBack,
         NavigateForward,
         ToggleProjectSearch,
+        SelectTheme,
+        CycleAppearance,
+        StopThread,
+        RegenerateThreadTitle,
         Unimplemented,
     ]
 );
@@ -43,7 +47,11 @@ actions!(
 pub fn action_for(command: &str) -> Box<dyn Action> {
     match command {
         "themeEditor.toggle" => Box::new(crate::theme_editor::ToggleThemeEditor),
+        "theme.select" => Box::new(SelectTheme),
+        "appearance.cycle" => Box::new(CycleAppearance),
         "sidebar.toggle" => Box::new(ToggleSidebar),
+        "thread.stop" => Box::new(StopThread),
+        "thread.regenerateTitle" => Box::new(RegenerateThreadTitle),
         "thread.previous" => Box::new(PreviousThread),
         "thread.next" => Box::new(NextThread),
         "thread.jump.1" => Box::new(JumpToThread1),
@@ -64,7 +72,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "navigation.back" => Box::new(NavigateBack),
         "navigation.forward" => Box::new(NavigateForward),
         "projectSearch.toggle" => Box::new(ToggleProjectSearch),
-        "chat.new" => Box::new(crate::new_thread::NewThread),
+        "chat.new" | "chat.newLocal" => Box::new(crate::new_thread::NewThread),
         "chat.newWithoutProject" => Box::new(crate::new_thread::NewThreadWithoutProject),
         "chat.find" => Box::new(crate::thread_view::FindInThread),
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),
@@ -210,7 +218,19 @@ pub fn label_in(command: &str, context: &ShortcutMatchContext, cx: &App) -> Opti
 }
 
 /// Flags app state contributes to `when` clauses, set on the workspace root.
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn root_context(right_panel_open: bool, turn_running: bool) -> KeyContext {
+    root_context_with(right_panel_open, turn_running, false, false, false)
+}
+
+/// Full workspace `when` flags: right panel, running turn, open terminal/preview, and draft route.
+pub fn root_context_with(
+    right_panel_open: bool,
+    turn_running: bool,
+    terminal_open: bool,
+    preview_open: bool,
+    draft_thread_route: bool,
+) -> KeyContext {
     let mut context = KeyContext::new_with_defaults();
     context.add("Workspace");
     context.add("isDesktop");
@@ -220,5 +240,38 @@ pub fn root_context(right_panel_open: bool, turn_running: bool) -> KeyContext {
     if turn_running {
         context.add("turnRunning");
     }
+    if terminal_open {
+        context.add("terminalOpen");
+    }
+    if preview_open {
+        context.add("previewOpen");
+    }
+    if draft_thread_route {
+        context.add("draftThreadRoute");
+    }
     context
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::TypeId;
+
+    #[test]
+    fn action_for_maps_theme_appearance_thread_and_chat_new_local() {
+        assert_eq!(action_for("theme.select").as_any().type_id(), TypeId::of::<SelectTheme>());
+        assert_eq!(action_for("appearance.cycle").as_any().type_id(), TypeId::of::<CycleAppearance>());
+        assert_eq!(action_for("thread.stop").as_any().type_id(), TypeId::of::<StopThread>());
+        assert_eq!(action_for("thread.regenerateTitle").as_any().type_id(), TypeId::of::<RegenerateThreadTitle>());
+        assert_eq!(action_for("chat.newLocal").as_any().type_id(), TypeId::of::<crate::new_thread::NewThread>());
+    }
+
+    #[test]
+    fn root_context_with_sets_expected_when_flags() {
+        assert!(root_context(true, false).contains("rightPanelOpen"));
+        let ctx = root_context_with(true, true, true, true, true);
+        for flag in ["Workspace", "isDesktop", "rightPanelOpen", "turnRunning", "terminalOpen", "previewOpen", "draftThreadRoute"] {
+            assert!(ctx.contains(flag), "missing flag {flag}");
+        }
+    }
 }

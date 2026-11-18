@@ -222,7 +222,8 @@ fn shortcut_for_context<'a>(
 ) -> Cow<'a, KeybindingShortcut> {
     let shortcut = &binding.shortcut;
     if context.flag("composerRequiresModifier")
-        && binding.command == "composer.sendAlternate"
+        && (binding.command == "composer.sendAlternate"
+            || binding.command == "composer.sendBackground")
         && shortcut.key == "enter"
         && shortcut.mod_key
         && !shortcut.meta_key

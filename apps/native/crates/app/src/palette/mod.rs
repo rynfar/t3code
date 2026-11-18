@@ -13,22 +13,29 @@ use gpui::{
     App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled,
     Subscription, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
-use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use gpui_component::ActiveTheme;
+use gpui_component::input::{Backspace, Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use t3_core::client_settings::{AppearanceMode, ClientSettingChange, ThemePreference};
 use t3_core::palette::{
-    CommandPaletteGroup, CommandPaletteItem, CommandPaletteItemKind, CommandPaletteProject, CommandPaletteRow, CommandPaletteSearch, CommandPaletteSearchState, CommandPaletteSearchAction, CommandPaletteView, PaletteThread, build_command_palette_rows,
-    create_command_palette_search_state, reduce_command_palette_search_state,
-    build_project_action_items, build_root_groups, build_thread_action_items, filter_command_palette_groups, recent_thread_items,
+    CommandPaletteAllOptions, CommandPaletteGroup, CommandPaletteItem, CommandPaletteItemKind, CommandPaletteProject, CommandPaletteRow, CommandPaletteSearch,
+    CommandPaletteSearchAction, CommandPaletteSearchState, CommandPaletteView, PaletteThread, build_command_palette_rows,
+    build_nested_search_items, build_project_action_items, build_root_groups, build_thread_action_items, create_command_palette_search_state,
+    enumerate_command_palette_items, filter_command_palette_groups, get_command_palette_input_placeholder, get_command_palette_mode, recent_thread_items,
+    reduce_command_palette_search_state,
 };
 use t3_core::sidebar::time::{compact_relative_label, format_iso, parse_iso};
 
 use crate::app_state::AppState;
+use crate::icons::Icon;
 use crate::keymap::{
     self, CopyThreadReference, JumpToThread1, JumpToThread2, JumpToThread3, JumpToThread4, JumpToThread5, JumpToThread6, JumpToThread7, JumpToThread8,
     JumpToThread9, PinThread,
 };
+use crate::new_thread::{NewThread, NewThreadWithoutProject};
 use crate::sidebar::is_composing;
 use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
+use crate::thread_view::FindInThread;
 
 const ENVIRONMENT: &str = t3_core::sidebar::ENVIRONMENT_ID;
 
@@ -97,36 +104,181 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
         shortcut_command: command.map(str::to_owned),
         ..Default::default()
     };
-    let mut items = vec![
-        action("action:add-project", "Add project", &["folder", "open", "import"], None),
-        action("action:new-project", "New project", &["create", "folder"], None),
-        action("action:toggle-sidebar", "Toggle sidebar", &["hide", "show", "panel"], Some("sidebar.toggle")),
-    ];
+    let mut items = Vec::new();
+    let default_project = crate::new_thread::default_project(state);
+    let default_project_name = default_project.as_deref().and_then(|project_id| {
+        state
+            .sidebar
+            .model
+            .project_names
+            .get(project_id)
+            .cloned()
+            .or_else(|| state.shell.project(project_id).map(|project| project.title.clone()))
+    });
+    if let Some(name) = default_project_name.as_deref() {
+        let title = format!("New thread in {name}");
+        items.push(action("action:new-thread-in-active", &title, &["new thread", "chat", "create", "draft"], Some("chat.newLocal")));
+    }
+    if state.server_config.config.as_ref().is_some_and(|config| config.scratch_workspace_root.is_some()) {
+        items.push(action(
+            "action:new-thread-without-project",
+            "New thread without a project",
+            &["new thread", "no project", "without project", "none", "chat"],
+            Some("chat.newWithoutProject"),
+        ));
+    }
+    if state.selected_thread.is_some() {
+        items.push(action("action:find-in-thread", "Find in current thread", &["find", "search", "thread", "messages"], Some("chat.find")));
+    }
     if let Some(thread) = state.selected_thread.as_deref().and_then(|id| state.sidebar.model.thread(id)) {
         let pin = if thread.pinned { "Unpin thread" } else { "Pin thread" };
         let settle = if thread.is_settled() { "Un-settle thread" } else { "Settle thread" };
         items.push(action("action:pin", pin, &["pin"], Some("thread.pin")));
         items.push(action("action:settle", settle, &["archive", "done"], Some("thread.settle")));
-        items.push(action("action:copy-thread", "Copy thread reference", &["link", "copy"], Some("thread.copyReference")));
+        let pr_url = if !state.fleet.environments.is_empty() {
+            state
+                .active_thread_key(&thread.id)
+                .and_then(|key| state.scoped_thread(&key))
+                .and_then(|row| t3_core::pull_requests::thread_badge::resolve_thread_current_pull_request_link(&row.thread.pull_requests).map(|link| link.url.clone()))
+        } else {
+            state
+                .thread_shell(&thread.id)
+                .and_then(|shell| t3_core::pull_requests::thread_badge::resolve_thread_current_pull_request_link(&shell.pull_requests).map(|link| link.url.clone()))
+        };
+        if let Some(url) = pr_url {
+            items.push(CommandPaletteItem {
+                description: Some(url),
+                ..action("action:copy-thread", "Copy PR link", &["copy", "pull request", "link", "reference"], Some("thread.copyReference"))
+            });
+        } else {
+            let title_desc = if thread.title.trim().is_empty() { "Thread".to_owned() } else { thread.title.trim().to_owned() };
+            items.push(CommandPaletteItem {
+                description: Some(title_desc),
+                ..action("action:copy-thread", "Copy thread", &["copy", "thread", "thread id", "reference"], Some("thread.copyReference"))
+            });
+        }
         items.push(action("action:link-pull-request", "Link pull request to thread", &["link", "pull request", "pr", "attach", "stack"], None));
         let linked = state.thread_shell(&thread.id).is_some_and(|shell| !t3_core::pull_requests::link::visible_links(&shell.pull_requests).is_empty());
         items.push(CommandPaletteItem { disabled: !linked, ..action("action:open-thread-pull-requests", "Show linked pull requests", &["pull requests", "linked", "stack", "prs"], None) });
     }
+    if state.active_project_target().is_some() {
+        items.push(action("action:open-file-picker", "Go to file", &["go to file", "open file", "file picker", "find file", "quick open"], Some("filePicker.toggle")));
+        items.push(action(
+            "action:search-project-contents",
+            "Search project contents",
+            &["search project", "find in files", "grep", "content search", "text search"],
+            Some("projectSearch.toggle"),
+        ));
+    }
+    items.push(action("action:add-project", "Add project", &["folder", "open", "import"], None));
+    items.push(action("action:new-project", "New project", &["create", "folder"], None));
+    items.push(action("action:toggle-sidebar", "Toggle sidebar", &["hide", "show", "panel"], Some("sidebar.toggle")));
     if state.server_config.config.is_some() {
         items.push(action("action:pull-requests", "Open pull requests", &["pull requests", "prs", "pr", "github", "review", "merge", "branch"], None));
     }
-    if let Some(project_id) = crate::new_thread::default_project(state) {
-        let name = state.sidebar.model.project_names.get(&project_id).cloned().or_else(|| state.shell.project(&project_id).map(|project| project.title.clone()));
+    if state.can_pin_projects()
+        && let Some(project_id) = default_project.as_deref()
+        && let Some(project) = state.shell.project(project_id)
+    {
+        let title = if project.pinned_at.is_some() { "Unpin project" } else { "Pin project" };
+        items.push(CommandPaletteItem {
+            description: default_project_name.clone(),
+            ..action("action:project-pin", title, &["pin", "unpin", "project", "favorite"], None)
+        });
+    }
+    if default_project.is_some() {
         let terms = ["project", "settings", "name", "icon", "scripts", "model", "workspace", "grouping", "checkout", "remove", "t3.json"];
-        items.push(CommandPaletteItem { description: name, ..action("action:project-settings", "Project settings", &terms, None) });
+        items.push(CommandPaletteItem { description: default_project_name, ..action("action:project-settings", "Project settings", &terms, None) });
     }
     items.push(action("action:previous-thread", "Previous thread", &["navigate"], Some("thread.previous")));
     items.push(action("action:next-thread", "Next thread", &["navigate"], Some("thread.next")));
-    items.push(action("action:theme-editor", "Toggle theme editor", &["theme", "appearance", "colors", "palette", "customize"], Some("themeEditor.toggle")));
     items.push(action("action:settings", "Open settings", &["settings", "preferences", "configuration", "keybindings"], None));
     items.push(action("action:usage", "Open usage", &["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"], Some("usage.open")));
     items.push(action("action:switch-environment", "Switch environment...", &["environment", "server", "connect", "pair", "machine", "disconnect"], None));
     items
+}
+
+fn theme_submenu_items(cx: &App) -> CommandPaletteItem {
+    use std::collections::HashSet;
+    let doc = crate::settings::store::client(cx);
+    let current = doc.theme();
+    let halves = t3_core::themes::halves(doc);
+    let dark = cx.theme().is_dark();
+    let custom = t3_core::themes::library(doc);
+    let env_themes = crate::theme::environment_themes(cx);
+    let active_id = t3_core::themes::half_theme(&current, &halves, dark, &custom, env_themes).map(|t| t.id.clone());
+    let mut seen = HashSet::new();
+    let mut items = vec![CommandPaletteItem {
+        value: "theme:standard".to_owned(),
+        title: "T3 Code".to_owned(),
+        description: active_id.is_none().then(|| "Current".to_owned()),
+        search_terms: vec!["T3 Code".into(), "standard".into(), "default".into(), "theme".into(), "appearance".into()],
+        ..Default::default()
+    }];
+    for theme in t3_core::themes::builtins().iter().chain(custom.iter()).chain(env_themes.iter()) {
+        if !seen.insert(theme.id.clone()) {
+            continue;
+        }
+        let has_light = theme.half(false).is_some();
+        let has_dark = theme.half(true).is_some();
+        let mut desc_parts = Vec::new();
+        if has_light != has_dark {
+            desc_parts.push(if has_dark { "For dark mode" } else { "For light mode" });
+        }
+        if active_id.as_deref() == Some(theme.id.as_str()) {
+            desc_parts.push("Current");
+        }
+        items.push(CommandPaletteItem {
+            value: format!("theme:palette:{}", theme.id),
+            title: theme.label.clone(),
+            description: (!desc_parts.is_empty()).then(|| desc_parts.join(" · ")),
+            search_terms: vec![theme.label.clone(), "theme".into(), "appearance".into()],
+            ..Default::default()
+        });
+    }
+    CommandPaletteItem {
+        kind: CommandPaletteItemKind::Submenu(CommandPaletteView {
+            groups: vec![CommandPaletteGroup { value: "themes".into(), label: "Change theme".into(), items }],
+            initial_query: None,
+        }),
+        value: "action:change-theme".into(),
+        title: "Change theme".into(),
+        search_terms: vec!["change theme".into(), "appearance".into(), "colors".into(), "palette".into()],
+        shortcut_command: Some("theme.select".into()),
+        ..Default::default()
+    }
+}
+
+fn appearance_submenu_items(cx: &App) -> CommandPaletteItem {
+    let current = crate::settings::store::client(cx).appearance_mode();
+    let items = AppearanceMode::ALL
+        .iter()
+        .map(|mode| {
+            let label = match mode {
+                AppearanceMode::System => "System",
+                AppearanceMode::Light => "Light",
+                AppearanceMode::Dark => "Dark",
+            };
+            CommandPaletteItem {
+                value: format!("appearance:{}", mode.as_str()),
+                title: label.to_owned(),
+                description: (current == *mode).then(|| "Current".to_owned()),
+                search_terms: vec![label.to_owned(), "appearance".into(), "mode".into()],
+                ..Default::default()
+            }
+        })
+        .collect();
+    CommandPaletteItem {
+        kind: CommandPaletteItemKind::Submenu(CommandPaletteView {
+            groups: vec![CommandPaletteGroup { value: "appearance".into(), label: "Change appearance".into(), items }],
+            initial_query: None,
+        }),
+        value: "action:change-appearance".into(),
+        title: "Change appearance".into(),
+        search_terms: vec!["change appearance".into(), "light".into(), "dark".into(), "system".into(), "mode".into(), "toggle".into()],
+        shortcut_command: Some("appearance.cycle".into()),
+        ..Default::default()
+    }
 }
 
 fn scoped_project_items(entries: &[crate::new_thread::ProjectPickerEntry]) -> (
@@ -297,6 +449,20 @@ impl CommandPalette {
         self.enter_mode(mode, window, cx);
     }
 
+    /// `theme.select` (`Mod+Alt+A`): opens the command palette directly in the "Change theme" submenu.
+    pub(crate) fn open_change_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.open {
+            self.focus_return = window.focused(cx);
+        }
+        self.open = true;
+        self.enter_mode(Mode::Command, window, cx);
+        self.activate("action:change-theme", window, cx);
+    }
+
+    fn command_placeholder(&self) -> &'static str {
+        get_command_palette_input_placeholder(get_command_palette_mode(!self.search.views.is_empty(), false))
+    }
+
     fn enter_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = mode;
         let target = self.state.read(cx).active_project_target();
@@ -313,7 +479,7 @@ impl CommandPalette {
                 self.refilter(cx);
             }
             Mode::Files => self.files.start(target, &self.state.clone(), cx),
-            Mode::Content => self.content.start(target),
+            Mode::Content => self.content.start(target, self.state.read(cx)),
             Mode::Browse => {
                 self.browse.reset();
                 self.input.update(cx, |input, cx| input.set_value("~/", window, cx));
@@ -346,7 +512,12 @@ impl CommandPalette {
         match self.mode {
             Mode::Command if !self.search.views.is_empty() => {
                 self.search = reduce_command_palette_search_state(std::mem::take(&mut self.search), CommandPaletteSearchAction::Back);
-                self.input.update(cx, |input, cx| input.set_value(self.search.query.clone(), window, cx));
+                let placeholder = self.command_placeholder();
+                let query = self.search.query.clone();
+                self.input.update(cx, |input, cx| {
+                    input.set_value(query, window, cx);
+                    input.set_placeholder(placeholder, window, cx);
+                });
                 self.refilter(cx);
             }
             Mode::Command => self.close(window, cx),
@@ -460,17 +631,44 @@ impl CommandPalette {
                 });
                 single_items.insert(0, current);
             }
-            single_items
+            if state.server_config.config.as_ref().is_some_and(|config| config.scratch_workspace_root.is_some()) {
+                single_items.push(CommandPaletteItem {
+                    value: "action:new-thread-without-project".into(),
+                    title: "No project".into(),
+                    search_terms: vec!["no project".into(), "without project".into(), "none".into()],
+                    ..Default::default()
+                });
+            }
+            enumerate_command_palette_items(single_items)
         } else {
-            scoped_project_thread_items(&self.projects, &self.scoped_project_actions, preferred.as_ref(), primary, actual_context, &eligible)
+            enumerate_command_palette_items(scoped_project_thread_items(
+                &self.projects,
+                &self.scoped_project_actions,
+                preferred.as_ref(),
+                primary,
+                actual_context,
+                &eligible,
+            ))
         };
         let mut actions = action_items(state);
         if !project_thread_items.is_empty() {
-            actions.push(CommandPaletteItem {
-                kind: CommandPaletteItemKind::Submenu(CommandPaletteView { groups: vec![CommandPaletteGroup { value:"projects".into(), label:"Projects".into(), items:project_thread_items }], initial_query:None }),
-                value:"action:new-thread-in".into(), title:"New thread in...".into(), search_terms:vec!["new thread project pick choose select".into()], ..Default::default()
-            });
+            actions.insert(
+                usize::from(actions.first().is_some_and(|item| item.value == "action:new-thread-in-active")),
+                CommandPaletteItem {
+                    kind: CommandPaletteItemKind::Submenu(CommandPaletteView { groups: vec![CommandPaletteGroup { value:"projects".into(), label:"Projects".into(), items:project_thread_items }], initial_query:None }),
+                    value:"action:new-thread-in".into(), title:"New thread in...".into(), search_terms:vec!["new thread project pick choose select".into()], ..Default::default()
+                },
+            );
         }
+        actions.push(theme_submenu_items(cx));
+        actions.push(appearance_submenu_items(cx));
+        actions.push(CommandPaletteItem {
+            value: "action:theme-editor".into(),
+            title: "Toggle theme editor".into(),
+            search_terms: vec!["theme".into(), "appearance".into(), "colors".into(), "palette".into(), "customize".into()],
+            shortcut_command: Some("themeEditor.toggle".into()),
+            ..Default::default()
+        });
         for (context, value, title) in [(false,"action:copy-prompt-link","Copy prompt link"),(true,"action:copy-prompt-link-context","Copy prompt link with repo and model")] {
             if self.composer.read(cx).prompt_link(context,cx).is_some() {
                 actions.push(CommandPaletteItem { value: value.into(), title: title.into(), search_terms: vec!["copy prompt link share repo model".into()], ..Default::default() });
@@ -492,11 +690,21 @@ impl CommandPalette {
     }
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
+        let root_actions = self
+            .root
+            .iter()
+            .find(|group| group.value == "actions")
+            .map(|group| group.items.as_slice())
+            .unwrap_or(&[]);
+        let nested_items = build_nested_search_items(root_actions, &self.search.query);
         self.groups = filter_command_palette_groups(&CommandPaletteSearch {
             active_groups: self.search.views.last().map_or(&self.root, |view| &view.view.groups),
             query: &self.search.query,
             is_in_submenu: !self.search.views.is_empty(),
-            all_options: None,
+            all_options: Some(CommandPaletteAllOptions {
+                root_groups: &self.root,
+                nested_items: &nested_items,
+            }),
             project_search_items: &self.projects,
             settings_search_items: &self.settings,
             thread_search_items: &self.threads,
@@ -533,6 +741,18 @@ impl CommandPalette {
 
     /// The pin key toggles the highlighted thread row's pin; anything else pins the open thread.
     fn pin_highlighted(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.highlighted.as_deref().and_then(|value| self.scoped_thread_actions.get(value)).cloned() {
+            self.state.update(cx, |state, cx| {
+                let Some(row) = state.scoped_thread(&key).cloned() else { return };
+                let action = if row.thread.pinned {
+                    t3_core::thread_actions::ThreadAction::Unpin
+                } else {
+                    t3_core::thread_actions::ThreadAction::Pin
+                };
+                state.run_scoped_thread_action(&key, action, &[], cx);
+            });
+            return;
+        }
         let Some(thread_id) = self.highlighted.as_deref().and_then(|value| value.strip_prefix("thread:")).map(|rest| rest.split_once(':').map_or(rest, |(_, id)| id).to_owned()) else {
             return cx.propagate();
         };
@@ -550,18 +770,28 @@ impl CommandPalette {
     }
 
     fn activate(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.groups.iter().flat_map(|group| &group.items).find_map(|item| {
-            if item.value != value { return None; }
-            match &item.kind { CommandPaletteItemKind::Submenu(view) => Some(view.clone()), CommandPaletteItemKind::Action => None }
-        }) {
-            self.search = reduce_command_palette_search_state(std::mem::take(&mut self.search), CommandPaletteSearchAction::Push(view));
-            self.input.update(cx, |input, cx| input.set_value(self.search.query.clone(), window, cx));
-            self.refilter(cx);
-            return;
+        if let Some(item) = self.groups.iter().flat_map(|group| &group.items).find(|item| item.value == value) {
+            if item.disabled {
+                return;
+            }
+            if let CommandPaletteItemKind::Submenu(view) = &item.kind {
+                let view = view.clone();
+                self.search = reduce_command_palette_search_state(std::mem::take(&mut self.search), CommandPaletteSearchAction::Push(view));
+                let placeholder = self.command_placeholder();
+                let query = self.search.query.clone();
+                self.input.update(cx, |input, cx| {
+                    input.set_value(query, window, cx);
+                    input.set_placeholder(placeholder, window, cx);
+                });
+                self.refilter(cx);
+                return;
+            }
         }
         match value {
             "action:add-project" => return self.enter_mode(Mode::Browse, window, cx),
             "action:new-project" => return self.enter_mode(Mode::NewProject, window, cx),
+            "action:open-file-picker" => return self.enter_mode(Mode::Files, window, cx),
+            "action:search-project-contents" => return self.enter_mode(Mode::Content, window, cx),
             _ => {}
         }
         let project_action = self.scoped_project_actions.get(value).cloned();
@@ -642,6 +872,9 @@ impl CommandPalette {
         }
         if let Some(command) = value.strip_prefix("action:") {
             let action: Box<dyn gpui::Action> = match command {
+                "new-thread-in-active" => Box::new(NewThread),
+                "new-thread-without-project" => Box::new(NewThreadWithoutProject),
+                "find-in-thread" => Box::new(FindInThread),
                 "copy-prompt-link" => Box::new(crate::composer::prompt_links::CopyPromptLink),
                 "copy-prompt-link-context" => Box::new(crate::composer::prompt_links::CopyPromptLinkWithContext),
                 "toggle-sidebar" => keymap::action_for("sidebar.toggle"),
@@ -656,6 +889,17 @@ impl CommandPalette {
                 "switch-environment" => Box::new(crate::menus::SwitchEnvironment),
                 "usage" => keymap::action_for("usage.open"),
                 "theme-editor" => keymap::action_for("themeEditor.toggle"),
+                "project-pin" => {
+                    self.state.update(cx, |state, cx| {
+                        if let Some(project_id) = crate::new_thread::default_project(state)
+                            && let Some(project) = state.shell.project(&project_id)
+                        {
+                            let pinned = project.pinned_at.is_some();
+                            state.set_project_pinned(&project_id, !pinned, cx);
+                        }
+                    });
+                    return;
+                }
                 "settings" => {
                     crate::settings::open(t3_core::settings::search::Section::General, cx);
                     return;
@@ -669,6 +913,31 @@ impl CommandPalette {
                 _ => return,
             };
             window.dispatch_action(action, cx);
+        } else if value == "theme:standard" {
+            let mode = crate::settings::store::client(cx).appearance_mode();
+            crate::settings::store::update_client(&self.state, ClientSettingChange::Theme(ThemePreference::Default(mode)), cx);
+        } else if let Some(id) = value.strip_prefix("theme:palette:") {
+            let doc = crate::settings::store::client(cx);
+            let custom = t3_core::themes::library(doc);
+            let definition = t3_core::themes::resolve(id, &custom, crate::theme::environment_themes(cx));
+            match definition.map(|t| (t.half(false).is_some(), t.half(true).is_some())) {
+                Some((true, false)) => {
+                    let patch = t3_core::themes::assign_half(doc, false, Some(id));
+                    crate::settings::store::update_client(&self.state, ClientSettingChange::ThemePatch(patch), cx);
+                }
+                Some((false, true)) => {
+                    let patch = t3_core::themes::assign_half(doc, true, Some(id));
+                    crate::settings::store::update_client(&self.state, ClientSettingChange::ThemePatch(patch), cx);
+                }
+                _ => crate::settings::store::update_client(&self.state, ClientSettingChange::Theme(ThemePreference::Named(id.to_owned())), cx),
+            }
+        } else if let Some(mode) = value.strip_prefix("appearance:") {
+            let mode = match mode {
+                "light" => AppearanceMode::Light,
+                "dark" => AppearanceMode::Dark,
+                _ => AppearanceMode::System,
+            };
+            crate::settings::store::update_client(&self.state, ClientSettingChange::AppearanceMode(mode), cx);
         } else if let Some(id) = value.strip_prefix("setting:") {
             crate::settings::open_setting(id, cx);
         } else if let Some(rest) = value.strip_prefix("thread:") {
@@ -727,9 +996,16 @@ impl CommandPalette {
                 .child(label.to_string())
                 .into_any_element(),
             CommandPaletteRow::Item { item, .. } => {
-                let highlighted = self.highlighted.as_deref() == Some(item.value.as_str());
+                let highlighted = !item.disabled && self.highlighted.as_deref() == Some(item.value.as_str());
+                let is_submenu = matches!(item.kind, CommandPaletteItemKind::Submenu(_));
                 let value = item.value.clone();
                 let hover_value = item.value.clone();
+                let disabled = item.disabled;
+                let description = item
+                    .match_hint
+                    .as_ref()
+                    .map(|hint| format!("{}: {}", hint.label, hint.text))
+                    .or_else(|| item.description.clone());
                 let trailing = item
                     .shortcut_command
                     .as_deref()
@@ -745,19 +1021,23 @@ impl CommandPalette {
                     .gap(px(8.))
                     .rounded(px(4.))
                     .text_sm()
-                    .cursor_pointer()
+                    .when(disabled, |this| this.opacity(0.4))
+                    .when(!disabled, |this| this.cursor_pointer())
                     .when(highlighted, |this| this.bg(hsla(p.foreground).opacity(0.09)))
                     .child(div().flex_none().max_w(px(320.)).truncate().text_color(hsla(p.foreground)).child(item.title.clone()))
-                    .children(item.description.clone().map(|text| div().flex_1().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(text)))
+                    .children(description.map(|text| div().flex_1().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(text)))
                     .child(div().flex_1())
                     .children(trailing.map(|text| div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(text)))
-                    .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                        if this.highlighted.as_deref() != Some(hover_value.as_str()) {
-                            this.highlighted = Some(hover_value.clone());
-                            cx.notify();
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, _, window, cx| this.activate(&value, window, cx)))
+                    .when(is_submenu, |this| this.child(Icon::ChevronRight.render(px(14.), hsla(p.muted_foreground))))
+                    .when(!disabled, |this| {
+                        this.on_mouse_move(cx.listener(move |this, _, _, cx| {
+                            if this.highlighted.as_deref() != Some(hover_value.as_str()) {
+                                this.highlighted = Some(hover_value.clone());
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, window, cx| this.activate(&value, window, cx)))
+                    })
                     .into_any_element()
             }
         }
@@ -769,6 +1049,8 @@ impl CommandPalette {
     fn render_content_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let options = self.content.options;
+        let can_read = files::grants_filesystem_read(self.state.read(cx));
+        let mono_font = cx.theme().mono_font_family.clone();
         let toggle = |id: &'static str, label: &'static str, on: bool, underline: bool, pick: fn(&mut t3_core::project_search::ContentOptions)| {
             div()
                 .id(id)
@@ -777,14 +1059,17 @@ impl CommandPalette {
                 .flex()
                 .items_center()
                 .rounded(px(6.))
-                .font_family("SF Mono")
+                .font_family(mono_font.clone())
                 .text_xs()
-                .cursor_pointer()
+                .when(can_read, |this| {
+                    this.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| this.content.toggle_option(pick, &this.state.clone(), cx)))
+                })
+                .when(!can_read, |this| this.opacity(0.4))
                 .text_color(hsla(if on { p.foreground } else { p.muted_foreground }))
                 .when(on, |this| this.bg(hsla(p.input).opacity(0.72)))
                 .when(underline, |this| this.underline())
                 .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.content.toggle_option(pick, &this.state.clone(), cx)))
         };
         div()
             .flex()
@@ -893,6 +1178,16 @@ impl Render for CommandPalette {
                                 cx.stop_propagation();
                             }
                         }))
+                        .capture_action(cx.listener(|this, _: &Backspace, window, cx| {
+                            if this.mode == Mode::Command
+                                && !this.search.views.is_empty()
+                                && this.input.read(cx).value().is_empty()
+                                && !is_composing(&this.input, window, cx)
+                            {
+                                this.escape(window, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
                         // Inside the palette, jump keys and the pin key act on its rows (`CommandPalette.tsx`).
                         .on_action(cx.listener(|this, _: &JumpToThread1, window, cx| this.jump(0, window, cx)))
                         .on_action(cx.listener(|this, _: &JumpToThread2, window, cx| this.jump(1, window, cx)))
@@ -905,6 +1200,18 @@ impl Render for CommandPalette {
                         .on_action(cx.listener(|this, _: &JumpToThread9, window, cx| this.jump(8, window, cx)))
                         .on_action(cx.listener(|this, _: &PinThread, _, cx| this.pin_highlighted(cx)))
                         .on_action(cx.listener(|this, _: &CopyThreadReference, window, cx| {
+                            this.close(window, cx);
+                            cx.propagate();
+                        }))
+                        .on_action(cx.listener(|this, _: &FindInThread, window, cx| {
+                            this.close(window, cx);
+                            cx.propagate();
+                        }))
+                        .on_action(cx.listener(|this, _: &NewThread, window, cx| {
+                            this.close(window, cx);
+                            cx.propagate();
+                        }))
+                        .on_action(cx.listener(|this, _: &NewThreadWithoutProject, window, cx| {
                             this.close(window, cx);
                             cx.propagate();
                         }))
@@ -933,21 +1240,43 @@ impl Render for CommandPalette {
                                         .flex()
                                         .items_center()
                                         .gap(px(8.))
+                                        .when(!self.search.views.is_empty() || self.mode != Mode::Command, |this| {
+                                            this.child(
+                                                div()
+                                                    .id("palette-back")
+                                                    .size(px(28.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(6.))
+                                                    .cursor_pointer()
+                                                    .hover(|this| this.bg(hsla(p.foreground).opacity(0.08)))
+                                                    .child(Icon::ArrowLeft.render(px(14.), hsla(p.muted_foreground)))
+                                                    .on_click(cx.listener(|this, _, window, cx| this.escape(window, cx))),
+                                            )
+                                        })
                                         .child(div().flex_1().min_w_0().child(Input::new(&self.input).appearance(false).bordered(false)))
                                         .when(self.mode == Mode::Content && self.content.target.is_some(), |this| this.child(self.render_content_options(cx))),
                                 ),
                         )
                         .child(match self.mode {
-                            Mode::Command => div()
-                                .id("palette-results")
-                                .flex_1()
-                                .min_h_0()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.scroll)
-                                .p(px(8.))
-                                .when(empty, |this| this.child(div().py(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("No results")))
-                                .children(rendered)
-                                .into_any_element(),
+                            Mode::Command => {
+                                let empty_text = if self.search.query.trim_start().starts_with('>') {
+                                    "No matching actions."
+                                } else {
+                                    "No matching commands, projects, or threads."
+                                };
+                                div()
+                                    .id("palette-results")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .p(px(8.))
+                                    .when(empty, |this| this.child(div().py(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child(empty_text)))
+                                    .children(rendered)
+                                    .into_any_element()
+                            }
                             Mode::Files => self.files.render(cx),
                             Mode::Content => self.content.render(cx),
                             Mode::Browse => self.browse.render(cx),
@@ -1321,5 +1650,154 @@ mod visit_recency_tests {
             });
         });
         assert!(!fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND));
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn palette_exposes_copy_target_nested_search_submenus_and_file_content_guards(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed.0.update(cx, |state, _| state.selected_thread = Some("menu-thread".to_owned()));
+            installed
+        });
+        let window = cx.open_window(gpui::size(px(900.), px(700.)), |_, _| gpui::EmptyView);
+        cx.update_window(window.into(), |_, window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let palette = cx.new(|cx| CommandPalette::new(state.clone(), composer, window, cx));
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                let actions = &palette.root.iter().find(|group| group.value == "actions").unwrap().items;
+                let copy = actions.iter().find(|item| item.value == "action:copy-thread").unwrap();
+                assert_eq!(copy.title, "Copy thread");
+                assert_eq!(copy.description.as_deref(), Some("menu-thread"));
+                assert!(actions.iter().any(|item| item.value == "action:change-theme"));
+                assert!(actions.iter().any(|item| item.value == "action:change-appearance"));
+                assert!(actions.iter().any(|item| item.value == "action:open-file-picker"));
+                assert!(actions.iter().any(|item| item.value == "action:search-project-contents"));
+                assert!(actions.iter().any(|item| item.value == "action:find-in-thread"));
+
+                // Nested search resolves submenu children directly from root.
+                palette.search = reduce_command_palette_search_state(
+                    std::mem::take(&mut palette.search),
+                    CommandPaletteSearchAction::Query("Change appearance Dark".into()),
+                );
+                palette.refilter(cx);
+                let matched_values: Vec<_> = palette.groups.iter().flat_map(|group| &group.items).map(|item| item.value.as_str()).collect();
+                assert!(matched_values.contains(&"appearance:dark"), "expected nested appearance item, got {matched_values:?}");
+
+                // Opening change-theme submenu pushes view and Escape pops cleanly.
+                palette.open_change_theme(window, cx);
+                assert_eq!(palette.search.views.len(), 1);
+                palette.escape(window, cx);
+                assert!(palette.search.views.is_empty());
+
+                // Linked PR switches the copy action to "Copy PR link" and prefers open over merged PRs (`pingdotgg/t3code#26290`).
+                state.update(cx, |state, _| {
+                    let thread = state.shell.snapshot.as_mut().unwrap().threads.iter_mut().find(|t| t.id == "menu-thread").unwrap();
+                    thread.pull_requests = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "host": "github",
+                            "repository": "pingdotgg/t3code",
+                            "number": 100,
+                            "url": "https://github.com/pingdotgg/t3code/pull/100",
+                            "source": "manual",
+                            "linkedAt": "2026-04-02T00:00:00Z",
+                            "snapshot": { "title": "Merged PR", "state": "merged", "headBranch": "old", "baseBranch": "main", "isDraft": false }
+                        })).unwrap(),
+                        serde_json::from_value(serde_json::json!({
+                            "host": "github",
+                            "repository": "pingdotgg/t3code",
+                            "number": 26290,
+                            "url": "https://github.com/pingdotgg/t3code/pull/26290",
+                            "source": "manual",
+                            "linkedAt": "2026-04-01T00:00:00Z",
+                            "snapshot": { "title": "Open PR", "state": "open", "headBranch": "feat", "baseBranch": "main", "isDraft": false }
+                        })).unwrap(),
+                    ];
+                });
+                palette.rebuild(cx);
+                let actions = &palette.root.iter().find(|group| group.value == "actions").unwrap().items;
+                let copy = actions.iter().find(|item| item.value == "action:copy-thread").unwrap();
+                assert_eq!(copy.title, "Copy PR link");
+                assert_eq!(copy.description.as_deref(), Some("https://github.com/pingdotgg/t3code/pull/26290"));
+
+                // Half-theme override marks that half as "Current" in the theme submenu.
+                let half_key = if cx.theme().is_dark() { "dark" } else { "light" };
+                let builtin_id = t3_core::themes::builtins()[1].id.clone();
+                let mut patch = serde_json::Map::new();
+                let mut halves_map = serde_json::Map::new();
+                halves_map.insert(half_key.to_owned(), serde_json::json!(builtin_id));
+                patch.insert(t3_core::themes::HALVES_KEY.to_owned(), serde_json::Value::Object(halves_map));
+                crate::settings::store::install_committed_client(&state, patch, cx);
+                let theme_menu = theme_submenu_items(cx);
+                let CommandPaletteItemKind::Submenu(theme_view) = &theme_menu.kind else { panic!("expected submenu") };
+                let current_entry = theme_view.groups[0].items.iter().find(|item| item.value == format!("theme:palette:{builtin_id}")).unwrap();
+                assert!(current_entry.description.as_deref().is_some_and(|d| d.contains("Current")), "expected Current in {:?}", current_entry.description);
+                let standard_entry = theme_view.groups[0].items.iter().find(|item| item.value == "theme:standard").unwrap();
+                assert!(standard_entry.description.is_none());
+
+                // Overlong content query shows length error instead of pending/RPC.
+                fixture
+                    .grants
+                    .send(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","filesystem:read"]})).unwrap()))
+                    .unwrap();
+                palette.toggle_mode(Mode::Content, window, cx);
+                palette.content.search("a".repeat(t3_core::project_search::SEARCH_QUERY_MAX_LENGTH + 1), &state, cx);
+                assert_eq!(palette.content.error.as_deref(), Some("Search is limited to 256 characters."));
+
+                // Stale file matches are suppressed on pending/error and cleared when permission is lost.
+                palette.toggle_mode(Mode::Files, window, cx);
+                palette.files.matches = vec![t3_core::project_search::FilePickerMatch {
+                    name: "lib.rs".into(),
+                    name_match_indices: Vec::new(),
+                    path: "src/lib.rs".into(),
+                    path_match_indices: Vec::new(),
+                }];
+                assert!(palette.files.highlighted_path().is_none(), "pending file search must not expose stale highlighted path");
+                fixture
+                    .grants
+                    .send(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap()))
+                    .unwrap();
+                palette.files.search("lib".into(), &state, cx);
+                assert_eq!(palette.files.error.as_deref(), Some(files::NO_FILE_READ_ACCESS));
+                assert!(palette.files.matches.is_empty(), "error must clear stale file matches");
+                assert!(palette.files.highlighted_path().is_none());
+                palette.toggle_mode(Mode::Content, window, cx);
+                assert_eq!(palette.content.error.as_deref(), Some(files::NO_FILE_READ_ACCESS));
+            });
+        })
+        .unwrap();
+
+        // Post-debounce loss of `filesystem:read` cancels FileSearch RPC before sending.
+        let mut fixture = fixture;
+        fixture.take_commands();
+        fixture
+            .grants
+            .send(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read","filesystem:read"]})).unwrap()))
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let palette = cx.new(|cx| CommandPalette::new(state.clone(), composer, window, cx));
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Files, window, cx);
+                palette.files.search("app".into(), &state, cx);
+            });
+        })
+        .unwrap();
+        fixture
+            .grants
+            .send(Some(serde_json::from_value(serde_json::json!({"authenticated":true,"permissions":["orchestration:read"]})).unwrap()))
+            .unwrap();
+        cx.executor().advance_clock(std::time::Duration::from_millis(t3_core::project_search::SEARCH_DEBOUNCE_MS + 10));
+        cx.run_until_parked();
+        assert!(
+            !fixture.take_commands().contains(&t3_core::project_search::SEARCH_ENTRIES),
+            "post-debounce search must not dispatch SEARCH_ENTRIES when filesystem:read was revoked"
+        );
     }
 }

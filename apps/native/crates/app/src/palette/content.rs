@@ -4,12 +4,14 @@
 use std::time::Duration;
 
 use gpui::{AnyElement, Context, Entity, FontWeight, HighlightStyle, IntoElement, ListAlignment, ListState, ParentElement, SharedString, Styled, StyledText, Task, div, list, prelude::*, px};
+use gpui_component::ActiveTheme;
 use t3_core::project_search::{
-    ContentOptions, ContentsResult, MatchGroup, SEARCH_CONTENTS, SEARCH_DEBOUNCE_MS, contents_request, group_matches, results_summary, split_path,
+    ContentOptions, ContentsResult, MatchGroup, SEARCH_CONTENTS, SEARCH_DEBOUNCE_MS, SEARCH_QUERY_MAX_LENGTH, content_query_too_long,
+    contents_request, group_matches, results_summary, split_path, utf16_byte_ranges,
 };
 
 use super::CommandPalette;
-use super::files::char_ranges;
+use super::files::{NO_FILE_READ_ACCESS, grants_filesystem_read};
 use crate::app_state::AppState;
 use crate::project_files::ProjectTarget;
 use crate::theme::{hsla, palette};
@@ -27,7 +29,7 @@ pub(super) struct ContentSearch {
     groups: Vec<MatchGroup>,
     rows: Vec<Row>,
     pending: bool,
-    error: Option<String>,
+    pub error: Option<String>,
     pub selected: usize,
     list: ListState,
     request: Option<Task<()>>,
@@ -52,34 +54,113 @@ impl Default for ContentSearch {
 }
 
 impl ContentSearch {
-    pub fn start(&mut self, target: Option<ProjectTarget>) {
-        *self = ContentSearch { target, ..Default::default() };
+    pub fn start(&mut self, target: Option<ProjectTarget>, state: &AppState) {
+        let missing_access = target.is_some() && !grants_filesystem_read(state);
+        *self = ContentSearch {
+            target,
+            error: missing_access.then(|| NO_FILE_READ_ACCESS.to_owned()),
+            ..Default::default()
+        };
     }
 
     pub fn search(&mut self, query: String, state: &Entity<AppState>, cx: &mut Context<CommandPalette>) {
         self.query = query;
-        let Some(target) = self.target.clone() else { return };
-        let Some(payload) = contents_request(&target.cwd, &self.query, self.options) else {
+        let Some(target) = self.target.clone() else {
             self.request = None;
             self.pending = false;
+            self.error = None;
             self.set_result(None);
             return;
         };
+        if !grants_filesystem_read(state.read(cx)) {
+            self.request = None;
+            self.pending = false;
+            self.error = Some(NO_FILE_READ_ACCESS.to_owned());
+            self.set_result(None);
+            return;
+        }
+        if content_query_too_long(&self.query) {
+            self.request = None;
+            self.pending = false;
+            self.error = Some(format!("Search is limited to {SEARCH_QUERY_MAX_LENGTH} characters."));
+            self.set_result(None);
+            return;
+        }
+        let Some(payload) = contents_request(&target.cwd, &self.query, self.options) else {
+            self.request = None;
+            self.pending = false;
+            self.error = None;
+            self.set_result(None);
+            return;
+        };
+        let conn_id = state.read(cx).connection_id();
         self.pending = true;
-        let request = state.read(cx).rpc(SEARCH_CONTENTS, payload);
+        self.error = None;
+        let state = state.clone();
         self.request = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
-            let result = request.await;
+            enum Preflight {
+                StaleConnection,
+                NoAccess,
+                Send,
+            }
+            let preflight = state.read_with(cx, |app, _| {
+                if app.connection_id() != conn_id {
+                    Preflight::StaleConnection
+                } else if !grants_filesystem_read(app) {
+                    Preflight::NoAccess
+                } else {
+                    Preflight::Send
+                }
+            });
+            match preflight {
+                Preflight::Send => {}
+                Preflight::NoAccess => {
+                    let _ = this.update(cx, |palette, cx| {
+                        let content = &mut palette.content;
+                        content.pending = false;
+                        content.set_result(None);
+                        content.error = Some(NO_FILE_READ_ACCESS.to_owned());
+                        cx.notify();
+                    });
+                    return;
+                }
+                Preflight::StaleConnection => {
+                    let _ = this.update(cx, |palette, cx| {
+                        palette.content.pending = false;
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+            let result = cx.update(|cx| state.read(cx).rpc(SEARCH_CONTENTS, payload)).await;
             let _ = this.update(cx, |palette, cx| {
+                let app = state.read(cx);
                 let content = &mut palette.content;
                 content.pending = false;
+                if app.connection_id() != conn_id {
+                    cx.notify();
+                    return;
+                }
+                if !grants_filesystem_read(app) {
+                    content.set_result(None);
+                    content.error = Some(NO_FILE_READ_ACCESS.to_owned());
+                    cx.notify();
+                    return;
+                }
                 match result.map(serde_json::from_value::<ContentsResult>) {
                     Ok(Ok(result)) => {
                         content.error = None;
                         content.set_result(Some(result));
                     }
-                    Ok(Err(error)) => content.error = Some(error.to_string()),
-                    Err(error) => content.error = Some(error.to_string()),
+                    Ok(Err(error)) => {
+                        content.set_result(None);
+                        content.error = Some(error.to_string());
+                    }
+                    Err(error) => {
+                        content.set_result(None);
+                        content.error = Some(error.to_string());
+                    }
                 }
                 cx.notify();
             });
@@ -87,6 +168,9 @@ impl ContentSearch {
     }
 
     pub fn toggle_option(&mut self, pick: fn(&mut ContentOptions), state: &Entity<AppState>, cx: &mut Context<CommandPalette>) {
+        if !grants_filesystem_read(state.read(cx)) {
+            return;
+        }
         pick(&mut self.options);
         let query = self.query.clone();
         self.search(query, state, cx);
@@ -118,6 +202,9 @@ impl ContentSearch {
 
     /// The selected match's path and line, to open.
     pub fn selected_match(&self) -> Option<(String, u64)> {
+        if self.pending || self.error.is_some() {
+            return None;
+        }
         let found = self.result.as_ref()?.matches.get(self.selected)?;
         Some((found.path.clone(), found.line_number))
     }
@@ -142,6 +229,13 @@ impl ContentSearch {
             self.result.as_ref().filter(|_| has_query).map(|result| div().child(results_summary(result)).into_any_element())
         };
         let body = if self.rows.is_empty() {
+            let (color, message) = if let Some(error) = &self.error {
+                (p.destructive, error.as_str())
+            } else if has_query && !self.pending {
+                (p.muted_foreground, "No results found.")
+            } else {
+                (p.muted_foreground, "Type to search across your project.")
+            };
             div()
                 .flex_1()
                 .flex()
@@ -149,8 +243,8 @@ impl ContentSearch {
                 .justify_center()
                 .px(px(24.))
                 .text_sm()
-                .text_color(hsla(p.muted_foreground))
-                .child(if has_query && !self.pending { "No results found." } else { "Type to search across your project." })
+                .text_color(hsla(color))
+                .child(message.to_owned())
                 .into_any_element()
         } else {
             list(self.list.clone(), cx.processor(|this, index: usize, _, cx| this.content.render_row(index, cx))).flex_1().py(px(8.)).into_any_element()
@@ -188,9 +282,9 @@ impl ContentSearch {
                 let found_index = *found_index;
                 let found = &result.matches[found_index];
                 let selected = found_index == self.selected;
-                let indices: Vec<usize> = found.match_ranges.iter().flat_map(|range| range.start..range.end).collect();
                 let mark = HighlightStyle { background_color: Some(hsla(p.search_match_background)), color: Some(hsla(p.search_match_foreground)), ..Default::default() };
-                let line = StyledText::new(SharedString::from(found.line_content.clone())).with_highlights(char_ranges(&found.line_content, &indices).into_iter().map(move |range| (range, mark)));
+                let line = StyledText::new(SharedString::from(found.line_content.clone()))
+                    .with_highlights(utf16_byte_ranges(&found.line_content, &found.match_ranges).into_iter().map(move |range| (range, mark)));
                 div()
                     .id(("content-match", found_index))
                     .h(px(28.))
@@ -198,7 +292,7 @@ impl ContentSearch {
                     .items_center()
                     .gap(px(12.))
                     .px(px(12.))
-                    .font_family("SF Mono")
+                    .font_family(cx.theme().mono_font_family.clone())
                     .text_xs()
                     .cursor_pointer()
                     .when(selected, |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
