@@ -316,16 +316,21 @@ impl SettingsView {
     fn take_card_editor(&mut self, cx: &mut Context<Self>) {
         use crate::git::PendingScriptEditor;
         let targets = self.project_targets(cx);
-        let Some(first) = targets.first() else { return };
-        if !cx.has_global::<PendingScriptEditor>() || !cx.global::<PendingScriptEditor>().0.as_ref().is_some_and(|card| targets.iter().any(|target| target.project.id == card.project_id)) {
+        if !cx.has_global::<PendingScriptEditor>() {
             return;
         }
+        let Some(project_id) = cx.global::<PendingScriptEditor>().0.as_ref().map(|card| card.project_id.clone()) else {
+            return;
+        };
+        let Some(target) = targets.iter().find(|target| target.project.id == project_id) else {
+            return;
+        };
         let Some(card) = cx.global_mut::<PendingScriptEditor>().0.take() else { return };
         let request = match card.script_id {
             None => Some(EditorRequest::add()),
-            Some(id) => self.project_config(first, cx).and_then(|config| {
+            Some(id) => self.project_config(target, cx).and_then(|config| {
                 let keybindings = decode_resolved_keybindings(&config.keybindings);
-                shown_scripts(&config.settings, &first.project.id).iter().find(|script| script.id == id).map(|script| EditorRequest::edit(script, &keybindings))
+                shown_scripts(&config.settings, &target.project.id).iter().find(|script| script.id == id).map(|script| EditorRequest::edit(script, &keybindings))
             }),
         };
         if request.is_some() {
@@ -798,5 +803,125 @@ impl SettingsView {
                 .with_priority(4),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::{Render, Window, div, prelude::*, px, size};
+    use serde_json::json;
+    use t3_client::environments::{EnvironmentView, FleetView};
+    use t3_client::supervisor::ConnectionStatus;
+    use t3_core::server_config::ServerConfigState;
+    use t3_core::shell::ShellState;
+    use t3_core::sidebar::fleet::EnvironmentSummary;
+    use t3_core::sidebar::grouping::EnvironmentOwner;
+
+    use super::*;
+    use crate::app_state::AppState;
+    use crate::git::{PendingScriptEditor, ScriptEditorRequest};
+    use crate::settings::{SettingsView, search};
+
+    #[gpui::test]
+    fn take_card_editor_resolves_non_first_scoped_target(cx: &mut gpui::TestAppContext) {
+        struct Root;
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        fn env_view(
+            saved_id: &str,
+            project_id: &str,
+            scripts_json: serde_json::Value,
+        ) -> EnvironmentView {
+            let mut shell = ShellState::default();
+            shell.apply(
+                serde_json::from_value(json!({
+                    "kind": "snapshot",
+                    "snapshot": {
+                        "snapshotSequence": 1,
+                        "projects": [{
+                            "id": project_id,
+                            "title": "Shared",
+                            "workspaceRoot": "/work/shared",
+                            "scripts": [],
+                            "createdAt": "2026-11-14T10:00:00.000Z",
+                            "updatedAt": "2026-11-14T10:00:00.000Z"
+                        }],
+                        "threads": []
+                    }
+                }))
+                .unwrap(),
+            );
+            let mut config = ServerConfigState::default();
+            config.config = Some(
+                serde_json::from_value(json!({
+                    "environment": { "environmentId": saved_id, "label": saved_id },
+                    "settings": { "defaultProjectScripts": scripts_json }
+                }))
+                .unwrap(),
+            );
+            let owner = EnvironmentOwner {
+                saved_id: saved_id.into(),
+                canonical_id: Some("shared-host".into()),
+                generation: 1,
+                connection_generation: 1,
+                shell_generation: 1,
+            };
+            let summary = EnvironmentSummary::from_shell(owner, &shell, &config);
+            EnvironmentView {
+                summary: Arc::new(summary),
+                status: ConnectionStatus::Connected,
+                config,
+                grants: None,
+                settings_revision: 1,
+                keybindings_revision: 1,
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state: Entity<AppState> = cx.update(|cx| {
+            let state = crate::boot(runtime.handle().clone(), cx);
+            state.update(cx, |state, cx| {
+                state.environments.active = Some("env-a".into());
+                let env_a = env_view("env-a", "proj-first", json!([]));
+                let env_b = env_view(
+                    "env-b",
+                    "proj-second",
+                    json!([{ "id": "second-dev", "name": "Second Dev", "command": "bun dev" }]),
+                );
+                state.apply_fleet_view(
+                    Arc::new(FleetView {
+                        revision: 1,
+                        environments: vec![Arc::new(env_a), Arc::new(env_b)],
+                    }),
+                    cx,
+                );
+            });
+            cx.set_global(PendingScriptEditor(Some(ScriptEditorRequest {
+                project_id: "proj-second".into(),
+                script_id: Some("second-dev".into()),
+            })));
+            state
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| Root);
+        cx.update_window(window.into(), |_, window, cx| {
+            let view = cx.new(|cx| SettingsView::new(state.clone(), search::Section::Projects, None, window, cx));
+            view.update(cx, |view, cx| {
+                view.select_project_id("proj-first", cx);
+                let targets = view.project_targets(cx);
+                assert_eq!(targets.len(), 2, "both scoped projects must share one group");
+                assert_eq!(targets[0].project.id, "proj-first");
+                assert_eq!(targets[1].project.id, "proj-second");
+                view.take_card_editor(cx);
+                let pending = view.projects.actions.pending.as_ref().expect("pending editor should open for non-first target");
+                assert_eq!(pending.script_id.as_deref(), Some("second-dev"));
+                assert_eq!(pending.initial.name, "Second Dev");
+            });
+        })
+        .unwrap();
     }
 }

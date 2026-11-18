@@ -159,8 +159,10 @@ fn script_menu_item(details: &Entity<Details>, menu: gpui::WeakEntity<gpui_compo
     let item = PopupMenuItem::element(move |_, cx| {
         let shortcut = shortcut.as_deref().and_then(|command| crate::keymap::label(command, cx));
         let (menu, project_id, script_id, tooltip) = (menu.clone(), edit_project.clone(), edit_script.clone(), edit_label.clone());
+        let edit_debug_id = edit_id.clone();
         let edit = div()
             .id(edit_id.clone())
+            .debug_selector(move || edit_debug_id.to_string())
             .flex_none()
             .size(px(24.))
             .flex()
@@ -852,9 +854,11 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
+            crate::keymap::init(cx);
             crate::settings::store::init(cx);
         });
         let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        cx.update(|cx| crate::settings::init(state.clone(), cx));
         let git = cx.new(|cx| GitStore::new(state.clone(), cx));
         let details = cx.new(|_| super::super::Details::new(git.clone()));
         state.update(cx, |state, cx| {
@@ -1021,9 +1025,11 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
+            crate::keymap::init(cx);
             crate::settings::store::init(cx);
         });
         let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        cx.update(|cx| crate::settings::init(state.clone(), cx));
         let git = cx.new(|cx| GitStore::new(state.clone(), cx));
         let details = cx.new(|_| super::super::Details::new(git.clone()));
         state.update(cx, |state, cx| {
@@ -1080,5 +1086,74 @@ mod tests {
         assert!(vcx.debug_bounds("details-add-script").is_none());
         assert!(vcx.debug_bounds("details-run-script").is_some(), "configured script should render split run row");
         assert!(vcx.debug_bounds("details-scripts-menu").is_some());
+    }
+
+    #[gpui::test]
+    fn script_run_respects_terminal_operate_while_edit_stays_clickable(cx: &mut TestAppContext) {
+        const SCRATCH_ROOT: &str = "/home/user/.t3/scratch";
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::store::init(cx);
+        });
+        let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        cx.update(|cx| crate::settings::init(state.clone(), cx));
+        let git = cx.new(|cx| GitStore::new(state.clone(), cx));
+        let details = cx.new(|_| super::super::Details::new(git.clone()));
+        let script = ProjectScript {
+            id: "dev".into(),
+            name: "Dev".into(),
+            command: "bun dev".into(),
+            ..Default::default()
+        };
+        state.update(cx, |state, cx| {
+            state.phase = Phase::Online(ConnectionStatus::Connected);
+            apply_config(state, SCRATCH_ROOT);
+            state.server_config.config.as_mut().unwrap().settings.default_project_scripts = vec![script.clone()];
+            seed_shell(state, SCRATCH_ROOT, cx);
+            state.selected_thread = Some("t-plain".into());
+        });
+        assert!(!git.read_with(cx, |git, _| git.can_run_scripts()));
+
+        // Invoking the keybinding/details entrypoint without `terminal:operate` must neither mutate
+        // `last_scripts` nor dispatch terminal RPCs.
+        details.update(cx, |details, cx| details.run_script("proj-plain", &script, cx));
+        assert_eq!(details.read_with(cx, |details, _| details.last_script("proj-plain").map(str::to_owned)), None);
+        git.update(cx, |git, cx| git.run_script(&script, cx));
+
+        struct MenuHost {
+            menu: Entity<gpui_component::menu::PopupMenu>,
+        }
+        impl Render for MenuHost {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                v_flex().w(px(300.)).child(self.menu.clone())
+            }
+        }
+        let window = cx.add_window(|window, cx| {
+            let menu = gpui_component::menu::PopupMenu::build(window, cx, |menu, _, cx| {
+                let handle = cx.entity().downgrade();
+                menu.min_w(px(ROW_WIDTH)).item(script_menu_item(&details, handle, "proj-plain", &script, false, false))
+            });
+            MenuHost { menu }
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear());
+        let edit_bounds = vcx.debug_bounds("details-script-edit-dev").expect("disabled script item should still render Edit button");
+        vcx.simulate_click(edit_bounds.center(), gpui::Modifiers::none());
+        let pending = vcx.update(|_, cx| {
+            cx.has_global::<git::PendingScriptEditor>()
+                .then(|| cx.global::<git::PendingScriptEditor>().0.clone())
+                .flatten()
+        });
+        assert_eq!(
+            pending,
+            Some(git::ScriptEditorRequest { project_id: "proj-plain".into(), script_id: Some("dev".into()) }),
+            "Edit button inside a disabled script menu item must remain clickable when !terminal:operate"
+        );
     }
 }

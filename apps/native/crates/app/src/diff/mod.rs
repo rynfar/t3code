@@ -369,6 +369,9 @@ impl DiffPanel {
             DiffScope::ToolCall(target) => target.source_available(state.thread_shell(&target.thread_id), state.thread_state(&target.thread_id)),
             _ => true,
         };
+        let branch_commits_key = environment.as_ref().zip(cwd.as_ref()).map(|(environment, cwd)| {
+            (environment.clone(), cwd.clone(), state.panels.branch_base_refs.get(&thread_id).cloned())
+        });
         let request = environment.filter(|_| can_read && source_exists).and_then(|environment| match &scope {
             DiffScope::Branch { base_ref } => cwd.clone().map(|cwd| RequestKey::Git {
                 kind: t3_core::diff::PreviewSourceKind::BranchRange,
@@ -461,7 +464,11 @@ impl DiffPanel {
         } else if !source_exists {
             self.error = Some("The source thread is no longer available.".into());
         }
-        if visible && connected && can_read && repository != Some(false) && self.branch_commits_key.is_none() {
+        if branch_commits_key.as_ref() != self.branch_commits_key.as_ref() {
+            self.branch_commits = None;
+            self.branch_commits_error = None;
+        }
+        if visible && connected && can_read && repository != Some(false) && branch_commits_key.is_some() && self.branch_commits_key != branch_commits_key {
             self.refresh_branch_commits(cx);
         }
         if changed {
@@ -1176,7 +1183,12 @@ impl DiffPanel {
         let state = self.state.read(cx);
         let config = state.server_config.config.as_ref()?;
         let os = config.environment.platform.as_ref().map_or("unknown", |platform| platform.os.as_str());
-        let capabilities = FileContextMenuCapabilities::from_server(&config.available_editors, os);
+        let capabilities = FileContextMenuCapabilities::from_server(
+            &config.available_editors,
+            os,
+            config.shell_reveal_in_file_manager,
+            config.shell_reveal_in_file_manager_kind.as_deref(),
+        );
         (!capabilities.is_empty()).then_some((absolute_path, capabilities))
     }
 

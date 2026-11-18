@@ -875,6 +875,12 @@ pub struct ServerConfig {
     pub shell_older_settled: bool,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub available_editors: Vec<String>,
+    /// Whether `shell.openInEditor` supports `reveal: true` for `file-manager`.
+    #[serde(default)]
+    pub shell_reveal_in_file_manager: Option<bool>,
+    /// Override for the reveal label (`finder`, `file-explorer`, `files`), e.g. WSL on Linux.
+    #[serde(default)]
+    pub shell_reveal_in_file_manager_kind: Option<String>,
     /// Advertised remote open targets (e.g. Tailscale, mDNS, SSH) from `ServerConfig.remoteOpenTargets`.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub remote_open_targets: Vec<RemoteOpenTarget>,

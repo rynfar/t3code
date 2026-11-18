@@ -257,6 +257,9 @@ impl Details {
 
     /// `runProjectScript`, remembering the script as the project's Run button.
     pub fn run_script(&mut self, project_id: &str, script: &ProjectScript, cx: &mut Context<Self>) {
+        if !self.git.read(cx).can_run_scripts() {
+            return;
+        }
         if self.last_scripts.get(project_id) != Some(&script.id) {
             self.last_scripts.insert(project_id.to_owned(), script.id.clone());
             self.save(cx);

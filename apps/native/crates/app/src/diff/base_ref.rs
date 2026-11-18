@@ -2,8 +2,6 @@
 //! ~1016-1144). Renders `head → [base picker]` when `DiffScope::Branch` is active and readable,
 //! fetching local and remote refs via `vcs.listRefs` on the network runtime.
 
-#![allow(dead_code)] // Wired into `header.rs` by the parent track.
-
 use std::time::{Duration, Instant};
 
 use gpui::{

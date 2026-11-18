@@ -931,3 +931,36 @@ fn lazy_batches_resume_after_jumping_past_pending_and_unmeasured_headers() {
     assert!(!review_boundary_near(100, 20, None, 2560., 600.));
     assert!(!review_boundary_near(25, 20, Some(1500.), 160., 600.), "measured geometry wins over estimates");
 }
+
+#[test]
+fn server_config_shell_reveal_gates_file_context_menu() {
+    let base: crate::server_config::ServerConfig = serde_json::from_value(json!({
+        "environment": { "environmentId": "env-1", "label": "Local", "platform": { "os": "linux", "arch": "x86_64", "machine": "linux" } },
+        "availableEditors": ["file-manager", "cursor"]
+    }))
+    .unwrap();
+    let without_cap = FileContextMenuCapabilities::from_server(
+        &base.available_editors,
+        "linux",
+        base.shell_reveal_in_file_manager,
+        base.shell_reveal_in_file_manager_kind.as_deref(),
+    );
+    assert!(without_cap.can_open_default);
+    assert_eq!(without_cap.reveal_label, None);
+    assert_eq!(without_cap.editors, vec![("cursor".into(), "Cursor".into())]);
+
+    let wsl: crate::server_config::ServerConfig = serde_json::from_value(json!({
+        "environment": { "environmentId": "env-1", "label": "WSL", "platform": { "os": "linux", "arch": "x86_64", "machine": "linux" } },
+        "availableEditors": ["file-manager"],
+        "shellRevealInFileManager": true,
+        "shellRevealInFileManagerKind": "file-explorer"
+    }))
+    .unwrap();
+    let with_wsl = FileContextMenuCapabilities::from_server(
+        &wsl.available_editors,
+        "linux",
+        wsl.shell_reveal_in_file_manager,
+        wsl.shell_reveal_in_file_manager_kind.as_deref(),
+    );
+    assert_eq!(with_wsl.reveal_label, Some("Reveal in File Explorer"));
+}

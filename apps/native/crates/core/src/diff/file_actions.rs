@@ -79,6 +79,16 @@ pub fn reveal_in_file_explorer_label_for_os(os: &str) -> &'static str {
     }
 }
 
+/// `revealInFileExplorerLabelForKind` (`apps/web/src/components/preview/fileExplorerLabel.ts`).
+pub fn reveal_in_file_explorer_label_for_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "finder" => Some("Reveal in Finder"),
+        "file-explorer" => Some("Reveal in File Explorer"),
+        "files" => Some("Reveal in Files"),
+        _ => None,
+    }
+}
+
 /// `resolveFileContextMenuAbsolutePath` (`apps/web/src/fileContextMenu.ts`): resolves a diff file
 /// path into the host path to pass to `shell.openInEditor`, or `None` outside the workspace.
 pub fn resolve_file_context_menu_absolute_path(
@@ -108,7 +118,12 @@ pub struct FileContextMenuCapabilities {
 }
 
 impl FileContextMenuCapabilities {
-    pub fn from_server(available_editors: &[String], os: &str) -> Self {
+    pub fn from_server(
+        available_editors: &[String],
+        os: &str,
+        shell_reveal_in_file_manager: Option<bool>,
+        shell_reveal_in_file_manager_kind: Option<&str>,
+    ) -> Self {
         let has_file_manager = available_editors.iter().any(|id| id == "file-manager");
         let editors = available_editors
             .iter()
@@ -118,8 +133,13 @@ impl FileContextMenuCapabilities {
                 (id.clone(), label.to_owned())
             })
             .collect();
+        let reveal_label = (shell_reveal_in_file_manager == Some(true) && has_file_manager).then(|| {
+            shell_reveal_in_file_manager_kind
+                .and_then(reveal_in_file_explorer_label_for_kind)
+                .unwrap_or_else(|| reveal_in_file_explorer_label_for_os(os))
+        });
         Self {
-            reveal_label: has_file_manager.then(|| reveal_in_file_explorer_label_for_os(os)),
+            reveal_label,
             can_open_default: has_file_manager,
             editors,
         }
@@ -204,15 +224,23 @@ mod tests {
             resolve_file_context_menu_absolute_path("/etc/passwd", Some("/repo/frontend"), Some("/repo")),
             None
         );
-        let caps = FileContextMenuCapabilities::from_server(&["file-manager".into(), "cursor".into()], "darwin");
+        let caps = FileContextMenuCapabilities::from_server(&["file-manager".into(), "cursor".into()], "darwin", Some(true), None);
         assert!(caps.can_open_default);
         assert_eq!(caps.reveal_label, Some("Reveal in Finder"));
         assert_eq!(caps.editors, vec![("cursor".into(), "Cursor".into())]);
+        let gated_off = FileContextMenuCapabilities::from_server(&["file-manager".into()], "darwin", None, None);
+        assert!(gated_off.can_open_default);
+        assert_eq!(gated_off.reveal_label, None);
+        let explicitly_false = FileContextMenuCapabilities::from_server(&["file-manager".into()], "darwin", Some(false), Some("finder"));
+        assert_eq!(explicitly_false.reveal_label, None);
+        let wsl_kind = FileContextMenuCapabilities::from_server(&["file-manager".into()], "linux", Some(true), Some("file-explorer"));
+        assert_eq!(wsl_kind.reveal_label, Some("Reveal in File Explorer"));
         assert_eq!(
             file_context_menu_open_request("/repo/a.ts", &FileContextMenuAction::RevealInFolder).1,
             json!({ "cwd": "/repo/a.ts", "editor": "file-manager", "reveal": true })
         );
         assert_eq!(reveal_in_file_explorer_label_for_os("windows"), "Reveal in File Explorer");
         assert_eq!(reveal_in_file_explorer_label_for_os("linux"), "Reveal in Files");
+        assert_eq!(reveal_in_file_explorer_label_for_kind("files"), Some("Reveal in Files"));
     }
 }

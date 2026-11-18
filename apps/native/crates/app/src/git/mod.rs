@@ -780,6 +780,9 @@ impl GitStore {
     /// `runProjectScript`: in the script's idle thread terminal, or a fresh one beside it. A
     /// `stopOnSettle` script, or a device that cannot read terminals, always opens a new one.
     pub fn run_script(&mut self, script: &ProjectScript, cx: &mut Context<Self>) {
+        if !self.can_run_scripts() {
+            return;
+        }
         let (Some(target), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else { return };
         let suffix: String = uuid_v4().chars().take(8).collect();
         let can_reuse = self.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::TERMINAL_READ_SCOPE));
