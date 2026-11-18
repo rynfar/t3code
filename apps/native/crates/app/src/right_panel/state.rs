@@ -230,9 +230,14 @@ impl AppState {
     }
 
     /// The thread's browser tabs and their sessions' snapshots, the active tab last.
+    /// Returns nothing when `Previews` cannot operate sessions, since `Previews::panel_changed`
+    /// leaves those server sessions open (`useRightPanelSurfaceClose.ts`).
     fn browser_snapshots(&self, thread_id: &str, cx: &App) -> Vec<(String, BrowserSnapshot)> {
         let Some(previews) = crate::preview::previews(cx) else { return Vec::new() };
         let previews = previews.read(cx);
+        if previews.availability() != crate::preview::Availability::Available {
+            return Vec::new();
+        }
         let panel = self.panels.panels.panel(thread_id);
         let mut snapshots: Vec<(String, BrowserSnapshot)> = panel
             .surfaces
@@ -289,6 +294,7 @@ impl AppState {
     /// settings, then its tab in front of its thread. A failure defers the entry.
     fn reopen_browser(&mut self, view: ClosedView, cx: &mut Context<Self>) {
         let ClosedTarget::Browser { snapshot } = &view.target else { return };
+        let connection = self.connection_id();
         let previews = crate::preview::previews(cx).filter(|previews| previews.read(cx).availability() == crate::preview::Availability::Available);
         let task = previews.as_ref().and_then(|_| self.request(preview::method::OPEN, snapshot.open_input(&view.thread_id), SessionSnapshot::decode));
         let (Some(previews), Some(task)) = (previews, task) else {
@@ -299,18 +305,34 @@ impl AppState {
         self.save_panels(cx);
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-            let _ = this.update(cx, |state, cx| match result {
-                Ok(opened) => {
-                    state.select_thread(&view.thread_id, cx);
-                    let thread = view.thread_id.clone();
-                    state.mutate_panels(cx, |panels, current| current == thread && panels.panels.open_browser(current, Some(&opened.tab_id)));
-                    // The preview controller fronts it again once its session arrives.
-                    cx.defer(move |cx| previews.update(cx, |previews, cx| previews.popup(&thread, &opened.tab_id, cx)));
+            let weak = this.clone();
+            let _ = this.update(cx, |state, cx| {
+                if state.connection_id() != connection {
+                    return;
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "reopening a closed browser tab failed");
-                    state.panels.panels.defer_closed(view);
-                    state.save_panels(cx);
+                match result {
+                    Ok(opened) => {
+                        let thread = view.thread_id.clone();
+                        state.select_thread(&thread, cx);
+                        // Let `AppEvent::Selection` flush (`Previews::threads.show` + `list_selected`)
+                        // before opening the tab, so `show`'s initial reconcile does not drop it.
+                        let tab_id = opened.tab_id;
+                        cx.defer(move |cx| {
+                            let Some(app) = weak.upgrade() else { return };
+                            app.update(cx, |state, cx| {
+                                if state.connection_id() != connection || state.panel_thread().as_deref() != Some(thread.as_str()) {
+                                    return;
+                                }
+                                state.mutate_panels(cx, |panels, current| current == thread && panels.panels.open_browser(current, Some(&tab_id)));
+                            });
+                            previews.update(cx, |previews, cx| previews.popup(&thread, &tab_id, cx));
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "reopening a closed browser tab failed");
+                        state.panels.panels.defer_closed(view);
+                        state.save_panels(cx);
+                    }
                 }
             });
         })
@@ -363,5 +385,122 @@ impl AppState {
             self.panels.diff_file_tree_open = open;
             self.save_panels(cx);
         }
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use gpui::Entity;
+    use t3_client::supervisor::{ClientFixture, ConnectionStatus};
+    use t3_core::right_panel::BrowserSnapshot;
+
+    fn setup_with_previews(cx: &mut gpui::TestAppContext, can_operate_preview: bool) -> (Entity<AppState>, ClientFixture, tokio::runtime::Runtime) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let perms = if can_operate_preview { json!(["preview:operate"]) } else { json!([]) };
+        fixture.grants.send(Some(serde_json::from_value(json!({"authenticated": true, "permissions": perms})).unwrap())).unwrap();
+        state.update(cx, |state, cx| {
+            state.panels = PanelState::default();
+            let config = state.server_config.config.as_mut().unwrap();
+            config.environment.capabilities.server_browser = Some(true);
+            state.select_thread("menu-thread", cx);
+        });
+        cx.update(|cx| crate::preview::init(state.clone(), cx));
+        cx.run_until_parked();
+        (state, fixture, runtime)
+    }
+
+    #[gpui::test]
+    async fn browser_snapshots_skips_when_preview_unavailable(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (state, _fixture, _runtime) = setup_with_previews(cx, false);
+        state.update(cx, |state, cx| {
+            state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, Some("tab-1")));
+            assert!(state.browser_snapshots("menu-thread", cx).is_empty());
+            state.close_surface("browser:tab-1", cx);
+            assert!(state.panels.panels.closed_views().is_empty());
+            state.stop_pump();
+        });
+    }
+
+    #[gpui::test]
+    async fn reopen_browser_survives_selection_reconcile_and_ignores_connection_switch(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let (state, mut fixture, _runtime) = setup_with_previews(cx, true);
+        let snapshot = BrowserSnapshot {
+            tab_id: "tab-old".into(),
+            url: Some("http://localhost:3000/a".into()),
+            viewport: None,
+            profile_id: None,
+            zoom_factor: None,
+            color_scheme: None,
+        };
+        state.update(cx, |state, cx| {
+            state.panels.panels.remember_browser("other-thread", snapshot.clone());
+            state.reopen_closed_view(cx);
+        });
+        let reply = loop {
+            let (method, _payload, reply) = fixture.next_request().await;
+            if method == preview::method::OPEN {
+                break reply;
+            }
+        };
+        reply
+            .send(Ok(json!({
+                "threadId": "other-thread",
+                "tabId": "tab-new",
+                "updatedAt": "2026-01-01T00:00:01Z",
+                "navStatus": { "_tag": "Success", "url": "http://localhost:3000/a", "title": "App" }
+            })))
+            .unwrap();
+        cx.run_until_parked();
+        let list_reply = loop {
+            let (method, payload, reply) = fixture.next_request().await;
+            if method == preview::method::LIST && payload.get("threadId").and_then(serde_json::Value::as_str) == Some("other-thread") {
+                break reply;
+            }
+        };
+        let _ = list_reply.send(Ok(json!({
+            "sessions": [{
+                "threadId": "other-thread",
+                "tabId": "tab-new",
+                "updatedAt": "2026-01-01T00:00:01Z",
+                "navStatus": { "_tag": "Success", "url": "http://localhost:3000/a", "title": "App" }
+            }]
+        })));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_thread.as_deref(), Some("other-thread"));
+            assert_eq!(state.panels.panels.active_surface("other-thread").map(Surface::id), Some("browser:tab-new"));
+        });
+
+        // Switching environments while `preview.open` is in flight must not mutate the new connection.
+        state.update(cx, |state, cx| {
+            state.panels.panels.remember_browser("other-thread", snapshot);
+            state.reopen_closed_view(cx);
+        });
+        let reply = loop {
+            let (method, _payload, reply) = fixture.next_request().await;
+            if method == preview::method::OPEN {
+                break reply;
+            }
+        };
+        let (new_client, _new_fixture) = ClientFixture::handle(
+            serde_json::from_value(json!({"authenticated": true, "permissions": ["preview:operate"]})).unwrap(),
+        );
+        state.update(cx, |state, cx| {
+            state.environments.active = Some("other-env".into());
+            let shell = state.shell.clone();
+            let config = state.server_config.clone();
+            state.install_active_environment(new_client, shell, config, ConnectionStatus::Connected, cx);
+            state.panels = PanelState::default();
+        });
+        let _ = reply.send(Err(t3_client::session::RpcError::Closed));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(state.panels.panels.closed_views().is_empty(), "stale failure must not defer into new connection");
+        });
+        state.update(cx, |state, _| state.stop_pump());
     }
 }

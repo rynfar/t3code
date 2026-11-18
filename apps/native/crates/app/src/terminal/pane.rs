@@ -302,12 +302,18 @@ impl TerminalPane {
     fn focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
         if !focused {
             self.dismiss_selection_menu(cx);
+            self.clear_hovered_link(cx);
         }
         let report = self.session.shared.lock().emulator.focus_input(focused);
         if let Some(report) = report {
             self.session.write(report);
         }
         cx.notify();
+    }
+
+    fn scroll_view(&mut self, change: impl FnOnce(&mut emulator::Emulator), cx: &mut Context<Self>) {
+        self.session.update(|core| change(&mut core.emulator));
+        self.update_row_stability(cx);
     }
 
     /// Sends input and follows the output again, like typing into any terminal does.
@@ -321,7 +327,7 @@ impl TerminalPane {
             core.emulator.display_offset() > 0
         };
         if scrolled {
-            self.session.update(|core| core.emulator.scroll_to_bottom());
+            self.scroll_view(emulator::Emulator::scroll_to_bottom, cx);
         }
         let writes = self.session.write(data);
         if !writes.is_empty() {
@@ -446,7 +452,7 @@ impl TerminalPane {
     }
 
     fn jump_to_latest(&mut self, _: &JumpToLatest, _: &mut Window, cx: &mut Context<Self>) {
-        self.session.update(|core| core.emulator.scroll_to_bottom());
+        self.scroll_view(emulator::Emulator::scroll_to_bottom, cx);
         cx.notify();
     }
 
@@ -486,15 +492,15 @@ impl TerminalPane {
                 TerminalShortcut::Paste => self.paste(&Paste, window, cx),
                 TerminalShortcut::SelectAll => self.select_all(&SelectAll, window, cx),
                 TerminalShortcut::ScrollPages(pages) => {
-                    self.session.update(|core| core.emulator.scroll(pages * rows.max(1)));
+                    self.scroll_view(|emulator| emulator.scroll(pages * rows.max(1)), cx);
                     cx.notify();
                 }
                 TerminalShortcut::ScrollToTop => {
-                    self.session.update(|core| core.emulator.scroll_to_top());
+                    self.scroll_view(emulator::Emulator::scroll_to_top, cx);
                     cx.notify();
                 }
                 TerminalShortcut::ScrollToBottom => {
-                    self.session.update(|core| core.emulator.scroll_to_bottom());
+                    self.scroll_view(emulator::Emulator::scroll_to_bottom, cx);
                     cx.notify();
                 }
             }
@@ -591,13 +597,19 @@ impl TerminalPane {
         if links::is_url(&hit.text) {
             return Some(hit);
         }
-        if self.can_activate_link(&hit.text, cx) {
-            return Some(hit);
+        if !self.has_link_scopes(true, cx) {
+            return None;
         }
-        if allow_validation && self.has_link_scopes(true, cx) && self.link_query_path(&hit.text).is_some() {
-            return Some(hit);
+        let query = self.link_query_path(&hit.text)?;
+        let mut cache = self.link_metadata.borrow_mut();
+        let now = cache.0.elapsed().as_millis() as u64;
+        let thread = self.session.target.thread_id.as_str();
+        match cache.1.lookup(&query, Some(thread), now) {
+            Lookup::Known(Some(meta)) if meta.is_openable() => Some(hit),
+            Lookup::Known(_) => None,
+            Lookup::Fetch if allow_validation => Some(hit),
+            Lookup::Fetch => None,
         }
-        None
     }
 
     fn validate_link(&self, text: &str, cx: &mut Context<Self>) -> LinkValidation {
@@ -782,7 +794,10 @@ impl TerminalPane {
     ) {
         match validation {
             LinkValidation::Ready(true) => self.open_validated_link(&link.text, modifiers, cx),
-            LinkValidation::Ready(false) => {}
+            LinkValidation::Ready(false) => {
+                self.session.update(|core| core.emulator.clear_selection());
+                cx.notify();
+            }
             LinkValidation::Pending(task) => {
                 let request_id = self.link_activation_request_id;
                 let geometry = self.geometry;
@@ -1030,7 +1045,7 @@ impl TerminalPane {
         match input {
             Some(input) => self.input(&input, cx),
             None => {
-                self.session.update(|core| core.emulator.scroll(lines));
+                self.scroll_view(|emulator| emulator.scroll(lines), cx);
                 cx.notify();
             }
         }
@@ -1179,5 +1194,138 @@ impl EntityInputHandler for TerminalPane {
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
         !self.session.shared.lock().read_only
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use t3_core::files::metadata::MetadataCache;
+    use t3_core::terminal::LaunchLocation;
+
+    fn test_pane(
+        cx: &mut gpui::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        cols: u16,
+        rows: u16,
+    ) -> (Entity<AppState>, t3_client::supervisor::ClientFixture, gpui::WindowHandle<TerminalPane>) {
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:operate", "filesystem:read"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let target = Target {
+            thread_id: "menu-thread".into(),
+            terminal_id: "term-1".into(),
+            location: LaunchLocation::new("/repo", None),
+        };
+        let client = state.read_with(cx, |state, _| state.client_handle().unwrap());
+        let cache = Rc::new(RefCell::new((Instant::now(), MetadataCache::default())));
+        let window = cx.add_window(|window, cx| {
+            let mut pane = TerminalPane::new(target, client, runtime.handle().clone(), window, cx);
+            pane.set_link_context(state.clone(), cache);
+            pane.set_geometry(Geometry {
+                origin: Point::default(),
+                cell_width: 10.,
+                line_height: 20.,
+                cols: cols as usize,
+                rows: rows as usize,
+            });
+            pane.session.update(|core| core.emulator.resize(Grid::new(cols, rows)));
+            pane
+        });
+        (state, fixture, window)
+    }
+
+    #[gpui::test]
+    fn scroll_refreshes_hovered_link_and_row_stability(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture, window) = test_pane(cx, &runtime, 40, 4);
+        window
+            .update(cx, |pane, _, cx| {
+                pane.set_geometry(Geometry {
+                    origin: Point::default(),
+                    cell_width: 10.,
+                    line_height: 20.,
+                    cols: 40,
+                    rows: 4,
+                });
+                pane.session.update(|core| {
+                    core.emulator.resize(Grid::new(40, 4));
+                    core.emulator.feed(b"https://example.com\r\nline1\r\nline2\r\nline3\r\nline4");
+                    assert_eq!(core.emulator.display_offset(), 0);
+                });
+                // Row 0 of the viewport currently shows "line1", while "https://example.com" scrolled into history.
+                pane.scroll_view(|emulator| emulator.scroll(1), cx);
+                assert_eq!(pane.session.shared.lock().emulator.display_offset(), 1);
+                pane.hover_pointer = Some(gpui::point(px(25.), px(10.)));
+                pane.refresh_hovered_link(cx);
+                assert_eq!(pane.hovered_link.as_ref().map(|hit| hit.text.as_str()), Some("https://example.com"));
+                let before_gen = pane.stability_generation;
+                // Scrolling back down moves the URL off row 0; hover and stability update immediately.
+                pane.scroll_view(|emulator| emulator.scroll(-1), cx);
+                assert_eq!(pane.session.shared.lock().emulator.display_offset(), 0);
+                assert!(pane.stability_generation > before_gen);
+                assert_eq!(pane.hovered_link, None);
+            })
+            .unwrap();
+        state.update(cx, |state, _| state.stop_pump());
+    }
+
+    #[gpui::test]
+    fn cached_miss_click_clears_selection_without_activating(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture, window) = test_pane(cx, &runtime, 40, 4);
+        window
+            .update(cx, |pane, window, cx| {
+                {
+                    let mut cache = pane.link_metadata.borrow_mut();
+                    let now = cache.0.elapsed().as_millis() as u64;
+                    cache.1.retain_thread("menu-thread");
+                    cache.1.remember("/repo/src/missing.rs", None, Some("menu-thread"), now);
+                }
+                pane.session.update(|core| {
+                    core.emulator.feed(b"open src/missing.rs now");
+                    core.emulator.select_all();
+                });
+                assert!(pane.session.shared.lock().emulator.has_selection());
+                let pos = gpui::point(px(75.), px(10.));
+                pane.mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: pos,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    },
+                    window,
+                    cx,
+                );
+                pane.mouse_up(
+                    &MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: pos,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(!pane.session.shared.lock().emulator.has_selection());
+            })
+            .unwrap();
+        let commands = fixture.take_commands();
+        assert!(
+            !commands.iter().any(|method| *method == GET_METADATA || *method == OPEN_IN_EDITOR),
+            "cached miss click must not fetch metadata or open editor, got {commands:?}"
+        );
+        state.update(cx, |state, _| state.stop_pump());
     }
 }
