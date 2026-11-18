@@ -210,6 +210,16 @@ pub fn checkpoint_diff_request(thread_id: &str, turn_count: u64, ignore_whitespa
     }
 }
 
+/// `CHECKPOINT_DIFF_TRUNCATED_MARKER` (`contracts/src/checkpointDiff.ts`): ends a checkpoint diff
+/// the server cut off at its output size limit.
+pub const CHECKPOINT_DIFF_TRUNCATED_MARKER: &str = "\n\n[truncated]";
+
+/// `isSelectedPatchTruncated` for a turn scope in `DiffPanel.tsx`: the server marks a cut-off
+/// checkpoint diff by appending the marker instead of a flag.
+pub fn is_checkpoint_diff_truncated(patch: &str) -> bool {
+    patch.ends_with(CHECKPOINT_DIFF_TRUNCATED_MARKER)
+}
+
 /// `OrchestrationGetTurnDiffResult.diff`.
 pub fn decode_turn_diff(value: &Value) -> Result<String, String> {
     value

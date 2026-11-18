@@ -378,6 +378,17 @@ fn turn_one_uses_the_full_thread_diff() {
 }
 
 #[test]
+fn a_turn_diff_cut_off_at_the_size_limit_is_truncated() {
+    let cut = format!("{MODIFIED}{CHECKPOINT_DIFF_TRUNCATED_MARKER}");
+    assert!(is_checkpoint_diff_truncated(&cut));
+    assert!(!is_checkpoint_diff_truncated(MODIFIED));
+    assert!(!is_checkpoint_diff_truncated("[truncated]"), "only the server's marker counts");
+    let parsed = files(&cut);
+    assert_eq!(parsed.len(), 1, "the files before the marker still render");
+    assert_eq!(parsed[0].path(), "src/main.rs");
+}
+
+#[test]
 fn diff_preview_picks_the_requested_source() {
     let (method, payload) = diff_preview_request("/repo", Some("main"), true);
     assert_eq!(method, "review.getDiffPreview");

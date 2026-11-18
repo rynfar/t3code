@@ -343,7 +343,17 @@ impl DiffPanel {
                     .on_click(move |event, window, cx| toggle_button(event, window, cx)),
             )
             .child(icon.svg().size(px(14.)).text_color(icon_color))
-            .child(div().min_w_0().text_ellipsis_start().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::MEDIUM).child(title))
+            .child({
+                let title = div().id(("diff-file-title", file_ix)).min_w_0().text_ellipsis_start().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::MEDIUM).child(title);
+                // The title opens the file; the rest of the header folds it (`onClickCapture`).
+                if self.is_external() { title } else {
+                    let hover = hsla(mix_rgba(p.code_foreground, p.primary, 0.16));
+                    title.hover(move |style| style.text_color(hover)).on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.open_file(file_ix, cx);
+                    }))
+                }
+            })
             .child(
                 Button::new(("diff-file-copy", file_ix))
                     .variant(Variant::Ghost)
@@ -362,6 +372,15 @@ impl DiffPanel {
             .child(stat_label(u64::from(file.additions), u64::from(file.deletions), cx))
             .into_any_element()
     }
+}
+
+/// `color-mix(in srgb, a (1-t), b t)` over packed `0xRRGGBBAA` tokens.
+fn mix_rgba(a: u32, b: u32, t: f32) -> u32 {
+    (0..4).fold(0u32, |out, channel| {
+        let shift = 24 - channel * 8;
+        let (x, y) = (((a >> shift) & 0xff) as f32, ((b >> shift) & 0xff) as f32);
+        out | (((x + (y - x) * t).round() as u32) << shift)
+    })
 }
 
 /// The shared diff row surface, also used by the embedded typography sample.

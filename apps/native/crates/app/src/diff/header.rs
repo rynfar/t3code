@@ -5,6 +5,8 @@ use gpui::{Context, IntoElement, ParentElement, Styled, Window, div, prelude::*,
 use gpui_component::h_flex;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use t3_core::diff::{DiffScope, DiffSelection, Layout, line_stat};
+use t3_core::sidebar::time::{parse_iso, to_local};
+use t3_core::timeline::TimestampLocale;
 
 use super::DiffPanel;
 use super::lines::stat_label;
@@ -45,6 +47,8 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
     let layout = crate::settings::client_settings(cx).diff_layout();
     let tree_open = panel.state.read(cx).panels.diff_file_tree_open;
     let all_collapsed = panel.all_collapsed();
+    let test_files = panel.test_file_count();
+    let hides_tests = panel.hides_test_files();
 
     let scope_menu = Button::new("diff-scope")
         .variant(Variant::Secondary)
@@ -79,14 +83,25 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                     .disabled(latest.is_none())
                     .on_click(move |_, _, cx| open_turn(&entity, &run_id, cx))
             })
-            .submenu("Turn", window, cx, move |menu, _, _| {
+            .submenu("Turn", window, cx, move |menu, _, cx| {
+                let format = crate::settings::store::client(cx).timestamp_format();
+                let zone = crate::timestamp::viewer_zone();
+                let muted = hsla(palette(cx).muted_foreground);
                 turns.iter().fold(menu, |menu, summary| {
                     let entity = turn_entity.clone();
                     let run_id = summary.run_id.clone();
+                    let label: gpui::SharedString = format!("Turn {}", summary.turn_count).into();
+                    // `formatShortTimestamp(summary.completedAt, timestampFormat)`.
+                    let time: gpui::SharedString = parse_iso(&summary.completed_at)
+                        .map(|ms| crate::timestamp::SystemTimestampLocale.time(to_local(ms, &zone), format))
+                        .unwrap_or_default()
+                        .into();
                     menu.item(
-                        PopupMenuItem::new(format!("Turn {}", summary.turn_count))
-                            .checked(selected.as_deref() == Some(summary.run_id.as_str()))
-                            .on_click(move |_, _, cx| open_turn(&entity, &run_id, cx)),
+                        PopupMenuItem::element(move |_, _| {
+                            h_flex().w_full().gap(px(8.)).child(label.clone()).child(div().ml_auto().text_xs().text_color(muted).child(time.clone()))
+                        })
+                        .checked(selected.as_deref() == Some(summary.run_id.as_str()))
+                        .on_click(move |_, _, cx| open_turn(&entity, &run_id, cx)),
                     )
                 })
             })
@@ -170,6 +185,16 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                         .pressed(panel.ignore_whitespace)
                         .tooltip(if panel.ignore_whitespace { "Show whitespace changes" } else { "Hide whitespace changes" })
                         .on_click(act(DiffPanel::toggle_whitespace)),
+                ))
+                .when(test_files > 0, |this| this.child(
+                    Button::new("diff-hide-tests")
+                        .variant(Variant::Toggle)
+                        .size(Size::IconSm)
+                        .icon(Icon::FlaskConical)
+                        .icon_size(14.)
+                        .pressed(hides_tests)
+                        .tooltip(if hides_tests { format!("Show {test_files} hidden test {}", if test_files == 1 { "file" } else { "files" }) } else { "Hide test files".to_owned() })
+                        .on_click(act(DiffPanel::toggle_hide_test_files)),
                 ))
                 .when(has_files, |this| {
                     this.child(

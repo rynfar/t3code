@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use t3_core::diff::{
     PreviewSourceKind, ToolCallDiff, ToolCallTarget, checkpoint_diff_request, decode_turn_diff,
-    hide_whitespace_changes, tool_call_diff, ReviewModel,
+    hide_whitespace_changes, is_checkpoint_diff_truncated, tool_call_diff, ReviewModel,
 };
 use t3_core::timeline::{GET_TURN_ITEM, decode_detail};
 
@@ -83,7 +83,7 @@ pub fn fetch(state: &AppState, key: &RequestKey) -> Option<tokio::task::JoinHand
         RequestKey::Turn { thread_id, turn_count, ignore_whitespace, .. } => {
             let (method, payload) = checkpoint_diff_request(thread_id, *turn_count, *ignore_whitespace);
             state.request(method, payload, |value| {
-                decode_turn_diff(&value).map(|patch| Loaded::Turn(Parsed::new(&patch, false, None, None, None)))
+                decode_turn_diff(&value).map(|patch| Loaded::Turn(Parsed::new(&patch, is_checkpoint_diff_truncated(&patch), None, None, None)))
             })
         }
         RequestKey::ToolCall { target, .. } if !target.source_available(state.thread_shell(&target.thread_id), state.thread_state(&target.thread_id)) => None,

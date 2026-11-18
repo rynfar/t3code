@@ -623,6 +623,13 @@ impl DiffPanel {
             Arc::ptr_eq(&view.parsed, &parsed) && view.scope_key == scope_key && view.layout == layout && view.files_collapsed_default == files_collapsed_default
         });
         if same {
+            let hidden = self.hidden_files(parsed.files());
+            if let Some(view) = self.view.as_mut()
+                && view.set_hidden(hidden, &self.tree_collapsed)
+            {
+                self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
+                cx.notify();
+            }
             self.reveal_requested(cx);
             if self.scroll_restore.has_pending() {
                 cx.notify();
@@ -647,15 +654,17 @@ impl DiffPanel {
             self.view = Some(View::new(parsed, scope_key.clone(), layout, &self.session, files_collapsed_default, &self.tree_collapsed, review));
             None
         };
+        let hidden = self.hidden_files(self.view.as_ref().expect("installed view").parsed.files());
+        let hidden_changed = self.view.as_mut().expect("installed view").set_hidden(hidden, &self.tree_collapsed);
         let view = self.view.as_ref().expect("installed view");
         if self.comments.editor.as_ref().is_some_and(|editor| !(0..view.parsed.files().len()).any(|i| view.key(i) == Some(editor.file_key.as_str()))) { self.comments.editor = None; }
         let count = view.row_count();
         match changes {
-            Some(changes) => {
+            Some(changes) if !hidden_changed => {
                 view::apply_row_changes(&self.list, changes);
                 let _ = self.list.clone().with_uniform_item_height(px(lines::LINE_HEIGHT));
             }
-            None => self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT)),
+            _ => self.list.reset_with_uniform_height(count, px(lines::LINE_HEIGHT)),
         }
         let keep = keep.and_then(|(key, within, offset_in_item)| {
             let file = (0..view.parsed.files().len()).find(|&i| view.key(i) == Some(&key))?;
@@ -963,10 +972,61 @@ impl DiffPanel {
         cx.notify();
     }
 
+    /// `isFileShown`: with "Hide test files" on, test files are left out, except the one another
+    /// view asked to reveal.
+    fn hidden_files(&self, files: &[t3_core::diff::FileDiff]) -> Vec<bool> {
+        let keep = match &self.selection {
+            DiffSelection::Turn { file_path: Some(path), .. } if self.external.is_none() => Some(path.as_str()),
+            _ => None,
+        };
+        files.iter().map(|file| self.session.hide_test_files && keep != Some(file.path()) && t3_core::diff::is_test_changed_file(file.path())).collect()
+    }
+
+    /// `testFileCount`: the toggle shows only when the patch has test files.
+    pub fn test_file_count(&self) -> usize {
+        self.view.as_ref().map_or(0, |view| view.parsed.files().iter().filter(|file| t3_core::diff::is_test_changed_file(file.path())).count())
+    }
+
+    pub fn hides_test_files(&self) -> bool {
+        self.session.hide_test_files
+    }
+
+    pub fn toggle_hide_test_files(&mut self, cx: &mut Context<Self>) {
+        self.session.hide_test_files = !self.session.hide_test_files;
+        let Some(files) = self.view.as_ref().map(|view| view.parsed.clone()) else { cx.notify(); return };
+        let hidden = self.hidden_files(files.files());
+        let Some(view) = self.view.as_mut() else { return };
+        if view.set_hidden(hidden, &self.tree_collapsed) {
+            self.scroll_restore.discard(&view.scope_key);
+            self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
+        }
+        cx.notify();
+    }
+
     pub fn copy_path(&mut self, file: usize, cx: &mut Context<Self>) {
         if let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|file| file.path().to_owned()) {
             cx.write_to_clipboard(ClipboardItem::new_string(path));
         }
+    }
+
+    /// `openDiffFilePrimaryAction`: a file title opens that file in a file tab, resolved against
+    /// the thread's workspace. Paths outside it (another package of the repository, `..`, an
+    /// absolute path elsewhere) do nothing.
+    pub fn open_file(&mut self, file: usize, cx: &mut Context<Self>) {
+        if self.external.is_some() { return; }
+        let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|file| file.path().to_owned()) else { return };
+        let Some(thread_id) = self.thread_id.as_deref() else { return };
+        let state = self.state.read(cx);
+        let Some(thread) = state.thread_shell(thread_id) else { return };
+        let project = state.shell.project(&thread.project_id);
+        let workspace_root = thread.worktree_path.clone().or_else(|| project.map(|project| project.workspace_root.clone()));
+        // A worktree is its own repository root; the project's identity names the main checkout.
+        let repository_root = match (&thread.worktree_path, project) {
+            (None, Some(project)) => project.repository_identity.as_ref().and_then(|identity| identity.get("rootPath")).and_then(|root| root.as_str()).map(str::to_owned),
+            _ => None,
+        };
+        let Some(relative) = t3_core::diff::resolve_diff_path_for_workspace(&path, workspace_root.as_deref(), repository_root.as_deref()) else { return };
+        self.state.update(cx, |state, cx| state.open_file(&relative, None, cx));
     }
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {

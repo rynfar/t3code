@@ -7,6 +7,8 @@
 //! (`apps/web/src/lib/toolCallDiff.ts`).
 
 mod completion;
+mod file_actions;
+mod file_kind;
 mod parse;
 mod hunks;
 mod reveal;
@@ -32,6 +34,8 @@ pub use completion::{
     pull_request_completions,
 };
 pub use parse::parse_patch;
+pub use file_actions::resolve_diff_path_for_workspace;
+pub use file_kind::{ChangedFileKind, classify_changed_file, is_test_changed_file};
 pub use hunks::FileHunks;
 pub use reveal::{
     FileReveal, FileRevealTarget, RevealAction, addition_line, expand_partial_diff_to_line,
@@ -43,11 +47,11 @@ pub use session::DiffSession;
 pub use rows::{DiffRow, Layout, build_rows, file_rows, separator_label};
 pub use scope::{
     CheckpointFile, method, DiffPreviewSource, DiffScope, DiffSelection, FileTotals, PreviewSourceKind,
-    TurnDiffSummary, checkpoint_diff_request, decode_diff_preview, decode_turn_diff,
-    diff_preview_request, preview_is_repository, turn_diff_summaries, workspace_mutation_id,
+    TurnDiffSummary, CHECKPOINT_DIFF_TRUNCATED_MARKER, checkpoint_diff_request, decode_diff_preview, decode_turn_diff,
+    diff_preview_request, is_checkpoint_diff_truncated, preview_is_repository, turn_diff_summaries, workspace_mutation_id,
 };
 pub use tool_call::{RecordedContent, ToolCallDiff, ToolCallTarget, tool_call_diff};
-pub use tree::{TreeRow, TreeRowKind, file_tree_rows};
+pub use tree::{TreeRow, TreeRowKind, file_tree_rows, file_tree_rows_shown};
 pub use whitespace::hide_whitespace_changes;
 
 /// Pierre's `FileDiffMetadata.type`.
