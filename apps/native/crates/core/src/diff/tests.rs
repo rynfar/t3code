@@ -412,6 +412,30 @@ fn diff_preview_picks_the_requested_source() {
 }
 
 #[test]
+fn commit_scope_requests_commits_and_builds_host_urls() {
+    let (method, payload) = branch_commits_request("/repo", Some("main"));
+    assert_eq!(method, "review.getBranchCommits");
+    assert_eq!(payload, json!({ "cwd": "/repo", "baseRef": "main" }));
+    let decoded = decode_branch_commits(&json!({
+        "commits": [{ "sha": "abcdef1234567890", "subject": "Add thing", "committedAt": "2026-01-01T00:00:00Z" }],
+        "truncated": true
+    }))
+    .unwrap();
+    assert_eq!(decoded.commits.len(), 1);
+    assert!(decoded.truncated);
+    let sel = DiffSelection::commit(&DiffSelection::Branch { base_ref: Some("main".into()) }, None, "abcdef1234567890");
+    assert_eq!(DiffScope::resolve(&sel, &[]).label(&[]), "Commit abcdef1");
+    let back_to_branch = DiffSelection::git(&sel, None, false);
+    assert_eq!(back_to_branch, DiffSelection::Branch { base_ref: Some("main".into()) });
+    let sha = "a".repeat(40);
+    let github = json!({ "provider": "github", "canonicalKey": "github.com/acme/app", "locator": { "remoteUrl": "https://github.com/acme/app.git" } });
+    assert_eq!(project_commit_url(Some(&github), &sha).as_deref(), Some(format!("https://github.com/acme/app/commit/{sha}").as_str()));
+    let gitlab = json!({ "provider": "gitlab", "canonicalKey": "gitlab.com/acme/sub/app", "locator": { "remoteUrl": "git@gitlab.com:acme/sub/app.git" } });
+    assert_eq!(project_commit_url(Some(&gitlab), &sha).as_deref(), Some(format!("https://gitlab.com/acme/sub/app/-/commit/{sha}").as_str()));
+    assert_eq!(project_commit_url(Some(&github), "short"), None);
+}
+
+#[test]
 fn selection_counts_reveals_and_reconciles_to_the_latest_turn() {
     let first = DiffSelection::turn(&DiffSelection::default(), "r1", Some(" src/a.rs "));
     assert_eq!(first, DiffSelection::Turn { turn_id: "r1".into(), file_path: Some("src/a.rs".into()), reveal_request_id: 1 });

@@ -47,6 +47,7 @@ pub(super) struct Editor {
     run_on_worktree_create: bool,
     wait_for_setup: bool,
     run_on_settle: bool,
+    stop_on_settle: bool,
     keybinding: String,
     auto_open_preview: bool,
     icon_picker_open: bool,
@@ -149,6 +150,7 @@ impl SettingsView {
             run_on_worktree_create: initial.run_on_worktree_create,
             wait_for_setup: initial.wait_for_setup,
             run_on_settle: initial.run_on_settle,
+            stop_on_settle: initial.stop_on_settle,
             keybinding: initial.keybinding.clone().flatten().unwrap_or_default(),
             auto_open_preview: initial.auto_open_preview,
             icon_picker_open: false,
@@ -206,6 +208,7 @@ impl SettingsView {
             run_on_worktree_create: editor.run_on_worktree_create,
             wait_for_setup: editor.wait_for_setup,
             run_on_settle: editor.run_on_settle,
+            stop_on_settle: editor.stop_on_settle,
             keybinding: editor.keybinding.clone(),
             preview_url: actions.preview_url.read(cx).value().to_string(),
             auto_open_preview: editor.auto_open_preview,
@@ -299,10 +302,34 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Opens the editor a failed import left, now that a render has the window.
+    /// Opens the editor a failed import or the thread card left, now that a render has the window.
     pub(super) fn open_pending_action_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_card_editor(cx);
         if let Some(request) = self.projects.actions.pending.take() {
             self.open_action_editor(request, window, cx);
+        }
+    }
+
+    /// The thread card's Add or Edit (`crate::git::open_script_editor`), once the project it
+    /// names is the one shown. Editing an action this list does not hold opens nothing, since
+    /// saving it would add nothing.
+    fn take_card_editor(&mut self, cx: &mut Context<Self>) {
+        use crate::git::PendingScriptEditor;
+        let targets = self.project_targets(cx);
+        let Some(first) = targets.first() else { return };
+        if !cx.has_global::<PendingScriptEditor>() || !cx.global::<PendingScriptEditor>().0.as_ref().is_some_and(|card| targets.iter().any(|target| target.project.id == card.project_id)) {
+            return;
+        }
+        let Some(card) = cx.global_mut::<PendingScriptEditor>().0.take() else { return };
+        let request = match card.script_id {
+            None => Some(EditorRequest::add()),
+            Some(id) => self.project_config(first, cx).and_then(|config| {
+                let keybindings = decode_resolved_keybindings(&config.keybindings);
+                shown_scripts(&config.settings, &first.project.id).iter().find(|script| script.id == id).map(|script| EditorRequest::edit(script, &keybindings))
+            }),
+        };
+        if request.is_some() {
+            self.projects.actions.pending = request;
         }
     }
 
@@ -602,6 +629,7 @@ impl SettingsView {
             .child(toggle("action-run-on-create", "Run automatically on worktree creation", editor.run_on_worktree_create, true, |editor, on| editor.run_on_worktree_create = on))
             .child(toggle("action-wait-for-setup", "Wait for it to finish before the agent starts", editor.wait_for_setup, editor.run_on_worktree_create, |editor, on| editor.wait_for_setup = on))
             .child(toggle("action-run-on-settle", "Run in the thread's worktree when the thread settles", editor.run_on_settle, true, |editor, on| editor.run_on_settle = on))
+            .child(toggle("action-stop-on-settle", "Stop this action when the thread settles", editor.stop_on_settle, true, |editor, on| editor.stop_on_settle = on))
             .child(toggle("action-auto-open-preview", "Open preview automatically when this action runs", editor.auto_open_preview, has_preview, |editor, on| editor.auto_open_preview = on))
             .children(editor.error.clone().map(|error| div().text_sm().text_color(hsla(p.destructive)).child(error)));
 

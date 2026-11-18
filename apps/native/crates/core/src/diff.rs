@@ -6,6 +6,7 @@
 //! `apps/web/src/state/queries.ts` (`useCheckpointDiff`), and one tool call's recorded patch
 //! (`apps/web/src/lib/toolCallDiff.ts`).
 
+mod base_ref;
 mod completion;
 mod file_actions;
 mod file_kind;
@@ -23,6 +24,12 @@ mod whitespace;
 
 use std::sync::Arc;
 
+pub use base_ref::{
+    AUTOMATIC_BASE_REF, BASE_REF_LIST_LIMIT, BaseRefChoice, BaseRefHighlightKey, BaseRefItem,
+    BaseRefKind, base_ref_items, build_base_ref_choices, build_diff_base_ref_choices,
+    decode_list_refs_result, filter_base_ref_choices, include_automatic_choice,
+    list_base_refs_request, value_for_base_ref_choice,
+};
 pub use completion::{
     COMPLETION_DEBOUNCE_MS, CompletionItem, CompletionOptions, CompletionScope,
     CompletionSearchDecision, CompletionSupport, FilterOptionsKind, MAX_COMPLETION_ITEMS,
@@ -34,7 +41,11 @@ pub use completion::{
     pull_request_completions,
 };
 pub use parse::parse_patch;
-pub use file_actions::resolve_diff_path_for_workspace;
+pub use file_actions::{
+    FileContextMenuAction, FileContextMenuCapabilities, file_context_menu_error_title,
+    file_context_menu_open_request, resolve_diff_path_for_workspace,
+    resolve_file_context_menu_absolute_path,
+};
 pub use file_kind::{ChangedFileKind, classify_changed_file, is_test_changed_file};
 pub use hunks::FileHunks;
 pub use reveal::{
@@ -46,9 +57,12 @@ pub use scroll::{ScrollRestore, ScrollRestoreAction};
 pub use session::DiffSession;
 pub use rows::{DiffRow, Layout, build_rows, file_rows, separator_label};
 pub use scope::{
-    CheckpointFile, method, DiffPreviewSource, DiffScope, DiffSelection, FileTotals, PreviewSourceKind,
-    TurnDiffSummary, CHECKPOINT_DIFF_TRUNCATED_MARKER, checkpoint_diff_request, decode_diff_preview, decode_turn_diff,
-    diff_preview_request, is_checkpoint_diff_truncated, preview_is_repository, turn_diff_summaries, workspace_mutation_id,
+    BranchCommit, BranchCommits, CheckpointFile, method, DiffPreviewSource, DiffScope,
+    DiffSelection, FileTotals, PreviewSourceKind, TurnDiffSummary,
+    CHECKPOINT_DIFF_TRUNCATED_MARKER, branch_commits_request, checkpoint_diff_request,
+    decode_branch_commits, decode_diff_preview, decode_turn_diff, diff_preview_request,
+    is_checkpoint_diff_truncated, preview_is_repository, project_commit_url, turn_diff_summaries,
+    workspace_mutation_id,
 };
 pub use tool_call::{RecordedContent, ToolCallDiff, ToolCallTarget, tool_call_diff};
 pub use tree::{TreeRow, TreeRowKind, file_tree_rows, file_tree_rows_shown};

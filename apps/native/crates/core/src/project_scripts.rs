@@ -2,9 +2,9 @@
 //! in a thread terminal. Ports `apps/web/src/projectScripts.ts`, `resolveProjectScripts`,
 //! `projectScriptMenuLabel` and `projectScriptTerminalInput` (`packages/shared/src/projectScripts.ts`),
 //! the launch in `components/chat/useChatTerminalActions.ts` and `terminal/useThreadTerminalActions.ts`
-//! (its env from `terminal::LaunchLocation`), and the terminal metadata stream
-//! (`TerminalMetadataStreamEvent`, `packages/contracts/src/terminal.ts`) that says which terminals
-//! still run a command.
+//! (its env from `terminal::LaunchLocation`, its opt-in `stopOnSettle`), and the terminal metadata
+//! stream (`TerminalMetadataStreamEvent`, `packages/contracts/src/terminal.ts`) that says which
+//! terminals still run a command.
 
 use std::collections::HashMap;
 
@@ -40,6 +40,9 @@ pub struct ProjectScript {
     pub run_on_worktree_create: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_on_settle: Option<bool>,
+    /// The server stops the script's terminal when the thread settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_on_settle: Option<bool>,
     /// False holds the agent until a setup script exits.
     #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
     pub run_async: Option<bool>,
@@ -52,6 +55,10 @@ pub struct ProjectScript {
 impl ProjectScript {
     pub fn runs_on_settle(&self) -> bool {
         self.run_on_settle == Some(true)
+    }
+
+    pub fn stops_on_settle(&self) -> bool {
+        self.stop_on_settle == Some(true)
     }
 }
 
@@ -133,6 +140,24 @@ pub fn write_terminal(thread_id: &str, terminal_id: &str, data: &str) -> Value {
     json!({ "threadId": thread_id, "terminalId": terminal_id, "data": data })
 }
 
+/// The terminal one run of a script uses, and whether it is a new session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptLaunch {
+    pub terminal_id: String,
+    pub fresh: bool,
+}
+
+/// `terminal.open` for a script run (`runProjectScript` → `launchTerminal`): in the thread's
+/// checkout with the project's runtime env. Only a new session is sized, and `stopOnSettle` is
+/// always sent so a reused session follows the script's current setting.
+pub fn open_script_terminal(thread_id: &str, launch: &ScriptLaunch, project_root: &str, worktree_path: Option<&str>, stop_on_settle: bool) -> Value {
+    let location = LaunchLocation::new(project_root, worktree_path);
+    let grid = launch.fresh.then(|| Grid::new(SCRIPT_TERMINAL_SIZE.0, SCRIPT_TERMINAL_SIZE.1));
+    let mut payload = terminal::open_input(thread_id, &launch.terminal_id, &location, grid);
+    payload["stopOnSettle"] = json!(stop_on_settle);
+    payload
+}
+
 /// `TerminalSummary`, the parts that say whether a command still runs.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -198,6 +223,21 @@ impl Terminals {
             .find(|terminal| !terminal.has_running_subprocess && terminal.status != "exited")
             .map(|terminal| terminal.terminal_id.clone())
             .unwrap_or_else(|| format!("{base}:{fresh_suffix}"))
+    }
+
+    /// Where a run of `script` goes. A `stopOnSettle` script, or a connection that cannot read
+    /// terminals, always gets a new session, so settling stops only what this run started
+    /// (`runProjectScript` skips `findReusableProjectScriptTerminal` for both).
+    pub fn launch_for(&self, thread_id: &str, script: &ProjectScript, can_reuse: bool, fresh_suffix: &str) -> ScriptLaunch {
+        let known = |id: &str| self.by_key.contains_key(&(thread_id.to_owned(), id.to_owned()));
+        let terminal_id = if script.stops_on_settle() || !can_reuse {
+            let base = script_terminal_id(&script.id);
+            if known(&base) { format!("{base}:{fresh_suffix}") } else { base }
+        } else {
+            self.terminal_for_run(thread_id, &script.id, fresh_suffix)
+        };
+        let fresh = !known(&terminal_id);
+        ScriptLaunch { terminal_id, fresh }
     }
 }
 
@@ -308,5 +348,41 @@ mod tests {
         terminals.apply(removed);
         let unknown: TerminalMetadataEvent = serde_json::from_value(json!({ "type": "future" })).expect("decodes");
         assert_eq!(unknown, TerminalMetadataEvent::Unknown);
+    }
+
+    #[test]
+    fn stop_on_settle_round_trips_and_is_omitted_when_unset() {
+        let decoded: ProjectScript = serde_json::from_value(json!({ "id": "dev", "name": "Dev", "command": "bun dev", "runOnWorktreeCreate": false, "stopOnSettle": true })).expect("decodes");
+        assert!(decoded.stops_on_settle());
+        assert_eq!(serde_json::to_value(&decoded).expect("encodes")["stopOnSettle"], true);
+        let plain = script("dev", false, false);
+        assert!(!plain.stops_on_settle());
+        assert!(serde_json::to_value(&plain).expect("encodes").get("stopOnSettle").is_none());
+    }
+
+    #[test]
+    fn stop_on_settle_runs_always_open_a_new_session() {
+        let dev = script("dev", false, false);
+        let stopping = ProjectScript { stop_on_settle: Some(true), ..dev.clone() };
+        let mut terminals = Terminals::default();
+        let first = terminals.launch_for("th", &stopping, true, "x1");
+        assert_eq!(first, ScriptLaunch { terminal_id: "script:dev".into(), fresh: true });
+        terminals.apply(TerminalMetadataEvent::Snapshot { terminals: vec![summary("script:dev", false)] });
+        assert_eq!(terminals.launch_for("th", &stopping, true, "x2"), ScriptLaunch { terminal_id: "script:dev:x2".into(), fresh: true }, "never types into an earlier run");
+        assert_eq!(terminals.launch_for("th", &dev, true, "x2"), ScriptLaunch { terminal_id: "script:dev".into(), fresh: false }, "a plain script reuses its idle session");
+        assert_eq!(terminals.launch_for("th", &dev, false, "x3"), ScriptLaunch { terminal_id: "script:dev:x3".into(), fresh: true }, "no terminal read access means no reuse");
+    }
+
+    #[test]
+    fn script_terminal_open_sizes_only_new_sessions_and_sends_stop_on_settle() {
+        let fresh = open_script_terminal("th", &ScriptLaunch { terminal_id: "script:dev".into(), fresh: true }, "/r", Some("/wt/a"), true);
+        assert_eq!(fresh["cols"], 120);
+        assert_eq!(fresh["rows"], 30);
+        assert_eq!(fresh["stopOnSettle"], true);
+        assert_eq!(fresh["worktreePath"], "/wt/a");
+        let reused = open_script_terminal("th", &ScriptLaunch { terminal_id: "script:dev".into(), fresh: false }, "/r", None, false);
+        assert!(reused.get("cols").is_none());
+        assert_eq!(reused["stopOnSettle"], false);
+        assert_eq!(reused["env"], json!({ "T3CODE_PROJECT_ROOT": "/r" }));
     }
 }

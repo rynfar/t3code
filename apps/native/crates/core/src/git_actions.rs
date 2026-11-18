@@ -1,14 +1,18 @@
 //! Git quick actions: what the split button offers, why an action is unavailable, the default
-//! branch confirmation, and the live progress of a running action. Ports
-//! `apps/web/src/components/GitActionsControl.logic.ts`, the disabled reasons and inline success in
+//! branch confirmation, the Changes row's totals and base, and the live progress of a running
+//! action. Ports `apps/web/src/components/GitActionsControl.logic.ts` (including
+//! `resolveChangesTotals`), the disabled reasons and inline success in
 //! `GitActionsControl.tsx`, `requiresDefaultBranchConfirmation`
 //! (`client-runtime/src/state/gitActions.ts`), the progress reducer in
 //! `client-runtime/src/state/vcsAction.ts`, and each source control definition's change request
 //! terms (`packages/source-control-*/src/shared/definition.ts`).
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::diff::DiffPreviewSource;
 use crate::vcs::{VcsStatus, changes_totals};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -91,6 +95,21 @@ pub fn build_menu_items(status: Option<&VcsStatus>, busy: bool, has_primary_remo
     }
     let can_create_pr = !busy && has_branch && has_default_branch_delta(status) && !behind && reachable;
     vec![commit, push, MenuItem { id: MenuItemId::Pr, label: format!("Create {}", terms.short_label), disabled: !can_create_pr }]
+}
+
+/// `hasUsableGitMenuContent`: the chevron menu opens only when it can publish, shows a notice,
+/// or holds an enabled action this connection can run.
+pub fn has_usable_menu_content(items: &[MenuItem], can_write_source_control: bool, can_publish_repository: bool, has_notice: bool) -> bool {
+    can_publish_repository || has_notice || (can_write_source_control && items.iter().any(|item| !item.disabled))
+}
+
+/// The default source control host (`sourceControlClients.get(undefined).kind`).
+pub const DEFAULT_SOURCE_CONTROL_PROVIDER: &str = "github";
+
+/// `isSourceControlProviderOffered`: only the default host is offered until the user turns
+/// others on (`ServerSettings.offeredSourceControlProviders`).
+pub fn is_source_control_provider_offered(offered: Option<&HashMap<String, bool>>, kind: &str) -> bool {
+    offered.and_then(|map| map.get(kind).copied()).unwrap_or(kind == DEFAULT_SOURCE_CONTROL_PROVIDER)
 }
 
 /// `getMenuActionDisabledReason` in `GitActionsControl.tsx`.
@@ -284,6 +303,45 @@ pub fn feature_branch_unavailable_reason(branch: &str, has_working_tree_changes:
 pub fn quiet_empty_thread(no_runs_yet: bool, running: bool, status_error: bool, quick: &QuickAction, status: Option<&VcsStatus>) -> bool {
     let (insertions, deletions) = status.map(changes_totals).unwrap_or((0, 0));
     no_runs_yet && !running && !status_error && quick.disabled && insertions == 0 && deletions == 0
+}
+
+/// `ChangesLineTotals`: what the Changes row counts and the ref it compares against; `None` means
+/// uncommitted changes against HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesTotals {
+    pub insertions: u64,
+    pub deletions: u64,
+    pub base_ref: Option<String>,
+}
+
+impl ChangesTotals {
+    /// `changesBaseLabel`: the muted label beside "Changes".
+    pub fn base_label(&self) -> String {
+        match &self.base_ref {
+            Some(base_ref) => format!("vs {base_ref}"),
+            None => "Uncommitted".to_owned(),
+        }
+    }
+}
+
+/// `resolveChangesTotals`: the diff panel's branch comparison when it has file stats, else the
+/// branch totals unless they are zero and the working tree is not.
+pub fn resolve_changes_totals(status: Option<&VcsStatus>, branch_preview: Option<&DiffPreviewSource>) -> Option<ChangesTotals> {
+    if let Some(preview) = branch_preview
+        && let Some((insertions, deletions)) = preview.totals
+    {
+        return Some(ChangesTotals { insertions, deletions, base_ref: preview.base_ref.clone() });
+    }
+    let local = &status?.local;
+    let tree = &local.working_tree;
+    let tree_totals = || ChangesTotals { insertions: tree.insertions, deletions: tree.deletions, base_ref: None };
+    let branch_totals = |branch: &crate::vcs::BranchChanges| ChangesTotals { insertions: branch.insertions, deletions: branch.deletions, base_ref: branch.base_ref.clone() };
+    Some(match &local.branch_changes {
+        Some(branch) if branch.insertions > 0 || branch.deletions > 0 => branch_totals(branch),
+        _ if tree.insertions > 0 || tree.deletions > 0 => tree_totals(),
+        Some(branch) => branch_totals(branch),
+        None => tree_totals(),
+    })
 }
 
 #[derive(Debug, Clone, Default)]

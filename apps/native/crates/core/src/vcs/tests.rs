@@ -134,14 +134,61 @@ fn vcs_ref(name: &str, default: bool, worktree: Option<&str>) -> VcsRef {
 
 #[test]
 fn branch_selection_reuses_other_worktrees_and_leaves_one_for_the_default_ref() {
-    let target = branch_selection_target("/repo", None, &vcs_ref("other", false, Some("/wt/other")));
-    assert_eq!(target, BranchSelectionTarget { checkout_cwd: "/wt/other".into(), next_worktree_path: Some("/wt/other".into()), reuse_existing_worktree: true });
-    let target = branch_selection_target("/repo", Some("/wt/x"), &vcs_ref("main", false, Some("/repo")));
+    let target = branch_selection_target("/repo", None, None, &vcs_ref("other", false, Some("/wt/other")));
+    assert_eq!(target, BranchSelectionTarget { checkout_cwd: "/wt/other".into(), next_worktree_path: Some("/wt/other".into()), reuse_existing_worktree: true, stays_in_active_checkout: false });
+    let target = branch_selection_target("/repo", Some("/repo"), Some("/wt/x"), &vcs_ref("main", false, Some("/repo")));
     assert_eq!(target.next_worktree_path, None);
-    let target = branch_selection_target("/repo", Some("/wt/x"), &vcs_ref("main", true, None));
-    assert_eq!(target, BranchSelectionTarget { checkout_cwd: "/repo".into(), next_worktree_path: None, reuse_existing_worktree: false });
-    let target = branch_selection_target("/repo", Some("/wt/x"), &vcs_ref("feature", false, None));
-    assert_eq!(target.checkout_cwd, "/wt/x");
+    let target = branch_selection_target("/repo", None, Some("/wt/x"), &vcs_ref("main", true, None));
+    assert_eq!(target, BranchSelectionTarget { checkout_cwd: "/repo".into(), next_worktree_path: None, reuse_existing_worktree: false, stays_in_active_checkout: false });
+    let target = branch_selection_target("/repo", None, Some("/wt/x"), &vcs_ref("feature", false, None));
+    assert_eq!(target, BranchSelectionTarget { checkout_cwd: "/wt/x".into(), next_worktree_path: Some("/wt/x".into()), reuse_existing_worktree: false, stays_in_active_checkout: true });
+}
+
+/// `#29908`: a subfolder project's own checkout is reported at the repository root.
+#[test]
+fn branch_selection_keeps_a_subfolder_project_in_its_own_checkout() {
+    let target = branch_selection_target("/repo/nested-checkout/packages/app", Some("/repo/nested-checkout"), None, &vcs_ref("main", true, Some("/repo")));
+    assert_eq!(target, BranchSelectionTarget { checkout_cwd: "/repo".into(), next_worktree_path: Some("/repo".into()), reuse_existing_worktree: true, stays_in_active_checkout: false });
+    let target = branch_selection_target("/repo", None, Some("/repo/.t3/worktrees/feature-a"), &vcs_ref("b", false, Some("/repo/.t3/worktrees/feature-b")));
+    assert_eq!(target.next_worktree_path.as_deref(), Some("/repo/.t3/worktrees/feature-b"));
+    // The checkout root is `None` until the project's status loads.
+    for (project_cwd, worktree, checkout_root) in [
+        ("/repo", Some("/repo/.t3/worktrees/feature-a"), Some("/repo")),
+        ("/repo/packages/app", Some("/repo/.t3/worktrees/feature-a"), Some("/repo")),
+        ("/repo/packages/app", None, Some("/repo")),
+        ("/repo/packages/app", Some("/repo/.t3/worktrees/feature-a"), None),
+        ("/repo/packages/app", None, None),
+    ] {
+        let target = branch_selection_target(project_cwd, checkout_root, worktree, &vcs_ref("main", true, Some("/repo")));
+        // A ref listed in the thread's own checkout may be stale, so it is checked out, not assumed.
+        let expected = BranchSelectionTarget { checkout_cwd: "/repo".into(), next_worktree_path: None, reuse_existing_worktree: true, stays_in_active_checkout: worktree.is_none() };
+        assert_eq!(target, expected, "{project_cwd} {worktree:?} {checkout_root:?}");
+    }
+}
+
+#[test]
+fn a_listed_ref_in_the_threads_own_checkout_switches_only_with_write_access() {
+    let own = branch_selection_target("/repo/packages/app", Some("/repo"), None, &vcs_ref("main", true, Some("/repo")));
+    assert!(!records_existing_worktree(&own, true));
+    assert!(records_existing_worktree(&own, false));
+    let other = branch_selection_target("/repo", None, None, &vcs_ref("b", false, Some("/wt/b")));
+    assert!(records_existing_worktree(&other, true));
+    let in_place = branch_selection_target("/repo", None, None, &vcs_ref("b", false, None));
+    assert!(!records_existing_worktree(&in_place, false));
+}
+
+#[test]
+fn branch_status_falls_back_to_local_status_events() {
+    let branch: VcsBranchStatus = serde_json::from_value(json!({ "refName": "main", "isRepo": false })).unwrap();
+    assert_eq!(branch, VcsBranchStatus { ref_name: Some("main".into()), is_repo: Some(false) });
+    let older: VcsBranchStatus = serde_json::from_value(json!({ "refName": null })).unwrap();
+    assert_eq!(older.is_repo, None);
+    let snapshot = event(json!({ "_tag": "snapshot", "local": local("feature", 1), "remote": null }));
+    assert_eq!(branch_status_from_status_event(snapshot), Some(VcsBranchStatus { ref_name: Some("feature".into()), is_repo: Some(true) }));
+    let updated = event(json!({ "_tag": "localUpdated", "local": local("next", 0) }));
+    assert_eq!(branch_status_from_status_event(updated).and_then(|status| status.ref_name).as_deref(), Some("next"));
+    assert_eq!(branch_status_from_status_event(event(json!({ "_tag": "remoteUpdated", "remote": null }))), None);
+    assert_eq!(branch_fallback_subscription("/repo"), json!({ "cwd": "/repo", "includeRemote": false }));
 }
 
 #[test]

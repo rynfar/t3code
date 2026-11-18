@@ -145,30 +145,73 @@ fn open_in_row(ctx: &Ctx, cx: &App) -> AnyElement {
     split_row("details-open-in", primary, trigger, cx).into_any_element()
 }
 
+/// `RUN_SCRIPT_UNAVAILABLE`: why Run is off without terminal access.
+const RUN_SCRIPT_UNAVAILABLE: &str = "Pair this client again with permission to run terminal commands.";
+const ADD_PROJECT_SCRIPT: &str = "Add project script";
+
+/// One script in the chevron's menu: run it, or edit it from the gear beside its shortcut.
+fn script_menu_item(details: &Entity<Details>, menu: gpui::WeakEntity<gpui_component::menu::PopupMenu>, project_id: &str, script: &ProjectScript, running: bool, can_run: bool) -> PopupMenuItem {
+    let label = menu_label(script);
+    let shortcut = command_for_project_script(&script.id);
+    let edit_id = SharedString::from(format!("details-script-edit-{}", script.id));
+    let edit_label: SharedString = format!("Edit {}", script.name).into();
+    let (edit_project, edit_script) = (project_id.to_owned(), script.id.clone());
+    let item = PopupMenuItem::element(move |_, cx| {
+        let shortcut = shortcut.as_deref().and_then(|command| crate::keymap::label(command, cx));
+        let (menu, project_id, script_id, tooltip) = (menu.clone(), edit_project.clone(), edit_script.clone(), edit_label.clone());
+        let edit = div()
+            .id(edit_id.clone())
+            .flex_none()
+            .size(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .text_color(hsla(palette(cx).muted_foreground))
+            .hover(|style| style.text_color(hsla(palette(cx).foreground)))
+            .child(Icon::Settings.sized(px(14.)))
+            .tooltip(move |window, cx| crate::right_panel::tooltip_view(tooltip.clone(), window, cx))
+            // The gear edits instead of running, and closes the menu itself.
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                let _ = menu.update(cx, |_, cx| cx.emit(gpui::DismissEvent));
+                git::open_script_editor(&project_id, Some(&script_id), cx);
+            });
+        h_flex()
+            .w_full()
+            .gap(px(8.))
+            .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+            .child(running_indicator(running, cx))
+            .children(shortcut.map(|shortcut| menu_shortcut(shortcut, cx)))
+            .child(edit)
+    });
+    let (details, project_id, script) = (details.clone(), project_id.to_owned(), script.clone());
+    item.icon(menu_icon(script_icon(script.icon))).disabled(!can_run).on_click(move |_, _, cx| details.update(cx, |details, cx| details.run_script(&project_id, &script, cx)))
+}
+
 /// `ProjectScriptsControl` in panel mode: runs the preferred script; the chevron lists them all
-/// with their shortcuts. A terminal glyph marks scripts still running.
+/// with their shortcuts, an edit button each, and Add project script. With no scripts the row
+/// adds one. A terminal glyph marks scripts still running.
 fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
     let (project_id, scripts) = project_scripts(ctx.state.read(cx))?;
     if scripts.is_empty() {
-        return None;
+        let row = Row::new("details-add-script", ADD_PROJECT_SCRIPT).icon(Icon::Plus).tooltip(ADD_PROJECT_SCRIPT).on_click(move |_, _, cx| git::open_script_editor(&project_id, None, cx));
+        return Some(row.into_any_element());
     }
     let git = ctx.git.read(cx);
-    let can_operate = git.can_operate_thread();
+    let can_run = git.can_run_scripts();
     let primary = run_button_script(ctx.details.read(cx), &project_id, &scripts).cloned();
     let running: Vec<bool> = scripts.iter().map(|script| git.script_running(&script.id)).collect();
     let menu = {
         let (details, project_id, scripts, running) = (ctx.details.clone(), project_id.clone(), scripts.clone(), running.clone());
-        MenuTrigger::new("details-scripts-menu", "Script actions").disabled(!can_operate).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
-            scripts.iter().zip(running.iter().copied()).fold(menu.min_w(px(ROW_WIDTH)), |menu, (script, running)| {
-                let (details, project_id, script) = (details.clone(), project_id.clone(), script.clone());
-                let label = menu_label(&script);
-                let shortcut = command_for_project_script(&script.id);
-                let item = PopupMenuItem::element(move |_, cx| {
-                    let shortcut = shortcut.as_deref().and_then(|command| crate::keymap::label(command, cx));
-                    h_flex().w_full().gap(px(8.)).child(div().flex_1().min_w_0().truncate().child(label.clone())).child(running_indicator(running, cx)).children(shortcut.map(|shortcut| menu_shortcut(shortcut, cx)))
-                });
-                menu.item(item.icon(menu_icon(script_icon(script.icon))).disabled(!can_operate).on_click(move |_, _, cx| details.update(cx, |details, cx| details.run_script(&project_id, &script, cx))))
-            })
+        MenuTrigger::new("details-scripts-menu", "Script actions").dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, cx| {
+            let handle = cx.entity().downgrade();
+            let menu = scripts.iter().zip(running.iter().copied()).fold(menu.min_w(px(ROW_WIDTH)), |menu, (script, running)| {
+                menu.item(script_menu_item(&details, handle.clone(), &project_id, script, running, can_run))
+            });
+            let project_id = project_id.clone();
+            menu.item(PopupMenuItem::new(ADD_PROJECT_SCRIPT).icon(menu_icon(Icon::Plus)).on_click(move |_, _, cx| git::open_script_editor(&project_id, None, cx)))
         })
     };
     let primary_row = match primary {
@@ -177,12 +220,12 @@ fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
             let running = git.script_running(&script.id);
             Row::new("details-run-script", script.name.clone())
                 .icon(script_icon(script.icon))
-                .disabled(!can_operate)
+                .disabled(!can_run)
                 .trailing(running_indicator(running, cx))
-                .tooltip(format!("Run {}", script.name))
+                .tooltip(if can_run { format!("Run {}", script.name) } else { RUN_SCRIPT_UNAVAILABLE.to_owned() })
                 .on_click(move |_, _, cx| run_script(&details, &project_id, &script, cx))
         }
-        None => Row::new("details-scripts", "Actions").icon(Icon::Wrench).tooltip("Script actions").disabled(!can_operate),
+        None => Row::new("details-scripts", "Actions").icon(Icon::Wrench).tooltip("Project actions"),
     };
     Some(split_row("details-scripts", primary_row, menu, cx).into_any_element())
 }
@@ -969,5 +1012,73 @@ mod tests {
         assert!(vcx.debug_bounds("details-open-in").is_none());
 
         state.update(&mut vcx, |state, _| state.stop_pump());
+    }
+
+    #[gpui::test]
+    fn changes_base_label_and_scripts_row_render_expected_controls(cx: &mut TestAppContext) {
+        const SCRATCH_ROOT: &str = "/home/user/.t3/scratch";
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+        });
+        let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+        let git = cx.new(|cx| GitStore::new(state.clone(), cx));
+        let details = cx.new(|_| super::super::Details::new(git.clone()));
+        state.update(cx, |state, cx| {
+            state.phase = Phase::Online(ConnectionStatus::Connected);
+            apply_config(state, SCRATCH_ROOT);
+            seed_shell(state, SCRATCH_ROOT, cx);
+            state.selected_thread = Some("t-plain".into());
+        });
+        git.update(cx, |git, _| {
+            let mut local = VcsLocalStatus {
+                is_repo: true,
+                has_working_tree_changes: true,
+                ..Default::default()
+            };
+            local.working_tree.insertions = 4;
+            local.working_tree.deletions = 1;
+            git.status = Some(VcsStatus { local, remote: VcsRemoteStatus::default() });
+        });
+        struct CombinedHost {
+            ctx: Ctx,
+        }
+        impl Render for CombinedHost {
+            fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                v_flex()
+                    .w(px(300.))
+                    .children(workspace(&self.ctx, CardDensity::Full, cx))
+                    .children(version_control(&self.ctx, false, CardDensity::Full, cx))
+            }
+        }
+        let window = cx.add_window(|window, cx| {
+            let dialogs = cx.new(|cx| GitDialogs::new(git.clone(), window, cx));
+            let picker = cx.new(|cx| BranchPicker::new(git.clone(), window, cx));
+            CombinedHost {
+                ctx: Ctx { row_menu_claim: Rc::new(Cell::new(false)), state: state.clone(), details: details.clone(), git: git.clone(), dialogs, picker },
+            }
+        });
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("git-changes-base").is_some(), "Changes row should show comparison/Uncommitted label");
+        assert!(vcx.debug_bounds("details-add-script").is_some(), "empty scripts should render Add project script row");
+        assert!(vcx.debug_bounds("details-run-script").is_none());
+
+        state.update(&mut vcx, |state, cx| {
+            let config = state.server_config.config.as_mut().unwrap();
+            config.settings.default_project_scripts = vec![ProjectScript {
+                id: "dev".into(),
+                name: "Dev".into(),
+                command: "bun dev".into(),
+                ..Default::default()
+            }];
+            cx.emit(crate::app_state::AppEvent::ServerConfig);
+        });
+        vcx.update(|window, cx| window.draw(cx).clear());
+        assert!(vcx.debug_bounds("details-add-script").is_none());
+        assert!(vcx.debug_bounds("details-run-script").is_some(), "configured script should render split run row");
+        assert!(vcx.debug_bounds("details-scripts-menu").is_some());
     }
 }

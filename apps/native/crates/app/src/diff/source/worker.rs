@@ -33,6 +33,7 @@ impl Projection {
 pub async fn run(
     client: ClientHandle,
     scope: ReviewScope,
+    commit_sha: Option<String>,
     previous: Option<ReviewModel>,
     patch_reads: Arc<tokio::sync::Semaphore>,
     commands: mpsc::Receiver<Command>,
@@ -44,6 +45,7 @@ pub async fn run(
             async move { client.request(method, payload).await.map_err(|error| error.to_string()) }
         },
         scope,
+        commit_sha,
         previous,
         patch_reads,
         commands,
@@ -55,6 +57,7 @@ pub async fn run(
 pub(crate) async fn run_with<F, Fut>(
     request: F,
     scope: ReviewScope,
+    commit_sha: Option<String>,
     previous: Option<ReviewModel>,
     patch_reads: Arc<tokio::sync::Semaphore>,
     mut commands: mpsc::Receiver<Command>,
@@ -63,10 +66,10 @@ pub(crate) async fn run_with<F, Fut>(
     F: Fn(&'static str, serde_json::Value) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<serde_json::Value, String>> + Send,
 {
-    let mut model = previous.unwrap_or_else(|| ReviewModel::new(scope.clone()));
+    let mut model = previous.unwrap_or_else(|| ReviewModel::new(scope.clone()).with_commit(commit_sha));
     model.states.retain(|_, state| !state.pending);
-    let tracked = !model.has_complete_preview();
-    let (method, payload) = scope.request(tracked);
+    let tracked = !model.has_complete_preview() && model.commit_sha.is_none();
+    let (method, payload) = model.request(tracked);
     let preview_received = match request(method, payload).await {
         Ok(value) => {
             model.accept_preview(&value);
@@ -81,9 +84,9 @@ pub(crate) async fn run_with<F, Fut>(
         }
     };
     let mut metadata = JoinSet::new();
-    if model.incomplete && preview_received {
+    if model.incomplete && preview_received && model.commit_sha.is_none() {
         let request = request.clone();
-        let (method, payload) = scope.request(false);
+        let (method, payload) = model.request(false);
         metadata.spawn(async move { request(method, payload).await });
     }
     let mut patches = JoinSet::new();
@@ -178,6 +181,7 @@ mod tests {
             },
             scope,
             None,
+            None,
             Arc::new(tokio::sync::Semaphore::new(4)),
             commands,
             updates,
@@ -207,6 +211,7 @@ mod tests {
                 }
             },
             retained.scope.clone(),
+            None,
             Some((*retained).clone()),
             Arc::new(tokio::sync::Semaphore::new(4)),
             commands,

@@ -40,6 +40,7 @@ pub fn install(panel: &mut DiffPanel, cx: &mut Context<DiffPanel>) -> bool {
         kind: scope.kind,
         cwd: scope.cwd.clone(),
         base_ref: None,
+        commit_sha: None,
         ignore_whitespace: true,
         revision: 0,
     });
@@ -78,6 +79,7 @@ pub fn install(panel: &mut DiffPanel, cx: &mut Context<DiffPanel>) -> bool {
             }
         },
         scope,
+        None,
         None,
         panel.patch_reads.clone(),
         commands,

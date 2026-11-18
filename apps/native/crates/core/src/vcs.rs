@@ -1,6 +1,7 @@
 //! Source control status, refs and the branch toolbar's rules. Ports the status and ref shapes in
 //! `packages/contracts/src/git.ts`, `applyGitStatusStreamEvent` and the ref-name helpers in
-//! `packages/shared/src/git.ts`, `apps/web/src/components/BranchToolbar.logic.ts`, the branch
+//! `packages/shared/src/git.ts`, the `subscribeVcsBranch` fallback in
+//! `client-runtime/src/rpc/client.ts`, `apps/web/src/components/BranchToolbar.logic.ts`, the branch
 //! picker's badges and filter (`BranchPicker.tsx`), the branch permissions in
 //! `BranchToolbarBranchSelector.tsx`, and `resolveChangesTotals` (`GitActionsControl.logic.ts`).
 
@@ -9,10 +10,14 @@ use serde_json::{Map, Value, json};
 
 use crate::auth::{AuthSessionState, ORCHESTRATION_OPERATE_SCOPE, SOURCE_CONTROL_WRITE_SCOPE};
 
+pub mod change_request_reference;
 pub mod refs;
+pub mod worktree_cleanup;
 
 pub mod method {
     pub const SUBSCRIBE_VCS_STATUS: &str = "subscribeVcsStatus";
+    pub const SUBSCRIBE_VCS_BRANCH: &str = "subscribeVcsBranch";
+    pub const VCS_REFRESH_BRANCH: &str = "vcs.refreshBranch";
     pub const VCS_PULL: &str = "vcs.pull";
     pub const VCS_REFRESH_STATUS: &str = "vcs.refreshStatus";
     pub const VCS_LIST_REFS: &str = "vcs.listRefs";
@@ -194,6 +199,27 @@ pub fn apply_status_event(current: Option<VcsStatus>, event: VcsStatusEvent) -> 
     }
 }
 
+/// `VcsBranchStatus`, one chunk of `subscribeVcsBranch`: the checkout's ref without its file
+/// totals or remote state (`#32947`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VcsBranchStatus {
+    #[serde(default)]
+    pub ref_name: Option<String>,
+    /// Absent from older servers, where a removed checkout looks like a detached HEAD.
+    #[serde(default)]
+    pub is_repo: Option<bool>,
+}
+
+/// `subscribeVcsBranch`'s fallback on hosts without `capabilities.vcsBranchStatus`
+/// (`client-runtime/src/rpc/client.ts`): local status events, remote ones dropped.
+pub fn branch_status_from_status_event(event: VcsStatusEvent) -> Option<VcsBranchStatus> {
+    match event {
+        VcsStatusEvent::Snapshot { local, .. } | VcsStatusEvent::LocalUpdated { local } => Some(VcsBranchStatus { ref_name: local.ref_name, is_repo: Some(local.is_repo) }),
+        VcsStatusEvent::RemoteUpdated { .. } | VcsStatusEvent::Unknown => None,
+    }
+}
+
 /// `resolveChangesTotals`: branch totals unless they are zero while the tree is dirty.
 pub fn changes_totals(status: &VcsStatus) -> (u64, u64) {
     let tree = &status.local.working_tree;
@@ -286,6 +312,17 @@ pub struct RefNameResult {
 
 pub fn status_subscription(cwd: &str) -> Value {
     json!({ "cwd": cwd })
+}
+
+/// `subscribeVcsBranch` and `vcs.refreshBranch` take a bare `VcsStatusInput`.
+pub fn branch_subscription(cwd: &str) -> Value {
+    json!({ "cwd": cwd })
+}
+
+/// The status stream `subscribeVcsBranch` falls back to: a passive observer that leaves the
+/// remote refresh loop alone.
+pub fn branch_fallback_subscription(cwd: &str) -> Value {
+    json!({ "cwd": cwd, "includeRemote": false })
 }
 
 pub fn refresh_status(cwd: &str, local_only: bool) -> Value {
@@ -427,24 +464,44 @@ pub struct BranchSelectionTarget {
     pub checkout_cwd: String,
     pub next_worktree_path: Option<String>,
     pub reuse_existing_worktree: bool,
+    /// The thread keeps its checkout. Listed refs can predate a checkout made outside the picker,
+    /// so a ref listed there is still checked out rather than assumed.
+    pub stays_in_active_checkout: bool,
 }
 
 /// `resolveBranchSelectionTarget`: a ref checked out in another worktree moves the thread there;
 /// the default ref leaves a worktree for the project root; anything else checks out in place.
-pub fn branch_selection_target(project_cwd: &str, worktree_path: Option<&str>, target: &VcsRef) -> BranchSelectionTarget {
-    if let Some(path) = target.worktree_path.as_deref() {
+/// `project_checkout_root` is the project's `workingTree.rootPath`, `None` until it loads: a
+/// subfolder project's own checkout is reported at the repository root (`#29908`).
+pub fn branch_selection_target(project_cwd: &str, project_checkout_root: Option<&str>, worktree_path: Option<&str>, target: &VcsRef) -> BranchSelectionTarget {
+    if let Some(path) = target.worktree_path.as_deref().filter(|path| !path.is_empty()) {
+        // Until the checkout root loads, a checkout containing the project counts as its own.
+        let is_project_checkout = match project_checkout_root {
+            None => crate::files::workspace_relative_path(project_cwd, path).is_some(),
+            Some(root) => crate::files::workspace_relative_path(root, path).as_deref() == Some("."),
+        };
+        let next_worktree_path = (!is_project_checkout).then(|| path.to_owned());
         return BranchSelectionTarget {
             checkout_cwd: path.to_owned(),
-            next_worktree_path: (path != project_cwd).then(|| path.to_owned()),
+            stays_in_active_checkout: next_worktree_path.as_deref() == worktree_path,
+            next_worktree_path,
             reuse_existing_worktree: true,
         };
     }
     let next_worktree_path = if worktree_path.is_some() && target.is_default { None } else { worktree_path.map(str::to_owned) };
     BranchSelectionTarget {
         checkout_cwd: next_worktree_path.clone().unwrap_or_else(|| project_cwd.to_owned()),
+        stays_in_active_checkout: next_worktree_path.as_deref() == worktree_path,
         next_worktree_path,
         reuse_existing_worktree: false,
     }
+}
+
+/// `resolveBranchSelectionTarget`'s caller in `BranchToolbarBranchSelector.tsx`: a ref already
+/// checked out elsewhere is only recorded on the thread, unless it stays in the thread's own
+/// checkout and this device may switch it there.
+pub fn records_existing_worktree(selection: &BranchSelectionTarget, can_write_source_control: bool) -> bool {
+    selection.reuse_existing_worktree && !(selection.stays_in_active_checkout && can_write_source_control)
 }
 
 /// `resolveBranchToolbarValue`. `selecting_worktree_base` is worktree mode with no worktree yet.

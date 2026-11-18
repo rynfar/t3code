@@ -3,6 +3,7 @@
 //! and its loading, empty and error states. Patches are fetched and parsed on the network
 //! runtime; the view paints only the rows on screen.
 
+mod base_ref;
 mod comments;
 #[cfg(feature = "snapshot")]
 mod snapshot;
@@ -26,9 +27,12 @@ use gpui_component::v_flex;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::composer::review::Side;
 use t3_core::diff::{
-    DiffLine, DiffScope, DiffSelection, DiffSession, FileReveal, FileRevealTarget, Layout,
-    ParsedPatch, RevealAction, ScrollRestore, ScrollRestoreAction, TurnDiffSummary,
-    line_number_for_side, turn_diff_summaries, workspace_mutation_id,
+    BranchCommits, DiffLine, DiffScope, DiffSelection, DiffSession, FileContextMenuAction,
+    FileContextMenuCapabilities, FileReveal, FileRevealTarget, Layout, ParsedPatch, RevealAction,
+    ScrollRestore, ScrollRestoreAction, TurnDiffSummary, branch_commits_request,
+    decode_branch_commits, file_context_menu_error_title, file_context_menu_open_request,
+    line_number_for_side, project_commit_url, resolve_file_context_menu_absolute_path,
+    turn_diff_summaries, workspace_mutation_id,
 };
 use t3_core::right_panel::SurfaceKind;
 
@@ -93,6 +97,15 @@ pub struct DiffPanel {
     external: Option<External>,
     comments: comments::Comments,
     comments_config: comments::CommentsConfig,
+    copied_path: Option<(String, u64)>,
+    copied_generation: u64,
+    _copied_reset: Option<Task<()>>,
+    branch_commits: Option<BranchCommits>,
+    branch_commits_error: Option<String>,
+    branch_commits_loading: bool,
+    branch_commits_key: Option<(String, String, Option<String>)>,
+    branch_commits_generation: u64,
+    _branch_commits: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -184,6 +197,15 @@ impl DiffPanel {
             external: None,
             comments: comments::Comments::default(),
             comments_config: comments::CommentsConfig::default(),
+            copied_path: None,
+            copied_generation: 0,
+            _copied_reset: None,
+            branch_commits: None,
+            branch_commits_error: None,
+            branch_commits_loading: false,
+            branch_commits_key: None,
+            branch_commits_generation: 0,
+            _branch_commits: None,
             _subscription: subscription,
         };
         let entity = cx.entity().downgrade();
@@ -243,6 +265,12 @@ impl DiffPanel {
             self.repositories.clear();
             self.git_fetched_at = None;
             self.connected = false;
+            self.branch_commits = None;
+            self.branch_commits_error = None;
+            self.branch_commits_loading = false;
+            self.branch_commits_key = None;
+            self.branch_commits_generation += 1;
+            self._branch_commits = None;
             self.comments = comments::Comments::default();
             self.file_reveal.reset();
             self.scroll_restore = ScrollRestore::default();
@@ -272,6 +300,12 @@ impl DiffPanel {
             self.selected_file = None;
             self.file_reveal.reset();
             self.tree_collapsed.clear();
+            self.branch_commits = None;
+            self.branch_commits_error = None;
+            self.branch_commits_loading = false;
+            self.branch_commits_key = None;
+            self.branch_commits_generation += 1;
+            self._branch_commits = None;
         }
         let Some(thread_id) = thread_id else {
             self.cancel_fetch();
@@ -341,6 +375,7 @@ impl DiffPanel {
                 environment,
                 cwd,
                 base_ref: base_ref.clone(),
+                commit_sha: None,
                 ignore_whitespace: self.ignore_whitespace,
                 revision: self.git_revision,
             }),
@@ -349,6 +384,16 @@ impl DiffPanel {
                 environment,
                 cwd,
                 base_ref: None,
+                commit_sha: None,
+                ignore_whitespace: self.ignore_whitespace,
+                revision: self.git_revision,
+            }),
+            DiffScope::Commit { sha, base_ref } => cwd.clone().map(|cwd| RequestKey::Git {
+                kind: t3_core::diff::PreviewSourceKind::Commit,
+                environment,
+                cwd,
+                base_ref: base_ref.clone(),
+                commit_sha: Some(sha.clone()),
                 ignore_whitespace: self.ignore_whitespace,
                 revision: self.git_revision,
             }),
@@ -416,6 +461,9 @@ impl DiffPanel {
         } else if !source_exists {
             self.error = Some("The source thread is no longer available.".into());
         }
+        if visible && connected && can_read && repository != Some(false) && self.branch_commits_key.is_none() {
+            self.refresh_branch_commits(cx);
+        }
         if changed {
             self.rebuild(cx);
             cx.notify();
@@ -481,16 +529,16 @@ impl DiffPanel {
     }
 
     fn fetch_git(&mut self, key: RequestKey, cx: &mut Context<Self>) {
-        let RequestKey::Git { environment, cwd, kind, base_ref, ignore_whitespace, .. } = &key else { return };
+        let RequestKey::Git { environment, cwd, kind, base_ref, commit_sha, ignore_whitespace, .. } = &key else { return };
         let Some(client) = self.state.read(cx).client_handle() else { return };
         let scope = t3_core::diff::ReviewScope { environment: environment.clone(), connection: self.connection.unwrap_or_default(), cwd: cwd.clone(), kind: *kind, base_ref: base_ref.clone(), ignore_whitespace: *ignore_whitespace };
         let previous = self.loaded.as_ref().filter(|(old, _)| old.same_source(&key)).and_then(|(_, loaded)| match loaded {
-            Loaded::Git { review, .. } if review.scope == scope => Some((**review).clone()),
+            Loaded::Git { review, .. } if review.scope == scope && review.commit_sha == *commit_sha => Some((**review).clone()),
             _ => None,
         });
         let (send, commands) = tokio::sync::mpsc::channel(16);
         let (updates, mut receive) = tokio::sync::mpsc::channel(1);
-        let task = self.state.read(cx).runtime().spawn(source::run(client, scope, previous, self.patch_reads.clone(), commands, updates));
+        let task = self.state.read(cx).runtime().spawn(source::run(client, scope, commit_sha.clone(), previous, self.patch_reads.clone(), commands, updates));
         self.patch_commands = Some(send);
         self.pending = true;
         let network = task.abort_handle();
@@ -562,7 +610,7 @@ impl DiffPanel {
             return None;
         }
         match (&self.loaded.as_ref()?.1, &self.scope) {
-            (Loaded::Git { parsed, .. }, DiffScope::Branch { .. } | DiffScope::Unstaged) => Some(parsed.clone()),
+            (Loaded::Git { parsed, .. }, DiffScope::Branch { .. } | DiffScope::Unstaged | DiffScope::Commit { .. }) => Some(parsed.clone()),
             (Loaded::Turn(parsed), DiffScope::Turn { .. }) => Some(parsed.clone()),
             (Loaded::ToolCall(call), DiffScope::ToolCall(_)) => call.parsed(self.ignore_whitespace),
             _ => None,
@@ -585,6 +633,7 @@ impl DiffPanel {
         let section = match &self.scope {
             DiffScope::Branch { .. } => "branch".to_owned(),
             DiffScope::Unstaged => "unstaged".to_owned(),
+            DiffScope::Commit { sha, .. } => format!("commit:{sha}"),
             DiffScope::Turn { summary_index, .. } => format!("turn:{}", self.summaries[*summary_index].run_id),
             DiffScope::NoTurns => "none".to_owned(),
             DiffScope::ToolCall(target) => format!("tool-call:{}:{}", target.thread_id, target.item_id),
@@ -928,6 +977,75 @@ impl DiffPanel {
         self.state.update(cx, |state, cx| state.select_diff(selection, cx));
     }
 
+    pub fn select_commit(&mut self, sha: &str, cx: &mut Context<Self>) {
+        let remembered = self
+            .thread_id
+            .as_deref()
+            .and_then(|id| self.state.read(cx).panels.branch_base_refs.get(id).cloned());
+        let next = DiffSelection::commit(&self.selection, remembered.as_deref(), sha);
+        self.select(next, cx);
+    }
+
+    pub fn commit_url(&self, sha: &str, cx: &gpui::App) -> Option<String> {
+        let thread_id = self.thread_id.as_deref()?;
+        let state = self.state.read(cx);
+        let thread = state.thread_shell(thread_id)?;
+        let project = state.shell.project(&thread.project_id)?;
+        project_commit_url(project.repository_identity.as_ref(), sha)
+    }
+
+    pub fn refresh_branch_commits(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.thread_id.as_deref() else { return };
+        let state = self.state.read(cx);
+        if !state.can_read_threads() || !matches!(state.phase, Phase::Online(ConnectionStatus::Connected)) {
+            return;
+        }
+        let Some(environment) = state.environment().map(str::to_owned) else { return };
+        let Some(cwd) = state.thread_shell(thread_id).and_then(|thread| {
+            thread.worktree_path.clone().or_else(|| state.shell.project(&thread.project_id).map(|project| project.workspace_root.clone()))
+        }) else {
+            return;
+        };
+        if self.repositories.get(&cwd) == Some(&false) {
+            return;
+        }
+        let base_ref = state.panels.branch_base_refs.get(thread_id).cloned();
+        let key = (environment, cwd.clone(), base_ref.clone());
+        if self.branch_commits_loading && self.branch_commits_key.as_ref() == Some(&key) {
+            return;
+        }
+        let Some(client) = state.client_handle() else { return };
+        let runtime = state.runtime().clone();
+        self.branch_commits_key = Some(key.clone());
+        self.branch_commits_loading = true;
+        self.branch_commits_error = None;
+        self.branch_commits_generation += 1;
+        let generation = self.branch_commits_generation;
+        let (method, payload) = branch_commits_request(&cwd, base_ref.as_deref());
+        let task = runtime.spawn(async move {
+            let value = client.request(method, payload).await.map_err(|error| error.to_string())?;
+            decode_branch_commits(&value)
+        });
+        self._branch_commits = Some(cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                if this.branch_commits_generation != generation || this.branch_commits_key.as_ref() != Some(&key) {
+                    return;
+                }
+                this.branch_commits_loading = false;
+                match result {
+                    Ok(commits) => {
+                        this.branch_commits = Some(commits);
+                        this.branch_commits_error = None;
+                    }
+                    Err(error) => this.branch_commits_error = Some(error),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.git_revision += 1;
         self.error = None;
@@ -1004,9 +1122,39 @@ impl DiffPanel {
     }
 
     pub fn copy_path(&mut self, file: usize, cx: &mut Context<Self>) {
-        if let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|file| file.path().to_owned()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(path));
-        }
+        let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|file| file.path().to_owned()) else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+        self.copied_generation += 1;
+        let generation = self.copied_generation;
+        self.copied_path = Some((path, generation));
+        self._copied_reset = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1000)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied_generation == generation {
+                    this.copied_path = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn is_path_copied(&self, path: &str) -> bool {
+        self.copied_path.as_ref().is_some_and(|(copied, _)| copied == path)
+    }
+
+    fn workspace_roots(&self, cx: &gpui::App) -> (Option<String>, Option<String>) {
+        let Some(thread_id) = self.thread_id.as_deref() else { return (None, None) };
+        let state = self.state.read(cx);
+        let Some(thread) = state.thread_shell(thread_id) else { return (None, None) };
+        let project = state.shell.project(&thread.project_id);
+        let workspace_root = thread.worktree_path.clone().or_else(|| project.map(|project| project.workspace_root.clone()));
+        // A worktree is its own repository root; the project's identity names the main checkout.
+        let repository_root = match (&thread.worktree_path, project) {
+            (None, Some(project)) => project.repository_identity.as_ref().and_then(|identity| identity.get("rootPath")).and_then(|root| root.as_str()).map(str::to_owned),
+            _ => None,
+        };
+        (workspace_root, repository_root)
     }
 
     /// `openDiffFilePrimaryAction`: a file title opens that file in a file tab, resolved against
@@ -1015,18 +1163,36 @@ impl DiffPanel {
     pub fn open_file(&mut self, file: usize, cx: &mut Context<Self>) {
         if self.external.is_some() { return; }
         let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|file| file.path().to_owned()) else { return };
-        let Some(thread_id) = self.thread_id.as_deref() else { return };
-        let state = self.state.read(cx);
-        let Some(thread) = state.thread_shell(thread_id) else { return };
-        let project = state.shell.project(&thread.project_id);
-        let workspace_root = thread.worktree_path.clone().or_else(|| project.map(|project| project.workspace_root.clone()));
-        // A worktree is its own repository root; the project's identity names the main checkout.
-        let repository_root = match (&thread.worktree_path, project) {
-            (None, Some(project)) => project.repository_identity.as_ref().and_then(|identity| identity.get("rootPath")).and_then(|root| root.as_str()).map(str::to_owned),
-            _ => None,
-        };
+        let (workspace_root, repository_root) = self.workspace_roots(cx);
         let Some(relative) = t3_core::diff::resolve_diff_path_for_workspace(&path, workspace_root.as_deref(), repository_root.as_deref()) else { return };
         self.state.update(cx, |state, cx| state.open_file(&relative, None, cx));
+    }
+
+    pub(super) fn file_context_menu(&self, file_ix: usize, cx: &gpui::App) -> Option<(String, FileContextMenuCapabilities)> {
+        if self.external.is_some() { return None; }
+        let path = self.view.as_ref()?.parsed.files().get(file_ix)?.path().to_owned();
+        let (workspace_root, repository_root) = self.workspace_roots(cx);
+        let absolute_path = resolve_file_context_menu_absolute_path(&path, workspace_root.as_deref(), repository_root.as_deref())?;
+        let state = self.state.read(cx);
+        let config = state.server_config.config.as_ref()?;
+        let os = config.environment.platform.as_ref().map_or("unknown", |platform| platform.os.as_str());
+        let capabilities = FileContextMenuCapabilities::from_server(&config.available_editors, os);
+        (!capabilities.is_empty()).then_some((absolute_path, capabilities))
+    }
+
+    pub(super) fn activate_file_context_menu(&mut self, action: FileContextMenuAction, absolute_path: String, cx: &mut Context<Self>) {
+        let (method, payload) = file_context_menu_open_request(&absolute_path, &action);
+        let Some(request) = self.state.update(cx, |state, _| Some(state.rpc(method, payload))) else { return };
+        let state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            if request.await.is_err() {
+                let title = file_context_menu_error_title(&action);
+                state.update(cx, |state, cx| {
+                    state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, title).description(absolute_path), cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {

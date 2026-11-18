@@ -2,16 +2,17 @@
 //! refs on the left; stats, refresh, fold-all, layout, wrap, whitespace and file tree on the right.
 
 use gpui::{Context, IntoElement, ParentElement, Styled, Window, div, prelude::*, px};
-use gpui_component::h_flex;
+use gpui_component::{ActiveTheme, h_flex};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use t3_core::diff::{DiffScope, DiffSelection, Layout, line_stat};
-use t3_core::sidebar::time::{parse_iso, to_local};
+use t3_core::sidebar::time::{compact_relative_label, parse_iso, to_local};
 use t3_core::timeline::TimestampLocale;
 
 use super::DiffPanel;
 use super::lines::stat_label;
 use crate::icons::Icon;
-use crate::right_panel::{Button, Size, Variant, segment, segmented};
+use crate::right_panel::{Button, Size, Variant, segment, segmented, tooltip_view};
+use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
 
 pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffPanel>) -> impl IntoElement {
@@ -19,7 +20,19 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
     let entity = cx.entity().downgrade();
     let summaries = panel.summaries.clone();
     let scope = panel.scope.clone();
-    let label = scope.label(&summaries);
+    let selected_commit = match &scope {
+        DiffScope::Commit { sha, .. } => Some(sha.clone()),
+        _ => None,
+    };
+    let label = match &scope {
+        DiffScope::Commit { sha, .. } => panel
+            .review()
+            .and_then(|review| review.source.as_ref())
+            .filter(|source| source.head_ref.as_deref() == Some(sha.as_str()))
+            .and_then(|source| source.commit_subject.clone())
+            .unwrap_or_else(|| scope.label(&summaries)),
+        _ => scope.label(&summaries),
+    };
     let thread_id = panel.thread_id.clone().unwrap_or_default();
     let remembered_base = panel.state.read(cx).panels.branch_base_refs.get(&thread_id).cloned();
     let selected_turn = match &panel.selection {
@@ -27,7 +40,19 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
         _ => None,
     };
     let external = panel.is_external();
-    let git_scope = !external && matches!(scope, DiffScope::Branch { .. } | DiffScope::Unstaged);
+    let git_scope = !external && matches!(scope, DiffScope::Branch { .. } | DiffScope::Unstaged | DiffScope::Commit { .. });
+    let header_commit_url = selected_commit.as_deref().and_then(|sha| panel.commit_url(sha, cx));
+    let can_read = panel.state.read(cx).can_read_threads();
+    let commits_snapshot = panel.branch_commits.clone();
+    let commits_error = panel.branch_commits_error.clone();
+    let project_identity = panel
+        .thread_id
+        .as_deref()
+        .and_then(|id| {
+            let state = panel.state.read(cx);
+            let thread = state.thread_shell(id)?;
+            state.shell.project(&thread.project_id)?.repository_identity.clone()
+        });
     let parsed = panel.view.as_ref().map(|view| view.parsed.clone());
     let has_files = parsed.as_ref().is_some_and(|parsed| !parsed.files().is_empty());
     let stats = parsed.as_ref().filter(|_| has_files).map(|parsed| {
@@ -36,20 +61,14 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
             (stat.additions, stat.deletions)
         })
     });
-    let refs = match (&scope, parsed.as_ref()) {
-        (DiffScope::Branch { base_ref }, Some(parsed)) => {
-            let head = parsed.head_ref.clone().unwrap_or_else(|| "HEAD".to_owned());
-            let base = parsed.base_ref.clone().or(base_ref.clone()).unwrap_or_else(|| "Automatic".to_owned());
-            Some(format!("{head} → {base}"))
-        }
-        _ => None,
-    };
+    let base_ref_picker = super::base_ref::picker(panel, window, cx);
     let layout = crate::settings::client_settings(cx).diff_layout();
     let tree_open = panel.state.read(cx).panels.diff_file_tree_open;
     let all_collapsed = panel.all_collapsed();
     let test_files = panel.test_file_count();
     let hides_tests = panel.hides_test_files();
 
+    let menu_selected_commit = selected_commit.clone();
     let scope_menu = Button::new("diff-scope")
         .variant(Variant::Secondary)
         .size(Size::Xs)
@@ -69,6 +88,16 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
             let turns = summaries.clone();
             let selected = selected_turn.clone();
             let turn_entity = entity.clone();
+            let commits_entity = entity.clone();
+            let commits_selected = menu_selected_commit.clone();
+            let commits_data = commits_snapshot.clone();
+            let commits_err = commits_error.clone();
+            let commits_identity = project_identity.clone();
+            if let Some(panel_entity) = entity.upgrade() {
+                cx.defer(move |cx| {
+                    panel_entity.update(cx, |panel, cx| panel.refresh_branch_commits(cx));
+                });
+            }
             menu.item(
                 PopupMenuItem::new("Changes")
                     .checked(matches!(scope, DiffScope::Branch { .. }))
@@ -105,6 +134,72 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                     )
                 })
             })
+            .submenu("Commits", window, cx, move |mut menu, _, cx| {
+                let muted = hsla(palette(cx).muted_foreground);
+                let now = now_ms();
+                if let Some(commits) = &commits_data {
+                    for (commit_ix, commit) in commits.commits.iter().enumerate() {
+                        let entity = commits_entity.clone();
+                        let sha = commit.sha.clone();
+                        let short: gpui::SharedString = commit.sha[..commit.sha.len().min(7)].to_owned().into();
+                        let subject: gpui::SharedString = commit.subject.clone().into();
+                        let age: gpui::SharedString = parse_iso(&commit.committed_at)
+                            .map(|ms| compact_relative_label(ms, now))
+                            .unwrap_or_default()
+                            .into();
+                        let checked = commits_selected.as_deref() == Some(commit.sha.as_str());
+                        let commit_url = t3_core::diff::project_commit_url(commits_identity.as_ref(), &commit.sha);
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, cx| {
+                                let family = cx.theme().mono_font_family.clone();
+                                h_flex()
+                                    .w_full()
+                                    .min_w(px(260.))
+                                    .max_w(px(360.))
+                                    .gap(px(8.))
+                                    .child(div().flex_1().min_w_0().truncate().child(subject.clone()))
+                                    .child(div().flex_none().text_xs().text_color(muted).child(age.clone()))
+                                    .child(if let Some(url) = commit_url.clone() {
+                                        div()
+                                            .id(("diff-commit-url", commit_ix))
+                                            .flex_none()
+                                            .font_family(family)
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .underline()
+                                            .cursor_pointer()
+                                            .on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                cx.open_url(&url);
+                                            })
+                                            .child(short.clone())
+                                            .into_any_element()
+                                    } else {
+                                        div().flex_none().font_family(family).text_xs().text_color(muted).child(short.clone()).into_any_element()
+                                    })
+                            })
+                            .checked(checked)
+                            .on_click(move |_, _, cx| {
+                                if let Some(entity) = entity.upgrade() {
+                                    entity.update(cx, |panel, cx| panel.select_commit(&sha, cx));
+                                }
+                            }),
+                        );
+                    }
+                    if commits.commits.is_empty() {
+                        menu = menu.item(PopupMenuItem::new("No commits on this branch.").disabled(true));
+                    } else if commits.truncated {
+                        menu = menu.item(PopupMenuItem::new(format!("Showing latest {} commits", commits.commits.len())).disabled(true));
+                    }
+                } else if let Some(err) = &commits_err {
+                    menu = menu.item(PopupMenuItem::new(err.clone()).disabled(true));
+                } else if !can_read {
+                    menu = menu.item(PopupMenuItem::new("This connection cannot read local diffs.").disabled(true));
+                } else {
+                    menu = menu.item(PopupMenuItem::new("Loading commits...").disabled(true));
+                }
+                menu
+            })
         });
 
     let entity = cx.entity().downgrade();
@@ -132,7 +227,37 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                 .min_w_0()
                 .gap(px(12.))
                 .when(!external, |this| this.child(scope_menu))
-                .children(refs.map(|refs| div().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(refs))),
+                .when(!external, |this| {
+                    this.children(selected_commit.map(|sha| {
+                        let short = sha[..sha.len().min(7)].to_owned();
+                        let family = cx.theme().mono_font_family.clone();
+                        match header_commit_url {
+                            Some(url) => {
+                                let tooltip_url: gpui::SharedString = url.clone().into();
+                                div()
+                                    .id("diff-header-commit-sha")
+                                    .flex_none()
+                                    .font_family(family)
+                                    .text_xs()
+                                    .text_color(hsla(p.muted_foreground))
+                                    .underline()
+                                    .cursor_pointer()
+                                    .tooltip(move |window, cx| tooltip_view(tooltip_url.clone(), window, cx))
+                                    .on_click(move |_, _, cx| cx.open_url(&url))
+                                    .child(short)
+                                    .into_any_element()
+                            }
+                            None => div()
+                                .flex_none()
+                                .font_family(family)
+                                .text_xs()
+                                .text_color(hsla(p.muted_foreground))
+                                .child(short)
+                                .into_any_element(),
+                        }
+                    }))
+                })
+                .child(base_ref_picker),
         )
         .child(
             h_flex()

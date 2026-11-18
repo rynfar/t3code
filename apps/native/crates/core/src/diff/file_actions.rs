@@ -4,7 +4,10 @@
 //! tool-call diffs that name files by absolute path resolve against the workspace
 //! (`pingdotgg/t3code#29309`).
 
-use crate::files::workspace_relative_path;
+use serde_json::{Value, json};
+
+use crate::files::{absolute_path, workspace_relative_path};
+use crate::project_search::{EDITOR_ORDER, OPEN_IN_EDITOR};
 use crate::sidebar::grouping::normalize_project_path;
 
 fn is_windows_absolute(path: &str) -> bool {
@@ -67,9 +70,92 @@ pub fn resolve_diff_path_for_workspace(file_path: &str, workspace_root: Option<&
     (!relative.is_empty()).then(|| relative.join("/"))
 }
 
+/// `revealInFileExplorerLabelForOs` (`apps/web/src/components/preview/fileExplorerLabel.ts`).
+pub fn reveal_in_file_explorer_label_for_os(os: &str) -> &'static str {
+    match os {
+        "darwin" => "Reveal in Finder",
+        "windows" => "Reveal in File Explorer",
+        _ => "Reveal in Files",
+    }
+}
+
+/// `resolveFileContextMenuAbsolutePath` (`apps/web/src/fileContextMenu.ts`): resolves a diff file
+/// path into the host path to pass to `shell.openInEditor`, or `None` outside the workspace.
+pub fn resolve_file_context_menu_absolute_path(
+    file_path: &str,
+    workspace_root: Option<&str>,
+    repository_root: Option<&str>,
+) -> Option<String> {
+    let workspace_file_path = resolve_diff_path_for_workspace(file_path, workspace_root, repository_root)?;
+    match workspace_root.filter(|root| !root.is_empty()) {
+        None => is_absolute(&workspace_file_path).then_some(workspace_file_path),
+        Some(root) => Some(absolute_path(&workspace_file_path, root)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileContextMenuAction {
+    Open,
+    RevealInFolder,
+    Editor { id: String, label: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileContextMenuCapabilities {
+    pub reveal_label: Option<&'static str>,
+    pub can_open_default: bool,
+    pub editors: Vec<(String, String)>,
+}
+
+impl FileContextMenuCapabilities {
+    pub fn from_server(available_editors: &[String], os: &str) -> Self {
+        let has_file_manager = available_editors.iter().any(|id| id == "file-manager");
+        let editors = available_editors
+            .iter()
+            .filter(|id| id.as_str() != "file-manager")
+            .map(|id| {
+                let label = EDITOR_ORDER.iter().find(|(known, _)| *known == id).map_or(id.as_str(), |(_, label)| *label);
+                (id.clone(), label.to_owned())
+            })
+            .collect();
+        Self {
+            reveal_label: has_file_manager.then(|| reveal_in_file_explorer_label_for_os(os)),
+            can_open_default: has_file_manager,
+            editors,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.can_open_default && self.reveal_label.is_none() && self.editors.is_empty()
+    }
+}
+
+/// Payload for `shell.openInEditor` from the diff header context menu (`fileContextMenu.ts`).
+pub fn file_context_menu_open_request(
+    absolute_path: &str,
+    action: &FileContextMenuAction,
+) -> (&'static str, Value) {
+    match action {
+        FileContextMenuAction::Open => (OPEN_IN_EDITOR, json!({ "cwd": absolute_path, "editor": "file-manager" })),
+        FileContextMenuAction::RevealInFolder => {
+            (OPEN_IN_EDITOR, json!({ "cwd": absolute_path, "editor": "file-manager", "reveal": true }))
+        }
+        FileContextMenuAction::Editor { id, .. } => (OPEN_IN_EDITOR, json!({ "cwd": absolute_path, "editor": id })),
+    }
+}
+
+pub fn file_context_menu_error_title(action: &FileContextMenuAction) -> String {
+    match action {
+        FileContextMenuAction::Open => "Could not open file".to_owned(),
+        FileContextMenuAction::RevealInFolder => "Unable to reveal file".to_owned(),
+        FileContextMenuAction::Editor { label, .. } => format!("Could not open in {label}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::resolve_diff_path_for_workspace as resolve;
+    use super::*;
 
     #[test]
     fn nested_projects_strip_their_prefix() {
@@ -106,5 +192,27 @@ mod tests {
         ] {
             assert_eq!(resolve(path, Some("/repo/frontend"), Some("/repo")), None, "{path}");
         }
+    }
+
+    #[test]
+    fn context_menu_resolves_workspace_absolute_path_and_actions() {
+        assert_eq!(
+            resolve_file_context_menu_absolute_path("frontend/src/a.ts", Some("/repo/frontend"), Some("/repo")).as_deref(),
+            Some("/repo/frontend/src/a.ts")
+        );
+        assert_eq!(
+            resolve_file_context_menu_absolute_path("/etc/passwd", Some("/repo/frontend"), Some("/repo")),
+            None
+        );
+        let caps = FileContextMenuCapabilities::from_server(&["file-manager".into(), "cursor".into()], "darwin");
+        assert!(caps.can_open_default);
+        assert_eq!(caps.reveal_label, Some("Reveal in Finder"));
+        assert_eq!(caps.editors, vec![("cursor".into(), "Cursor".into())]);
+        assert_eq!(
+            file_context_menu_open_request("/repo/a.ts", &FileContextMenuAction::RevealInFolder).1,
+            json!({ "cwd": "/repo/a.ts", "editor": "file-manager", "reveal": true })
+        );
+        assert_eq!(reveal_in_file_explorer_label_for_os("windows"), "Reveal in File Explorer");
+        assert_eq!(reveal_in_file_explorer_label_for_os("linux"), "Reveal in Files");
     }
 }

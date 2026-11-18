@@ -5,10 +5,10 @@ use gpui::{AnyElement, App, Entity, FontWeight, IntoElement, ParentElement, Shar
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::git_actions::{
-    self, MenuItemId, QuickAction, QuickActionIcon, QuickActionKind, StackedAction, build_menu_items, format_elapsed, menu_disabled_reason,
-    resolve_quick_action, terminology,
+    self, MenuItemId, QuickAction, QuickActionIcon, QuickActionKind, StackedAction, build_menu_items, format_elapsed, has_usable_menu_content,
+    menu_disabled_reason, resolve_changes_totals, resolve_quick_action, terminology,
 };
-use t3_core::vcs::{changes_totals, format_diff_count};
+use t3_core::vcs::format_diff_count;
 
 use super::dialogs::ActionRequest;
 use super::{GitDialogs, GitStore};
@@ -85,13 +85,14 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
     let store = git.read(cx);
     let p = palette(cx);
     let status = store.status.as_ref();
+    let can_write = store.can_write_source_control();
     if status.is_some_and(|status| !status.local.is_repo) {
         if compact {
             return None;
         }
         let label = if store.initializing { "Initializing..." } else { "Initialize Git" };
         let git = git.clone();
-        return Some(Row::new("git-init", label).icon(Icon::GitBranchPlus).tooltip(label).disabled(store.initializing).on_click(move |_, _, cx| git.update(cx, |git, cx| git.init_repo(cx))).into_any_element());
+        return Some(Row::new("git-init", label).icon(Icon::GitBranchPlus).tooltip(label).disabled(!can_write || store.initializing).on_click(move |_, _, cx| git.update(cx, |git, cx| git.init_repo(cx))).into_any_element());
     }
     let has_primary_remote = status.is_some_and(|status| status.local.has_primary_remote);
     let is_default_ref = status.is_some_and(|status| status.local.is_default_ref);
@@ -126,9 +127,13 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
         return None;
     }
     let icon = quick_icon(quick.icon());
-    let disabled_reason = match quick.kind {
-        QuickActionKind::Publish => Some("Publishing a repository is not available in this app yet.".to_owned()),
-        _ => quick.disabled_reason(),
+    let disabled_reason = if !can_write {
+        Some("This connection cannot change source control.".to_owned())
+    } else {
+        match quick.kind {
+            QuickActionKind::Publish => Some("Publishing a repository is not available in this app yet.".to_owned()),
+            _ => quick.disabled_reason(),
+        }
     };
     let primary = match disabled_reason {
         Some(reason) => Row::new("git-quick-action", quick.label.clone()).icon(icon).disabled(true).tooltip(reason),
@@ -140,17 +145,33 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
     Some(split_row("git-actions", primary, menu, cx).into_any_element())
 }
 
+fn menu_has_notice(store: &GitStore) -> bool {
+    let detached = store.status.as_ref().is_some_and(|status| status.local.ref_name.is_none());
+    let clean_behind = store.status.as_ref().is_some_and(|status| {
+        status.local.ref_name.is_some()
+            && !status.local.has_working_tree_changes
+            && status.remote.behind_count > 0
+            && status.remote.ahead_count == 0
+    });
+    detached || clean_behind || store.status_error.is_some()
+}
+
 /// The chevron and its menu (`gitItems`): Commit, Push and Create PR, with why each is
 /// unavailable, then the notes about a detached HEAD, a branch behind upstream, or a status error.
 fn menu_trigger(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, cx: &App) -> impl IntoElement {
-    let running = git.read(cx).is_running();
+    let store = git.read(cx);
+    let running = store.is_running();
+    let has_primary_remote = store.status.as_ref().is_some_and(|status| status.local.has_primary_remote);
+    let menu_items = build_menu_items(store.status.as_ref(), running, has_primary_remote);
+    let has_content = has_usable_menu_content(&menu_items, store.can_write_source_control(), false, menu_has_notice(store));
     let (git, dialogs) = (git.clone(), dialogs.clone());
-    MenuTrigger::new("git-actions-menu", "Git action options").disabled(running).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, cx| {
+    MenuTrigger::new("git-actions-menu", "Git action options").disabled(running || !has_content).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, cx| {
         git.update(cx, |git, cx| git.refresh_status(false, cx));
         let store = git.read(cx);
         let p = palette(cx);
         let status = store.status.clone();
         let busy = store.is_running();
+        let can_write = store.can_write_source_control();
         let has_primary_remote = status.as_ref().is_some_and(|status| status.local.has_primary_remote);
         let terms = terminology(status.as_ref().and_then(|status| status.provider_kind()));
         let status_error = store.status_error.clone();
@@ -175,7 +196,7 @@ fn menu_trigger(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, cx: &App) 
                         MenuItemId::Push => dialogs.update(cx, |dialogs, cx| dialogs.request_action(ActionRequest::new(StackedAction::Push), window, cx)),
                         MenuItemId::Pr => dialogs.update(cx, |dialogs, cx| dialogs.request_action(ActionRequest::new(StackedAction::CreatePr), window, cx)),
                     })
-                    .disabled(git.read(cx).is_running())
+                    .disabled(!can_write || git.read(cx).is_running())
                 }
             };
             menu = menu.item(entry);
@@ -195,7 +216,8 @@ fn menu_trigger(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, cx: &App) 
     })
 }
 
-/// The Changes row: line totals for the branch (or the dirty tree); opens the diff panel.
+/// The Changes row: line totals for the branch (or the dirty tree) beside what they compare
+/// against (`vs main` or `Uncommitted`); opens the diff panel.
 pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet: bool, cx: &App) -> Option<AnyElement> {
     let store = git.read(cx);
     let status = store.status.as_ref();
@@ -209,23 +231,48 @@ pub fn changes_row(git: &Entity<GitStore>, state: &Entity<AppState>, no_runs_yet
         return None;
     }
     let p = palette(cx);
-    let (insertions, deletions) = status.map(changes_totals).unwrap_or((0, 0));
+    let resolved = resolve_changes_totals(status, None);
+    let base_label: Option<SharedString> = resolved.as_ref().map(|totals| totals.base_label().into());
+    let (insertions, deletions) = resolved.map(|totals| (totals.insertions, totals.deletions)).unwrap_or((0, 0));
     let count = |sign: &str, value: u64, color: u32| {
         div().text_color(hsla(if value > 0 { color } else { p.muted_foreground })).child(format!("{sign}{}", format_diff_count(value)))
     };
-    let totals = h_flex()
+    let counts = h_flex()
         .flex_none()
         .gap(px(6.))
         .font_family(gpui_component::ActiveTheme::theme(cx).mono_font_family.clone())
         .text_xs()
         .child(count("+", insertions, p.diff_addition_foreground))
         .child(count("-", deletions, p.diff_deletion_foreground));
+    // "Changes" keeps its width and the base label after it truncates first, so the row draws
+    // its own label: `Row`'s empty one takes no room and its gap is taken back.
+    let mut content = h_flex()
+        .flex_1()
+        .min_w_0()
+        .ml(px(-10.))
+        .gap(px(6.))
+        .child(div().flex_none().child("Changes"))
+        .children(base_label.map(|label| {
+            let tooltip = label.clone();
+            div()
+                .id("git-changes-base")
+                .debug_selector(|| "git-changes-base".to_owned())
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::NORMAL)
+                .text_color(hsla(p.muted_foreground))
+                .child(label)
+                .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
+        }))
+        .child(div().flex_1().min_w(px(8.)))
+        .child(counts);
+    content.style().flex_grow = Some(1_000_000.);
     let state = state.clone();
     let can_open = state.read(cx).selected_thread.is_some();
     Some(
-        Row::new("git-changes", "Changes")
+        Row::new("git-changes", "")
             .icon(Icon::FileDiff)
-            .trailing(totals)
+            .trailing(content)
             .disabled(!can_open)
             .on_click(move |_, _, cx| state.update(cx, |state, cx| state.add_diff_surface(cx)))
             .into_any_element(),
