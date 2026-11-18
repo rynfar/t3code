@@ -6,34 +6,55 @@
 //! handling of `apps/web/src/terminal/ghostty/surface.ts`.
 
 use std::cell::RefCell;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Styled, Subscription, Task, UTF16Selection, Window, div, px,
+    App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection, Window, div, px,
 };
 use gpui_component::menu::ContextMenuExt;
 use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
+use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
+use t3_core::client_settings::BrowserLinkTarget;
 use t3_core::composer::context::{normalize_text, selection_line_range};
+use t3_core::files::metadata::{self, GET_METADATA, Lookup};
+use t3_core::markdown::links::open_in_editor_request_with_root;
+use t3_core::project_search::{OPEN_IN_EDITOR, preferred_editor};
 use t3_core::terminal::emulator::{self, GridPoint, MouseAction, SelectionType, Side, TermMode, ThemeColors, hit_cell};
-use t3_core::terminal::{self, Grid, KeyInput, encode_key, encode_paste, shortcut_data};
+use t3_core::terminal::links::{self, LinkHit};
+use t3_core::terminal::{
+    self, Grid, KeyInput, TerminalShortcut, encode_key, encode_paste, local_shortcut, shortcut_data,
+};
 
 use super::colors;
+use super::drawer::SharedMetadataCache;
 use super::element::{RowCache, TerminalElement, TerminalFont};
 use super::session::{Frame, Session, Signal, Target};
 use super::{AddToChat, Clear, Copy, JumpToLatest, Paste, SelectAll};
+use crate::app_state::AppState;
 use crate::composer::controls::{MenuItem, menu_surface};
 
 /// The PTY hears a new grid only after the size settles, so a drag does not reflow the prompt.
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 const DRAG_THRESHOLD: f32 = 2.;
+const LINK_DRAG_THRESHOLD: f32 = 4.;
+/// `TERMINAL_LINK_HOVER_DELAY_MS`: wait until a row stops changing before asking for metadata.
+const LINK_HOVER_DELAY: Duration = Duration::from_millis(250);
 /// `SELECTION_MULTI_CLICK_INTERVAL_MS`: after a double or triple click the selection menu waits
 /// out the next click.
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const FILESYSTEM_READ_SCOPE: &str = "filesystem:read";
+const PREVIEW_OPERATE_SCOPE: &str = "preview:operate";
+#[cfg(target_os = "macos")]
+const MAC: bool = true;
+#[cfg(not(target_os = "macos"))]
+const MAC: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
@@ -73,6 +94,23 @@ struct Drag {
     armed: bool,
 }
 
+enum LinkValidation {
+    Ready(bool),
+    Pending(Task<bool>),
+}
+
+struct LinkActivation {
+    origin: Point<Pixels>,
+    link: LinkHit,
+    validation: LinkValidation,
+}
+
+#[derive(Clone, Copy)]
+struct RowStability {
+    hash: u64,
+    changed_at: Instant,
+}
+
 /// `shouldReportTerminalMouse`: Shift, Control and Command keep the pointer for selection.
 fn reports_mouse(modifiers: &Modifiers) -> bool {
     !modifiers.shift && !modifiers.control && !modifiers.platform
@@ -89,6 +127,7 @@ fn report_button(button: MouseButton) -> Option<emulator::MouseButton> {
 }
 
 pub struct TerminalPane {
+    app: Option<Entity<AppState>>,
     session: Session,
     focus: FocusHandle,
     frame: Rc<RefCell<Frame>>,
@@ -96,6 +135,7 @@ pub struct TerminalPane {
     geometry: Option<Geometry>,
     /// The grid and cell size the emulator was last fitted to.
     fitted: Option<(Grid, (f32, f32))>,
+    visible: bool,
     marked: Option<String>,
     drag: Option<Drag>,
     /// The button whose press went to the program, and the cell it last reported.
@@ -107,6 +147,17 @@ pub struct TerminalPane {
     selection_menu: Option<SelectionMenu>,
     /// A selection menu waiting out a possible next click.
     selection_menu_delay: Option<Task<()>>,
+    link_metadata: SharedMetadataCache,
+    hover_pointer: Option<Point<Pixels>>,
+    hovered_link: Option<LinkHit>,
+    link_hover_candidate: Option<LinkHit>,
+    link_hover_timer: Option<Task<()>>,
+    link_hover_fetch: Option<Task<()>>,
+    row_stability: Vec<RowStability>,
+    stability_generation: u64,
+    link_activation_request_id: u64,
+    link_activation: Option<LinkActivation>,
+    link_activation_task: Option<Task<()>>,
     _pump: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -135,7 +186,11 @@ impl TerminalPane {
                 let alive = match signal {
                     Signal::Changed => {
                         signals.pending.store(false, std::sync::atomic::Ordering::Release);
-                        this.update(cx, |_, cx| cx.notify()).is_ok()
+                        this.update(cx, |pane, cx| {
+                            pane.update_row_stability(cx);
+                            cx.notify();
+                        })
+                        .is_ok()
                     }
                     Signal::Exited => this.update(cx, |_, cx| cx.emit(PaneEvent::Exited)).is_ok(),
                 };
@@ -150,12 +205,14 @@ impl TerminalPane {
             cx.observe_global::<TerminalFont>(|_, cx| cx.notify()),
         ];
         TerminalPane {
+            app: None,
             session,
             focus,
             frame: Rc::default(),
             rows: Rc::default(),
             geometry: None,
             fitted: None,
+            visible: true,
             marked: None,
             drag: None,
             reporting: None,
@@ -165,13 +222,43 @@ impl TerminalPane {
             resize_settle: None,
             selection_menu: None,
             selection_menu_delay: None,
+            link_metadata: Rc::new(RefCell::new((Instant::now(), t3_core::files::metadata::MetadataCache::default()))),
+            hover_pointer: None,
+            hovered_link: None,
+            link_hover_candidate: None,
+            link_hover_timer: None,
+            link_hover_fetch: None,
+            row_stability: Vec::new(),
+            stability_generation: 0,
+            link_activation_request_id: 0,
+            link_activation: None,
+            link_activation_task: None,
             _pump: pump,
             _subscriptions: subscriptions,
         }
     }
 
+    pub(super) fn set_link_context(&mut self, app: Entity<AppState>, link_metadata: SharedMetadataCache) {
+        self.app = Some(app);
+        self.link_metadata = link_metadata;
+    }
+
     pub fn terminal_id(&self) -> &str {
         &self.session.target.terminal_id
+    }
+
+    pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if !visible {
+            self.link_activation_request_id += 1;
+            self.link_activation = None;
+            self.link_activation_task = None;
+            self.row_stability.clear();
+            self.clear_hovered_link(cx);
+        }
     }
 
     /// Called from the element's prepaint with the grid and cell size that fit this frame. The
@@ -182,6 +269,10 @@ impl TerminalPane {
         }
         let regrid = self.fitted.is_none_or(|(grid, _)| grid != measured);
         self.fitted = Some((measured, cell));
+        if regrid {
+            self.link_activation_request_id += 1;
+            self.link_activation_task = None;
+        }
         self.session.update(|core| core.lay_out(measured, cell));
         if regrid {
             self.resize_pending = true;
@@ -193,6 +284,10 @@ impl TerminalPane {
     }
 
     pub(super) fn set_geometry(&mut self, geometry: Geometry) {
+        if self.geometry != Some(geometry) {
+            self.link_activation_request_id += 1;
+            self.link_activation_task = None;
+        }
         self.geometry = Some(geometry);
     }
 
@@ -340,6 +435,8 @@ impl TerminalPane {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.link_activation_request_id += 1;
+        self.link_activation_task = None;
         self.session.update(|core| core.emulator.select_all());
         cx.notify();
     }
@@ -353,7 +450,7 @@ impl TerminalPane {
         cx.notify();
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_selection_menu(cx);
         let keystroke = &event.keystroke;
         let modifiers = &keystroke.modifiers;
@@ -365,7 +462,44 @@ impl TerminalPane {
             shift: modifiers.shift,
             platform: modifiers.platform,
         };
-        let app_cursor = self.session.shared.lock().emulator.mode().contains(TermMode::APP_CURSOR);
+        let (app_cursor, has_selection, alt_screen, rows) = {
+            let core = self.session.shared.lock();
+            let mode = core.emulator.mode();
+            (
+                mode.contains(TermMode::APP_CURSOR),
+                core.emulator.has_selection(),
+                mode.contains(TermMode::ALT_SCREEN),
+                core.emulator.grid().rows as i32,
+            )
+        };
+        let mapper = cx.keyboard_mapper().clone();
+        if let Some(shortcut) = local_shortcut(&key, MAC, has_selection, alt_screen, mapper.get_key_equivalents()) {
+            cx.stop_propagation();
+            match shortcut {
+                TerminalShortcut::Copy { clear_selection } => {
+                    self.copy(&Copy, window, cx);
+                    if clear_selection {
+                        self.session.update(|core| core.emulator.clear_selection());
+                        cx.notify();
+                    }
+                }
+                TerminalShortcut::Paste => self.paste(&Paste, window, cx),
+                TerminalShortcut::SelectAll => self.select_all(&SelectAll, window, cx),
+                TerminalShortcut::ScrollPages(pages) => {
+                    self.session.update(|core| core.emulator.scroll(pages * rows.max(1)));
+                    cx.notify();
+                }
+                TerminalShortcut::ScrollToTop => {
+                    self.session.update(|core| core.emulator.scroll_to_top());
+                    cx.notify();
+                }
+                TerminalShortcut::ScrollToBottom => {
+                    self.session.update(|core| core.emulator.scroll_to_bottom());
+                    cx.notify();
+                }
+            }
+            return;
+        }
         let data = match shortcut_data(&key) {
             Some(data) => data.to_owned(),
             None => match encode_key(&key, app_cursor) {
@@ -405,22 +539,334 @@ impl TerminalPane {
         Some((core.emulator.mouse_report(action, button, alt, row, col)?, (row, col)))
     }
 
-    /// Capture phase, so a press the program takes never starts a selection or the context menu.
-    fn report_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(button) = report_button(event.button).filter(|_| reports_mouse(&event.modifiers)) else { return };
-        let Some((report, cell)) = self.mouse_report(MouseAction::Press, button, event.modifiers.alt, event.position) else { return };
-        cx.stop_propagation();
-        window.focus(&self.focus, cx);
-        cx.emit(PaneEvent::Activated);
-        self.reporting = Some((event.button, cell));
-        self.input(&report, cx);
+    fn link_cell_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
+        let geometry = self.geometry?;
+        if geometry.cols == 0 || geometry.rows == 0 || geometry.cell_width <= 0. || geometry.line_height <= 0. {
+            return None;
+        }
+        let dx = f32::from(position.x - geometry.origin.x);
+        let dy = f32::from(position.y - geometry.origin.y);
+        if dx < 0. || dy < 0. {
+            return None;
+        }
+        let col = (dx / geometry.cell_width).floor() as usize;
+        let row = (dy / geometry.line_height).floor() as usize;
+        (col < geometry.cols && row < geometry.rows).then_some((row, col))
     }
 
-    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus, cx);
-        cx.emit(PaneEvent::Activated);
-        let Some((point, side)) = self.hit(event.position) else { return };
-        let (click_count, extend) = (event.click_count, event.modifiers.shift);
+    fn link_query_path(&self, text: &str) -> Option<String> {
+        let cwd = &self.session.target.location.cwd;
+        let target = links::resolve_link_target(text, cwd);
+        metadata::query_path(&target, Some(cwd))
+    }
+
+    fn has_link_scopes(&self, require_filesystem_read: bool, cx: &App) -> bool {
+        let Some(app) = &self.app else { return false };
+        let Some(client) = app.read(cx).client_handle() else { return false };
+        let session = client.session_state();
+        let state = session.borrow();
+        let Some(auth) = state.as_ref() else { return false };
+        auth.grants(ORCHESTRATION_OPERATE_SCOPE) && (!require_filesystem_read || auth.grants(FILESYSTEM_READ_SCOPE))
+    }
+
+    fn can_activate_link(&self, text: &str, cx: &App) -> bool {
+        if links::is_url(text) {
+            return true;
+        }
+        if !self.has_link_scopes(true, cx) {
+            return false;
+        }
+        let Some(query) = self.link_query_path(text) else {
+            return false;
+        };
+        let mut cache = self.link_metadata.borrow_mut();
+        let now = cache.0.elapsed().as_millis() as u64;
+        let thread = self.session.target.thread_id.as_str();
+        matches!(cache.1.lookup(&query, Some(thread), now), Lookup::Known(Some(meta)) if meta.is_openable())
+    }
+
+    fn link_at_position(&self, position: Point<Pixels>, allow_validation: bool, cx: &App) -> Option<LinkHit> {
+        let (row, col) = self.link_cell_at(position)?;
+        let hit = self.session.shared.lock().emulator.link_at(row, col)?;
+        if links::is_url(&hit.text) {
+            return Some(hit);
+        }
+        if self.can_activate_link(&hit.text, cx) {
+            return Some(hit);
+        }
+        if allow_validation && self.has_link_scopes(true, cx) && self.link_query_path(&hit.text).is_some() {
+            return Some(hit);
+        }
+        None
+    }
+
+    fn validate_link(&self, text: &str, cx: &mut Context<Self>) -> LinkValidation {
+        if self.can_activate_link(text, cx) {
+            return LinkValidation::Ready(true);
+        }
+        if !self.has_link_scopes(true, cx) {
+            return LinkValidation::Ready(false);
+        }
+        let Some(query) = self.link_query_path(text) else {
+            return LinkValidation::Ready(false);
+        };
+        {
+            let mut cache = self.link_metadata.borrow_mut();
+            let now = cache.0.elapsed().as_millis() as u64;
+            let thread = self.session.target.thread_id.as_str();
+            if let Lookup::Known(entry) = cache.1.lookup(&query, Some(thread), now) {
+                return LinkValidation::Ready(entry.is_some_and(|meta| meta.is_openable()));
+            }
+        }
+        let Some(app) = &self.app else {
+            return LinkValidation::Ready(false);
+        };
+        let Some(client) = app.read(cx).client_handle() else {
+            return LinkValidation::Ready(false);
+        };
+        let runtime = app.read(cx).runtime().clone();
+        let link_metadata = self.link_metadata.clone();
+        let thread_id = self.session.target.thread_id.clone();
+        let task = runtime.spawn(async move {
+            let Ok(reply) = client.request(GET_METADATA, metadata::request(std::slice::from_ref(&query))).await else {
+                return None;
+            };
+            let entry = metadata::decode(&reply, 1).ok()?.into_iter().next().flatten();
+            Some((query, entry))
+        });
+        LinkValidation::Pending(cx.spawn(async move |_, _| {
+            let Ok(Some((query, entry))) = task.await else {
+                return false;
+            };
+            let openable = entry.as_ref().is_some_and(|meta| meta.is_openable());
+            let mut cache = link_metadata.borrow_mut();
+            let now = cache.0.elapsed().as_millis() as u64;
+            cache.1.remember(&query, entry, Some(&thread_id), now);
+            openable
+        }))
+    }
+
+    fn update_row_stability(&mut self, cx: &mut Context<Self>) {
+        let mut frame = self.frame.borrow_mut();
+        super::session::take_newer(&self.session.front, &mut frame);
+        if frame.generation == self.stability_generation {
+            return;
+        }
+        self.stability_generation = frame.generation;
+        let snapshot = &frame.snapshot;
+        let now = Instant::now();
+        let mut next = Vec::with_capacity(snapshot.rows);
+        for row in 0..snapshot.rows {
+            let mut hasher = DefaultHasher::new();
+            snapshot.cols.hash(&mut hasher);
+            let start = row * snapshot.cols;
+            for (offset, cell) in snapshot.row(row).iter().enumerate() {
+                cell.c.hash(&mut hasher);
+                if cell.combining {
+                    snapshot.combining(start + offset).for_each(|c| c.hash(&mut hasher));
+                }
+            }
+            let hash = hasher.finish();
+            let changed_at = self
+                .row_stability
+                .get(row)
+                .filter(|prev| prev.hash == hash)
+                .map_or(now, |prev| prev.changed_at);
+            next.push(RowStability { hash, changed_at });
+        }
+        self.row_stability = next;
+        drop(frame);
+        self.refresh_hovered_link(cx);
+    }
+
+    fn clear_hovered_link(&mut self, cx: &mut Context<Self>) {
+        self.hover_pointer = None;
+        self.update_link_hover(None, cx);
+        self.set_hovered_link(None, cx);
+    }
+
+    fn refresh_hovered_link(&mut self, cx: &mut Context<Self>) {
+        let link = self
+            .hover_pointer
+            .and_then(|pointer| self.link_cell_at(pointer))
+            .and_then(|(row, col)| self.session.shared.lock().emulator.link_at(row, col));
+        self.update_link_hover(link.clone(), cx);
+        let active = link.filter(|hit| self.can_activate_link(&hit.text, cx));
+        self.set_hovered_link(active, cx);
+    }
+
+    fn update_link_hover(&mut self, link: Option<LinkHit>, cx: &mut Context<Self>) {
+        if link == self.link_hover_candidate {
+            return;
+        }
+        self.link_hover_candidate = link.clone();
+        self.link_hover_timer = None;
+        self.link_hover_fetch = None;
+        let Some(link) = link else { return };
+        if links::is_url(&link.text) || !self.has_link_scopes(true, cx) {
+            return;
+        }
+        let Some(query) = self.link_query_path(&link.text) else { return };
+        {
+            let mut cache = self.link_metadata.borrow_mut();
+            let now = cache.0.elapsed().as_millis() as u64;
+            let thread = self.session.target.thread_id.as_str();
+            if !matches!(cache.1.lookup(&query, Some(thread), now), Lookup::Fetch) {
+                return;
+            }
+        }
+        let now = Instant::now();
+        let mut changed_at = None::<Instant>;
+        for y in link.start.0..=link.end.0 {
+            let row_at = self.row_stability.get(y).map_or(now, |s| s.changed_at);
+            changed_at = Some(changed_at.map_or(row_at, |acc| acc.max(row_at)));
+        }
+        let elapsed = changed_at.unwrap_or(now).elapsed();
+        if elapsed >= LINK_HOVER_DELAY {
+            self.fetch_hovered_link_metadata(query, cx);
+        } else {
+            let wait = LINK_HOVER_DELAY.saturating_sub(elapsed);
+            self.link_hover_timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |pane, cx| {
+                    pane.link_hover_timer = None;
+                    pane.fetch_hovered_link_metadata(query, cx);
+                });
+            }));
+        }
+    }
+
+    fn fetch_hovered_link_metadata(&mut self, query: String, cx: &mut Context<Self>) {
+        if !self.has_link_scopes(true, cx) {
+            return;
+        }
+        let Some(app) = &self.app else { return };
+        let Some(client) = app.read(cx).client_handle() else { return };
+        let runtime = app.read(cx).runtime().clone();
+        let link_metadata = self.link_metadata.clone();
+        let thread_id = self.session.target.thread_id.clone();
+        let task = runtime.spawn(async move {
+            let reply = client.request(GET_METADATA, metadata::request(std::slice::from_ref(&query))).await.ok()?;
+            let entry = metadata::decode(&reply, 1).ok()?.into_iter().next().flatten();
+            Some((query, entry))
+        });
+        self.link_hover_fetch = Some(cx.spawn(async move |this, cx| {
+            let Ok(Some((query, entry))) = task.await else { return };
+            {
+                let mut cache = link_metadata.borrow_mut();
+                let now = cache.0.elapsed().as_millis() as u64;
+                cache.1.remember(&query, entry, Some(&thread_id), now);
+            }
+            let _ = this.update(cx, |pane, cx| {
+                pane.link_hover_fetch = None;
+                pane.refresh_hovered_link(cx);
+            });
+        }));
+    }
+
+    fn set_hovered_link(&mut self, link: Option<LinkHit>, cx: &mut Context<Self>) {
+        if self.hovered_link == link {
+            return;
+        }
+        self.hovered_link = link;
+        cx.notify();
+    }
+
+    fn activate_link(
+        &mut self,
+        link: LinkHit,
+        validation: LinkValidation,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        match validation {
+            LinkValidation::Ready(true) => self.open_validated_link(&link.text, modifiers, cx),
+            LinkValidation::Ready(false) => {}
+            LinkValidation::Pending(task) => {
+                let request_id = self.link_activation_request_id;
+                let geometry = self.geometry;
+                self.link_activation_task = Some(cx.spawn(async move |this, cx| {
+                    let valid = task.await;
+                    let _ = this.update(cx, |pane, cx| {
+                        pane.link_activation_task = None;
+                        if !pane.visible
+                            || request_id != pane.link_activation_request_id
+                            || pane.geometry != geometry
+                            || pane.link_cell_at(position).and_then(|(row, col)| pane.session.shared.lock().emulator.link_at(row, col)).as_ref() != Some(&link)
+                        {
+                            return;
+                        }
+                        if valid {
+                            pane.open_validated_link(&link.text, modifiers, cx);
+                        } else {
+                            pane.session.update(|core| core.emulator.clear_selection());
+                            cx.notify();
+                        }
+                    });
+                }));
+            }
+        }
+    }
+
+    fn open_validated_link(&mut self, text: &str, modifiers: Modifiers, cx: &mut Context<Self>) {
+        if links::is_url(text) {
+            let force_browser = modifiers.platform || modifiers.control;
+            let can_preview = self
+                .app
+                .as_ref()
+                .and_then(|app| app.read(cx).client_handle())
+                .is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|auth| auth.grants(PREVIEW_OPERATE_SCOPE)));
+            let target = crate::settings::client_settings(cx).browser_link_target();
+            if !force_browser
+                && can_preview
+                && target == BrowserLinkTarget::App
+                && let Some(previews) = crate::preview::previews(cx)
+            {
+                let thread_id = self.session.target.thread_id.clone();
+                previews.update(cx, |previews, cx| previews.open_link(thread_id, text.to_owned(), cx));
+                return;
+            }
+            cx.open_url(text);
+            return;
+        }
+        if !self.has_link_scopes(false, cx) {
+            return;
+        }
+        let Some(app) = &self.app else { return };
+        let target = links::resolve_link_target(text, &self.session.target.location.cwd);
+        let project_root = self
+            .session
+            .target
+            .location
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&self.session.target.location.cwd)
+            .to_owned();
+        let request = app.update(cx, |app, _| {
+            let available = app
+                .server_config
+                .config
+                .as_ref()
+                .map(|config| config.available_editors.clone())
+                .unwrap_or_default();
+            let (editor, _) = preferred_editor(&available, None)?;
+            Some(app.rpc(OPEN_IN_EDITOR, open_in_editor_request_with_root(&target, editor, Some(&project_root))))
+        });
+        let Some(request) = request else {
+            self.note("No editor is available to open this path.", cx);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = request.await {
+                let _ = this.update(cx, |pane, cx| pane.note(&error.to_string(), cx));
+            }
+        })
+        .detach();
+    }
+
+    fn begin_selection(&mut self, position: Point<Pixels>, click_count: usize, extend: bool, cx: &mut Context<Self>) {
+        let Some((point, side)) = self.hit(position) else { return };
         let armed = self.session.update(|core| match click_count {
             0 => None,
             1 if extend && core.emulator.has_selection() => {
@@ -441,8 +887,41 @@ impl TerminalPane {
             }
         });
         let Some(armed) = armed else { return };
-        self.drag = Some(Drag { origin: event.position, armed });
+        self.drag = Some(Drag { origin: position, armed });
         cx.notify();
+    }
+
+    /// Capture phase, so a press the program takes never starts a selection or the context menu.
+    fn report_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_activation_request_id += 1;
+        self.link_activation_task = None;
+        let Some(button) = report_button(event.button).filter(|_| reports_mouse(&event.modifiers)) else { return };
+        let Some((report, cell)) = self.mouse_report(MouseAction::Press, button, event.modifiers.alt, event.position) else { return };
+        cx.stop_propagation();
+        self.clear_hovered_link(cx);
+        window.focus(&self.focus, cx);
+        cx.emit(PaneEvent::Activated);
+        self.reporting = Some((event.button, cell));
+        self.input(&report, cx);
+    }
+
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.link_activation_request_id += 1;
+        self.link_activation_task = None;
+        window.focus(&self.focus, cx);
+        cx.emit(PaneEvent::Activated);
+        if event.button == MouseButton::Left
+            && !event.modifiers.shift
+            && event.click_count == 1
+            && let Some(link) = self.link_at_position(event.position, true, cx)
+        {
+            cx.stop_propagation();
+            let validation = self.validate_link(&link.text, cx);
+            self.link_activation = Some(LinkActivation { origin: event.position, link, validation });
+            return;
+        }
+        self.clear_hovered_link(cx);
+        self.begin_selection(event.position, event.click_count, event.modifiers.shift, cx);
     }
 
     /// Drags with a reported button, and hover motion for programs that track all motion
@@ -462,15 +941,31 @@ impl TerminalPane {
             }
             self.reporting = Some((button, cell));
         }
+        self.set_hovered_link(None, cx);
         self.input(&report, cx);
         true
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active) = &self.link_activation {
+            let travel = event.position - active.origin;
+            if f32::from(travel.x).hypot(f32::from(travel.y)) <= LINK_DRAG_THRESHOLD {
+                return;
+            }
+            let origin = active.origin;
+            self.link_activation = None;
+            self.clear_hovered_link(cx);
+            self.begin_selection(origin, 1, false, cx);
+        }
         if self.report_motion(event, cx) {
             return;
         }
-        let Some(mut drag) = self.drag.filter(|_| event.pressed_button == Some(MouseButton::Left)) else { return };
+        let Some(mut drag) = self.drag.filter(|_| event.pressed_button == Some(MouseButton::Left)) else {
+            self.hover_pointer = Some(event.position);
+            self.refresh_hovered_link(cx);
+            return;
+        };
+        self.clear_hovered_link(cx);
         if !drag.armed {
             let travel = event.position - drag.origin;
             if f32::from(travel.x).hypot(f32::from(travel.y)) < DRAG_THRESHOLD {
@@ -489,6 +984,12 @@ impl TerminalPane {
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.flush_resize();
+        if let Some(active) = self.link_activation.take().filter(|_| event.button == MouseButton::Left) {
+            if self.link_at_position(event.position, true, cx).as_ref() == Some(&active.link) {
+                self.activate_link(active.link, active.validation, event.position, event.modifiers, cx);
+            }
+            return;
+        }
         if let Some((button, _)) = self.reporting.filter(|(button, _)| *button == event.button) {
             self.reporting = None;
             let report = report_button(button)
@@ -496,6 +997,8 @@ impl TerminalPane {
             if let Some((report, _)) = report {
                 self.input(&report, cx);
             }
+            self.hover_pointer = Some(event.position);
+            self.refresh_hovered_link(cx);
             return;
         }
         if event.button == MouseButton::Left {
@@ -508,6 +1011,8 @@ impl TerminalPane {
 
     fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.dismiss_selection_menu(cx);
+        self.link_activation_request_id += 1;
+        self.link_activation_task = None;
         let Some(geometry) = self.geometry else { return };
         let delta = event.delta.pixel_delta(px(geometry.line_height)).y;
         self.scroll_remainder += f32::from(delta) / geometry.line_height;
@@ -563,7 +1068,8 @@ impl Render for TerminalPane {
             self.focus.clone(),
             focused,
             self.marked.clone().map(SharedString::from),
-        );
+        )
+        .hovered_link(self.hovered_link.clone());
         div()
             .id(SharedString::from(format!("terminal-pane-{}", self.terminal_id())))
             .key_context("Terminal")
@@ -571,7 +1077,13 @@ impl Render for TerminalPane {
             .size_full()
             .overflow_hidden()
             .bg(paint.background)
-            .cursor_text()
+            .when(self.hovered_link.is_some(), |this| this.cursor_pointer())
+            .when(self.hovered_link.is_none(), |this| this.cursor_text())
+            .on_hover(cx.listener(|pane, hovered: &bool, _, cx| {
+                if !*hovered {
+                    pane.clear_hovered_link(cx);
+                }
+            }))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))

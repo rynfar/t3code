@@ -5,14 +5,17 @@
 //! handlers of `components/chat/useChatTerminalActions.ts`. Creating and closing terminals
 //! needs `terminal:operate`; the drawer follows the device's grants as they change.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext, Context, Entity, Focusable, PromptLevel, Subscription, Task, Window};
 use serde_json::json;
 use t3_client::session::RpcError;
 use t3_client::store;
 use t3_core::composer::context::TerminalSelection;
+use t3_core::files::metadata::MetadataCache;
 use t3_core::terminal::{
     self, LaunchLocation, MetadataEvent, SplitDirection, TerminalAccess, TerminalLayouts, TerminalSummary, ThreadTerminalLayout,
     method,
@@ -37,12 +40,15 @@ pub struct RunningTerminals {
 
 impl gpui::Global for RunningTerminals {}
 
+pub(super) type SharedMetadataCache = Rc<RefCell<(Instant, MetadataCache)>>;
+
 pub struct TerminalDrawer {
     pub(super) app: Entity<AppState>,
     pub(super) layouts: TerminalLayouts,
     summaries: Option<Vec<TerminalSummary>>,
     panes: HashMap<String, Entity<TerminalPane>>,
     panes_thread: Option<String>,
+    link_metadata: SharedMetadataCache,
     metadata: Option<(tokio::task::JoinHandle<()>, Task<()>)>,
     /// The connection `metadata`, `grants`, and the panes belong to.
     connection: Option<u64>,
@@ -75,6 +81,7 @@ impl TerminalDrawer {
             summaries: None,
             panes: HashMap::new(),
             panes_thread: None,
+            link_metadata: Rc::new(RefCell::new((Instant::now(), MetadataCache::default()))),
             metadata: None,
             connection: None,
             access: TerminalAccess::default(),
@@ -125,6 +132,8 @@ impl TerminalDrawer {
             self.access = TerminalAccess::default();
             self.summaries = None;
             self.panes.clear();
+            self.panes_thread = None;
+            *self.link_metadata.borrow_mut() = (Instant::now(), MetadataCache::default());
             self.connection = current;
             self.publish_running(cx);
             cx.notify();
@@ -225,6 +234,14 @@ impl TerminalDrawer {
         let selected = self.selected_thread(cx);
         if self.panes_thread != selected {
             self.panes.clear();
+            let mut cache = self.link_metadata.borrow_mut();
+            if let Some(previous) = self.panes_thread.take() {
+                cache.1.release_thread(&previous);
+            }
+            if let Some(thread_id) = &selected {
+                cache.1.retain_thread(thread_id);
+            }
+            drop(cache);
             self.panes_thread = selected;
         }
         self.reconcile(cx);
@@ -234,8 +251,13 @@ impl TerminalDrawer {
 
     fn ensure_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((thread_id, layout)) = self.layout(cx) else { return };
-        for terminal_id in layout.visible_terminal_ids() {
-            self.pane(&thread_id, &terminal_id, window, cx);
+        let visible_ids = layout.visible_terminal_ids();
+        for terminal_id in &visible_ids {
+            self.pane(&thread_id, terminal_id, window, cx);
+        }
+        for (terminal_id, pane) in &self.panes {
+            let visible = layout.terminal_open && visible_ids.iter().any(|id| id == terminal_id);
+            pane.update(cx, |pane, cx| pane.set_visible(visible, cx));
         }
     }
 
@@ -310,7 +332,13 @@ impl TerminalDrawer {
         let client = self.app.read(cx).client_handle()?;
         let runtime = self.app.read(cx).runtime().clone();
         let target = Target { thread_id: thread_id.to_owned(), terminal_id: terminal_id.to_owned(), location };
-        let pane = cx.new(|cx| TerminalPane::new(target, client, runtime, window, cx));
+        let app = self.app.clone();
+        let link_metadata = self.link_metadata.clone();
+        let pane = cx.new(|cx| {
+            let mut pane = TerminalPane::new(target, client, runtime, window, cx);
+            pane.set_link_context(app, link_metadata);
+            pane
+        });
         let (thread, terminal) = (thread_id.to_owned(), terminal_id.to_owned());
         cx.subscribe_in(&pane, window, move |drawer, _, event: &PaneEvent, window, cx| match event {
             PaneEvent::Exited => drawer.close_terminal(&thread, &terminal, window, cx),

@@ -4,8 +4,11 @@
 
 use gpui::{ClipboardItem, Context};
 use t3_core::files::{absolute_path, clipboard_path, composer_file_link, file_surface_path};
+use t3_core::markdown::links::open_in_editor_request_with_root;
+use t3_core::project_search::{OPEN_IN_EDITOR, editor_target, preferred_editor};
 
 use crate::app_state::AppState;
+use crate::toast::{Toast, ToastKind};
 
 /// Where the open thread's files live (`RightPanelFileProps`): its worktree, else its project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,5 +72,28 @@ impl AppState {
         let cwd = self.file_workspace().map(|workspace| workspace.cwd).unwrap_or_default();
         let path = clipboard_path(relative_path, &absolute_path(relative_path, &cwd));
         cx.write_to_clipboard(ClipboardItem::new_string(path));
+    }
+
+    /// Opens a workspace or host path in the preferred editor, passing `projectRoot` (`#33558`).
+    pub fn open_file_in_preferred_editor(&mut self, relative_path: &str, line: Option<u64>, cx: &mut Context<Self>) -> bool {
+        let Some(workspace) = self.file_workspace() else { return false };
+        let available = self
+            .server_config
+            .config
+            .as_ref()
+            .map(|config| config.available_editors.clone())
+            .unwrap_or_default();
+        let Some((editor, label)) = preferred_editor(&available, None) else { return false };
+        let target = editor_target(&workspace.cwd, relative_path, line);
+        let request = self.rpc(OPEN_IN_EDITOR, open_in_editor_request_with_root(&target, editor, Some(&workspace.cwd)));
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = request.await {
+                let _ = this.update(cx, |state, cx| {
+                    state.show_toast(Toast::new(ToastKind::Error, format!("Could not open in {label}")).description(error.to_string()), cx);
+                });
+            }
+        })
+        .detach();
+        true
     }
 }

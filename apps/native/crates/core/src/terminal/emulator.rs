@@ -14,7 +14,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
-use super::Grid;
+use super::{Grid, links};
 
 pub use alacritty_terminal::index::{Point as GridPoint, Side};
 pub use alacritty_terminal::sync::FairMutex;
@@ -278,6 +278,10 @@ impl Emulator {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    pub fn scroll_to_top(&mut self) {
+        self.term.scroll_display(Scroll::Top);
+    }
+
     /// The grid point under a visible cell; rows count from the top of the viewport.
     pub fn point_at(&self, row: usize, col: usize) -> Point {
         let last_col = self.term.columns().saturating_sub(1);
@@ -395,6 +399,75 @@ impl Emulator {
         let limit = if mode.contains(TermMode::UTF8_MOUSE) { 2047 } else { 127 };
         let encode = |value: u32| char::from_u32(32 + value).filter(|_| 32 + value <= limit);
         Some(format!("\x1b[M{}{}{}", encode(code)?, encode(x)?, encode(y)?))
+    }
+
+    /// The visible row `row` as link detection reads it (`terminalRowText`).
+    fn row_text(&self, row: usize) -> Option<links::RowText> {
+        let (cols, rows) = (self.term.columns(), self.term.screen_lines());
+        if row >= rows || cols == 0 {
+            return None;
+        }
+        let grid = self.term.grid();
+        let line = Line(row as i32 - self.display_offset() as i32);
+        let wraps = |line: Line| grid[line][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+        let above = line - 1;
+        let continuation = above >= self.term.topmost_line() && wraps(above);
+        let mut text = links::RowText { continuation, wraps: wraps(line), ..links::RowText::default() };
+        for column in 0..cols {
+            let cell = &grid[line][Column(column)];
+            let spacer = cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+            text.offsets.push(text.text.len());
+            text.spacer.push(spacer);
+            if spacer {
+                continue;
+            }
+            text.text.push(if cell.c == '\0' { ' ' } else { cell.c });
+            text.text.extend(cell.zerowidth().unwrap_or_default());
+        }
+        Some(text)
+    }
+
+    fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
+        let line = Line(row as i32 - self.display_offset() as i32);
+        self.term.grid()[line][Column(col)].hyperlink().map(|link| link.uri().to_owned())
+    }
+
+    /// The link at a visible cell: an explicit OSC 8 hyperlink over every adjacent cell that
+    /// carries the same target (across soft wraps), else a link detected in the text
+    /// (`findLinkAt`).
+    pub fn link_at(&self, row: usize, col: usize) -> Option<links::LinkHit> {
+        let (cols, rows) = (self.term.columns(), self.term.screen_lines());
+        if row >= rows || col >= cols {
+            return None;
+        }
+        if let Some(uri) = self.hyperlink_at(row, col) {
+            let wraps = |row: usize| self.row_text(row).is_some_and(|text| text.wraps);
+            let (mut start, mut end) = ((row, col), (row, col));
+            loop {
+                let previous = match start {
+                    (r, c) if c > 0 => (r, c - 1),
+                    (r, _) if r > 0 && wraps(r - 1) => (r - 1, cols - 1),
+                    _ => break,
+                };
+                if self.hyperlink_at(previous.0, previous.1).as_deref() != Some(&uri) {
+                    break;
+                }
+                start = previous;
+            }
+            loop {
+                let next = match end {
+                    (r, c) if c + 1 < cols => (r, c + 1),
+                    (r, _) if r + 1 < rows && wraps(r) => (r + 1, 0),
+                    _ => break,
+                };
+                if self.hyperlink_at(next.0, next.1).as_deref() != Some(&uri) {
+                    break;
+                }
+                end = next;
+            }
+            return Some(links::LinkHit { text: uri, start, end });
+        }
+        links::link_at(row, col, |row| self.row_text(row))
     }
 
     /// Focus reports for programs that asked for them (DEC 1004).

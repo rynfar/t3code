@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 
-use gpui::Context;
+use gpui::{App, Context};
 use serde_json::json;
 use t3_client::store;
 use t3_core::diff::{DiffSelection, TurnDiffSummary};
-use t3_core::right_panel::{RightPanels, Surface, SurfaceKind, decode_lenient_map};
+use t3_core::preview::{self, SessionSnapshot};
+use t3_core::right_panel::{BrowserSnapshot, ClosedTarget, ClosedView, Reopened, RightPanels, Surface, SurfaceKind, decode_lenient_map};
 
 use crate::app_state::{AppEvent, AppState};
 
@@ -195,19 +196,51 @@ impl AppState {
     }
 
     pub fn close_surface(&mut self, surface_id: &str, cx: &mut Context<Self>) {
-        self.mutate_panels(cx, |state, thread| state.panels.close_surface(thread, surface_id));
+        self.close_surfaces(cx, |panels, thread| panels.close_surface(thread, surface_id));
     }
 
     pub fn close_other_surfaces(&mut self, surface_id: &str, cx: &mut Context<Self>) {
-        self.mutate_panels(cx, |state, thread| state.panels.close_other_surfaces(thread, surface_id));
+        self.close_surfaces(cx, |panels, thread| panels.close_other_surfaces(thread, surface_id));
     }
 
     pub fn close_surfaces_to_right(&mut self, surface_id: &str, cx: &mut Context<Self>) {
-        self.mutate_panels(cx, |state, thread| state.panels.close_surfaces_to_right(thread, surface_id));
+        self.close_surfaces(cx, |panels, thread| panels.close_surfaces_to_right(thread, surface_id));
     }
 
     pub fn close_all_surfaces(&mut self, cx: &mut Context<Self>) {
-        self.mutate_panels(cx, |state, thread| state.panels.close_all_surfaces(thread));
+        self.close_surfaces(cx, |panels, thread| panels.close_all_surfaces(thread));
+    }
+
+    /// A user's close. Browser tabs it removes are remembered with their session's snapshot
+    /// (`closePreviewSession`), active tab last; a session the server already closed has none.
+    fn close_surfaces(&mut self, cx: &mut Context<Self>, close: impl FnOnce(&mut RightPanels, &str) -> bool) {
+        let Some(thread_id) = self.panel_thread() else { return };
+        let browsers = self.browser_snapshots(&thread_id, cx);
+        self.mutate_panels(cx, |state, thread| {
+            if !close(&mut state.panels, thread) {
+                return false;
+            }
+            let open = &state.panels.panel(thread).surfaces;
+            let closed: Vec<BrowserSnapshot> = browsers.into_iter().filter(|(id, _)| !open.iter().any(|surface| surface.id == *id)).map(|(_, snapshot)| snapshot).collect();
+            for snapshot in closed {
+                state.panels.remember_browser(thread, snapshot);
+            }
+            true
+        });
+    }
+
+    /// The thread's browser tabs and their sessions' snapshots, the active tab last.
+    fn browser_snapshots(&self, thread_id: &str, cx: &App) -> Vec<(String, BrowserSnapshot)> {
+        let Some(previews) = crate::preview::previews(cx) else { return Vec::new() };
+        let previews = previews.read(cx);
+        let panel = self.panels.panels.panel(thread_id);
+        let mut snapshots: Vec<(String, BrowserSnapshot)> = panel
+            .surfaces
+            .iter()
+            .filter_map(|surface| Some((surface.id.clone(), BrowserSnapshot::from_session(previews.session(thread_id, surface.preview_tab()?)?))))
+            .collect();
+        snapshots.sort_by_key(|(id, _)| panel.active_surface_id.as_deref() == Some(id.as_str()));
+        snapshots
     }
 
     /// `rightPanel.close` (`cmd-w`): closes the active tab while the panel shows.
@@ -227,13 +260,61 @@ impl AppState {
     /// `view.reopenClosed` (`cmd-shift-t`): may switch to the thread the tab belonged to.
     pub fn reopen_closed_view(&mut self, cx: &mut Context<Self>) {
         let (shell, mounts) = (&self.shell, &self.omitted.mounts);
-        let Some(thread_id) = self.panels.panels.reopen_closed(|thread| mounts.thread(shell, thread).is_some()) else { return };
-        self.select_thread(&thread_id, cx);
-        // A restored tab was not showing before, so a restored diff opens like any other open.
-        if self.panels.diff_visible(&thread_id) {
-            self.reset_diff_to_branch(&thread_id);
+        let thread_exists = |thread: &str| mounts.thread(shell, thread).is_some();
+        let workspace_available = |thread: &str| {
+            mounts.thread(shell, thread).is_some_and(|thread| {
+                thread.worktree_path.as_deref().is_some_and(|p| !p.is_empty())
+                    || shell.project(&thread.project_id).is_some_and(|project| !project.workspace_root.is_empty())
+            })
+        };
+        let before = self.panels.panels.closed_views().to_vec();
+        let reopened = self.panels.panels.reopen_closed(thread_exists, shell.synchronized, workspace_available);
+        match reopened {
+            Some(Reopened::Thread(thread_id)) => {
+                self.select_thread(&thread_id, cx);
+                // A restored tab was not showing before, so a restored diff opens like any other open.
+                if self.panels.diff_visible(&thread_id) {
+                    self.reset_diff_to_branch(&thread_id);
+                }
+                self.save_panels(cx);
+            }
+            Some(Reopened::Browser(view)) => self.reopen_browser(view, cx),
+            // Dropped entries, or a failed restore moving its entry to the back, still save.
+            None if self.panels.panels.closed_views() != before.as_slice() => self.panels.save(),
+            None => {}
         }
+    }
+
+    /// The browser arm of `reopenClosedView`: a new session with the closed one's page and
+    /// settings, then its tab in front of its thread. A failure defers the entry.
+    fn reopen_browser(&mut self, view: ClosedView, cx: &mut Context<Self>) {
+        let ClosedTarget::Browser { snapshot } = &view.target else { return };
+        let previews = crate::preview::previews(cx).filter(|previews| previews.read(cx).availability() == crate::preview::Availability::Available);
+        let task = previews.as_ref().and_then(|_| self.request(preview::method::OPEN, snapshot.open_input(&view.thread_id), SessionSnapshot::decode));
+        let (Some(previews), Some(task)) = (previews, task) else {
+            self.panels.panels.defer_closed(view);
+            self.save_panels(cx);
+            return;
+        };
         self.save_panels(cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
+            let _ = this.update(cx, |state, cx| match result {
+                Ok(opened) => {
+                    state.select_thread(&view.thread_id, cx);
+                    let thread = view.thread_id.clone();
+                    state.mutate_panels(cx, |panels, current| current == thread && panels.panels.open_browser(current, Some(&opened.tab_id)));
+                    // The preview controller fronts it again once its session arrives.
+                    cx.defer(move |cx| previews.update(cx, |previews, cx| previews.popup(&thread, &opened.tab_id, cx)));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "reopening a closed browser tab failed");
+                    state.panels.panels.defer_closed(view);
+                    state.save_panels(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Width while dragging the resize handle; `persist` once the drag settles.

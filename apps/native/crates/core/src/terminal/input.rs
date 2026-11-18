@@ -1,7 +1,13 @@
 //! Keystrokes and pastes as PTY input. The editing shortcuts mirror `apps/web/src/keybindings.ts`
-//! (`terminalNavigationShortcutData`, `terminalDeleteShortcutData`, `isTerminalClearShortcut`);
+//! (`terminalNavigationShortcutData`, `terminalDeleteShortcutData`, `isTerminalClearShortcut`),
+//! and local clipboard/scroll shortcuts mirror `apps/web/src/terminal/ghostty/surface.ts`
+//! (`isTerminalCopyShortcut`, `isTerminalPasteShortcut`, non-Latin layout matching
+//! `pingdotgg/t3code#35210`, and macOS Option-layer composition `pingdotgg/t3code#21596`).
 //! keys are encoded the way xterm does, which is what the web's ghostty surface sends.
 //! Plain printable keys are left to the text input path, so IME composition works.
+
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 /// A keystroke in GPUI's vocabulary: `key` is the key name ("a", "left", "enter"), `key_char`
 /// the character it types, `platform` is Cmd on macOS.
@@ -23,6 +29,82 @@ const DELETE_TO_LINE_START: &str = "\x15";
 const CLEAR: &str = "\x0c";
 /// `terminal.write` caps `data` at 65,536 UTF-16 units; pastes are split well under it.
 const MAX_CHUNK_UTF16: usize = 16_384;
+
+/// Local surface shortcuts handled before PTY encoding (`surface.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalShortcut {
+    Copy { clear_selection: bool },
+    Paste,
+    SelectAll,
+    ScrollPages(i32),
+    ScrollToTop,
+    ScrollToBottom,
+}
+
+fn resolved_us_letter<S: BuildHasher>(key: &str, equivalents: Option<&HashMap<char, char, S>>) -> Option<char> {
+    let mut chars = key.chars();
+    let first = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    let lowered = first.to_lowercase().next().unwrap_or(first);
+    if lowered.is_ascii_alphabetic() {
+        return Some(lowered);
+    }
+    equivalents.and_then(|table| table.iter().find(|(_, layout)| **layout == lowered).map(|(us, _)| *us))
+}
+
+/// Resolves clipboard and scrollback shortcuts, including non-Latin keyboard layouts via
+/// GPUI's key equivalents (`pingdotgg/t3code#35210`).
+pub fn local_shortcut<S: BuildHasher>(
+    key: &KeyInput,
+    mac: bool,
+    has_selection: bool,
+    alt_screen: bool,
+    equivalents: Option<&HashMap<char, char, S>>,
+) -> Option<TerminalShortcut> {
+    let primary = if mac { key.platform && !key.control } else { key.control && !key.platform };
+    let us_letter = resolved_us_letter(key.key, equivalents);
+
+    if primary && !key.alt && (if mac { !key.shift } else { key.shift }) && us_letter == Some('a') {
+        return Some(TerminalShortcut::SelectAll);
+    }
+
+    if !alt_screen {
+        if key.shift && !key.alt && !key.control && !key.platform {
+            match key.key {
+                "pageup" => return Some(TerminalShortcut::ScrollPages(1)),
+                "pagedown" => return Some(TerminalShortcut::ScrollPages(-1)),
+                _ => {}
+            }
+        }
+        if key.shift && !key.alt && primary {
+            match key.key {
+                "home" => return Some(TerminalShortcut::ScrollToTop),
+                "end" => return Some(TerminalShortcut::ScrollToBottom),
+                _ => {}
+            }
+        }
+    }
+
+    if has_selection {
+        if !mac && key.key == "insert" && key.control && !key.shift && !key.platform && !key.alt {
+            return Some(TerminalShortcut::Copy { clear_selection: false });
+        }
+        if us_letter == Some('c') && !key.alt && if mac { key.platform && !key.control } else { key.control && !key.platform } {
+            return Some(TerminalShortcut::Copy { clear_selection: !mac && !key.shift });
+        }
+    }
+
+    if !mac && key.key == "insert" && key.shift && !key.control && !key.platform && !key.alt {
+        return Some(TerminalShortcut::Paste);
+    }
+    if us_letter == Some('v') && !key.alt && if mac { key.platform && !key.control } else { key.control && key.shift && !key.platform } {
+        return Some(TerminalShortcut::Paste);
+    }
+
+    None
+}
 
 /// The macOS editing shortcuts the drawer turns into readline input: Option-arrows move by
 /// word, Cmd-arrows to the line ends, Cmd-Backspace deletes to the line start, and Cmd-K or

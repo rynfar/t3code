@@ -98,6 +98,42 @@ fn buffer_resets_on_snapshots_and_appends_output() {
 }
 
 #[test]
+fn a_reattach_snapshot_starts_a_generation_the_grid_is_replayed_for() {
+    let mut buffer = BufferState::default();
+    let mut replay = GridReplay::default();
+    assert!(!replay.observe(&buffer), "nothing to resize before the first snapshot");
+    buffer.apply(snapshot("running", "$ "));
+    assert!(replay.observe(&buffer));
+    buffer.apply(AttachEvent::Output { data: "ls".into() });
+    assert!(!replay.observe(&buffer), "output stays in the same generation");
+    // The socket reconnected: the server's new snapshot must hear the measured grid again.
+    buffer.apply(snapshot("running", "$ ls"));
+    assert_eq!(buffer.generation, 1);
+    assert!(replay.observe(&buffer));
+    // A shell that stops and comes back through output replays once it runs again.
+    buffer.apply(AttachEvent::Closed);
+    assert!(!replay.observe(&buffer));
+    buffer.apply(AttachEvent::Output { data: "x".into() });
+    assert!(replay.observe(&buffer));
+    // Leaving the attachment forgets the generation.
+    replay.detach();
+    assert!(replay.observe(&buffer));
+    // A starting shell waits until it runs.
+    let mut starting = BufferState::default();
+    let mut replay = GridReplay::default();
+    starting.apply(snapshot("starting", ""));
+    assert!(!replay.observe(&starting));
+    // Restarting an already-running shell starts a new generation too.
+    let restarted = match snapshot("running", "$ ") {
+        AttachEvent::Snapshot { snapshot } => AttachEvent::Restarted { snapshot },
+        other => panic!("{other:?}"),
+    };
+    buffer.apply(restarted);
+    assert_eq!(buffer.generation, 2);
+    assert!(replay.observe(&buffer));
+}
+
+#[test]
 fn output_before_a_snapshot_marks_the_session_running() {
     let mut buffer = BufferState::default();
     buffer.apply(AttachEvent::Output { data: "x".into() });
@@ -252,6 +288,8 @@ fn payloads_match_the_contract() {
     assert_eq!(attach["worktreePath"], "/wt");
     assert_eq!(attach["env"]["T3CODE_WORKTREE_PATH"], "/wt");
     assert_eq!(attach["resume"], true);
+    assert_eq!(attach["maxHistoryBytes"], MAX_BUFFER_BYTES);
+    assert_eq!(attach_input("t1", "term-1", &root, None, false)["maxHistoryBytes"], 512 * 1024);
     assert_eq!(attach_input("t1", "term-1", &root, None, false).get("resume"), None);
     assert_eq!(attach_input("t1", "term-1", &root, None, false)["worktreePath"], json!(null));
     assert_eq!(attach.get("providerInstanceId"), None);
@@ -333,8 +371,58 @@ fn keys_encode_like_xterm() {
 fn text_and_app_shortcuts_are_not_encoded() {
     assert_eq!(encode_key(&KeyInput { key_char: Some("a"), ..key("a") }, false), None);
     assert_eq!(encode_key(&KeyInput { alt: true, key_char: Some("∫"), ..key("b") }, false), None);
+    // macOS Option-layer composed characters stay left to text input (`pingdotgg/t3code#21596`).
+    assert_eq!(encode_key(&KeyInput { alt: true, key_char: Some("#"), ..key("3") }, false), None);
+    assert_eq!(encode_key(&KeyInput { alt: true, key_char: Some("@"), ..key("l") }, false), None);
     assert_eq!(encode_key(&KeyInput { platform: true, ..key("enter") }, false), None);
     assert_eq!(encode_key(&KeyInput { control: true, ..key("1") }, false), None);
+}
+
+#[test]
+fn local_shortcuts_match_copy_paste_select_and_scroll_including_non_latin_layouts() {
+    use std::collections::HashMap;
+    let russian = HashMap::from([('a', 'ф'), ('c', 'с'), ('v', 'м')]);
+    // Non-Latin Cmd+C/V/A on macOS and Ctrl+Shift+C/V/A on non-macOS (`pingdotgg/t3code#35210`).
+    assert_eq!(
+        local_shortcut(&KeyInput { platform: true, ..key("с") }, true, true, false, Some(&russian)),
+        Some(TerminalShortcut::Copy { clear_selection: false }),
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { control: true, shift: true, ..key("с") }, false, true, false, Some(&russian)),
+        Some(TerminalShortcut::Copy { clear_selection: false }),
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { control: true, ..key("с") }, false, true, false, Some(&russian)),
+        Some(TerminalShortcut::Copy { clear_selection: true }),
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { control: true, ..key("c") }, false, false, false, Some(&russian)),
+        None,
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { control: true, shift: true, ..key("м") }, false, false, false, Some(&russian)),
+        Some(TerminalShortcut::Paste),
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { platform: true, ..key("ф") }, true, false, false, Some(&russian)),
+        Some(TerminalShortcut::SelectAll),
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { control: true, shift: true, ..key("ф") }, false, false, false, Some(&russian)),
+        Some(TerminalShortcut::SelectAll),
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { shift: true, ..key("pageup") }, true, false, false, None::<&HashMap<char, char>>),
+        Some(TerminalShortcut::ScrollPages(1)),
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { shift: true, ..key("pageup") }, true, false, true, None::<&HashMap<char, char>>),
+        None,
+    );
+    assert_eq!(
+        local_shortcut(&KeyInput { shift: true, platform: true, ..key("home") }, true, false, false, None::<&HashMap<char, char>>),
+        Some(TerminalShortcut::ScrollToTop),
+    );
 }
 
 #[test]
@@ -464,4 +552,191 @@ fn reconcile_and_reuse_rules() {
     assert_eq!(pick_existing_terminal(&[&idle, &busy]).as_deref(), Some("term-2"));
     assert_eq!(pick_existing_terminal(&[&idle]).as_deref(), Some("term-1"));
     assert_eq!(pick_existing_terminal(&[]), None);
+}
+
+fn found(kind: links::LinkKind, text: &str, start: usize, end: usize) -> links::LinkMatch {
+    links::LinkMatch { kind, text: text.to_owned(), start, end }
+}
+
+fn path_at(text: &str, start: usize) -> links::LinkMatch {
+    found(links::LinkKind::Path, text, start, start + text.len())
+}
+
+#[test]
+fn links_follow_terminal_links_test_ts() {
+    use links::{LinkKind, extract_links, is_url};
+    for path in [r"C:\dev\ai-test\dir 1", r"C:\dev\ai-test\dir 1\test", "C:\\", r"\\server\my share\dir 1", "/home/Jane Doe/project", r"C:\dev\folder (draft)\name!"] {
+        assert_eq!(extract_links(&format!("PS {path}> ")), vec![path_at(path, 3)], "{path}");
+    }
+    let prompt = r"PS C:\dev\dir 1\test> ";
+    assert_eq!(
+        extract_links(&format!("{prompt}echo https://example.com")),
+        vec![path_at(r"C:\dev\dir 1\test", 3), found(LinkKind::Url, "https://example.com", prompt.len() + 5, prompt.len() + 24)]
+    );
+    assert_eq!(extract_links(r"see C:\dev\project for details"), vec![path_at(r"C:\dev\project", 4)]);
+    for text in [r"src\index.ts:12", r".\src\index.ts:12:7", r"..\src\index.ts:12", r"C:\Users\Jane\project\index.ts:12", r"\\server\share\index.ts:12"] {
+        assert_eq!(extract_links(&format!("error at {text}: failed")), vec![path_at(text, 9)], "{text}");
+    }
+    for quote in ['"', '\'', '`'] {
+        let text = r"C:\Users\Jane Doe\project\index.ts:12:7";
+        assert_eq!(extract_links(&format!("see {quote}{text}{quote}.")), vec![path_at(text, 5)]);
+        let at_text = "src/my contact@support.vue:12:3";
+        assert_eq!(extract_links(&format!("see {quote}{at_text}{quote}.")), vec![path_at(at_text, 5)]);
+    }
+    for path in [r"src\my folder\index.ts", "./my folder/index.ts", "/home/Jane Doe/index.ts", "/home/Jane Doe/file)", r"\\server\my share\index.ts"] {
+        assert_eq!(extract_links(&format!("\"{path}\":12:7: error")), vec![found(LinkKind::Path, &format!("{path}:12:7"), 1, path.len() + 7)], "{path}");
+    }
+    assert_eq!(extract_links("error: \"something went wrong\""), vec![]);
+    assert_eq!(extract_links("error: \"something went wrong.\""), vec![]);
+    let (path, url) = (r"C:\Jane Doe\index.ts:12", "https://example.com/docs");
+    let line = format!("\"{path}\" {url} src/index.ts");
+    assert_eq!(
+        extract_links(&line),
+        vec![path_at(path, 1), found(LinkKind::Url, url, path.len() + 3, path.len() + 3 + url.len()), path_at("src/index.ts", line.len() - 12)]
+    );
+    assert!(is_url("HTTPS://example.com/docs") && is_url("Http://example.com"));
+    assert!(!is_url("src/components/main.ts") && !is_url("httpsdocs/readme.md"));
+    assert_eq!(
+        extract_links("(https://example.com/docs), ./src/main.ts:12."),
+        vec![found(LinkKind::Url, "https://example.com/docs", 1, 25), path_at("./src/main.ts:12", 28)]
+    );
+    for text in [
+        "src/żółć.ts:12:7",
+        "żółć/main.ts:12",
+        r"żółć\main.ts:12",
+        "src/cafe\u{301}.ts:12",
+        "src/𐐀.ts:12",
+        "src/app/[id]/page.tsx:3:10",
+        "src/routes/(app)/+page.svelte:12:4",
+        "src/routes/(app)/+page@.svelte:12:3",
+        "src/contact@support.vue:12:3",
+        r"src\contact@support.ts:12:3",
+        "src/équipe@home.ts:12:3",
+        "src/foo$contact@support.ts:12:3",
+        "node_modules/.pnpm/react@18.3.1/node_modules/react/index.js:12:5",
+        "app/routes/posts.$id.tsx:5",
+    ] {
+        assert_eq!(extract_links(&format!("see {text} for details")), vec![path_at(text, 4)], "{text}");
+    }
+    assert_eq!(extract_links("see C:/Users/someone/project/src/file.ts:42 for details"), vec![path_at("C:/Users/someone/project/src/file.ts:42", 4)]);
+    assert_eq!(extract_links("GET https://example.test/items/foo:"), vec![found(LinkKind::Url, "https://example.test/items/foo:", 4, 35)]);
+    for (line, text) in [
+        ("./main.go:10:5: undefined: x", "./main.go:10:5"),
+        ("/home/dev/app/src/main.c:10:5: error: expected ';'", "/home/dev/app/src/main.c:10:5"),
+        ("C:\\dev\\app\\src\\main.c:10:5: error: expected ';'", "C:\\dev\\app\\src\\main.c:10:5"),
+        ("wrote ./out/report.txt:", "./out/report.txt"),
+    ] {
+        assert_eq!(extract_links(line), vec![path_at(text, line.find(text).unwrap())], "{line}");
+    }
+    for line in [
+        " GET /api/trpc/post.list,user.me?batch=1&input=%7B%220%22%3A%7B%22json%22%3Anull%7D%7D 200 in 35ms",
+        "GET /api?+debug 200",
+        "Started GET \"/posts?page=2\" for ::1",
+        "proxying api/trpc/post.list?batch=1 to the backend",
+        "connected to redis://127.0.0.1:6379/0",
+        "connected to postgres://localhost:5432/app",
+        "uploaded s3://bucket/reports/today.csv",
+        "    at main (file:///Users/jane/app/src/index.mjs:3:7)",
+        "+redis://localhost:6379/0",
+        "-redis://localhost:6379/0",
+        "git clone git@github.com:acme/widgets.git",
+        "remote: git@gitlab.com:group/sub/project.git",
+    ] {
+        assert_eq!(extract_links(line), vec![], "{line}");
+    }
+    let (before, after, url) = ("src/server.ts:12", "/app/bin/server:3:7", "https://example.com/api/users?id=42");
+    let line = format!("{before} GET /api/users?id=42 200 {after} {url}");
+    let (after_start, url_start) = (line.find(after).unwrap(), line.find(url).unwrap());
+    assert_eq!(
+        extract_links(&line),
+        vec![path_at(before, 0), path_at(after, after_start), found(LinkKind::Url, url, url_start, url_start + url.len())]
+    );
+    assert_eq!(extract_links("src/db.ts:4 redis://localhost:6379/0 C:/app/src/db.ts:9"), vec![path_at("src/db.ts:4", 0), path_at("C:/app/src/db.ts:9", 37)]);
+    assert_eq!(extract_links("wrote /tmp/report?draft"), vec![path_at("/tmp/report?draft", 6)]);
+}
+
+#[test]
+fn link_targets_resolve_like_resolve_terminal_link_target() {
+    use crate::files::position::resolve_path_link_target;
+    use links::{extract_links, resolve_link_target};
+    let link = &extract_links(r#"error at "src\my folder\index.ts":12:7"#)[0];
+    assert_eq!(resolve_path_link_target(&link.text, r"C:\Users\Jane Doe\project"), r"C:\Users\Jane Doe\project\src\my folder\index.ts:12:7");
+    let link = &extract_links("/Users/julius/project/main.c:10:5: error: expected ';'")[0];
+    assert_eq!(resolve_path_link_target(&link.text, "/Users/julius/project"), "/Users/julius/project/main.c:10:5");
+    for (path, target) in [
+        ("src/main.ts", "/repo/src/main.ts"),
+        ("/repo/src/main.ts", "/repo/src/main.ts"),
+        (r"C:\repo\src\main.ts", r"C:\repo\src\main.ts"),
+        ("app/(auth)/page.tsx", "/repo/app/(auth)/page.tsx"),
+    ] {
+        let text = format!("{path}(42,7)");
+        let found_links = extract_links(&format!("{text}: error TS2322: Type mismatch"));
+        assert_eq!(found_links, vec![found(links::LinkKind::Path, &format!("{path}:42:7"), 0, text.len())], "{path}");
+        assert_eq!(resolve_link_target(&found_links[0].text, "/repo"), format!("{target}:42:7"));
+    }
+    for (line, target) in [
+        (r"PS C:\dev\folder (42,7)> ", r"C:\dev\folder (42,7)"),
+        ("/tmp/report(42,7)", "/tmp/report(42,7)"),
+        ("src/Program.cs(3,10): error CS1002: x", "/repo/src/Program.cs"),
+    ] {
+        assert_eq!(resolve_link_target(&extract_links(line)[0].text, "/repo"), target, "{line}");
+    }
+    // OSC 8 file URIs name their file; they are never joined onto the cwd (`pingdotgg/t3code#36025`).
+    assert_eq!(resolve_link_target("file:///var/tmp/report.txt", "/workspace/project"), "/var/tmp/report.txt");
+    assert_eq!(resolve_link_target("file:///var/tmp/a%20b.txt#L12", "/workspace/project"), "/var/tmp/a b.txt:12");
+    assert!(!resolve_link_target("file://remote.invalid/var/tmp/report.txt", "/workspace/project").starts_with("/workspace/project/"));
+    assert_eq!(resolve_path_link_target("file:notes.md", "/workspace/project"), "/workspace/project/file:notes.md");
+    assert_eq!(resolve_path_link_target("~/notes.md:3", "/Users/jane/project"), "/Users/jane/notes.md:3");
+}
+
+fn row(text: &str, continuation: bool, wraps: bool) -> links::RowText {
+    let offsets = text.char_indices().map(|(at, _)| at).collect::<Vec<_>>();
+    let spacer = vec![false; offsets.len()];
+    links::RowText { text: text.to_owned(), offsets, spacer, continuation, wraps }
+}
+
+#[test]
+fn links_are_found_across_soft_wraps_and_never_truncated() {
+    use links::{LinkHit, link_at};
+    let rows = [row("prompt> ", false, false), row("see https://example.com/a", false, true), row("/bc?x=1  ", true, false), row("done", false, false)];
+    let get = |index: usize| rows.get(index).cloned();
+    let hit = LinkHit { text: "https://example.com/a/bc?x=1".into(), start: (1, 4), end: (2, 6) };
+    // From the first row and from its continuation alike.
+    assert_eq!(link_at(1, 10, get), Some(hit.clone()));
+    assert_eq!(link_at(2, 2, get), Some(hit));
+    assert_eq!(link_at(1, 1, get), None);
+    assert_eq!(link_at(3, 1, get), None);
+    // A logical line that began above the viewport, or a link running past its bottom, is cut.
+    let cut_above = [row("/bc?x=1", true, false)];
+    assert_eq!(link_at(0, 2, |index| cut_above.get(index).cloned()), None);
+    let cut_below = [row("see https://example.com/a", false, true)];
+    assert_eq!(link_at(0, 8, |index| cut_below.get(index).cloned()), None);
+    // A wide character occupies two columns, its spacer hits the character.
+    let wide = links::RowText {
+        text: "日 src/a.rs".into(),
+        offsets: vec![0, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        spacer: vec![false, true, false, false, false, false, false, false, false, false, false],
+        continuation: false,
+        wraps: false,
+    };
+    assert_eq!(link_at(0, 5, |index| (index == 0).then(|| wide.clone())), Some(LinkHit { text: "src/a.rs".into(), start: (0, 3), end: (0, 10) }));
+}
+
+#[test]
+fn emulator_finds_detected_and_osc8_links() {
+    use emulator::Emulator;
+    let theme = emulator::ThemeColors {
+        foreground: emulator::Rgb { r: 255, g: 255, b: 255 },
+        background: emulator::Rgb { r: 0, g: 0, b: 0 },
+        cursor: emulator::Rgb { r: 255, g: 255, b: 255 },
+        ansi: [emulator::Rgb { r: 0, g: 0, b: 0 }; 16],
+    };
+    let mut term = Emulator::new(Grid::new(20, 4), theme);
+    term.feed(b"open src/main.rs:3 now\r\n\x1b]8;;file:///tmp/a.txt\x1b\\report\x1b]8;;\x1b\\ x");
+    // The 20-column row soft-wraps `now` onto the next row.
+    let detected = term.link_at(0, 7).expect("detected link");
+    assert_eq!((detected.text.as_str(), detected.start, detected.end), ("src/main.rs:3", (0, 5), (0, 17)));
+    let explicit = term.link_at(2, 3).expect("osc 8 link");
+    assert_eq!((explicit.text.as_str(), explicit.start, explicit.end), ("file:///tmp/a.txt", (2, 0), (2, 5)));
+    assert_eq!(term.link_at(2, 7), None);
 }

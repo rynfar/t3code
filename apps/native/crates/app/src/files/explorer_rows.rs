@@ -104,14 +104,22 @@ impl Explorer {
                     .when(row.loading, |svg| svg.opacity(0.6)),
             )
             .child(div().min_w_0().truncate().when(selected, |this| this.font_weight(FontWeight::MEDIUM)).child(label))
-            .context_menu(move |menu, _, _| {
-                let item = |label: &'static str, run: fn(&mut crate::app_state::AppState, &str, &mut Context<crate::app_state::AppState>)| {
+            .context_menu(move |menu, _, cx| {
+                let item = |label: SharedString, run: fn(&mut crate::app_state::AppState, &str, &mut Context<crate::app_state::AppState>)| {
                     let state = state.clone();
                     let path = path.clone();
                     PopupMenuItem::new(label).on_click(move |_, _, cx| state.update(cx, |state, cx| run(state, &path, cx)))
                 };
-                menu.item(item("Copy mention", |state, path, cx| state.copy_file_mention(path, cx)))
-                    .item(item("Add to chat", |state, path, cx| state.add_file_to_chat(path, cx)))
+                let menu = if let Some(editor) = state.read(cx).preferred_editor_label() {
+                    menu.item(item(format!("Open in {editor}").into(), |state, path, cx| {
+                        state.open_file_in_preferred_editor(path, None, cx);
+                    }))
+                } else {
+                    menu
+                };
+                menu.item(item("Copy path".into(), |state, path, cx| state.copy_file_path(path, cx)))
+                    .item(item("Copy mention".into(), |state, path, cx| state.copy_file_mention(path, cx)))
+                    .item(item("Add to chat".into(), |state, path, cx| state.add_file_to_chat(path, cx)))
             })
             .into_any_element()
     }

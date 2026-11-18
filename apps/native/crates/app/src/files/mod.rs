@@ -36,7 +36,7 @@ use crate::app_state::{AppEvent, AppState, Phase};
 use crate::icons::Icon;
 use crate::right_panel::{Button, Variant};
 use crate::theme::{hsla, palette};
-use explorer::Explorer;
+use explorer::{Explorer, ExplorerEvent};
 use preview::Preview;
 
 const STORE: &str = "files";
@@ -133,6 +133,10 @@ impl FilesPanel {
                 this.sync(cx);
             }
         });
+        cx.subscribe(&explorer, |this, _, event: &ExplorerEvent, cx| match event {
+            ExplorerEvent::Refresh => this.preview.update(cx, |preview, cx| preview.refetch(cx)),
+        })
+        .detach();
         cx.observe(&preview, |this, preview, cx| {
             // A path that reads as a folder opens in the explorer (`FileBrowserPanel` reveal).
             if preview.read(cx).is_folder()
@@ -227,7 +231,7 @@ impl FilesPanel {
                 preview.set_target(target, cx);
             });
             if std::mem::take(&mut self.stale) {
-                self.explorer.update(cx, |explorer, cx| explorer.refresh(cx));
+                self.explorer.update(cx, |explorer, cx| explorer.refresh_entries(cx));
                 self.preview.update(cx, |preview, cx| preview.refetch(cx));
             }
             if std::mem::take(&mut self.reconnected) {

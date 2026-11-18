@@ -1,10 +1,13 @@
 //! Per-thread right panel state: which surfaces (tabs) are open, which is active, whether the
 //! panel shows, and the closed-tab history `cmd-shift-t` reopens. Ports `apps/web/src/rightPanelStore.ts`
 //! (`upsertSurface`, `toggle`, `closeSurface`, `closeOtherSurfaces`, `closeSurfacesToRight`,
-//! `closeAllSurfaces`, `moveSurface`, `setMaximized`), `apps/web/src/closedViewStore.ts` and
-//! `planNextReopen` from `apps/web/src/reopenClosedView.ts`, with the file surfaces' `openFile` and
-//! `navigateFolder`, the browser tabs' `openBrowser` and `reconcileBrowserSurfaces`, and the device
-//! tabs' `openDevice`. Other surfaces plug in as new `Surface` variants.
+//! `closeAllSurfaces`, `moveSurface`, `setMaximized`, `renameDevice`), `apps/web/src/closedViewStore.ts`
+//! (`remember`, `defer`, `sameTarget`, `isPersistentView`: closed browser tabs keep their session's
+//! snapshot, incognito ones only in memory, `pingdotgg/t3code#34859`), and `planNextReopen` with the
+//! synchronous half of `reopenClosedView` from `apps/web/src/reopenClosedView.ts`, with the file
+//! surfaces' `openFile` and `navigateFolder`, the browser tabs' `openBrowser` and
+//! `reconcileBrowserSurfaces`, and the device tabs' `openDevice`. Other surfaces plug in as new
+//! `Surface` variants.
 
 use std::collections::{HashMap, HashSet};
 
@@ -211,12 +214,138 @@ impl ThreadPanel {
     }
 }
 
-/// `ClosedViewEntry` of kind `panel-tab`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `ClosedViewEntry`: a closed tab and the thread whose panel it belonged to.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClosedView {
     pub thread_id: String,
-    pub surface: Surface,
+    #[serde(flatten)]
+    pub target: ClosedTarget,
+}
+
+/// `ClosedView`'s two kinds: a panel tab reopens as itself; a browser tab's session closed with
+/// it, so it reopens as a new session opened with the old one's settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ClosedTarget {
+    PanelTab { surface: Surface },
+    Browser { snapshot: BrowserSnapshot },
+}
+
+/// The `PreviewSessionSnapshot` fields `reopenClosedView` reopens a browser tab with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserSnapshot {
+    pub tab_id: String,
+    /// The page, `None` for an idle tab (`navStatus._tag === "Idle"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom_factor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_scheme: Option<String>,
+}
+
+/// `INCOGNITO_BROWSER_PROFILE_ID` from `packages/contracts/src/browserProfile.ts`.
+pub const INCOGNITO_BROWSER_PROFILE_ID: &str = "incognito";
+
+impl BrowserSnapshot {
+    pub fn from_session(snapshot: &crate::preview::SessionSnapshot) -> BrowserSnapshot {
+        BrowserSnapshot {
+            tab_id: snapshot.tab_id.clone(),
+            url: snapshot.nav_status.url().map(str::to_owned),
+            viewport: snapshot.viewport.clone(),
+            profile_id: snapshot.profile_id.clone(),
+            zoom_factor: snapshot.zoom_factor,
+            color_scheme: snapshot.color_scheme.clone(),
+        }
+    }
+
+    pub fn is_incognito(&self) -> bool {
+        self.profile_id.as_deref() == Some(INCOGNITO_BROWSER_PROFILE_ID)
+    }
+
+    /// The `preview.open` input `openPreviewSession` sends for the server's browser: the old
+    /// session's page and settings, each only when it had one.
+    pub fn open_input(&self, thread_id: &str) -> Value {
+        let mut input = serde_json::json!({ "threadId": thread_id, "runtime": "server" });
+        let fields = [
+            ("url", self.url.clone().map(Value::String)),
+            ("viewport", self.viewport.clone()),
+            ("profileId", self.profile_id.clone().map(Value::String)),
+            ("zoomFactor", self.zoom_factor.and_then(serde_json::Number::from_f64).map(Value::Number)),
+            ("colorScheme", self.color_scheme.clone().map(Value::String)),
+        ];
+        for (key, value) in fields {
+            if let Some(value) = value {
+                input[key] = value;
+            }
+        }
+        input
+    }
+}
+
+impl ClosedView {
+    pub fn panel_tab(thread_id: &str, surface: Surface) -> ClosedView {
+        ClosedView { thread_id: thread_id.to_owned(), target: ClosedTarget::PanelTab { surface } }
+    }
+
+    pub fn browser(thread_id: &str, snapshot: BrowserSnapshot) -> ClosedView {
+        ClosedView { thread_id: thread_id.to_owned(), target: ClosedTarget::Browser { snapshot } }
+    }
+
+    pub fn surface(&self) -> Option<&Surface> {
+        match &self.target {
+            ClosedTarget::PanelTab { surface } => Some(surface),
+            ClosedTarget::Browser { .. } => None,
+        }
+    }
+
+    /// `sameTarget`: one entry per panel tab, or per browser session.
+    fn same_target(&self, other: &ClosedView) -> bool {
+        self.thread_id == other.thread_id
+            && match (&self.target, &other.target) {
+                (ClosedTarget::PanelTab { surface }, ClosedTarget::PanelTab { surface: other }) => surface.id == other.id,
+                (ClosedTarget::Browser { snapshot }, ClosedTarget::Browser { snapshot: other }) => snapshot.tab_id == other.tab_id,
+                _ => false,
+            }
+    }
+
+    /// `isPersistentView`: an incognito tab is remembered for this run only.
+    fn is_persistent(&self) -> bool {
+        !matches!(&self.target, ClosedTarget::Browser { snapshot } if snapshot.is_incognito())
+    }
+
+    /// Entries saved before browser tabs were remembered carry no `kind`: they are panel tabs.
+    fn from_value(value: &Value) -> Option<ClosedView> {
+        let thread_id = value.get("threadId")?.as_str()?.to_owned();
+        let target = match value.get("kind").and_then(Value::as_str).unwrap_or("panel-tab") {
+            "panel-tab" => ClosedTarget::PanelTab { surface: serde_json::from_value(value.get("surface")?.clone()).ok()? },
+            "browser" => ClosedTarget::Browser { snapshot: serde_json::from_value(value.get("snapshot")?.clone()).ok()? },
+            _ => return None,
+        };
+        let view = ClosedView { thread_id, target };
+        view.is_persistent().then_some(view)
+    }
+}
+
+/// `partialize`: incognito entries never reach disk.
+fn persistent_views<S: serde::Serializer>(views: &[ClosedView], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(views.iter().filter(|view| view.is_persistent()))
+}
+
+/// What `reopen_closed` restored, for the caller to finish.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reopened {
+    /// A panel tab is back in this thread's panel; the caller selects the thread.
+    Thread(String),
+    /// A browser tab: the caller opens a session with `snapshot.open_input`, then
+    /// `open_browser`s its tab, or hands the view back to `defer_closed` when that fails.
+    Browser(ClosedView),
 }
 
 const CLOSED_VIEW_LIMIT: usize = 20;
@@ -243,6 +372,7 @@ pub struct RightPanels {
     /// `t3code:preview-panel-width:<thread>`.
     widths: HashMap<String, f32>,
     /// Newest first.
+    #[serde(serialize_with = "persistent_views")]
     closed: Vec<ClosedView>,
 }
 
@@ -264,7 +394,7 @@ impl RightPanels {
         let closed = value
             .get("closed")
             .and_then(Value::as_array)
-            .map(|closed| closed.iter().filter_map(|view| serde_json::from_value(view.clone()).ok()).take(CLOSED_VIEW_LIMIT).collect())
+            .map(|closed| closed.iter().filter_map(ClosedView::from_value).take(CLOSED_VIEW_LIMIT).collect())
             .unwrap_or_default();
         let widths = decode_lenient_map::<f32>(value.get("widths")).into_iter().filter(|(_, width)| width.is_finite()).collect();
         RightPanels { threads, widths, closed }
@@ -353,18 +483,33 @@ impl RightPanels {
             .iter()
             .filter(|surface| Some(surface.id()) != active)
             .chain(removed.iter().filter(|surface| Some(surface.id()) == active));
-        // A closed browser tab's session closes with it, so there is nothing to reopen by id.
+        // A browser tab's session closes with it: `remember_browser` keeps its snapshot instead.
         for surface in ordered.filter(|surface| surface.preview_tab().is_none()) {
-            self.remember(ClosedView { thread_id: thread_id.to_owned(), surface: (*surface).clone() });
+            self.remember(ClosedView::panel_tab(thread_id, (*surface).clone()));
         }
         true
     }
 
     /// `closedViewStore.remember`: newest first, one entry per target, at most 20.
     fn remember(&mut self, view: ClosedView) {
-        self.closed.retain(|entry| entry.thread_id != view.thread_id || entry.surface.id != view.surface.id);
+        self.closed.retain(|entry| !entry.same_target(&view));
         self.closed.insert(0, view);
         self.closed.truncate(CLOSED_VIEW_LIMIT);
+    }
+
+    /// `closePreviewSession`: a browser tab the user closed, remembered with its session's
+    /// snapshot so `cmd-shift-t` can open the page again.
+    pub fn remember_browser(&mut self, thread_id: &str, snapshot: BrowserSnapshot) {
+        self.remember(ClosedView::browser(thread_id, snapshot));
+    }
+
+    /// `closedViewStore.defer`: a view that failed to reopen goes to the back of the history
+    /// instead of being lost, unless newer closes filled it meanwhile.
+    pub fn defer_closed(&mut self, view: ClosedView) {
+        self.closed.retain(|entry| !entry.same_target(&view));
+        if self.closed.len() < CLOSED_VIEW_LIMIT {
+            self.closed.push(view);
+        }
     }
 
     pub fn open(&mut self, thread_id: &str, surface: Surface) -> bool {
@@ -578,27 +723,82 @@ impl RightPanels {
         self.update(thread_id, |panel| panel.maximized = maximized)
     }
 
-    /// `planNextReopen` + `reopenClosedView`: restores the newest closed tab whose thread still
-    /// exists and is not already showing it. Returns that thread, which the caller selects.
-    pub fn reopen_closed(&mut self, thread_exists: impl Fn(&str) -> bool) -> Option<String> {
+    /// `planNextReopen` + `reopenClosedView`, newest first: an entry whose thread (or side chat)
+    /// is gone is skipped once the shell is live, and stops the search while it still loads, since
+    /// the thread may yet arrive; an entry already showing is dropped. The first other entry is
+    /// restored. Files without a workspace cannot be, so that entry goes to the back
+    /// (`defer`) and nothing reopens this time.
+    pub fn reopen_closed(&mut self, thread_exists: impl Fn(&str) -> bool, shell_live: bool, workspace_available: impl Fn(&str) -> bool) -> Option<Reopened> {
         let mut index = 0;
         while index < self.closed.len() {
             let entry = &self.closed[index];
-            // A closed side chat tab the server since deleted is skipped like a deleted thread.
-            if !thread_exists(&entry.thread_id) || entry.surface.side_chat_thread().is_some_and(|id| !thread_exists(id)) {
+            let side_chat = entry.surface().and_then(Surface::side_chat_thread);
+            if !thread_exists(&entry.thread_id) || side_chat.is_some_and(|id| !thread_exists(id)) {
+                if !shell_live {
+                    return None;
+                }
                 index += 1;
                 continue;
             }
             let panel = self.panel(&entry.thread_id);
-            if panel.is_open && panel.surfaces.iter().any(|surface| surface.id == entry.surface.id) {
+            let already_open = match &entry.target {
+                ClosedTarget::PanelTab { surface } => panel.is_open && panel.surfaces.iter().any(|open| open.id == surface.id),
+                ClosedTarget::Browser { snapshot } => panel.surfaces.iter().any(|open| open.preview_tab() == Some(snapshot.tab_id.as_str())),
+            };
+            if already_open {
                 self.closed.remove(index);
                 continue;
             }
             let entry = self.closed.remove(index);
-            self.open(&entry.thread_id, entry.surface);
-            return Some(entry.thread_id);
+            let ClosedTarget::PanelTab { surface } = &entry.target else { return Some(Reopened::Browser(entry)) };
+            if self.restore_surface(&entry.thread_id, surface.clone(), workspace_available(&entry.thread_id)) {
+                return Some(Reopened::Thread(entry.thread_id));
+            }
+            self.defer_closed(entry);
+            return None;
         }
         None
+    }
+
+    /// The panel-tab arm of `reopenClosedView`: each kind reopens through its own open, so a file
+    /// asks for a fresh reveal and a device takes the list's place with its name back.
+    fn restore_surface(&mut self, thread_id: &str, surface: Surface, workspace_available: bool) -> bool {
+        match surface.kind {
+            SurfaceKind::Files | SurfaceKind::File { .. } if !workspace_available => false,
+            SurfaceKind::Preview { resource_id: Some(_) } => false,
+            SurfaceKind::Preview { resource_id: None } => {
+                self.open_browser(thread_id, None);
+                true
+            }
+            SurfaceKind::File { relative_path, reveal_line, .. } => {
+                self.open_file(thread_id, Some(&relative_path), reveal_line);
+                true
+            }
+            SurfaceKind::Device { target: Some(target), title } => {
+                let id = Surface::device(Some(target.clone())).id;
+                self.open_device(thread_id, target);
+                if let Some(title) = title {
+                    self.rename_device(thread_id, &id, &title);
+                }
+                true
+            }
+            _ => {
+                self.open(thread_id, surface);
+                true
+            }
+        }
+    }
+
+    /// `renameDevice`: a blank name falls back to the device's own, then "Device".
+    pub fn rename_device(&mut self, thread_id: &str, surface_id: &str, title: &str) -> bool {
+        self.update(thread_id, |panel| {
+            let Some(surface) = panel.surfaces.iter_mut().find(|surface| surface.id == surface_id) else { return };
+            if let SurfaceKind::Device { target, title: current } = &mut surface.kind {
+                let trimmed = title.trim();
+                let name = if trimmed.is_empty() { target.as_ref().map_or("Device", |target| target.name.as_str()) } else { trimmed };
+                *current = Some(name.to_owned());
+            }
+        })
     }
 
     pub fn remove_thread(&mut self, thread_id: &str) -> bool {

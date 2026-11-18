@@ -9,6 +9,15 @@ fn ids(panels: &RightPanels, thread: &str) -> Vec<String> {
     panels.panel(thread).surfaces.iter().map(|surface| surface.id.clone()).collect()
 }
 
+/// Reopens with the shell live and every thread in a workspace, returning the restored thread.
+fn reopen(panels: &mut RightPanels, thread_exists: impl Fn(&str) -> bool) -> Option<String> {
+    match panels.reopen_closed(thread_exists, true, |_| true) {
+        Some(Reopened::Thread(thread)) => Some(thread),
+        None => None,
+        other => panic!("expected a panel tab, got {other:?}"),
+    }
+}
+
 fn with_tabs(names: &[&str]) -> RightPanels {
     let mut panels = RightPanels::default();
     for name in names {
@@ -89,9 +98,9 @@ fn closed_tabs_reopen_newest_first_with_the_active_tab_last_closed() {
     let mut panels = with_tabs(&["a", "b", "c"]);
     panels.activate("t", "b");
     panels.close_all_surfaces("t");
-    let order: Vec<_> = panels.closed_views().iter().map(|view| view.surface.id.as_str()).collect();
+    let order: Vec<_> = panels.closed_views().iter().filter_map(|view| view.surface().map(Surface::id)).collect();
     assert_eq!(order, ["b", "c", "a"]);
-    assert_eq!(panels.reopen_closed(|_| true).as_deref(), Some("t"));
+    assert_eq!(reopen(&mut panels, |_| true), Some("t".to_owned()));
     assert_eq!(panels.active_surface("t").map(Surface::id), Some("b"));
     assert_eq!(panels.closed_views().len(), 2);
 }
@@ -107,11 +116,11 @@ fn reopen_skips_missing_threads_and_drops_tabs_already_open() {
     panels.close_surface("t", "b");
     panels.open("t", tab("b"));
     // Newest first: t/b (already open, dropped), t/a (restored), gone/x (kept, thread missing).
-    assert_eq!(panels.reopen_closed(|thread| thread == "t").as_deref(), Some("t"));
+    assert_eq!(reopen(&mut panels, |thread| thread == "t"), Some("t".to_owned()));
     assert_eq!(ids(&panels, "t"), ["b", "a"]);
     let left: Vec<_> = panels.closed_views().iter().map(|view| view.thread_id.as_str()).collect();
     assert_eq!(left, ["gone"]);
-    assert_eq!(panels.reopen_closed(|thread| thread == "t"), None);
+    assert_eq!(reopen(&mut panels, |thread| thread == "t"), None);
 }
 
 #[test]
@@ -126,7 +135,7 @@ fn side_chat_tabs_persist_like_the_web_and_skip_deleted_chats_on_reopen() {
     panels.open("t", Surface::side_chat("gone"));
     panels.close_surface("t", "side-chat:gone");
     // Newest first is the deleted side chat; it stays skipped and the live one comes back.
-    assert_eq!(panels.reopen_closed(|thread| thread != "gone").as_deref(), Some("t"));
+    assert_eq!(reopen(&mut panels, |thread| thread != "gone"), Some("t".to_owned()));
     assert_eq!(ids(&panels, "t"), ["side-chat:s"]);
 }
 
@@ -147,7 +156,7 @@ fn closed_history_dedupes_and_is_bounded() {
         panels.close_surface("t", &id);
     }
     assert_eq!(panels.closed_views().len(), 20);
-    assert_eq!(panels.closed_views()[0].surface.id, "tab-29");
+    assert_eq!(panels.closed_views()[0].surface().map(Surface::id), Some("tab-29"));
 }
 
 #[test]
@@ -299,7 +308,7 @@ fn browser_tabs_follow_preview_sessions() {
     assert!(!panels.reconcile_browser_surfaces("t", &["b".to_owned(), "h".to_owned()], &hidden));
     // Closing a session tab is not remembered for cmd-shift-t: its session is gone.
     panels.close_surface("t", "browser:b");
-    assert!(panels.closed_views().iter().all(|view| view.surface.preview_tab().is_none()));
+    assert!(panels.closed_views().iter().all(|view| view.surface().is_some_and(|surface| surface.preview_tab().is_none())));
     // The last session tab closing on the server hides the panel.
     let mut only = RightPanels::default();
     only.open_browser("t", Some("a"));
@@ -375,4 +384,152 @@ fn tool_diff_keeps_its_source_when_the_side_chat_pane_is_replaced() {
     panels.remove_thread("parent");
     assert_eq!(panels.active_thread_source("parent", &selection), None);
     assert_eq!(RightPanels::default().active_thread_source("parent", &selection), None);
+}
+
+fn session(tab: &str, extra: Value) -> crate::preview::SessionSnapshot {
+    let mut value = serde_json::json!({
+        "threadId": "t", "tabId": tab, "updatedAt": "",
+        "navStatus": { "_tag": "Success", "url": format!("http://localhost:3000/{tab}"), "title": "App" },
+    });
+    value.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
+    crate::preview::SessionSnapshot::decode(value).expect("snapshot")
+}
+
+fn closed_browser_tabs(panels: &RightPanels) -> Vec<&str> {
+    panels
+        .closed_views()
+        .iter()
+        .filter_map(|view| match &view.target {
+            ClosedTarget::Browser { snapshot } => Some(snapshot.tab_id.as_str()),
+            ClosedTarget::PanelTab { .. } => None,
+        })
+        .collect()
+}
+
+#[test]
+fn closed_browser_tabs_reopen_as_a_new_session_with_their_settings() {
+    let extra = serde_json::json!({ "viewport": { "_tag": "fixed", "width": 390, "height": 844 }, "profileId": "work", "zoomFactor": 1.25, "colorScheme": "dark" });
+    let snapshot = BrowserSnapshot::from_session(&session("a", extra));
+    assert_eq!(snapshot.url.as_deref(), Some("http://localhost:3000/a"));
+    assert_eq!(
+        snapshot.open_input("t"),
+        serde_json::json!({ "threadId": "t", "runtime": "server", "url": "http://localhost:3000/a",
+            "viewport": { "_tag": "fixed", "width": 390, "height": 844 }, "profileId": "work", "zoomFactor": 1.25, "colorScheme": "dark" })
+    );
+    // An idle tab reopens blank, with only the settings it had.
+    let idle = session("idle", serde_json::json!({ "navStatus": { "_tag": "Idle" } }));
+    assert_eq!(BrowserSnapshot::from_session(&idle).open_input("t"), serde_json::json!({ "threadId": "t", "runtime": "server" }));
+
+    let mut panels = RightPanels::default();
+    panels.open("t", Surface::diff());
+    panels.remember_browser("t", snapshot.clone());
+    panels.remember_browser("t", BrowserSnapshot::from_session(&session("a", Value::Null)));
+    assert_eq!(closed_browser_tabs(&panels), ["a"], "one entry per session");
+    panels.remember_browser("t", snapshot.clone());
+    let Some(Reopened::Browser(view)) = panels.reopen_closed(|_| true, true, |_| true) else { panic!("browser") };
+    assert_eq!((view.thread_id.as_str(), &view.target), ("t", &ClosedTarget::Browser { snapshot: snapshot.clone() }));
+    assert!(panels.closed_views().is_empty());
+    // The open failed: the entry goes behind newer ones rather than being lost.
+    panels.close_surface("t", "diff");
+    panels.defer_closed(view.clone());
+    assert_eq!(panels.closed_views().last(), Some(&view));
+    assert_eq!(panels.closed_views().len(), 2);
+}
+
+#[test]
+fn a_browser_tab_whose_close_failed_is_dropped_from_history() {
+    let mut panels = RightPanels::default();
+    panels.open_browser("t", Some("a"));
+    panels.remember_browser("t", BrowserSnapshot::from_session(&session("a", Value::Null)));
+    // The server refused the close, so the tab came back while the panel was hidden.
+    panels.hide("t");
+    assert_eq!(panels.reopen_closed(|_| true, true, |_| true), None);
+    assert!(panels.closed_views().is_empty());
+}
+
+#[test]
+fn incognito_browser_tabs_are_remembered_but_never_saved() {
+    let mut panels = RightPanels::default();
+    panels.remember_browser("t", BrowserSnapshot::from_session(&session("work", Value::Null)));
+    panels.remember_browser("t", BrowserSnapshot::from_session(&session("private", serde_json::json!({ "profileId": INCOGNITO_BROWSER_PROFILE_ID }))));
+    assert_eq!(closed_browser_tabs(&panels), ["private", "work"]);
+    let saved = serde_json::to_value(&panels).unwrap();
+    assert_eq!(saved["closed"].as_array().map(Vec::len), Some(1), "{saved}");
+    assert_eq!(saved["closed"][0]["kind"], "browser");
+    assert_eq!(saved["closed"][0]["snapshot"]["tabId"], "work");
+    let restored = RightPanels::from_value(&saved);
+    assert_eq!(closed_browser_tabs(&restored), ["work"]);
+    // A hand-edited incognito entry on disk is dropped on load too (`migrate`).
+    let mut tampered = saved.clone();
+    tampered["closed"][0]["snapshot"]["profileId"] = INCOGNITO_BROWSER_PROFILE_ID.into();
+    assert!(RightPanels::from_value(&tampered).closed_views().is_empty());
+}
+
+#[test]
+fn closed_panel_tabs_persist_with_their_kind_and_older_entries_still_load() {
+    let mut panels = with_tabs(&["a"]);
+    panels.close_surface("t", "a");
+    let saved = serde_json::to_value(&panels).unwrap();
+    assert_eq!(saved["closed"][0], serde_json::json!({ "threadId": "t", "kind": "panel-tab", "surface": { "id": "a", "kind": "diff" } }));
+    let legacy = serde_json::json!({ "closed": [{ "threadId": "t", "surface": { "id": "diff", "kind": "diff" } }, { "threadId": "t", "kind": "later", "surface": {} }] });
+    let restored = RightPanels::from_value(&legacy);
+    assert_eq!(restored.closed_views(), [ClosedView::panel_tab("t", Surface::diff())]);
+}
+
+#[test]
+fn reopen_waits_for_the_shell_before_skipping_missing_threads() {
+    let mut panels = RightPanels::default();
+    panels.open("t", tab("a"));
+    panels.close_surface("t", "a");
+    panels.open("loading", tab("b"));
+    panels.close_surface("loading", "b");
+    // The newest entry's thread may still arrive: nothing older reopens past it.
+    assert_eq!(panels.reopen_closed(|thread| thread == "t", false, |_| true), None);
+    assert_eq!(panels.closed_views().len(), 2);
+    assert_eq!(panels.reopen_closed(|thread| thread == "t", true, |_| true), Some(Reopened::Thread("t".into())));
+    assert_eq!(panels.closed_views().len(), 1);
+}
+
+#[test]
+fn files_reopen_only_with_a_workspace_and_otherwise_wait_at_the_back() {
+    let mut panels = RightPanels::default();
+    panels.open_file("t", Some("src/a.rs"), Some(4));
+    panels.open_file("t", None, None);
+    panels.open("t", tab("x"));
+    panels.close_all_surfaces("t");
+    let order = |panels: &RightPanels| -> Vec<String> { panels.closed_views().iter().filter_map(|view| view.surface().map(|surface| surface.id.clone())).collect() };
+    assert_eq!(order(&panels), ["x", "files", "file:src/a.rs"]);
+    panels.reopen_closed(|_| true, true, |_| true);
+    // No workspace: the explorer is deferred behind the rest instead of dropped, and nothing opens.
+    assert_eq!(panels.reopen_closed(|_| true, true, |_| false), None);
+    assert_eq!(order(&panels), ["file:src/a.rs", "files"]);
+    assert_eq!(ids(&panels, "t"), ["x"]);
+    // With one, it reopens through `openFile`: a fresh reveal of its line.
+    assert_eq!(panels.reopen_closed(|_| true, true, |_| true), Some(Reopened::Thread("t".into())));
+    assert_eq!(file_reveal(&panels, "t", "file:src/a.rs"), Some((Some(4), 1)));
+    // The placeholder browser tab reopens as one, a session's panel tab never does.
+    panels.open_browser("t", None);
+    panels.close_surface("t", "browser:new");
+    assert_eq!(panels.reopen_closed(|_| true, true, |_| false), Some(Reopened::Thread("t".into())));
+    assert_eq!(panels.panel("t").active_surface_id.as_deref(), Some("browser:new"));
+}
+
+#[test]
+fn renamed_device_tabs_reopen_in_the_lists_place_with_their_name() {
+    use crate::device::Platform;
+    let target = DeviceTarget { host_id: "local".into(), device_id: "A".into(), platform: Platform::Android, name: "Pixel".into() };
+    let mut panels = RightPanels::default();
+    panels.open("t", Surface::device(Some(target.clone())));
+    assert!(panels.rename_device("t", "device:local:A", "  Test phone "));
+    assert_eq!(panels.panel("t").active().map(Surface::title).as_deref(), Some("Test phone"));
+    assert!(panels.rename_device("t", "device:local:A", " "));
+    assert_eq!(panels.panel("t").active().map(Surface::title).as_deref(), Some("Pixel"));
+    assert!(!panels.rename_device("t", "missing", "x"));
+    panels.rename_device("t", "device:local:A", "Test phone");
+    panels.close_surface("t", "device:local:A");
+    panels.open("t", Surface::diff());
+    panels.open("t", Surface::device(None));
+    assert_eq!(panels.reopen_closed(|_| true, true, |_| true), Some(Reopened::Thread("t".into())));
+    assert_eq!(ids(&panels, "t"), ["diff", "device:local:A"]);
+    assert_eq!(panels.panel("t").active().map(Surface::title).as_deref(), Some("Test phone"));
 }
