@@ -319,13 +319,16 @@ impl AppState {
                         let tab_id = opened.tab_id;
                         cx.defer(move |cx| {
                             let Some(app) = weak.upgrade() else { return };
-                            app.update(cx, |state, cx| {
+                            let current = app.update(cx, |state, cx| {
                                 if state.connection_id() != connection || state.panel_thread().as_deref() != Some(thread.as_str()) {
-                                    return;
+                                    return false;
                                 }
                                 state.mutate_panels(cx, |panels, current| current == thread && panels.panels.open_browser(current, Some(&tab_id)));
+                                true
                             });
-                            previews.update(cx, |previews, cx| previews.popup(&thread, &tab_id, cx));
+                            if current {
+                                previews.update(cx, |previews, cx| previews.popup(&thread, &tab_id, cx));
+                            }
                         });
                     }
                     Err(error) => {
@@ -473,6 +476,76 @@ mod tests {
         state.read_with(cx, |state, _| {
             assert_eq!(state.selected_thread.as_deref(), Some("other-thread"));
             assert_eq!(state.panels.panels.active_surface("other-thread").map(Surface::id), Some("browser:tab-new"));
+        });
+
+        // If selection moves away before `cx.defer` runs, `reopen_browser` must skip both
+        // `open_browser` and `previews.popup` (no leaked `pending_popup`).
+        let bounced = std::rc::Rc::new(std::cell::Cell::new(false));
+        let bounce_sub = {
+            let bounced = bounced.clone();
+            cx.update(|cx| {
+                cx.subscribe(&state, move |entity, event, cx| {
+                    if matches!(event, AppEvent::Selection)
+                        && entity.read(cx).selected_thread.as_deref() == Some("menu-thread")
+                        && !bounced.replace(true)
+                    {
+                        entity.update(cx, |state, cx| state.select_thread("other-thread", cx));
+                    }
+                })
+            })
+        };
+        let stale_snapshot = BrowserSnapshot { tab_id: "tab-stale-old".into(), ..snapshot.clone() };
+        state.update(cx, |state, cx| {
+            state.panels.panels.remember_browser("menu-thread", stale_snapshot);
+            state.reopen_closed_view(cx);
+        });
+        let reply = loop {
+            let (method, _payload, reply) = fixture.next_request().await;
+            if method == preview::method::OPEN {
+                break reply;
+            }
+        };
+        reply
+            .send(Ok(json!({
+                "threadId": "menu-thread",
+                "tabId": "tab-stale-new",
+                "updatedAt": "2026-01-01T00:00:02Z",
+                "navStatus": { "_tag": "Success", "url": "http://localhost:3000/a", "title": "App" }
+            })))
+            .unwrap();
+        let _bounce_list = loop {
+            let (method, payload, reply) = fixture.next_request().await;
+            if method == preview::method::LIST
+                && payload.get("threadId").and_then(serde_json::Value::as_str) == Some("other-thread")
+                && !reply.is_closed()
+            {
+                break reply;
+            }
+        };
+        cx.run_until_parked();
+        drop(bounce_sub);
+        state.update(cx, |state, cx| state.select_thread("menu-thread", cx));
+        let list_reply = loop {
+            let (method, payload, reply) = fixture.next_request().await;
+            if method == preview::method::LIST
+                && payload.get("threadId").and_then(serde_json::Value::as_str) == Some("menu-thread")
+                && !reply.is_closed()
+            {
+                break reply;
+            }
+        };
+        let _ = list_reply.send(Ok(json!({
+            "sessions": [{
+                "threadId": "menu-thread",
+                "tabId": "tab-stale-new",
+                "updatedAt": "2026-01-01T00:00:02Z",
+                "navStatus": { "_tag": "Success", "url": "http://localhost:3000/a", "title": "App" }
+            }]
+        })));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(bounced.get());
+            assert_eq!(state.panels.panels.active_surface("menu-thread"), None, "stale reopen must not leak pending_popup into Previews");
         });
 
         // Switching environments while `preview.open` is in flight must not mutate the new connection.
