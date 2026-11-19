@@ -50,6 +50,10 @@ fn the_access_stream_snapshots_upserts_and_removes() {
 fn scopes_presets_and_coupling_follow_the_dialog() {
     let mut selected = standard_scopes();
     assert_eq!(selected.len(), 16);
+    assert!(!selected.iter().any(|scope| scope == RELAY_CONFIGURE));
+    let admin = administrative_scopes();
+    assert_eq!(admin.len(), 17);
+    assert!(admin.iter().any(|scope| scope == RELAY_CONFIGURE));
     toggle_scope(&mut selected, "terminal:read", false);
     assert!(!selected.iter().any(|scope| scope.starts_with("terminal:")), "turning off viewing terminals turns off using them");
     toggle_scope(&mut selected, "terminal:operate", true);

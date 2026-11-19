@@ -173,7 +173,11 @@ pub struct TerminalSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", rename_all_fields = "camelCase")]
 pub enum TerminalMetadataEvent {
-    Snapshot { terminals: Vec<TerminalSummary> },
+    Snapshot {
+        terminals: Vec<TerminalSummary>,
+        #[serde(default)]
+        manager_id: Option<String>,
+    },
     Upsert { terminal: TerminalSummary },
     Remove { thread_id: String, terminal_id: String },
     #[serde(other)]
@@ -189,7 +193,7 @@ pub struct Terminals {
 impl Terminals {
     pub fn apply(&mut self, event: TerminalMetadataEvent) {
         match event {
-            TerminalMetadataEvent::Snapshot { terminals } => {
+            TerminalMetadataEvent::Snapshot { terminals, .. } => {
                 self.by_key = terminals.into_iter().map(|terminal| ((terminal.thread_id.clone(), terminal.terminal_id.clone()), terminal)).collect();
             }
             TerminalMetadataEvent::Upsert { terminal } => {
@@ -334,7 +338,7 @@ mod tests {
     fn terminals_track_running_scripts_and_never_reuse_a_busy_one() {
         let mut terminals = Terminals::default();
         assert_eq!(terminals.terminal_for_run("th", "dev", "x1"), "script:dev");
-        terminals.apply(TerminalMetadataEvent::Snapshot { terminals: vec![summary("script:dev", true), summary("script:dev-server", false)] });
+        terminals.apply(TerminalMetadataEvent::Snapshot { terminals: vec![summary("script:dev", true), summary("script:dev-server", false)], manager_id: None });
         assert!(terminals.script_running("th", "dev"));
         assert!(!terminals.script_running("th", "dev-server"));
         assert!(!terminals.script_running("other", "dev"));
@@ -367,7 +371,7 @@ mod tests {
         let mut terminals = Terminals::default();
         let first = terminals.launch_for("th", &stopping, true, "x1");
         assert_eq!(first, ScriptLaunch { terminal_id: "script:dev".into(), fresh: true });
-        terminals.apply(TerminalMetadataEvent::Snapshot { terminals: vec![summary("script:dev", false)] });
+        terminals.apply(TerminalMetadataEvent::Snapshot { terminals: vec![summary("script:dev", false)], manager_id: None });
         assert_eq!(terminals.launch_for("th", &stopping, true, "x2"), ScriptLaunch { terminal_id: "script:dev:x2".into(), fresh: true }, "never types into an earlier run");
         assert_eq!(terminals.launch_for("th", &dev, true, "x2"), ScriptLaunch { terminal_id: "script:dev".into(), fresh: false }, "a plain script reuses its idle session");
         assert_eq!(terminals.launch_for("th", &dev, false, "x3"), ScriptLaunch { terminal_id: "script:dev:x3".into(), fresh: true }, "no terminal read access means no reuse");

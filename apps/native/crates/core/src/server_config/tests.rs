@@ -298,3 +298,73 @@ fn resolves_shortcut_keybindings_with_primary_authority_and_connected_fallback()
         "secondary.cmd"
     );
 }
+
+#[test]
+fn decodes_hostname_provider_subproviders_retention_and_forward_compat_defaults() {
+    let config: ServerConfig = serde_json::from_value(json!({
+        "hostname": "devbox.local",
+        "providers": [{
+            "instanceId": "fx",
+            "driver": "fx",
+            "enabled": true,
+            "installed": true,
+            "status": "ready",
+            "models": [{ "slug": "m1", "name": "M1", "subProvider": "openai" }],
+            "subProviders": [
+                { "name": "openai" },
+                { "name": "anthropic", "unavailableReason": "Signed out" },
+                { "broken": true }
+            ],
+            "modelsRetained": true,
+            "workspaceRescannedAt": "2026-10-12T00:00:00Z"
+        }],
+        "settings": {
+            "usageHistoryRetentionDays": "unlimited"
+        }
+    }))
+    .unwrap();
+    assert_eq!(config.hostname.as_deref(), Some("devbox.local"));
+    assert_eq!(config.settings.usage_history_retention_days, UsageHistoryRetentionDays::Unlimited);
+    let provider = &config.providers[0];
+    assert_eq!(
+        provider.sub_providers.as_deref(),
+        Some(&[
+            ProviderSubProvider { name: "openai".into(), unavailable_reason: None },
+            ProviderSubProvider { name: "anthropic".into(), unavailable_reason: Some("Signed out".into()) },
+        ][..])
+    );
+    assert_eq!(provider.models_retained, Some(true));
+    assert_eq!(provider.workspace_rescanned_at.as_deref(), Some("2026-10-12T00:00:00Z"));
+
+    // Provider deltas preserve the new fields while inheriting omitted models/commands/skills.
+    let delta: ServerProviderDelta = serde_json::from_value(json!({
+        "instanceId": "fx",
+        "driver": "fx",
+        "enabled": true,
+        "installed": true,
+        "status": "error",
+        "modelsRetained": true,
+        "subProviders": [{ "name": "openai" }],
+        "workspaceRescannedAt": "2026-10-13T00:00:00Z"
+    }))
+    .unwrap();
+    let merged = apply_server_provider_deltas(&config.providers, vec![delta]);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].models.len(), 1);
+    assert_eq!(merged[0].models_retained, Some(true));
+    assert_eq!(merged[0].sub_providers.as_ref().map(Vec::len), Some(1));
+    assert_eq!(merged[0].workspace_rescanned_at.as_deref(), Some("2026-10-13T00:00:00Z"));
+
+    // Retention days: positive int, default 92 when omitted or invalid.
+    let days_settings: ServerSettings = serde_json::from_value(json!({ "usageHistoryRetentionDays": 30 })).unwrap();
+    assert_eq!(days_settings.usage_history_retention_days, UsageHistoryRetentionDays::Days(30));
+    assert_eq!(serde_json::to_value(UsageHistoryRetentionDays::Days(30)).unwrap(), json!(30));
+    assert_eq!(serde_json::to_value(UsageHistoryRetentionDays::Unlimited).unwrap(), json!("unlimited"));
+    for invalid in [json!({}), json!({ "usageHistoryRetentionDays": 0 }), json!({ "usageHistoryRetentionDays": -5 }), json!({ "usageHistoryRetentionDays": "forever" })] {
+        let parsed: ServerSettings = serde_json::from_value(invalid).unwrap();
+        assert_eq!(parsed.usage_history_retention_days, UsageHistoryRetentionDays::Days(92));
+    }
+    let older: ServerConfig = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(older.hostname, None);
+    assert_eq!(older.settings.usage_history_retention_days, UsageHistoryRetentionDays::Days(92));
+}

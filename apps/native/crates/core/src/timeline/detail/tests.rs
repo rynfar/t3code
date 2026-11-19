@@ -157,13 +157,76 @@ fn call_lines_show_arguments_in_order_and_other_inputs_as_text() {
 }
 
 #[test]
-fn command_output_unwraps_the_claude_envelope() {
-    let command = |output: &str| item(json!({ "type": "command_execution", "input": "ls", "output": output }));
-    assert_eq!(turn_item_output_text(&command("{\"stdout\":\"out\",\"stderr\":\"err\",\"interrupted\":false}")).as_deref(), Some("out\nerr"));
-    assert_eq!(turn_item_output_text(&command("{\"stdout\":\" \",\"stderr\":\"\",\"interrupted\":false}")), None);
-    assert_eq!(turn_item_output_text(&command("{\"stdout\":\"out\"}")).as_deref(), Some("{\"stdout\":\"out\"}"));
-    assert_eq!(turn_item_output_text(&command("plain\n")).as_deref(), Some("plain\n"));
-    assert_eq!(turn_item_output_text(&command("\n ")), None);
+fn command_output_unwraps_only_pre_cutoff_claude_envelopes() {
+    let envelope = "{\"stdout\":\"out\",\"stderr\":\"err\",\"interrupted\":false}";
+    let claude_early = |output: &str| {
+        item(json!({
+            "type": "command_execution",
+            "input": "ls",
+            "output": output,
+            "nativeItemRef": { "nativeId": "n1", "driver": "claudeAgent" },
+            "startedAt": "2026-10-04T00:00:00Z",
+        }))
+    };
+    let claude_post_cutoff = item(json!({
+        "type": "command_execution",
+        "input": "ls",
+        "output": envelope,
+        "nativeItemRef": { "nativeId": "n1", "driver": "claudeAgent" },
+        "startedAt": "2026-10-08T00:00:00Z",
+    }));
+    let other_driver = item(json!({
+        "type": "command_execution",
+        "input": "ls",
+        "output": envelope,
+        "nativeItemRef": { "nativeId": "n1", "driver": "codex" },
+        "startedAt": "2026-10-04T00:00:00Z",
+    }));
+    let no_driver = item(json!({
+        "type": "command_execution",
+        "input": "ls",
+        "output": envelope,
+    }));
+
+    assert_eq!(turn_item_output_text(&claude_early(envelope)).as_deref(), Some("out\nerr"));
+    assert_eq!(
+        turn_item_output_text(&claude_early("{\"stdout\":\"out\\n\",\"stderr\":\"err\",\"interrupted\":false}")).as_deref(),
+        Some("out\nerr"),
+        "trailing newline on stdout is not doubled"
+    );
+    assert_eq!(turn_item_output_text(&claude_early("{\"stdout\":\" \",\"stderr\":\"\",\"interrupted\":false}")), None);
+    assert_eq!(turn_item_output_text(&claude_early("{\"stdout\":\"out\"}")).as_deref(), Some("{\"stdout\":\"out\"}"));
+    assert_eq!(turn_item_output_text(&claude_early("plain\n")).as_deref(), Some("plain\n"));
+    assert_eq!(turn_item_output_text(&claude_early("\n ")), None);
+    assert_eq!(turn_item_output_text(&claude_post_cutoff).as_deref(), Some(envelope));
+    assert_eq!(turn_item_output_text(&other_driver).as_deref(), Some(envelope));
+    assert_eq!(turn_item_output_text(&no_driver).as_deref(), Some(envelope));
+}
+
+#[test]
+fn pretty_json_preserves_lossy_numbers_and_formats_safe_ones() {
+    let text = |output: &str| turn_item_output_text(&tool(json!(output)));
+    // Unsafe integer (> 2^53 - 1) preserves raw text instead of rounding through f64.
+    let unsafe_int = "{\"id\":9007199254740993,\"ok\":true}";
+    assert_eq!(text(unsafe_int).as_deref(), Some(unsafe_int));
+    let neg_unsafe = "{\"id\":-9007199254740992}";
+    assert_eq!(text(neg_unsafe).as_deref(), Some(neg_unsafe));
+    // Unsafe integer inside a string is safe to pretty-print.
+    assert_eq!(
+        text("{\"id\":\"9007199254740993\"}").as_deref(),
+        Some("{\n  \"id\": \"9007199254740993\"\n}")
+    );
+    // Max safe integer (2^53 - 1) pretty-prints normally.
+    assert_eq!(
+        text("{\"id\":9007199254740991}").as_deref(),
+        Some("{\n  \"id\": 9007199254740991\n}")
+    );
+    // Overflowing float preserves raw text.
+    let overflow = "{\"x\":1e309}";
+    assert_eq!(text(overflow).as_deref(), Some(overflow));
+    // JSON lines with an unsafe integer preserve raw text.
+    let ndjson = "{\"a\":1}\n{\"b\":9007199254740993}";
+    assert_eq!(text(ndjson).as_deref(), Some(ndjson));
 }
 
 #[test]

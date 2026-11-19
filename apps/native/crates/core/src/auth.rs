@@ -5,6 +5,9 @@
 use serde::Deserialize;
 
 pub const ACCESS_WRITE_SCOPE: &str = "access:write";
+pub const RELAY_READ_SCOPE: &str = "relay:read";
+pub const RELAY_WRITE_SCOPE: &str = "relay:write";
+pub const RELAY_CONFIGURE_SCOPE: &str = "relay:configure";
 pub const TERMINAL_READ_SCOPE: &str = "terminal:read";
 pub const TERMINAL_OPERATE_SCOPE: &str = "terminal:operate";
 pub const SOURCE_CONTROL_WRITE_SCOPE: &str = "source-control:write";

@@ -1,5 +1,6 @@
 // Loads the real TypeScript sources the fixtures run, and the wire codecs the server and client
 // share. Bare imports resolve from packages/client-runtime, so run from anywhere.
+import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
@@ -39,6 +40,67 @@ export const ROOT = NodePath.resolve(
 const fromRuntime = NodeModule.createRequire(
   NodePath.join(ROOT, "packages/client-runtime/package.json"),
 );
+const fromWeb = NodeModule.createRequire(NodePath.join(ROOT, "apps/web/package.json"));
+
+// Vite/bundler imports inside apps/web omit `.ts`/`.tsx` extensions and `with { type: "json" }`,
+// and resolve bare packages from apps/web/package.json. Stock Node needs a fallback loader hook.
+const RELATIVE_TS_PROBES = [".ts", ".tsx", "/index.ts", "/index.tsx"] as const;
+const WEB_PREFIX = `${NodePath.join(ROOT, "apps/web")}${NodePath.sep}`;
+NodeModule.registerHooks({
+  resolve(specifier, context, nextResolve) {
+    try {
+      return nextResolve(specifier, context);
+    } catch (error) {
+      if (
+        (specifier.startsWith("./") || specifier.startsWith("../")) &&
+        context.parentURL?.startsWith("file://")
+      ) {
+        const base = NodePath.resolve(
+          NodePath.dirname(NodeURL.fileURLToPath(context.parentURL)),
+          specifier,
+        );
+        for (const ext of RELATIVE_TS_PROBES) {
+          const candidate = `${base}${ext}`;
+          if (NodeFS.existsSync(candidate)) {
+            return { url: NodeURL.pathToFileURL(candidate).href, shortCircuit: true };
+          }
+        }
+      }
+      if (
+        !specifier.startsWith(".") &&
+        !specifier.startsWith("/") &&
+        !specifier.startsWith("node:") &&
+        !specifier.startsWith("file:") &&
+        context.parentURL?.startsWith("file://") &&
+        NodeURL.fileURLToPath(context.parentURL).startsWith(WEB_PREFIX)
+      ) {
+        try {
+          return {
+            url: NodeURL.pathToFileURL(fromWeb.resolve(specifier)).href,
+            shortCircuit: true,
+          };
+        } catch {
+          // Fall through to rethrow the original resolution error.
+        }
+      }
+      throw error;
+    }
+  },
+  load(url, context, nextLoad) {
+    if (
+      url.startsWith("file://") &&
+      url.endsWith(".json") &&
+      context.importAttributes?.type !== "json"
+    ) {
+      return {
+        format: "json",
+        source: NodeFS.readFileSync(NodeURL.fileURLToPath(url), "utf8"),
+        shortCircuit: true,
+      };
+    }
+    return nextLoad(url, context);
+  },
+});
 
 const importPackage = async <T>(specifier: string): Promise<T> =>
   (await import(NodeURL.pathToFileURL(fromRuntime.resolve(specifier)).href)) as T;
@@ -97,15 +159,15 @@ export const ItemDetail = await importSource<typeof ItemDetailModule>(
   "packages/client-runtime/src/work-log/itemDetail.ts",
 );
 
-export const ProjectGrouping = await importSource<typeof import("../../../packages/client-runtime/src/state/projectGrouping.ts")>(
-  "packages/client-runtime/src/state/projectGrouping.ts",
-);
-export const SidebarProjectGrouping = await importSource<typeof import("../../../apps/web/src/sidebarProjectGrouping.ts")>(
-  "apps/web/src/sidebarProjectGrouping.ts",
-);
-export const UiProjectState = await importSource<typeof import("../../../apps/web/src/uiStateStore.ts")>(
-  "apps/web/src/uiStateStore.ts",
-);
+export const ProjectGrouping = await importSource<
+  typeof import("../../../packages/client-runtime/src/state/projectGrouping.ts")
+>("packages/client-runtime/src/state/projectGrouping.ts");
+export const SidebarProjectGrouping = await importSource<
+  typeof import("../../../apps/web/src/sidebarProjectGrouping.ts")
+>("apps/web/src/sidebarProjectGrouping.ts");
+export const UiProjectState = await importSource<
+  typeof import("../../../apps/web/src/uiStateStore.ts")
+>("apps/web/src/uiStateStore.ts");
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Item = OrchestrationV2TurnItem;

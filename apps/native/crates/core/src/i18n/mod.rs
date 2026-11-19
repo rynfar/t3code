@@ -1,13 +1,15 @@
 //! Multi-language UI localization: ports `packages/client-runtime/src/locales.ts`,
-//! `apps/web/src/i18n/locales.ts`, `apps/web/src/i18n/runtime.ts`, and embeds the 9
-//! translation catalogs from `apps/web/src/i18n/translations/*.json`.
+//! `apps/web/src/i18n/locales.ts`, `apps/web/src/i18n/runtime.ts`, and embeds the 10
+//! translation catalogs directly from `apps/web/src/i18n/translations/*.json`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
+
+use serde::Deserialize;
 
 pub const SYSTEM_LANGUAGE: &str = "system";
 pub const DEFAULT_LOCALE: &str = "en";
-pub const SUPPORTED_LOCALES: &[&str] = &["en", "de", "es", "fr", "ja", "ko", "pt-BR", "ru", "zh"];
+pub const SUPPORTED_LOCALES: &[&str] = &["en", "de", "es", "fr", "ja", "ko", "pt-BR", "ru", "sv", "zh"];
 
 /// Shown in their own language so a user can find theirs from any UI language
 /// (`NATIVE_LANGUAGE_NAMES` in `packages/client-runtime/src/locales.ts`).
@@ -20,6 +22,7 @@ pub const NATIVE_LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("ko", "한국어"),
     ("pt-BR", "Português (Brasil)"),
     ("ru", "Русский"),
+    ("sv", "Svenska"),
     ("zh", "中文（简体）"),
 ];
 
@@ -69,6 +72,42 @@ pub fn match_supported_locale<'a>(tag: &str, supported: &[&'a str]) -> Option<&'
     supported.iter().copied().find(|locale| locale.eq_ignore_ascii_case(language))
 }
 
+/// Result of `resolve_locale_selection`: the supported catalog locale plus the regional tag used
+/// for date/number formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocaleSelection<'a> {
+    pub catalog_locale: &'a str,
+    pub formatting_locale: String,
+}
+
+/// Keep the matching system tag for regional formats while loading a supported catalog
+/// (`resolveLocaleSelection` in `packages/client-runtime/src/locales.ts`).
+pub fn resolve_locale_selection<'a, S: AsRef<str>>(
+    language: &str,
+    system_locales: &[S],
+    supported: &[&'a str],
+    fallback: &'a str,
+) -> LocaleSelection<'a> {
+    if let Some(&exact) = supported.iter().find(|&&locale| locale == language) {
+        return LocaleSelection {
+            catalog_locale: exact,
+            formatting_locale: exact.to_owned(),
+        };
+    }
+    for tag in system_locales {
+        if let Some(matched) = match_supported_locale(tag.as_ref(), supported) {
+            return LocaleSelection {
+                catalog_locale: matched,
+                formatting_locale: tag.as_ref().trim().replace('_', "-"),
+            };
+        }
+    }
+    LocaleSelection {
+        catalog_locale: fallback,
+        formatting_locale: fallback.to_owned(),
+    }
+}
+
 /// Saved setting to active locale; `"system"` and unknown values follow the host's languages
 /// (`resolveLocale` in `packages/client-runtime/src/locales.ts`).
 pub fn resolve_locale<'a, S: AsRef<str>>(
@@ -77,15 +116,7 @@ pub fn resolve_locale<'a, S: AsRef<str>>(
     supported: &[&'a str],
     fallback: &'a str,
 ) -> &'a str {
-    if let Some(&exact) = supported.iter().find(|&&locale| locale == language) {
-        return exact;
-    }
-    for tag in system_locales {
-        if let Some(matched) = match_supported_locale(tag.as_ref(), supported) {
-            return matched;
-        }
-    }
-    fallback
+    resolve_locale_selection(language, system_locales, supported, fallback).catalog_locale
 }
 
 /// Parses POSIX UI-language environment variables (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`)
@@ -122,42 +153,61 @@ pub fn parse_env_locales(
     out
 }
 
-const RAW_BUNDLES: &[(&str, &str)] = &[
-    ("en", include_str!("translations/en.json")),
-    ("de", include_str!("translations/de.json")),
-    ("es", include_str!("translations/es.json")),
-    ("fr", include_str!("translations/fr.json")),
-    ("ja", include_str!("translations/ja.json")),
-    ("ko", include_str!("translations/ko.json")),
-    ("pt-BR", include_str!("translations/pt-BR.json")),
-    ("ru", include_str!("translations/ru.json")),
-    ("zh", include_str!("translations/zh.json")),
-];
-
-struct Catalogs {
-    /// `locale -> (english_source -> translated_text)`.
-    by_locale: HashMap<&'static str, HashMap<String, String>>,
+/// GT-React translation catalogs store plain strings alongside rich AST array entries.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CatalogEntry {
+    Text(String),
+    #[allow(dead_code)]
+    Rich(serde_json::Value),
 }
 
-fn catalogs() -> &'static Catalogs {
-    static CATALOGS: OnceLock<Catalogs> = OnceLock::new();
-    CATALOGS.get_or_init(|| {
-        let en_raw: HashMap<String, String> =
-            serde_json::from_str(RAW_BUNDLES[0].1).expect("valid embedded en.json catalog");
-        let mut by_locale = HashMap::with_capacity(RAW_BUNDLES.len());
-        for &(locale, raw_json) in &RAW_BUNDLES[1..] {
-            let localized: HashMap<String, String> =
-                serde_json::from_str(raw_json).expect("valid embedded locale catalog");
-            let mut map = HashMap::with_capacity(en_raw.len());
-            for (hash, english) in &en_raw {
-                if let Some(translated) = localized.get(hash) {
-                    map.insert(english.clone(), translated.clone());
-                }
-            }
-            by_locale.insert(locale, map);
-        }
-        Catalogs { by_locale }
+const RAW_EN_BUNDLE: &str = include_str!("../../../../../web/src/i18n/translations/en.json");
+
+const NON_DEFAULT_BUNDLES: [(&str, &str); 9] = [
+    ("de", include_str!("../../../../../web/src/i18n/translations/de.json")),
+    ("es", include_str!("../../../../../web/src/i18n/translations/es.json")),
+    ("fr", include_str!("../../../../../web/src/i18n/translations/fr.json")),
+    ("ja", include_str!("../../../../../web/src/i18n/translations/ja.json")),
+    ("ko", include_str!("../../../../../web/src/i18n/translations/ko.json")),
+    ("pt-BR", include_str!("../../../../../web/src/i18n/translations/pt-BR.json")),
+    ("ru", include_str!("../../../../../web/src/i18n/translations/ru.json")),
+    ("sv", include_str!("../../../../../web/src/i18n/translations/sv.json")),
+    ("zh", include_str!("../../../../../web/src/i18n/translations/zh.json")),
+];
+
+fn english_catalog() -> &'static BTreeMap<String, String> {
+    static ENGLISH: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+    ENGLISH.get_or_init(|| {
+        let parsed: BTreeMap<String, CatalogEntry> =
+            serde_json::from_str(RAW_EN_BUNDLE).expect("valid embedded en.json catalog");
+        parsed
+            .into_iter()
+            .filter_map(|(hash, entry)| match entry {
+                CatalogEntry::Text(text) => Some((hash, text)),
+                CatalogEntry::Rich(_) => None,
+            })
+            .collect()
     })
+}
+
+/// Lazily parses and caches one locale's `english_source -> translated_text` map on first lookup.
+fn locale_catalog(locale: &str) -> Option<&'static HashMap<String, String>> {
+    static CACHES: [OnceLock<HashMap<String, String>>; 9] = [const { OnceLock::new() }; 9];
+    let index = NON_DEFAULT_BUNDLES.iter().position(|&(code, _)| code == locale)?;
+    Some(CACHES[index].get_or_init(|| {
+        let raw_json = NON_DEFAULT_BUNDLES[index].1;
+        let localized: HashMap<String, CatalogEntry> =
+            serde_json::from_str(raw_json).expect("valid embedded locale catalog");
+        let en = english_catalog();
+        let mut map = HashMap::with_capacity(en.len());
+        for (hash, english) in en {
+            if let Some(CatalogEntry::Text(translated)) = localized.get(hash) {
+                map.entry(english.clone()).or_insert_with(|| translated.clone());
+            }
+        }
+        map
+    }))
 }
 
 /// Translates an English source string into `locale`. Returns `english` unchanged for `"en"` or
@@ -166,9 +216,7 @@ pub fn translate<'a>(locale: &str, english: &'a str) -> &'a str {
     if locale == DEFAULT_LOCALE {
         return english;
     }
-    catalogs()
-        .by_locale
-        .get(locale)
+    locale_catalog(locale)
         .and_then(|map| map.get(english))
         .map(String::as_str)
         .unwrap_or(english)
@@ -177,40 +225,50 @@ pub fn translate<'a>(locale: &str, english: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::HashSet;
     use std::path::Path;
 
     #[test]
     fn embedded_translation_catalogs_match_web_json_exactly() {
         let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../web/src/i18n/translations");
         assert!(web_dir.is_dir(), "expected web translations dir at {}", web_dir.display());
-        let en_web: BTreeMap<String, String> = serde_json::from_str(
-            &std::fs::read_to_string(web_dir.join("en.json")).expect("read web en.json"),
-        )
-        .expect("parse web en.json");
-        assert_eq!(en_web.len(), 72, "expected 72 translation keys in en.json");
+        let en_web_raw = std::fs::read_to_string(web_dir.join("en.json")).expect("read web en.json");
+        assert_eq!(RAW_EN_BUNDLE, en_web_raw);
+        let en_web: BTreeMap<String, CatalogEntry> =
+            serde_json::from_str(&en_web_raw).expect("parse web en.json");
+        assert!(!en_web.is_empty(), "expected non-empty web en.json");
 
-        for &(locale, embedded_raw) in RAW_BUNDLES {
+        // All 10 supported locales exist on disk and are covered by embedded bundles.
+        assert_eq!(SUPPORTED_LOCALES.len(), 1 + NON_DEFAULT_BUNDLES.len());
+        assert_eq!(NATIVE_LANGUAGE_NAMES.len(), SUPPORTED_LOCALES.len());
+
+        for &(locale, embedded_raw) in &NON_DEFAULT_BUNDLES {
             let web_path = web_dir.join(format!("{locale}.json"));
             let web_raw = std::fs::read_to_string(&web_path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", web_path.display()));
-            let web_map: BTreeMap<String, String> =
-                serde_json::from_str(&web_raw).unwrap_or_else(|e| panic!("parse web {locale}: {e}"));
-            let embedded_map: BTreeMap<String, String> = serde_json::from_str(embedded_raw)
-                .unwrap_or_else(|e| panic!("parse embedded {locale}: {e}"));
             assert_eq!(
-                embedded_map, web_map,
+                embedded_raw, web_raw,
                 "embedded {locale}.json drifted from apps/web/src/i18n/translations/{locale}.json"
             );
-            assert_eq!(embedded_map.len(), en_web.len(), "{locale}.json key count mismatch");
+            let web_map: BTreeMap<String, CatalogEntry> =
+                serde_json::from_str(&web_raw).unwrap_or_else(|e| panic!("parse web {locale}: {e}"));
 
-            // Every key in en.json translates to the exact value in this bundle.
-            for (hash, english) in &en_web {
-                let expected = web_map.get(hash).expect("matching hash");
-                assert_eq!(
-                    translate(locale, english),
-                    expected.as_str(),
-                    "translate({locale:?}, {english:?}) mismatch"
+            // Build the expected set of valid string translations per English source (multiple
+            // GT hashes can share one English string under distinct `$context` values).
+            let mut valid_by_english: HashMap<&str, HashSet<&str>> = HashMap::new();
+            for (hash, en_entry) in &en_web {
+                if let CatalogEntry::Text(english) = en_entry
+                    && let Some(CatalogEntry::Text(translated)) = web_map.get(hash)
+                {
+                    valid_by_english.entry(english.as_str()).or_default().insert(translated.as_str());
+                }
+            }
+            assert!(!valid_by_english.is_empty(), "{locale}.json has no plain string entries");
+            for (english, valid) in &valid_by_english {
+                let actual = translate(locale, english);
+                assert!(
+                    valid.contains(actual),
+                    "translate({locale:?}, {english:?}) returned {actual:?}, expected one of {valid:?}"
                 );
             }
         }
@@ -226,10 +284,12 @@ mod tests {
         assert_eq!(native_language_name("ko"), "한국어");
         assert_eq!(native_language_name("pt-BR"), "Português (Brasil)");
         assert_eq!(native_language_name("ru"), "Русский");
+        assert_eq!(native_language_name("sv"), "Svenska");
         assert_eq!(native_language_name("zh"), "中文（简体）");
         assert_eq!(native_language_name("xx"), "xx");
 
         assert_eq!(supported_language_value("en"), "en");
+        assert_eq!(supported_language_value("sv"), "sv");
         assert_eq!(supported_language_value("pt-BR"), "pt-BR");
         assert_eq!(supported_language_value("system"), SYSTEM_LANGUAGE);
         assert_eq!(supported_language_value("nl"), SYSTEM_LANGUAGE);
@@ -267,16 +327,34 @@ mod tests {
         assert_eq!(match_supported_locale("ja-JP", SUPPORTED_LOCALES), Some("ja"));
         assert_eq!(match_supported_locale("ko-KR", SUPPORTED_LOCALES), Some("ko"));
         assert_eq!(match_supported_locale("ru-RU", SUPPORTED_LOCALES), Some("ru"));
+        assert_eq!(match_supported_locale("sv-SE", SUPPORTED_LOCALES), Some("sv"));
     }
 
     #[test]
     fn resolve_locale_honors_explicit_setting_and_system_fallback() {
-        let sys = vec!["zh-TW".to_owned(), "de-CH".to_owned(), "en-US".to_owned()];
+        let sys = vec!["zh-TW".to_owned(), "de_CH".to_owned(), "en-US".to_owned()];
         assert_eq!(resolve_locale("fr", &sys, SUPPORTED_LOCALES, DEFAULT_LOCALE), "fr");
         assert_eq!(resolve_locale(SYSTEM_LANGUAGE, &sys, SUPPORTED_LOCALES, DEFAULT_LOCALE), "de");
         assert_eq!(resolve_locale("unknown-tag", &sys, SUPPORTED_LOCALES, DEFAULT_LOCALE), "de");
         assert_eq!(resolve_locale(SYSTEM_LANGUAGE, &["zh-Hant-TW", "it-IT"], SUPPORTED_LOCALES, DEFAULT_LOCALE), "en");
         assert_eq!(resolve_locale(SYSTEM_LANGUAGE, &[] as &[&str], SUPPORTED_LOCALES, DEFAULT_LOCALE), "en");
+
+        assert_eq!(
+            resolve_locale_selection("fr", &sys, SUPPORTED_LOCALES, DEFAULT_LOCALE),
+            LocaleSelection { catalog_locale: "fr", formatting_locale: "fr".to_owned() }
+        );
+        assert_eq!(
+            resolve_locale_selection(SYSTEM_LANGUAGE, &sys, SUPPORTED_LOCALES, DEFAULT_LOCALE),
+            LocaleSelection { catalog_locale: "de", formatting_locale: "de-CH".to_owned() }
+        );
+        assert_eq!(
+            resolve_locale_selection(SYSTEM_LANGUAGE, &["sv_FI"], SUPPORTED_LOCALES, DEFAULT_LOCALE),
+            LocaleSelection { catalog_locale: "sv", formatting_locale: "sv-FI".to_owned() }
+        );
+        assert_eq!(
+            resolve_locale_selection(SYSTEM_LANGUAGE, &["it-IT"], SUPPORTED_LOCALES, DEFAULT_LOCALE),
+            LocaleSelection { catalog_locale: "en", formatting_locale: "en".to_owned() }
+        );
     }
 
     #[test]

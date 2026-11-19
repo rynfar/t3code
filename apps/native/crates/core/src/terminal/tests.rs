@@ -740,3 +740,46 @@ fn emulator_finds_detected_and_osc8_links() {
     assert_eq!((explicit.text.as_str(), explicit.start, explicit.end), ("file:///tmp/a.txt", (2, 0), (2, 5)));
     assert_eq!(term.link_at(2, 7), None);
 }
+
+#[test]
+fn wire_codecs_handle_write_options_snapshot_error_and_metadata_manager_id() {
+    let plain = write_input("th-1", "term-1", "ls\n");
+    assert_eq!(plain, json!({ "threadId": "th-1", "terminalId": "term-1", "data": "ls\n" }));
+    let opts = write_input_with_options("th-1", "term-1", "\u{1b}[?1;2c", Some(true), Some(true));
+    assert_eq!(
+        opts,
+        json!({ "threadId": "th-1", "terminalId": "term-1", "data": "\u{1b}[?1;2c", "binary": true, "reply": true })
+    );
+    let typed: TerminalWriteInput = serde_json::from_value(opts).unwrap();
+    assert_eq!(typed.binary, Some(true));
+    assert_eq!(typed.reply, Some(true));
+
+    let failed_snapshot: AttachEvent = serde_json::from_value(json!({
+        "type": "snapshot",
+        "snapshot": {
+            "threadId": "th-1",
+            "terminalId": "term-1",
+            "status": "error",
+            "error": "spawn /bin/zsh ENOENT"
+        }
+    }))
+    .unwrap();
+    let mut buffer = BufferState::default();
+    buffer.apply(failed_snapshot);
+    assert_eq!(buffer.status, BufferStatus::Error);
+    assert_eq!(buffer.error.as_deref(), Some("spawn /bin/zsh ENOENT"));
+
+    let meta_with_mgr: MetadataEvent = serde_json::from_value(json!({
+        "type": "snapshot",
+        "terminals": [],
+        "managerId": "mgr-42"
+    }))
+    .unwrap();
+    assert_eq!(meta_with_mgr, MetadataEvent::Snapshot { terminals: vec![], manager_id: Some("mgr-42".into()) });
+    let meta_legacy: MetadataEvent = serde_json::from_value(json!({
+        "type": "snapshot",
+        "terminals": []
+    }))
+    .unwrap();
+    assert_eq!(meta_legacy, MetadataEvent::Snapshot { terminals: vec![], manager_id: None });
+}

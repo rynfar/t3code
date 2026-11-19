@@ -12,8 +12,10 @@ pub const SUBSCRIBE: &str = "subscribeAuthAccess";
 pub const ACCESS_READ: &str = "access:read";
 pub const ACCESS_WRITE: &str = "access:write";
 
+pub const RELAY_CONFIGURE: &str = crate::auth::RELAY_CONFIGURE_SCOPE;
+
 /// `AUTH_SCOPE_OPTIONS`: scope, title, description, in the dialog's order.
-pub const SCOPE_OPTIONS: [(&str, &str, &str); 16] = [
+pub const SCOPE_OPTIONS: [(&str, &str, &str); 17] = [
     ("orchestration:read", "View environment", "Read threads, status, checkpoints, and configuration."),
     ("orchestration:operate", "Operate tasks", "Start, update, and stop tasks."),
     ("settings:write", "Change environment settings", "Edit environment preferences and keybindings."),
@@ -29,7 +31,12 @@ pub const SCOPE_OPTIONS: [(&str, &str, &str); 16] = [
     (ACCESS_READ, "View access", "Inspect pairing links and authorized clients."),
     (ACCESS_WRITE, "Manage access", "Issue and revoke credentials for other clients."),
     ("relay:read", "View relay", "Inspect managed relay connectivity."),
-    ("relay:write", "Manage relay", "Change managed tunnel connectivity."),
+    ("relay:write", "Manage relay", "Update relay preferences or unlink T3 Connect."),
+    (
+        RELAY_CONFIGURE,
+        "Configure relay (admin)",
+        "Set up or replace T3 Connect, including its trusted pairing credential issuer.",
+    ),
 ];
 
 /// The "Read only" preset.
@@ -37,6 +44,16 @@ pub const READ_ONLY_SCOPES: [&str; 4] = ["orchestration:read", "filesystem:read"
 
 /// `AuthStandardClientScopes`, the "Standard" preset and the dialog's default.
 pub fn standard_scopes() -> Vec<String> {
+    SCOPE_OPTIONS
+        .iter()
+        .map(|(scope, _, _)| *scope)
+        .filter(|scope| *scope != RELAY_CONFIGURE)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `AuthAdministrativeClientScopes`: `standard_scopes()` plus `relay:configure`.
+pub fn administrative_scopes() -> Vec<String> {
     SCOPE_OPTIONS.iter().map(|(scope, _, _)| (*scope).to_owned()).collect()
 }
 

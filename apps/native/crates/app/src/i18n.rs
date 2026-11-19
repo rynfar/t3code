@@ -46,7 +46,7 @@ fn system_preferred_languages() -> &'static [String] {
 }
 
 /// Active resolved UI locale (`"en"`, `"de"`, `"es"`, `"fr"`, `"ja"`, `"ko"`, `"pt-BR"`, `"ru"`,
-/// or `"zh"`), reactively derived from the saved `language` client setting.
+/// `"sv"`, or `"zh"`), reactively derived from the saved `language` client setting.
 pub fn active_locale(cx: &App) -> &'static str {
     let saved = crate::settings::store::try_client(cx)
         .map(|doc| doc.language())
