@@ -129,6 +129,29 @@ pub fn close_input(terminal_id: &str, can_operate: bool) -> Option<Value> {
     can_operate.then(|| crate::terminal::close_input(THREAD_ID, terminal_id, true))
 }
 
+/// Tracks whether an onboarding install/login command started and then finished in the embedded
+/// terminal (`pingdotgg/t3code#36477`), so onboarding rechecks the agent immediately without
+/// closing the shell.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CommandCompletionTracker {
+    started: bool,
+}
+
+impl CommandCompletionTracker {
+    /// Returns `true` on the `running: true -> false` transition.
+    pub fn observe_running(&mut self, running: bool) -> bool {
+        if running {
+            self.started = true;
+            false
+        } else if self.started {
+            self.started = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +229,17 @@ mod tests {
             close_input(&id, true).unwrap(),
             json!({"threadId": THREAD_ID, "terminalId":id, "deleteHistory":true})
         );
+    }
+
+    #[test]
+    fn command_completion_tracker_fires_once_when_running_transitions_true_to_false() {
+        let mut tracker = CommandCompletionTracker::default();
+        assert!(!tracker.observe_running(false));
+        assert!(!tracker.observe_running(true));
+        assert!(!tracker.observe_running(true));
+        assert!(tracker.observe_running(false));
+        assert!(!tracker.observe_running(false));
+        assert!(!tracker.observe_running(true));
+        assert!(tracker.observe_running(false));
     }
 }

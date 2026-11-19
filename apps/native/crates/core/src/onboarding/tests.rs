@@ -247,3 +247,45 @@ fn install_commands_follow_the_server_platform() {
     assert_eq!(install_command("codex", "windows"), Some("irm https://chatgpt.com/codex/install.ps1 | iex"));
     assert_eq!(install_command("cursor", "linux"), None);
 }
+
+#[test]
+fn welcome_page_groups_agents_by_readiness_and_detects_cli_path_status() {
+    let claude = provider("claude", "claudeAgent", json!({ "status": "ready", "installed": true, "auth": { "status": "authenticated" } }));
+    let codex = provider("codex", "codex", json!({ "status": "warning", "installed": true, "auth": { "status": "unauthenticated" } }));
+    let cursor = provider("cursor", "cursor", json!({ "status": "warning", "installed": false, "auth": { "status": "unknown" } }));
+    let broken = provider("codex-old", "codex", json!({
+        "displayName": "Old Codex",
+        "status": "ready",
+        "installed": true,
+        "auth": { "status": "authenticated" },
+        "compatibilityAdvisory": { "status": "broken" }
+    }));
+    let list = [cursor, codex, broken, claude];
+    let grouped = group_welcome_agents(Some(&list), None, None);
+    assert_eq!(grouped.ready_count, 1);
+    assert!(grouped.checking);
+    let found_ids: Vec<&str> = grouped.found.iter().map(|p| p.instance_id.as_str()).collect();
+    assert_eq!(found_ids, vec!["claude", "codex", "codex-old"]);
+    let avail_ids: Vec<&str> = grouped.available.iter().map(|p| p.instance_id.as_str()).collect();
+    assert_eq!(avail_ids, vec!["cursor"]);
+
+    let status = detect_cli_command_status(
+        std::path::Path::new("/Users/me/.t3/bin"),
+        true,
+        &[("/usr/local/bin", false), ("/usr/bin", false)],
+        Some("/bin/zsh"),
+    );
+    assert!(!status.on_path);
+    assert_eq!(status.profile_file, "~/.zshrc");
+    assert!(status.description().contains("not on your PATH yet"));
+    assert_eq!(status.path_export_line(), "export PATH=\"/Users/me/.t3/bin:$PATH\"");
+
+    let shadowed = detect_cli_command_status(
+        std::path::Path::new("/Users/me/.t3/bin"),
+        true,
+        &[("/opt/homebrew/bin", true), ("/Users/me/.t3/bin", true)],
+        Some("/bin/bash"),
+    );
+    assert_eq!(shadowed.shadowed_by.as_deref(), Some("/opt/homebrew/bin/t3"));
+    assert!(shadowed.description().contains("runs first in a new terminal"));
+}

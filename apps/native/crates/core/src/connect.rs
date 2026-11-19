@@ -103,6 +103,177 @@ pub fn permanent_refresh_failure(status: u16) -> bool {
     (400..500).contains(&status) && status != 408 && status != 429
 }
 
+const BASE64URL_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+/// `PAIRING_CODE_ALPHABET` (`packages/contracts/src/auth.ts`).
+const PAIRING_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+
+/// `connectDeviceVerificationCode` (`packages/contracts/src/auth.ts`, `pingdotgg/t3code#36419`):
+/// short `XXXX-XXXX` code derived from a T3 Connect device's proof key thumbprint.
+pub fn connect_device_verification_code(proof_key_thumbprint: &str) -> String {
+    let mut code = String::with_capacity(9);
+    for (index, byte) in proof_key_thumbprint.bytes().take(8).enumerate() {
+        if index == 4 {
+            code.push('-');
+        }
+        let pos = BASE64URL_ALPHABET.iter().position(|candidate| *candidate == byte).unwrap_or(0);
+        let mapped = PAIRING_CODE_ALPHABET[pos % PAIRING_CODE_ALPHABET.len()] as char;
+        code.push(mapped);
+    }
+    if code.len() < 4 {
+        code.push('-');
+    }
+    code
+}
+
+/// Client metadata reported by a T3 Connect device (`AuthClientMetadata`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConnectDeviceClient {
+    pub label: Option<String>,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub device_type: Option<String>,
+    pub os: Option<String>,
+    pub browser: Option<String>,
+}
+
+/// Pending T3 Connect device request embedded on a pairing link (`AuthConnectDeviceRequest`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectDeviceRequest {
+    pub verification_code: String,
+    #[serde(default)]
+    pub client: Option<ConnectDeviceClient>,
+}
+
+/// One pending T3 Connect device approval entry from `subscribeAuthAccess`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingConnectDeviceRequest {
+    pub pairing_link_id: String,
+    pub expires_at: String,
+    pub verification_code: String,
+    pub client: Option<ConnectDeviceClient>,
+}
+
+/// A T3 Connect device key trusted by this environment (`AuthConnectDevice`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectDevice {
+    pub proof_key_thumbprint: String,
+    pub verification_code: String,
+    #[serde(default)]
+    pub client: Option<ConnectDeviceClient>,
+    pub approved_at: String,
+}
+
+/// Tracks pending T3 Connect device approval requests and trusted Connect devices from
+/// `subscribeAuthAccess` stream items (`pingdotgg/t3code#36419`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectDevicesState {
+    pub pending_requests: Vec<PendingConnectDeviceRequest>,
+    pub devices: Vec<ConnectDevice>,
+    pub supported: bool,
+}
+
+impl ConnectDevicesState {
+    pub fn apply(&mut self, item: &serde_json::Value) {
+        let payload = item.get("payload").unwrap_or(&serde_json::Value::Null);
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("snapshot") => {
+                self.pending_requests = payload
+                    .get("pairingLinks")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|links| links.iter().filter_map(parse_pending_request).collect())
+                    .unwrap_or_default();
+                if let Some(devices) = payload.get("connectDevices").and_then(serde_json::Value::as_array) {
+                    self.supported = true;
+                    self.devices = devices
+                        .iter()
+                        .filter_map(|value| serde_json::from_value::<ConnectDevice>(value.clone()).ok())
+                        .collect();
+                } else {
+                    self.devices.clear();
+                }
+            }
+            Some("pairingLinkUpserted") => {
+                if let Some(id) = payload.get("id").and_then(serde_json::Value::as_str) {
+                    self.pending_requests.retain(|req| req.pairing_link_id != id);
+                    if let Some(request) = parse_pending_request(payload) {
+                        self.supported = true;
+                        self.pending_requests.push(request);
+                    }
+                }
+            }
+            Some("pairingLinkRemoved") => {
+                if let Some(id) = payload.get("id").and_then(serde_json::Value::as_str) {
+                    self.pending_requests.retain(|req| req.pairing_link_id != id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pending Connect device requests that have not yet expired.
+    pub fn visible_pending_requests(&self, now_ms: i64) -> Vec<&PendingConnectDeviceRequest> {
+        self.pending_requests
+            .iter()
+            .filter(|req| crate::sidebar::time::parse_iso(&req.expires_at).is_some_and(|at| at > now_ms))
+            .collect()
+    }
+}
+
+fn parse_pending_request(link: &serde_json::Value) -> Option<PendingConnectDeviceRequest> {
+    let id = link.get("id")?.as_str()?.to_owned();
+    let expires_at = link.get("expiresAt")?.as_str()?.to_owned();
+    let request: ConnectDeviceRequest = serde_json::from_value(link.get("connectDeviceRequest")?.clone()).ok()?;
+    Some(PendingConnectDeviceRequest {
+        pairing_link_id: id,
+        expires_at,
+        verification_code: request.verification_code,
+        client: request.client,
+    })
+}
+
+/// `connectDeviceName` (`ConnectionsSettings.logic.ts`): short name for a Connect device.
+pub fn connect_device_name(client: Option<&ConnectDeviceClient>) -> String {
+    let Some(client) = client else {
+        return "this device".to_owned();
+    };
+    [client.label.as_deref(), client.os.as_deref(), client.browser.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
+        .map_or_else(|| "this device".to_owned(), str::to_owned)
+}
+
+/// `describeConnectDeviceClient` (`ConnectionsSettings.logic.ts`): deduplicated client summary.
+pub fn describe_connect_device_client(client: Option<&ConnectDeviceClient>) -> String {
+    let Some(client) = client else {
+        return "Unknown device".to_owned();
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for candidate in [
+        client.label.as_deref(),
+        client.os.as_deref(),
+        client.browser.as_deref(),
+        client.ip_address.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidate.is_empty() && !parts.contains(&candidate) {
+            parts.push(candidate);
+        }
+    }
+    if parts.is_empty() { "Unknown device".to_owned() } else { parts.join(" \u{00b7} ") }
+}
+
+/// Recognizes HTTP 403 `EnvironmentConnectApprovalPendingError` payloads (`pingdotgg/t3code#36419`).
+pub fn is_connect_approval_pending_error(body: &serde_json::Value) -> bool {
+    body.get("_tag").and_then(serde_json::Value::as_str) == Some("EnvironmentConnectApprovalPendingError")
+        || body.get("code").and_then(serde_json::Value::as_str) == Some("connect_approval_pending")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +320,52 @@ mod tests {
             assert!(!permanent_refresh_failure(status));
         }
         assert!(serde_json::from_str::<TokenResponse>(r#"{"access_token":"a"}"#).is_err());
+    }
+
+    #[test]
+    fn connect_device_verification_code_and_access_stream_state() {
+        let code = connect_device_verification_code("ABCDEFGHijkl");
+        assert_eq!(code, "2345-6789");
+        assert!(is_connect_approval_pending_error(&serde_json::json!({
+            "_tag": "EnvironmentConnectApprovalPendingError",
+            "code": "connect_approval_pending"
+        })));
+        assert!(!is_connect_approval_pending_error(&serde_json::json!({ "_tag": "EnvironmentAuthInvalidError" })));
+
+        let mut state = ConnectDevicesState::default();
+        state.apply(&serde_json::json!({
+            "type": "snapshot",
+            "payload": {
+                "pairingLinks": [
+                    {
+                        "id": "req-1",
+                        "createdAt": "2026-11-18T00:00:00.000Z",
+                        "expiresAt": "2099-01-01T00:00:00.000Z",
+                        "connectDeviceRequest": {
+                            "verificationCode": "2345-6789",
+                            "client": { "label": "iPhone", "os": "iOS", "browser": "iOS" }
+                        }
+                    }
+                ],
+                "connectDevices": [
+                    {
+                        "proofKeyThumbprint": "thumb-1",
+                        "verificationCode": "ABCD-EFGH",
+                        "approvedAt": "2026-11-18T00:00:00.000Z",
+                        "client": { "os": "macOS", "browser": "Safari" }
+                    }
+                ]
+            }
+        }));
+        assert!(state.supported);
+        assert_eq!(state.visible_pending_requests(0).len(), 1);
+        assert_eq!(describe_connect_device_client(state.pending_requests[0].client.as_ref()), "iPhone \u{00b7} iOS");
+        assert_eq!(connect_device_name(state.devices[0].client.as_ref()), "macOS");
+
+        state.apply(&serde_json::json!({
+            "type": "pairingLinkRemoved",
+            "payload": { "id": "req-1" }
+        }));
+        assert!(state.pending_requests.is_empty());
     }
 }

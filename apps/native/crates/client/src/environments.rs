@@ -680,7 +680,12 @@ async fn run(
                                 entry.shell.synchronized = false;
                                 entry.clock_recorded = false;
                             }
-                            if matches!(status, ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. }) {
+                            if matches!(
+                                status,
+                                ConnectionStatus::Connecting
+                                    | ConnectionStatus::Reconnecting { .. }
+                                    | ConnectionStatus::AwaitingApproval { .. }
+                            ) {
                                 entry.clock_requested_at_ms = wall_now_ms();
                             }
                             let _ = output.send(EnvironmentEvent::Status { id: id.clone(), generation: epoch, status: status.clone() }).await;

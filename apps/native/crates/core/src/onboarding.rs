@@ -285,5 +285,203 @@ pub fn login_command(provider: &ServerProvider, settings: &ServerSettings, os: &
     format!("{} {verb}", quote_binary(binary, fallback, os))
 }
 
+/// `isBrokenVersion` (`apps/web/src/onboarding/welcomePage.logic.ts`, `pingdotgg/t3code#33209`).
+pub fn is_broken_version(provider: &ServerProvider) -> bool {
+    provider.installed
+        && provider
+            .compatibility_advisory
+            .as_ref()
+            .is_some_and(|advisory| advisory.status == "broken")
+}
+
+/// `isProviderAvailable` check: unavailable providers cannot be used without attention.
+pub fn is_provider_available(provider: &ServerProvider) -> bool {
+    provider.availability.as_deref() != Some("unavailable")
+}
+
+/// `welcomeAgentState` (`welcomePage.logic.ts`, `pingdotgg/t3code#33209`).
+pub fn welcome_agent_state(provider: &ServerProvider, settings: Option<&ServerSettings>) -> AgentState {
+    if !is_provider_available(provider) {
+        return AgentState::Attention;
+    }
+    if let Some(settings) = settings
+        && let Some(instance) = settings.provider_instances.get(&provider.instance_id)
+        && instance.enabled == Some(false)
+    {
+        return AgentState::Disabled;
+    }
+    let state = agent_state(Some(provider));
+    if state == AgentState::Ready && is_broken_version(provider) {
+        return AgentState::Attention;
+    }
+    if state == AgentState::Checking && provider.driver == "acpRegistry" {
+        return AgentState::Attention;
+    }
+    state
+}
+
+/// Grouped agents for the single Welcome page (`groupWelcomeAgents`, `pingdotgg/t3code#33209`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WelcomeAgentGroups<'a> {
+    pub checking: bool,
+    pub ready_count: usize,
+    /// Ready first, then SignIn, then Attention, sorted by display name within each state.
+    pub found: Vec<&'a ServerProvider>,
+    /// Install, Disabled, or Checking agents the user can add, sorted by display name.
+    pub available: Vec<&'a ServerProvider>,
+}
+
+/// Splits allowed providers into agents already found on the computer and agents available to add.
+pub fn group_welcome_agents<'a>(
+    providers: Option<&'a [ServerProvider]>,
+    settings: Option<&ServerSettings>,
+    managed_policy: Option<&Value>,
+) -> WelcomeAgentGroups<'a> {
+    let mut checking = providers.is_none();
+    let mut ready_count = 0usize;
+    let mut found: Vec<(&'a ServerProvider, u8)> = Vec::new();
+    let mut available: Vec<&'a ServerProvider> = Vec::new();
+    for provider in providers.unwrap_or_default() {
+        if !managed_driver_allowed(managed_policy, &provider.driver) {
+            continue;
+        }
+        let state = welcome_agent_state(provider, settings);
+        if state == AgentState::Ready {
+            ready_count += 1;
+        }
+        if state == AgentState::Checking {
+            checking = true;
+        }
+        match state {
+            AgentState::Ready => found.push((provider, 0)),
+            AgentState::SignIn => found.push((provider, 1)),
+            AgentState::Attention => found.push((provider, 2)),
+            AgentState::Install | AgentState::Disabled | AgentState::Checking => available.push(provider),
+        }
+    }
+    let name_key = |provider: &ServerProvider| agent_display_name(&provider.driver, Some(provider)).to_lowercase();
+    found.sort_by(|(a, a_ord), (b, b_ord)| a_ord.cmp(b_ord).then_with(|| name_key(a).cmp(&name_key(b))));
+    available.sort_by_key(|a| name_key(a));
+    WelcomeAgentGroups {
+        checking,
+        ready_count,
+        found: found.into_iter().map(|(provider, _)| provider).collect(),
+        available,
+    }
+}
+
+/// `cliTerminalStep` (`welcomePage.logic.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliTerminalStep {
+    Wait,
+    Open,
+    Done,
+}
+
+pub fn cli_terminal_step(provider: &ServerProvider, settings: Option<&ServerSettings>) -> CliTerminalStep {
+    if provider.setup.as_ref().is_some_and(|setup| setup.can_authenticate) {
+        return CliTerminalStep::Wait;
+    }
+    let state = welcome_agent_state(provider, settings);
+    if state == AgentState::Checking {
+        return CliTerminalStep::Wait;
+    }
+    if is_broken_version(provider) {
+        return CliTerminalStep::Done;
+    }
+    if provider.installed && provider.auth.status == "authenticated" {
+        return CliTerminalStep::Done;
+    }
+    if matches!(state, AgentState::Install | AgentState::SignIn)
+        || (state == AgentState::Attention && is_provider_available(provider))
+    {
+        CliTerminalStep::Open
+    } else {
+        CliTerminalStep::Done
+    }
+}
+
+/// `codexNeedsSetup` (`welcomePage.logic.ts`).
+pub fn codex_needs_setup(provider: &ServerProvider, settings: Option<&ServerSettings>) -> bool {
+    if provider.driver != "codex"
+        || provider.auth.status == "authenticated"
+        || is_broken_version(provider)
+    {
+        return false;
+    }
+    let state = welcome_agent_state(provider, settings);
+    matches!(state, AgentState::Install | AgentState::SignIn)
+        || (state == AgentState::Attention && is_provider_available(provider))
+}
+
+/// Status of the local `t3` CLI command (`pingdotgg/t3code#33150`, `pingdotgg/t3code#33153`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliCommandStatus {
+    pub installed_path: Option<String>,
+    pub on_path: bool,
+    pub shadowed_by: Option<String>,
+    pub path_dir: String,
+    pub profile_file: String,
+}
+
+impl CliCommandStatus {
+    pub fn description(&self) -> String {
+        if let Some(shadowed) = &self.shadowed_by {
+            return format!("Another t3 at {shadowed} runs first in a new terminal. Remove it to use T3 Code's.");
+        }
+        match &self.installed_path {
+            None => "Run T3 Code's CLI as `t3` from any terminal.".to_owned(),
+            Some(path) if self.on_path => format!("Installed at {path}. Open a new terminal to use it."),
+            Some(path) => format!("Installed at {path}, which is not on your PATH yet. Add {} to {}.", self.path_dir, self.profile_file),
+        }
+    }
+
+    pub fn path_export_line(&self) -> String {
+        format!("export PATH=\"{}:$PATH\"", self.path_dir)
+    }
+}
+
+/// Detects local `t3` CLI installation & PATH status from the resolved T3 home and `PATH`.
+pub fn detect_cli_command_status(
+    t3_bin_dir: &std::path::Path,
+    t3_bin_installed: bool,
+    path_entries: &[(&str, bool)],
+    shell: Option<&str>,
+) -> CliCommandStatus {
+    let path_dir = t3_bin_dir.to_string_lossy().into_owned();
+    let installed_path = t3_bin_installed.then(|| t3_bin_dir.join("t3").to_string_lossy().into_owned());
+    let mut on_path = false;
+    let mut shadowed_by = None;
+    for (dir, has_t3) in path_entries {
+        let same_dir = std::path::Path::new(dir) == t3_bin_dir;
+        if same_dir {
+            on_path = true;
+            break;
+        }
+        if *has_t3 && shadowed_by.is_none() {
+            shadowed_by = Some(std::path::Path::new(dir).join("t3").to_string_lossy().into_owned());
+        }
+    }
+    if !on_path {
+        on_path = path_entries.iter().any(|(dir, _)| std::path::Path::new(dir) == t3_bin_dir);
+    }
+    let profile_file = match shell.and_then(|s| s.rsplit('/').next()) {
+        Some("bash") => "~/.bashrc".to_owned(),
+        Some("fish") => "~/.config/fish/config.fish".to_owned(),
+        _ => "~/.zshrc".to_owned(),
+    };
+    CliCommandStatus {
+        installed_path,
+        on_path,
+        shadowed_by,
+        path_dir,
+        profile_file,
+    }
+}
+
+/// Shell command to install the `t3` CLI command (`InstallT3Commands.tsx`, `pingdotgg/t3code#33150`).
+pub const INSTALL_T3_COMMAND_UNIX: &str = "curl -fsSL https://t3.codes/install.sh | sh";
+pub const INSTALL_T3_COMMAND_NPX: &str = "npx t3";
+
 #[cfg(test)]
 mod tests;

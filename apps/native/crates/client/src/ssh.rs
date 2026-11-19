@@ -340,11 +340,12 @@ fn readiness_client() -> &'static reqwest::Client {
 }
 
 /// `waitForHttpReady`: `GET /` answers 2xx within `limit`.
+/// Uses `TUNNEL_READY_PROBE_TIMEOUT_MS` (5s) so links with ~1s RTT succeed (`pingdotgg/t3code#35418`).
 async fn wait_http_ready(http_base: &str, limit: Duration) -> Result<(), String> {
     let url = format!("{http_base}/");
     let deadline = Instant::now() + limit;
     loop {
-        let probe = readiness_client().get(&url).timeout(millis(core::READY_PROBE_TIMEOUT_MS)).send().await;
+        let probe = readiness_client().get(&url).timeout(millis(core::TUNNEL_READY_PROBE_TIMEOUT_MS)).send().await;
         if probe.is_ok_and(|response| response.status().is_success()) {
             return Ok(());
         }
@@ -438,11 +439,11 @@ async fn start_tunnel(program: &Path, life: &Lifecycle, target: &SshTarget, loca
 }
 
 /// `launchOrReuseRemoteServer`.
-async fn launch_remote(program: &Path, life: &Lifecycle, target: &SshTarget, auth: Auth, version: &str) -> Result<LaunchResult, SshError> {
+async fn launch_remote(program: &Path, life: &Lifecycle, target: &SshTarget, auth: Auth, version: &str, launcher_id: Option<&str>) -> Result<LaunchResult, SshError> {
     let state_key = core::native_state_key(target);
     let spec = CommandSpec {
         remote: &["sh", "-l", "-s", "--", state_key.as_str()],
-        stdin: Some(scripts::launch_script(version).map_err(SshError)?),
+        stdin: Some(scripts::launch_script_with_launcher(version, launcher_id).map_err(SshError)?),
         timeout: millis(core::ARCHIVE_LAUNCH_TIMEOUT_MS),
         ..Default::default()
     };
@@ -750,7 +751,8 @@ impl SshEnvironments {
             let _ = monitor.await;
         }
         let (program, life) = (&self.inner.program, self.life());
-        let launched = self.with_auth(key, target, |auth| launch_remote(program, &life, target, auth, version)).await?;
+        let launcher_id = crate::store::ssh_launcher_id();
+        let launched = self.with_auth(key, target, |auth| launch_remote(program, &life, target, auth, version, launcher_id.as_deref())).await?;
         let mut moved = false;
         let tunnel = loop {
             match self.with_auth(key, target, |auth| start_tunnel(program, &life, target, port, launched.remote_port, auth)).await {

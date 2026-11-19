@@ -94,10 +94,15 @@ impl AppState {
     }
 
     pub fn pair_link(&mut self, link: &str, cx: &mut Context<Self>) {
+        self.pair_link_with_code(link, None, cx);
+    }
+
+    /// Pairs with a full pairing URL, a hosted pairing link, a `t3code://` link, or a host + separate code.
+    pub fn pair_link_with_code(&mut self, link: &str, code: Option<&str>, cx: &mut Context<Self>) {
         if self.connect.pairing.is_some() {
             return;
         }
-        let link = match parse_pairing_link(link, None) {
+        let link = match parse_pairing_link(link, code) {
             Ok(link) => link,
             Err(error) => return self.fail_pairing(PairingSource::Link, error.to_string(), cx),
         };
@@ -419,6 +424,22 @@ impl AppState {
         if let Some(client) = self.client_handle() {
             client.retry_now();
         }
+    }
+
+    /// Retries a specific saved environment's supervisor immediately, even when it is not active.
+    pub fn retry_environment(&self, id: &str) {
+        if self.environments.active.as_deref() == Some(id)
+            && let Some(client) = self.client_handle()
+        {
+            client.retry_now();
+            return;
+        }
+        let lookup = self.connections.client(id);
+        self.runtime().spawn(async move {
+            if let Some(client) = lookup.await {
+                client.retry_now();
+            }
+        });
     }
 
     /// The server rejected this device: drop the credential, keep the entry, and prompt to pair

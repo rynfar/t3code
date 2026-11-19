@@ -20,6 +20,12 @@ use crate::theme::{hsla, palette};
 
 pub(super) struct Closed;
 
+/// Fired when the command running inside the onboarding terminal finishes (`pingdotgg/t3code#36477`),
+/// prompting onboarding to recheck the agent while keeping the shell open.
+pub(super) struct CommandFinished {
+    pub(super) instance_id: Option<String>,
+}
+
 enum Operation {
     Begin(u64),
     Close,
@@ -38,11 +44,14 @@ pub(super) struct AgentInstallTerminal {
     pane_events: Option<Subscription>,
     focus_pending: bool,
     _pump: Option<Task<()>>,
+    metadata_abort: Option<tokio::task::AbortHandle>,
+    _metadata_pump: Option<Task<()>>,
     #[cfg(feature = "snapshot")]
     permission_fixture: Option<bool>,
 }
 
 impl EventEmitter<Closed> for AgentInstallTerminal {}
+impl EventEmitter<CommandFinished> for AgentInstallTerminal {}
 
 pub(super) fn can_operate(client: &ClientHandle) -> bool {
     TerminalAccess::of(client.session_state().borrow().as_ref()).operate
@@ -124,6 +133,44 @@ impl AgentInstallTerminal {
                 }
             }
         });
+        // Watch `subscribeTerminalMetadata` so onboarding rechecks the agent as soon as the
+        // install/sign-in command finishes (`pingdotgg/t3code#36477`), even though the shell stays open.
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel::<()>();
+        let meta_client = client.clone();
+        let watch_terminal_id = terminal_id.clone();
+        let metadata_task = runtime.spawn(async move {
+            let Ok(mut stream) = meta_client.stream(method::SUBSCRIBE_METADATA, serde_json::json!({})).await else {
+                return;
+            };
+            let mut summaries: Vec<t3_core::terminal::TerminalSummary> = Vec::new();
+            let mut tracker = model::CommandCompletionTracker::default();
+            while let Some(Ok(raw)) = stream.receiver.recv().await {
+                if let Ok(event) = serde_json::from_value::<t3_core::terminal::MetadataEvent>(raw) {
+                    t3_core::terminal::apply_metadata(&mut summaries, event);
+                    let running = summaries.iter().any(|summary| {
+                        summary.thread_id == model::THREAD_ID
+                            && summary.terminal_id == watch_terminal_id
+                            && summary.has_running_subprocess
+                    });
+                    if tracker.observe_running(running) && finished_tx.send(()).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let metadata_abort = Some(metadata_task.abort_handle());
+        let metadata_pump = Some(cx.spawn(async move |this, cx| {
+            while finished_rx.recv().await.is_some() {
+                if this
+                    .update(cx, |this, cx| {
+                        cx.emit(CommandFinished { instance_id: this.provider_instance_id.clone() });
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
         let mut terminal = Self {
             model,
             command,
@@ -137,6 +184,8 @@ impl AgentInstallTerminal {
             pane_events: None,
             focus_pending: true,
             _pump: Some(pump),
+            metadata_abort,
+            _metadata_pump: metadata_pump,
             #[cfg(feature = "snapshot")]
             permission_fixture: None,
         };
@@ -249,6 +298,9 @@ impl AgentInstallTerminal {
 
 impl Drop for AgentInstallTerminal {
     fn drop(&mut self) {
+        if let Some(abort) = self.metadata_abort.take() {
+            abort.abort();
+        }
         self.model.lock().unwrap().cancel();
         if let Some(queue) = &self.queue {
             let _ = queue.send(Operation::Close);
@@ -349,6 +401,8 @@ impl AgentInstallTerminal {
             pane_events: None,
             focus_pending: true,
             _pump: None,
+            metadata_abort: None,
+            _metadata_pump: None,
             permission_fixture: Some(fixture.can_operate),
         })
     }
