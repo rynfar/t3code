@@ -888,6 +888,15 @@ impl SettingsView {
         };
         let member_ids = shown.member_ids();
         let can_write = self.projects_permitted(SETTINGS_WRITE_SCOPE, cx);
+        let policies: Vec<Option<&Value>> = configs.iter().map(|c| c.managed_policy.as_ref()).collect();
+        let model_locked = t3_core::managed_policy::setting_lock_reason_for_any(
+            policies.iter().copied(),
+            &["defaultModelSelection"],
+        );
+        let workspace_locked = t3_core::managed_policy::setting_lock_reason_for_any(
+            policies.iter().copied(),
+            &["defaultThreadEnvMode"],
+        );
         let models: Vec<_> = shown.targets.iter().zip(&configs).map(|(project, config)| project_model(config, &project.project.id)).collect();
         let model = &models[0];
         let mixed_model = models.iter().any(|other| other.shown != model.shown);
@@ -896,7 +905,7 @@ impl SettingsView {
             .into_iter()
             .filter(|option| parse_selection(&option.value).is_some_and(|selection| self.project_model_unavailable(&selection, cx).is_none()))
             .collect();
-        let model_reset = can_write && models.iter().any(|model| model.source == Source::Project);
+        let model_reset = can_write && model_locked.is_none() && models.iter().any(|model| model.source == Source::Project);
         let automatic_model = models.iter().all(|candidate| candidate.automatic);
         let unavailable = model.shown.as_ref().filter(|_| !mixed_model).and_then(|selection| self.project_model_unavailable(selection, cx));
         let model_status = if mixed_model {
@@ -910,6 +919,7 @@ impl SettingsView {
         let model_row = Row::new("project-default-model", "Model")
             .description("Model for new threads in this project.")
             .when_some(model_status, |row, reason| row.status(reason))
+            .unavailable(model_locked.clone())
             .reset_tooltip("Reset to inherited value")
             .reset(model_reset, {
                 let view = cx.entity().downgrade();
@@ -921,7 +931,7 @@ impl SettingsView {
             Some(selection) if !options.is_empty() => {
                 let view = cx.entity().downgrade();
                 let trigger = if mixed_model { if automatic_model { "Automatic (mixed)".to_owned() } else { "Mixed".to_owned() } } else { selection_label(config, selection) };
-                let select = Select::new("project-default-model-select", options).selected(selection_value(selection)).label(trigger).width(220.).popup_width(260.).show_check().on_change(
+                let select = Select::new("project-default-model-select", options).selected(selection_value(selection)).label(trigger).width(220.).popup_width(260.).show_check().disabled(model_locked.is_some()).on_change(
                     move |value, _, cx| {
                         let Some(selection) = parse_selection(&value) else { return };
                         let _ = view.update(cx, |this, cx| this.set_project_model(selection, cx));
@@ -933,7 +943,7 @@ impl SettingsView {
                     Vec::new()
                 };
                 let control = h_flex().flex_wrap().justify_end().gap(r(6.)).child(select).children(traits);
-                model_row.control(self.inert_unless(can_write, "project-default-model-inert", control, cx))
+                model_row.control(self.inert_unless(can_write || model_locked.is_some(), "project-default-model-inert", control, cx))
             }
             _ => model_row.control(muted_text(if mixed_model { "Mixed" } else { "No providers available" }, cx)),
         };
@@ -944,10 +954,11 @@ impl SettingsView {
         };
         let modes: Vec<(ThreadEnvMode, Source)> = shown.targets.iter().zip(&configs).map(|(project, config)| project_env_mode(&config.settings, &project.project.id, (project.reference() == shown.targets[0].reference()).then_some(file_mode).flatten())).collect();
         let mixed_mode = modes.iter().any(|(mode, _)| *mode != modes[0].0);
-        let mode_reset = can_write && modes.iter().any(|(_, source)| *source == Source::Project);
+        let mode_reset = can_write && workspace_locked.is_none() && modes.iter().any(|(_, source)| *source == Source::Project);
         let view = cx.entity().downgrade();
         let mut workspace_select = Select::new("project-default-workspace-select", ENV_MODES.iter().map(|(mode, label)| SelectOption::new(env_mode_value(*mode), *label)).collect())
             .show_check()
+            .disabled(workspace_locked.is_some())
             .on_change(move |value, _, cx| {
                 let mode = match value.as_ref() {
                     "local" | "worktree" => value.to_string(),
@@ -958,6 +969,7 @@ impl SettingsView {
         workspace_select = if mixed_mode { workspace_select.label("Mixed") } else { workspace_select.selected(env_mode_value(modes[0].0)) };
         let workspace_row = Row::new("project-default-workspace", "Workspace")
             .description("Where new threads in this project start.")
+            .unavailable(workspace_locked.clone())
             .reset_tooltip("Reset to inherited value")
             .reset(mode_reset, {
                 let view = cx.entity().downgrade();
@@ -965,7 +977,7 @@ impl SettingsView {
                     let _ = view.update(cx, |this, cx| this.clear_project_override("defaultThreadEnvMode", cx));
                 }
             })
-            .control(self.inert_unless(can_write, "project-default-workspace-inert", workspace_select, cx));
+            .control(self.inert_unless(can_write || workspace_locked.is_some(), "project-default-workspace-inert", workspace_select, cx));
         section("New threads", vec![model_row.into_any_element(), workspace_row.into_any_element()], cx).into_any_element()
     }
 

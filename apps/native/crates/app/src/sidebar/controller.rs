@@ -934,6 +934,7 @@ impl AppState {
         let Some(destination) = owner.destination.clone() else { return; };
         if !owner.current(self) || !self.scoped_ready(&destination, scope) { return; }
         let kind = command.get("type").and_then(Value::as_str).unwrap_or_default();
+        let is_pin = kind == "thread.pin";
         let removes = matches!(kind, "thread.archive" | "thread.settle" | "thread.unpin" | "thread.delete");
         let stop_first = kind == "thread.delete" && owner.key().and_then(|key| self.scoped_thread(&key)).is_some_and(|row| row.thread.runtime.is_some());
         let undo = self.scoped_undo_claim(&owner, kind);
@@ -956,10 +957,15 @@ impl AppState {
                 if let Err(error) = result {
                     if let Some((claim, _, _)) = &undo { state.sidebar.undo.finish(claim); }
                     state.show_toast(Toast::new(ToastKind::Error, failure).description(error.to_string()), cx);
-                } else if let Some((claim, action, plan)) = undo {
-                    state.sidebar.undo.show(action, claim, plan, now_ms());
-                    state.after_undo_change(cx);
-                    cx.emit(AppEvent::Notice);
+                } else {
+                    if is_pin {
+                        state.announce("Pinned 1 thread", None, cx);
+                    }
+                    if let Some((claim, action, plan)) = undo {
+                        state.sidebar.undo.show(action, claim, plan, now_ms());
+                        state.after_undo_change(cx);
+                        cx.emit(AppEvent::Notice);
+                    }
                 }
             });
         }).detach();
@@ -1371,7 +1377,11 @@ impl AppState {
 
     pub fn pin_thread(&mut self, thread_id: &str, order_key: Option<String>, cx: &mut Context<Self>) {
         let command = self.pin_command(thread_id, order_key);
-        self.dispatch_then(command, Some("Failed to pin thread"), cx, |_, _, _| {});
+        self.dispatch_then(command, Some("Failed to pin thread"), cx, |state, ok, cx| {
+            if ok {
+                state.announce("Pinned 1 thread", None, cx);
+            }
+        });
     }
 
     /// `pinThread`: tops the pinned run by default, and supersedes older pin, settle and snooze
@@ -2496,9 +2506,11 @@ impl AppState {
 
     /// `undoLatestThreadAction`: restores the latest group of same-kind actions.
     pub fn undo_latest(&mut self, cx: &mut Context<Self>) -> bool {
+        let action = self.sidebar.undo.notice().map(|notice| notice.action);
         let group = self.sidebar.undo.take_latest_group();
         if group.is_empty() { return false; }
         let mut threads = Vec::new();
+        let mut restored_drafts = 0usize;
         for (context, plan) in group {
             match context {
                 UndoContext::Thread(owner) => threads.push((*owner,plan)),
@@ -2508,21 +2520,27 @@ impl AppState {
                         && self.shell.project(&project.id).is_some_and(|current| current.created_at == project.created_at && current.workspace_root == project.workspace_root)
                         && plan.contains(&UndoStep::RestoreDraft) {
                         self.sidebar.drafts_to_restore.push(project.id); cx.emit(AppEvent::RestoreDraft);
+                        restored_drafts += 1;
                     }
                 }
                 UndoContext::ThreadDraft { thread_id } => {
                     if plan.contains(&UndoStep::RestoreDraft) {
                         self.sidebar.thread_drafts_to_restore.push(thread_id); cx.emit(AppEvent::RestoreDraft);
+                        restored_drafts += 1;
                     }
                 }
                 UndoContext::Unavailable { .. } => {}
             }
         }
-        if !threads.is_empty() { self.run_owned_undo(threads,cx); }
+        if !threads.is_empty() {
+            self.run_owned_undo(action, restored_drafts, threads, cx);
+        } else if let Some(message) = action.and_then(|action| t3_core::announcements::undone_announcement(action, restored_drafts)) {
+            self.announce(message, None, cx);
+        }
         self.after_undo_change(cx); true
     }
 
-    fn run_owned_undo(&mut self, group: Vec<(crate::context_menu::ThreadMenuOwner,Vec<UndoStep>)>, cx: &mut Context<Self>) {
+    fn run_owned_undo(&mut self, action: Option<UndoAction>, restored_drafts: usize, group: Vec<(crate::context_menu::ThreadMenuOwner,Vec<UndoStep>)>, cx: &mut Context<Self>) {
         let clients = group.iter().map(|(owner,_)| {
             let scoped = owner.destination.as_ref().map(|destination| self.connections.destination(destination,t3_core::auth::ORCHESTRATION_OPERATE_SCOPE));
             let local = owner.destination.is_none().then(|| self.client_handle()).flatten();
@@ -2535,9 +2553,14 @@ impl AppState {
                 && client.session_state().borrow().as_ref().is_some_and(|session| session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE))
                 && owner.destination.as_ref().is_none_or(|destination| *client.connection_generation().borrow() == destination.connection_generation);
             if !this.read_with(cx,|state,_| group.iter().zip(&targets).all(|((owner,_),client)| valid(state,owner,client))).unwrap_or(false) { return; }
+            let mut undone = restored_drafts;
             for ((owner,steps),client) in group.into_iter().zip(targets) {
+                let mut item_ok = true;
                 for step in steps.into_iter().filter(|step| actions::runnable_step(step,now_ms())) {
-                    if !this.read_with(cx,|state,_| valid(state,&owner,&client)).unwrap_or(false) { return; }
+                    if !this.read_with(cx,|state,_| valid(state,&owner,&client)).unwrap_or(false) {
+                        item_ok = false;
+                        break;
+                    }
                     let command = match step {
                         UndoStep::Unsettle => actions::unsettle(&uuid(),&owner.thread), UndoStep::Unsnooze => actions::unsnooze(&uuid(),&owner.thread),
                         UndoStep::Pin { order_key } => actions::pin(&uuid(),&owner.thread,order_key.as_deref()),
@@ -2545,9 +2568,17 @@ impl AppState {
                         UndoStep::Unarchive => actions::unarchive(&uuid(),&owner.thread), UndoStep::RestoreDraft => continue,
                     };
                     if let Err(error) = client.dispatch(command).await {
-                        let _ = this.update(cx,|state,cx| state.show_toast(Toast::new(ToastKind::Error,"Could not undo thread action").description(error.to_string()),cx)); return;
+                        item_ok = false;
+                        let _ = this.update(cx,|state,cx| state.show_toast(Toast::new(ToastKind::Error,"Could not undo thread action").description(error.to_string()),cx));
+                        break;
                     }
                 }
+                if item_ok {
+                    undone += 1;
+                }
+            }
+            if let Some(message) = action.and_then(|action| t3_core::announcements::undone_announcement(action, undone)) {
+                let _ = this.update(cx, |state, cx| state.announce(message, None, cx));
             }
         }).detach();
     }
@@ -4094,5 +4125,45 @@ mod deletion_tests {
 
         state.update(cx, |state, _| state.stop_pump());
         std::mem::forget(runtime);
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn undo_latest_draft_and_undo_notice_emit_screen_reader_announcements(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        state.update(cx, |state, cx| {
+            // Queue a thread-draft discard undo item and announce the notice.
+            let claim = state.sidebar.undo.begin_thread_draft("t-draft");
+            state.sidebar.undo.show(
+                UndoAction::Discarded,
+                claim,
+                vec![UndoStep::RestoreDraft],
+                now_ms(),
+            );
+            state.after_undo_change(cx);
+            let notice_announcement = state
+                .flush_announcements_for_test()
+                .expect("undo notice must queue a screen reader announcement");
+            assert!(
+                notice_announcement.message.starts_with("Discarded 1 draft,"),
+                "unexpected undo notice announcement: {}",
+                notice_announcement.message
+            );
+
+            // Undoing the discarded draft announces "Undid discard of 1 draft".
+            assert!(state.undo_latest(cx));
+            let undone = state
+                .flush_announcements_for_test()
+                .expect("undoing a draft must queue an undone announcement");
+            assert_eq!(undone.message, "Undid discard of 1 draft");
+            state.stop_pump();
+        });
+        runtime.shutdown_background();
     }
 }

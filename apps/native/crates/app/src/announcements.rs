@@ -27,6 +27,9 @@ impl Announcements {
             ) {
                 state.observe_thread_announcement(cx);
             }
+            if matches!(event, AppEvent::Selection | AppEvent::Shell) {
+                state.observe_background_announcements(cx);
+            }
         });
         Self {
             queue: Announcer::default(),
@@ -130,22 +133,47 @@ impl AppState {
     }
 
     pub(crate) fn observe_background_announcements(&mut self, cx: &mut Context<Self>) {
-        if !self.shell.synchronized
-            || !matches!(
+        let now = crate::sidebar::controller::now_ms();
+        let active_online = self.shell.synchronized
+            && matches!(
                 self.phase,
                 Phase::Online(t3_client::supervisor::ConnectionStatus::Connected)
-            )
-        {
-            return;
-        }
-        let now = crate::sidebar::controller::now_ms();
-        if let Some(message) =
-            self.announcements
-                .background
-                .observe(&self.shell, self.selected_thread.as_deref(), now)
+            );
+        if active_online
+            && let Some(message) =
+                self.announcements
+                    .background
+                    .observe(&self.shell, self.selected_thread.as_deref(), now)
         {
             self.announce(message, None, cx);
         }
+        let active_env = self.environments.active.as_deref();
+        let secondary: Vec<_> = self
+            .fleet
+            .environments
+            .iter()
+            .filter(|entry| {
+                entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                    && entry.summary.synchronized
+                    && Some(entry.summary.owner.saved_id.as_str()) != active_env
+            })
+            .map(|entry| entry.summary.as_ref())
+            .collect();
+        let open = active_env.zip(self.selected_thread.as_deref());
+        if let Some(message) =
+            self.announcements
+                .background
+                .observe_secondary_fleet(&secondary, open, now)
+        {
+            self.announce(message, None, cx);
+        }
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn flush_announcements_for_test(&mut self) -> Option<announcements::Announcement> {
+        let due = self.announcements.queue.due()?;
+        self.announcements.timer = None;
+        self.announcements.queue.flush(due)
     }
     fn observe_thread_announcement(&mut self, cx: &mut Context<Self>) {
         if !matches!(

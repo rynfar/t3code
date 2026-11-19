@@ -112,6 +112,139 @@ pub fn setting_lock_reason(policy: Option<&Value>, path: &str) -> Option<String>
     setting_locked(Some(p), path).then(|| instance_reason(p))
 }
 
+/// `SettingsRow` (`settingsLayout.tsx`): first policy whose `lockedSettings` locks any of `paths`.
+pub fn setting_lock_reason_for_any<'a, I>(policies: I, paths: &[&str]) -> Option<String>
+where
+    I: IntoIterator<Item = Option<&'a Value>>,
+{
+    if paths.is_empty() {
+        return None;
+    }
+    first_managed_denial(policies, |policy| {
+        let p = policy?;
+        paths
+            .iter()
+            .any(|path| setting_locked(Some(p), path))
+            .then(|| instance_reason(p))
+    })
+}
+
+const RUNTIME_MODE_ORDER: [&str; 4] = [
+    "approval-required",
+    "auto-accept-edits",
+    "auto",
+    "full-access",
+];
+
+fn runtime_mode_rank(mode: &str) -> Option<usize> {
+    RUNTIME_MODE_ORDER.iter().position(|candidate| *candidate == mode)
+}
+
+fn runtime_mode_policy_label(mode: &str) -> &str {
+    match mode {
+        "approval-required" => "Supervised",
+        "auto-accept-edits" => "Auto-accept edits",
+        "auto" => "Auto",
+        "full-access" => "Full access",
+        other => other,
+    }
+}
+
+/// `isRuntimeModeAbove` (`contracts/src/providerPolicy.ts`).
+pub fn is_runtime_mode_above(mode: &str, ceiling: Option<&str>) -> bool {
+    let Some(ceiling) = ceiling else {
+        return false;
+    };
+    matches!(
+        (runtime_mode_rank(mode), runtime_mode_rank(ceiling)),
+        (Some(m), Some(c)) if m > c
+    )
+}
+
+/// `managedRuntimeModeCeilingMessage` (`contracts/src/managedPolicy.ts`).
+pub fn runtime_mode_ceiling_message(organization: &str, ceiling: &str) -> String {
+    format!(
+        "{organization} limits threads to {}.",
+        runtime_mode_policy_label(ceiling)
+    )
+}
+
+/// `managedRuntimeModeDenial` (`contracts/src/managedPolicy.ts`).
+pub fn runtime_mode_denial(policy: Option<&Value>, mode: &str) -> Option<String> {
+    let p = policy?;
+    let ceiling = p["limits"]["maxRuntimeMode"].as_str()?;
+    is_runtime_mode_above(mode, Some(ceiling))
+        .then(|| runtime_mode_ceiling_message(organization(p), ceiling))
+}
+
+/// `clampManagedRuntimeMode` (`contracts/src/managedPolicy.ts`).
+pub fn clamp_runtime_mode<'a>(
+    policy: Option<&Value>,
+    mode: &'a str,
+    modes: &[&'a str],
+) -> Option<&'a str> {
+    let ceiling = policy.and_then(|p| p["limits"]["maxRuntimeMode"].as_str());
+    if !is_runtime_mode_above(mode, ceiling) {
+        return Some(mode);
+    }
+    modes
+        .iter()
+        .rev()
+        .copied()
+        .find(|candidate| !is_runtime_mode_above(candidate, ceiling))
+}
+
+/// Typed convenience wrapper over `clamp_runtime_mode` for `RuntimeMode`.
+pub fn clamp_typed_runtime_mode(
+    policy: Option<&Value>,
+    mode: crate::server_config::RuntimeMode,
+    modes: &[crate::server_config::RuntimeMode],
+) -> Option<crate::server_config::RuntimeMode> {
+    let ceiling = policy.and_then(|p| p["limits"]["maxRuntimeMode"].as_str());
+    if !is_runtime_mode_above(mode.as_str(), ceiling) {
+        return Some(mode);
+    }
+    modes
+        .iter()
+        .rev()
+        .copied()
+        .find(|candidate| !is_runtime_mode_above(candidate.as_str(), ceiling))
+}
+
+/// `managedUpdatesMessage` (`contracts/src/managedPolicy.ts`).
+pub fn updates_message(organization: &str) -> String {
+    format!("{organization} manages T3 Code updates.")
+}
+
+/// `managedNightlyDeniedMessage` (`contracts/src/managedPolicy.ts`).
+pub fn nightly_denied_message(organization: &str) -> String {
+    format!(
+        "{} Only stable releases can be installed.",
+        updates_message(organization)
+    )
+}
+
+/// `managedUpdatesDenial` (`contracts/src/managedPolicy.ts`).
+pub fn updates_denial(policy: Option<&Value>) -> Option<String> {
+    let p = policy?;
+    (p["limits"]["updates"]["mode"].as_str() == Some("off"))
+        .then(|| updates_message(organization(p)))
+}
+
+/// Whether `limits.providers.allowedDrivers` is present and empty (`ProviderSettingsPanel.tsx`).
+pub fn providers_allowed_drivers_empty(policy: Option<&Value>) -> bool {
+    policy
+        .and_then(|p| p["limits"]["providers"]["allowedDrivers"].as_array())
+        .is_some_and(|drivers| drivers.is_empty())
+}
+
+/// Whether `limits.providers.allowedDrivers` is present at all (`ProviderSettingsPanel.tsx`).
+pub fn providers_allowed_drivers_restricted(policy: Option<&Value>) -> bool {
+    policy
+        .and_then(|p| p["limits"]["providers"]["allowedDrivers"].as_array())
+        .is_some()
+}
+
 /// `ManagedInstanceLocks` (`web/src/state/managedPolicy.ts`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedInstanceLocks {
@@ -214,5 +347,79 @@ mod tests {
         assert!(locks.whole_environment);
         assert_eq!(locks.reason, "Managed by Example Corp.");
         assert!(managed_instance_locks(Some(&p), "cursor").is_none());
+    }
+
+    #[test]
+    fn runtime_mode_ceiling_updates_and_provider_restrictions_match_web() {
+        use crate::server_config::RuntimeMode;
+        let policy = json!({
+            "organization": "Example Corp",
+            "lockedSettings": ["guestSharingEnabled", "threads.linkedEnvironmentsEnabled"],
+            "limits": {
+                "maxRuntimeMode": "auto-accept-edits",
+                "updates": { "mode": "off", "allowNightly": false },
+                "providers": { "allowedDrivers": [] }
+            }
+        });
+        assert!(!is_runtime_mode_above("approval-required", Some("auto-accept-edits")));
+        assert!(!is_runtime_mode_above("auto-accept-edits", Some("auto-accept-edits")));
+        assert!(is_runtime_mode_above("auto", Some("auto-accept-edits")));
+        assert!(is_runtime_mode_above("full-access", Some("auto-accept-edits")));
+        assert!(!is_runtime_mode_above("full-access", None));
+
+        assert_eq!(
+            runtime_mode_denial(Some(&policy), "full-access").as_deref(),
+            Some("Example Corp limits threads to Auto-accept edits.")
+        );
+        assert!(runtime_mode_denial(Some(&policy), "auto-accept-edits").is_none());
+        assert!(runtime_mode_denial(None, "full-access").is_none());
+
+        assert_eq!(
+            clamp_runtime_mode(Some(&policy), "full-access", &RUNTIME_MODE_ORDER),
+            Some("auto-accept-edits")
+        );
+        assert_eq!(
+            clamp_runtime_mode(Some(&policy), "full-access", &["approval-required", "full-access"]),
+            Some("approval-required")
+        );
+        assert_eq!(
+            clamp_runtime_mode(Some(&policy), "full-access", &["auto", "full-access"]),
+            None
+        );
+        assert_eq!(
+            clamp_typed_runtime_mode(
+                Some(&policy),
+                RuntimeMode::FullAccess,
+                &[RuntimeMode::ApprovalRequired, RuntimeMode::AutoAcceptEdits, RuntimeMode::FullAccess],
+            ),
+            Some(RuntimeMode::AutoAcceptEdits)
+        );
+        assert_eq!(
+            clamp_typed_runtime_mode(Some(&policy), RuntimeMode::ApprovalRequired, &RuntimeMode::ALL),
+            Some(RuntimeMode::ApprovalRequired)
+        );
+
+        assert_eq!(
+            updates_denial(Some(&policy)).as_deref(),
+            Some("Example Corp manages T3 Code updates.")
+        );
+        assert_eq!(
+            nightly_denied_message("Example Corp"),
+            "Example Corp manages T3 Code updates. Only stable releases can be installed."
+        );
+        assert!(providers_allowed_drivers_empty(Some(&policy)));
+        assert!(providers_allowed_drivers_restricted(Some(&policy)));
+        assert!(!providers_allowed_drivers_empty(None));
+        assert!(!providers_allowed_drivers_restricted(None));
+
+        let non_empty = json!({"organization": "Acme", "limits": {"providers": {"allowedDrivers": ["codex"]}}});
+        assert!(!providers_allowed_drivers_empty(Some(&non_empty)));
+        assert!(providers_allowed_drivers_restricted(Some(&non_empty)));
+
+        assert_eq!(
+            setting_lock_reason_for_any([None, Some(&non_empty), Some(&policy)], &["threads.linkedEnvironmentsEnabled"]).as_deref(),
+            Some("Managed by Example Corp.")
+        );
+        assert!(setting_lock_reason_for_any([Some(&policy)], &["promptSuggestionsEnabled"]).is_none());
     }
 }

@@ -499,6 +499,7 @@ impl AppState {
                         return;
                     }
                 }
+                let is_pin = command.get("type").and_then(serde_json::Value::as_str) == Some("thread.pin");
                 if let Err(error) = target.client.dispatch(command).await {
                     let _ = this.update(cx, |state, cx| {
                         if let Some((claim, _, _)) = &undo { state.sidebar.undo.finish(claim); }
@@ -507,6 +508,9 @@ impl AppState {
                 }
                 let _ = this.update(cx, |state, cx| {
                     if owner.response_after_placement(state) && owner.can_operate_owner(state) {
+                        if is_pin {
+                            state.announce("Pinned 1 thread", None, cx);
+                        }
                         if let Some((claim, action, plan)) = undo {
                             state.sidebar.undo.show(action, claim, plan, now_ms()); state.after_undo_change(cx);
                             cx.emit(AppEvent::Notice);

@@ -1140,6 +1140,15 @@ impl Composer {
         !self.resolve(cx).multi_models.is_empty()
     }
 
+    fn managed_policy(&self, cx: &App) -> Option<serde_json::Value> {
+        self.state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|c| c.managed_policy.clone())
+    }
+
     fn picker_input(&self, cx: &App) -> PickerInput {
         let resolved = self.resolve(cx);
         let cwd = self.menu_cwd(cx);
@@ -1155,6 +1164,7 @@ impl Composer {
             descriptors: resolved.descriptors,
             runtime_mode: resolved.runtime_mode,
             runtime_modes: resolved.runtime_modes,
+            managed_policy: self.managed_policy(cx),
             locked_instance: resolved.locked_instance,
         }
     }
@@ -1338,6 +1348,14 @@ impl Composer {
 
     fn set_runtime_mode(&mut self, mode: RuntimeMode, cx: &mut Context<Self>) {
         if self.is_rewinding(cx) {
+            return;
+        }
+        if t3_core::managed_policy::runtime_mode_denial(
+            self.managed_policy(cx).as_ref(),
+            mode.as_str(),
+        )
+        .is_some()
+        {
             return;
         }
         if let Some(choices) = self.choices_mut() {
@@ -1792,41 +1810,97 @@ impl Composer {
         cx.notify();
     }
 
-    pub(super) fn render_fresh_session_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        if !self.is_fresh_session_armed(cx) || self.editing_queued().is_some() {
+    pub(super) fn render_managed_runtime_mode_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.active_input().is_some() {
             return None;
         }
+        let policy = self.managed_policy(cx);
+        let resolved = self.resolve(cx);
+        let denial = t3_core::managed_policy::runtime_mode_denial(
+            policy.as_ref(),
+            resolved.runtime_mode.as_str(),
+        )?;
+        let fallback = t3_core::managed_policy::clamp_typed_runtime_mode(
+            policy.as_ref(),
+            resolved.runtime_mode,
+            &resolved.runtime_modes,
+        );
         let p = palette(cx);
-        let dismiss = div()
-            .id("fresh-session-dismiss")
-            .px(px(6.))
-            .h(px(22.))
-            .rounded(px(6.))
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .text_xs()
-            .text_color(hsla(p.muted_foreground))
-            .cursor_pointer()
-            .hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
-            .child("Keep the current session")
-            .child(Icon::X.render(px(12.), hsla(p.muted_foreground)))
-            .on_click(cx.listener(|this, _, _, cx| this.disarm_fresh_session(cx)));
+        let switch_action = fallback.map(|target| {
+            div()
+                .id("managed-runtime-mode-switch")
+                .debug_selector(|| "managed-runtime-mode-switch".to_owned())
+                .px(px(6.))
+                .h(px(22.))
+                .rounded(px(6.))
+                .flex()
+                .items_center()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hsla(p.foreground))
+                .cursor_pointer()
+                .hover(|this| this.bg(hsla(p.accent)))
+                .child(format!("Switch to {}", rules::runtime_mode_label(target)))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_runtime_mode(target, cx)))
+        });
         let content = h_flex()
             .w_full()
             .min_h(px(24.))
             .gap(px(6.))
-            .child(div().flex_none().w(px(24.)).flex().justify_center().child(Icon::Eraser.render(px(12.), hsla(p.info))))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(6.))
-                    .child(div().font_weight(FontWeight::MEDIUM).child("Your next message starts a fresh session"))
-                    .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child("The agent won't see earlier messages in this thread.")),
-            )
-            .child(div().flex_none().ml_auto().child(dismiss));
-        Some(banner_surface(false, content, cx).id("fresh-session-banner").debug_selector(|| "fresh-session-banner".to_owned()).into_any_element())
+            .child(div().flex_none().w(px(24.)).flex().justify_center().child(Icon::Building.render(px(12.), hsla(p.warning))))
+            .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child(denial))
+            .children(switch_action.map(|action| div().flex_none().ml_auto().child(action)));
+        Some(
+            banner_surface(false, content, cx)
+                .id("managed-runtime-mode-banner")
+                .debug_selector(|| "managed-runtime-mode-banner".to_owned())
+                .into_any_element(),
+        )
+    }
+
+    pub(super) fn render_fresh_session_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        model_picker::set_active_managed_policy(self.managed_policy(cx), cx);
+        let managed = self.render_managed_runtime_mode_banner(cx);
+        let fresh = if !self.is_fresh_session_armed(cx) || self.editing_queued().is_some() {
+            None
+        } else {
+            let p = palette(cx);
+            let dismiss = div()
+                .id("fresh-session-dismiss")
+                .px(px(6.))
+                .h(px(22.))
+                .rounded(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .text_xs()
+                .text_color(hsla(p.muted_foreground))
+                .cursor_pointer()
+                .hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
+                .child("Keep the current session")
+                .child(Icon::X.render(px(12.), hsla(p.muted_foreground)))
+                .on_click(cx.listener(|this, _, _, cx| this.disarm_fresh_session(cx)));
+            let content = h_flex()
+                .w_full()
+                .min_h(px(24.))
+                .gap(px(6.))
+                .child(div().flex_none().w(px(24.)).flex().justify_center().child(Icon::Eraser.render(px(12.), hsla(p.info))))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(6.))
+                        .child(div().font_weight(FontWeight::MEDIUM).child("Your next message starts a fresh session"))
+                        .child(div().min_w_0().truncate().text_color(hsla(p.muted_foreground)).child("The agent won't see earlier messages in this thread.")),
+                )
+                .child(div().flex_none().ml_auto().child(dismiss));
+            Some(banner_surface(false, content, cx).id("fresh-session-banner").debug_selector(|| "fresh-session-banner".to_owned()).into_any_element())
+        };
+        match (fresh, managed) {
+            (Some(fresh), Some(managed)) => Some(gpui_component::v_flex().w_full().gap(px(4.)).child(fresh).child(managed).into_any_element()),
+            (Some(banner), None) | (None, Some(banner)) => Some(banner),
+            (None, None) => None,
+        }
     }
 
     fn sync_prompt_suggestion(&mut self, cx: &mut Context<Self>) {
@@ -5228,5 +5302,119 @@ mod stream_error_tests {
         });
         runtime.shutdown_background();
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn managed_runtime_mode_ceiling_renders_banner_blocks_upgrade_and_clamps_down(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        state.update(cx, |state, cx| {
+            let config = state.server_config.config.as_mut().unwrap();
+            config.managed_policy = Some(serde_json::json!({
+                "organization": "Example Corp",
+                "lockedSettings": [],
+                "limits": { "maxRuntimeMode": "auto-accept-edits" }
+            }));
+            config.providers = serde_json::from_value(serde_json::json!([
+                {
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "auth": { "status": "authenticated" },
+                    "models": [{ "slug": "m", "name": "GPT-5" }]
+                }
+            ]))
+            .unwrap();
+            state.apply_batch(
+                vec![t3_client::supervisor::ClientEvent::Shell(
+                    t3_core::shell::ShellStreamItem::Snapshot {
+                        snapshot: Box::new(serde_json::from_value(serde_json::json!({
+                            "snapshotSequence": 1,
+                            "projects": [{ "id": "p1", "title": "demo", "workspaceRoot": "/repo", "defaultModelSelection": null, "createdAt": "2026-11-01T00:00:00Z", "updatedAt": "2026-11-01T00:00:00Z" }],
+                            "threads": [{
+                                "id": "t-policy", "projectId": "p1", "title": "Policy thread",
+                                "providerInstanceId": "codex",
+                                "modelSelection": { "instanceId": "codex", "model": "m" },
+                                "runtimeMode": "full-access", "interactionMode": "default",
+                                "branch": null, "worktreePath": null,
+                                "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "t-policy" },
+                                "latestRunId": null, "activeRunId": null,
+                                "status": "idle", "pendingRuntimeRequest": null,
+                                "latestVisibleMessage": null, "latestUserMessageAt": null,
+                                "hasActionableProposedPlan": false,
+                                "itemCount": 0, "visibleItemCount": 0,
+                                "createdAt": "2026-11-01T00:00:00Z", "updatedAt": "2026-11-01T00:00:00Z",
+                                "archivedAt": null, "settledOverride": null, "settledAt": null, "deletedAt": null
+                            }]
+                        })).unwrap()),
+                        resolved_repository_identity_roots: None,
+                    },
+                )],
+                cx,
+            );
+            state.selected_thread = Some("t-policy".into());
+            cx.emit(crate::app_state::AppEvent::Selection);
+            cx.emit(crate::app_state::AppEvent::ServerConfig);
+        });
+        let (composer, vcx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
+            struct BannerHost(Entity<Composer>);
+            impl Render for BannerHost {
+                fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                    let banner = self.0.update(cx, |composer, cx| composer.render_fresh_session_banner(cx));
+                    gpui::div().w(gpui::px(720.)).children(banner)
+                }
+            }
+            BannerHost(composer)
+        });
+        let composer = composer.read_with(vcx, |host, _| host.0.clone());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        assert!(
+            vcx.debug_bounds("managed-runtime-mode-banner").is_some(),
+            "thread above maxRuntimeMode must show managed-runtime-mode-banner"
+        );
+        let switch_bounds = vcx
+            .debug_bounds("managed-runtime-mode-switch")
+            .expect("Switch to Auto-accept edits action must render");
+
+        // Trying to pick an above-ceiling mode is rejected.
+        vcx.update(|_, cx| {
+            composer.update(cx, |composer, cx| {
+                let input = composer.picker_input(cx);
+                assert!(input.managed_policy.is_some());
+                composer.set_runtime_mode(RuntimeMode::Auto, cx);
+                assert_eq!(composer.resolve(cx).runtime_mode, RuntimeMode::FullAccess);
+            });
+        });
+
+        // Clicking the Switch button clamps down to Auto-accept edits and clears the banner.
+        vcx.simulate_click(switch_bounds.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        composer.read_with(vcx, |composer, cx| {
+            assert_eq!(composer.resolve(cx).runtime_mode, RuntimeMode::AutoAcceptEdits);
+        });
+        assert!(
+            vcx.debug_bounds("managed-runtime-mode-banner").is_none(),
+            "clamping to ceiling must clear managed-runtime-mode-banner"
+        );
+
+        state.update(vcx, |state, _| state.stop_pump());
+        runtime.shutdown_background();
     }
 }

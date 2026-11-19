@@ -61,6 +61,20 @@ impl SettingsView {
             sections.push(setup.into_any_element());
         }
         if let Some(runtime)=self.render_runtime_form(selected,cx) {sections.push(runtime);}
+        let whole_env_reason = self
+            .scoped_raw_representative_config(cx)
+            .and_then(|c| t3_core::managed_policy::managed_instance_locks(c.managed_policy.as_ref(), &selected.row.driver))
+            .filter(|locks| locks.whole_environment)
+            .map(|locks| locks.reason);
+        if let Some(reason) = whole_env_reason {
+            sections.push(
+                div()
+                    .px(r(16.))
+                    .debug_selector(|| "managed-provider-environment-notice".to_owned())
+                    .child(crate::components::managed::notice(reason, cx))
+                    .into_any_element(),
+            );
+        }
         sections.extend(self.render_environment_form(selected,cx));
         if model::find_driver(&selected.row.driver).is_none() {
             let description = format!(
@@ -78,24 +92,35 @@ impl SettingsView {
         let p = palette(cx);
         let view = &selected.view;
         let row = &selected.row;
+        let providers_locked = self
+            .scoped_raw_representative_config(cx)
+            .and_then(|c| t3_core::managed_policy::setting_lock_reason(c.managed_policy.as_ref(), "providers"));
         let reset = (row.is_default && row.is_dirty).then(|| {
             let id = row.instance_id.clone();
             let label = model::find_driver(&row.driver).map_or(row.driver.clone(), |driver| driver.label.to_owned());
-            Button::new("reset-provider-instance", ButtonVariant::GhostMuted, ButtonSize::IconMicro)
-                .icon(Icon::Undo2)
-                .focus_handle(self.providers.removal.action_focus.clone())
-                .disabled(self.providers.removal.model.busy() || !self.removal_allowed(cx))
-                .tooltip(format!("Reset {label} provider settings"))
-                .on_click(cx.listener(move |this, _, window, cx| this.request_provider_removal(&id, true, window, cx)))
+            crate::components::managed::ManagedControl::new(
+                "managed-reset-provider-instance",
+                providers_locked.clone(),
+                Button::new("reset-provider-instance", ButtonVariant::GhostMuted, ButtonSize::IconMicro)
+                    .icon(Icon::Undo2)
+                    .focus_handle(self.providers.removal.action_focus.clone())
+                    .disabled(self.providers.removal.model.busy() || !self.removal_allowed(cx))
+                    .tooltip(format!("Reset {label} provider settings"))
+                    .on_click(cx.listener(move |this, _, window, cx| this.request_provider_removal(&id, true, window, cx))),
+            )
         });
         let delete = (!row.is_default).then(|| {
             let id = row.instance_id.clone();
-            Button::new("delete-provider-instance", ButtonVariant::GhostMuted, ButtonSize::IconSm)
-                .icon(Icon::Trash2)
-                .focus_handle(self.providers.removal.action_focus.clone())
-                .disabled(self.providers.removal.model.busy() || !self.removal_allowed(cx))
-                .tooltip(format!("Delete instance {}", row.instance_id))
-                .on_click(cx.listener(move |this, _, window, cx| this.request_provider_removal(&id, false, window, cx)))
+            crate::components::managed::ManagedControl::new(
+                "managed-delete-provider-instance",
+                providers_locked,
+                Button::new("delete-provider-instance", ButtonVariant::GhostMuted, ButtonSize::IconSm)
+                    .icon(Icon::Trash2)
+                    .focus_handle(self.providers.removal.action_focus.clone())
+                    .disabled(self.providers.removal.model.busy() || !self.removal_allowed(cx))
+                    .tooltip(format!("Delete instance {}", row.instance_id))
+                    .on_click(cx.listener(move |this, _, window, cx| this.request_provider_removal(&id, false, window, cx))),
+            )
         });
         let header = h_flex()
             .min_h(r(28.))
@@ -222,8 +247,12 @@ impl SettingsView {
                             .gap(r(8.))
                             .child(div().text_xs().text_color(hsla(palette(cx).muted_foreground)).child(environment_label.to_owned()))
                             .when(!enabled, |this| {
+                                let raw_config = self.scoped_raw_representative_config(cx);
+                                let policy = raw_config.as_ref().and_then(|c| c.managed_policy.as_ref());
+                                let denial = t3_core::managed_policy::setting_lock_reason(policy, "providers")
+                                    .or_else(|| t3_core::managed_policy::driver_denial(policy, "antigravity", "Antigravity"));
                                 this.child(
-                                    crate::components::managed::ManagedControl::new("managed-antigravity", t3_core::managed_policy::driver_denial(self.state.read(cx).server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()), "antigravity", "Antigravity"), Button::new("enable-antigravity", ButtonVariant::Outline, ButtonSize::Sm)
+                                    crate::components::managed::ManagedControl::new("managed-antigravity", denial, Button::new("enable-antigravity", ButtonVariant::Outline, ButtonSize::Sm)
                                         .label("Enable Antigravity")
                                         .on_click(cx.listener(move |this, _, _, cx| this.update_instance(&id, model::InstanceEdit::Enabled(true), cx)))),
                                 )

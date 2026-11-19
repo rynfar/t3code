@@ -1277,9 +1277,15 @@ impl SettingsView {
                 .into_any_element(),
             Row::new("scheduled-task-enabled", "Enabled")
                 .description("Disabled tasks stay saved but do not run.")
-                .control(Switch::new("scheduled-task-enabled-switch", draft.enabled).on_change(move |on, _, cx| {
-                    let _ = enabled_state.update(cx, |this, cx| this.edit_draft(|draft| draft.enabled = on, cx));
-                }))
+                .control(crate::components::managed::ManagedControl::new(
+                    "managed-scheduled-task-enabled-switch",
+                    (!draft.enabled && draft.schedule_mode == ScheduleMode::Webhook)
+                        .then(|| self.webhook_denial(cx))
+                        .flatten(),
+                    Switch::new("scheduled-task-enabled-switch", draft.enabled).on_change(move |on, _, cx| {
+                        let _ = enabled_state.update(cx, |this, cx| this.edit_draft(|draft| draft.enabled = on, cx));
+                    }),
+                ))
                 .into_any_element(),
         ])
         .collect();

@@ -348,12 +348,17 @@ impl WelcomeWizard {
         }
         if let Some(view) = add_view {
             let enabled = view.read(cx).can_manage(cx);
+            let denial = view.read(cx).managed_denial(cx);
             cards.push(
-                Button::new("welcome-chatgpt-another", ButtonVariant::GhostMuted, ButtonSize::Xs)
-                    .label("Connect another ChatGPT account")
-                    .disabled(!enabled)
-                    .on_click(move |_, _, cx| view.update(cx, |view, cx| view.open_add(cx)))
-                    .into_any_element(),
+                crate::components::managed::ManagedControl::new(
+                    "managed-welcome-chatgpt-another",
+                    denial,
+                    Button::new("welcome-chatgpt-another", ButtonVariant::GhostMuted, ButtonSize::Xs)
+                        .label("Connect another ChatGPT account")
+                        .disabled(!enabled)
+                        .on_click(move |_, _, cx| view.update(cx, |view, cx| view.open_add(cx))),
+                )
+                .into_any_element(),
             );
         }
 

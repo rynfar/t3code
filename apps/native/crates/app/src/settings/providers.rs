@@ -493,25 +493,37 @@ impl SettingsView {
         self.schedule_label_refresh(data.next_label_change, cx);
         self.sync_health_interval(&data.panel, window, cx);
 
+        let policy = self
+            .scoped_raw_representative_config(cx)
+            .and_then(|c| c.managed_policy);
+        let show_text_generators = !t3_core::managed_policy::providers_allowed_drivers_restricted(policy.as_ref());
         let providers = self.render_providers_section(&data, window, cx);
         let usage_sources = self.render_usage_sources_section(&data.environment_label, cx);
-        let text_generators = self.render_text_generators_section(cx);
+        let text_generators = show_text_generators.then(|| self.render_text_generators_section(cx));
         let advanced = self.render_advanced(&data.panel, cx);
         let dialog = self.render_add_dialog(window, cx);
         let removal = self.render_provider_removal(window, cx);
         let usage_source_dialog = self.render_usage_source_dialog(window, cx);
         let usage_source_removal = self.render_usage_source_removal(window, cx);
         let notice = self.render_notice(cx);
-        vec![
+        let mut blocks = vec![
             Block::new(&["providers"], v_flex().gap(r(16.)).children(notice).child(providers).children(dialog).children(removal)),
             Block::new(&["usage-providers"], v_flex().child(usage_sources).children(usage_source_dialog).children(usage_source_removal)),
-            Block::new(&["text-generators"], text_generators),
-            Block::new(&["provider-health-check-interval", "compact-idle-threads"], advanced),
-        ]
+        ];
+        if let Some(text_generators) = text_generators {
+            blocks.push(Block::new(&["text-generators"], text_generators));
+        }
+        blocks.push(Block::new(&["provider-health-check-interval", "compact-idle-threads"], advanced));
+        blocks
     }
 
     fn render_providers_section(&mut self, data: &PageData, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let policy = self
+            .scoped_raw_representative_config(cx)
+            .and_then(|c| c.managed_policy);
+        let can_add_provider = !t3_core::managed_policy::providers_allowed_drivers_empty(policy.as_ref())
+            && !t3_core::managed_policy::setting_locked(policy.as_ref(), "providers");
         let refreshing = self.providers.refreshing;
         let label = if refreshing { Some("Refreshing providers".to_owned()) } else { data.checked_label.clone() };
         let header = h_flex()
@@ -519,12 +531,14 @@ impl SettingsView {
             .px(r(16.))
             .gap(r(8.))
             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Providers"))
-            .child(
-                Button::new("add-provider-title", ButtonVariant::GhostMuted, ButtonSize::IconMicro)
-                    .icon(Icon::Plus)
-                    .tooltip("Add provider")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx))),
-            )
+            .when(can_add_provider, |this| {
+                this.child(
+                    Button::new("add-provider-title", ButtonVariant::GhostMuted, ButtonSize::IconMicro)
+                        .icon(Icon::Plus)
+                        .tooltip("Add provider")
+                        .on_click(cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx))),
+                )
+            })
             .child(div().flex_1())
             .child(
                 h_flex()
@@ -552,23 +566,25 @@ impl SettingsView {
                 let selected = data.selected.as_ref().is_some_and(|selected| selected.row.instance_id == row.instance_id);
                 self.render_list_row(index, row, view, *accent, selected, cx)
             }))
-            .child(
-                h_flex()
-                    .id("add-provider-row")
-                    .w_full()
-                    .gap(r(12.))
-                    .px(r(16.))
-                    .py(r(12.))
-                    .border_t_1()
-                    .border_color(hsla(p.border).opacity(0.5))
-                    .text_sm()
-                    .text_color(hsla(p.muted_foreground))
-                    .cursor_pointer()
-                    .hover(|this| this.bg(hsla(p.muted).opacity(0.25)).text_color(hsla(p.foreground)))
-                    .child(icon(Icon::Plus, 16., hsla(p.muted_foreground)))
-                    .child("Add provider")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx))),
-            );
+            .when(can_add_provider, |this| {
+                this.child(
+                    h_flex()
+                        .id("add-provider-row")
+                        .w_full()
+                        .gap(r(12.))
+                        .px(r(16.))
+                        .py(r(12.))
+                        .border_t_1()
+                        .border_color(hsla(p.border).opacity(0.5))
+                        .text_sm()
+                        .text_color(hsla(p.muted_foreground))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(hsla(p.muted).opacity(0.25)).text_color(hsla(p.foreground)))
+                        .child(icon(Icon::Plus, 16., hsla(p.muted_foreground)))
+                        .child("Add provider")
+                        .on_click(cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx))),
+                )
+            });
 
         let editor = match &data.selected {
             Some(selected) => self.render_editor(selected, &data.environment_label, window, cx),
@@ -631,15 +647,19 @@ impl SettingsView {
                 None => view.headline.clone(),
             },
         };
-        let denial = if enabled {
-            None
-        } else {
-            t3_core::managed_policy::driver_denial(
-                self.scoped_raw_representative_config(cx).as_ref().and_then(|c| c.managed_policy.as_ref()),
-                &row.driver,
-                model::find_driver(&row.driver).map_or(row.driver.as_str(), |d| d.label),
-            )
-        };
+        let raw_config = self.scoped_raw_representative_config(cx);
+        let policy = raw_config.as_ref().and_then(|c| c.managed_policy.as_ref());
+        let denial = t3_core::managed_policy::setting_lock_reason(policy, "providers").or_else(|| {
+            if enabled {
+                None
+            } else {
+                t3_core::managed_policy::driver_denial(
+                    policy,
+                    &row.driver,
+                    model::find_driver(&row.driver).map_or(row.driver.as_str(), |d| d.label),
+                )
+            }
+        });
         let can_write_override = self.can_write_project_provider_overrides(cx);
         let project_override_summary = self
             .supports_project_provider_overrides(cx)
@@ -911,13 +931,25 @@ impl SettingsView {
         let current = panel.health_interval_seconds();
         let default = panel.default_health_interval_seconds();
         let env_only = self.env_only_unavailable(cx);
+        let raw_config = self.scoped_raw_representative_config(cx);
+        let policy = raw_config.as_ref().and_then(|c| c.managed_policy.as_ref());
+        let interval_unavailable = t3_core::managed_policy::setting_lock_reason(
+            policy,
+            "providerHealthCheckIntervalSeconds",
+        )
+        .or_else(|| env_only.clone());
+        let compact_unavailable = t3_core::managed_policy::setting_lock_reason(
+            policy,
+            "claudeIdleCompactionMode",
+        )
+        .or(env_only);
         let view = cx.entity().downgrade();
         let reset_view = view.clone();
         let reset_payload = panel.health_interval_payload(None);
         let interval = Row::new("provider-health-check-interval", "Health check interval")
             .description("Refresh provider status, versions, and models in the background. Set to 0 to disable.")
             .highlighted(self.is_target("provider-health-check-interval"))
-            .unavailable(env_only.clone())
+            .unavailable(interval_unavailable.clone())
             .reset(current != default, move |_, _, cx| {
                 let _ = reset_view.update(cx, |this, cx| {
                     this.update_scoped_single_env(ServerSettingChange::Prepared(reset_payload.clone()), cx);
@@ -926,7 +958,7 @@ impl SettingsView {
             .control(
                 h_flex()
                     .gap(r(8.))
-                    .child(div().w(r(96.)).child(gpui_component::input::Input::new(&self.providers.health_interval).small().disabled(env_only.is_some())))
+                    .child(div().w(r(96.)).child(gpui_component::input::Input::new(&self.providers.health_interval).small().disabled(interval_unavailable.is_some())))
                     .child(div().text_xs().text_color(hsla(palette(cx).muted_foreground)).child("seconds")),
             );
         let mode = panel.idle_compaction();
@@ -940,13 +972,13 @@ impl SettingsView {
                 "When to compact an idle Claude thread over 200,000 tokens: after you return, just before its prompt cache expires, or never. Each Claude provider can override this.",
             )
             .highlighted(self.is_target("compact-idle-threads"))
-            .unavailable(env_only)
+            .unavailable(compact_unavailable.clone())
             .reset(mode != "onReturn", move |_, _, cx| {
                 let _ = reset_compact_view.update(cx, |this, cx| {
                     this.update_scoped_single_env(ServerSettingChange::Prepared(reset_payload.clone()), cx);
                 });
             })
-            .control(Select::new("compact-idle-threads-select", options).selected(mode).width(224.).show_check().on_change(move |value, _, cx| {
+            .control(Select::new("compact-idle-threads-select", options).selected(mode).width(224.).show_check().disabled(compact_unavailable.is_some()).on_change(move |value, _, cx| {
                 if value.as_ref() != select_panel.idle_compaction() {
                     let _ = select_view.update(cx, |this, cx| {
                         this.update_scoped_single_env(ServerSettingChange::Prepared(select_panel.idle_compaction_payload(&value)), cx);
@@ -1195,11 +1227,14 @@ impl SettingsView {
     /// Saves an edit of one instance as an upsert (or as a `projectSettingsOverrides[projectId].providerInstances[id].enabled`
     /// override when toggling enabled at Project/Checkout scope).
     pub(super) fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
-        if matches!(edit, model::InstanceEdit::Enabled(true))
-            && let Some(c) = self.scoped_raw_representative_config(cx)
-        {
-            let driver = c.provider(instance_id).map(|p| p.driver.as_str()).or_else(|| c.settings.provider_instances.get(instance_id).map(|i| i.driver.as_str())).unwrap_or(instance_id);
-            if t3_core::managed_policy::driver_denial(c.managed_policy.as_ref(), driver, driver).is_some() { return; }
+        if let Some(c) = self.scoped_raw_representative_config(cx) {
+            if t3_core::managed_policy::setting_locked(c.managed_policy.as_ref(), "providers") {
+                return;
+            }
+            if matches!(edit, model::InstanceEdit::Enabled(true)) {
+                let driver = c.provider(instance_id).map(|p| p.driver.as_str()).or_else(|| c.settings.provider_instances.get(instance_id).map(|i| i.driver.as_str())).unwrap_or(instance_id);
+                if t3_core::managed_policy::driver_denial(c.managed_policy.as_ref(), driver, driver).is_some() { return; }
+            }
         }
         if self.supports_project_provider_overrides(cx)
             && let model::InstanceEdit::Enabled(flag) = edit

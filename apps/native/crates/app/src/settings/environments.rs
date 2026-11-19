@@ -768,17 +768,35 @@ impl SettingsView {
             Row::new("orchestration-protocol", "Orchestration protocol")
                 .control(value(protocol.to_string()))
                 .into_any_element(),
-            Row::new("cloud-account", "T3 Connect")
-                .description("Sign in to view your T3 Connect environments.")
-                .control(
-                    Button::new("cloud-account-button", ButtonVariant::Outline, ButtonSize::Sm)
-                        .label("Manage\u{2026}")
-                        .on_click(move |_, window, cx| {
-                            close(window, cx);
-                            cloud_state.update(cx, |state, cx| state.open_switcher(cx));
-                        }),
-                )
-                .into_any_element(),
+            {
+                let connect_denial = t3_core::managed_policy::capability_denial(
+                    state
+                        .server_config
+                        .config
+                        .as_ref()
+                        .and_then(|c| c.managed_policy.as_ref()),
+                    t3_core::managed_policy::Capability::Connect,
+                );
+                let mut row = Row::new("cloud-account", "T3 Connect")
+                    .description("Sign in to view your T3 Connect environments.")
+                    .control(
+                        Button::new("cloud-account-button", ButtonVariant::Outline, ButtonSize::Sm)
+                            .label("Manage\u{2026}")
+                            .on_click(move |_, window, cx| {
+                                close(window, cx);
+                                cloud_state.update(cx, |state, cx| state.open_switcher(cx));
+                            }),
+                    );
+                if let Some(reason) = connect_denial {
+                    row = row.below(
+                        div()
+                            .pb(r(8.))
+                            .debug_selector(|| "managed-connect-notice".to_owned())
+                            .child(crate::components::managed::notice(reason, cx)),
+                    );
+                }
+                row.into_any_element()
+            },
             Row::new("switch-environment", "Switch environment")
                 .description("Connect to another saved environment, or pair a new one.")
                 .control(

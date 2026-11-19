@@ -434,9 +434,117 @@ impl Background {
                 },
             );
         }
-        self.previous.retain(|_, memory| memory.seen == self.epoch);
+        self.previous
+            .retain(|key, memory| key.starts_with(SECONDARY_PREFIX) || memory.seen == self.epoch);
         (!messages.is_empty()).then(|| messages.join(". "))
     }
+
+    /// Observes background threads across connected environments (`BackgroundThreadAnnouncer.tsx`).
+    /// Active environment threads use `observe` so exact `pending_runtime_request.id` replacements
+    /// are preserved; secondary environments supply their synchronized `EnvironmentSummary` rows.
+    pub fn observe_secondary_fleet(
+        &mut self,
+        summaries: &[&crate::sidebar::fleet::EnvironmentSummary],
+        open: Option<(&str, &str)>,
+        now: i64,
+    ) -> Option<String> {
+        use crate::sidebar::{settled::effective_snoozed, thread::SubagentRequest};
+        let mut messages = Vec::new();
+        let mut live_keys = std::collections::HashSet::new();
+        for summary in summaries.iter().filter(|s| s.synchronized) {
+            let env_id = summary.owner.saved_id.as_str();
+            for row in summary
+                .threads
+                .iter()
+                .filter(|row| !row.thread.archived && row.lineage.is_listed())
+            {
+                let key = format!("{SECONDARY_PREFIX}{env_id}{SECONDARY_PREFIX}{}", row.thread.id);
+                live_keys.insert(key.clone());
+                let status = if row.thread.has_pending_approvals
+                    || row.thread.pending_subagent_request == Some(SubagentRequest::Approval)
+                {
+                    Status::Approval
+                } else if row.thread.has_pending_user_input
+                    || row.thread.pending_subagent_request == Some(SubagentRequest::UserInput)
+                {
+                    Status::Input
+                } else {
+                    Status::Idle
+                };
+                let run = row.thread.latest_run.as_ref();
+                let run_id = run.map(|r| r.run_id.as_str());
+                let run_status = run.map_or("", |r| r.status.as_str());
+                let result = outcome(run_status);
+                let is_open = open == Some((env_id, row.thread.id.as_str()));
+                let before = self.previous.get(&key);
+                if let Some(before) =
+                    before.filter(|_| !is_open && !effective_snoozed(&row.thread, now))
+                {
+                    if status != before.request
+                        && let Some(text) = status.request_text()
+                    {
+                        messages.push(format!("{text}: {}", row.thread.title));
+                    }
+                    let another = row
+                        .thread
+                        .runtime
+                        .as_ref()
+                        .and_then(|r| r.active_run_id.as_deref())
+                        .is_some_and(|id| Some(id) != run_id);
+                    if let Some(text) =
+                        result.filter(|_| run_id != before.settled.as_deref() && !another)
+                    {
+                        messages.push(format!("{text}: {}", row.thread.title));
+                    }
+                }
+                let settled = if result.is_some() || run_status == "rolled_back" {
+                    run_id.map(str::to_owned)
+                } else {
+                    before.and_then(|b| b.settled.clone())
+                };
+                self.previous.insert(
+                    key,
+                    BackgroundMemory {
+                        seen: self.epoch,
+                        revision: None,
+                        request: status,
+                        request_id: None,
+                        settled,
+                    },
+                );
+            }
+        }
+        self.previous
+            .retain(|key, _| !key.starts_with(SECONDARY_PREFIX) || live_keys.contains(key));
+        (!messages.is_empty()).then(|| messages.join(". "))
+    }
+}
+
+const SECONDARY_PREFIX: &str = "\u{1f}";
+
+/// `showThreadUndoNotice.ts`: spoken confirmation after an undo group restores threads or drafts.
+pub fn undone_announcement(
+    action: crate::thread_actions::UndoAction,
+    count: usize,
+) -> Option<String> {
+    use crate::thread_actions::UndoAction;
+    if count == 0 {
+        return None;
+    }
+    let verb = match action {
+        UndoAction::Settled => "settle",
+        UndoAction::Snoozed => "snooze",
+        UndoAction::Unpinned => "unpin",
+        UndoAction::Archived => "archive",
+        UndoAction::Discarded => "discard",
+    };
+    let noun = if action == UndoAction::Discarded {
+        "draft"
+    } else {
+        "thread"
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    Some(format!("Undid {verb} of {count} {noun}{plural}"))
 }
 #[cfg(test)]
 mod tests {
@@ -1325,5 +1433,83 @@ mod screen_reader_detail_tests {
             "T3 Code: Ready. Needs approval"
         );
         assert_eq!(hold_after("Hi"), ACTIVITY_GAP_MS);
+    }
+
+    #[test]
+    fn undone_announcement_matches_web_copy_and_pluralization() {
+        use crate::thread_actions::UndoAction;
+        assert_eq!(undone_announcement(UndoAction::Settled, 0), None);
+        assert_eq!(
+            undone_announcement(UndoAction::Settled, 1).as_deref(),
+            Some("Undid settle of 1 thread")
+        );
+        assert_eq!(
+            undone_announcement(UndoAction::Snoozed, 2).as_deref(),
+            Some("Undid snooze of 2 threads")
+        );
+        assert_eq!(
+            undone_announcement(UndoAction::Unpinned, 1).as_deref(),
+            Some("Undid unpin of 1 thread")
+        );
+        assert_eq!(
+            undone_announcement(UndoAction::Archived, 3).as_deref(),
+            Some("Undid archive of 3 threads")
+        );
+        assert_eq!(
+            undone_announcement(UndoAction::Discarded, 1).as_deref(),
+            Some("Undid discard of 1 draft")
+        );
+        assert_eq!(
+            undone_announcement(UndoAction::Discarded, 2).as_deref(),
+            Some("Undid discard of 2 drafts")
+        );
+    }
+
+    #[test]
+    fn secondary_fleet_background_announces_requests_and_completions() {
+        use crate::server_config::ServerConfigState;
+        use crate::shell::{ShellSnapshot, ShellState, ShellStreamItem};
+        use crate::sidebar::fleet::EnvironmentSummary;
+        use crate::sidebar::grouping::EnvironmentOwner;
+        use serde_json::json;
+
+        let owner = EnvironmentOwner {
+            saved_id: "env-2".into(),
+            canonical_id: None,
+            generation: 1,
+            connection_generation: 1,
+            shell_generation: 0,
+        };
+        let build_summary = |threads| {
+            let mut shell = ShellState::default();
+            shell.apply(ShellStreamItem::Snapshot {
+                snapshot: Box::new(ShellSnapshot { threads, ..Default::default() }),
+                resolved_repository_identity_roots: None,
+            });
+            shell.synchronized = true;
+            EnvironmentSummary::from_shell(owner.clone(), &shell, &ServerConfigState::default())
+        };
+
+        let mut watcher = Background::default();
+        let baseline = build_summary(vec![super::background_tests::row("t1", "running", json!({}))]);
+        assert_eq!(watcher.observe_secondary_fleet(&[&baseline], None, 1_000), None);
+
+        let waiting = build_summary(vec![super::background_tests::row(
+            "t1",
+            "waiting",
+            json!({"pendingRuntimeRequest": {"id": "req-1", "kind": "command_approval"}}),
+        )]);
+        assert_eq!(
+            watcher.observe_secondary_fleet(&[&waiting], None, 1_000).as_deref(),
+            Some("Needs approval: t1")
+        );
+        assert_eq!(watcher.observe_secondary_fleet(&[&waiting], None, 1_000), None);
+
+        let done = build_summary(vec![super::background_tests::row("t1", "completed", json!({}))]);
+        assert_eq!(
+            watcher.observe_secondary_fleet(&[&done], None, 1_000).as_deref(),
+            Some("Done: t1")
+        );
+        assert_eq!(watcher.observe_secondary_fleet(&[&done], None, 1_000), None);
     }
 }
