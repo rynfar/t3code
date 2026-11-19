@@ -207,8 +207,22 @@ pub fn cli_command_status() -> Option<t3_core::onboarding::CliCommandStatus> {
         .filter(|dir| !dir.is_empty())
         .map(|dir| (dir, is_executable(&Path::new(dir).join("t3"))))
         .collect();
+    let user_home = user_home().map(|p| p.to_string_lossy().into_owned());
     let shell = std::env::var("SHELL").ok();
-    Some(t3_core::onboarding::detect_cli_command_status(&bin_dir, installed, &entries, shell.as_deref()))
+    let config_home = std::env::var("XDG_CONFIG_HOME").ok();
+    let zdotdir = std::env::var("ZDOTDIR").ok();
+    Some(t3_core::onboarding::detect_cli_command_status(
+        &bin_dir,
+        installed,
+        &entries,
+        &t3_core::onboarding::ShellEnv {
+            platform: std::env::consts::OS,
+            home: user_home.as_deref(),
+            shell: shell.as_deref(),
+            config_home: config_home.as_deref(),
+            zdotdir: zdotdir.as_deref(),
+        },
+    ))
 }
 
 /// Runs the CLI from the user's home (from a linked worktree it would pair with that worktree's

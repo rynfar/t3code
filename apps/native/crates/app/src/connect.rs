@@ -5,7 +5,7 @@
 //! T3 Connect rows mirror `components/cloud/CloudEnvironmentConnectList.tsx`.
 //! The SSH host suggestions list inline under the field rather than in a popup.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{
     App, ClipboardItem, Context, Div, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div,
@@ -52,8 +52,9 @@ pub struct ConnectView {
     confirm_remove: Option<String>,
     /// Saved environment IDs whose connection diagnosis panel is expanded (`CN-STATUS`).
     expanded_diagnosis: HashSet<String>,
-    /// Environment IDs whose legacy-permission update notice was dismissed this session (`CN-REPAIR`).
-    dismissed_permission_notice: HashSet<String>,
+    /// Cached dismissal state per environment ID for the legacy-permission update notice (`CN-REPAIR`).
+    /// Loaded from UI state at most once per key so `render()` never hits disk every frame.
+    dismissed_permission_notice: HashMap<String, bool>,
     /// A pasted link is pairing; the field clears once it succeeds.
     submitted: bool,
     /// An SSH host is being added; the fields clear once it succeeds.
@@ -192,7 +193,7 @@ impl ConnectView {
             ssh_matches: Vec::new(),
             confirm_remove: None,
             expanded_diagnosis: HashSet::new(),
-            dismissed_permission_notice: HashSet::new(),
+            dismissed_permission_notice: HashMap::new(),
             submitted: false,
             ssh_submitted: false,
             _subscriptions: subscriptions,
@@ -218,13 +219,14 @@ impl ConnectView {
         self.ssh_submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Ssh);
     }
 
-    /// A suggested host connects at once, as `ssh -G` resolves it.
-    fn add_ssh_host(&mut self, alias: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// A suggested host connects at once, preserving discovered `hostname`, `username`, and `port`
+    /// (e.g. `[host]:port` from `known_hosts`, `AddEnvironmentDialog.tsx:301`).
+    fn add_ssh_host(&mut self, target: SshTarget, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.read(cx).connect.pairing.is_some() {
             return;
         }
-        self.ssh_host.update(cx, |input, cx| input.set_value(alias.clone(), window, cx));
-        let target = SshTarget { alias: alias.clone(), hostname: alias, username: None, port: None };
+        let alias = target.alias.clone();
+        self.ssh_host.update(cx, |input, cx| input.set_value(alias, window, cx));
         self.state.update(cx, |state, cx| state.add_ssh(target, cx));
         self.ssh_submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Ssh);
     }
@@ -494,15 +496,15 @@ impl ConnectView {
     }
 
     /// Legacy-permission re-pair notice (`PermissionUpdateNotice.ts`, `CN-REPAIR`).
-    fn render_legacy_permissions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_legacy_permissions(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let state = self.state.read(cx);
         let env = state.active_environment()?;
-        let env_key = env.environment_id.as_deref().unwrap_or(env.id.as_str());
-        if self.dismissed_permission_notice.contains(env_key) {
-            return None;
-        }
+        let env_key = env.environment_id.as_deref().unwrap_or(env.id.as_str()).to_owned();
         let ui_key = format!("permission-update-dismissed-{env_key}");
-        if t3_client::store::load_ui_state(&ui_key).and_then(|v| v.as_bool()) == Some(true) {
+        let dismissed = *self.dismissed_permission_notice.entry(env_key.clone()).or_insert_with(|| {
+            t3_client::store::load_ui_state(&ui_key).and_then(|v| v.as_bool()) == Some(true)
+        });
+        if dismissed {
             return None;
         }
         let session = state
@@ -516,7 +518,7 @@ impl ConnectView {
         }
         let p = palette(cx);
         let label = env.label.clone();
-        let dismiss_env = env_key.to_owned();
+        let dismiss_env = env_key;
         let dismiss_key = ui_key;
         Some(
             v_flex()
@@ -541,7 +543,7 @@ impl ConnectView {
                         Button::new("connect-legacy-perms-dismiss", ButtonVariant::GhostMuted, ButtonSize::Compact)
                             .label("Dismiss")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.dismissed_permission_notice.insert(dismiss_env.clone());
+                                this.dismissed_permission_notice.insert(dismiss_env.clone(), true);
                                 t3_client::store::save_ui_state(&dismiss_key, &serde_json::Value::Bool(true));
                                 cx.notify();
                             })),
@@ -814,8 +816,8 @@ impl ConnectView {
         let Some(host) = self.ssh_matches.get(index) else { return div().h(px(HOST_ROW_HEIGHT)).into_any_element() };
         let p = palette(cx);
         let busy = self.state.read(cx).connect.pairing.is_some();
-        let address = format_target(&host.target());
-        let alias = host.alias.clone();
+        let target = host.target();
+        let address = format_target(&target);
         h_flex()
             .id(SharedString::from(format!("ssh-host-{index}")))
             .w_full()
@@ -835,7 +837,7 @@ impl ConnectView {
                     .text_color(hsla(p.muted_foreground))
                     .when(address != host.alias, |this| this.child(address)),
             )
-            .when(!busy, |this| this.on_click(cx.listener(move |this, _, window, cx| this.add_ssh_host(alias.clone(), window, cx))))
+            .when(!busy, |this| this.on_click(cx.listener(move |this, _, window, cx| this.add_ssh_host(target.clone(), window, cx))))
             .into_any_element()
     }
 

@@ -421,7 +421,13 @@ pub struct CliCommandStatus {
     pub on_path: bool,
     pub shadowed_by: Option<String>,
     pub path_dir: String,
-    pub profile_file: String,
+    /// Shell profile path (`~/.zshrc`, `~/.bashrc`, `~/.config/fish/config.fish`) when safe to edit
+    /// (`packages/shared/src/shell.ts` `pathSetup`). `None` on Windows, macOS `bash`, unknown shells,
+    /// or unsafe paths.
+    pub profile_file: Option<String>,
+    /// Line to append to `profile_file` (`fish_add_path --append --path …` for fish,
+    /// `export PATH="$PATH:…"` for zsh / non-macOS bash).
+    pub path_line: Option<String>,
 }
 
 impl CliCommandStatus {
@@ -432,13 +438,92 @@ impl CliCommandStatus {
         match &self.installed_path {
             None => "Run T3 Code's CLI as `t3` from any terminal.".to_owned(),
             Some(path) if self.on_path => format!("Installed at {path}. Open a new terminal to use it."),
-            Some(path) => format!("Installed at {path}, which is not on your PATH yet. Add {} to {}.", self.path_dir, self.profile_file),
+            Some(path) => match &self.profile_file {
+                Some(profile) => format!("Installed at {path}, which is not on your PATH yet. Add {} to {profile}.", self.path_dir),
+                None => format!("Installed at {path}, which is not on your PATH yet. Add {} to your shell PATH.", self.path_dir),
+            },
         }
     }
 
-    pub fn path_export_line(&self) -> String {
-        format!("export PATH=\"{}:$PATH\"", self.path_dir)
+    /// Shell command to paste that appends `path_line` to `profile_file` (`pathSetupCommand`).
+    pub fn path_setup_command(&self) -> Option<String> {
+        let file = self.profile_file.as_deref()?;
+        let line = self.path_line.as_deref()?;
+        let append = format!("printf '\\n%s\\n' '{line}' >> {file}");
+        if file.ends_with(".fish") {
+            let dir = file.rsplit_once('/').map_or(file, |(dir, _)| dir);
+            Some(format!("mkdir -p {dir} && {append}"))
+        } else {
+            Some(append)
+        }
     }
+}
+
+fn is_safe_shell_path(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'))
+}
+
+/// Exact line match (ignoring blank lines and `#` comments) so substring hits in comments or
+/// unrelated paths never suppress PATH setup.
+pub fn profile_contains_line(existing: &str, line: &str) -> bool {
+    let wanted = line.trim();
+    existing.lines().any(|candidate| {
+        let trimmed = candidate.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('#') && trimmed == wanted
+    })
+}
+
+/// Host shell environment inputs for `path_setup` (`packages/shared/src/shell.ts` `PathSetupInput`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShellEnv<'a> {
+    pub platform: &'a str,
+    pub home: Option<&'a str>,
+    pub shell: Option<&'a str>,
+    pub config_home: Option<&'a str>,
+    pub zdotdir: Option<&'a str>,
+}
+
+/// `pathSetup` (`packages/shared/src/shell.ts`): returns `(profile_file, line)` that puts
+/// `directory` last on PATH for new zsh, fish, or non-macOS bash terminals.
+pub fn path_setup(directory: &str, env: &ShellEnv<'_>) -> Option<(String, String)> {
+    if env.platform == "windows" || env.platform == "win32" || !directory.starts_with('/') {
+        return None;
+    }
+    let home = env.home.filter(|h| !h.is_empty())?;
+    let home_prefix = format!("{}/", home.trim_end_matches('/'));
+    let (under_home, rest) = match directory.strip_prefix(&home_prefix) {
+        Some(tail) => (true, format!("/{tail}")),
+        None => (false, directory.to_owned()),
+    };
+    if !is_safe_shell_path(&rest) {
+        return None;
+    }
+    let dir_expr = if under_home { format!("$HOME{rest}") } else { rest };
+    let shell_name = env.shell.and_then(|s| s.rsplit('/').next());
+    let read_from = |value: Option<&str>, fallback: &str| -> Option<String> {
+        match value.filter(|v| !v.is_empty()) {
+            None => Some(fallback.to_owned()),
+            Some(v) if v.starts_with('/') && is_safe_shell_path(v) => Some(v.to_owned()),
+            Some(_) => None,
+        }
+    };
+    if shell_name == Some("fish") {
+        let config = read_from(env.config_home, "~/.config")?;
+        return Some((
+            format!("{config}/fish/config.fish"),
+            format!("fish_add_path --append --path {dir_expr}"),
+        ));
+    }
+    let is_macos = env.platform == "macos" || env.platform == "darwin";
+    let file = match shell_name {
+        Some("zsh") => format!("{}/.zshrc", read_from(env.zdotdir, "~")?),
+        Some("bash") if !is_macos => "~/.bashrc".to_owned(),
+        _ => return None,
+    };
+    Some((file, format!("export PATH=\"$PATH:{dir_expr}\"")))
 }
 
 /// Detects local `t3` CLI installation & PATH status from the resolved T3 home and `PATH`.
@@ -446,7 +531,7 @@ pub fn detect_cli_command_status(
     t3_bin_dir: &std::path::Path,
     t3_bin_installed: bool,
     path_entries: &[(&str, bool)],
-    shell: Option<&str>,
+    env: &ShellEnv<'_>,
 ) -> CliCommandStatus {
     let path_dir = t3_bin_dir.to_string_lossy().into_owned();
     let installed_path = t3_bin_installed.then(|| t3_bin_dir.join("t3").to_string_lossy().into_owned());
@@ -465,10 +550,9 @@ pub fn detect_cli_command_status(
     if !on_path {
         on_path = path_entries.iter().any(|(dir, _)| std::path::Path::new(dir) == t3_bin_dir);
     }
-    let profile_file = match shell.and_then(|s| s.rsplit('/').next()) {
-        Some("bash") => "~/.bashrc".to_owned(),
-        Some("fish") => "~/.config/fish/config.fish".to_owned(),
-        _ => "~/.zshrc".to_owned(),
+    let (profile_file, path_line) = match path_setup(&path_dir, env) {
+        Some((file, line)) => (Some(file), Some(line)),
+        None => (None, None),
     };
     CliCommandStatus {
         installed_path,
@@ -476,6 +560,7 @@ pub fn detect_cli_command_status(
         shadowed_by,
         path_dir,
         profile_file,
+        path_line,
     }
 }
 

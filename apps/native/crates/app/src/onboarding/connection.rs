@@ -360,7 +360,10 @@ impl WelcomeWizard {
         } else if status.installed_path.is_some() {
             if status.on_path || self.cli_path_added {
                 let text = if self.cli_path_added {
-                    format!("Added to {}. Open a new terminal to use `t3`.", status.profile_file)
+                    match &status.profile_file {
+                        Some(profile) => format!("Added to {profile}. Open a new terminal to use `t3`."),
+                        None => "Added to your shell profile. Open a new terminal to use `t3`.".to_owned(),
+                    }
                 } else {
                     status.description()
                 };
@@ -372,9 +375,9 @@ impl WelcomeWizard {
                         .child(Icon::Check.render(px(14.), hsla(p.success_foreground)))
                         .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(text)),
                 );
-            } else {
-                let export_line = status.path_export_line();
-                let profile = status.profile_file.clone();
+            } else if let (Some(profile), Some(export_line)) = (status.profile_file.clone(), status.path_line.clone()) {
+                let command = status.path_setup_command().unwrap_or_else(|| export_line.clone());
+                let saving = self.cli_path_saving;
                 body = body.child(
                     v_flex()
                         .gap(r(8.))
@@ -393,13 +396,23 @@ impl WelcomeWizard {
                                 )
                                 .child(
                                     Button::new("welcome-cli-add-path", ButtonVariant::Outline, ButtonSize::Compact)
-                                        .label("Add to PATH")
+                                        .label(if saving { "Adding\u{2026}" } else { "Add to PATH" })
+                                        .disabled(saving)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.add_cli_to_path(&profile, &export_line, cx);
+                                            this.add_cli_to_path(profile.clone(), export_line.clone(), cx);
                                         })),
                                 ),
                         )
-                        .child(self.command_block("welcome-copy-cli-path", &status.path_export_line(), cx)),
+                        .child(self.command_block("welcome-copy-cli-path", &command, cx))
+                        .children(self.cli_path_error.clone().map(|error| {
+                            div().text_xs().text_color(hsla(p.destructive_foreground)).child(error)
+                        })),
+                );
+            } else {
+                body = body.child(
+                    row_card(cx).px(r(12.)).py(r(10.)).child(
+                        div().text_xs().text_color(hsla(p.muted_foreground)).child(status.description()),
+                    ),
                 );
             }
         } else {

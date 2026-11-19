@@ -41,9 +41,51 @@ use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
 const QR_SIZE: f32 = 168.;
+const RELAY_READ: &str = "relay:read";
+const CLOUD_CONNECT_SESSION_SUBJECT: &str = "cloud-connect";
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+/// Human-readable relative/date label for `ConnectDevice.approved_at` instead of raw ISO text.
+fn format_approved_since(approved_at: &str, now_ms: i64) -> String {
+    let Some(ms) = t3_core::sidebar::time::parse_iso(approved_at) else {
+        return approved_at.split('T').next().unwrap_or(approved_at).to_owned();
+    };
+    let delta_secs = (now_ms - ms).max(0) / 1000;
+    if delta_secs < 60 {
+        "just now".to_owned()
+    } else if delta_secs < 3_600 {
+        format!("{}m ago", delta_secs / 60)
+    } else if delta_secs < 86_400 {
+        format!("{}h ago", delta_secs / 3_600)
+    } else if delta_secs < 30 * 86_400 {
+        format!("{}d ago", delta_secs / 86_400)
+    } else {
+        approved_at.split('T').next().unwrap_or(approved_at).to_owned()
+    }
+}
+
+/// `ConnectionsSettings.tsx:1304-1311` + `SavedEnvironmentRows.tsx:746`: the approval toggle
+/// renders only when T3 Connect's managed tunnel is active and the server advertises the setting.
+fn connect_approval_row_visible(managed_tunnel_active: bool, require_approval: Option<bool>) -> bool {
+    managed_tunnel_active && require_approval.is_some()
+}
+
+/// `ConnectionsSettings.tsx:1379-1389`: the T3 Connect devices section renders only when the
+/// session can read access and there is at least one pending request or trusted device.
+fn connect_devices_section_visible(can_read: bool, request_count: usize, device_count: usize) -> bool {
+    can_read && (request_count > 0 || device_count > 0)
+}
+
+/// `ConnectionsSettings.tsx:758-769`: "Revoke others" triggers the Connect approval-off
+/// confirmation when any trusted Connect device or non-current `cloud-connect` session exists.
+fn revokes_connect_devices(devices: &[ConnectDevice], sessions: &[ClientSession]) -> bool {
+    !devices.is_empty()
+        || sessions
+            .iter()
+            .any(|session| !session.current && session.subject == CLOUD_CONNECT_SESSION_SUBJECT)
 }
 
 /// Keeps a `subscribeAuthAccess` stream alive for the chosen target environment.
@@ -65,11 +107,20 @@ struct CreateLink {
     error: Option<String>,
 }
 
-/// Inline confirmation when revoking a trusted T3 Connect device while approval is turned off
-/// (`RevokeConnectDeviceDialog.tsx`, `pingdotgg/t3code#36419`).
+/// Which revoke action is awaiting confirmation while T3 Connect device approval is off
+/// (`ConnectionsSettings.tsx:737-769`, `RevokeConnectDeviceDialog.tsx`, `pingdotgg/t3code#36419`).
+#[derive(Debug, Clone)]
+enum PendingConnectRevokeAction {
+    ConnectDevice(String),
+    ClientSession(String),
+    OtherClients,
+}
+
+/// Inline confirmation when revoking a trusted T3 Connect device, a `cloud-connect` client
+/// session, or "Revoke others" while approval is turned off (`RevokeConnectDeviceDialog.tsx`).
 #[derive(Debug, Clone)]
 struct RevokeConnectDeviceConfirm {
-    thumbprint: String,
+    action: PendingConnectRevokeAction,
     title: String,
     turn_on_approval: bool,
     busy: bool,
@@ -101,6 +152,13 @@ pub(crate) struct AccessPageState {
     error: Option<String>,
     /// Keyed by `(saved_id, connection_generation)`.
     stream: Option<(String, u64, TargetStream)>,
+    /// Watches `server_config_extras` and `session_state` on the target client so non-active
+    /// targets (`is_active == false`) repaint immediately on remote updates.
+    extras_watcher: Option<(String, TargetStream)>,
+    /// Whether `GET /api/connect/link-state` reports an active managed T3 Connect tunnel.
+    managed_tunnel_active: bool,
+    /// Keyed by `(saved_id, connection_generation)`.
+    link_state_task: Option<(String, u64, Task<()>)>,
     create: Option<CreateLink>,
     /// Credentials of links this client created, known only in memory (`credentialsById`).
     credentials: HashMap<String, String>,
@@ -115,7 +173,8 @@ pub(crate) struct AccessPageState {
     revoke_device_confirm: Option<RevokeConnectDeviceConfirm>,
     approval_saving: bool,
     permissions_open: bool,
-    dismissed_legacy_notice: HashSet<String>,
+    /// Cached dismissal state per environment key so `render()` reads disk at most once per key.
+    dismissed_legacy_notice: HashMap<String, bool>,
     /// The last QR encoded, by URL, so countdown ticks and hovers do not re-encode it.
     qr: RefCell<Option<(String, Rc<QrMatrix>)>>,
     /// Ticks once a second while a pairing link counts down.
@@ -134,6 +193,9 @@ impl AccessPageState {
             connect_devices: ConnectDevicesState::default(),
             error: None,
             stream: None,
+            extras_watcher: None,
+            managed_tunnel_active: false,
+            link_state_task: None,
             create: None,
             credentials: HashMap::new(),
             sharing: None,
@@ -145,7 +207,7 @@ impl AccessPageState {
             revoke_device_confirm: None,
             approval_saving: false,
             permissions_open: false,
-            dismissed_legacy_notice: HashSet::new(),
+            dismissed_legacy_notice: HashMap::new(),
             qr: RefCell::new(None),
             ticker: None,
         }
@@ -160,6 +222,9 @@ impl AccessPageState {
         self.connect_devices = ConnectDevicesState::default();
         self.error = None;
         self.stream = None;
+        self.extras_watcher = None;
+        self.managed_tunnel_active = false;
+        self.link_state_task = None;
         self.create = None;
         self.credentials.clear();
         self.sharing = None;
@@ -176,6 +241,8 @@ impl AccessPageState {
     /// Leaving the page stops the stream and the countdown.
     pub(super) fn close(&mut self) {
         self.stream = None;
+        self.extras_watcher = None;
+        self.link_state_task = None;
         self.ticker = None;
         self.target_client_task = None;
     }
@@ -464,6 +531,87 @@ impl SettingsView {
         self.access.stream = Some((target_id, generation, TargetStream { _pump: pump, abort }));
     }
 
+    /// Watches `server_config_extras`, `session_state`, and `connection_generation` on the target
+    /// `ClientHandle`, and reads `GET /api/connect/link-state` (`managedTunnelActive`) once per
+    /// `(saved_id, generation)` so non-active targets (`is_active == false`) stay reactive.
+    fn ensure_target_watchers(&mut self, target: &ResolvedAccessTarget, cx: &mut Context<Self>) {
+        let Some(client) = target.client.clone() else {
+            self.access.extras_watcher = None;
+            self.access.link_state_task = None;
+            return;
+        };
+        let target_id = target.saved_id.clone();
+        if !self.access.extras_watcher.as_ref().is_some_and(|(id, _)| id == &target_id) {
+            let runtime = self.state.read(cx).runtime().clone();
+            let mut extras_rx = client.server_config_extras();
+            let mut grants_rx = client.session_state();
+            let mut gen_rx = client.connection_generation();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let network = runtime.spawn(async move {
+                loop {
+                    let changed = tokio::select! {
+                        res = extras_rx.changed() => res.is_ok(),
+                        res = grants_rx.changed() => res.is_ok(),
+                        res = gen_rx.changed() => res.is_ok(),
+                    };
+                    if !changed || tx.send(()).is_err() {
+                        return;
+                    }
+                }
+            });
+            let abort = network.abort_handle();
+            let expected = target_id.clone();
+            let pump = cx.spawn(async move |this, cx| {
+                while rx.recv().await.is_some() {
+                    let alive = this.update(cx, |this, cx| {
+                        if this.access.active_target.as_deref() == Some(expected.as_str()) {
+                            cx.notify();
+                        }
+                    });
+                    if alive.is_err() {
+                        return;
+                    }
+                }
+            });
+            self.access.extras_watcher = Some((target_id.clone(), TargetStream { _pump: pump, abort }));
+        }
+
+        let generation = *client.connection_generation().borrow();
+        let can_read_relay = Self::target_may(target.grants.as_ref(), RELAY_READ);
+        if !can_read_relay {
+            self.access.managed_tunnel_active = false;
+            self.access.link_state_task = None;
+            return;
+        }
+        if self
+            .access
+            .link_state_task
+            .as_ref()
+            .is_some_and(|(id, gen_id, _)| id == &target_id && *gen_id == generation)
+        {
+            return;
+        }
+        let runtime = self.state.read(cx).runtime().clone();
+        let expected = target_id.clone();
+        let fetch = runtime.spawn(async move { client.get_access("/api/connect/link-state").await });
+        let task = cx.spawn(async move |this, cx| {
+            let active = fetch.await.ok().and_then(|res| res.ok()).is_some_and(|body| {
+                let linked = body.get("linked").and_then(Value::as_bool).unwrap_or(false);
+                let revoked = body.get("linkRevoked").and_then(Value::as_bool).unwrap_or(false);
+                body.get("managedTunnelActive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(linked && !revoked)
+            });
+            let _ = this.update(cx, |this, cx| {
+                if this.access.active_target.as_deref() == Some(expected.as_str()) {
+                    this.access.managed_tunnel_active = active;
+                    cx.notify();
+                }
+            });
+        });
+        self.access.link_state_task = Some((target_id, generation, task));
+    }
+
     fn ensure_ticker(&mut self, counting: bool, cx: &mut Context<Self>) {
         if !counting {
             self.access.ticker = None;
@@ -659,14 +807,25 @@ impl SettingsView {
             return;
         }
         confirm.busy = true;
-        let thumbprint = confirm.thumbprint.clone();
+        let action = confirm.action.clone();
         let turn_on = confirm.turn_on_approval;
         let Some(client) = client else {
             confirm.busy = false;
             return store::show_error("Reconnect to this environment first.".to_owned(), cx);
         };
         if !turn_on {
-            return self.revoke_connect_device_now(Some(client), target_id, thumbprint, cx);
+            self.access.revoke_device_confirm = None;
+            return match action {
+                PendingConnectRevokeAction::ConnectDevice(thumbprint) => {
+                    self.revoke_connect_device_now(Some(client), target_id, thumbprint, cx)
+                }
+                PendingConnectRevokeAction::ClientSession(session_id) => {
+                    self.revoke_client(Some(client), target_id, session_id, cx)
+                }
+                PendingConnectRevokeAction::OtherClients => {
+                    self.revoke_others(Some(client), target_id, cx)
+                }
+            };
         }
         let runtime = self.state.read(cx).runtime().clone();
         let update_client = client.clone();
@@ -676,9 +835,21 @@ impl SettingsView {
                 .await
                 .map_err(|e| e.to_string())?;
             update_client.set_require_connect_device_approval(true);
-            update_client
-                .post_access("/api/auth/connect-devices/revoke", Some(json!({ "proofKeyThumbprint": thumbprint })))
-                .await
+            match action {
+                PendingConnectRevokeAction::ConnectDevice(thumbprint) => {
+                    update_client
+                        .post_access("/api/auth/connect-devices/revoke", Some(json!({ "proofKeyThumbprint": thumbprint })))
+                        .await
+                }
+                PendingConnectRevokeAction::ClientSession(session_id) => {
+                    update_client
+                        .post_access("/api/auth/clients/revoke", Some(json!({ "sessionId": session_id })))
+                        .await
+                }
+                PendingConnectRevokeAction::OtherClients => {
+                    update_client.post_access("/api/auth/clients/revoke-others", None).await
+                }
+            }
         });
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|e| Err(e.to_string()));
@@ -690,7 +861,7 @@ impl SettingsView {
                     if let Some(confirm) = this.access.revoke_device_confirm.as_mut() {
                         confirm.busy = false;
                     }
-                    store::show_error(format!("Could not revoke the device: {error}"), cx);
+                    store::show_error(format!("Could not revoke access: {error}"), cx);
                 } else {
                     this.access.revoke_device_confirm = None;
                 }
@@ -708,6 +879,7 @@ impl SettingsView {
                 .description("Connect an environment to view its settings and access.");
             return vec![Block::new(&["connections-environment"], section("Primary environment", vec![row.into_any_element()], cx))];
         };
+        self.ensure_target_watchers(&target, cx);
         self.ensure_target_access_stream(&target, cx);
         let now = now_ms();
         let links = regular_visible_links(&self.access.access, &self.access.connect_devices, now);
@@ -776,28 +948,63 @@ impl SettingsView {
             .description(network_desc)
             .into_any_element();
 
+        let can_read = Self::target_may(target.grants.as_ref(), ACCESS_READ);
+        let can_write = Self::target_may(target.grants.as_ref(), ACCESS_WRITE);
+
         let toggle = cx.listener(|this, _, _, cx| {
             this.access.permissions_open = !this.access.permissions_open;
             cx.notify();
         });
         let permissions = disclosure("access-permissions", "Permissions", self.access.permissions_open, vec![self.permissions_row(target.grants.as_ref(), cx)], toggle, cx);
 
-        let mut machine_rows = vec![version, network, permissions];
+        let mut machine_rows = vec![version, network];
+        // `ConnectionsSettings.tsx:1304-1311` + `SavedEnvironmentRows.tsx:746`: render the
+        // T3 Connect device-approval switch only when the managed tunnel is active and the server
+        // advertises `requireConnectDeviceApproval`.
+        if connect_approval_row_visible(self.access.managed_tunnel_active, target.extras.require_connect_device_approval) {
+            let require_approval = target.extras.require_connect_device_approval.unwrap_or(false);
+            let toggle_client = target.client.clone();
+            let toggle_target = target.saved_id.clone();
+            let toggle_entity = cx.entity().downgrade();
+            machine_rows.push(
+                Row::new("connect-require-approval", "Require approval for new devices")
+                    .description("Devices that sign in to your T3 Connect account wait until someone already connected here approves them.")
+                    .control(
+                        Switch::new("connect-require-approval-switch", require_approval)
+                            .disabled(!can_write || self.access.approval_saving)
+                            .on_change(move |next, _, cx| {
+                                let client = toggle_client.clone();
+                                let target = toggle_target.clone();
+                                let _ = toggle_entity.update(cx, |this, cx| {
+                                    this.toggle_connect_device_approval(client, target, next, cx);
+                                });
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        machine_rows.push(permissions);
         if let Some(policy) = target.config.as_ref().and_then(|c| c.managed_policy.as_ref()) {
             machine_rows.push(div().px(r(16.)).py(r(12.)).child(crate::components::managed::attribution(policy, cx)).into_any_element());
         }
         blocks.push(Block::new(&["connections-environment"], section(target.label.clone(), machine_rows, cx)));
 
-        let can_read = Self::target_may(target.grants.as_ref(), ACCESS_READ);
-        let can_write = Self::target_may(target.grants.as_ref(), ACCESS_WRITE);
+        if let Some(confirm_panel) = self.revoke_connect_confirm_panel(&target, cx) {
+            blocks.push(Block::new(&["connect-revoke-confirm"], confirm_panel));
+        }
+
         if can_read || can_write {
             blocks.push(Block::new(&["authorized-clients"], self.authorized_clients(&target, now, window, cx)));
-            blocks.push(Block::new(&["connect-devices"], self.connect_devices_section(&target, &pending_requests, can_write, cx)));
+        }
+        // `ConnectionsSettings.tsx:1379-1389`: render T3 Connect devices only when the session
+        // can read access and there is at least one pending request or trusted device.
+        if connect_devices_section_visible(can_read, pending_requests.len(), self.access.connect_devices.devices.len()) {
+            blocks.push(Block::new(&["connect-devices"], self.connect_devices_section(&target, &pending_requests, now, can_write, cx)));
         }
         blocks
     }
 
-    fn legacy_permissions_notice(&self, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> Option<gpui::Div> {
+    fn legacy_permissions_notice(&mut self, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let session = target.grants.as_ref()?;
         if !session_has_legacy_permissions(session) {
             return None;
@@ -807,16 +1014,17 @@ impl SettingsView {
             .as_ref()
             .map(|c| c.environment.environment_id.as_str())
             .filter(|id| !id.is_empty())
-            .unwrap_or(&target.saved_id);
-        if self.access.dismissed_legacy_notice.contains(env_key) {
-            return None;
-        }
+            .unwrap_or(&target.saved_id)
+            .to_owned();
         let ui_key = format!("permission-update-dismissed-{env_key}");
-        if t3_client::store::load_ui_state(&ui_key).and_then(|v| v.as_bool()) == Some(true) {
+        let dismissed = *self.access.dismissed_legacy_notice.entry(env_key.clone()).or_insert_with(|| {
+            t3_client::store::load_ui_state(&ui_key).and_then(|v| v.as_bool()) == Some(true)
+        });
+        if dismissed {
             return None;
         }
         let p = palette(cx);
-        let dismiss_env = env_key.to_owned();
+        let dismiss_env = env_key;
         let dismiss_key = ui_key;
         Some(
             v_flex()
@@ -836,7 +1044,7 @@ impl SettingsView {
                         Button::new("access-legacy-perms-dismiss", ButtonVariant::GhostMuted, ButtonSize::Compact)
                             .label("Dismiss")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.access.dismissed_legacy_notice.insert(dismiss_env.clone());
+                                this.access.dismissed_legacy_notice.insert(dismiss_env.clone(), true);
                                 t3_client::store::save_ui_state(&dismiss_key, &serde_json::Value::Bool(true));
                                 cx.notify();
                             })),
@@ -881,6 +1089,10 @@ impl SettingsView {
         let grants_for_create = target.grants.clone();
         let denied = denial.is_some();
 
+        let connect_approval_off = target.extras.require_connect_device_approval == Some(false);
+        let confirm_revoke_others = connect_approval_off
+            && can_write
+            && revokes_connect_devices(&self.access.connect_devices.devices, &self.access.access.clients);
         let actions = can_write.then(|| {
             h_flex()
                 .gap(r(6.))
@@ -889,7 +1101,17 @@ impl SettingsView {
                         .label(if self.access.revoking_others { "Revoking\u{2026}" } else { "Revoke others" })
                         .disabled(self.access.revoking_others || !self.access.access.can_revoke_others())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.revoke_others(client_for_revoke.clone(), target_id_for_revoke.clone(), cx);
+                            if confirm_revoke_others {
+                                this.access.revoke_device_confirm = Some(RevokeConnectDeviceConfirm {
+                                    action: PendingConnectRevokeAction::OtherClients,
+                                    title: "Revoke all other clients?".to_owned(),
+                                    turn_on_approval: true,
+                                    busy: false,
+                                });
+                                cx.notify();
+                            } else {
+                                this.revoke_others(client_for_revoke.clone(), target_id_for_revoke.clone(), cx);
+                            }
                         })),
                 )
                 .child(
@@ -991,98 +1213,86 @@ impl SettingsView {
         container.into_any_element()
     }
 
-    /// T3 Connect device approval toggle, pending approval requests, and trusted Connect devices
-    /// (`ConnectDeviceApprovalSettings.tsx`, `RevokeConnectDeviceDialog.tsx`, `pingdotgg/t3code#36419`).
+    /// Confirmation banner when revoking a Connect device, `cloud-connect` session, or other
+    /// clients while device approval is turned off (`RevokeConnectDeviceDialog.tsx`).
+    fn revoke_connect_confirm_panel(&self, target: &ResolvedAccessTarget, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let confirm = self.access.revoke_device_confirm.as_ref()?;
+        let p = palette(cx);
+        let confirm_client = target.client.clone();
+        let confirm_target = target.saved_id.clone();
+        let checked = confirm.turn_on_approval;
+        let busy = confirm.busy;
+        let card = v_flex()
+            .px(r(16.))
+            .py(r(14.))
+            .gap(r(10.))
+            .rounded(r(12.))
+            .border_1()
+            .border_color(hsla(p.warning).opacity(0.35))
+            .bg(hsla(p.muted).opacity(0.25))
+            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(confirm.title.clone()))
+            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(
+                "Approval for new devices is off, so a revoked device signed in to your T3 Connect account can connect again on its own.",
+            ))
+            .child(
+                h_flex()
+                    .id("revoke-connect-turn-on-approval")
+                    .items_start()
+                    .gap(r(8.))
+                    .when(!busy, |this| this.cursor_pointer())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(confirm) = this.access.revoke_device_confirm.as_mut().filter(|c| !c.busy) {
+                            confirm.turn_on_approval = !confirm.turn_on_approval;
+                        }
+                        cx.notify();
+                    }))
+                    .child(div().pt(r(2.)).child(checkbox(checked, cx)))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Require approval for new devices"))
+                            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("The device has to be approved here before it can connect again.")),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap(r(8.))
+                    .child(
+                        Button::new("revoke-connect-cancel", ButtonVariant::Outline, ButtonSize::Compact)
+                            .label("Cancel")
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.access.revoke_device_confirm = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("revoke-connect-confirm", ButtonVariant::DestructiveOutline, ButtonSize::Compact)
+                            .label(if busy { "Revoking\u{2026}" } else { "Revoke" })
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm_revoke_connect_device(confirm_client.clone(), confirm_target.clone(), cx);
+                            })),
+                    ),
+            )
+            .into_any_element();
+        Some(card)
+    }
+
+    /// Pending T3 Connect approval requests and trusted Connect devices
+    /// (`ConnectDeviceApprovalSettings.tsx`, `pingdotgg/t3code#36419`).
     fn connect_devices_section(
         &self,
         target: &ResolvedAccessTarget,
         requests: &[PendingConnectDeviceRequest],
+        now: i64,
         can_write: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = palette(cx);
-        let require_approval = target.extras.require_connect_device_approval;
-        let toggle_client = target.client.clone();
-        let toggle_target = target.saved_id.clone();
-
-        let toggle_entity = cx.entity().downgrade();
-        let toggle_row = Row::new("connect-require-approval", "Require approval for new devices")
-            .description("New T3 Connect devices must be approved here using a verification code before connecting.")
-            .control(
-                Switch::new("connect-require-approval-switch", require_approval)
-                    .disabled(!can_write || self.access.approval_saving)
-                    .on_change(move |next, _, cx| {
-                        let client = toggle_client.clone();
-                        let target = toggle_target.clone();
-                        let _ = toggle_entity.update(cx, |this, cx| {
-                            this.toggle_connect_device_approval(client, target, next, cx);
-                        });
-                    }),
-            )
-            .into_any_element();
-
-        let mut rows: Vec<AnyElement> = vec![toggle_row];
-
-        if let Some(confirm) = &self.access.revoke_device_confirm {
-            let confirm_client = target.client.clone();
-            let confirm_target = target.saved_id.clone();
-            let checked = confirm.turn_on_approval;
-            let busy = confirm.busy;
-            rows.push(
-                v_flex()
-                    .px(r(16.))
-                    .py(r(14.))
-                    .gap(r(10.))
-                    .bg(hsla(p.muted).opacity(0.25))
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(confirm.title.clone()))
-                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(
-                        "Approval for new devices is off, so a revoked device signed in to your T3 Connect account can connect again on its own.",
-                    ))
-                    .child(
-                        h_flex()
-                            .id("revoke-connect-turn-on-approval")
-                            .items_start()
-                            .gap(r(8.))
-                            .when(!busy, |this| this.cursor_pointer())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(confirm) = this.access.revoke_device_confirm.as_mut().filter(|c| !c.busy) {
-                                    confirm.turn_on_approval = !confirm.turn_on_approval;
-                                }
-                                cx.notify();
-                            }))
-                            .child(div().pt(r(2.)).child(checkbox(checked, cx)))
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Require approval for new devices"))
-                                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("The device has to be approved here before it can connect again.")),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap(r(8.))
-                            .child(
-                                Button::new("revoke-connect-cancel", ButtonVariant::Outline, ButtonSize::Compact)
-                                    .label("Cancel")
-                                    .disabled(busy)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.access.revoke_device_confirm = None;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("revoke-connect-confirm", ButtonVariant::DestructiveOutline, ButtonSize::Compact)
-                                    .label(if busy { "Revoking\u{2026}" } else { "Revoke" })
-                                    .disabled(busy)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.confirm_revoke_connect_device(confirm_client.clone(), confirm_target.clone(), cx);
-                                    })),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-        }
+        let connect_approval_off = target.extras.require_connect_device_approval == Some(false);
+        let mut rows: Vec<AnyElement> = Vec::new();
 
         for req in requests {
             let busy = self.access.connect_device_busy.as_deref() == Some(req.pairing_link_id.as_str());
@@ -1176,7 +1386,7 @@ impl SettingsView {
                                     .text_xs()
                                     .text_color(hsla(p.muted_foreground))
                                     .child(div().font_family(cx.theme().mono_font_family.clone()).child(device.verification_code.clone()))
-                                    .child(format!("\u{00b7} Trusted since {}", device.approved_at)),
+                                    .child(format!("\u{00b7} Trusted {}", format_approved_since(&device.approved_at, now))),
                             ),
                     )
                     .child(
@@ -1184,9 +1394,9 @@ impl SettingsView {
                             .label(if busy { "Revoking\u{2026}" } else { "Revoke" })
                             .disabled(!can_write || busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if !require_approval {
+                                if connect_approval_off && can_write {
                                     this.access.revoke_device_confirm = Some(RevokeConnectDeviceConfirm {
-                                        thumbprint: thumbprint.clone(),
+                                        action: PendingConnectRevokeAction::ConnectDevice(thumbprint.clone()),
                                         title: confirm_title.clone(),
                                         turn_on_approval: true,
                                         busy: false,
@@ -1197,16 +1407,6 @@ impl SettingsView {
                                 }
                             })),
                     )
-                    .into_any_element(),
-            );
-        }
-
-        if requests.is_empty() && devices.is_empty() {
-            rows.push(
-                div()
-                    .px(r(16.))
-                    .py(r(12.))
-                    .child(muted_text("No device has connected through T3 Connect yet.", cx))
                     .into_any_element(),
             );
         }
@@ -1436,6 +1636,10 @@ impl SettingsView {
         let session_id = client.session_id.clone();
         let revoke_client = target.client.clone();
         let revoke_target = target.saved_id.clone();
+        let confirm_cloud_session = client.subject == CLOUD_CONNECT_SESSION_SUBJECT
+            && target.extras.require_connect_device_approval == Some(false)
+            && can_write;
+        let confirm_title = format!("Revoke {}?", client.title());
         h_flex()
             .px(r(16.))
             .py(r(12.))
@@ -1460,7 +1664,17 @@ impl SettingsView {
                         .label(if revoking { "Revoking\u{2026}" } else { "Revoke" })
                         .disabled(revoking)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.revoke_client(revoke_client.clone(), revoke_target.clone(), session_id.clone(), cx);
+                            if confirm_cloud_session {
+                                this.access.revoke_device_confirm = Some(RevokeConnectDeviceConfirm {
+                                    action: PendingConnectRevokeAction::ClientSession(session_id.clone()),
+                                    title: confirm_title.clone(),
+                                    turn_on_approval: true,
+                                    busy: false,
+                                });
+                                cx.notify();
+                            } else {
+                                this.revoke_client(revoke_client.clone(), revoke_target.clone(), session_id.clone(), cx);
+                            }
                         })),
                 )
             })
@@ -1511,5 +1725,45 @@ mod tests {
         let direct = vec!["https://studio.ts.net:3773".to_owned()];
         assert_eq!(effective_pairing_address("http://127.0.0.1:3773", &direct), "https://studio.ts.net:3773");
         assert_eq!(effective_pairing_address("https://box.example:3773", &direct), "https://box.example:3773");
+    }
+
+    #[test]
+    fn connect_device_gating_formatting_and_revoke_detection_match_web() {
+        assert!(!connect_approval_row_visible(false, Some(true)));
+        assert!(!connect_approval_row_visible(true, None));
+        assert!(connect_approval_row_visible(true, Some(false)));
+
+        assert!(!connect_devices_section_visible(false, 2, 1));
+        assert!(!connect_devices_section_visible(true, 0, 0));
+        assert!(connect_devices_section_visible(true, 1, 0));
+        assert!(connect_devices_section_visible(true, 0, 1));
+
+        let now = t3_core::sidebar::time::parse_iso("2026-11-18T12:00:00.000Z").unwrap();
+        assert_eq!(format_approved_since("2026-11-18T11:59:30.000Z", now), "just now");
+        assert_eq!(format_approved_since("2026-11-18T11:45:00.000Z", now), "15m ago");
+        assert_eq!(format_approved_since("2026-11-18T09:00:00.000Z", now), "3h ago");
+        assert_eq!(format_approved_since("2026-11-15T12:00:00.000Z", now), "3d ago");
+        assert_eq!(format_approved_since("2026-09-01T12:00:00.000Z", now), "2026-09-01");
+
+        let normal_session: ClientSession = serde_json::from_value(json!({
+            "sessionId": "s1",
+            "subject": "pairing",
+            "current": false
+        }))
+        .unwrap();
+        let cloud_session: ClientSession = serde_json::from_value(json!({
+            "sessionId": "s2",
+            "subject": CLOUD_CONNECT_SESSION_SUBJECT,
+            "current": false
+        }))
+        .unwrap();
+        let current_cloud_session: ClientSession = serde_json::from_value(json!({
+            "sessionId": "s3",
+            "subject": CLOUD_CONNECT_SESSION_SUBJECT,
+            "current": true
+        }))
+        .unwrap();
+        assert!(!revokes_connect_devices(&[], &[normal_session.clone(), current_cloud_session]));
+        assert!(revokes_connect_devices(&[], &[normal_session, cloud_session]));
     }
 }

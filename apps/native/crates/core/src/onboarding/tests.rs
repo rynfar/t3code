@@ -273,18 +273,57 @@ fn welcome_page_groups_agents_by_readiness_and_detects_cli_path_status() {
         std::path::Path::new("/Users/me/.t3/bin"),
         true,
         &[("/usr/local/bin", false), ("/usr/bin", false)],
-        Some("/bin/zsh"),
+        &ShellEnv { platform: "macos", home: Some("/Users/me"), shell: Some("/bin/zsh"), ..Default::default() },
     );
     assert!(!status.on_path);
-    assert_eq!(status.profile_file, "~/.zshrc");
+    assert_eq!(status.profile_file.as_deref(), Some("~/.zshrc"));
+    assert_eq!(status.path_line.as_deref(), Some("export PATH=\"$PATH:$HOME/.t3/bin\""));
     assert!(status.description().contains("not on your PATH yet"));
-    assert_eq!(status.path_export_line(), "export PATH=\"/Users/me/.t3/bin:$PATH\"");
+
+    let fish = detect_cli_command_status(
+        std::path::Path::new("/Users/me/.t3/bin"),
+        true,
+        &[("/usr/bin", false)],
+        &ShellEnv { platform: "macos", home: Some("/Users/me"), shell: Some("/opt/homebrew/bin/fish"), ..Default::default() },
+    );
+    assert_eq!(fish.profile_file.as_deref(), Some("~/.config/fish/config.fish"));
+    assert_eq!(fish.path_line.as_deref(), Some("fish_add_path --append --path $HOME/.t3/bin"));
+    assert_eq!(
+        fish.path_setup_command().as_deref(),
+        Some("mkdir -p ~/.config/fish && printf '\\n%s\\n' 'fish_add_path --append --path $HOME/.t3/bin' >> ~/.config/fish/config.fish")
+    );
+
+    // macOS bash is intentionally omitted (`packages/shared/src/shell.ts` `pathSetup`).
+    let macos_bash = detect_cli_command_status(
+        std::path::Path::new("/Users/me/.t3/bin"),
+        true,
+        &[("/usr/bin", false)],
+        &ShellEnv { platform: "macos", home: Some("/Users/me"), shell: Some("/bin/bash"), ..Default::default() },
+    );
+    assert_eq!(macos_bash.profile_file, None);
+    assert_eq!(macos_bash.path_line, None);
+    assert_eq!(macos_bash.path_setup_command(), None);
+
+    // Linux bash uses ~/.bashrc.
+    let linux_bash = detect_cli_command_status(
+        std::path::Path::new("/home/me/.t3/bin"),
+        true,
+        &[("/usr/bin", false)],
+        &ShellEnv { platform: "linux", home: Some("/home/me"), shell: Some("/bin/bash"), ..Default::default() },
+    );
+    assert_eq!(linux_bash.profile_file.as_deref(), Some("~/.bashrc"));
+    assert_eq!(linux_bash.path_line.as_deref(), Some("export PATH=\"$PATH:$HOME/.t3/bin\""));
+
+    // Exact line matching ignores comments and substring matches.
+    assert!(!profile_contains_line("# export PATH=\"$PATH:$HOME/.t3/bin\"\n", "export PATH=\"$PATH:$HOME/.t3/bin\""));
+    assert!(!profile_contains_line("export PATH=\"$PATH:$HOME/.t3/bin2\"\n", "export PATH=\"$PATH:$HOME/.t3/bin\""));
+    assert!(profile_contains_line("  export PATH=\"$PATH:$HOME/.t3/bin\"  \n", "export PATH=\"$PATH:$HOME/.t3/bin\""));
 
     let shadowed = detect_cli_command_status(
         std::path::Path::new("/Users/me/.t3/bin"),
         true,
         &[("/opt/homebrew/bin", true), ("/Users/me/.t3/bin", true)],
-        Some("/bin/bash"),
+        &ShellEnv { platform: "linux", home: Some("/Users/me"), shell: Some("/bin/bash"), ..Default::default() },
     );
     assert_eq!(shadowed.shadowed_by.as_deref(), Some("/opt/homebrew/bin/t3"));
     assert!(shadowed.description().contains("runs first in a new terminal"));

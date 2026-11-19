@@ -135,6 +135,11 @@ pub struct WelcomeWizard {
     /// Local `t3` CLI installation / PATH status (`#33150`, `#33153`).
     cli_status: Option<t3_core::onboarding::CliCommandStatus>,
     cli_path_added: bool,
+    cli_path_saving: bool,
+    cli_path_error: Option<String>,
+    cli_path_task: Option<Task<()>>,
+    /// Connection ID for which the open Welcome page has already initialized provider refresh + project scan.
+    connected_for_welcome: Option<u64>,
     terminal_access: bool,
     terminal_grants: Option<(u64, Task<()>)>,
     copied: Option<(String, Task<()>)>,
@@ -175,6 +180,10 @@ impl WelcomeWizard {
             more_agents_open: false,
             cli_status: t3_client::local::cli_command_status(),
             cli_path_added: false,
+            cli_path_saving: false,
+            cli_path_error: None,
+            cli_path_task: None,
+            connected_for_welcome: None,
             terminal_access: false,
             terminal_grants: None,
             copied: None,
@@ -220,13 +229,14 @@ impl WelcomeWizard {
         if event == AppEvent::Phase {
             self.chatgpt.clear();self.created_chatgpt=None;self.chatgpt_subscriptions.clear();
             self.watch_terminal_grants(cx);
-            let (pairing, failed, unpaired, connected) = {
+            let (pairing, failed, unpaired, connected, connection_id) = {
                 let app = self.state.read(cx);
                 (
                     app.connect.pairing.is_some(),
                     app.connect.error.is_some(),
                     app.phase == Phase::Unpaired,
                     app.phase == Phase::Online(ConnectionStatus::Connected),
+                    app.connection_id(),
                 )
             };
             if self.submitted && !pairing {
@@ -239,7 +249,10 @@ impl WelcomeWizard {
             if unpaired && self.step != Step::Connection {
                 self.step = Step::Connection;
             }
-            if self.open && connected {
+            if !connected {
+                self.connected_for_welcome = None;
+            } else if self.open && self.connected_for_welcome != connection_id {
+                self.connected_for_welcome = connection_id;
                 self.refresh_providers(cx);
                 self.enter_projects(cx);
             }
@@ -341,9 +354,16 @@ impl WelcomeWizard {
         self.focus_pending = true;
         self.welcome = None;
         self.cli_status = t3_client::local::cli_command_status();
-        if self.state.read(cx).phase == Phase::Online(ConnectionStatus::Connected) {
+        let (connected, connection_id) = {
+            let app = self.state.read(cx);
+            (app.phase == Phase::Online(ConnectionStatus::Connected), app.connection_id())
+        };
+        if connected {
+            self.connected_for_welcome = connection_id;
             self.refresh_providers(cx);
             self.enter_projects(cx);
+        } else {
+            self.connected_for_welcome = None;
         }
         cx.emit(Visibility);
         cx.notify();
@@ -361,6 +381,8 @@ impl WelcomeWizard {
         if !crate::chatgpt_setup::fixture_active(cx) {t3_client::store::save_ui_state("welcome-resume", &serde_json::Value::Null);}
         self.cancel_projects();
         self.open = false;
+        self.connected_for_welcome = None;
+        self.cli_path_task = None;
         self.setup = None;
         self.complete(cx);
         cx.emit(Visibility);
@@ -395,26 +417,65 @@ impl WelcomeWizard {
         self.submitted = self.state.read(cx).connect.pairing.is_some();
     }
 
-    /// Appends the `t3` PATH export line to the user's shell profile if not already present
-    /// (`DesktopCliCommand.ts` `addToPath`, `pingdotgg/t3code#33153`).
-    fn add_cli_to_path(&mut self, profile: &str, export_line: &str, cx: &mut Context<Self>) {
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    /// Appends the `t3` PATH line to the user's shell profile on a background thread
+    /// (`DesktopCliCommand.ts` `addToPath`, `pingdotgg/t3code#33153`), checking for an exact
+    /// line match, surfacing write failures, and refreshing `cli_status`.
+    fn add_cli_to_path(&mut self, profile: String, export_line: String, cx: &mut Context<Self>) {
+        if self.cli_path_saving {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            self.cli_path_error = Some("Could not locate your home directory.".to_owned());
+            cx.notify();
+            return;
+        };
+        self.cli_path_saving = true;
+        self.cli_path_error = None;
         let path = profile
             .strip_prefix("~/")
-            .map_or_else(|| std::path::PathBuf::from(profile), |rest| home.join(rest));
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if !existing.contains(export_line) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let prefix = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
-            let next = format!("{existing}{prefix}{export_line}\n");
-            if let Err(error) = std::fs::write(&path, next) {
-                tracing::warn!(%error, path = %path.display(), "failed to update shell profile PATH");
-                return;
-            }
-        }
-        self.cli_path_added = true;
+            .map_or_else(|| std::path::PathBuf::from(&profile), |rest| home.join(rest));
+        let task = cx.spawn(async move |this, cx| {
+            let result: Result<Option<t3_core::onboarding::CliCommandStatus>, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let existing = match std::fs::read_to_string(&path) {
+                        Ok(content) => content,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                        Err(error) => return Err(format!("Could not read {}: {error}", path.display())),
+                    };
+                    if !t3_core::onboarding::profile_contains_line(&existing, &export_line) {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+                        }
+                        let prefix = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+                        let next = format!("{existing}{prefix}{export_line}\n");
+                        std::fs::write(&path, next)
+                            .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+                    }
+                    Ok(t3_client::local::cli_command_status())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.cli_path_saving = false;
+                this.cli_path_task = None;
+                match result {
+                    Ok(status) => {
+                        this.cli_path_added = true;
+                        this.cli_path_error = None;
+                        if status.is_some() {
+                            this.cli_status = status;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to update shell profile PATH");
+                        this.cli_path_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.cli_path_task = Some(task);
         cx.notify();
     }
 

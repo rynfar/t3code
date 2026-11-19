@@ -45,11 +45,13 @@ pub enum ConnectionStatus {
 /// host event-loop stall (`hostFreeze.ts`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServerConfigExtras {
-    pub require_connect_device_approval: bool,
+    pub require_connect_device_approval: Option<bool>,
     pub auth_policy: Option<String>,
     pub direct_endpoints: Vec<String>,
     pub thread_snapshot_pagination: bool,
     pub last_event_loop_stall: Option<crate::status::ServerEventLoopStall>,
+    /// Accurate `subscribeServerConfig`-scoped clock sample `(server_time_ms, requested_at_ms, received_at_ms)` (`#36420`).
+    pub clock_sample: Option<(Option<i64>, i64, i64)>,
 }
 
 /// Why preparing a route failed.
@@ -147,7 +149,7 @@ impl ClientHandle {
     /// Optimistically updates `requireConnectDeviceApproval` after `server.updateSettings` succeeds.
     pub fn set_require_connect_device_approval(&self, require: bool) {
         extras_sender(&self.credentials.http_base).send_modify(|extras| {
-            extras.require_connect_device_approval = require;
+            extras.require_connect_device_approval = Some(require);
         });
     }
 }
@@ -301,6 +303,12 @@ impl ClientHandle {
     /// runtime.
     pub async fn pull_request_diff(&self, payload: Value) -> Result<Value, crate::pull_requests::HttpFailure> {
         crate::pull_requests::fetch_diff(&self.credentials, payload).await
+    }
+
+    /// An authenticated `GET` endpoint with this device's credential (`auth::get_access`). Run it
+    /// on the network runtime.
+    pub async fn get_access(&self, path: &str) -> Result<Value, String> {
+        auth::get_access(&self.credentials, path).await
     }
 
     /// An access endpoint `POST` with this device's credential (`auth::post_access`). Run it on the
@@ -704,6 +712,7 @@ impl ServerConfigPreprocessor {
                     if let Some(providers) = config.get("providers").and_then(Value::as_array) {
                         self.record_providers(providers);
                     }
+                    let mut clock_sample = config_extras.borrow().clock_sample;
                     if !self.clock_recorded {
                         let received_at_ms = wall_now_ms();
                         let server_time_ms = config
@@ -717,15 +726,17 @@ impl ServerConfigPreprocessor {
                         {
                             t3_core::clock::record_server_clock(env_id, server_time_ms, config_requested_at_ms, received_at_ms);
                         }
+                        clock_sample = Some((server_time_ms, config_requested_at_ms, received_at_ms));
                         self.clock_recorded = true;
                     }
-                    let extras = extract_server_config_extras(config);
+                    let mut extras = extract_server_config_extras(config);
+                    extras.clock_sample = clock_sample;
                     config_extras.send_replace(extras);
                 }
             }
             "settingsUpdated" => {
                 if let Some(require) = value.pointer("/payload/settings/requireConnectDeviceApproval").and_then(Value::as_bool) {
-                    config_extras.send_modify(|extras| extras.require_connect_device_approval = require);
+                    config_extras.send_modify(|extras| extras.require_connect_device_approval = Some(require));
                 }
             }
             "providerStatuses" => {
@@ -781,8 +792,7 @@ fn apply_provider_status_deltas(held: &HashMap<String, Value>, deltas: &[Value])
 fn extract_server_config_extras(config: &Value) -> ServerConfigExtras {
     let require_connect_device_approval = config
         .pointer("/settings/requireConnectDeviceApproval")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .and_then(Value::as_bool);
     let auth_policy = config.pointer("/auth/policy").and_then(Value::as_str).map(str::to_owned);
     let direct_endpoints = config
         .get("directEndpoints")
@@ -806,6 +816,7 @@ fn extract_server_config_extras(config: &Value) -> ServerConfigExtras {
         direct_endpoints,
         thread_snapshot_pagination,
         last_event_loop_stall,
+        clock_sample: None,
     }
 }
 
@@ -1205,11 +1216,12 @@ mod parity_tests {
         let parsed: ServerConfigStreamEvent = serde_json::from_value(processed).unwrap();
         assert!(matches!(parsed, ServerConfigStreamEvent::Snapshot { .. }));
         let extras = extras_rx.borrow().clone();
-        assert!(extras.require_connect_device_approval);
+        assert_eq!(extras.require_connect_device_approval, Some(true));
         assert_eq!(extras.auth_policy.as_deref(), Some("loopback-browser"));
         assert_eq!(extras.direct_endpoints, vec!["https://studio.ts.net:3773"]);
         assert!(extras.thread_snapshot_pagination);
         assert!(extras.last_event_loop_stall.is_some());
+        assert!(extras.clock_sample.is_some());
 
         // Delta omits models, slashCommands, skills -> reconstructed from prior snapshot!
         let delta = json!({
@@ -1244,7 +1256,7 @@ mod parity_tests {
             "payload": { "settings": { "requireConnectDeviceApproval": false } }
         });
         pre.preprocess(updated, 1000, &extras_tx);
-        assert!(!extras_rx.borrow().require_connect_device_approval);
+        assert_eq!(extras_rx.borrow().require_connect_device_approval, Some(false));
     }
 
     #[tokio::test]

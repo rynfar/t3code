@@ -202,6 +202,24 @@ pub async fn fetch_session_state(credentials: &Credentials) -> Result<AuthSessio
     response.json().await.map_err(|source| AuthError::Unreachable { host, source })
 }
 
+/// An authenticated `GET` to an environment HTTP endpoint (such as `/api/connect/link-state`).
+pub async fn get_access(credentials: &Credentials, path: &str) -> Result<serde_json::Value, String> {
+    let response = http()
+        .get(format!("{}{path}", credentials.http_base))
+        .bearer_auth(&credentials.access_token)
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach {}: {error}", credentials.http_base))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let message = value.get("message").and_then(serde_json::Value::as_str).filter(|message| !message.is_empty());
+        return Err(message.map_or_else(|| format!("The server answered {}.", status.as_u16()), str::to_owned));
+    }
+    Ok(value)
+}
+
 /// An authenticated `POST` to an access endpoint (`/api/auth/pairing-token`,
 /// `/api/auth/clients/revoke`, …). A failure carries the server's `message` when it sends one.
 pub async fn post_access(credentials: &Credentials, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
