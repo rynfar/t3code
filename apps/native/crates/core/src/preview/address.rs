@@ -1,9 +1,16 @@
-//! The address bar and the recently used list. Ports `normalizePreviewUrl` and
-//! `resolveAddressBarInput` from `packages/shared/src/preview.ts`, and the per-project history
-//! of `apps/web/src/browserHistoryStore.ts` (`upsertHistoryEntry`, `evictExcessProjects`,
-//! `normalizeHistoryUrl`) with the labels of `PreviewRecentUrlCard.tsx`.
+//! The address bar, recently used history, and closed preview tab history. Ports
+//! `normalizePreviewUrl` and `resolveAddressBarInput` from `packages/shared/src/preview.ts`,
+//! per-project history and Incognito exclusion from `apps/web/src/browserHistoryStore.ts`
+//! (`pingdotgg/t3code#34859`), labels from `PreviewRecentUrlCard.tsx`, and closed browser tab
+//! persistence from `apps/web/src/closedViewStore.ts` and `apps/web/src/reopenClosedView.ts`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::viewport::{
+    AppearancePreference, INCOGNITO_BROWSER_PROFILE_ID, OpenPreviewOverrides, ViewportSetting, is_incognito_profile,
+};
+use super::{NavStatus, SessionSnapshot};
 
 /// `PreviewUrlNormalizationError`; every reason reads the same to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,11 +193,49 @@ const HISTORY_MAX_TITLE_LENGTH: usize = 512;
 /// The empty state shows this many (`PreviewEmptyState`).
 pub const RECENT_SHOWN: usize = 8;
 
-/// `normalizeHistoryUrl`.
-fn history_url(raw: &str) -> Option<String> {
-    let url = url::Url::parse(raw.trim()).ok().filter(|url| matches!(url.scheme(), "http" | "https"))?;
+/// `isHistoryProfile` (`PreviewView.tsx`, `pingdotgg/t3code#34859`): Incognito visits stay out
+/// of the project's persisted history.
+pub fn is_history_profile(profile_id: Option<&str>) -> bool {
+    !is_incognito_profile(profile_id)
+}
+
+/// `normalizeHistoryUrl`: normalizes to http(s) and strips embedded credentials.
+pub fn normalize_history_url(raw: &str) -> Option<String> {
+    let normalized = normalize_preview_url(raw).ok()?;
+    let mut url = url::Url::parse(&normalized).ok()?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     let href = url.to_string();
     (href.len() <= HISTORY_MAX_URL_LENGTH).then_some(href)
+}
+
+fn normalize_hostname(host: &str) -> String {
+    host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1" | "0.0.0.0" | "::")
+        || host.ends_with(".localhost")
+}
+
+fn visit_lookup_key(normalized: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(normalized) else { return normalized.to_owned() };
+    if let Some(host) = parsed.host_str().map(normalize_hostname)
+        && is_loopback_host(&host)
+    {
+        let _ = parsed.set_host(Some("local"));
+    }
+    parsed.to_string()
+}
+
+fn title_lookup_key(normalized: &str) -> String {
+    let key = visit_lookup_key(normalized);
+    let Ok(mut parsed) = url::Url::parse(&key) else { return key };
+    let path = parsed.path().to_owned();
+    if path != "/" && path.ends_with('/') {
+        parsed.set_path(path.trim_end_matches('/'));
+    }
+    parsed.to_string()
 }
 
 /// Recently used addresses per project, newest first.
@@ -205,35 +250,80 @@ impl BrowserHistory {
         self.by_project.get(project).map_or(&[], Vec::as_slice)
     }
 
-    /// `recordVisit`: moves the address to the front, keeping a title it already had.
+    /// `recordVisit`: moves the address to the front, keeping a title it already had and
+    /// deduplicating loopback hosts.
     pub fn record(&mut self, project: &str, raw: &str, now_ms: i64) -> bool {
-        let Some(url) = history_url(raw) else { return false };
+        let Some(url) = normalize_history_url(raw) else { return false };
+        let key = visit_lookup_key(&url);
         let entries = self.by_project.entry(project.to_owned()).or_default();
-        let title = entries.iter().find(|entry| entry.url == url).and_then(|entry| entry.title.clone());
-        entries.retain(|entry| entry.url != url);
-        entries.insert(0, HistoryEntry { url, last_visited_at: now_ms, title });
+        let existing = entries.iter().find(|entry| visit_lookup_key(&entry.url) == key).cloned();
+        let title = existing.as_ref().and_then(|entry| entry.title.clone());
+        let stored_url = existing
+            .as_ref()
+            .filter(|entry| {
+                let existing_local = url::Url::parse(&entry.url).ok().and_then(|u| u.host_str().map(normalize_hostname)).is_some_and(|h| is_loopback_host(&h));
+                let next_local = url::Url::parse(&url).ok().and_then(|u| u.host_str().map(normalize_hostname)).is_some_and(|h| is_loopback_host(&h));
+                existing_local || !next_local
+            })
+            .map_or(url, |entry| entry.url.clone());
+        entries.retain(|entry| visit_lookup_key(&entry.url) != key);
+        entries.insert(0, HistoryEntry { url: stored_url, last_visited_at: now_ms, title });
         entries.truncate(HISTORY_MAX_ENTRIES_PER_PROJECT);
         self.evict();
         true
     }
 
-    /// A loaded page names the entry it was opened from.
-    pub fn set_title(&mut self, project: &str, raw: &str, title: &str) -> bool {
-        let (Some(url), Some(entries)) = (history_url(raw), self.by_project.get_mut(project)) else { return false };
-        let title = title.trim();
-        let Some(entry) = entries.iter_mut().find(|entry| entry.url == url) else { return false };
-        let next = (!title.is_empty()).then(|| title.chars().take(HISTORY_MAX_TITLE_LENGTH).collect::<String>());
-        if entry.title == next || next.is_none() {
+    /// `recordVisitForThread` gated by `is_history_profile`: Incognito visits are ignored.
+    pub fn record_for_profile(&mut self, project: &str, profile_id: Option<&str>, raw: &str, now_ms: i64) -> bool {
+        if !is_history_profile(profile_id) {
             return false;
         }
-        entry.title = next;
+        self.record(project, raw, now_ms)
+    }
+
+    /// A loaded page names the entry it was opened from (`setTitleForUrl`).
+    pub fn set_title(&mut self, project: &str, raw: &str, title: &str) -> bool {
+        let (Some(url), Some(entries)) = (normalize_history_url(raw), self.by_project.get_mut(project)) else {
+            return false;
+        };
+        let title = title.trim();
+        if title.is_empty() {
+            return false;
+        }
+        let key = title_lookup_key(&url);
+        let Some(entry) = entries.iter_mut().find(|entry| title_lookup_key(&entry.url) == key) else {
+            return false;
+        };
+        let next: String = title.chars().take(HISTORY_MAX_TITLE_LENGTH).collect();
+        if entry.title.as_deref() == Some(next.as_str()) {
+            return false;
+        }
+        entry.title = Some(next);
         true
+    }
+
+    /// `recordPreviewTitles` (`browserHistoryStore.ts`, `pingdotgg/t3code#34859`): applies settled
+    /// page titles oldest-first so the newest settle wins, skipping Incognito tabs completely.
+    pub fn record_settled_titles(&mut self, project: &str, sessions: &[SessionSnapshot]) -> bool {
+        let mut ordered: Vec<&SessionSnapshot> = sessions.iter().collect();
+        ordered.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let mut changed = false;
+        for session in ordered {
+            if session.profile_id.as_deref() == Some(INCOGNITO_BROWSER_PROFILE_ID) {
+                continue;
+            }
+            if let NavStatus::Success { url, title } = &session.nav_status {
+                changed |= self.set_title(project, url, title);
+            }
+        }
+        changed
     }
 
     pub fn remove(&mut self, project: &str, url: &str) -> bool {
         let Some(entries) = self.by_project.get_mut(project) else { return false };
+        let normalized = normalize_history_url(url);
         let before = entries.len();
-        entries.retain(|entry| entry.url != url);
+        entries.retain(|entry| entry.url != url && normalized.as_deref() != Some(entry.url.as_str()));
         let removed = entries.len() != before;
         if entries.is_empty() {
             self.by_project.remove(project);
@@ -252,6 +342,115 @@ impl BrowserHistory {
         for (_, project) in latest.into_iter().skip(HISTORY_MAX_PROJECTS) {
             self.by_project.remove(&project);
         }
+    }
+}
+
+/// Bounded stack of recently closed browser tabs (`closedViewStore.ts` + `reopenClosedView.ts`,
+/// `pingdotgg/t3code#34859` & `pingdotgg/t3code#25874`).
+pub const CLOSED_PREVIEW_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClosedPreviewEntry {
+    pub thread_id: String,
+    pub tab_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<ViewportSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom_factor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_scheme: Option<AppearancePreference>,
+}
+
+impl ClosedPreviewEntry {
+    pub fn from_snapshot(snapshot: &SessionSnapshot) -> Self {
+        let url = snapshot.nav_status.url().map(str::to_owned);
+        let viewport = snapshot.viewport.as_ref().map(ViewportSetting::from_value);
+        let color_scheme = snapshot.color_scheme.as_deref().and_then(AppearancePreference::parse);
+        Self {
+            thread_id: snapshot.thread_id.clone(),
+            tab_id: snapshot.tab_id.clone(),
+            url,
+            viewport,
+            profile_id: snapshot.profile_id.clone(),
+            zoom_factor: snapshot.zoom_factor,
+            color_scheme,
+        }
+    }
+
+    /// `isPersistentView` (`closedViewStore.ts`): Incognito tabs are never persisted to disk.
+    pub fn is_persistent(&self) -> bool {
+        self.profile_id.as_deref() != Some(INCOGNITO_BROWSER_PROFILE_ID)
+    }
+
+    /// Parameters passed to `preview.open` when reopening this closed tab (`reopenClosedView.ts`).
+    pub fn reopen_overrides(&self) -> OpenPreviewOverrides {
+        OpenPreviewOverrides {
+            url: self.url.clone(),
+            viewport: self.viewport.clone(),
+            profile_id: self.profile_id.clone(),
+            zoom_factor: self.zoom_factor,
+            color_scheme: self.color_scheme,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClosedPreviewHistory {
+    #[serde(default)]
+    entries: Vec<ClosedPreviewEntry>,
+}
+
+impl ClosedPreviewHistory {
+    pub fn entries(&self) -> &[ClosedPreviewEntry] {
+        &self.entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn has_for_thread(&self, thread_id: &str) -> bool {
+        self.entries.iter().any(|entry| entry.thread_id == thread_id)
+    }
+
+    /// Remembers a closed tab in memory (newest first, deduped by `(thread_id, tab_id)`,
+    /// capped at `CLOSED_PREVIEW_LIMIT`).
+    pub fn remember(&mut self, snapshot: &SessionSnapshot) {
+        let entry = ClosedPreviewEntry::from_snapshot(snapshot);
+        self.entries.retain(|existing| !(existing.thread_id == entry.thread_id && existing.tab_id == entry.tab_id));
+        self.entries.insert(0, entry);
+        self.entries.truncate(CLOSED_PREVIEW_LIMIT);
+    }
+
+    /// Pops the newest closed tab for `thread_id`.
+    pub fn pop_for_thread(&mut self, thread_id: &str) -> Option<ClosedPreviewEntry> {
+        let index = self.entries.iter().position(|entry| entry.thread_id == thread_id)?;
+        Some(self.entries.remove(index))
+    }
+
+    /// Only non-Incognito entries are serialized for disk persistence (`partialize`).
+    pub fn to_persisted_value(&self) -> Value {
+        let persisted: Vec<&ClosedPreviewEntry> = self.entries.iter().filter(|entry| entry.is_persistent()).collect();
+        serde_json::json!({ "entries": persisted })
+    }
+
+    /// Loads persisted entries, discarding invalid or Incognito entries (`migrate`).
+    pub fn from_persisted_value(value: Option<&Value>) -> Self {
+        let Some(entries) = value.and_then(|v| v.get("entries")).and_then(Value::as_array) else {
+            return Self::default();
+        };
+        let mut loaded: Vec<ClosedPreviewEntry> = entries
+            .iter()
+            .filter_map(|item| serde_json::from_value::<ClosedPreviewEntry>(item.clone()).ok())
+            .filter(|entry| !entry.thread_id.is_empty() && !entry.tab_id.is_empty() && entry.is_persistent())
+            .collect();
+        loaded.truncate(CLOSED_PREVIEW_LIMIT);
+        Self { entries: loaded }
     }
 }
 
@@ -302,5 +501,95 @@ mod tests {
         }
         assert!(history.recent("p").is_empty());
         assert_eq!(history.recent("24").len(), 1);
+    }
+
+    #[test]
+    fn incognito_visits_and_titles_stay_out_of_project_history() {
+        let mut history = BrowserHistory::default();
+        assert!(!is_history_profile(Some(INCOGNITO_BROWSER_PROFILE_ID)));
+        assert!(is_history_profile(Some("default")));
+        assert!(is_history_profile(None));
+
+        // Incognito visits are ignored.
+        assert!(!history.record_for_profile("p", Some(INCOGNITO_BROWSER_PROFILE_ID), "https://secret.test/", 1));
+        assert!(history.recent("p").is_empty());
+
+        // Normal visits strip credentials and accept normal settled titles, never Incognito titles.
+        assert!(history.record_for_profile("p", Some("default"), "https://user:pass@a.test/path", 2));
+        assert_eq!(history.recent("p")[0].url, "https://a.test/path");
+
+        let incognito_session = SessionSnapshot::decode(serde_json::json!({
+            "threadId": "t1",
+            "tabId": "tab-inc",
+            "navStatus": { "_tag": "Success", "url": "https://a.test/path", "title": "Private Title" },
+            "canGoBack": false,
+            "canGoForward": false,
+            "profileId": "incognito",
+            "updatedAt": "2026-11-12T00:00:02Z"
+        }))
+        .unwrap();
+        assert!(!history.record_settled_titles("p", &[incognito_session]));
+        assert_eq!(history.recent("p")[0].title, None);
+
+        let normal_session = SessionSnapshot::decode(serde_json::json!({
+            "threadId": "t1",
+            "tabId": "tab-pub",
+            "navStatus": { "_tag": "Success", "url": "https://a.test/path/", "title": "Public Title" },
+            "canGoBack": false,
+            "canGoForward": false,
+            "profileId": "default",
+            "updatedAt": "2026-11-12T00:00:03Z"
+        }))
+        .unwrap();
+        assert!(history.record_settled_titles("p", &[normal_session]));
+        assert_eq!(history.recent("p")[0].title.as_deref(), Some("Public Title"));
+    }
+
+    #[test]
+    fn closed_preview_history_remembers_tab_settings_and_never_persists_incognito() {
+        let mut closed = ClosedPreviewHistory::default();
+        let normal = SessionSnapshot::decode(serde_json::json!({
+            "threadId": "t1",
+            "tabId": "tab-1",
+            "navStatus": { "_tag": "Success", "url": "https://example.com/", "title": "Example" },
+            "canGoBack": false,
+            "canGoForward": false,
+            "viewport": { "_tag": "freeform", "width": 1200, "height": 800 },
+            "profileId": "work",
+            "zoomFactor": 1.5,
+            "colorScheme": "dark",
+            "updatedAt": "2026-11-12T00:00:01Z"
+        }))
+        .unwrap();
+        let incognito = SessionSnapshot::decode(serde_json::json!({
+            "threadId": "t1",
+            "tabId": "tab-inc",
+            "navStatus": { "_tag": "Success", "url": "https://private.test/", "title": "Private" },
+            "canGoBack": false,
+            "canGoForward": false,
+            "profileId": "incognito",
+            "updatedAt": "2026-11-12T00:00:02Z"
+        }))
+        .unwrap();
+        closed.remember(&normal);
+        closed.remember(&incognito);
+        assert_eq!(closed.entries().len(), 2);
+
+        // Persisted form drops incognito tabs; loading also rejects incognito entries.
+        let persisted = closed.to_persisted_value();
+        let reloaded = ClosedPreviewHistory::from_persisted_value(Some(&persisted));
+        assert_eq!(reloaded.entries().len(), 1);
+        assert_eq!(reloaded.entries()[0].tab_id, "tab-1");
+        let overrides = reloaded.entries()[0].reopen_overrides();
+        assert_eq!(overrides.url.as_deref(), Some("https://example.com/"));
+        assert_eq!(overrides.viewport, Some(ViewportSetting::Freeform { width: 1200, height: 800 }));
+        assert_eq!(overrides.profile_id.as_deref(), Some("work"));
+        assert_eq!(overrides.zoom_factor, Some(1.5));
+        assert_eq!(overrides.color_scheme, Some(AppearancePreference::Dark));
+
+        // In-memory pop returns newest closed tab for the thread.
+        assert_eq!(closed.pop_for_thread("t1").unwrap().tab_id, "tab-inc");
+        assert_eq!(closed.pop_for_thread("t1").unwrap().tab_id, "tab-1");
+        assert!(closed.pop_for_thread("t1").is_none());
     }
 }

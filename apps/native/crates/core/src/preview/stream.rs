@@ -8,7 +8,12 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use super::viewport::ViewportSetting;
+
+pub const STREAM_BASE_PATH: &str = "/api/preview-stream";
 pub const STREAM_PATH: &str = "/api/preview-stream/ws";
+pub const STREAM_UPLOAD_PATH: &str = "/api/preview-stream/upload";
+pub const STREAM_DOWNLOAD_PATH: &str = "/api/preview-stream/download";
 pub const ACK_MESSAGE: &str = r#"{"type":"ack"}"#;
 /// `TAB_GONE_CODE`: the tab closed; stop.
 pub const GONE_CLOSE_CODE: u16 = 4404;
@@ -223,6 +228,138 @@ pub enum StreamInput {
         #[serde(skip_serializing_if = "Option::is_none")]
         ignore_cache: Option<bool>,
     },
+    StopLoading,
+    Viewport {
+        setting: ViewportSetting,
+    },
+    Probe {
+        x: f64,
+        y: f64,
+    },
+}
+
+/// An active file picker offered by the streamed server browser (`PreviewStreamFileChooser`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChooserOffer {
+    pub id: String,
+    pub multiple: bool,
+    pub accept: String,
+}
+
+/// Tracks the currently offered file picker across a stream connection's lifetime
+/// (`packages/client-runtime/src/preview/serverBrowserStream.ts`, `pingdotgg/t3code#29655`).
+/// Dropping or stopping a stream withdraws any stale offer; reconnecting accepts the server's
+/// re-offered picker under its new chooser id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileChooserTracker {
+    active: Option<FileChooserOffer>,
+}
+
+impl FileChooserTracker {
+    pub fn active(&self) -> Option<&FileChooserOffer> {
+        self.active.as_ref()
+    }
+
+    /// Processes a decoded stream message. Returns `Some(next_state)` only when the offered
+    /// picker changed (offered, replaced, or withdrawn by a matching close id).
+    pub fn on_message(&mut self, message: &StreamMessage) -> Option<Option<FileChooserOffer>> {
+        match message {
+            StreamMessage::FileChooser { id, multiple, accept } => {
+                let offer = FileChooserOffer {
+                    id: id.clone(),
+                    multiple: *multiple,
+                    accept: accept.clone(),
+                };
+                self.active = Some(offer.clone());
+                Some(Some(offer))
+            }
+            StreamMessage::FileChooserClosed { id } => {
+                if self.active.as_ref().is_some_and(|current| current.id == *id) {
+                    self.active = None;
+                    Some(None)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Withdraws any offered file picker when the stream drops or stops (`withdrawFileChooser`).
+    /// Returns `true` if a stale offer was withdrawn so callers notify the UI exactly once.
+    pub fn withdraw(&mut self) -> bool {
+        self.active.take().is_some()
+    }
+}
+
+/// `previewStreamUploadUrl`: builds `/api/preview-stream/upload?threadId=...&tabId=...&chooser=...&wsTicket=...`.
+pub fn upload_url(http_base: &str, thread_id: &str, tab_id: &str, chooser_id: &str, ticket: Option<&str>) -> String {
+    let mut url = url::Url::parse(&format!("{}{STREAM_UPLOAD_PATH}", http_base.trim_end_matches('/'))).expect("valid preview upload url");
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("threadId", thread_id).append_pair("tabId", tab_id).append_pair("chooser", chooser_id);
+        if let Some(ticket) = ticket.filter(|ticket| !ticket.is_empty()) {
+            pairs.append_pair("wsTicket", ticket);
+        }
+    }
+    url.to_string()
+}
+
+/// `previewStreamDownloadUrl`: builds `/api/preview-stream/download?threadId=...&tabId=...&id=...&wsTicket=...`.
+pub fn download_url(http_base: &str, thread_id: &str, tab_id: &str, download_id: &str, ticket: Option<&str>) -> String {
+    let mut url = url::Url::parse(&format!("{}{STREAM_DOWNLOAD_PATH}", http_base.trim_end_matches('/'))).expect("valid preview download url");
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("threadId", thread_id).append_pair("tabId", tab_id).append_pair("id", download_id);
+        if let Some(ticket) = ticket.filter(|ticket| !ticket.is_empty()) {
+            pairs.append_pair("wsTicket", ticket);
+        }
+    }
+    url.to_string()
+}
+
+/// A file part for `POST /api/preview-stream/upload`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadFile {
+    pub name: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+fn sanitize_header_value(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\r' | '\n' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+/// Encodes `files` as an RFC 7578 `multipart/form-data` body with field name `file`.
+/// An empty slice produces a valid empty multipart body (which cancels the page's picker).
+pub fn encode_multipart_files(boundary: &str, files: &[UploadFile]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for file in files {
+        let name = if file.name.trim().is_empty() { "file".to_owned() } else { sanitize_header_value(&file.name) };
+        let mime = if file.mime_type.trim().is_empty() {
+            "application/octet-stream".to_owned()
+        } else {
+            sanitize_header_value(&file.mime_type)
+        };
+        body.extend_from_slice(b"--");
+        body.extend_from_slice(boundary.as_bytes());
+        body.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"file\"; filename=\"");
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(b"\"\r\nContent-Type: ");
+        body.extend_from_slice(mime.as_bytes());
+        body.extend_from_slice(b"\r\n\r\n");
+        body.extend_from_slice(&file.bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(b"--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"--\r\n");
+    body
 }
 
 impl StreamInput {
@@ -498,8 +635,71 @@ mod tests {
         );
         assert_eq!(StreamInput::Wheel { x: 0., y: 0., delta_x: 0., delta_y: 3., modifiers: 0 }.encode(), r#"{"type":"wheel","x":0.0,"y":0.0,"deltaX":0.0,"deltaY":3.0,"modifiers":0}"#);
         assert_eq!(StreamInput::Reload { ignore_cache: None }.encode(), r#"{"type":"reload"}"#);
+        assert_eq!(StreamInput::StopLoading.encode(), r#"{"type":"stopLoading"}"#);
+        assert_eq!(
+            StreamInput::Viewport { setting: ViewportSetting::Freeform { width: 800, height: 600 } }.encode(),
+            r#"{"type":"viewport","setting":{"_tag":"freeform","width":800,"height":600}}"#
+        );
         assert_eq!(StreamInput::Dialog { accept: true, prompt_text: Some("x".into()) }.encode(), r#"{"type":"dialog","accept":true,"promptText":"x"}"#);
         assert_eq!(StreamInput::History { delta: -1 }.encode(), r#"{"type":"history","delta":-1}"#);
+    }
+
+    #[test]
+    fn file_chooser_tracker_withdraws_on_drop_and_ignores_stale_close_ids() {
+        let mut tracker = FileChooserTracker::default();
+        assert!(!tracker.withdraw());
+
+        let offered = tracker.on_message(&StreamMessage::FileChooser {
+            id: "c1".into(),
+            multiple: false,
+            accept: ".csv".into(),
+        });
+        assert_eq!(
+            offered,
+            Some(Some(FileChooserOffer { id: "c1".into(), multiple: false, accept: ".csv".into() }))
+        );
+        // A close for an unrelated id leaves c1 open.
+        assert_eq!(tracker.on_message(&StreamMessage::FileChooserClosed { id: "c0".into() }), None);
+        assert_eq!(tracker.active().map(|offer| offer.id.as_str()), Some("c1"));
+
+        // Dropping or stopping the stream withdraws the stale picker exactly once.
+        assert!(tracker.withdraw());
+        assert_eq!(tracker.active(), None);
+        assert!(!tracker.withdraw());
+
+        // Reconnecting offers a new chooser id and a matching close clears it.
+        let reoffered = tracker.on_message(&StreamMessage::FileChooser {
+            id: "c2".into(),
+            multiple: true,
+            accept: "".into(),
+        });
+        assert_eq!(
+            reoffered,
+            Some(Some(FileChooserOffer { id: "c2".into(), multiple: true, accept: "".into() }))
+        );
+        assert_eq!(tracker.on_message(&StreamMessage::FileChooserClosed { id: "c2".into() }), Some(None));
+        assert_eq!(tracker.active(), None);
+    }
+
+    #[test]
+    fn upload_download_urls_and_multipart_encoding_match_server_contract() {
+        assert_eq!(
+            upload_url("https://host.example:3773/", "thread 1", "tab", "c1", Some("tk")),
+            "https://host.example:3773/api/preview-stream/upload?threadId=thread+1&tabId=tab&chooser=c1&wsTicket=tk"
+        );
+        assert_eq!(
+            download_url("https://host.example:3773", "thread-1", "tab", "d1", Some("tk")),
+            "https://host.example:3773/api/preview-stream/download?threadId=thread-1&tabId=tab&id=d1&wsTicket=tk"
+        );
+        // Empty file list produces a valid terminating boundary (cancels picker).
+        assert_eq!(encode_multipart_files("b1", &[]), b"--b1--\r\n");
+        let body = encode_multipart_files(
+            "b1",
+            &[UploadFile { name: "a\"b.csv".into(), mime_type: "text/csv".into(), bytes: b"x,y".to_vec() }],
+        );
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("Content-Disposition: form-data; name=\"file\"; filename=\"a_b.csv\""));
+        assert!(text.contains("Content-Type: text/csv\r\n\r\nx,y\r\n--b1--\r\n"));
     }
 
     #[test]

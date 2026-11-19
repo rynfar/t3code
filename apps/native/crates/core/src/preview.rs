@@ -8,7 +8,9 @@
 //! protocol is in `stream`, address bar and history in `address`.
 
 pub mod address;
+pub mod annotation;
 pub mod stream;
+pub mod viewport;
 
 use std::collections::HashSet;
 
@@ -16,11 +18,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::right_panel::RightPanels;
+use viewport::{AppearancePreference, DEFAULT_BROWSER_PROFILE_ID, ViewportSetting, is_incognito_profile};
 
 pub mod method {
     pub const OPEN: &str = "preview.open";
+    pub const RESIZE: &str = "preview.resize";
     pub const ADJUST: &str = "preview.adjust";
     pub const CLOSE: &str = "preview.close";
+    pub const CLEAR_PROFILE: &str = "preview.clearProfile";
     pub const LIST: &str = "preview.list";
     pub const SUBSCRIBE_EVENTS: &str = "subscribePreviewEvents";
     pub const SUBSCRIBE_DISCOVERED_SERVERS: &str = "subscribeDiscoveredLocalServers";
@@ -142,7 +147,26 @@ impl SessionSnapshot {
 
     /// A tab on the server's browser fills the panel unless the device toolbar chose a size.
     pub fn fills_panel(&self) -> bool {
-        self.viewport.as_ref().is_none_or(|viewport| viewport.get("_tag").and_then(Value::as_str) == Some("fill"))
+        self.viewport_setting().is_fill()
+    }
+
+    pub fn viewport_setting(&self) -> ViewportSetting {
+        self.viewport.as_ref().map_or(ViewportSetting::Fill, ViewportSetting::from_value)
+    }
+
+    pub fn color_scheme_preference(&self) -> AppearancePreference {
+        self.color_scheme
+            .as_deref()
+            .and_then(AppearancePreference::parse)
+            .unwrap_or(AppearancePreference::System)
+    }
+
+    pub fn profile_id_or_default(&self) -> &str {
+        self.profile_id.as_deref().unwrap_or(DEFAULT_BROWSER_PROFILE_ID)
+    }
+
+    pub fn is_incognito(&self) -> bool {
+        is_incognito_profile(self.profile_id.as_deref())
     }
 
     pub fn zoom(&self) -> f64 {

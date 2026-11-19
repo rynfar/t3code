@@ -48,6 +48,30 @@ fn decodes_snapshots_and_unknown_statuses_forward_compatibly() {
     assert!(matches!(decoded.nav_status, NavStatus::LoadFailed { code: -102, .. }));
     assert!(decoded.fills_panel());
     assert_eq!(decoded.zoom(), 1.25);
+    assert_eq!(decoded.color_scheme_preference(), viewport::AppearancePreference::System);
+    assert_eq!(decoded.profile_id_or_default(), viewport::DEFAULT_BROWSER_PROFILE_ID);
+    assert!(!decoded.is_incognito());
+    let custom = SessionSnapshot::decode(json!({
+        "threadId": "t", "tabId": "c", "updatedAt": "x",
+        "navStatus": { "_tag": "LoadFailed", "url": "http://localhost:1/report.pdf", "title": "", "code": -3, "description": "ERR_ABORTED", "download": { "id": "dl-1", "fileName": "report.pdf" } },
+        "viewport": { "_tag": "preset", "width": 390, "height": 844, "presetId": "iphone-12-pro" },
+        "colorScheme": "dark",
+        "profileId": "incognito",
+        "zoomFactor": 0.8
+    }))
+    .unwrap();
+    assert!(!custom.fills_panel());
+    assert_eq!(
+        custom.viewport_setting(),
+        viewport::ViewportSetting::Preset { width: 390, height: 844, preset_id: "iphone-12-pro".into() }
+    );
+    assert_eq!(custom.color_scheme_preference(), viewport::AppearancePreference::Dark);
+    assert!(custom.is_incognito());
+    assert!(matches!(
+        custom.nav_status,
+        NavStatus::LoadFailed { download: Some(FileDownload { ref id, ref file_name }), .. }
+            if id == "dl-1" && file_name == "report.pdf"
+    ));
     let future = SessionSnapshot::decode(json!({ "threadId": "t", "tabId": "a", "navStatus": { "_tag": "Prerendering" } })).unwrap();
     assert_eq!(future.nav_status, NavStatus::Unknown);
     // A list keeps the sessions it can read.
