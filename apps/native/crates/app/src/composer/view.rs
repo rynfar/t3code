@@ -413,6 +413,7 @@ impl Render for Composer {
                         this.enter_repeat = event.is_held;
                         if !event.is_held
                             && !event.keystroke.modifiers.shift
+                            && !event.keystroke.modifiers.alt
                             && this.voice.read(cx).blocks_submission()
                             && !this.voice.read(cx).preparing()
                         {
@@ -440,9 +441,12 @@ impl Render for Composer {
                 // Each composer takes its own shortcuts, so a side chat's never reach the open thread's.
                 .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| this.toggle_picker(window, cx)))
                 .on_action(cx.listener(|this, _: &super::OpenWorkspace, window, cx| this.open_workspace(window, cx)))
+                .on_action(cx.listener(|this, _: &super::OpenBranch, window, cx| this.open_base_branch_picker(window, cx)))
                 .on_action(cx.listener(|this, _: &super::OpenHost, window, cx| this.open_host(window, cx)))
                 .on_action(cx.listener(|this, _: &super::CycleHost, window, cx| this.cycle_host(window, cx)))
                 .on_action(cx.listener(|this, _: &super::UsePreviousWorktree, window, cx| this.use_previous_worktree(window, cx)))
+                .on_action(cx.listener(|this, _: &super::IncreaseEffort, window, cx| this.step_reasoning_effort(1, window, cx)))
+                .on_action(cx.listener(|this, _: &super::DecreaseEffort, window, cx| this.step_reasoning_effort(-1, window, cx)))
                 .on_action(cx.listener(|this, _: &super::SendAlternate, window, cx| this.send_alternate(window, cx)))
                 .on_action(cx.listener(|this, _: &super::SteerQueuedMessage, window, cx| {
                     if !this.steer_queued_message(window, cx) {

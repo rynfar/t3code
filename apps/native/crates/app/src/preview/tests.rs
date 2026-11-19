@@ -471,3 +471,41 @@ async fn toggle_device_toolbar_dispatches_preview_resize(cx: &mut gpui::TestAppC
     state.update(window_cx, |state, _| state.stop_pump());
     window_cx.run_until_parked();
 }
+
+#[gpui::test]
+async fn preview_find_action_shows_unavailable_info_toast(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let (state, previews, _fixture, _runtime) = setup(cx);
+    previews.update(cx, |previews, cx| {
+        previews.seed_snapshot_for_test(snapshot("tab-find", "https://example.com/", Some("default")), cx);
+    });
+
+    let (pane, window_cx) = cx.add_window_view(|window, cx| {
+        PreviewPane::new(
+            state.clone(),
+            previews.clone(),
+            "menu-thread".into(),
+            "browser:tab-find".into(),
+            Some("tab-find".into()),
+            window,
+            cx,
+        )
+    });
+
+    window_cx.update(|window, cx| {
+        let frame = pane.read(cx).frame_for_test().expect("frame view exists");
+        let focus = frame.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        window.draw(cx).clear();
+        window.dispatch_action(Box::new(super::Find), cx);
+    });
+
+    state.read_with(window_cx, |state, _| {
+        let toast = state.toasts.latest().expect("preview.find shows info toast");
+        assert_eq!(toast.kind, crate::toast::ToastKind::Info);
+        assert_eq!(toast.title, "Find on page isn't available for this page");
+    });
+
+    state.update(window_cx, |state, _| state.stop_pump());
+    window_cx.run_until_parked();
+}

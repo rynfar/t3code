@@ -10,7 +10,7 @@ mod tabs;
 use std::time::Duration;
 
 use gpui::{
-    App, Context, DragMoveEvent, Entity, EmptyView, IntoElement, ParentElement, Render, StyleRefinement,
+    App, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, StyleRefinement,
     Styled, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 use gpui_component::v_flex;
@@ -28,7 +28,7 @@ use crate::files::FilesPanel;
 use crate::theme::{hsla, palette};
 use crate::workspace::sidebar_inline_width;
 
-actions!(right_panel, [ToggleRightPanel, ToggleDiff, CloseActiveSurface, ReopenClosedView, ToggleMaximized]);
+actions!(right_panel, [ToggleRightPanel, ToggleDiff, CloseActiveSurface, ReopenClosedView, ToggleMaximized, NewSurface]);
 
 /// The actions behind `rightPanel.toggle`, `rightPanel.toggleMaximized`, `rightPanel.close`,
 /// `view.reopenClosed` and `diff.toggle`; `keymap` binds their keys and `when` clauses.
@@ -62,6 +62,9 @@ pub struct RightPanelView {
     previews: Vec<Entity<crate::preview::PreviewPane>>,
     /// One pane per open device tab of the showing thread; only the active one streams.
     devices: Vec<Entity<crate::device::DevicePane>>,
+    add_menu_open: bool,
+    add_menu_highlighted: usize,
+    add_menu_focus: FocusHandle,
     _save_width: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -85,10 +88,19 @@ impl RightPanelView {
         let subscription = cx.subscribe(&state, |this, state, event: &AppEvent, cx| match event {
             AppEvent::RightPanel => {
                 this.prune_side_chats(cx);
+                let open = state
+                    .read(cx)
+                    .panel_thread()
+                    .as_deref()
+                    .is_some_and(|thread| state.read(cx).panels.panels.is_open(thread));
+                if !open {
+                    this.add_menu_open = false;
+                }
                 cx.notify();
             }
             AppEvent::Selection => {
                 this.prune_side_chats(cx);
+                this.add_menu_open = false;
                 // A pending width save belongs to the thread that was showing: flush it now.
                 let flush = this._save_width.take().is_some();
                 state.update(cx, |state, cx| {
@@ -101,7 +113,116 @@ impl RightPanelView {
             }
             _ => {}
         });
-        RightPanelView { state, diff, pull_requests, files, side_chats: Vec::new(), previews: Vec::new(), devices: Vec::new(), _save_width: None, _subscription: subscription }
+        RightPanelView {
+            state,
+            diff,
+            pull_requests,
+            files,
+            side_chats: Vec::new(),
+            previews: Vec::new(),
+            devices: Vec::new(),
+            add_menu_open: false,
+            add_menu_highlighted: 0,
+            add_menu_focus: cx.focus_handle(),
+            _save_width: None,
+            _subscription: subscription,
+        }
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub fn is_add_menu_open(&self) -> bool {
+        self.add_menu_open
+    }
+
+    /// `rightPanel.new` (`RightPanelTabs.tsx`): opens and focuses the add-surface menu while the
+    /// right panel is open.
+    pub fn open_add_surface_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let is_open = state
+            .panel_thread()
+            .as_deref()
+            .is_some_and(|thread| state.panels.panels.is_open(thread));
+        if !is_open {
+            self.add_menu_open = false;
+            return;
+        }
+        let entries = tabs::add_menu_entries(state, cx);
+        self.add_menu_highlighted = entries.iter().position(|entry| entry.unavailable.is_none()).unwrap_or(0);
+        self.add_menu_open = true;
+        window.focus(&self.add_menu_focus, cx);
+        cx.notify();
+    }
+
+    pub fn toggle_add_surface_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.add_menu_open {
+            self.close_add_surface_menu(cx);
+        } else {
+            self.open_add_surface_menu(window, cx);
+        }
+    }
+
+    pub fn close_add_surface_menu(&mut self, cx: &mut Context<Self>) {
+        if self.add_menu_open {
+            self.add_menu_open = false;
+            cx.notify();
+        }
+    }
+
+    fn handle_add_menu_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.add_menu_open {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            cx.stop_propagation();
+            self.close_add_surface_menu(cx);
+            return;
+        }
+        let entries = tabs::add_menu_entries(self.state.read(cx), cx);
+        if entries.is_empty() {
+            return;
+        }
+        match key {
+            "up" | "down" => {
+                cx.stop_propagation();
+                let step: isize = if key == "down" { 1 } else { -1 };
+                let count = entries.len() as isize;
+                let mut index = self.add_menu_highlighted as isize;
+                for _ in 0..entries.len() {
+                    index = (index + step).rem_euclid(count);
+                    if entries[index as usize].unavailable.is_none() {
+                        self.add_menu_highlighted = index as usize;
+                        cx.notify();
+                        break;
+                    }
+                }
+            }
+            "enter" | "space" => {
+                cx.stop_propagation();
+                if let Some(entry) = entries.get(self.add_menu_highlighted)
+                    && entry.unavailable.is_none()
+                {
+                    let open = entry.open;
+                    self.close_add_surface_menu(cx);
+                    self.state.update(cx, open);
+                }
+            }
+            _ if !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt
+                && !event.keystroke.modifiers.platform =>
+            {
+                if let Some(entry) = entries
+                    .iter()
+                    .find(|entry| entry.unavailable.is_none() && entry.shortcut.eq_ignore_ascii_case(key))
+                {
+                    cx.stop_propagation();
+                    let open = entry.open;
+                    self.close_add_surface_menu(cx);
+                    self.state.update(cx, open);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn resize(&mut self, event: &DragMoveEvent<ResizeDrag>, window: &mut Window, cx: &mut Context<Self>) {
@@ -254,6 +375,26 @@ impl Render for RightPanelView {
             },
             None => tabs::empty_state(self.state.clone(), window, cx).into_any_element(),
         };
+        let view = cx.entity();
+        let add_menu = self.add_menu_open.then(|| {
+            let entries = tabs::add_menu_entries(self.state.read(cx), cx);
+            let close_view = view.clone();
+            let key_view = view.clone();
+            tabs::render_add_menu(
+                self.state.clone(),
+                &entries,
+                self.add_menu_highlighted,
+                &self.add_menu_focus,
+                move |cx| {
+                    close_view.update(cx, |this, cx| this.close_add_surface_menu(cx));
+                },
+                move |event, window, cx| {
+                    key_view.update(cx, |this, cx| this.handle_add_menu_key_down(event, window, cx));
+                },
+                cx,
+            )
+        });
+        let toggle_view = view.clone();
         v_flex()
             .id("right-panel")
             .relative()
@@ -264,10 +405,22 @@ impl Render for RightPanelView {
             .when(!panel.maximized, |this| {
                 this.flex_none().w(px(width)).border_l_1().border_color(hsla(p.border))
             })
+            .on_action(cx.listener(|this, _: &NewSurface, window, cx| this.open_add_surface_menu(window, cx)))
             .on_drag_move(cx.listener(Self::resize))
             .when(!panel.maximized, |this| this.child(self.render_resize_handle(cx)))
-            .child(tabs::tab_bar(self.state.clone(), &panel, titlebar_inset, window, cx))
+            .child(tabs::tab_bar(
+                self.state.clone(),
+                &panel,
+                titlebar_inset,
+                self.add_menu_open,
+                move |window, cx| {
+                    toggle_view.update(cx, |this, cx| this.toggle_add_surface_menu(window, cx));
+                },
+                window,
+                cx,
+            ))
             .child(div().flex_1().min_h_0().flex().flex_col().child(content))
+            .children(add_menu)
             .into_any_element()
     }
 }
@@ -305,4 +458,80 @@ pub fn header_controls(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                 .tooltip(crate::keymap::label("rightPanel.toggle", cx).map_or_else(|| "Toggle right panel".to_owned(), |key| format!("Toggle right panel ({key})")))
                 .on_click(move |_, _, cx| toggle_state.update(cx, |state, cx| state.toggle_right_panel(cx))),
         )
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use gpui::Keystroke;
+
+    #[gpui::test]
+    fn right_panel_new_action_opens_add_menu_and_handles_shortcuts(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::keymap::init(cx);
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::store::init(cx);
+            installed
+        });
+        state.update(cx, |state, cx| {
+            state.panels.panels = t3_core::right_panel::RightPanels::default();
+            state.select_thread("menu-thread", cx);
+        });
+
+        let (panel, vcx) = cx.add_window_view(|window, cx| RightPanelView::new(state.clone(), window, cx));
+
+        // While right panel is closed, `open_add_surface_menu` is a no-op.
+        vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
+            assert!(!panel.read(cx).is_add_menu_open());
+        });
+
+        // Open right panel -> `open_add_surface_menu` opens the add-surface menu and focuses it.
+        state.update(vcx, |state, cx| state.toggle_right_panel(cx));
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
+            assert!(panel.read(cx).is_add_menu_open());
+            window.draw(cx).clear();
+        });
+
+        // Pressing Escape dismisses the menu.
+        vcx.update(|window, cx| {
+            let esc = KeyDownEvent { keystroke: Keystroke::parse("escape").unwrap(), is_held: false, prefer_character_input: false };
+            panel.update(cx, |panel, cx| panel.handle_add_menu_key_down(&esc, window, cx));
+            assert!(!panel.read(cx).is_add_menu_open());
+        });
+
+        // Re-open menu and press `d` (Diff shortcut) -> closes menu and opens Diff surface.
+        vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
+            assert!(panel.read(cx).is_add_menu_open());
+            let diff_key = KeyDownEvent { keystroke: Keystroke::parse("d").unwrap(), is_held: false, prefer_character_input: false };
+            panel.update(cx, |panel, cx| panel.handle_add_menu_key_down(&diff_key, window, cx));
+            assert!(!panel.read(cx).is_add_menu_open());
+        });
+        state.read_with(vcx, |state, _| {
+            let active = state.panels.panels.active_surface("menu-thread").expect("diff surface opened");
+            assert!(matches!(active.kind, SurfaceKind::Diff));
+        });
+
+        // Closing the right panel resets an open add menu.
+        vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
+            assert!(panel.read(cx).is_add_menu_open());
+        });
+        state.update(vcx, |state, cx| state.toggle_right_panel(cx));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(!panel.read(cx).is_add_menu_open());
+        });
+
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
 }

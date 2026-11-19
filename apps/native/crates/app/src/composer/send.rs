@@ -4,7 +4,7 @@
 //! the previous one committed, as `declinePendingApprovals` and `persistThreadSettingsForNextTurn`
 //! await them.
 
-use gpui::{App, Context, Window};
+use gpui::{App, Context, EventEmitter, Window};
 use serde_json::Value;
 use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
 use t3_core::composer::attachments::{self, Attachment};
@@ -58,10 +58,47 @@ pub(super) struct Outgoing {
     pub(super) attachments: Vec<Value>,
 }
 
+/// Emitted by `Composer` after a `composer.sendAndNewThread` send to an existing server thread
+/// succeeds while the user is still viewing that thread (`useComposerSend.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SendAndNewThreadCompleted {
+    pub thread_id: String,
+}
+
+impl EventEmitter<SendAndNewThreadCompleted> for Composer {}
+
 impl Composer {
     pub(crate) fn send_alternate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.snapshot.running && !matches!(self.snapshot.target, Some(Target::Draft(_))) {
-            self.submit(SubmitIntent::Alternate, window, cx);
+            self.submit_with_dictation(SubmitIntent::Alternate, window, cx);
+        }
+    }
+
+    /// `composer.sendBackground`: starts a draft thread in the background and keeps the draft open.
+    pub(crate) fn send_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixed.is_none() && matches!(self.snapshot.target, Some(Target::Draft(_))) {
+            self.submit_with_dictation(SubmitIntent::Background, window, cx);
+        }
+    }
+
+    /// `composer.sendAndNewThread`: sends to the open server thread and opens a fresh draft only
+    /// after dispatch succeeds.
+    pub(crate) fn send_and_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixed.is_none() && matches!(self.snapshot.target, Some(Target::Thread(_))) {
+            self.submit_with_dictation(SubmitIntent::Background, window, cx);
+        }
+    }
+
+    pub(crate) fn submit_with_dictation(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.voice.read(cx).blocks_submission() {
+            if !self.voice.read(cx).preparing() {
+                self.voice_pending_intent = Some(intent);
+                self.voice.update(cx, |voice, cx| {
+                    voice.submit_after_dictation(cx);
+                });
+            }
+        } else {
+            self.submit(intent, window, cx);
         }
     }
 
@@ -820,6 +857,14 @@ impl Composer {
                     this.clear_usage_limits_for(&taken.target);
                     if sends_prompt {
                         this.state.update(cx, |state, cx| state.record_prompt_sent(star_origin, cx));
+                    }
+                    let shown = this.state.read(cx).environment() == taken.environment.as_deref()
+                        && this.snapshot.target.as_ref() == Some(&taken.target);
+                    if intent == SubmitIntent::Background
+                        && shown
+                        && let Target::Thread(ref thread_id) = taken.target
+                    {
+                        cx.emit(SendAndNewThreadCompleted { thread_id: thread_id.clone() });
                     }
                 }
                 cx.notify();

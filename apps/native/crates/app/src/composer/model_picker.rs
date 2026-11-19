@@ -23,7 +23,26 @@ use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
-actions!(model_picker, [HighlightPrevious, HighlightNext, PickHighlighted, ToggleHighlighted]);
+actions!(
+    model_picker,
+    [
+        HighlightPrevious,
+        HighlightNext,
+        PickHighlighted,
+        ToggleHighlighted,
+        PreviousProvider,
+        NextProvider,
+        JumpToModel1,
+        JumpToModel2,
+        JumpToModel3,
+        JumpToModel4,
+        JumpToModel5,
+        JumpToModel6,
+        JumpToModel7,
+        JumpToModel8,
+        JumpToModel9,
+    ]
+);
 
 const CONTEXT: &str = "ModelPicker";
 const RAIL_WIDTH: f32 = 44.;
@@ -322,6 +341,58 @@ impl ModelPicker {
             cx.emit(PickerEvent::InspectInstance(id));
         }
         cx.notify();
+    }
+
+    fn selectable_tabs(&self, cx: &App) -> Vec<Tab> {
+        let state = self.state.read(cx);
+        let Some(config) = state.server_config.config.as_ref() else {
+            return Vec::new();
+        };
+        let mut tabs = Vec::new();
+        if !providers::favorites(&config.settings).is_empty() {
+            tabs.push(Tab::Favorites);
+        }
+        for entry in providers::entries(config, self.input.project_id.as_deref()) {
+            let locked = self.input.locked_instance.as_deref().is_some_and(|locked| locked != entry.instance_id());
+            if entry.enabled && entry.is_ready() && !locked {
+                tabs.push(Tab::Instance(entry.instance_id().to_owned()));
+            }
+        }
+        tabs
+    }
+
+    /// `modelPicker.previousProvider` / `modelPicker.nextProvider` (`adjacentModelPickerProvider`).
+    pub(crate) fn step_provider(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = self.selectable_tabs(cx);
+        if tabs.is_empty() {
+            return;
+        }
+        let next_index = match tabs.iter().position(|tab| *tab == self.tab) {
+            Some(index) => (index as isize + direction).rem_euclid(tabs.len() as isize) as usize,
+            None if direction > 0 => 0,
+            None => tabs.len() - 1,
+        };
+        let next = tabs[next_index].clone();
+        self.search.update(cx, |search, cx| {
+            if !search.value().is_empty() {
+                search.set_value("", window, cx);
+            }
+        });
+        self.select_tab(next, cx);
+    }
+
+    /// `modelPicker.jump.1..9`: activates the Nth enabled model row (`0`-based).
+    pub(crate) fn jump_to_model(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((row_index, _)) = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, Row::Model { disabled: None, .. }))
+            .nth(index)
+        else {
+            return;
+        };
+        self.activate(row_index, false, cx);
     }
 
     fn activate(&mut self, index: usize, toggle: bool, cx: &mut Context<Self>) {
@@ -812,6 +883,17 @@ impl Render for ModelPicker {
                     this.activate(index, true, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &PreviousProvider, window, cx| this.step_provider(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &NextProvider, window, cx| this.step_provider(1, window, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel1, _, cx| this.jump_to_model(0, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel2, _, cx| this.jump_to_model(1, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel3, _, cx| this.jump_to_model(2, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel4, _, cx| this.jump_to_model(3, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel5, _, cx| this.jump_to_model(4, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel6, _, cx| this.jump_to_model(5, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel7, _, cx| this.jump_to_model(6, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel8, _, cx| this.jump_to_model(7, cx)))
+            .on_action(cx.listener(|this, _: &JumpToModel9, _, cx| this.jump_to_model(8, cx)))
             .on_action(cx.listener(|_, _: &Escape, _, cx| cx.emit(PickerEvent::Dismiss)))
             .child(
                 h_flex()

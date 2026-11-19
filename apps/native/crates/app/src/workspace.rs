@@ -22,8 +22,8 @@ use crate::icons::Icon;
 use crate::keymap::{
     self, CopyThreadReference, CycleAppearance, FocusNextWorkspaceArea, FocusPreviousWorkspaceArea, JumpToThread1, JumpToThread2, JumpToThread3,
     JumpToThread4, JumpToThread5, JumpToThread6, JumpToThread7, JumpToThread8, JumpToThread9, NextThread, PinThread, PreviousThread,
-    RegenerateThreadTitle, SelectTheme, SendBackground, SettleThread, StopThread, ToggleCommandPalette, ToggleFilePicker, ToggleProjectSearch,
-    ToggleSidebar, UndoThreadAction, Unimplemented,
+    RegenerateThreadTitle, SelectTheme, SendAndNewThread, SendBackground, SettleThread, StopThread, ToggleCommandPalette, ToggleFilePicker,
+    ToggleProjectSearch, ToggleSidebar, UndoThreadAction, Unimplemented,
 };
 use crate::palette::{CommandPalette, Mode as PaletteMode};
 use crate::right_panel::RightPanelView;
@@ -169,6 +169,9 @@ impl Workspace {
                 this.state.update(cx, |state, cx| state.set_sidebar_viewport(width, cx));
             }),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&composer, window, |this, _, event: &crate::composer::SendAndNewThreadCompleted, window, cx| {
+                this.finish_send_and_new_thread(&event.thread_id, window, cx);
+            }),
             cx.subscribe(&welcome, |_, _, _: &crate::onboarding::Visibility, cx| cx.notify()),
             cx.subscribe(&details_model, |_, _, _: &DetailsEvent, cx| cx.notify()),
             // The bar ticks while a subagent works; only swapping it for the composer re-lays out.
@@ -379,9 +382,12 @@ impl Render for Workspace {
                 this.composer.update(cx, |composer, cx| composer.focus(window, cx));
             }))
             .on_action(cx.listener(|this, _: &crate::composer::OpenWorkspace, window, cx| this.composer.update(cx, |composer, cx| composer.open_workspace(window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::OpenBranch, window, cx| this.composer.update(cx, |composer, cx| composer.open_base_branch_picker(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::OpenHost, window, cx| this.composer.update(cx, |composer, cx| composer.open_host(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::CycleHost, window, cx| this.composer.update(cx, |composer, cx| composer.cycle_host(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::UsePreviousWorktree, window, cx| this.composer.update(cx, |composer, cx| composer.use_previous_worktree(window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::IncreaseEffort, window, cx| this.composer.update(cx, |composer, cx| composer.step_reasoning_effort(1, window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::DecreaseEffort, window, cx| this.composer.update(cx, |composer, cx| composer.step_reasoning_effort(-1, window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::SendAlternate, window, cx| this.composer.update(cx, |composer, cx| composer.send_alternate(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::SteerQueuedMessage, window, cx| {
                 if !this.composer.update(cx, |composer, cx| composer.steer_queued_message(window, cx)) {
@@ -407,6 +413,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FocusNextWorkspaceArea, window, cx| this.move_workspace_focus(true, window, cx)))
             .on_action(cx.listener(|this, _: &FocusPreviousWorkspaceArea, window, cx| this.move_workspace_focus(false, window, cx)))
             .on_action(cx.listener(|this, _: &SendBackground, window, cx| this.send_background(window, cx)))
+            .on_action(cx.listener(|this, _: &SendAndNewThread, window, cx| this.send_and_new_thread(window, cx)))
+            .on_action(cx.listener(|this, _: &crate::right_panel::NewSurface, window, cx| this.open_right_panel_add_menu(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.state.update(cx, |state, cx| state.toggle_sidebar_or_sheet(cx))))
             .on_action(cx.listener(|this, _: &SelectTheme, window, cx| this.palette.update(cx, |palette, cx| palette.open_change_theme(window, cx))))
             .on_action(cx.listener(|this, _: &CycleAppearance, _, cx| this.cycle_appearance(cx)))
@@ -937,17 +945,16 @@ impl Workspace {
             self.state.update(cx, |state, cx| {
                 state.show_toast(
                     crate::toast::Toast::new(crate::toast::ToastKind::Warning, "Invalid keybindings configuration")
-                        .description(message),
+                        .description(message)
+                        .open_keybindings_config(),
                     cx,
                 );
             });
         }
     }
 
-    /// `workspace.focusNext` / `workspace.focusPrevious` (`workspaceFocus.ts`): cycles focus
-    /// between visible top-level workspace regions without escaping active modals or overlays.
-    fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let overlay_open = self.menu.read(cx).is_open()
+    fn has_blocking_overlay(&self, window: &mut Window, cx: &mut gpui::App) -> bool {
+        self.menu.read(cx).is_open()
             || self.dialog.read(cx).is_open()
             || self.snooze.read(cx).is_open()
             || self.palette.read(cx).is_open()
@@ -956,8 +963,13 @@ impl Workspace {
             || self.welcome.read(cx).is_open()
             || crate::settings::overlay(window, cx).is_some()
             || crate::usage::overlay(window, cx).is_some()
-            || crate::theme_editor::overlay(window, cx).is_some();
-        if overlay_open {
+            || crate::theme_editor::overlay(window, cx).is_some()
+    }
+
+    /// `workspace.focusNext` / `workspace.focusPrevious` (`workspaceFocus.ts`): cycles focus
+    /// between visible top-level workspace regions without escaping active modals or overlays.
+    fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_blocking_overlay(window, cx) {
             return;
         }
         let state = self.state.read(cx);
@@ -1031,8 +1043,189 @@ impl Workspace {
         let state = self.state.read(cx);
         if state.selected_thread.is_none() && state.draft_project.is_some() {
             self.composer.update(cx, |composer, cx| {
-                composer.submit(t3_core::composer::SubmitIntent::Background, window, cx);
+                composer.send_background(window, cx);
             });
         }
+    }
+
+    /// `composer.sendAndNewThread`: sends to the active server thread and opens a fresh draft in
+    /// the thread's project only after the send succeeds (`SendAndNewThreadCompleted`).
+    fn send_and_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_replaced {
+            return;
+        }
+        if self.state.read(cx).selected_thread.is_some() {
+            self.composer.update(cx, |composer, cx| {
+                composer.send_and_new_thread(window, cx);
+            });
+        }
+    }
+
+    fn finish_send_and_new_thread(&mut self, thread_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let project_id = {
+            let state = self.state.read(cx);
+            if state.selected_thread.as_deref() != Some(thread_id) {
+                return;
+            }
+            state
+                .thread_shell(thread_id)
+                .map(|thread| thread.project_id.clone())
+                .or_else(|| new_thread::default_project(state))
+        };
+        let Some(project_id) = project_id else {
+            return;
+        };
+        self.state.update(cx, |state, cx| state.start_draft(&project_id, cx));
+        let composer = self.composer.clone();
+        window.defer(cx, move |window, cx| {
+            composer.update(cx, |composer, cx| composer.focus(window, cx));
+        });
+    }
+
+    /// `rightPanel.new`: opens the right panel's add-surface menu while the panel is open and no
+    /// blocking overlay is shown (`RightPanelTabs.tsx`).
+    fn open_right_panel_add_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_blocking_overlay(window, cx) {
+            return;
+        }
+        self.right_panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[gpui::test]
+    async fn workspace_wires_keybindings_toast_action_and_send_and_new_thread_handoff(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::init(installed.0.clone(), cx);
+            crate::theme_editor::init(installed.0.clone(), cx);
+            crate::usage::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |state, cx| {
+            state.phase = Phase::Online(ConnectionStatus::Connected);
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.keybindings_config_path = Some("/tmp/keybindings.json".to_owned());
+                config.available_editors = vec!["vscode".to_owned()];
+                config.providers = serde_json::from_value(json!([{
+                    "driver": "claudeAgent",
+                    "instanceId": "claudeAgent",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "auth": { "status": "authenticated" },
+                    "models": [{ "slug": "sonnet", "name": "Sonnet", "isCustom": false }]
+                }]))
+                .unwrap();
+            }
+            state.select_thread("menu-thread", cx);
+        });
+
+        let window = cx.open_window(gpui::size(px(1200.), px(800.)), |_, _| gpui::EmptyView);
+        let workspace = cx
+            .update_window(window.into(), |_, window, cx| cx.new(|cx| Workspace::new(state.clone(), window, cx)))
+            .unwrap();
+
+        // 1. Live `keybindingsUpdated` stream issue -> warning toast with inline `Open keybindings.json` enabled.
+        state.update(cx, |state, cx| {
+            let event: t3_core::server_config::ServerConfigStreamEvent = serde_json::from_value(json!({
+                "version": 1,
+                "type": "keybindingsUpdated",
+                "payload": {
+                    "keybindings": [],
+                    "issues": [{ "kind": "keybindings.invalid-entry", "message": "Invalid chord on line 2", "index": 0 }]
+                }
+            }))
+            .unwrap();
+            assert!(state.server_config.apply(event));
+            cx.emit(AppEvent::ServerConfig);
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            let toast = state.toasts.latest().expect("keybindings warning toast");
+            assert_eq!(toast.kind, crate::toast::ToastKind::Warning);
+            assert_eq!(toast.title, "Invalid keybindings configuration");
+            assert_eq!(toast.description.as_deref(), Some("Invalid chord on line 2"));
+            assert!(toast.open_keybindings_config, "warning toast must carry Open keybindings.json action");
+        });
+
+        let expected_project = state.read_with(cx, |state, _| {
+            state.thread_shell("menu-thread").expect("fixture thread").project_id.clone()
+        });
+        // 2. `composer.sendAndNewThread` sends to `menu-thread` and switches to a fresh draft ONLY after RPC succeeds.
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.composer.update(cx, |composer, cx| composer.set_prompt("Ship the follow-up", window, cx));
+                ws.send_and_new_thread(window, cx);
+            });
+        })
+        .unwrap();
+        // While RPC is in flight, the workspace stays on `menu-thread` (no premature draft switch).
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.selected_thread.as_deref(), Some("menu-thread"));
+            assert!(state.draft_project.is_none());
+        });
+        let (method, payload, reply) = loop {
+            let (method, payload, reply) = fixture.next_request().await;
+            if method == t3_core::commands::method::DISPATCH_COMMAND && payload["type"] == "message.dispatch" {
+                break (method, payload, reply);
+            }
+            let _ = reply.send(Ok(json!({})));
+        };
+        assert_eq!(method, t3_core::commands::method::DISPATCH_COMMAND);
+        assert_eq!(payload["threadId"], "menu-thread");
+        let (draft_tx, draft_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut draft_tx = Some(draft_tx);
+        let expected_for_sub = expected_project.clone();
+        let _draft_sub = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event: &AppEvent, _| {
+                if *event == AppEvent::Selection
+                    && state.selected_thread.is_none()
+                    && state.draft_project.as_deref() == Some(expected_for_sub.as_str())
+                    && let Some(tx) = draft_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        reply.send(Ok(json!({}))).unwrap();
+        draft_rx.await.unwrap();
+        drop(_draft_sub);
+        cx.run_until_parked();
+
+        // After RPC succeeds, workspace switches to a fresh draft in the thread's project.
+        state.read_with(cx, |state, _| {
+            assert!(state.selected_thread.is_none(), "sendAndNewThread opens a fresh draft after success");
+            assert_eq!(state.draft_project.as_deref(), Some(expected_project.as_str()));
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

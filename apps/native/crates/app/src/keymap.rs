@@ -43,6 +43,7 @@ actions!(
         StopThread,
         RegenerateThreadTitle,
         SendBackground,
+        SendAndNewThread,
         Unimplemented,
     ]
 );
@@ -81,18 +82,34 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "chat.newWithoutProject" => Box::new(crate::new_thread::NewThreadWithoutProject),
         "chat.find" => Box::new(crate::thread_view::FindInThread),
         "modelPicker.toggle" | "composer.effort" => Box::new(crate::composer::ToggleModelPicker),
+        "modelPicker.previousProvider" => Box::new(crate::composer::model_picker::PreviousProvider),
+        "modelPicker.nextProvider" => Box::new(crate::composer::model_picker::NextProvider),
+        "modelPicker.jump.1" => Box::new(crate::composer::model_picker::JumpToModel1),
+        "modelPicker.jump.2" => Box::new(crate::composer::model_picker::JumpToModel2),
+        "modelPicker.jump.3" => Box::new(crate::composer::model_picker::JumpToModel3),
+        "modelPicker.jump.4" => Box::new(crate::composer::model_picker::JumpToModel4),
+        "modelPicker.jump.5" => Box::new(crate::composer::model_picker::JumpToModel5),
+        "modelPicker.jump.6" => Box::new(crate::composer::model_picker::JumpToModel6),
+        "modelPicker.jump.7" => Box::new(crate::composer::model_picker::JumpToModel7),
+        "modelPicker.jump.8" => Box::new(crate::composer::model_picker::JumpToModel8),
+        "modelPicker.jump.9" => Box::new(crate::composer::model_picker::JumpToModel9),
         "composer.workspace" => Box::new(crate::composer::OpenWorkspace),
+        "composer.branch" => Box::new(crate::composer::OpenBranch),
         "composer.host" => Box::new(crate::composer::OpenHost),
         "composer.cycleHost" => Box::new(crate::composer::CycleHost),
         "composer.previousWorktree" => Box::new(crate::composer::UsePreviousWorktree),
+        "composer.increaseEffort" => Box::new(crate::composer::IncreaseEffort),
+        "composer.decreaseEffort" => Box::new(crate::composer::DecreaseEffort),
         "composer.mode" => Box::new(crate::composer::OpenPermissions),
         "composer.stash" => Box::new(crate::composer::StashPrompt),
         "composer.sendAlternate" => Box::new(crate::composer::SendAlternate),
         "composer.sendBackground" => Box::new(SendBackground),
+        "composer.sendAndNewThread" => Box::new(SendAndNewThread),
         "composer.dictation" => Box::new(crate::voice::Dictation),
         "thread.steerQueuedMessage" => Box::new(crate::composer::SteerQueuedMessage),
         "thread.editQueuedMessage" => Box::new(crate::composer::EditQueuedMessage),
         "rightPanel.toggle" => Box::new(crate::right_panel::ToggleRightPanel),
+        "rightPanel.new" => Box::new(crate::right_panel::NewSurface),
         "rightPanel.toggleMaximized" => Box::new(crate::right_panel::ToggleMaximized),
         "rightPanel.close" => Box::new(crate::right_panel::CloseActiveSurface),
         "view.reopenClosed" => Box::new(crate::right_panel::ReopenClosedView),
@@ -103,6 +120,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "preview.zoomIn" => Box::new(crate::preview::ZoomIn),
         "preview.zoomOut" => Box::new(crate::preview::ZoomOut),
         "preview.resetZoom" => Box::new(crate::preview::ResetZoom),
+        "preview.find" => Box::new(crate::preview::Find),
         "pullRequest.copyNumber" => Box::new(crate::pull_requests::CopyPullRequestNumber),
         "terminal.toggle" => Box::new(crate::terminal::ToggleTerminal),
         "terminal.split" => Box::new(crate::terminal::SplitTerminal),
@@ -303,15 +321,39 @@ mod tests {
     use std::any::TypeId;
 
     #[test]
-    fn action_for_maps_theme_appearance_thread_and_chat_new_local() {
-        assert_eq!(action_for("theme.select").as_any().type_id(), TypeId::of::<SelectTheme>());
-        assert_eq!(action_for("appearance.cycle").as_any().type_id(), TypeId::of::<CycleAppearance>());
-        assert_eq!(action_for("thread.stop").as_any().type_id(), TypeId::of::<StopThread>());
-        assert_eq!(action_for("thread.regenerateTitle").as_any().type_id(), TypeId::of::<RegenerateThreadTitle>());
-        assert_eq!(action_for("chat.newLocal").as_any().type_id(), TypeId::of::<crate::new_thread::NewThread>());
-        assert_eq!(action_for("workspace.focusNext").as_any().type_id(), TypeId::of::<FocusNextWorkspaceArea>());
-        assert_eq!(action_for("workspace.focusPrevious").as_any().type_id(), TypeId::of::<FocusPreviousWorkspaceArea>());
-        assert_eq!(action_for("composer.sendBackground").as_any().type_id(), TypeId::of::<SendBackground>());
+    fn action_for_maps_every_static_keybinding_command() {
+        let unimplemented = TypeId::of::<Unimplemented>();
+        for &command in t3_core::keybindings::STATIC_KEYBINDING_COMMANDS {
+            let action = action_for(command);
+            assert_ne!(
+                action.as_any().type_id(),
+                unimplemented,
+                "command `{command}` should map to a concrete action, not Unimplemented"
+            );
+        }
+        assert_eq!(action_for("composer.sendAndNewThread").as_any().type_id(), TypeId::of::<SendAndNewThread>());
+        assert_eq!(action_for("composer.branch").as_any().type_id(), TypeId::of::<crate::composer::OpenBranch>());
+        assert_eq!(action_for("composer.increaseEffort").as_any().type_id(), TypeId::of::<crate::composer::IncreaseEffort>());
+        assert_eq!(action_for("composer.decreaseEffort").as_any().type_id(), TypeId::of::<crate::composer::DecreaseEffort>());
+        assert_eq!(action_for("rightPanel.new").as_any().type_id(), TypeId::of::<crate::right_panel::NewSurface>());
+        assert_eq!(action_for("preview.find").as_any().type_id(), TypeId::of::<crate::preview::Find>());
+        assert_eq!(
+            action_for("modelPicker.previousProvider").as_any().type_id(),
+            TypeId::of::<crate::composer::model_picker::PreviousProvider>()
+        );
+        assert_eq!(
+            action_for("modelPicker.nextProvider").as_any().type_id(),
+            TypeId::of::<crate::composer::model_picker::NextProvider>()
+        );
+        assert_eq!(
+            action_for("modelPicker.jump.1").as_any().type_id(),
+            TypeId::of::<crate::composer::model_picker::JumpToModel1>()
+        );
+        assert_eq!(
+            action_for("modelPicker.jump.9").as_any().type_id(),
+            TypeId::of::<crate::composer::model_picker::JumpToModel9>()
+        );
+        assert_eq!(action_for("unknown.command").as_any().type_id(), unimplemented);
     }
 
     #[test]
