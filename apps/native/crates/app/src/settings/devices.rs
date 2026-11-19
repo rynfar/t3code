@@ -4,6 +4,7 @@
 //! and `SimlockDeviceHostEditor`.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, SharedString,
@@ -37,6 +38,7 @@ use crate::toast::{Toast, ToastKind};
 
 const STORED_SECRET: &str = "__stored__";
 const AUTO_EAS_APP: &str = "__auto__";
+const ADD_MENU_REOPEN_GUARD: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
@@ -121,6 +123,7 @@ pub(crate) struct DevicesState {
     tool_busy: Option<&'static str>,
     tool_error: Option<String>,
     add_menu_open: bool,
+    add_menu_dismissed: Option<Instant>,
     row_checks: HashMap<String, SshCheckState>,
     editor: Option<HostEditor>,
     _subscription: Option<Subscription>,
@@ -142,10 +145,34 @@ impl DevicesState {
             tool_busy: None,
             tool_error: None,
             add_menu_open: false,
+            add_menu_dismissed: None,
             row_checks: HashMap::new(),
             editor: None,
             _subscription: subscription,
         }
+    }
+
+    /// Toggles the `Add source` menu, suppressing the GPUI mouse-down-outside -> mouse-up-click
+    /// reopen race when clicking the trigger button while the menu is already open.
+    fn toggle_add_menu(&mut self, now: Instant) {
+        if self.add_menu_open {
+            self.add_menu_open = false;
+            self.add_menu_dismissed = None;
+            return;
+        }
+        if self
+            .add_menu_dismissed
+            .is_some_and(|at| now.saturating_duration_since(at) < ADD_MENU_REOPEN_GUARD)
+        {
+            self.add_menu_dismissed = None;
+            return;
+        }
+        self.add_menu_open = true;
+    }
+
+    fn dismiss_add_menu_outside(&mut self, now: Instant) {
+        self.add_menu_open = false;
+        self.add_menu_dismissed = Some(now);
     }
 }
 
@@ -388,7 +415,7 @@ impl SettingsView {
 
         let add_open = self.devices.add_menu_open;
         let show_eas = service.supports_eas_hosts;
-        let show_simlock = service.supports_simlock_hosts && config.settings.simlock_device_hosts_enabled;
+        let show_simlock = service.supports_simlock_hosts && config.settings.threads.simlock_device_hosts_enabled;
 
         let add_menu = div()
             .relative()
@@ -398,7 +425,7 @@ impl SettingsView {
                     .label("Add source")
                     .disabled(!can_write)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.devices.add_menu_open = !this.devices.add_menu_open;
+                        this.devices.toggle_add_menu(Instant::now());
                         cx.notify();
                     })),
             )
@@ -431,7 +458,7 @@ impl SettingsView {
                                     .bg(hsla(p.popover))
                                     .shadow(floating_shadow(cx.theme().is_dark()))
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                        this.devices.add_menu_open = false;
+                                        this.devices.dismiss_add_menu_outside(Instant::now());
                                         cx.notify();
                                     }))
                                     .child(menu_item("add-device-ssh", "Machine over SSH").on_click(cx.listener(|this, _, window, cx| {
@@ -1297,6 +1324,7 @@ impl SettingsView {
                     Select::new("eas-token-source", secret_source_options(config))
                         .selected(ed.source.clone())
                         .width(156.)
+                        .disabled(ed.saving)
                         .on_change(move |next, window, cx| {
                             let next_str = next.to_string();
                             let _ = view_source.update(cx, |this, cx| {
@@ -1307,7 +1335,11 @@ impl SettingsView {
                                         input.set_masked(is_stored, window, cx);
                                         input.set_value(String::new(), window, cx);
                                     });
-                                    ed.token_editor.set_validity(is_stored);
+                                    if is_stored {
+                                        ed.token_editor.switch_to_stored();
+                                    } else {
+                                        ed.token_editor.set_validity(false);
+                                    }
                                     cx.notify();
                                 }
                             });
@@ -1458,6 +1490,7 @@ impl SettingsView {
                     Select::new("simlock-token-source", secret_source_options(config))
                         .selected(ed.source.clone())
                         .width(156.)
+                        .disabled(ed.saving)
                         .on_change(move |next, window, cx| {
                             let next_str = next.to_string();
                             let _ = view_source.update(cx, |this, cx| {
@@ -1468,7 +1501,11 @@ impl SettingsView {
                                         input.set_masked(is_stored, window, cx);
                                         input.set_value(String::new(), window, cx);
                                     });
-                                    ed.token_editor.set_validity(is_stored);
+                                    if is_stored {
+                                        ed.token_editor.switch_to_stored();
+                                    } else {
+                                        ed.token_editor.set_validity(false);
+                                    }
                                     cx.notify();
                                 }
                             });
@@ -1605,5 +1642,76 @@ impl SettingsView {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switching_eas_and_simlock_secret_source_to_stored_never_leaks_stale_reference() {
+        let reference = SecretValue::reference("op", "op://Vault/Expo/token").unwrap();
+
+        // EAS host originally saved with a secret reference: switching to Stored secret clears it.
+        let eas_ref = EasHostConfig { access_token: reference.clone(), ..EasHostConfig::new("eas-1") };
+        let mut eas_ed = EasTokenEditor::new(&eas_ref, false);
+        assert_eq!(eas_ed.token_for_save(), reference);
+        eas_ed.switch_to_stored();
+        assert!(eas_ed.token_for_save().is_empty());
+        assert_eq!(eas_ed.check_payload("eas-1"), json!({ "accessToken": "" }));
+        assert!(eas_ed.valid());
+
+        // EAS host originally saved with a literal, user committed a reference then switched back to Stored:
+        // restores the saved literal instead of leaking the committed reference.
+        let eas_lit = EasHostConfig { access_token: SecretValue::Literal("__REDACTED__".into()), ..EasHostConfig::new("eas-2") };
+        let mut eas_lit_ed = EasTokenEditor::new(&eas_lit, false);
+        eas_lit_ed.set_token(Some(reference.clone()));
+        eas_lit_ed.switch_to_stored();
+        assert!(eas_lit_ed.configured());
+        assert_eq!(eas_lit_ed.token_for_save(), SecretValue::Literal("__REDACTED__".into()));
+
+        // Simlock host originally saved with a secret reference: switching to Stored secret clears it.
+        let sim_ref = SimlockHostConfig {
+            gateway_url: "https://gw.example.ts.net:4700".into(),
+            agent_token: reference,
+            ..SimlockHostConfig::new("sim-1")
+        };
+        let mut sim_ed = SimlockTokenEditor::new(&sim_ref, false);
+        sim_ed.switch_to_stored();
+        assert!(sim_ed.token_for_save().is_empty());
+        assert_eq!(
+            sim_ed.check_payload("sim-1", "https://gw.example.ts.net:4700"),
+            json!({ "gatewayUrl": "https://gw.example.ts.net:4700", "agentToken": "" })
+        );
+    }
+
+    #[test]
+    fn add_source_menu_reopen_guard_blocks_immediate_mouse_up_reopen() {
+        let mut state = DevicesState {
+            pending: None,
+            retrying: None,
+            tool_popover: None,
+            tool_busy: None,
+            tool_error: None,
+            add_menu_open: false,
+            add_menu_dismissed: None,
+            row_checks: HashMap::new(),
+            editor: None,
+            _subscription: None,
+        };
+        let t0 = Instant::now();
+        state.toggle_add_menu(t0);
+        assert!(state.add_menu_open);
+
+        // Mouse down on trigger fires on_mouse_down_out, then mouse up fires on_click 20ms later.
+        state.dismiss_add_menu_outside(t0 + Duration::from_millis(10));
+        assert!(!state.add_menu_open);
+        state.toggle_add_menu(t0 + Duration::from_millis(30));
+        assert!(!state.add_menu_open, "reopen guard keeps menu closed on mouse-up");
+
+        // Clicking again after the guard window opens the menu normally.
+        state.toggle_add_menu(t0 + Duration::from_millis(300));
+        assert!(state.add_menu_open);
     }
 }

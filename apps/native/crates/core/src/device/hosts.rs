@@ -306,6 +306,18 @@ impl EasTokenEditor {
         self.valid = true;
     }
 
+    /// Switching the source picker back to "Stored secret": restores a previously saved literal
+    /// token, or clears so a previously saved or committed secret reference cannot leak while
+    /// the stored-secret input is empty (`SecretSourceInput.tsx:248-252`).
+    pub fn switch_to_stored(&mut self) {
+        if !self.saved.is_empty() && !self.saved.is_reference() {
+            self.token = TokenDraft::Saved;
+            self.valid = true;
+        } else {
+            self.clear();
+        }
+    }
+
     /// The token Save writes.
     pub fn token_for_save(&self) -> SecretValue {
         match &self.token {
@@ -673,6 +685,17 @@ impl SimlockTokenEditor {
     pub fn clear(&mut self) {
         self.token = TokenDraft::Cleared;
         self.valid = true;
+    }
+
+    /// Switching the source picker back to "Stored secret": restores a previously saved literal
+    /// token, or clears so a saved/committed `SecretValue::Reference` never leaks while empty.
+    pub fn switch_to_stored(&mut self) {
+        if !self.saved.is_empty() && !self.saved.is_reference() {
+            self.token = TokenDraft::Saved;
+            self.valid = true;
+        } else {
+            self.clear();
+        }
     }
 
     pub fn token_for_save(&self) -> SecretValue {

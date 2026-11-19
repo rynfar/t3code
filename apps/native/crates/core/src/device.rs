@@ -122,7 +122,8 @@ pub struct ToolVersion {
 }
 
 impl ToolVersion {
-    /// The version shown on the trigger button: running, else required if installed, else latest installed.
+    /// The version shown on the trigger button: running, else required if installed, else highest
+    /// numeric installed version (`DeviceToolVersions.tsx`).
     pub fn display_version(&self) -> Option<&str> {
         if let Some(running) = self.running_version.as_deref() {
             return Some(running);
@@ -130,13 +131,45 @@ impl ToolVersion {
         if self.installed_versions.iter().any(|v| v == &self.required_version) {
             return Some(self.required_version.as_str());
         }
-        self.installed_versions.iter().max().map(String::as_str)
+        self.installed_versions.iter().max_by(|a, b| cmp_numeric_version(a, b)).map(String::as_str)
     }
 
     pub fn needs_update(&self) -> bool {
         self.running_version.as_deref().is_some_and(|v| v != self.required_version)
             || !self.installed_versions.iter().any(|v| v == &self.required_version)
     }
+}
+
+/// Numeric-aware version comparison matching JS `localeCompare(..., { numeric: true })` so
+/// `"10.0.0" > "9.0.0"` and `"1.10.2" > "1.2.9"`.
+fn cmp_numeric_version(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut ab, mut bb) = (a.as_bytes(), b.as_bytes());
+    while !ab.is_empty() && !bb.is_empty() {
+        if ab[0].is_ascii_digit() && bb[0].is_ascii_digit() {
+            let an = ab.iter().take_while(|c| c.is_ascii_digit()).count();
+            let bn = bb.iter().take_while(|c| c.is_ascii_digit()).count();
+            let (ad, bd) = (&ab[..an], &bb[..bn]);
+            let (at, bt) = (
+                ad.iter().position(|c| *c != b'0').map_or(&b""[..], |i| &ad[i..]),
+                bd.iter().position(|c| *c != b'0').map_or(&b""[..], |i| &bd[i..]),
+            );
+            let ord = at.len().cmp(&bt.len()).then_with(|| at.cmp(bt)).then_with(|| ad.len().cmp(&bd.len()));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ab = &ab[an..];
+            bb = &bb[bn..];
+        } else {
+            let ord = ab[0].to_ascii_lowercase().cmp(&bb[0].to_ascii_lowercase()).then_with(|| ab[0].cmp(&bb[0]));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ab = &ab[1..];
+            bb = &bb[1..];
+        }
+    }
+    ab.len().cmp(&bb.len())
 }
 
 /// `DeviceToolVersions`.

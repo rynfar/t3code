@@ -494,6 +494,12 @@ fn ssh_simlock_and_tool_versions_decode_validate_and_patch() {
     assert!(tools.hub.needs_update());
     assert_eq!(tools.agent.display_version(), Some("1.2.0"));
     assert!(!tools.agent.needs_update());
+    let numeric = ToolVersion {
+        required_version: "11.0.0".into(),
+        installed_versions: vec!["9.0.0".into(), "10.0.0".into(), "2.1.0".into()],
+        running_version: None,
+    };
+    assert_eq!(numeric.display_version(), Some("10.0.0"));
     assert_eq!(update_tool_payload("hub"), json!({ "updateTool": "hub" }));
     assert_eq!(inspect_only_payload(), json!({ "inspectOnly": true }));
 

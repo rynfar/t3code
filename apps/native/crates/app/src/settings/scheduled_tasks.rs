@@ -727,12 +727,13 @@ impl SettingsView {
     /// The row's "…" menu: Edit, Deliveries (webhook), Run now (non-webhook), Delete.
     fn task_menu(&self, task: &ScheduledTask, busy: bool, can_operate: bool, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
-        let open = self.scheduled.menu.as_deref() == Some(task.id.as_str());
+        let disabled = task_menu_disabled(busy, task.is_webhook(), can_operate);
+        let open = !disabled && self.scheduled.menu.as_deref() == Some(task.id.as_str());
         let id = task.id.clone();
         let trigger = Button::new(SharedString::from(format!("scheduled-task-menu-{}", task.id)), ButtonVariant::GhostMuted, ButtonSize::IconSm)
             .icon(Icon::Ellipsis)
             .tooltip(format!("Actions for {}", task.title))
-            .disabled(busy)
+            .disabled(disabled)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.scheduled.menu = if open { None } else { Some(id.clone()) };
                 cx.notify();
@@ -1542,5 +1543,26 @@ impl SettingsView {
             )
             .child(sig_box)
             .into_any_element()
+    }
+}
+
+/// Disable the task row menu when an operation is in flight or when a read-only non-webhook task
+/// would otherwise render an empty 0-item popup (`ScheduledTasksSettings.tsx:826`).
+fn task_menu_disabled(busy: bool, is_webhook: bool, can_operate: bool) -> bool {
+    busy || (!is_webhook && !can_operate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_menu_disabled;
+
+    #[test]
+    fn task_menu_is_disabled_for_busy_or_read_only_non_webhook_tasks() {
+        assert!(task_menu_disabled(true, true, true));
+        assert!(task_menu_disabled(true, false, true));
+        assert!(task_menu_disabled(false, false, false));
+        assert!(!task_menu_disabled(false, true, false));
+        assert!(!task_menu_disabled(false, false, true));
+        assert!(!task_menu_disabled(false, true, true));
     }
 }

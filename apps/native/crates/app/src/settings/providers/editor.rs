@@ -346,7 +346,7 @@ impl SettingsView {
                 cx.notify();
             });
             controls = controls.child(Select::new("provider-auth-method", options).selected(current.clone()).label(label).width(176.).on_change(move |value, window, cx| pick(&value, window, cx)));
-            if let Some(method) = chosen_method.filter(|m| m.account_email.is_some()) {
+            if let Some(method) = chosen_method.filter(|m| m.is_removable()) {
                 let rm_instance = instance_id.clone();
                 let rm_method = method.id.clone();
                 let rm_name = method.name.clone();
@@ -1059,5 +1059,39 @@ impl SettingsView {
             }
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use t3_core::settings::providers::auth::AuthMethod;
+
+    #[test]
+    fn auth_method_removal_gates_on_can_remove_not_account_email() {
+        let default_completed: AuthMethod = serde_json::from_value(json!({
+            "id": "chatgpt-default",
+            "name": "ChatGPT",
+            "accountEmail": "user@example.com"
+        }))
+        .unwrap();
+        assert!(!default_completed.is_removable());
+
+        let explicit_false: AuthMethod = serde_json::from_value(json!({
+            "id": "chatgpt-primary",
+            "name": "ChatGPT",
+            "accountEmail": "user@example.com",
+            "canRemove": false
+        }))
+        .unwrap();
+        assert!(!explicit_false.is_removable());
+
+        let removable_incomplete: AuthMethod = serde_json::from_value(json!({
+            "id": "chatgpt-profile:pending",
+            "name": "Incomplete connection",
+            "canRemove": true
+        }))
+        .unwrap();
+        assert!(removable_incomplete.is_removable());
     }
 }

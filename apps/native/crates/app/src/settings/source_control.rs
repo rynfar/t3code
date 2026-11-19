@@ -4,7 +4,7 @@
 //! `SourceControlTokenSettings`, `SourceControlAccountSettings`, `SourceControlHostSettings`),
 //! and `SourceControlWritingSettings.tsx`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use gpui::{
     AnyElement, App, AppContext, ClipboardItem, Context, Entity, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
@@ -16,9 +16,10 @@ use serde_json::{Map, Value, json};
 use t3_core::device::hosts::SecretValue;
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::source_control::{
-    self, AppSignInDef, DISCOVER, Discovery, DiscoveryItem, Dot, HostCredentialsDef, HostDefinition, MERGE_METHODS, SIGN_IN_CANCEL, SIGN_IN_START,
-    SIGN_IN_WAIT, SignInPrompt, SourceControlChange, WritingMode, decode_discovery, decode_sign_in_prompt, group_host_accounts, has_secret_value,
-    host_definition, merge_method_value, next_host_account_choices, parse_merge_method, read_host_credential_settings, read_host_fields,
+    self, AppSignInDef, DISCOVER, Discovery, DiscoveryItem, Dot, HostCredentialsDef, HostDefinition, HostFieldDef, MERGE_METHODS, SIGN_IN_CANCEL,
+    SIGN_IN_START, SIGN_IN_WAIT, SignInPrompt, SourceControlChange, WritingMode, decode_discovery, decode_sign_in_prompt, group_host_accounts,
+    has_secret_value, host_definition, merge_method_value, next_host_account_choices, parse_merge_method, read_host_credential_settings,
+    read_host_fields,
 };
 
 use super::controls::{
@@ -95,8 +96,10 @@ struct TokenEditorState {
 struct GenericHostState {
     inputs: HashMap<String, Entity<InputState>>,
     sources: HashMap<String, String>,
+    cleared_fields: HashSet<String>,
     saving: bool,
     synced_signature: String,
+    _subscriptions: Vec<Subscription>,
 }
 
 pub(crate) struct SourceControlState {
@@ -205,6 +208,54 @@ fn secret_placeholder(source: &str, configured: bool, fallback: &str) -> String 
 
 fn mask_account(account: &str, revealed: bool) -> String {
     if revealed { account.to_owned() } else { "\u{2022}".repeat(8) }
+}
+
+/// Account pinning is read-only when the user cannot write settings or the host is disabled.
+fn account_select_disabled(can_write: bool, enabled: bool) -> bool {
+    !can_write || !enabled
+}
+
+/// Builds a partial `sourceControlHosts.<kind>` field patch for generic host forms (e.g. Bitbucket),
+/// preserving untouched secrets while allowing any single saved secret or reference to be cleared
+/// with `""` without wiping the remaining fields on that host.
+fn build_generic_host_patch(
+    fields_def: &[HostFieldDef],
+    saved: &BTreeMap<String, SecretValue>,
+    raw_values: &HashMap<String, String>,
+    sources: &HashMap<String, String>,
+    cleared: &HashSet<String>,
+) -> Result<Map<String, Value>, String> {
+    let mut fields = Map::new();
+    for field in fields_def {
+        let raw = raw_values.get(field.key).map(|s| s.trim()).unwrap_or_default();
+        let source = sources.get(field.key).map(String::as_str).unwrap_or(STORED_SECRET);
+        let saved_val = saved.get(field.key);
+        if field.secret {
+            if source != STORED_SECRET {
+                let Some(secret) = SecretValue::reference(source, raw) else {
+                    return Err(format!("Enter a valid secret reference for {}.", field.label));
+                };
+                if saved_val != Some(&secret) {
+                    fields.insert(field.key.to_owned(), secret.encode());
+                }
+            } else if !raw.is_empty() {
+                fields.insert(field.key.to_owned(), Value::String(raw.to_owned()));
+            } else if cleared.contains(field.key) || saved_val.is_some_and(SecretValue::is_reference) {
+                // Switching a saved secret-provider reference back to stored with an empty value,
+                // or explicitly clearing a saved secret, sends "" for just this field.
+                fields.insert(field.key.to_owned(), Value::String(String::new()));
+            }
+        } else {
+            let saved_text = match saved_val {
+                Some(SecretValue::Literal(text)) => text.as_str(),
+                _ => "",
+            };
+            if raw != saved_text {
+                fields.insert(field.key.to_owned(), Value::String(raw.to_owned()));
+            }
+        }
+    }
+    Ok(fields)
 }
 
 impl SettingsView {
@@ -337,23 +388,41 @@ impl SettingsView {
     fn ensure_generic_editor(&mut self, def: &HostDefinition, config: &ServerConfig, window: &mut Window, cx: &mut Context<Self>) {
         let saved = read_host_fields(&config.settings.source_control_hosts, def.kind);
         let signature = format!("{:?}", saved);
+        let mut new_subscriptions = Vec::new();
         let editor = self.source_control.generic_editors.entry(def.kind.to_owned()).or_insert_with(|| GenericHostState {
             inputs: HashMap::new(),
             sources: HashMap::new(),
+            cleared_fields: HashSet::new(),
             saving: false,
             synced_signature: String::new(),
+            _subscriptions: Vec::new(),
         });
         for field in def.fields {
-            editor.inputs.entry(field.key.to_owned()).or_insert_with(|| {
-                cx.new(|cx| {
+            if !editor.inputs.contains_key(field.key) {
+                let input = cx.new(|cx| {
                     let input = InputState::new(window, cx).placeholder(field.placeholder);
                     if field.secret { input.masked(true) } else { input }
-                })
-            });
+                });
+                let kind_for_edit = def.kind.to_owned();
+                let key_for_edit = field.key.to_owned();
+                new_subscriptions.push(cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        if !input.read(cx).value().trim().is_empty()
+                            && let Some(ed) = this.source_control.generic_editors.get_mut(&kind_for_edit)
+                        {
+                            ed.cleared_fields.remove(&key_for_edit);
+                        }
+                        cx.notify();
+                    }
+                }));
+                editor.inputs.insert(field.key.to_owned(), input);
+            }
             editor.sources.entry(field.key.to_owned()).or_insert_with(|| STORED_SECRET.to_owned());
         }
+        editor._subscriptions.extend(new_subscriptions);
         if editor.synced_signature != signature {
             editor.synced_signature = signature;
+            editor.cleared_fields.clear();
             for field in def.fields {
                 let Some(input) = editor.inputs.get(field.key) else { continue };
                 match saved.get(field.key) {
@@ -1003,6 +1072,7 @@ impl SettingsView {
             Select::new(SharedString::from(format!("sc-token-source-{}", def.kind)), secret_source_options(config))
                 .selected(source.clone())
                 .width(156.)
+                .disabled(!can_write || saving)
                 .on_change(move |next, window, cx| {
                     let next_str = next.to_string();
                     let _ = view_for_source.update(cx, |this, cx| {
@@ -1239,11 +1309,16 @@ impl SettingsView {
                             h_flex()
                                 .gap(r(8.))
                                 .when(!group_item.selectable.is_empty(), |h| {
+                                    let select_disabled = account_select_disabled(can_write, enabled);
                                     h.child(
                                         Select::new(SharedString::from(format!("sc-acct-{}-{}", def.kind, group_item.host)), options)
                                             .selected(selected_value)
                                             .width(196.)
+                                            .disabled(select_disabled)
                                             .on_change(move |value, _, cx| {
+                                                if select_disabled {
+                                                    return;
+                                                }
                                                 let next_account = if value.as_ref() == ACTIVE_ACCOUNT { None } else { Some(value.to_string()) };
                                                 let next = next_host_account_choices(&select_hosts, &select_host, None, Some(next_account));
                                                 let _ = view_select.update(cx, |this, cx| {
@@ -1348,13 +1423,16 @@ impl SettingsView {
         let saving = editor.saving;
         let inputs = editor.inputs.clone();
         let sources = editor.sources.clone();
+        let cleared_fields = editor.cleared_fields.clone();
 
         let mut body = v_flex().gap(r(12.)).pt(r(8.));
         for field in def.fields {
             let Some(input) = inputs.get(field.key) else { continue };
             let source = sources.get(field.key).cloned().unwrap_or_else(|| STORED_SECRET.to_owned());
             let field_saved = saved.get(field.key);
-            let is_configured = field.secret && has_secret_value(field_saved) && !field_saved.is_some_and(SecretValue::is_reference);
+            let is_cleared = cleared_fields.contains(field.key);
+            let field_has_saved = field.secret && has_secret_value(field_saved);
+            let is_configured = field_has_saved && !is_cleared && !field_saved.is_some_and(SecretValue::is_reference);
             let kind_for_source = def.kind.to_owned();
             let key_for_source = field.key.to_owned();
             let view_for_source = cx.entity().downgrade();
@@ -1362,12 +1440,16 @@ impl SettingsView {
                 Select::new(SharedString::from(format!("sc-field-source-{}-{}", def.kind, field.key)), secret_source_options(config))
                     .selected(source.clone())
                     .width(156.)
+                    .disabled(!can_write || saving)
                     .on_change(move |next, window, cx| {
                         let next_str = next.to_string();
                         let _ = view_for_source.update(cx, |this, cx| {
                             if let Some(ed) = this.source_control.generic_editors.get_mut(&kind_for_source) {
                                 let is_stored = next_str == STORED_SECRET;
                                 ed.sources.insert(key_for_source.clone(), next_str);
+                                if !is_stored {
+                                    ed.cleared_fields.remove(&key_for_source);
+                                }
                                 if let Some(input) = ed.inputs.get(&key_for_source) {
                                     input.update(cx, |input, cx| {
                                         input.set_masked(is_stored, window, cx);
@@ -1379,8 +1461,32 @@ impl SettingsView {
                         });
                     })
             });
+            let clear_kind = def.kind.to_owned();
+            let clear_key = field.key.to_owned();
+            let clear_btn = (field_has_saved && !is_cleared).then(|| {
+                Button::new(SharedString::from(format!("sc-field-clear-{}-{}", def.kind, field.key)), ButtonVariant::GhostMuted, ButtonSize::Compact)
+                    .label("Clear")
+                    .disabled(!can_write || saving)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(ed) = this.source_control.generic_editors.get_mut(&clear_kind) {
+                            ed.cleared_fields.insert(clear_key.clone());
+                            ed.sources.insert(clear_key.clone(), STORED_SECRET.to_owned());
+                            if let Some(input) = ed.inputs.get(&clear_key) {
+                                input.update(cx, |input, cx| {
+                                    input.set_masked(true, window, cx);
+                                    input.set_value(String::new(), window, cx);
+                                });
+                            }
+                            cx.notify();
+                        }
+                    }))
+            });
             let hint = if field.secret {
-                secret_placeholder(&source, is_configured, field.description)
+                if is_cleared {
+                    "Will be cleared on Save.".to_owned()
+                } else {
+                    secret_placeholder(&source, is_configured, field.description)
+                }
             } else {
                 field.description.to_owned()
             };
@@ -1393,7 +1499,8 @@ impl SettingsView {
                         h_flex()
                             .gap(r(6.))
                             .children(source_picker)
-                            .child(div().flex_1().min_w_0().child(Input::new(input).small().disabled(!can_write || saving))),
+                            .child(div().flex_1().min_w_0().child(Input::new(input).small().disabled(!can_write || saving)))
+                            .children(clear_btn),
                     )
                     .child(div().text_size(r(11.)).text_color(hsla(p.muted_foreground)).child(hint)),
             );
@@ -1401,6 +1508,7 @@ impl SettingsView {
 
         let save_kind = def.kind.to_owned();
         let save_fields_def = def.fields;
+        let save_saved = saved.clone();
         let remove_kind = def.kind.to_owned();
         let remove_keys: Vec<String> = saved.keys().cloned().collect();
 
@@ -1428,6 +1536,7 @@ impl SettingsView {
                                     move |this, _, _| {
                                         if let Some(ed) = this.source_control.generic_editors.get_mut(&kind_done) {
                                             ed.saving = false;
+                                            ed.cleared_fields.clear();
                                             ed.synced_signature.clear();
                                         }
                                     },
@@ -1442,25 +1551,18 @@ impl SettingsView {
                         .disabled(!can_write || saving)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let Some(ed) = this.source_control.generic_editors.get(&save_kind) else { return };
-                            let mut fields = Map::new();
-                            for field in save_fields_def {
-                                let Some(input) = ed.inputs.get(field.key) else { continue };
-                                let raw = input.read(cx).value().trim().to_owned();
-                                let source = ed.sources.get(field.key).map(String::as_str).unwrap_or(STORED_SECRET);
-                                if field.secret {
-                                    if source != STORED_SECRET {
-                                        let Some(secret) = SecretValue::reference(source, &raw) else {
-                                            store::show_error(format!("Enter a valid secret reference for {}.", field.label), cx);
-                                            return;
-                                        };
-                                        fields.insert(field.key.to_owned(), secret.encode());
-                                    } else if !raw.is_empty() {
-                                        fields.insert(field.key.to_owned(), Value::String(raw));
-                                    }
-                                } else {
-                                    fields.insert(field.key.to_owned(), Value::String(raw));
+                            let raw_values: HashMap<String, String> = ed
+                                .inputs
+                                .iter()
+                                .map(|(key, input)| (key.clone(), input.read(cx).value().to_string()))
+                                .collect();
+                            let fields = match build_generic_host_patch(save_fields_def, &save_saved, &raw_values, &ed.sources, &ed.cleared_fields) {
+                                Ok(fields) => fields,
+                                Err(message) => {
+                                    store::show_error(message, cx);
+                                    return;
                                 }
-                            }
+                            };
                             if fields.is_empty() {
                                 return;
                             }
@@ -1474,6 +1576,7 @@ impl SettingsView {
                                 move |this, _, _| {
                                     if let Some(ed) = this.source_control.generic_editors.get_mut(&kind_done) {
                                         ed.saving = false;
+                                        ed.cleared_fields.clear();
                                         ed.synced_signature.clear();
                                     }
                                 },
@@ -1626,4 +1729,58 @@ struct ModelRow {
     /// What turning the switch on saves: the writer model in use.
     seed: Option<t3_core::model::ModelSelection>,
     change: fn(Option<t3_core::model::ModelSelection>) -> SourceControlChange,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_select_is_disabled_when_read_only_or_host_disabled() {
+        assert!(!account_select_disabled(true, true));
+        assert!(account_select_disabled(false, true));
+        assert!(account_select_disabled(true, false));
+        assert!(account_select_disabled(false, false));
+    }
+
+    #[test]
+    fn generic_host_patch_clears_single_saved_secret_reference_or_literal_without_wiping_siblings() {
+        let def = host_definition("bitbucket").expect("bitbucket definition");
+        let saved = BTreeMap::from([
+            ("accessToken".to_owned(), SecretValue::Reference { provider: "1password".into(), reference: "op://Dev/Bitbucket/access".into() }),
+            ("email".to_owned(), SecretValue::Literal("dev@example.com".into())),
+            ("apiToken".to_owned(), SecretValue::Literal("saved-api-token".into())),
+        ]);
+
+        // Switching accessToken back to STORED_SECRET with empty input clears only accessToken.
+        let raw_values = HashMap::from([
+            ("accessToken".to_owned(), String::new()),
+            ("email".to_owned(), "dev@example.com".to_owned()),
+            ("apiToken".to_owned(), String::new()),
+        ]);
+        let sources = HashMap::from([
+            ("accessToken".to_owned(), STORED_SECRET.to_owned()),
+            ("apiToken".to_owned(), STORED_SECRET.to_owned()),
+        ]);
+        let patch = build_generic_host_patch(def.fields, &saved, &raw_values, &sources, &HashSet::new()).expect("valid patch");
+        assert_eq!(patch.get("accessToken"), Some(&Value::String(String::new())));
+        assert!(!patch.contains_key("email"));
+        assert!(!patch.contains_key("apiToken"));
+
+        // Explicitly clearing apiToken clears only apiToken while keeping accessToken's ref untouched.
+        let raw_keep_ref = HashMap::from([
+            ("accessToken".to_owned(), "op://Dev/Bitbucket/access".to_owned()),
+            ("email".to_owned(), "dev@example.com".to_owned()),
+            ("apiToken".to_owned(), String::new()),
+        ]);
+        let sources_keep_ref = HashMap::from([
+            ("accessToken".to_owned(), "1password".to_owned()),
+            ("apiToken".to_owned(), STORED_SECRET.to_owned()),
+        ]);
+        let cleared = HashSet::from(["apiToken".to_owned()]);
+        let patch = build_generic_host_patch(def.fields, &saved, &raw_keep_ref, &sources_keep_ref, &cleared).expect("valid patch");
+        assert_eq!(patch.get("apiToken"), Some(&Value::String(String::new())));
+        assert!(!patch.contains_key("accessToken"));
+        assert!(!patch.contains_key("email"));
+    }
 }

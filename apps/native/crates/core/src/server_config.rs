@@ -772,8 +772,6 @@ pub struct ServerSettings {
     pub eas_device_hosts: Value,
     #[serde(default)]
     pub simlock_device_hosts: Value,
-    #[serde(default, deserialize_with = "lenient")]
-    pub simlock_device_hosts_enabled: bool,
     #[serde(default)]
     pub cloud_speech_credentials: Value,
     #[serde(default, deserialize_with = "lenient_vec")]

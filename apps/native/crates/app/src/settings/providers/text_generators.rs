@@ -112,6 +112,41 @@ fn brand_label(brand: &str) -> &'static str {
     }
 }
 
+fn models_button_disabled(enabled: bool) -> bool {
+    !enabled
+}
+
+fn use_it_keep_label(current: Option<&ModelSelection>, generator_id: &str) -> String {
+    match current {
+        Some(sel) if sel.instance_id != generator_id => format!("Keep current ({}/{})", sel.instance_id, sel.model),
+        _ => "Do not use for this task".to_owned(),
+    }
+}
+
+/// Computes the server patch for a `UseIt` task picker change.
+/// Returns `None` (no RPC) when keeping an assignment owned by a different provider so we never
+/// overwrite another provider's task model with `null`.
+fn use_it_task_change(current: Option<&ModelSelection>, generator_id: &str, picked: &str) -> Option<Option<ModelSelection>> {
+    if picked == KEEP_EXISTING_MODEL {
+        if current.is_some_and(|sel| sel.instance_id == generator_id) {
+            Some(None)
+        } else {
+            None
+        }
+    } else {
+        Some(Some(ModelSelection { instance_id: generator_id.to_owned(), model: picked.to_owned(), options: None }))
+    }
+}
+
+/// Only offers a test model when the task actually targets this text generator.
+fn use_it_test_model(selected_model: &str) -> Option<String> {
+    (selected_model != KEEP_EXISTING_MODEL).then(|| selected_model.to_owned())
+}
+
+fn use_it_test_disabled(testing_any: bool, test_model: Option<&str>) -> bool {
+    testing_any || test_model.is_none()
+}
+
 impl SettingsView {
     fn open_text_generator_wizard(&mut self, existing: Option<(String, TextGeneratorConfig)>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config) = self.thread_settings(cx).cloned() else { return };
@@ -307,6 +342,7 @@ impl SettingsView {
     }
 
     fn test_wizard_task(&mut self, task: TextTask, model_slug: Option<String>, cx: &mut Context<Self>) {
+        let Some(model_slug) = model_slug else { return };
         let Some(wizard) = self.providers.text_generators.wizard.as_mut() else { return };
         if wizard.testing_task.is_some() {
             return;
@@ -319,7 +355,7 @@ impl SettingsView {
         let Some(rpc) = self
             .state
             .read(cx)
-            .request(LIST_TEXT_GENERATOR_MODELS, test_model_payload(&id, model_slug.as_deref()), ListModelsResult::decode)
+            .request(LIST_TEXT_GENERATOR_MODELS, test_model_payload(&id, Some(model_slug.as_str())), ListModelsResult::decode)
         else {
             if let Some(w) = self.providers.text_generators.wizard.as_mut() {
                 w.testing_task = None;
@@ -511,6 +547,7 @@ impl SettingsView {
                                 .child(
                                     Button::new(SharedString::from(format!("tg-models-{id}")), ButtonVariant::GhostMuted, ButtonSize::Compact)
                                         .label("Models")
+                                        .disabled(models_button_disabled(cfg.enabled))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.open_text_generator_models(models_id.clone(), models_name.clone(), window, cx)
                                         })),
@@ -577,9 +614,7 @@ impl SettingsView {
                             if w.is_new {
                                 w.id = next_text_generator_id(preset.id, &cfg.settings, &cfg.providers);
                             }
-                            if !preset.base_url.is_empty() {
-                                w.base_url.update(cx, |input, cx| input.set_value(preset.base_url.to_owned(), window, cx));
-                            }
+                            w.base_url.update(cx, |input, cx| input.set_value(preset.base_url.to_owned(), window, cx));
                             w.error = None;
                             cx.notify();
                         }
@@ -591,6 +626,7 @@ impl SettingsView {
                     Select::new("tg-key-source", secret_source_options(config))
                         .selected(wizard.source.clone())
                         .width(156.)
+                        .disabled(wizard.checking || wizard.saving)
                         .on_change(move |next, window, cx| {
                             let next_str = next.to_string();
                             let _ = view_source.update(cx, |this, cx| {
@@ -681,7 +717,7 @@ impl SettingsView {
                         .filter(|sel| sel.instance_id == id)
                         .map(|sel| sel.model.clone())
                         .unwrap_or_else(|| KEEP_EXISTING_MODEL.to_owned());
-                    let mut options = vec![SelectOption::new(KEEP_EXISTING_MODEL, "Do not use for this task")];
+                    let mut options = vec![SelectOption::new(KEEP_EXISTING_MODEL, use_it_keep_label(current.as_ref(), &id))];
                     for model in &wizard.models {
                         options.push(SelectOption::new(model.id.clone(), model.name.clone()));
                     }
@@ -690,9 +726,9 @@ impl SettingsView {
                     }
                     let state_for_task = self.state.clone();
                     let task_id = id.clone();
-                    let test_model = (selected_model != KEEP_EXISTING_MODEL)
-                        .then(|| selected_model.clone())
-                        .or_else(|| wizard.models.first().map(|m| m.id.clone()));
+                    let current_for_change = current.clone();
+                    let test_model = use_it_test_model(&selected_model);
+                    let test_disabled = use_it_test_disabled(wizard.testing_task.is_some(), test_model.as_deref());
                     let testing = wizard.testing_task == Some(task);
                     let test_status = wizard.task_results.get(task.setting_key()).map(|res| match res {
                         Ok(msg) => tone_badge(msg.clone(), Tone::Success, cx),
@@ -709,15 +745,10 @@ impl SettingsView {
                                         Select::new(SharedString::from(format!("tg-task-select-{}", task.setting_key())), options)
                                             .selected(selected_model)
                                             .width(220.)
+                                            .disabled(!can_write)
                                             .on_change(move |value, _, cx| {
-                                                let selection = if value.as_ref() == KEEP_EXISTING_MODEL {
-                                                    None
-                                                } else {
-                                                    Some(ModelSelection {
-                                                        instance_id: task_id.clone(),
-                                                        model: value.to_string(),
-                                                        options: None,
-                                                    })
+                                                let Some(selection) = use_it_task_change(current_for_change.as_ref(), &task_id, value.as_ref()) else {
+                                                    return;
                                                 };
                                                 store::update_server(
                                                     &state_for_task,
@@ -729,7 +760,7 @@ impl SettingsView {
                                     .child(
                                         Button::new(SharedString::from(format!("tg-task-test-{}", task.setting_key())), ButtonVariant::Outline, ButtonSize::Compact)
                                             .label(if testing { "Testing…" } else { "Test" })
-                                            .disabled(wizard.testing_task.is_some())
+                                            .disabled(test_disabled)
                                             .on_click(cx.listener(move |this, _, _, cx| this.test_wizard_task(task, test_model.clone(), cx))),
                                     ),
                             )
@@ -868,5 +899,57 @@ impl SettingsView {
                 .child(list)
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_button_is_disabled_when_generator_is_disabled() {
+        assert!(models_button_disabled(false));
+        assert!(!models_button_disabled(true));
+    }
+
+    #[test]
+    fn custom_preset_clears_base_url_to_empty() {
+        let custom = TEXT_GENERATOR_PRESETS.iter().find(|p| p.id == "custom").expect("custom preset");
+        assert_eq!(custom.base_url, "");
+    }
+
+    #[test]
+    fn use_it_keep_option_preserves_other_provider_and_only_clears_owned_selection() {
+        let other = ModelSelection { instance_id: "claudeAgent".into(), model: "claude-haiku-4-5".into(), options: None };
+        let own = ModelSelection { instance_id: "openai".into(), model: "gpt-4.1-mini".into(), options: None };
+
+        // Keeping while another provider owns the task sends no RPC (never overwrites with null).
+        assert_eq!(use_it_task_change(Some(&other), "openai", KEEP_EXISTING_MODEL), None);
+        assert_eq!(use_it_keep_label(Some(&other), "openai"), "Keep current (claudeAgent/claude-haiku-4-5)");
+
+        // Keeping while nothing is set also sends no RPC.
+        assert_eq!(use_it_task_change(None, "openai", KEEP_EXISTING_MODEL), None);
+        assert_eq!(use_it_keep_label(None, "openai"), "Do not use for this task");
+
+        // Unselecting when this generator owns the task sends Some(None).
+        assert_eq!(use_it_task_change(Some(&own), "openai", KEEP_EXISTING_MODEL), Some(None));
+
+        // Picking a model assigns this generator.
+        assert_eq!(
+            use_it_task_change(Some(&other), "openai", "gpt-4.1-mini"),
+            Some(Some(ModelSelection { instance_id: "openai".into(), model: "gpt-4.1-mini".into(), options: None }))
+        );
+    }
+
+    #[test]
+    fn use_it_test_is_disabled_when_unassigned_or_no_model_selected() {
+        let unassigned = use_it_test_model(KEEP_EXISTING_MODEL);
+        assert_eq!(unassigned, None);
+        assert!(use_it_test_disabled(false, unassigned.as_deref()));
+
+        let assigned = use_it_test_model("gpt-4.1-mini");
+        assert_eq!(assigned.as_deref(), Some("gpt-4.1-mini"));
+        assert!(!use_it_test_disabled(false, assigned.as_deref()));
+        assert!(use_it_test_disabled(true, assigned.as_deref()));
     }
 }

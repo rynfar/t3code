@@ -32,6 +32,15 @@ pub struct AuthMethod {
     pub description: Option<String>,
     #[serde(default)]
     pub account_email: Option<String>,
+    #[serde(default)]
+    pub can_remove: Option<bool>,
+}
+
+impl AuthMethod {
+    /// Only methods the server marks `canRemove: true` may call `provider.auth.removeMethod`.
+    pub fn is_removable(&self) -> bool {
+        self.can_remove == Some(true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
