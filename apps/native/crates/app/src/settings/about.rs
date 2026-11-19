@@ -448,7 +448,7 @@ impl SettingsView {
                             .on_click(|_, _, cx| cx.open_url(PRIVACY_POLICY_URL)),
                     )
                     .into_any_element(),
-                Row::new("open-source-licenses", "Open-source licenses")
+                Row::new("open-source-licenses", crate::i18n::t(cx, "Open source licenses"))
                     .description("Notices for dependencies, assets, and optional tools used by T3 Code.")
                     .highlighted(self.is_target("open-source-licenses"))
                     .control(

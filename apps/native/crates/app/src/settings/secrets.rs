@@ -11,13 +11,11 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_client::supervisor::ConnectionStatus;
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::secrets::{self, Classified, Draft, PageState, Target};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, Row, dialog_footer, group, muted_text, r, section_title, tooltip};
-use super::{Block, SettingsView, store};
-use crate::app_state::Phase;
+use super::{Block, SettingsView};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -72,10 +70,14 @@ impl SecretsState {
 
 impl SettingsView {
     fn secret_page_state(&self, cx: &App) -> PageState {
-        let app = self.state.read(cx);
-        let connected = matches!(app.phase, Phase::Online(ConnectionStatus::Connected));
-        let config = app.server_config.config.as_ref();
-        secrets::page_state(connected, config.is_some(), config.and_then(|config| config.secret_provider_settings), self.session(cx).as_ref())
+        let connected = self.scoped_connected_now(cx);
+        let config = self.scoped_raw_representative_config(cx);
+        secrets::page_state(
+            connected,
+            config.is_some(),
+            config.as_ref().and_then(|config| config.secret_provider_settings),
+            self.scoped_session(cx).as_ref(),
+        )
     }
 
     fn secret_draft(&self, cx: &App) -> Draft {
@@ -83,8 +85,11 @@ impl SettingsView {
     }
 
     fn open_secret_dialog(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_project_scope(cx) {
+            return;
+        }
         let existing = match &target {
-            Target::Edit(id) => self.thread_settings(cx).and_then(|config| config.settings.secret_providers.get(id)).map(secrets::draft_from),
+            Target::Edit(id) => self.scoped_raw_representative_config(cx).and_then(|config| config.settings.secret_providers.get(id).cloned()).as_ref().map(secrets::draft_from),
             Target::Add => None,
         };
         let draft = existing.unwrap_or_default();
@@ -112,7 +117,7 @@ impl SettingsView {
         };
         dialog.submitted = true;
         let target = dialog.target.clone();
-        let providers = self.thread_settings(cx).map(|config| config.settings.secret_providers.clone()).unwrap_or_default();
+        let providers = self.scoped_raw_representative_config(cx).map(|config| config.settings.secret_providers).unwrap_or_default();
         if !target.is_open_in(&providers) {
             self.secrets.dialog = None;
             return cx.notify();
@@ -120,7 +125,7 @@ impl SettingsView {
         let existing = providers.ids();
         let draft = self.secret_draft(cx);
         if let Ok((id, config)) = secrets::provider_from_draft(&draft, &existing, &target) {
-            store::update_server(&self.state, ServerSettingChange::Prepared(secrets::save_payload(&id, config)), cx);
+            self.update_scoped_single_env(ServerSettingChange::Prepared(secrets::save_payload(&id, config)), cx);
             self.secrets.dialog = None;
         }
         cx.notify();
@@ -128,6 +133,9 @@ impl SettingsView {
 
     /// `RemoveSecretProviderButton`: asks first, listing settings reading from it; secrets stay untouched.
     fn request_remove_secret_provider(&mut self, id: String, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_project_scope(cx) {
+            return;
+        }
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         self.secrets.dialog = None;
@@ -139,14 +147,15 @@ impl SettingsView {
         let Some(dialog) = self.secrets.remove_dialog.take() else {
             return;
         };
-        store::update_server(&self.state, ServerSettingChange::Prepared(secrets::remove_payload(&dialog.id)), cx);
+        self.update_scoped_single_env(ServerSettingChange::Prepared(secrets::remove_payload(&dialog.id)), cx);
         self.focus.focus(window, cx);
         cx.notify();
     }
 
     pub(super) fn secrets_page(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
         // The web stops rendering an edit/remove whose provider another client removed.
-        let providers = self.thread_settings(cx).map(|config| config.settings.secret_providers.clone()).unwrap_or_default();
+        let scoped_config = self.scoped_raw_representative_config(cx);
+        let providers = scoped_config.as_ref().map(|config| config.settings.secret_providers.clone()).unwrap_or_default();
         if self.secrets.dialog.as_ref().is_some_and(|dialog| !dialog.target.is_open_in(&providers)) {
             self.secrets.dialog = None;
         }
@@ -154,21 +163,26 @@ impl SettingsView {
             self.secrets.remove_dialog = None;
         }
         let p = palette(cx);
-        let environment = self.environment_label(cx);
+        let environment = scoped_config
+            .as_ref()
+            .map(|c| c.environment.label.clone())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| self.environment_label(cx));
         let notice = |text: String| {
             Block::new(
                 &["secret-providers"],
                 v_flex().gap(r(10.)).child(section_title("Secret providers")).child(group(vec![div().px(r(16.)).py(r(12.)).child(muted_text(text, cx)).into_any_element()], cx)),
             )
         };
+        let is_project_scope = self.is_project_scope(cx);
         let editable = match self.secret_page_state(cx) {
             PageState::Disconnected => return vec![notice(secrets::DISCONNECTED.to_owned())],
             PageState::UpdateRequired => {
                 return vec![notice(secrets::update_required(&environment))];
             }
-            PageState::Providers { editable } => editable,
+            PageState::Providers { editable } => editable && !is_project_scope,
         };
-        let providers = self.thread_settings(cx).map(|config| config.settings.secret_providers.0.clone()).unwrap_or_default();
+        let providers = providers.0;
         let rows: Vec<AnyElement> = if providers.is_empty() {
             vec![Row::new("secret-providers-empty", secrets::EMPTY_TITLE).description(secrets::EMPTY_DESCRIPTION).into_any_element()]
         } else {
@@ -253,7 +267,7 @@ impl SettingsView {
     pub(super) fn secret_dialog_overlay(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if let Some(dialog) = self.secrets.remove_dialog.as_ref() {
             let p = palette(cx);
-            let config = self.thread_settings(cx)?;
+            let config = self.scoped_raw_representative_config(cx)?;
             config.settings.secret_providers.get(&dialog.id)?;
             let uses = secrets::secret_provider_uses(&config.settings, &dialog.id);
             let (title, description) = secrets::remove_confirmation(&dialog.label, uses.is_empty());
@@ -316,13 +330,13 @@ impl SettingsView {
         }
         let dialog = self.secrets.dialog.as_ref()?;
         let p = palette(cx);
-        let config = self.thread_settings(cx);
-        if !dialog.target.is_open_in(&config.map(|config| config.settings.secret_providers.clone()).unwrap_or_default()) {
+        let config = self.scoped_raw_representative_config(cx);
+        if !dialog.target.is_open_in(&config.as_ref().map(|config| config.settings.secret_providers.clone()).unwrap_or_default()) {
             return None;
         }
-        let existing = config.map(|config| config.settings.secret_providers.ids()).unwrap_or_default();
+        let existing = config.as_ref().map(|config| config.settings.secret_providers.ids()).unwrap_or_default();
         let editing = match &dialog.target {
-            Target::Edit(id) => config.and_then(|config| config.settings.secret_providers.get(id)).map(|provider| provider.label.clone()),
+            Target::Edit(id) => config.as_ref().and_then(|config| config.settings.secret_providers.get(id)).map(|provider| provider.label.clone()),
             Target::Add => None,
         };
         let result = secrets::provider_from_draft(&self.secret_draft(cx), &existing, &dialog.target);

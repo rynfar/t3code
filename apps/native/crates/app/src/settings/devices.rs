@@ -28,7 +28,7 @@ use t3_core::settings::search::Section;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, group, r, section, section_title};
 use super::source_control::{Tone, tone_badge};
-use super::{Block, SettingsView, store};
+use super::{Block, SettingsView};
 use crate::composer::controls::floating_shadow;
 use crate::device::{Devices, DevicesEvent, HostRetry, host_updates, setup_status};
 use crate::icons::Icon;
@@ -231,7 +231,20 @@ impl SettingsView {
         };
         let loaded = service.is_some();
         let service = service.unwrap_or_else(ServiceState::empty);
-        let config = self.thread_settings(cx).cloned();
+        let config = self.scoped_raw_representative_config(cx);
+        let is_project_scope = self.is_project_scope(cx);
+        let env_only = self.env_only_unavailable(cx);
+        let scope_project = is_project_scope.then(|| self.scope_project_id(cx)).flatten();
+        let agent_access_effective = config
+            .as_ref()
+            .map(|c| {
+                t3_core::settings::effective_agent_device_access(
+                    &c.settings,
+                    scope_project.as_deref(),
+                    service.agent_access_enabled,
+                )
+            })
+            .unwrap_or(service.agent_access_enabled);
         let pending = self.devices.pending;
         let busy = service.hub_readiness().busy;
         let enabled = service.hub_enabled();
@@ -240,17 +253,30 @@ impl SettingsView {
         let local_tool_err = local_host.and_then(|h| h.tool_inspection_error.as_deref());
 
         let view = cx.entity().downgrade();
-        let hub = Switch::new("device-hub-switch", enabled).disabled(!can_configure || !loaded || busy || pending.is_some()).on_change({
+        let hub = Switch::new("device-hub-switch", enabled).disabled(env_only.is_some() || !can_configure || !loaded || busy || pending.is_some()).on_change({
             let view = view.clone();
             move |on, _, cx| {
                 let input = if on { json!({ "enabled": true, "onboardingCompleted": true }) } else { configure_hub_payload(false) };
                 let _ = view.update(cx, |view, cx| view.configure_devices(Pending::Hub, input, cx));
             }
         });
-        let agent = Switch::new("agent-device-access-switch", service.agent_access_enabled)
-            .disabled(!can_configure || !loaded || !enabled || busy || pending.is_some())
+        let agent = Switch::new("agent-device-access-switch", agent_access_effective)
+            .disabled(if is_project_scope {
+                !self.may("settings:write", cx) || config.is_none()
+            } else {
+                !can_configure || !loaded || !enabled || busy || pending.is_some()
+            })
             .on_change(move |on, _, cx| {
-                let _ = view.update(cx, |view, cx| view.configure_devices(Pending::Agent, json!({ "agentAccessEnabled": on }), cx));
+                let _ = view.update(cx, |view, cx| {
+                    if view.is_project_scope(cx) {
+                        view.update_scoped_server(
+                            ServerSettingChange::Prepared(json!({ "patch": { "enableAgentDeviceAccess": on } })),
+                            cx,
+                        );
+                    } else {
+                        view.configure_devices(Pending::Agent, json!({ "agentAccessEnabled": on }), cx);
+                    }
+                });
             });
 
         let hub_status = setup_status((pending == Some(Pending::Hub)).then(|| service.hub_setup_status(true)).flatten(), cx);
@@ -280,13 +306,21 @@ impl SettingsView {
         let hub_row = Row::new("device-hub", "Use devices")
             .description("Open simulators and emulators in the Device panel.")
             .highlighted(self.is_target("device-hub"))
+            .unavailable(env_only.clone())
             .control(h_flex().gap(r(8.)).children(hub_tool_trigger).children(hub_status).child(hub))
             .when(self.devices.tool_popover == Some(ToolPopover::Hub), |row| {
                 row.below(self.tool_version_details(ToolPopover::Hub, local_tools.map(|t| &t.hub), local_tool_err, &service, can_configure, cx))
             });
+        let agent_reset_view = cx.entity().downgrade();
         let agent_row = Row::new("agent-device-access", "Agents can use devices")
-            .description("New agent sessions can open and drive these devices.")
+            .description("New agent sessions can open and drive these devices. Projects can override it.")
             .highlighted(self.is_target("agent-device-access"))
+            .reset_tooltip("Reset to inherited value")
+            .reset(is_project_scope && self.has_project_override(&["enableAgentDeviceAccess"], cx), move |_, _, cx| {
+                let _ = agent_reset_view.update(cx, |this, cx| {
+                    this.clear_project_overrides(&["enableAgentDeviceAccess"], cx);
+                });
+            })
             .control(h_flex().gap(r(8.)).children(agent_tool_trigger).children(agent_status).child(agent))
             .when(self.devices.tool_popover == Some(ToolPopover::Agent), |row| {
                 row.below(self.tool_version_details(ToolPopover::Agent, local_tools.map(|t| &t.agent), local_tool_err, &service, can_configure, cx))
@@ -804,7 +838,7 @@ impl SettingsView {
             valid
         };
         let existing = self
-            .thread_settings(cx)
+            .scoped_raw_representative_config(cx)
             .and_then(|c| decode_ssh_hosts(&c.settings.device_hosts).ok())
             .unwrap_or_default();
         let next = update_ssh_hosts(&existing, &valid, false);
@@ -813,8 +847,7 @@ impl SettingsView {
         }
         cx.notify();
         let view = cx.entity().downgrade();
-        store::update_server_then(
-            &self.state,
+        self.update_scoped_single_env_then(
             ServerSettingChange::Prepared(ssh_hosts_patch(&next)),
             move |error, cx| {
                 cx.defer(move |cx| {
@@ -843,11 +876,11 @@ impl SettingsView {
                 let host = host.clone();
                 let _ = view.update(cx, |this, cx| {
                     let existing = this
-                        .thread_settings(cx)
+                        .scoped_raw_representative_config(cx)
                         .and_then(|c| decode_ssh_hosts(&c.settings.device_hosts).ok())
                         .unwrap_or_default();
                     let next = update_ssh_hosts(&existing, &host, true);
-                    store::update_server(&this.state, ServerSettingChange::Prepared(ssh_hosts_patch(&next)), cx);
+                    this.update_scoped_single_env(ServerSettingChange::Prepared(ssh_hosts_patch(&next)), cx);
                 });
             },
             cx,
@@ -982,7 +1015,7 @@ impl SettingsView {
             (ed.token_editor.next(&draft), matches!(ed.token_editor.token(), hosts::TokenDraft::Saved))
         };
         let existing = self
-            .thread_settings(cx)
+            .scoped_raw_representative_config(cx)
             .and_then(|c| decode_eas_hosts(&c.settings.eas_device_hosts).ok())
             .unwrap_or_default();
         let next = update_eas_hosts(&existing, &next_host, false, keep_token);
@@ -991,8 +1024,7 @@ impl SettingsView {
         }
         cx.notify();
         let view = cx.entity().downgrade();
-        store::update_server_then(
-            &self.state,
+        self.update_scoped_single_env_then(
             ServerSettingChange::Prepared(eas_hosts_patch(&next)),
             move |error, cx| {
                 cx.defer(move |cx| {
@@ -1021,11 +1053,11 @@ impl SettingsView {
                 let host = host.clone();
                 let _ = view.update(cx, |this, cx| {
                     let existing = this
-                        .thread_settings(cx)
+                        .scoped_raw_representative_config(cx)
                         .and_then(|c| decode_eas_hosts(&c.settings.eas_device_hosts).ok())
                         .unwrap_or_default();
                     let next = update_eas_hosts(&existing, &host, true, false);
-                    store::update_server(&this.state, ServerSettingChange::Prepared(eas_hosts_patch(&next)), cx);
+                    this.update_scoped_single_env(ServerSettingChange::Prepared(eas_hosts_patch(&next)), cx);
                 });
             },
             cx,
@@ -1174,7 +1206,7 @@ impl SettingsView {
             (ed.token_editor.next(&draft), ed.token_editor.configured())
         };
         let existing = self
-            .thread_settings(cx)
+            .scoped_raw_representative_config(cx)
             .and_then(|c| decode_simlock_hosts(&c.settings.simlock_device_hosts).ok())
             .unwrap_or_default();
         let next = update_simlock_hosts(&existing, &next_host, false, keep_token);
@@ -1183,8 +1215,7 @@ impl SettingsView {
         }
         cx.notify();
         let view = cx.entity().downgrade();
-        store::update_server_then(
-            &self.state,
+        self.update_scoped_single_env_then(
             ServerSettingChange::Prepared(simlock_hosts_patch(&next)),
             move |error, cx| {
                 cx.defer(move |cx| {
@@ -1213,11 +1244,11 @@ impl SettingsView {
                 let host = host.clone();
                 let _ = view.update(cx, |this, cx| {
                     let existing = this
-                        .thread_settings(cx)
+                        .scoped_raw_representative_config(cx)
                         .and_then(|c| decode_simlock_hosts(&c.settings.simlock_device_hosts).ok())
                         .unwrap_or_default();
                     let next = update_simlock_hosts(&existing, &host, true, false);
-                    store::update_server(&this.state, ServerSettingChange::Prepared(simlock_hosts_patch(&next)), cx);
+                    this.update_scoped_single_env(ServerSettingChange::Prepared(simlock_hosts_patch(&next)), cx);
                 });
             },
             cx,

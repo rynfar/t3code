@@ -13,7 +13,7 @@ use t3_core::settings::providers::auth::{self, AccountAction, AccountView, Crede
 use t3_core::settings::providers::{self as model, ACP_REGISTRY, DisplayModel, ModelGroup};
 
 use super::super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, icon, r};
-use super::super::{SettingsView, store};
+use super::super::SettingsView;
 use super::{Selected, failure_text, flat_section, status_dot};
 use crate::components::badge::{BadgeKind, badge};
 use crate::icons::Icon;
@@ -586,7 +586,7 @@ impl SettingsView {
                     .label(if all_hidden { "Enable all" } else { "Disable all" })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(payload) = model::bulk_hidden_payload(&id, &models, &hidden) {
-                            store::update_server(&this.state, ServerSettingChange::Prepared(payload), cx);
+                            this.update_scoped_single_env(ServerSettingChange::Prepared(payload), cx);
                         }
                     })),
             );
@@ -725,7 +725,7 @@ impl SettingsView {
                 gpui_component::tooltip::Tooltip::new(if favorite { "Remove from favorites" } else { "Add to favorites" }).build(window, cx)
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                store::update_server(&this.state, ServerSettingChange::Prepared(model::favorite_payload(&star_id, &star_slug, !favorite)), cx);
+                this.update_scoped_single_env(ServerSettingChange::Prepared(model::favorite_payload(&star_id, &star_slug, !favorite)), cx);
             }))
             .child(icon(if favorite { Icon::StarFill } else { Icon::Star }, 12., if favorite { hsla(p.warning) } else { hsla(p.muted_foreground) }));
         let mut actions = h_flex().flex_none().gap(r(2.)).justify_end().min_w(r(88.));
@@ -767,7 +767,7 @@ impl SettingsView {
             "Shown in picker".into()
         };
         let toggle = cx.listener(move |this, shown: &bool, _, cx| {
-            store::update_server(&this.state, ServerSettingChange::Prepared(model::hidden_payload(&show_id, &[(show_slug.clone(), !*shown)])), cx);
+            this.update_scoped_single_env(ServerSettingChange::Prepared(model::hidden_payload(&show_id, &[(show_slug.clone(), !*shown)])), cx);
         });
         let switch = Switch::new(("model-shown", index), !hidden);
         let switch = if model.is_custom { switch } else { switch.on_change(move |shown, window, cx| toggle(&shown, window, cx)) };
@@ -809,8 +809,7 @@ impl SettingsView {
         let Some(instance_id) = self.selected_instance_id(cx) else { return };
         let typed = self.providers.custom_model.read(cx).value().to_string();
         let validated = {
-            let app = self.state.read(cx);
-            let Some(config) = app.server_config.config.as_ref() else { return };
+            let Some(config) = self.scoped_raw_representative_config(cx) else { return };
             let instance = config.settings.provider_instances.get(&instance_id).cloned().unwrap_or_else(|| t3_core::server_config::ProviderInstanceConfig { driver: instance_id.clone(), ..Default::default() });
             let live = config.provider(&instance_id).map(|provider| provider.models.as_slice()).unwrap_or_default();
             model::validate_custom_model(&typed, live, &model::custom_models(&instance))
@@ -832,24 +831,22 @@ impl SettingsView {
     fn remove_custom_model(&mut self, instance_id: &str, slug: &str, cx: &mut Context<Self>) {
         self.update_instance(instance_id, model::InstanceEdit::RemoveCustomModel(slug.to_owned()), cx);
         let (order, favorite) = {
-            let app = self.state.read(cx);
-            let Some(config) = app.server_config.config.as_ref() else { return };
+            let Some(config) = self.scoped_raw_representative_config(cx) else { return };
             let (_, order) = model::instance_preferences(&config.settings, instance_id);
             (order, model::instance_favorites(&config.settings, instance_id).iter().any(|model| model == slug))
         };
         if order.iter().any(|model| model == slug) {
             let next: Vec<String> = order.into_iter().filter(|model| model != slug).collect();
-            store::update_server(&self.state, ServerSettingChange::Prepared(model::order_payload(instance_id, &next)), cx);
+            self.update_scoped_single_env(ServerSettingChange::Prepared(model::order_payload(instance_id, &next)), cx);
         }
         if favorite {
-            store::update_server(&self.state, ServerSettingChange::Prepared(model::favorite_payload(instance_id, slug, false)), cx);
+            self.update_scoped_single_env(ServerSettingChange::Prepared(model::favorite_payload(instance_id, slug, false)), cx);
         }
     }
 
     fn move_model(&mut self, instance_id: &str, slug: &str, down: bool, cx: &mut Context<Self>) {
         let order = {
-            let app = self.state.read(cx);
-            let Some(config) = app.server_config.config.as_ref() else { return };
+            let Some(config) = self.scoped_raw_representative_config(cx) else { return };
             let instance = config.settings.provider_instances.get(instance_id).cloned().unwrap_or_else(|| t3_core::server_config::ProviderInstanceConfig { driver: instance_id.to_owned(), ..Default::default() });
             let live = config.provider(instance_id).map(|provider| provider.models.as_slice()).unwrap_or_default();
             let favorites = model::instance_favorites(&config.settings, instance_id);
@@ -858,12 +855,12 @@ impl SettingsView {
             model::moved_order(&grouped, slug, down)
         };
         if let Some(order) = order {
-            store::update_server(&self.state, ServerSettingChange::Prepared(model::order_payload(instance_id, &order)), cx);
+            self.update_scoped_single_env(ServerSettingChange::Prepared(model::order_payload(instance_id, &order)), cx);
         }
     }
 
     fn accept_url_auth(&mut self, instance_id: &str, elicitation_id: &str, cx: &mut Context<Self>) {
-        let task = self.state.read(cx).rpc(SERVER_ACCEPT_ACP_URL_AUTH, json!({ "instanceId": instance_id, "elicitationId": elicitation_id }));
+        let task = self.scoped_rpc(t3_core::usage::PROVIDERS_MANAGE_SCOPE, SERVER_ACCEPT_ACP_URL_AUTH, json!({ "instanceId": instance_id, "elicitationId": elicitation_id }), cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -888,8 +885,7 @@ impl SettingsView {
     pub(super) fn auth_command(&mut self, method: &'static str, payload: Value, cx: &mut Context<Self>) {
         if super::fixture_active(cx) || !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE,cx) || self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()){return;}
         let allowed = self.providers.auth.as_ref().is_some_and(|s| {
-            let app=self.state.read(cx);
-            app.server_config.config.as_ref().is_some_and(|c| c.provider(&s.instance_id).is_some_and(|p| t3_core::managed_policy::driver_allowed(c.managed_policy.as_ref(),&p.driver)))
+            self.scoped_raw_representative_config(cx).is_some_and(|c| c.provider(&s.instance_id).is_some_and(|p| t3_core::managed_policy::driver_allowed(c.managed_policy.as_ref(),&p.driver)))
         });
         if !allowed {return;}
         let Some(session) = self.providers.auth.as_mut() else { return };
@@ -901,7 +897,7 @@ impl SettingsView {
         let id = session.instance_id.clone();
         cx.notify();
         let connection=self.state.read(cx).connection_id();
-        let task = self.state.read(cx).rpc(method, payload);
+        let task = self.scoped_rpc(t3_core::usage::PROVIDERS_MANAGE_SCOPE, method, payload, cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -946,7 +942,7 @@ impl SettingsView {
         }
         session.pending = true;
         let id = instance_id.to_owned();
-        let task = self.state.read(cx).rpc(auth::AUTH_RESPOND, payload);
+        let task = self.scoped_rpc(t3_core::usage::PROVIDERS_MANAGE_SCOPE, auth::AUTH_RESPOND, payload, cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -1022,7 +1018,7 @@ impl SettingsView {
         session.error = None;
         let id = session.instance_id.clone();
         cx.notify();
-        let task = self.state.read(cx).rpc(method, payload);
+        let task = self.scoped_rpc(t3_core::usage::PROVIDERS_MANAGE_SCOPE, method, payload, cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {

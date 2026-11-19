@@ -566,6 +566,12 @@ pub struct EnvironmentCapabilities {
     pub storage_cleanup_run: Option<bool>,
     #[serde(default)]
     pub settled_worktree_cleanup: Option<bool>,
+    /// Server supports project-scoped `worktreeCleanup` overrides.
+    #[serde(default)]
+    pub project_worktree_cleanup: Option<bool>,
+    /// Server supports project-scoped `providerInstances[id].enabled` overrides.
+    #[serde(default)]
+    pub project_provider_instance_overrides: Option<bool>,
     #[serde(default)]
     pub database_storage: Option<bool>,
     #[serde(default)]

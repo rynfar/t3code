@@ -1,10 +1,9 @@
 //! Settings → Projects: `ProjectsSettings` and `ProjectSettingsPanel` in
 //! `web/src/components/settings/`. Without a chosen project the page lists them
-//! (`SettingsScopeNotice`); a chosen one shows its name, icon, pin and archive, its New threads
-//! overrides (`ProjectDefaultsSettings` at project scope), its actions (`project_actions.rs`), its
-//! checkouts and removal. The project picker follows the watched environments' scoped groups.
-//! Not ported: the info alert about keeping the project picked on other pages, which other
-//! native pages do not scope by project.
+//! (`SettingsScopeNotice`); a chosen one shows the cross-page project-scope notice, its name,
+//! icon, pin and archive, its New threads overrides (`ProjectDefaultsSettings` at project scope),
+//! its actions (`project_actions.rs`), its checkouts and removal. The project picker follows the
+//! watched environments' scoped groups and stays synced with `SettingsScopeSentence`.
 
 use std::rc::Rc;
 
@@ -141,7 +140,7 @@ impl SettingsView {
     }
 
     pub(super) fn shown_project(&self, cx: &App) -> Option<Shown> {
-        let key = self.projects.selected.as_deref()?;
+        let key = self.scope.project.as_deref().or(self.projects.selected.as_deref())?;
         let groups = self.project_groups(cx);
         let group = groups.iter().find(|group| group.key == key)
             .or_else(|| groups.iter().find(|group| group.member_refs.iter().any(|reference| self.projects.last_members.contains(reference))))?.clone();
@@ -167,13 +166,28 @@ impl SettingsView {
 
     pub(super) fn select_project_id(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let active = self.state.read(cx).environments.active.as_deref();
-        let key = self.project_groups(cx).into_iter().find(|group| group.member_refs.iter().any(|reference| Some(reference.environment_id.as_str()) == active && reference.project_id == project_id)).map(|group| group.key);
+        let groups = self.project_groups(cx);
+        let key = groups
+            .iter()
+            .find(|group| {
+                group.member_refs.iter().any(|reference| {
+                    Some(reference.environment_id.as_str()) == active && reference.project_id == project_id
+                })
+            })
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|group| group.member_refs.iter().any(|reference| reference.project_id == project_id))
+            })
+            .map(|group| group.key.clone());
         self.projects.pending_project = key.is_none().then(|| project_id.to_owned());
         if let Some(key) = key { self.select_project(Some(key), cx); }
     }
 
     pub(super) fn select_project(&mut self, key: Option<String>, cx: &mut Context<Self>) {
         self.projects.pending_project = None;
+        self.scope.project = key.clone();
+        self.scope.checkout = None;
         if self.projects.selected == key {
             return;
         }
@@ -335,6 +349,12 @@ impl SettingsView {
         if let Some(project_id) = self.projects.pending_project.clone() {
             self.select_project_id(&project_id, cx);
         }
+        if self.projects.selected != self.scope.project {
+            self.projects.selected = self.scope.project.clone();
+            self.projects.last_members.clear();
+            self.projects.name_edited = false;
+            self.projects.actions.close();
+        }
         if self.projects.selected.is_none() {
             return Vec::new();
         }
@@ -351,8 +371,25 @@ impl SettingsView {
         self.open_pending_action_editor(window, cx);
         self.ensure_project_file(&shown.targets[0], cx);
         Self::sync_input(&self.projects.name, shown.display_name(), window, cx);
+        let p = palette(cx);
+        let scope_notice = h_flex()
+            .id("project-cross-page-scope-notice")
+            .debug_selector(|| "project-cross-page-scope-notice".to_owned())
+            .px(r(14.))
+            .py(r(12.))
+            .gap(r(10.))
+            .items_center()
+            .rounded(r(12.))
+            .border_1()
+            .border_color(hsla(p.info).opacity(0.32))
+            .bg(hsla(p.info).opacity(0.08))
+            .text_sm()
+            .text_color(hsla(p.info_foreground))
+            .child(icon(Icon::Info, 16., hsla(p.info_foreground)))
+            .child(div().flex_1().child("Can't find a setting? Keep this project picked above and hop to any other settings page."));
         let mut blocks = vec![
             Block::new(&[], picker),
+            Block::new(&[], scope_notice),
             Block::new(&["project-overview"], self.project_overview(&shown, &config, cx)),
             Block::new(&["project-defaults"], self.project_new_threads(&shown, &config, cx)),
             Block::new(&["project-actions"], self.project_actions_section(&shown, &config, window, cx)),
@@ -454,6 +491,9 @@ impl SettingsView {
     /// `SettingsScopeNotice` for a project, while none is chosen: the picker and status line,
     /// then one row per project, as a virtualized list over the page.
     pub(super) fn project_list_view(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.projects.selected != self.scope.project {
+            self.projects.selected = self.scope.project.clone();
+        }
         if self.projects.selected.is_some() {
             return None;
         }

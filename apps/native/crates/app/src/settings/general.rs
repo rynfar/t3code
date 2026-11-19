@@ -6,9 +6,14 @@ use gpui::{App, Context, Entity, InteractiveElement, IntoElement, ParentElement,
 use gpui_component::h_flex;
 use t3_core::client_settings::{
     ClientSettingChange, ClientSettingsDoc, NOTIFICATION_MODES, ProjectGroupingMode, ProjectSortOrder, QuitConfirmationMode,
-    TimestampFormat, ToolCallVisibility, notification_mode_value, project_grouping_from_toggle,
+    SCREEN_READER_ANNOUNCEMENTS_MODES, ScreenReaderAnnouncements, TimestampFormat, ToolCallVisibility,
+    notification_mode_value, project_grouping_from_toggle, screen_reader_announcements_label,
+    screen_reader_announcements_value,
 };
 use t3_core::composer::{FollowUpBehavior, SendShortcut};
+use t3_core::i18n::{
+    DEFAULT_LOCALE, SUPPORTED_LOCALES, SYSTEM_LANGUAGE, native_language_name, supported_language_value,
+};
 use t3_core::managed_policy::{self, Capability};
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::search::Section;
@@ -18,6 +23,7 @@ use super::controls::{
 };
 use super::{Block, SettingsView, store};
 use crate::app_state::AppState;
+use crate::i18n::t;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -32,6 +38,15 @@ pub(crate) struct ChatState {
 
 fn literal_options<T: Copy>(all: &[T], value: fn(T) -> &'static str, label: fn(T) -> &'static str) -> Vec<SelectOption> {
     all.iter().map(|item| SelectOption::new(value(*item), label(*item))).collect()
+}
+
+fn translated_literal_options<T: Copy>(
+    all: &[T],
+    value: fn(T) -> &'static str,
+    label: fn(T) -> &'static str,
+    cx: &App,
+) -> Vec<SelectOption> {
+    all.iter().map(|item| SelectOption::new(value(*item), t(cx, label(*item)))).collect()
 }
 
 /// A switch bound to one client setting.
@@ -56,7 +71,7 @@ impl SettingsView {
 
         let notification_state = state.clone();
         let notifications = section(
-            "Notifications",
+            t(cx, "Notifications"),
             vec![
                 Row::new("thread-notifications", "Thread notifications")
                     .description("System alerts when a thread finishes, fails, or needs input or approval. Applies to this device while T3 Code is open.")
@@ -72,8 +87,8 @@ impl SettingsView {
                             }),
                     )
                     .into_any_element(),
-                Row::new("in-app-notifications", "In-app notifications")
-                    .description("Show a toast when another thread finishes, fails, or needs input or approval while this app has focus.")
+                Row::new("in-app-notifications", t(cx, "In-app notifications"))
+                    .description(t(cx, "Show a toast when another thread finishes, fails, or needs input or approval while this app has focus."))
                     .highlighted(self.is_target("in-app-notifications"))
                     .control(switch(state, "in-app-notifications-switch", doc.in_app_notifications(), ClientSettingChange::InAppNotifications))
                     .into_any_element(),
@@ -86,10 +101,10 @@ impl SettingsView {
         let grouping_state = state.clone();
         let order_state = state.clone();
         let sidebar = section(
-            "Sidebar",
+            t(cx, "Sidebar"),
             vec![
-                Row::new("project-grouping", "Project grouping")
-                    .description("Combine matching repositories across environments.")
+                Row::new("project-grouping", t(cx, "Project grouping"))
+                    .description(t(cx, "Combine matching repositories across environments."))
                     .highlighted(self.is_target("project-grouping"))
                     .reset(grouping != ProjectGroupingMode::default(), reset(state, ClientSettingChange::ProjectGrouping(ProjectGroupingMode::default())))
                     .control(Switch::new("project-grouping-switch", grouping != ProjectGroupingMode::Separate).on_change(move |checked, _, cx| {
@@ -100,15 +115,15 @@ impl SettingsView {
                         store::update_client(&grouping_state, ClientSettingChange::ProjectGrouping(project_grouping_from_toggle(checked, remembered)), cx);
                     }))
                     .into_any_element(),
-                Row::new("project-order", "Project order")
-                    .description("Order of projects in the sidebar project picker and command palette.")
+                Row::new("project-order", t(cx, "Project order"))
+                    .description(t(cx, "Order of projects in the sidebar project picker and command palette."))
                     .highlighted(self.is_target("project-order"))
                     .reset(
                         doc.project_sort_order() != ProjectSortOrder::default(),
                         reset(state, ClientSettingChange::ProjectSortOrder(ProjectSortOrder::default())),
                     )
                     .control(
-                        Select::new("project-order-select", literal_options(ProjectSortOrder::ALL, ProjectSortOrder::as_str, ProjectSortOrder::label))
+                        Select::new("project-order-select", translated_literal_options(ProjectSortOrder::ALL, ProjectSortOrder::as_str, ProjectSortOrder::label, cx))
                             .selected(doc.project_sort_order().as_str())
                             .width(176.)
                             .on_change(move |value, _, cx| {
@@ -118,8 +133,8 @@ impl SettingsView {
                             }),
                     )
                     .into_any_element(),
-                Row::new("working-shelf", "Working section")
-                    .description("Fold working and monitoring threads into a Working section. They return to the top of the inbox when they need you. The boring sidebar in Labs has no Working section.")
+                Row::new("working-shelf", t(cx, "Working section"))
+                    .description(t(cx, "Fold working and monitoring threads into a Working section. They return to the top of the inbox when they need you. The boring sidebar in Labs has no Working section."))
                     .highlighted(self.is_target("working-shelf"))
                     .reset(!doc.working_shelf(), reset(state, ClientSettingChange::WorkingShelf(true)))
                     .control(switch(state, "working-shelf-switch", doc.working_shelf(), ClientSettingChange::WorkingShelf))
@@ -130,28 +145,28 @@ impl SettingsView {
 
         let quit_state = state.clone();
         let confirmations = section(
-            "Confirmations",
+            t(cx, "Confirmations"),
             vec![
-                Row::new("unpin-confirmation", "Unpin confirmation")
-                    .description("Ask before unpinning a thread from the pinned section.")
+                Row::new("unpin-confirmation", t(cx, "Unpin confirmation"))
+                    .description(t(cx, "Ask before unpinning a thread from the pinned section."))
                     .highlighted(self.is_target("unpin-confirmation"))
                     .reset(doc.confirm_thread_unpin(), reset(state, ClientSettingChange::ConfirmThreadUnpin(false)))
                     .control(switch(state, "unpin-confirmation-switch", doc.confirm_thread_unpin(), ClientSettingChange::ConfirmThreadUnpin))
                     .into_any_element(),
-                Row::new("archive-confirmation", "Archive confirmation")
-                    .description("Require a second click on the inline archive action before a thread is archived.")
+                Row::new("archive-confirmation", t(cx, "Archive confirmation"))
+                    .description(t(cx, "Require a second click on the inline archive action before a thread is archived."))
                     .highlighted(self.is_target("archive-confirmation"))
                     .reset(doc.confirm_thread_archive(), reset(state, ClientSettingChange::ConfirmThreadArchive(false)))
                     .control(switch(state, "archive-confirmation-switch", doc.confirm_thread_archive(), ClientSettingChange::ConfirmThreadArchive))
                     .into_any_element(),
-                Row::new("delete-confirmation", "Delete confirmation")
-                    .description("Ask before deleting a thread and its chat history.")
+                Row::new("delete-confirmation", t(cx, "Delete confirmation"))
+                    .description(t(cx, "Ask before deleting a thread and its chat history."))
                     .highlighted(self.is_target("delete-confirmation"))
                     .reset(!doc.confirm_thread_delete(), reset(state, ClientSettingChange::ConfirmThreadDelete(true)))
                     .control(switch(state, "delete-confirmation-switch", doc.confirm_thread_delete(), ClientSettingChange::ConfirmThreadDelete))
                     .into_any_element(),
-                Row::new("quit-confirmation", "Quit shortcut")
-                    .description("Hold mode also quits on two quick presses.")
+                Row::new("quit-confirmation", t(cx, "Quit shortcut"))
+                    .description(t(cx, "Hold mode also quits on two quick presses."))
                     .highlighted(self.is_target("quit-confirmation"))
                     .reset(
                         doc.confirm_quit() != QuitConfirmationMode::default(),
@@ -160,7 +175,7 @@ impl SettingsView {
                     .control(
                         Select::new(
                             "quit-confirmation-select",
-                            literal_options(QuitConfirmationMode::ALL, QuitConfirmationMode::as_str, QuitConfirmationMode::label),
+                            translated_literal_options(QuitConfirmationMode::ALL, QuitConfirmationMode::as_str, QuitConfirmationMode::label, cx),
                         )
                         .selected(doc.confirm_quit().as_str())
                         .width(160.)
@@ -175,26 +190,54 @@ impl SettingsView {
             cx,
         );
 
+        let lang_state = state.clone();
+        let language_value = supported_language_value(doc.language());
+        let mut language_options = Vec::with_capacity(SUPPORTED_LOCALES.len() + 1);
+        language_options.push(SelectOption::new(SYSTEM_LANGUAGE, t(cx, "System default")));
+        for &locale in SUPPORTED_LOCALES {
+            language_options.push(SelectOption::new(locale, native_language_name(locale)));
+        }
         let time_state = state.clone();
         let display = section(
-            "Display",
+            t(cx, "Display"),
             vec![
-                Row::new("time-format", "Time format")
-                    .description("System default follows your browser or OS clock preference.")
+                Row::new("language", t(cx, "Language"))
+                    .description(t(cx, "System default follows your browser or OS language."))
+                    .highlighted(self.is_target("language"))
+                    .reset(
+                        doc.language() != DEFAULT_LOCALE,
+                        reset(state, ClientSettingChange::Language(DEFAULT_LOCALE.to_owned())),
+                    )
+                    .control(
+                        Select::new("language-select", language_options)
+                            .selected(language_value)
+                            .width(160.)
+                            .on_change(move |value, _, cx| {
+                                if !value.is_empty() {
+                                    store::update_client(&lang_state, ClientSettingChange::Language(value.to_string()), cx);
+                                }
+                            }),
+                    )
+                    .into_any_element(),
+                Row::new("time-format", t(cx, "Time format"))
+                    .description(t(cx, "System default follows your browser or OS clock preference."))
                     .highlighted(self.is_target("time-format"))
                     .reset(
                         doc.timestamp_format() != TimestampFormat::default(),
                         reset(state, ClientSettingChange::TimestampFormat(TimestampFormat::default())),
                     )
                     .control(
-                        Select::new("time-format-select", literal_options(TimestampFormat::ALL, TimestampFormat::as_str, TimestampFormat::label))
-                            .selected(doc.timestamp_format().as_str())
-                            .width(160.)
-                            .on_change(move |value, _, cx| {
-                                if let Some(format) = TimestampFormat::parse(&value) {
-                                    store::update_client(&time_state, ClientSettingChange::TimestampFormat(format), cx);
-                                }
-                            }),
+                        Select::new(
+                            "time-format-select",
+                            translated_literal_options(TimestampFormat::ALL, TimestampFormat::as_str, TimestampFormat::label, cx),
+                        )
+                        .selected(doc.timestamp_format().as_str())
+                        .width(160.)
+                        .on_change(move |value, _, cx| {
+                            if let Some(format) = TimestampFormat::parse(&value) {
+                                store::update_client(&time_state, ClientSettingChange::TimestampFormat(format), cx);
+                            }
+                        }),
                     )
                     .into_any_element(),
             ],
@@ -205,7 +248,7 @@ impl SettingsView {
             Block::new(&["notifications", "thread-notifications", "in-app-notifications"], notifications),
             Block::new(&["sidebar", "project-grouping", "project-order", "working-shelf"], sidebar),
             Block::new(&["confirmations", "unpin-confirmation", "archive-confirmation", "delete-confirmation", "quit-confirmation"], confirmations),
-            Block::new(&["display", "time-format"], display),
+            Block::new(&["display", "language", "time-format"], display),
         ]
     }
 
@@ -350,25 +393,76 @@ impl SettingsView {
             ],
             cx,
         );
+        let sr_announcements = doc.screen_reader_announcements();
+        let sr_announcements_state = state.clone();
+        let screen_reader = section(
+            "Screen reader",
+            vec![
+                Row::new("screen-reader-announcements", "Screen reader announcements")
+                    .description("What a screen reader hears from the open thread: a turn starting, needing you, and ending. Status and messages adds what the agent writes before its last message. Everything adds each step.")
+                    .highlighted(self.is_target("screen-reader-announcements"))
+                    .reset(
+                        sr_announcements != ScreenReaderAnnouncements::default(),
+                        reset(state, ClientSettingChange::ScreenReaderAnnouncements(ScreenReaderAnnouncements::default())),
+                    )
+                    .control(
+                        Select::new(
+                            "screen-reader-announcements-select",
+                            literal_options(
+                                &SCREEN_READER_ANNOUNCEMENTS_MODES,
+                                screen_reader_announcements_value,
+                                screen_reader_announcements_label,
+                            ),
+                        )
+                        .selected(screen_reader_announcements_value(sr_announcements))
+                        .width(192.)
+                        .on_change(move |value, _, cx| {
+                            if let Some(mode) = ScreenReaderAnnouncements::parse(&value) {
+                                store::update_client(&sr_announcements_state, ClientSettingChange::ScreenReaderAnnouncements(mode), cx);
+                            }
+                        }),
+                    )
+                    .into_any_element(),
+                Row::new("screen-reader-window-title", "Screen reader window title")
+                    .description("Start the window title with the thread's status, like Needs approval, and its name, so screen readers read them first when you switch apps. Taskbars, shared screens, and time trackers see it too.")
+                    .highlighted(self.is_target("screen-reader-window-title"))
+                    .reset(doc.screen_reader_window_title(), reset(state, ClientSettingChange::ScreenReaderWindowTitle(false)))
+                    .control(switch(
+                        state,
+                        "screen-reader-window-title-switch",
+                        doc.screen_reader_window_title(),
+                        ClientSettingChange::ScreenReaderWindowTitle,
+                    ))
+                    .into_any_element(),
+            ],
+            cx,
+        );
         vec![
             Block::new(&["composer", "composer-rich-text", "send-shortcut", "skills-in-slash-menu"], composer_section),
             Block::new(&["follow-ups", "follow-up-behavior"], follow_ups),
             Block::new(&["activity", "tool-call-visibility"], activity),
+            Block::new(&["screen-reader", "screen-reader-announcements", "screen-reader-window-title"], screen_reader),
         ]
     }
 
     pub(super) fn labs(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
         let p = palette(cx);
         let doc = self.doc(cx).clone();
-        let config = self.state.read(cx).server_config.config.clone();
-        let can_write = config.is_some() && self.may("settings:write", cx);
-        let write_unavailable = (!can_write).then_some("Reconnect with settings write access to change this setting.");
-        let state = self.state.clone();
+        let config = self.scoped_representative_config(cx);
+        let write_unavailable = if config.is_none() || !self.may("settings:write", cx) {
+            Some("Reconnect with settings write access to change this setting.".to_owned())
+        } else {
+            self.env_only_unavailable(cx)
+        };
+        let can_write = write_unavailable.is_none();
+        let weak = cx.entity().downgrade();
         let server_switch = |id: &'static str, checked: bool, disabled: bool, change: fn(bool) -> ServerSettingChange| {
-            let state = state.clone();
+            let weak = weak.clone();
             Switch::new(id, checked)
                 .disabled(disabled)
-                .on_change(move |checked, _, cx| store::update_server(&state, change(checked), cx))
+                .on_change(move |checked, _, cx| {
+                    let _ = weak.update(cx, |this, cx| this.update_scoped_server(change(checked), cx));
+                })
         };
 
         let boring_enabled = doc.boring_sidebar_enabled();
@@ -404,7 +498,7 @@ impl SettingsView {
         } else {
             managed_policy::capability_denial(config.as_ref().and_then(|c| c.managed_policy.as_ref()), Capability::Connect)
         };
-        let guest_unavailable = connect_denial.or_else(|| write_unavailable.map(str::to_owned));
+        let guest_unavailable = connect_denial.or_else(|| write_unavailable.clone());
         let access_link = cx.entity().downgrade();
         let guest_row = Row::new("guest-links", "Guest links")
             .description_content(
@@ -440,7 +534,7 @@ impl SettingsView {
                     .child("While off, nothing new starts over a link; running tasks finish."),
             )
             .highlighted(self.is_target("linked-environments-beta"))
-            .unavailable(write_unavailable)
+            .unavailable(write_unavailable.clone())
             .control(server_switch(
                 "linked-environments-switch",
                 linked_enabled,
@@ -452,7 +546,7 @@ impl SettingsView {
         let prompt_suggestions_row = Row::new("prompt-suggestions-beta", "Suggest next prompt")
             .description("Show a predicted next message in the empty composer after a Claude or Codex turn. Tab uses it. Each is an extra cached request on your plan. Needs Codex 0.165+. Claude threads update on restart.")
             .highlighted(self.is_target("prompt-suggestions-beta"))
-            .unavailable(write_unavailable)
+            .unavailable(write_unavailable.clone())
             .control(server_switch(
                 "prompt-suggestions-switch",
                 prompt_suggestions_enabled,
@@ -476,7 +570,7 @@ impl SettingsView {
                     .child("An alpha that may change or break. T3 Code never installs Simlock."),
             )
             .highlighted(self.is_target("simlock-hosts"))
-            .unavailable(write_unavailable)
+            .unavailable(write_unavailable.clone())
             .control(server_switch(
                 "simlock-hosts-switch",
                 simlock_enabled,

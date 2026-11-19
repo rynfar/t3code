@@ -2,7 +2,6 @@
 use super::super::{
     SettingsView,
     controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, r, section_title},
-    store,
 };
 use super::{Selected, flat_section};
 use crate::{
@@ -524,8 +523,7 @@ impl SettingsView {
             let generation = self.provider_form().generation;
             let publication_id = publication.id;
             let view = cx.entity().downgrade();
-            store::update_server_then(
-                &self.state,
+            self.update_scoped_single_env_then(
                 ServerSettingChange::ProviderInstance {
                     instance_id: id.clone(),
                     edit: model::InstanceEdit::CommandArgs {
@@ -542,7 +540,8 @@ impl SettingsView {
                                 return;
                             }
                             let saved = if error.is_none() {
-                                this.state.read(cx).server_config.config.as_ref().and_then(|c| c.settings.provider_instances.get(&id)).map(form::command_args)
+                                this.scoped_raw_representative_config(cx)
+                                    .and_then(|c| c.settings.provider_instances.get(&id).map(form::command_args))
                             } else {
                                 None
                             };
@@ -1115,7 +1114,7 @@ impl SettingsView {
         }
         let generation = self.provider_form().generation;
         self.provider_form_mut().secret_checks.insert(key.clone(), SecretCheckStatus::Checking);
-        let task = self.state.read(cx).rpc(secrets::CHECK_SECRET_SOURCE, secrets::check_secret_source_payload(&provider, &reference));
+        let task = self.scoped_rpc(SETTINGS_WRITE_SCOPE, secrets::CHECK_SECRET_SOURCE, secrets::check_secret_source_payload(&provider, &reference), cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let next = match result {

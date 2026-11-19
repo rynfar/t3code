@@ -372,7 +372,7 @@ impl SettingsView {
             _ => (false, false),
         };
         let cleanup = voice_cleanup_granted(cx);
-        let has_scope = self.state.read(cx).server_config.config.is_some();
+        let has_scope = self.scoped_representative_config(cx).is_some();
         voice_search_target_fallback(
             target,
             has_local_prepared,
@@ -1245,7 +1245,7 @@ impl SettingsView {
     }
 
     fn current_project_dictionary_words(&self, cx: &App) -> Vec<SpeechCustomWordEntry> {
-        let Some(config) = self.state.read(cx).server_config.config.as_ref() else {
+        let Some(config) = self.scoped_raw_representative_config(cx) else {
             return Vec::new();
         };
         config
@@ -1254,30 +1254,7 @@ impl SettingsView {
     }
 
     fn save_project_dictionary_words(&self, words: Vec<SpeechCustomWordEntry>, cx: &mut App) {
-        if let Some(project_id) = self.scope_project_id(cx)
-            && let Some(config) = self.state.read(cx).server_config.config.as_ref()
-        {
-            let mut raw = config
-                .settings
-                .project_settings_overrides
-                .get(&project_id)
-                .map(|o| o.raw.clone())
-                .unwrap_or_default();
-            raw.insert(
-                "speechProjectCustomWords".to_owned(),
-                serde_json::to_value(&words).unwrap_or_default(),
-            );
-            let payload = serde_json::json!({
-                "patch": {
-                    "projectSettingsOverrides": {
-                        project_id: serde_json::Value::Object(raw),
-                    }
-                }
-            });
-            store::update_server(&self.state, ServerSettingChange::Prepared(payload), cx);
-        } else {
-            store::update_server(&self.state, ServerSettingChange::SpeechProjectCustomWords(words), cx);
-        }
+        self.update_scoped_server(ServerSettingChange::SpeechProjectCustomWords(words), cx);
     }
 
     fn commit_voice_custom_prompt(&mut self, cx: &mut Context<Self>) {
@@ -2358,7 +2335,7 @@ impl SettingsView {
                 .into_any_element(),
         ];
 
-        let has_server = self.state.read(cx).server_config.config.is_some();
+        let has_server = self.scoped_representative_config(cx).is_some();
         let scoped_project_label = self.scope_project_label(cx);
         let project_words = self.current_project_dictionary_words(cx);
         let project_editor = self.render_dictionary_editor(
@@ -2396,13 +2373,22 @@ impl SettingsView {
                 "Used by everyone who dictates on this environment.".to_owned(),
             ),
         };
-        dict_rows.push(
-            Row::new("speech-project-dictionary", proj_dict_title)
-                .description(proj_dict_desc)
-                .highlighted(self.is_target("speech-project-dictionary"))
-                .below(project_editor)
-                .into_any_element(),
-        );
+        let mut proj_dict_row = Row::new("speech-project-dictionary", proj_dict_title)
+            .description(proj_dict_desc)
+            .highlighted(self.is_target("speech-project-dictionary"))
+            .below(project_editor);
+        if self.is_project_scope(cx) {
+            let reset_view = cx.entity().downgrade();
+            proj_dict_row = proj_dict_row.reset_tooltip("Reset to inherited value").reset(
+                self.has_project_override(&["speechProjectCustomWords"], cx),
+                move |_, _, cx| {
+                    let _ = reset_view.update(cx, |this, cx| {
+                        this.clear_project_overrides(&["speechProjectCustomWords"], cx);
+                    });
+                },
+            );
+        }
+        dict_rows.push(proj_dict_row.into_any_element());
         let dictionary_section = section("Dictionary", dict_rows, cx);
 
         // -------------------------------------------------------------------
@@ -2534,7 +2520,7 @@ impl SettingsView {
     }
 
     fn render_cleanup_model_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(config) = self.state.read(cx).server_config.config.clone() else {
+        let Some(config) = self.scoped_representative_config(cx) else {
             return Row::new("speech-post-processing-model", "Cleanup model")
                 .description(
                     "Model for transcript cleanup, such as a cheaper or faster one. When disabled, use the text generation model configured for this environment.",
@@ -2544,20 +2530,25 @@ impl SettingsView {
                 .into_any_element();
         };
         self.sync_text_generator_models(&config, cx);
+        let env_only = self.env_only_unavailable(cx);
         let saved_cleanup = speech_post_processing_model_selection(&config.settings);
         let dedicated = saved_cleanup.is_some();
         let fallback_text_gen =
-            resolve_default_text_generation_selection(&config, None, &self.threads.text_gen_models);
+            resolve_default_text_generation_selection(&config, None, self.text_gen_models_for(&config));
         let shown = saved_cleanup.clone().or_else(|| fallback_text_gen.clone());
-        let options = self.text_gen_select_options(
+        let options = self.apply_scoped_model_availability(
             &config,
-            None,
-            &[saved_cleanup.as_ref(), fallback_text_gen.as_ref()],
+            self.text_gen_select_options(&config, None, &[saved_cleanup.as_ref(), fallback_text_gen.as_ref()]),
+            true,
+            cx,
         );
+        let disabled_reason = saved_cleanup.as_ref().and_then(|sel| {
+            self.scoped_model_disabled_reason(&config, &sel.instance_id, &sel.model, true, cx)
+        });
         let has_provider = !options.is_empty();
-        let switch_state = self.state.clone();
+        let switch_view = cx.entity().downgrade();
         let switch_default = fallback_text_gen.clone();
-        let select_state = self.state.clone();
+        let select_view = cx.entity().downgrade();
 
         let mut control = h_flex().flex_wrap().justify_end().gap(r(8.));
         if dedicated {
@@ -2569,7 +2560,7 @@ impl SettingsView {
                     "speech-cleanup-model",
                     &config,
                     sel,
-                    &self.state,
+                    cx.entity().downgrade(),
                     ServerSettingChange::SpeechPostProcessingModelSelection,
                 );
                 control = control
@@ -2582,11 +2573,12 @@ impl SettingsView {
                             .show_check()
                             .on_change(move |value, _, cx| {
                                 if let Some(next) = parse_selection(&value) {
-                                    store::update_server(
-                                        &select_state,
-                                        ServerSettingChange::SpeechPostProcessingModelSelection(Some(next)),
-                                        cx,
-                                    );
+                                    let _ = select_view.update(cx, |this, cx| {
+                                        this.update_scoped_server(
+                                            ServerSettingChange::SpeechPostProcessingModelSelection(Some(next)),
+                                            cx,
+                                        );
+                                    });
                                 }
                             }),
                     )
@@ -2600,21 +2592,25 @@ impl SettingsView {
                 .disabled(!dedicated && !has_provider)
                 .on_change(move |checked, _, cx| {
                     let next = if checked { switch_default.clone() } else { None };
-                    store::update_server(
-                        &switch_state,
-                        ServerSettingChange::SpeechPostProcessingModelSelection(next),
-                        cx,
-                    );
+                    let _ = switch_view.update(cx, |this, cx| {
+                        this.update_scoped_server(
+                            ServerSettingChange::SpeechPostProcessingModelSelection(next),
+                            cx,
+                        );
+                    });
                 }),
         );
 
-        Row::new("speech-post-processing-model", "Cleanup model")
+        let mut row = Row::new("speech-post-processing-model", "Cleanup model")
             .description(
                 "Model for transcript cleanup, such as a cheaper or faster one. When disabled, use the text generation model configured for this environment.",
             )
             .highlighted(self.is_target("speech-post-processing-model"))
-            .control(control)
-            .into_any_element()
+            .unavailable(env_only);
+        if let Some(reason) = disabled_reason {
+            row = row.status(reason);
+        }
+        row.control(control).into_any_element()
     }
 
     fn render_speech_model_browser(

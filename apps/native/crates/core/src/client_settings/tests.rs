@@ -338,3 +338,45 @@ fn voice_settings_round_trip_and_project_custom_words() {
     assert_eq!(words.len(), 1);
     assert_eq!(words[0].term, "GPUI");
 }
+
+#[test]
+fn language_proactive_panels_and_screen_reader_settings_match_contract_defaults() {
+    use super::ScreenReaderAnnouncements;
+
+    let mut doc = ClientSettingsDoc::default();
+    assert_eq!(doc.language(), "en");
+    assert!(!doc.proactive_panels_enabled());
+    assert_eq!(doc.screen_reader_announcements(), ScreenReaderAnnouncements::Status);
+    assert!(!doc.screen_reader_window_title());
+
+    assert!(doc.apply(&ClientSettingChange::Language("system".into())));
+    assert_eq!(doc.language(), "system");
+    assert!(doc.apply(&ClientSettingChange::Language("pt-BR".into())));
+    assert_eq!(doc.language(), "pt-BR");
+
+    assert!(doc.apply(&ClientSettingChange::ProactivePanelsEnabled(true)));
+    assert!(doc.proactive_panels_enabled());
+
+    assert!(doc.apply(&ClientSettingChange::ScreenReaderAnnouncements(
+        ScreenReaderAnnouncements::Everything
+    )));
+    assert_eq!(doc.screen_reader_announcements(), ScreenReaderAnnouncements::Everything);
+    assert!(doc.apply(&ClientSettingChange::ScreenReaderWindowTitle(true)));
+    assert!(doc.screen_reader_window_title());
+
+    let reread = ClientSettingsDoc::from_json(&doc.to_json());
+    assert_eq!(reread.language(), "pt-BR");
+    assert!(reread.proactive_panels_enabled());
+    assert_eq!(reread.screen_reader_announcements(), ScreenReaderAnnouncements::Everything);
+    assert!(reread.screen_reader_window_title());
+
+    // Invalid values fall back to contract defaults without dropping unknown keys.
+    let invalid = ClientSettingsDoc::from_json(
+        r#"{"language":42,"proactivePanelsEnabled":"yes","screenReaderAnnouncements":"invalid","screenReaderWindowTitle":1,"future":9}"#,
+    );
+    assert_eq!(invalid.language(), "en");
+    assert!(!invalid.proactive_panels_enabled());
+    assert_eq!(invalid.screen_reader_announcements(), ScreenReaderAnnouncements::Status);
+    assert!(!invalid.screen_reader_window_title());
+    assert_eq!(invalid.entries()["future"], 9);
+}
