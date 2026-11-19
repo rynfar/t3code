@@ -563,8 +563,7 @@ impl Composer {
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn set_test_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_prompt(text, window, cx);
-        self.draft_changed(cx);
+        self.replace_prompt_text(text, window, cx);
     }
 
     #[cfg(all(test, feature = "snapshot"))]

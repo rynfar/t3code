@@ -67,7 +67,8 @@ pub(super) struct Outgoing {
 /// activating its destination environment before launching the draft thread.
 pub(super) struct PendingRoutedSend {
     saved_id: String,
-    project_id: String,
+    pub(super) project_id: String,
+    pub(super) expected_prompt: String,
     intent: SubmitIntent,
     preserved_workspace: Option<(ThreadEnvMode, Option<String>, Option<bool>)>,
     preserved_multi_models: Vec<ModelSelection>,
@@ -276,19 +277,34 @@ impl Composer {
         let Some(pending) = self.pending_routed_send.as_ref() else {
             return;
         };
-        let (selected_thread, active_env, draft_project, has_client, has_config, has_project) = {
+        let (
+            selected_thread,
+            active_env,
+            draft_project,
+            has_pending_scoped_route,
+            has_client,
+            has_config,
+            has_project,
+        ) = {
             let state = self.state.read(cx);
             (
                 state.selected_thread.is_some(),
                 state.environments.active.clone(),
                 state.draft_project.clone(),
+                state.has_pending_scoped_route(),
                 state.client_handle().is_some(),
                 state.server_config.config.is_some(),
                 state.shell.project(&pending.project_id).is_some(),
             )
         };
-        if selected_thread || active_env.as_deref() != Some(pending.saved_id.as_str()) {
+        let route_dropped =
+            !has_pending_scoped_route && draft_project.as_deref() != Some(pending.project_id.as_str());
+        if selected_thread
+            || active_env.as_deref() != Some(pending.saved_id.as_str())
+            || route_dropped
+        {
             self.pending_routed_send = None;
+            self.workspace.routing.pending_navigation = None;
             self.sending = false;
             cx.notify();
             return;
@@ -307,6 +323,12 @@ impl Composer {
             self.refresh(false, window, cx);
             self.sync_workspace(false, cx);
         }
+        let prompt = self.prompt(cx);
+        let staged = self.staged_attachments();
+        if prompt != pending.expected_prompt || !staged.is_empty() {
+            cx.notify();
+            return;
+        }
         if let Some((mode, branch, start_from_origin)) = pending.preserved_workspace {
             self.mutate_draft_workspace(cx, |ws| {
                 ws.mode = mode;
@@ -320,8 +342,6 @@ impl Composer {
                 .or_default()
                 .multi_models = pending.preserved_multi_models;
         }
-        let prompt = self.prompt(cx);
-        let staged = self.staged_attachments();
         let terminals = TerminalSend::of(&prompt, self.current_terminals());
         let outgoing = self.outgoing(terminals.text, &staged);
         self.launch(pending.project_id, outgoing, pending.intent, window, cx);
@@ -480,6 +500,26 @@ impl Composer {
                     cx.notify();
                     return;
                 };
+                if !this
+                    .state
+                    .read(cx)
+                    .scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                {
+                    let warn = load_balancing_send_warning(
+                        false,
+                        &referenced_threads,
+                        &orig_candidate_ids,
+                    );
+                    this.state.update(cx, |state, cx| {
+                        state.show_toast(
+                            Toast::new(ToastKind::Warning, warn.title)
+                                .description(warn.description),
+                            cx,
+                        );
+                    });
+                    cx.notify();
+                    return;
+                }
                 this.retarget_draft_for_routing(
                     &orig_project_id,
                     &target.project_id,
@@ -490,6 +530,7 @@ impl Composer {
                 this.pending_routed_send = Some(PendingRoutedSend {
                     saved_id: target.saved_id.clone(),
                     project_id: target.project_id.clone(),
+                    expected_prompt: orig_prompt,
                     intent,
                     preserved_workspace: orig_workspace,
                     preserved_multi_models: orig_multi_models,

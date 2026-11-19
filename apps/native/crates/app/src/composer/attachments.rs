@@ -457,11 +457,23 @@ impl Composer {
             .collect()
     }
 
+    fn cancel_pending_routed_send_for(&mut self, target: &Target) -> bool {
+        let matches = self.snapshot.target.as_ref() == Some(target)
+            || self
+                .pending_routed_send
+                .as_ref()
+                .is_some_and(|pending| *target == Target::Draft(pending.project_id.clone()));
+        matches && self.cancel_pending_routed_send()
+    }
+
     /// Attachments a saved draft restores: uploaded, without their bytes or preview.
     pub(super) fn seed_attachments(&mut self, target: &Target, restored: Vec<Attachment>, verify: bool, cx: &mut Context<Self>) {
         if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
         if restored.is_empty() {
             return;
+        }
+        if self.cancel_pending_routed_send_for(target) {
+            cx.notify();
         }
         let ids: Vec<String> = if verify {
             restored.iter().filter_map(|a| a.attachment_id().map(|_| a.id.clone())).collect()
@@ -477,6 +489,7 @@ impl Composer {
 
     pub(super) fn stage_imported_attachment(&mut self, target: &Target, imported: super::imports::ImportedAttachment, cx: &mut Context<Self>) {
         if self.snapshot.target.as_ref() == Some(target) { self.cancel_pending_send(); }
+        if self.cancel_pending_routed_send_for(target) { cx.notify(); }
         let id = imported.attachment.id.clone();
         let copying = imported.source.is_some();
         let mut entry = Staged::ready(imported.attachment);
@@ -560,6 +573,7 @@ impl Composer {
         let preparation = self.attachments.preparations.begin(&storage_key);
         let file_limit = self.file_limit(cx);
         self.cancel_pending_send();
+        self.cancel_pending_routed_send();
         cx.notify();
         let read = cx.background_executor().spawn(async move {
             files
@@ -606,6 +620,7 @@ impl Composer {
         if let Target::Question(key) = target && !self.question_can_attach(key, cx, IntakePhase::Preparing) { return; }
         if matches!(target, Target::Thread(id) if self.state.read(cx).is_thread_rewinding(id)) { return; }
         if self.attachment_target().as_ref() == Some(target) { self.cancel_pending_send(); }
+        if self.cancel_pending_routed_send_for(target) { cx.notify(); }
         let size = picked.bytes.len() as u64;
         // Replacing a matching reattach marker must not consume an extra slot (`useComposerAttachmentIntake.ts`).
         if picked.kind == AttachmentKind::File
@@ -1130,6 +1145,7 @@ impl Composer {
     pub(super) fn retry_upload(&mut self, id: String, cx: &mut Context<Self>) {
         if !self.can_attach(cx) { return; }
         self.cancel_pending_send();
+        self.cancel_pending_routed_send();
         let Some(target) = self.attachment_target() else { return };
         if self.staged_for(&target).iter().any(|s| s.attachment.id == id && s.source.is_none()) {
             let uploads = self.state.read(cx).uploads.clone();
@@ -1162,6 +1178,7 @@ impl Composer {
         let owned_by_queue = removed.source.is_none() && uploads.state(&key).is_some();
         uploads.release_upload(&key);
         self.cancel_pending_send();
+        self.cancel_pending_routed_send();
         if !owned_by_queue && let Some(attachment_id) = removed.attachment.attachment_id() {
             self.release_upload(attachment_id, cx);
         }
@@ -1228,6 +1245,7 @@ impl Composer {
                         let storage_key = super::drafts::key(&target);
                         let preparation = self.attachments.preparations.begin(&storage_key);
                         self.cancel_pending_send();
+                        self.cancel_pending_routed_send();
                         cx.notify();
                         let mime_owned = mime.to_owned();
                         let task = cx.background_executor().spawn(async move {

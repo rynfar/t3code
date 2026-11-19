@@ -1352,6 +1352,14 @@ impl Composer {
     }
 
     pub(crate) fn replace_prompt_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .pending_routed_send
+            .as_ref()
+            .is_some_and(|pending| text != pending.expected_prompt)
+            && self.cancel_pending_routed_send()
+        {
+            cx.notify();
+        }
         self.set_prompt(text, window, cx);
         self.draft_changed(cx);
     }
@@ -1474,6 +1482,14 @@ impl Composer {
     /// text: the send button's enabled state, or the active answer.
     fn on_prompt_change(&mut self, cx: &mut Context<Self>) {
         if self.cancel_pending_send() { cx.notify(); }
+        let current = self.prompt(cx);
+        if self.pending_routed_send.as_ref().is_some_and(|pending| {
+            current != pending.expected_prompt
+                && (self.snapshot.target.is_some() || !current.is_empty())
+        }) && self.cancel_pending_routed_send()
+        {
+            cx.notify();
+        }
         self.sync_menu(true, cx);
         self.close_stash_menu(cx);
         if self.answering.is_none() {
@@ -4906,7 +4922,231 @@ mod stream_error_tests {
             "edited draft must abandon in-flight refreshBeforeSend"
         );
 
-        // 5. Manual host selection disables auto label, and selecting Auto balance with attachments
+        // 5. Editing the prompt while `pending_routed_send` is waiting on `navigate_scoped`
+        //    cancels the handoff immediately and never launches when the target activates.
+        let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut handoff_tx = Some(handoff_tx);
+        let _handoff_sub = vcx.update(|_, cx| {
+            cx.subscribe(&state, move |state, event: &AppEvent, cx| {
+                if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::Phase)
+                    && state.read(cx).environments.active.as_deref() == Some("remote-1")
+                    && let Some(tx) = handoff_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_test_prompt("Handoff edit test", window, cx);
+                composer.submit(rules::SubmitIntent::Foreground, window, cx);
+            });
+        });
+        futures::future::join(
+            reply_host_resources(&mut local_fixture, 0.90),
+            reply_host_resources(&mut remote_fixture, 0.10),
+        )
+        .await;
+        handoff_rx.await.unwrap();
+        drop(_handoff_sub);
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            assert!(composer.read(cx).sending);
+            assert!(composer.read(cx).pending_routed_send.is_some());
+            composer.update(cx, |composer, cx| {
+                composer
+                    .input
+                    .update(cx, |input, cx| input.insert(" edited", window, cx));
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(
+                composer.read(cx).pending_routed_send.is_none(),
+                "editing prompt during handoff must cancel pending_routed_send"
+            );
+            assert!(!composer.read(cx).sending);
+            state.update(cx, |state, cx| {
+                state.install_active_environment(
+                    remote_client.clone(),
+                    remote_shell.clone(),
+                    remote_cfg.clone(),
+                    t3_client::supervisor::ConnectionStatus::Connected,
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+        let (remote_reqs, _) = remote_fixture.take_requests();
+        assert!(
+            !remote_reqs.iter().any(|(m, _, _)| *m == t3_core::commands::method::LAUNCH_THREAD),
+            "cancelled handoff must not launch after destination activates"
+        );
+
+        // 6. If `navigate_scoped` drops `pending_scoped_route` mid-handoff (e.g. target machine
+        //    disconnects), `try_finish_pending_routed_send` clears `pending_routed_send` and
+        //    unsticks `sending`.
+        let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut drop_tx = Some(drop_tx);
+        let _drop_sub = vcx.update(|_, cx| {
+            cx.subscribe(&state, move |state, event: &AppEvent, cx| {
+                if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::Phase)
+                    && state.read(cx).environments.active.as_deref() == Some("local")
+                    && let Some(tx) = drop_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.workspace.routing.selection = workspace::DraftEnvSelection::Auto;
+                composer.workspace.routing.resolved_environment_id = Some("env-remote".into());
+                composer.set_test_prompt("Dropped route test", window, cx);
+                composer.submit(rules::SubmitIntent::Foreground, window, cx);
+            });
+        });
+        futures::future::join(
+            reply_host_resources(&mut local_fixture, 0.10),
+            reply_host_resources(&mut remote_fixture, 0.90),
+        )
+        .await;
+        drop_rx.await.unwrap();
+        drop(_drop_sub);
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(composer.read(cx).sending);
+            assert!(composer.read(cx).pending_routed_send.is_some());
+            assert!(state.read(cx).has_pending_scoped_route());
+        });
+        let disconnect_local = state.update(vcx, |state, _| {
+            state.connections.install_fixture(
+                "local",
+                local_client.clone(),
+                local_shell.clone(),
+                local_cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Reconnecting {
+                    reason: "offline".into(),
+                    attempt: 1,
+                },
+            )
+        });
+        let _disconnected_events = runtime.spawn(disconnect_local).await.unwrap();
+        let disconnected_fleet = view.borrow_and_update().clone();
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.apply_fleet_view(disconnected_fleet, cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert!(!state.read(cx).has_pending_scoped_route());
+            assert!(
+                composer.read(cx).pending_routed_send.is_none(),
+                "dropped scoped route must clear pending_routed_send"
+            );
+            assert!(
+                !composer.read(cx).sending,
+                "dropped scoped route must unstick composer.sending"
+            );
+        });
+
+        // 7. Failed `server.getHostResources` probes settle on `"Auto balance unavailable"` and
+        //    do not immediately re-fetch on subsequent Shell/ServerConfig/Phase events.
+        let reconnect_local = state.update(vcx, |state, _| {
+            state.connections.install_fixture(
+                "local",
+                local_client.clone(),
+                local_shell.clone(),
+                local_cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _reconnected_events = runtime.spawn(reconnect_local).await.unwrap();
+        let reconnected_fleet = view.borrow_and_update().clone();
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.apply_fleet_view(reconnected_fleet, cx);
+                state.install_active_environment(
+                    local_client.clone(),
+                    local_shell.clone(),
+                    local_cfg.clone(),
+                    t3_client::supervisor::ConnectionStatus::Connected,
+                    cx,
+                );
+                state.start_draft("proj-local", cx);
+            });
+        });
+        vcx.run_until_parked();
+        let _ = local_fixture.take_requests();
+        let _ = remote_fixture.take_requests();
+
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut fail_tx = Some(fail_tx);
+        let _fail_obs = vcx.update(|_, cx| {
+            cx.observe(&composer, move |composer, cx| {
+                let c = composer.read(cx);
+                let opts = c.host_options(cx);
+                if c.draft_auto_environment_label(&opts, cx) == Some("Auto balance unavailable")
+                    && let Some(tx) = fail_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.select_auto_host(window, cx);
+            });
+        });
+        let reply_host_resources_err = async |fx: &mut t3_client::supervisor::ClientFixture| {
+            loop {
+                let (method, _, reply) = fx.next_request().await;
+                if method == t3_client::load_balancing::SERVER_GET_HOST_RESOURCES {
+                    let _ = reply.send(Err(t3_client::session::RpcError::Closed));
+                    return;
+                }
+                let _ = reply.send(Ok(json!({})));
+            }
+        };
+        futures::future::join(
+            reply_host_resources_err(&mut local_fixture),
+            reply_host_resources_err(&mut remote_fixture),
+        )
+        .await;
+        fail_rx.await.unwrap();
+        drop(_fail_obs);
+        vcx.run_until_parked();
+        let _ = local_fixture.take_requests();
+        let _ = remote_fixture.take_requests();
+        vcx.update(|_, cx| {
+            state.update(cx, |_, cx| {
+                cx.emit(AppEvent::Shell);
+                cx.emit(AppEvent::ServerConfig);
+                cx.emit(AppEvent::Phase);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let c = composer.read(cx);
+            let opts = c.host_options(cx);
+            assert_eq!(
+                c.draft_auto_environment_label(&opts, cx),
+                Some("Auto balance unavailable"),
+                "subsequent events must not re-fetch failed probes within freshness window"
+            );
+        });
+        let (local_after_fail, _) = local_fixture.take_requests();
+        let (remote_after_fail, _) = remote_fixture.take_requests();
+        assert!(
+            !local_after_fail
+                .iter()
+                .chain(remote_after_fail.iter())
+                .any(|(m, _, _)| *m == t3_client::load_balancing::SERVER_GET_HOST_RESOURCES),
+            "subsequent events must not trigger immediate server.getHostResources re-fetch"
+        );
+
+        // 8. Manual host selection disables auto label, and selecting Auto balance with attachments
         //    emits the attachments warning toast.
         vcx.update(|window, cx| {
             composer.update(cx, |composer, cx| {

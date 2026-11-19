@@ -1157,7 +1157,12 @@ impl Composer {
         if let Some(from) = from_project {
             self.retarget_draft_for_routing(&from, &target.project_id, same_env, window, cx);
         }
-        if let Some(owner) = target.owner {
+        if let Some(owner) = target.owner
+            && self
+                .state
+                .read(cx)
+                .scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+        {
             if !same_env {
                 self.workspace.routing.pending_navigation =
                     Some((target.saved_id.clone(), target.project_id.clone()));
@@ -1180,6 +1185,7 @@ impl Composer {
             let waiting_on_routed_switch = {
                 let state = self.state.read(cx);
                 state.selected_thread.is_none()
+                    && state.has_pending_scoped_route()
                     && self.workspace.routing.pending_navigation.as_ref().is_some_and(
                         |(saved_id, _)| state.environments.active.as_deref() == Some(saved_id.as_str()),
                     )
@@ -1251,8 +1257,7 @@ impl Composer {
                 None => true,
                 Some(entry) => {
                     !entry.pending
-                        && (entry.resources.is_none()
-                            || current_ms.saturating_sub(entry.received_at_ms) > HOST_RESOURCES_FRESH_MS)
+                        && current_ms.saturating_sub(entry.received_at_ms) > HOST_RESOURCES_FRESH_MS
                 }
             }
         });
