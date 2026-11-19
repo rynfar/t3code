@@ -348,3 +348,329 @@ fn metadata_cache_drops_the_oldest_write_past_its_limit() {
     assert_eq!(cache.lookup("/f1", None, 1), Lookup::Known(None));
     assert_eq!(cache.lookup("/f2", None, 1), Lookup::Fetch);
 }
+
+
+#[test]
+fn write_file_wire_shapes_and_preview_classifiers() {
+    assert_eq!(
+        write_file_request("/repo", "src/a.rs", "fn main() {}"),
+        json!({ "cwd": "/repo", "relativePath": "src/a.rs", "contents": "fn main() {}" })
+    );
+    assert_eq!(decode_write_file(&json!({ "relativePath": "src/a.rs" })).unwrap(), "src/a.rs");
+    assert!(decode_write_file(&json!({})).is_err());
+
+    let err = WriteFailure::from_error(
+        &json!({ "_tag": "ProjectWriteFileError", "failure": "workspace_path_outside_root", "message": "bad" }),
+        "fallback",
+    );
+    assert_eq!(err.failure, Some(FileFailure::OutsideRoot));
+    assert_eq!(err.describe(), "The requested path is outside the workspace.");
+
+    assert!(is_mermaid("diagram.mmd") && is_mermaid("arch.MERMAID") && !is_mermaid("a.md"));
+    assert!(is_notebook("analysis.ipynb") && !is_notebook("data.json"));
+    assert_eq!(delimited_separator("data.CSV"), Some(','));
+    assert_eq!(delimited_separator("rows.tsv"), Some('\t'));
+    assert_eq!(delimited_separator("notes.txt"), None);
+    assert!(is_audio("clip.mp3") && is_audio("song.wav") && is_audio("voice.m4a") && !is_audio("clip.mp4"));
+    assert!(is_font("Inter.ttf") && is_font("Mono.OTF") && is_font("ui.woff2") && !is_font("ui.svg"));
+    assert_eq!(binary_container_kind("pkg.zip"), Some(BinaryContainerKind::Archive));
+    assert_eq!(binary_container_kind("app.tar"), Some(BinaryContainerKind::Archive));
+    assert_eq!(binary_container_kind("state.sqlite3"), Some(BinaryContainerKind::Sqlite));
+    assert_eq!(binary_container_kind("main.rs"), None);
+}
+
+#[test]
+fn content_revision_and_save_coordinator_follow_web_semantics() {
+    use super::save::{
+        DEFAULT_SAVE_DEBOUNCE_MS, DismissalOutcome, FileSaveCoordinator, FileSaveSessionStore, FileSaveTarget,
+        SaveEffect, decide_escape_dismissal, decide_leave_editor, decide_outside_pointer_dismissal,
+        file_content_revision, project_file_cache_key,
+    };
+
+    assert_ne!(
+        project_file_cache_key("/repo", "file.json", "nodeVersion"),
+        project_file_cache_key("/repo", "file.json", "nodeVeasdrs")
+    );
+    assert_eq!(file_content_revision(""), "0:ztntfp");
+
+    // Keeps pending state until an edit made during a write is also saved.
+    let mut coord = FileSaveCoordinator::new(DEFAULT_SAVE_DEBOUNCE_MS);
+    let effects = coord.change("first".into(), 0);
+    let token = match effects.as_slice() {
+        [SaveEffect::PendingChanged(true), SaveEffect::ScheduleDebounce { delay_ms: 500, token }] => *token,
+        other => panic!("unexpected effects: {other:?}"),
+    };
+    let effects = coord.on_debounce_fired(token, true);
+    assert_eq!(effects, vec![SaveEffect::Persist { revision: 1, contents: "first".into() }]);
+    assert!(coord.is_saving());
+
+    // Edit during in-flight write schedules debounce but does not start a second write yet.
+    let effects = coord.change("latest".into(), 600);
+    assert!(effects.iter().any(|e| matches!(e, SaveEffect::ScheduleDebounce { delay_ms: 500, .. })));
+    // First write completes; remaining debounce is scheduled for the newer edit.
+    let effects = coord.on_persist_result(1, true, true, true, 700);
+    let token2 = match effects.as_slice() {
+        [SaveEffect::CancelDebounce, SaveEffect::ScheduleDebounce { delay_ms: 400, token }] => *token,
+        other => panic!("unexpected effects after first write: {other:?}"),
+    };
+    let effects = coord.on_debounce_fired(token2, true);
+    assert_eq!(effects, vec![SaveEffect::Persist { revision: 2, contents: "latest".into() }]);
+    let effects = coord.on_persist_result(2, true, true, true, 1200);
+    assert_eq!(effects, vec![SaveEffect::PendingChanged(false), SaveEffect::Settled]);
+    assert!(!coord.is_dirty());
+    assert_eq!(coord.unconfirmed_contents(), None);
+
+    // Edits after disposal are ignored.
+    let mut disposed = FileSaveCoordinator::new(500);
+    assert!(disposed.dispose(true).is_empty());
+    assert!(disposed.change("stale".into(), 10).is_empty());
+
+    // Permission removed keeps draft pending without persisting.
+    let mut ro = FileSaveCoordinator::new(500);
+    let effects = ro.change("unsaved".into(), 0);
+    let tok = match effects.last() {
+        Some(SaveEffect::ScheduleDebounce { token, .. }) => *token,
+        other => panic!("expected debounce: {other:?}"),
+    };
+    let effects = ro.on_debounce_fired(tok, false);
+    assert_eq!(effects, vec![SaveEffect::Settled]);
+    assert_eq!(ro.unconfirmed_contents(), Some("unsaved"));
+
+    // Session store: unsaved edits survive release when read-only and recover when writable returns.
+    let mut store = FileSaveSessionStore::new(500);
+    let target = FileSaveTarget::new("env-1", "/repo", "a.txt");
+    store.acquire(&target, false, 0);
+    let _ = store.change(&target, "draft v1".into(), 10);
+    assert_eq!(store.unsaved_contents(&target), Some("draft v1"));
+    let _ = store.release(&target, false);
+    assert_eq!(store.active_session_count(), 0);
+    assert_eq!(store.unsaved_contents(&target), Some("draft v1"));
+
+    // Reacquire when writable recovers unsaved draft automatically.
+    let recovered = store.acquire(&target, true, 100);
+    assert!(recovered.iter().any(|e| matches!(e.effect, SaveEffect::ScheduleDebounce { .. })));
+
+    // Dismissal decisions.
+    assert_eq!(decide_escape_dismissal(false, false), DismissalOutcome::Ignore);
+    assert_eq!(decide_escape_dismissal(true, false), DismissalOutcome::DismissNow);
+    assert_eq!(decide_escape_dismissal(true, true), DismissalOutcome::PromptUnsaved);
+    assert_eq!(decide_outside_pointer_dismissal(true, true), DismissalOutcome::Ignore);
+    assert_eq!(decide_outside_pointer_dismissal(false, true), DismissalOutcome::PromptUnsaved);
+    assert_eq!(decide_leave_editor(false, false), DismissalOutcome::DismissNow);
+    assert_eq!(decide_leave_editor(true, false), DismissalOutcome::PromptUnsaved);
+}
+
+#[test]
+fn delimited_table_parses_rfc4180_sorts_and_resizes() {
+    use super::delimited::{DelimitedLimits, DelimitedTable, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, SortDirection, column_label};
+
+    assert_eq!(column_label(0), "A");
+    assert_eq!(column_label(25), "Z");
+    assert_eq!(column_label(26), "AA");
+
+    let csv = "\u{feff}name,score,note\r\nAlice,100,\"hello, \"\"world\"\"\"\r\nBob,20,\"line1\nline2\"\r\ncarol,5,\r\n";
+    let mut table = DelimitedTable::parse(csv, ',', DelimitedLimits::default());
+    assert!(!table.truncated);
+    assert_eq!(table.header, vec!["name", "score", "note"]);
+    assert_eq!(table.row_count(), 3);
+    assert_eq!(table.display_row(0).unwrap().1[2], "hello, \"world\"");
+    assert_eq!(table.display_row(1).unwrap().1[2], "line1\nline2");
+
+    // Numeric sort ascending: 5, 20, 100.
+    table.toggle_sort(1);
+    assert_eq!(table.sort.unwrap().direction, SortDirection::Ascending);
+    assert_eq!(table.display_row(0).unwrap().1[0], "carol");
+    assert_eq!(table.display_row(1).unwrap().1[0], "Bob");
+    assert_eq!(table.display_row(2).unwrap().1[0], "Alice");
+
+    // Descending: 100, 20, 5.
+    table.toggle_sort(1);
+    assert_eq!(table.sort.unwrap().direction, SortDirection::Descending);
+    assert_eq!(table.display_row(0).unwrap().1[0], "Alice");
+
+    // Third click resets to natural order.
+    table.toggle_sort(1);
+    assert!(table.sort.is_none());
+    assert_eq!(table.display_row(0).unwrap().1[0], "Alice");
+    assert_eq!(table.display_row(1).unwrap().1[0], "Bob");
+
+    // Resize clamps to bounds.
+    table.resize_column(0, 10.0);
+    assert_eq!(table.column_widths[0], MIN_COLUMN_WIDTH);
+    table.resize_column(0, 2000.0);
+    assert_eq!(table.column_widths[0], MAX_COLUMN_WIDTH);
+}
+
+#[test]
+fn binary_hex_signature_and_archive_inspection() {
+    use super::binary::{
+        ArchiveEntry, HexDocument, archive_children, archive_parent_folder, detect_binary_signature, format_hex_row,
+        list_zip_entries, parse_sqlite_header, read_zip_entry,
+    };
+    use std::io::{Cursor, Write};
+
+    let row = format_hex_row(0x10, b"Hello, world!\x00\x7f\x01");
+    assert_eq!(row.offset_label, "00000010");
+    assert_eq!(row.hex_left, "48 65 6c 6c 6f 2c 20 77");
+    assert_eq!(row.hex_right, "6f 72 6c 64 21 00 7f 01");
+    assert_eq!(row.ascii, "Hello, world!...");
+
+    let doc = HexDocument::from_bytes(b"\x89PNG\r\n\x1a\nrest", None);
+    assert_eq!(doc.signature, "PNG image");
+    assert_eq!(doc.row_count(), 1);
+    assert!(!doc.truncated);
+
+    // SQLite 3 header detection.
+    let mut sqlite = vec![0u8; 100];
+    sqlite[..16].copy_from_slice(b"SQLite format 3\0");
+    sqlite[16..18].copy_from_slice(&4096u16.to_be_bytes());
+    sqlite[28..32].copy_from_slice(&12u32.to_be_bytes());
+    sqlite[56..60].copy_from_slice(&1u32.to_be_bytes());
+    assert_eq!(detect_binary_signature(&sqlite), "SQLite 3 database");
+    let header = parse_sqlite_header(&sqlite).unwrap();
+    assert_eq!((header.page_size, header.page_count, header.text_encoding), (4096, 12, "UTF-8"));
+
+    // ZIP creation, listing, folder navigation, and entry extraction.
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let opts = zip::write::FileOptions::default();
+        writer.start_file("dir/hello.txt", opts).unwrap();
+        writer.write_all(b"hi from zip").unwrap();
+        writer.start_file("README.md", opts).unwrap();
+        writer.write_all(b"# Title").unwrap();
+        writer.finish().unwrap();
+    }
+    let zip_bytes = cursor.into_inner();
+    let entries = list_zip_entries(&zip_bytes).unwrap();
+    assert_eq!(entries.len(), 2);
+    let root_children = archive_children(&entries, "");
+    assert_eq!(root_children.len(), 2);
+    assert!(root_children[0].directory && root_children[0].name == "dir");
+    assert!(!root_children[1].directory && root_children[1].name == "README.md");
+    assert_eq!(archive_parent_folder("a/b/"), "a/");
+    assert_eq!(archive_parent_folder("a/"), "");
+    assert_eq!(read_zip_entry(&zip_bytes, "dir/hello.txt").unwrap(), b"hi from zip");
+
+    let synthetic = vec![
+        ArchiveEntry { path: "sub/a.txt".into(), size: 10, directory: false, modified: None },
+        ArchiveEntry { path: "sub/b.txt".into(), size: 25, directory: false, modified: None },
+    ];
+    let top = archive_children(&synthetic, "");
+    assert_eq!(top.len(), 1);
+    assert_eq!(top[0].size, 35);
+}
+
+#[test]
+fn notebook_parser_and_inert_markdown_sanitizer() {
+    use super::notebook::{NotebookCellKind, NotebookOutput, parse_notebook, sanitize_notebook_markdown, strip_ansi};
+    use base64::Engine as _;
+
+    let png_b64 = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n");
+    let nb = json!({
+        "nbformat": 4,
+        "metadata": { "language_info": { "name": "python" } },
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "source": ["# Heading\n", "[click](https://evil.test) ![pic](https://evil.test/a.png) <script>x</script>"]
+            },
+            {
+                "cell_type": "code",
+                "execution_count": 3,
+                "source": ["print('ok')\n"],
+                "outputs": [
+                    { "output_type": "stream", "text": ["\x1b[31mok\x1b[0m\n"] },
+                    { "output_type": "display_data", "data": { "image/png": png_b64 } },
+                    { "output_type": "display_data", "data": { "text/html": "<table><tr><td>A</td><td>B</td></tr></table>" } }
+                ]
+            }
+        ]
+    });
+    let doc = parse_notebook(nb.to_string().as_bytes()).unwrap();
+    assert_eq!(doc.language, "python");
+    assert_eq!(doc.syntax_language(), Some("python"));
+    assert_eq!(doc.cells.len(), 2);
+    assert_eq!(doc.cells[0].kind, NotebookCellKind::Markdown);
+    assert_eq!(doc.cells[1].execution_count, Some(3));
+    assert_eq!(doc.cells[1].outputs.len(), 3);
+    assert_eq!(doc.cells[1].outputs[0], NotebookOutput::Text("ok\n".into()));
+    assert!(matches!(doc.cells[1].outputs[1], NotebookOutput::Image { .. }));
+    assert!(matches!(&doc.cells[1].outputs[2], NotebookOutput::Html(t) if t.contains("A") && t.contains("B")));
+
+    let inert = sanitize_notebook_markdown("See [docs](https://x.test) and ![logo](https://x.test/a.png) <b>bold</b>\n```mermaid\ngraph TD\n```");
+    assert!(!inert.contains("https://x.test"));
+    assert!(!inert.contains("<b>"));
+    assert!(inert.contains("See docs and logo bold"));
+    assert!(inert.contains("```text"));
+    assert_eq!(strip_ansi("\x1b[1;31merr\x1b[0m"), "err");
+
+    assert!(parse_notebook(b"{\"nbformat\": 3, \"cells\": []}").is_err());
+}
+
+#[test]
+fn mermaid_guard_audio_font_and_drag_mention_helpers() {
+    use super::media_preview::{
+        DragMentionController, FontFormat, format_audio_time, inspect_audio_bytes, parse_font_info,
+    };
+    use super::mermaid::{MermaidFileOutcome, contains_unsafe_mermaid_directives, render_mermaid_file};
+
+    assert!(!contains_unsafe_mermaid_directives("flowchart LR\n  A[Start] --> B[End]"));
+    assert!(contains_unsafe_mermaid_directives("%%{init: {'theme': 'dark'}}%%\nflowchart LR\n  A --> B"));
+    assert!(contains_unsafe_mermaid_directives("flowchart LR\n  A[https://evil.test] --> B"));
+    assert!(contains_unsafe_mermaid_directives("---\ntitle: front\n---\nflowchart LR\n  A --> B"));
+    assert!(matches!(
+        render_mermaid_file("flowchart LR\n  A --> B", true),
+        MermaidFileOutcome::Rendered(_)
+    ));
+    assert!(matches!(
+        render_mermaid_file("flowchart LR\n  A[<img src=x>] --> B", false),
+        MermaidFileOutcome::UnsafeDirective(_)
+    ));
+
+    assert_eq!(format_audio_time(0.0), "0:00");
+    assert_eq!(format_audio_time(65.9), "1:05");
+    assert_eq!(format_audio_time(-5.0), "0:00");
+
+    // Minimal valid 44-byte WAV header (44100 Hz, 2ch, 16-bit, 1 second = 176400 bytes).
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&36u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&2u16.to_le_bytes()); // channels
+    wav.extend_from_slice(&44100u32.to_le_bytes()); // sample rate
+    wav.extend_from_slice(&176400u32.to_le_bytes()); // byte rate
+    wav.extend_from_slice(&4u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&176400u32.to_le_bytes());
+    let audio = inspect_audio_bytes("clip.wav", &wav);
+    assert_eq!(audio.format, "WAV");
+    assert_eq!((audio.sample_rate, audio.channels, audio.bits_per_sample), (Some(44100), Some(2), Some(16)));
+    assert_eq!(audio.duration_secs, Some(1.0));
+
+    // Minimal TrueType header with maxp & head.
+    let mut ttf = vec![0u8; 64];
+    ttf[0..4].copy_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+    let font = parse_font_info(&ttf).unwrap();
+    assert_eq!(font.format, FontFormat::TrueType);
+    assert!(font.format.native_loadable());
+    assert!(parse_font_info(b"not-a-font-at-all").is_err());
+
+    // Drag-to-mention controller matches fileTreeDragMention.test.ts.
+    let mut drag = DragMentionController::default();
+    let single = drag.start_drag(Some("docs/index.md")).unwrap();
+    assert_eq!(single.mention, "[index.md](docs/index.md)");
+    assert!(drag.is_drag_in_progress());
+    assert_eq!(drag.end_drag(), vec!["docs/index.md"]);
+    assert!(!drag.is_drag_in_progress());
+
+    drag.set_selection(vec!["docs/index.md".into(), "docs/api.md".into(), "src/app.ts".into()]);
+    let multi = drag.start_drag(Some("docs/api.md")).unwrap();
+    assert_eq!(multi.mention, "[index.md](docs/index.md) [api.md](docs/api.md) [app.ts](src/app.ts)");
+    assert_eq!(multi.label, "3 files");
+    assert_eq!(drag.end_drag(), vec!["docs/index.md", "docs/api.md", "src/app.ts"]);
+}

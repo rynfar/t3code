@@ -1,31 +1,49 @@
 //! The file preview (`FilePreviewPanel.tsx`'s content column): `projects.readFile` on the network
-//! runtime, line layout and syntax parsing on the background executor, then source with line
-//! numbers (`ReadOnlySourcePreview.tsx`), rendered markdown (`FileMarkdownPreview.tsx`), an image
-//! (`WorkspaceImagePreview`), a folder, or the read error. Recent reads are kept, a few files deep.
+//! runtime, line layout and syntax parsing on the background executor, then in-place editing
+//! (`editor.rs`), source with line numbers (`code.rs`), rendered markdown, standalone Mermaid
+//! diagrams (`mermaid.rs`), delimited CSV/TSV virtual tables (`table.rs`), Jupyter notebooks
+//! (`notebook.rs`), binary/hex & archive inspection (`binary.rs`), images (`image.rs`), audio
+//! (`audio.rs`), fonts (`font.rs`), video, folders, or read errors.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use gpui::{AnyElement, AppContext, Context, Entity, IntoElement, ParentElement, Render, ScrollHandle, Styled, Task, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, AppContext, Context, Entity, IntoElement, ParentElement, Render, ScrollHandle, Styled, Task, Window, div, prelude::*, px};
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::TextViewState;
 use gpui_component::{ActiveTheme, Rope, h_flex, v_flex};
 use t3_client::session::RpcError;
+use t3_core::files::save::FileSaveTarget;
 use t3_core::files::{
-    FileContents, FileFailure, ImageKind, LineIndex, READ_FILE, ReadFailure, decode_read_file, group_thousands, image_kind, is_host_path,
-    is_markdown, mask_frontmatter, read_file_request, syntax_language,
+    FileContents, FileFailure, ImageKind, LineIndex, READ_FILE, ReadFailure, binary_container_kind,
+    decode_read_file, delimited_separator, group_thousands, image_kind, is_audio, is_font, is_host_path,
+    is_markdown, is_mermaid, is_notebook, mask_frontmatter, read_file_request, syntax_language,
 };
 
 use super::Root;
+use super::audio::{self, AudioState};
+use super::binary::{self, BinaryState, BinaryViewMode};
 use super::code::CodeView;
+use super::editor::{FileEditorController, target_to_save_target};
+use super::font::{self, FontState};
 use super::image::{self, ImageState};
+use super::mermaid::MermaidView;
+use super::notebook::NotebookView;
+use super::table::TableView;
 use crate::app_state::AppState;
-use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
 /// Text files kept after leaving them, so tabbing back shows them at once.
 const CACHE_LIMIT: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderedMode {
+    Markdown,
+    Mermaid,
+    Table,
+    Notebook,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -58,7 +76,7 @@ pub struct TextFile {
     pub highlighter: Option<SyntaxHighlighter>,
 }
 
-fn build_text_file(key: Key, file: FileContents) -> TextFile {
+pub(super) fn build_text_file(key: Key, file: FileContents) -> TextFile {
     let lines = LineIndex::new(&file.contents);
     let highlighter = syntax_language(&key.path).map(|language| {
         let mut highlighter = SyntaxHighlighter::new(language);
@@ -80,25 +98,35 @@ enum Content {
         source: t3_core::media::MediaSource,
         player: Entity<crate::media::video::VideoPlayer>,
     },
+    Audio(AudioState),
+    Font(FontState),
+    Binary(BinaryState),
 }
 
 pub struct Preview {
-    state: Entity<AppState>,
-    target: Option<Target>,
+    pub(super) state: Entity<AppState>,
+    pub(super) target: Option<Target>,
     key: Option<Key>,
     content: Content,
     cache: VecDeque<Rc<TextFile>>,
     generation: u64,
     _fetch: Option<Task<()>>,
     pub(super) code: CodeView,
+    pub(super) editor: FileEditorController,
+    pub(super) table: TableView,
+    pub(super) notebook: NotebookView,
+    pub(super) mermaid: MermaidView,
     render_markdown: bool,
+    render_mermaid: bool,
+    render_table: bool,
+    render_notebook: bool,
     markdown: Option<(Key, Entity<TextViewState>)>,
     markdown_scroll: ScrollHandle,
     mutation: Option<String>,
     media_scope: Option<std::sync::Arc<std::sync::Mutex<crate::media::MediaScope>>>,
     media_document: Option<crate::transcript::MediaDocument>,
     media_extensions: Option<gpui_component::text::MarkdownExtensions>,
-    viewer: Entity<crate::media::MediaViewer>,
+    pub(super) viewer: Entity<crate::media::MediaViewer>,
     handled_reveal: Option<(String, u64)>,
     /// A reveal shows the source; the rendered view returns once the user asks for it.
     rendered_after_reveal: Option<(String, u64)>,
@@ -108,7 +136,7 @@ impl Preview {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         crate::media::cache(&state, cx);
         let viewer = cx.new(crate::media::MediaViewer::new);
-        Preview {
+        let mut preview = Preview {
             state,
             target: None,
             key: None,
@@ -117,7 +145,14 @@ impl Preview {
             generation: 0,
             _fetch: None,
             code: CodeView::new(),
+            editor: FileEditorController::new(),
+            table: TableView::new(),
+            notebook: NotebookView::new(),
+            mermaid: MermaidView::new(),
             render_markdown: false,
+            render_mermaid: true,
+            render_table: true,
+            render_notebook: true,
             markdown: None,
             markdown_scroll: ScrollHandle::new(),
             mutation: None,
@@ -127,16 +162,23 @@ impl Preview {
             viewer,
             handled_reveal: None,
             rendered_after_reveal: None,
-        }
+        };
+        preview.refresh_write_scope(cx);
+        preview
     }
 
     pub fn set_target(&mut self, target: Option<Target>, cx: &mut Context<Self>) {
+        self.refresh_write_scope(cx);
         if target == self.target {
             return;
         }
         let key = target.as_ref().map(Key::of);
+        let key_changed = key != self.key;
+        if key_changed {
+            self.release_active_editor_on_target_change(cx);
+        }
         self.target = target;
-        if key != self.key {
+        if key_changed {
             self.key = key.clone();
             self.generation += 1;
             self._fetch = None;
@@ -165,11 +207,16 @@ impl Preview {
 
     fn replace_content(&mut self, content: Content, cx: &mut Context<Self>) {
         let previous = std::mem::replace(&mut self.content, content);
-        if let Content::Image(image) = previous {
-            image.release(cx);
+        match previous {
+            Content::Image(image) => image.release(cx),
+            Content::Audio(mut audio) => audio.stop(),
+            _ => {}
         }
         if !matches!(self.content, Content::Text(_)) {
             self.code.set_file(None);
+            self.table.clear();
+            self.notebook.release_images(cx);
+            self.mermaid.release(cx);
         }
     }
 
@@ -188,17 +235,88 @@ impl Preview {
         self.apply_reveal();
     }
 
+    pub(super) fn current_text_contents(&self) -> Option<String> {
+        match &self.content {
+            Content::Text(file) => Some(file.contents.clone()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn apply_saved_text_locally(
+        &mut self,
+        target: &FileSaveTarget,
+        contents: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let key = Key {
+            environment: target.environment_id.clone(),
+            cwd: target.cwd.clone(),
+            path: target.relative_path.clone(),
+        };
+        let file = Rc::new(build_text_file(
+            key.clone(),
+            FileContents {
+                relative_path: target.relative_path.clone(),
+                contents: contents.to_owned(),
+                byte_length: contents.len() as u64,
+                truncated: false,
+            },
+        ));
+        self.cache.retain(|cached| cached.key != key);
+        self.cache.push_back(file.clone());
+        while self.cache.len() > CACHE_LIMIT {
+            self.cache.pop_front();
+        }
+        if self.key.as_ref() == Some(&key) {
+            self.show_text(file, cx);
+        }
+    }
+
     /// Reads the target again (Refresh, a workspace mutation), keeping what shows until it lands.
     pub fn refetch(&mut self, cx: &mut Context<Self>) {
-        if self.key.is_some() && !matches!(self.content, Content::Folder) {
+        if self.key.is_some() && !matches!(self.content, Content::Folder) && !self.editor.is_dirty() {
             self.fetch(cx);
         }
     }
 
     pub fn reconnected(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.content, Content::Failed(_) | Content::Loading) || matches!(&self.content, Content::Image(image) if image.failed()) {
+        self.refresh_write_scope(cx);
+        let needs_retry = matches!(self.content, Content::Failed(_) | Content::Loading)
+            || matches!(&self.content, Content::Image(image) if image.failed())
+            || matches!(&self.content, Content::Audio(audio) if audio.failed())
+            || matches!(&self.content, Content::Font(font) if font.failed())
+            || matches!(&self.content, Content::Binary(binary) if binary.failed());
+        if needs_retry {
             self.fetch(cx);
         }
+    }
+
+    fn fetch_binary(&mut self, target: Target, generation: u64, cx: &mut Context<Self>) {
+        if !matches!(self.content, Content::Binary(_)) {
+            self.replace_content(Content::Binary(BinaryState::Loading), cx);
+        }
+        let state = self.state.read(cx);
+        let path = target.path.clone();
+        let task = binary::load(state, &target.root, &path, self.mutation.as_deref());
+        self._fetch = Some(cx.spawn(async move |this, cx| {
+            let result = match task {
+                Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+                None => Err("Not connected to the server.".to_owned()),
+            };
+            let decoded = match result {
+                Ok(bytes) => {
+                    let decode_path = path.clone();
+                    Ok(cx.background_executor().spawn(async move { binary::decode(&decode_path, bytes) }).await)
+                }
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.replace_content(Content::Binary(BinaryState::from(decoded)), cx);
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn fetch(&mut self, cx: &mut Context<Self>) {
@@ -214,6 +332,7 @@ impl Preview {
         }
         self.generation += 1;
         let generation = self.generation;
+
         if t3_core::media::is_workspace_video_preview_path(&key.path) {
             self._fetch = None;
             let source = t3_core::media::MediaSource::Asset(t3_core::media::AssetResource::MediaFile {
@@ -258,66 +377,136 @@ impl Preview {
             cx.notify();
             return;
         }
-        match image_kind(&key.path) {
-            Some(kind) => {
-                if !matches!(self.content, Content::Image(_)) {
-                    self.replace_content(Content::Image(ImageState::Loading), cx);
-                }
-                let state = self.state.read(cx);
-                let task = image::load(state, &target.root, &key.path, kind, self.mutation.as_deref());
-                self._fetch = Some(cx.spawn(async move |this, cx| {
-                    let result = match task {
-                        Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
-                        None => Err("Not connected to the server.".to_owned()),
-                    };
-                    let decoded = match result {
-                        Ok(bytes) => cx.background_executor().spawn(async move { image::decode(bytes, kind == ImageKind::Svg) }).await,
-                        Err(error) => Err(error),
-                    };
-                    let _ = this.update(cx, |this, cx| {
-                        if this.generation == generation {
-                            this.replace_content(Content::Image(ImageState::from(decoded)), cx);
-                            cx.notify();
-                        }
-                    });
-                }));
+
+        if is_audio(&key.path) {
+            if !matches!(self.content, Content::Audio(_)) {
+                self.replace_content(Content::Audio(AudioState::Loading), cx);
             }
-            None => {
-                let state = self.state.read(cx);
-                let Some(client) = state.client_handle() else {
-                    if !matches!(self.content, Content::Text(_)) {
-                        self.replace_content(Content::Failed(ReadFailure::message("Not connected to the server.")), cx);
-                    }
-                    return;
+            let state = self.state.read(cx);
+            let task = audio::load(state, &target.root, &key.path, self.mutation.as_deref());
+            self._fetch = Some(cx.spawn(async move |this, cx| {
+                let result = match task {
+                    Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+                    None => Err("Not connected to the server.".to_owned()),
                 };
-                let payload = read_file_request(&key.cwd, &key.path);
-                let request = state.runtime().spawn(async move {
-                    match client.request(READ_FILE, payload).await {
-                        Ok(value) => decode_read_file(value).map_err(ReadFailure::message),
-                        Err(RpcError::Failure(failure)) => Err(ReadFailure::from_error(&failure.error, &failure.message)),
-                        Err(RpcError::Closed) => Err(ReadFailure::message("Not connected to the server.")),
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        this.replace_content(Content::Audio(AudioState::from_decoded(result)), cx);
+                        cx.notify();
                     }
                 });
-                self._fetch = Some(cx.spawn(async move |this, cx| {
-                    let result = request.await.unwrap_or_else(|_| Err(ReadFailure::message("The file could not be read.")));
-                    let result = match result {
-                        Ok(file) => Ok(cx.background_executor().spawn(async move { build_text_file(key, file) }).await),
-                        Err(failure) => Err(failure),
-                    };
-                    let _ = this.update(cx, |this, cx| {
-                        if this.generation == generation {
-                            this.finish_read(result, cx);
-                            cx.notify();
-                        }
-                    });
-                }));
-            }
+            }));
+            return;
         }
+
+        if is_font(&key.path) {
+            if !matches!(self.content, Content::Font(_)) {
+                self.replace_content(Content::Font(FontState::Loading), cx);
+            }
+            let state = self.state.read(cx);
+            let task = font::load(state, &target.root, &key.path, self.mutation.as_deref());
+            self._fetch = Some(cx.spawn(async move |this, cx| {
+                let result = match task {
+                    Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+                    None => Err("Not connected to the server.".to_owned()),
+                };
+                let decoded = match result {
+                    Ok(bytes) => cx.background_executor().spawn(async move { font::decode(bytes) }).await,
+                    Err(error) => Err(error),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        let font_state = FontState::from_decoded(decoded, cx);
+                        this.replace_content(Content::Font(font_state), cx);
+                        cx.notify();
+                    }
+                });
+            }));
+            return;
+        }
+
+        if let Some(kind) = image_kind(&key.path) {
+            if !matches!(self.content, Content::Image(_)) {
+                self.replace_content(Content::Image(ImageState::Loading), cx);
+            }
+            let state = self.state.read(cx);
+            let task = image::load(state, &target.root, &key.path, kind, self.mutation.as_deref());
+            self._fetch = Some(cx.spawn(async move |this, cx| {
+                let result = match task {
+                    Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+                    None => Err("Not connected to the server.".to_owned()),
+                };
+                let decoded = match result {
+                    Ok(bytes) => cx.background_executor().spawn(async move { image::decode(bytes, kind == ImageKind::Svg) }).await,
+                    Err(error) => Err(error),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        this.replace_content(Content::Image(ImageState::from(decoded)), cx);
+                        cx.notify();
+                    }
+                });
+            }));
+            return;
+        }
+
+        if binary_container_kind(&key.path).is_some() {
+            self.fetch_binary(target, generation, cx);
+            return;
+        }
+
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else {
+            if !matches!(self.content, Content::Text(_)) {
+                self.replace_content(Content::Failed(ReadFailure::message("Not connected to the server.")), cx);
+            }
+            return;
+        };
+        let payload = read_file_request(&key.cwd, &key.path);
+        let request = state.runtime().spawn(async move {
+            match client.request(READ_FILE, payload).await {
+                Ok(value) => decode_read_file(value).map_err(ReadFailure::message),
+                Err(RpcError::Failure(failure)) => Err(ReadFailure::from_error(&failure.error, &failure.message)),
+                Err(RpcError::Closed) => Err(ReadFailure::message("Not connected to the server.")),
+            }
+        });
+        self._fetch = Some(cx.spawn(async move |this, cx| {
+            let result = request.await.unwrap_or_else(|_| Err(ReadFailure::message("The file could not be read.")));
+            let result = match result {
+                Ok(file) => Ok(cx.background_executor().spawn(async move { build_text_file(key, file) }).await),
+                Err(failure) => Err(failure),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.finish_read(result, generation, cx);
+                    cx.notify();
+                }
+            });
+        }));
     }
 
-    fn finish_read(&mut self, result: Result<TextFile, ReadFailure>, cx: &mut Context<Self>) {
+    fn finish_read(&mut self, result: Result<TextFile, ReadFailure>, generation: u64, cx: &mut Context<Self>) {
         match result {
-            Ok(file) => {
+            Ok(mut file) => {
+                if let Some(target) = &self.target {
+                    let save_target = target_to_save_target(target);
+                    self.editor.set_server_text(file.contents.clone());
+                    self.editor.clear_confirmed_if_matching(&save_target, &file.contents);
+                    // Preserve unsaved optimistic draft across refreshes/tab switches.
+                    if let Some(unsaved) = self.editor.optimistic_for(&save_target).map(str::to_owned)
+                        && unsaved != file.contents
+                    {
+                        file = build_text_file(
+                            file.key.clone(),
+                            FileContents {
+                                relative_path: target.path.clone(),
+                                byte_length: unsaved.len() as u64,
+                                truncated: false,
+                                contents: unsaved,
+                            },
+                        );
+                    }
+                }
                 let file = Rc::new(file);
                 self.cache.retain(|cached| cached.key != file.key);
                 self.cache.push_back(file.clone());
@@ -327,6 +516,13 @@ impl Preview {
                 self.show_text(file, cx);
             }
             Err(failure) if failure.failure == Some(FileFailure::NotFile) => self.replace_content(Content::Folder, cx),
+            Err(failure) if failure.failure == Some(FileFailure::Binary) => {
+                if let Some(target) = self.target.clone() {
+                    self.fetch_binary(target, generation, cx);
+                } else {
+                    self.replace_content(Content::Failed(failure), cx);
+                }
+            }
             // A failed refresh keeps the file it read before (`file.error && file.data === null`).
             Err(_) if matches!(self.content, Content::Text(_)) => {}
             Err(failure) => self.replace_content(Content::Failed(failure), cx),
@@ -352,15 +548,59 @@ impl Preview {
         matches!(self.content, Content::Folder)
     }
 
-    pub fn shows_text(&self) -> bool {
-        matches!(self.content, Content::Text(_)) && !self.renders_markdown()
+    pub fn is_editing(&self) -> bool {
+        self.editor.is_editing()
     }
 
-    fn renders_markdown(&self) -> bool {
+    pub fn is_dirty(&self) -> bool {
+        self.editor.is_dirty()
+    }
+
+    pub fn can_edit_current(&self, _cx: &App) -> bool {
         let Some(target) = &self.target else { return false };
-        let revealing = target.reveal_line.is_some()
-            && self.rendered_after_reveal.as_ref() != Some(&(target.path.clone(), target.reveal_request_id));
-        self.render_markdown && is_markdown(&target.path) && !revealing && matches!(self.content, Content::Text(_))
+        if is_host_path(&target.path) {
+            return false;
+        }
+        let Content::Text(file) = &self.content else { return false };
+        !file.truncated
+    }
+
+    pub fn rendered_mode(&self) -> Option<RenderedMode> {
+        let path = &self.target.as_ref()?.path;
+        if is_mermaid(path) {
+            Some(RenderedMode::Mermaid)
+        } else if is_markdown(path) {
+            Some(RenderedMode::Markdown)
+        } else if delimited_separator(path).is_some() {
+            Some(RenderedMode::Table)
+        } else if is_notebook(path) {
+            Some(RenderedMode::Notebook)
+        } else {
+            None
+        }
+    }
+
+    fn reveal_forces_source(&self) -> bool {
+        let Some(target) = &self.target else { return false };
+        target.reveal_line.is_some()
+            && self.rendered_after_reveal.as_ref() != Some(&(target.path.clone(), target.reveal_request_id))
+    }
+
+    pub fn is_rendered_active(&self) -> bool {
+        if self.editor.is_editing() || !matches!(self.content, Content::Text(_)) || self.reveal_forces_source() {
+            return false;
+        }
+        match self.rendered_mode() {
+            Some(RenderedMode::Markdown) => self.render_markdown,
+            Some(RenderedMode::Mermaid) => self.render_mermaid,
+            Some(RenderedMode::Table) => self.render_table,
+            Some(RenderedMode::Notebook) => self.render_notebook,
+            None => false,
+        }
+    }
+
+    pub fn shows_text(&self) -> bool {
+        matches!(self.content, Content::Text(_)) && !self.is_rendered_active()
     }
 
     pub fn set_render_markdown(&mut self, render: bool, cx: &mut Context<Self>) {
@@ -373,13 +613,43 @@ impl Preview {
         }
     }
 
+    pub fn set_render_mermaid(&mut self, render: bool, cx: &mut Context<Self>) {
+        if render && let Some(target) = &self.target {
+            self.rendered_after_reveal = Some((target.path.clone(), target.reveal_request_id));
+        }
+        if render != self.render_mermaid {
+            self.render_mermaid = render;
+            cx.notify();
+        }
+    }
+
+    pub fn set_render_table(&mut self, render: bool, cx: &mut Context<Self>) {
+        if render && let Some(target) = &self.target {
+            self.rendered_after_reveal = Some((target.path.clone(), target.reveal_request_id));
+        }
+        if render != self.render_table {
+            self.render_table = render;
+            cx.notify();
+        }
+    }
+
+    pub fn set_render_notebook(&mut self, render: bool, cx: &mut Context<Self>) {
+        if render && let Some(target) = &self.target {
+            self.rendered_after_reveal = Some((target.path.clone(), target.reveal_request_id));
+        }
+        if render != self.render_notebook {
+            self.render_notebook = render;
+            cx.notify();
+        }
+    }
+
     pub fn set_wrap(&mut self, wrap: bool, cx: &mut Context<Self>) {
         self.code.set_wrap(wrap);
+        self.editor.set_wrap(wrap);
         cx.notify();
     }
 
-    /// The truncation notice the web shows over drafts, markdown and HTML; native reads text
-    /// only, so it shows over every truncated file.
+    /// The truncation notice shown over truncated text previews.
     pub fn truncation_notice(&self) -> Option<String> {
         let Content::Text(file) = &self.content else { return None };
         file.truncated.then(|| format!("Preview limited to the first 1 MB of a {} byte file.", group_thousands(file.byte_length)))
@@ -389,6 +659,100 @@ impl Preview {
         if self.mutation == mutation { return; }
         self.mutation = mutation;
         if let Some(scope) = &self.media_scope { scope.lock().unwrap().workspace_mutation_id = self.mutation.clone(); }
+        cx.notify();
+    }
+
+    pub(super) fn binary_state(&self) -> Option<&BinaryState> {
+        match &self.content {
+            Content::Binary(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub(super) fn set_binary_mode(&mut self, mode: BinaryViewMode, cx: &mut Context<Self>) {
+        if let Content::Binary(state) = &mut self.content {
+            state.set_mode(mode);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn archive_open_folder(&mut self, folder: String, cx: &mut Context<Self>) {
+        if let Content::Binary(state) = &mut self.content {
+            state.open_folder(folder);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn archive_go_up(&mut self, cx: &mut Context<Self>) {
+        if let Content::Binary(state) = &mut self.content {
+            state.go_up();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn archive_open_entry(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Content::Binary(state) = &mut self.content {
+            state.open_entry(path);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn audio_state(&self) -> Option<&AudioState> {
+        match &self.content {
+            Content::Audio(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub(super) fn audio_state_mut(&mut self) -> Option<&mut AudioState> {
+        match &mut self.content {
+            Content::Audio(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_text_for_test(&mut self, target: Target, contents: &str, cx: &mut Context<Self>) {
+        let key = Key::of(&target);
+        self.target = Some(target);
+        self.key = Some(key.clone());
+        let file = FileContents {
+            relative_path: key.path.clone(),
+            contents: contents.to_owned(),
+            byte_length: contents.len() as u64,
+            truncated: false,
+        };
+        let built = Rc::new(build_text_file(key, file));
+        self.show_text(built, cx);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_binary_for_test(&mut self, path: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let decoded = binary::decode(path, bytes);
+        self.replace_content(Content::Binary(BinaryState::from(Ok(decoded))), cx);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_font_for_test(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let decoded = font::decode(bytes);
+        let state = FontState::from_decoded(decoded, cx);
+        self.replace_content(Content::Font(state), cx);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_audio_for_test(&mut self, path: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let info = t3_core::files::media_preview::inspect_audio_bytes(path, &bytes);
+        let decoded = audio::DecodedAudio {
+            name: t3_core::files::basename(path).to_owned(),
+            path: path.to_owned(),
+            thread_id: "t-1".into(),
+            info,
+            bytes,
+        };
+        self.replace_content(Content::Audio(AudioState::from_decoded(Ok(decoded))), cx);
         cx.notify();
     }
 
@@ -463,22 +827,6 @@ impl Preview {
         let host = target.is_some_and(|target| is_host_path(&target.path));
         let cwd = failure.cwd.clone().or_else(|| target.map(|target| target.root.workspace.cwd.clone())).unwrap_or_default();
         let mono = cx.theme().mono_font_family.clone();
-        if failure.failure == Some(FileFailure::Binary) {
-            let name = target.map(|target| t3_core::files::basename(&target.path).to_owned()).unwrap_or_default();
-            return v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap(px(8.))
-                .px(px(24.))
-                .text_center()
-                .text_xs()
-                .text_color(hsla(p.muted_foreground))
-                .child(Icon::File.svg().size(px(20.)).text_color(hsla(p.muted_foreground)))
-                .child(div().text_color(hsla(p.foreground)).child(name))
-                .child(failure.describe())
-                .into_any_element();
-        }
         div()
             .id("file-error")
             .flex_1()
@@ -536,6 +884,9 @@ impl Render for Preview {
             Content::Loading => loading(cx),
             Content::Failed(failure) => self.render_failure(&failure.clone(), cx),
             Content::Image(image) => image.render(cx),
+            Content::Font(font) => font.render(cx),
+            Content::Audio(_) => self.render_audio(cx),
+            Content::Binary(_) => self.render_binary(cx),
             Content::Video { player, .. } => div()
                 .size_full()
                 .flex()
@@ -546,7 +897,26 @@ impl Render for Preview {
                 .into_any_element(),
             Content::Text(file) => {
                 let file = file.clone();
-                if self.renders_markdown() { self.render_markdown(&file, cx) } else { self.render_code(window, cx) }
+                if self.editor.is_editing() {
+                    self.render_editor(window, cx)
+                } else if self.is_rendered_active() {
+                    match self.rendered_mode() {
+                        Some(RenderedMode::Markdown) => self.render_markdown(&file, cx),
+                        Some(RenderedMode::Mermaid) => self.render_mermaid(&file.key, &file.contents, cx),
+                        Some(RenderedMode::Table) => {
+                            let sep = self
+                                .target
+                                .as_ref()
+                                .and_then(|t| delimited_separator(&t.path))
+                                .unwrap_or(',');
+                            self.render_table(&file.key, &file.contents, sep, cx)
+                        }
+                        Some(RenderedMode::Notebook) => self.render_notebook(&file.key, &file.contents, cx),
+                        None => self.render_code(window, cx),
+                    }
+                } else {
+                    self.render_code(window, cx)
+                }
             }
         };
         v_flex().relative().size_full().min_h_0().child(body).child(self.viewer.clone())
@@ -563,6 +933,22 @@ impl gpui::Global for MarkdownFixture {}
 mod tests {
     use super::*;
 
+    fn test_target(path: &str) -> Target {
+        Target {
+            root: Root {
+                environment: "env-1".into(),
+                workspace: super::super::FileWorkspace {
+                    thread_id: "t-1".into(),
+                    cwd: "/repo".into(),
+                    project_name: "repo".into(),
+                },
+            },
+            path: path.into(),
+            reveal_line: None,
+            reveal_request_id: 0,
+        }
+    }
+
     #[gpui::test]
     fn video_file_opens_workspace_video_player(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
@@ -573,21 +959,8 @@ mod tests {
             let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
             cx.new(|cx| Preview::new(state, cx))
         });
-        let target = Target {
-            root: Root {
-                environment: "env-1".into(),
-                workspace: super::super::FileWorkspace {
-                    thread_id: "t-1".into(),
-                    cwd: "/repo".into(),
-                    project_name: "repo".into(),
-                },
-            },
-            path: "demo/clip.mp4".into(),
-            reveal_line: None,
-            reveal_request_id: 0,
-        };
         preview.update(cx, |preview, cx| {
-            preview.set_target(Some(target), cx);
+            preview.set_target(Some(test_target("demo/clip.mp4")), cx);
             match &preview.content {
                 Content::Video { source, .. } => assert_eq!(
                     *source,
@@ -598,6 +971,119 @@ mod tests {
                 ),
                 _ => panic!("expected Content::Video for demo/clip.mp4"),
             }
+        });
+    }
+
+    #[gpui::test]
+    fn rich_previews_and_editor_dismissal_guard_render_cleanly(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        let (preview, vcx) = cx.add_window_view(|_, cx| Preview::new(state.clone(), cx));
+
+        // 1. Delimited CSV table preview
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_text_for_test(test_target("data.csv"), "name,val\nalpha,10\nbeta,2\n", cx);
+                assert_eq!(p.rendered_mode(), Some(RenderedMode::Table));
+                assert!(p.is_rendered_active());
+            });
+            window.draw(cx).clear();
+        });
+        preview.update(vcx, |p, _| {
+            let table = p.table.table.as_mut().expect("table parsed");
+            assert_eq!(table.row_count(), 2);
+            table.toggle_sort(1);
+            assert_eq!(table.display_row(0).unwrap().1[0], "beta");
+        });
+
+        // 2. Jupyter notebook preview
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                let nb = serde_json::json!({
+                    "nbformat": 4,
+                    "metadata": { "language_info": { "name": "python" } },
+                    "cells": [
+                        { "cell_type": "markdown", "source": ["# Notes"] },
+                        { "cell_type": "code", "execution_count": 1, "source": ["print(1)"], "outputs": [{ "output_type": "stream", "text": ["1\n"] }] }
+                    ]
+                });
+                p.load_text_for_test(test_target("demo.ipynb"), &nb.to_string(), cx);
+                assert_eq!(p.rendered_mode(), Some(RenderedMode::Notebook));
+            });
+            window.draw(cx).clear();
+        });
+
+        // 3. Mermaid file preview (valid + unsafe directive guard)
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_text_for_test(test_target("arch.mmd"), "flowchart LR\n  A --> B", cx);
+                assert_eq!(p.rendered_mode(), Some(RenderedMode::Mermaid));
+            });
+            window.draw(cx).clear();
+        });
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_text_for_test(test_target("unsafe.mmd"), "flowchart LR\n  A[https://evil.test] --> B", cx);
+            });
+            window.draw(cx).clear();
+        });
+
+        // 4. Binary / Hex preview
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_binary_for_test("blob.bin", b"\x89PNG\r\n\x1a\nhello binary!".to_vec(), cx);
+            });
+            window.draw(cx).clear();
+        });
+
+        // 5. Audio & Font previews
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_audio_for_test("clip.wav", b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec(), cx);
+            });
+            window.draw(cx).clear();
+        });
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_font_for_test(b"not-valid-font".to_vec(), cx);
+            });
+            window.draw(cx).clear();
+        });
+
+        // 6. In-place editor + dirty state + unsaved dismissal guard + discard
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_text_for_test(test_target("src/lib.rs"), "pub fn hi() {}\n", cx);
+                p.enter_edit_mode(cx);
+                assert!(p.is_editing());
+                assert!(!p.is_dirty());
+                p.on_editor_text_changed("pub fn hi() { /* edited */ }\n".into(), cx);
+                assert!(p.is_dirty());
+                p.request_exit_edit_mode(cx);
+                assert!(p.is_editing(), "dirty editor must remain open with dismissal guard");
+                assert!(p.editor.has_unsaved_prompt());
+            });
+            window.draw(cx).clear();
+        });
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.discard_unsaved_and_exit(cx);
+                assert!(!p.is_editing());
+                assert!(!p.is_dirty());
+            });
+            window.draw(cx).clear();
+        });
+
+        #[cfg(feature = "snapshot")]
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
         });
     }
 }

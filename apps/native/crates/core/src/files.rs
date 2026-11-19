@@ -1,12 +1,21 @@
-//! Project files: the `projects.listEntries`, `projects.searchEntries` and `projects.readFile`
-//! wire shapes (`packages/contracts/src/project.ts`), the path rules of
+//! Project files: the `projects.listEntries`, `projects.searchEntries`, `projects.readFile`,
+//! and `projects.writeFile` wire shapes (`packages/contracts/src/project.ts`), the path rules of
 //! `apps/web/src/components/files/filePath.ts`, `filePreviewMode.ts` and
 //! `packages/shared/src/path.ts` (`workspaceRelativeFilePath`, `isHostPath`), the mention text of
 //! `packages/shared/src/composerTrigger.ts` (`serializeComposerFileLink`), and the read-error copy
-//! of `filePreviewReadErrorMessage`. The explorer tree lives in `tree`, line layout in `text`.
+//! of `filePreviewReadErrorMessage`. The explorer tree lives in `tree`, line layout in `text`,
+//! in-place save coordination in `save`, delimited CSV/TSV tables in `delimited`, binary/hex and
+//! archive inspection in `binary`, Jupyter notebooks in `notebook`, Mermaid preview in `mermaid`,
+//! and audio/font/drag-mention helpers in `media_preview`.
 
+pub mod binary;
+pub mod delimited;
+pub mod media_preview;
+pub mod mermaid;
 pub mod metadata;
+pub mod notebook;
 pub mod position;
+pub mod save;
 mod text;
 mod tree;
 
@@ -18,6 +27,7 @@ pub use tree::{FileTree, TreeRow};
 pub const LIST_ENTRIES: &str = "projects.listEntries";
 pub const SEARCH_ENTRIES: &str = "projects.searchEntries";
 pub const READ_FILE: &str = "projects.readFile";
+pub const WRITE_FILE: &str = "projects.writeFile";
 pub const CREATE_ASSET_URL: &str = "assets.createUrl";
 
 /// `PROJECT_SEARCH_ENTRIES_MAX_LIMIT`, the limit `useProjectPathSearch` asks for.
@@ -63,6 +73,27 @@ pub fn search_entries_request(cwd: &str, query: &str) -> Value {
 
 pub fn read_file_request(cwd: &str, relative_path: &str) -> Value {
     json!({ "cwd": cwd, "relativePath": relative_path })
+}
+
+/// `ProjectWriteFileInput` (`packages/contracts/src/project.ts`).
+pub fn write_file_request(cwd: &str, relative_path: &str, contents: &str) -> Value {
+    json!({ "cwd": cwd, "relativePath": relative_path, "contents": contents })
+}
+
+/// `ProjectWriteFileResult.relativePath`.
+pub fn decode_write_file(value: &Value) -> Result<String, String> {
+    value
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "The server did not confirm the saved file path.".to_owned())
+}
+
+/// `AssetResource` `workspace-file`, or `media-file` for a path outside the workspace
+/// (`workspaceAssetResource`): the server signs workspace files only below the root.
+pub fn workspace_asset_request(thread_id: &str, workspace_root: &str, absolute_path: &str) -> Value {
+    image_asset_request(thread_id, workspace_root, absolute_path)
 }
 
 /// `AssetResource` `workspace-file`, or `media-file` for a path outside the workspace
@@ -206,6 +237,61 @@ impl ReadFailure {
             }
             Some(FileFailure::OperationFailed) => {
                 "The file could not be accessed or read. It may be missing or inaccessible.".to_owned()
+            }
+            None => self.message.clone(),
+        }
+    }
+}
+
+/// `ProjectWriteFileError`, or any other write failure with only a message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteFailure {
+    pub failure: Option<FileFailure>,
+    pub operation: Option<String>,
+    pub message: String,
+    pub cwd: Option<String>,
+    pub attempted_path: Option<String>,
+}
+
+impl WriteFailure {
+    pub fn message(message: impl Into<String>) -> WriteFailure {
+        WriteFailure { message: message.into(), ..WriteFailure::default() }
+    }
+
+    pub fn from_error(error: &Value, message: &str) -> WriteFailure {
+        let field = |name: &str| error.get(name).and_then(Value::as_str).map(str::to_owned);
+        if error.get("_tag").and_then(Value::as_str) != Some("ProjectWriteFileError") {
+            return WriteFailure::message(message);
+        }
+        let failure = match error.get("failure").and_then(Value::as_str) {
+            Some("workspace_path_outside_root") => Some(FileFailure::OutsideRoot),
+            Some("resolved_path_outside_root") => Some(FileFailure::ResolvedOutsideRoot),
+            Some("path_not_file") => Some(FileFailure::NotFile),
+            Some("binary_file") => Some(FileFailure::Binary),
+            Some("operation_failed") => Some(FileFailure::OperationFailed),
+            _ => None,
+        };
+        WriteFailure {
+            failure,
+            operation: field("operation"),
+            message: field("message").unwrap_or_else(|| message.to_owned()),
+            cwd: field("cwd"),
+            attempted_path: field("resolvedPath").or_else(|| field("operationPath")),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self.failure {
+            Some(FileFailure::NotFile) => "The path is a directory or special file and cannot be written.".to_owned(),
+            Some(FileFailure::Binary) => "Binary files cannot be edited as text.".to_owned(),
+            Some(FileFailure::OutsideRoot) => "The requested path is outside the workspace.".to_owned(),
+            Some(FileFailure::ResolvedOutsideRoot) => "The path resolves to a location outside the workspace.".to_owned(),
+            Some(FileFailure::OperationFailed) => {
+                if self.message.is_empty() {
+                    "The file could not be saved.".to_owned()
+                } else {
+                    self.message.clone()
+                }
             }
             None => self.message.clone(),
         }
@@ -423,7 +509,7 @@ pub fn breadcrumbs(project_name: &str, relative_path: &str) -> Vec<Crumb> {
     crumbs
 }
 
-fn extension(path: &str) -> Option<String> {
+pub(crate) fn extension(path: &str) -> Option<String> {
     let name = basename(path);
     let index = name.rfind('.')?;
     (index > 0 || name.len() > 1).then(|| name[index + 1..].to_ascii_lowercase())
@@ -432,6 +518,64 @@ fn extension(path: &str) -> Option<String> {
 /// `isMarkdownPreviewFile`.
 pub fn is_markdown(path: &str) -> bool {
     matches!(extension(path).as_deref(), Some("md" | "mdx" | "markdown" | "mdown" | "mkd"))
+}
+
+/// Standalone Mermaid diagram files (`FilePreviewPanel.tsx`: `.mmd`, `.mermaid`).
+pub fn is_mermaid(path: &str) -> bool {
+    matches!(extension(path).as_deref(), Some("mmd" | "mermaid"))
+}
+
+/// Jupyter Notebook files (`packages/shared/src/filePreview.ts`: `.ipynb`).
+pub fn is_notebook(path: &str) -> bool {
+    matches!(extension(path).as_deref(), Some("ipynb"))
+}
+
+/// Delimited CSV/TSV separator (`packages/shared/src/delimitedPreview.ts`).
+pub fn delimited_separator(path: &str) -> Option<char> {
+    match extension(path).as_deref()? {
+        "csv" => Some(','),
+        "tsv" => Some('\t'),
+        _ => None,
+    }
+}
+
+/// `audioMimeTypeFromExtension` / `isWorkspaceAudioPreviewPath` (`packages/shared/src/mediaPreview.ts`).
+pub fn audio_mime_type(path: &str) -> Option<&'static str> {
+    match extension(path).as_deref()? {
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" | "oga" | "opus" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        "aac" => Some("audio/aac"),
+        "m4a" => Some("audio/mp4"),
+        "aiff" => Some("audio/aiff"),
+        "webm-audio" | "weba" => Some("audio/webm"),
+        _ => None,
+    }
+}
+
+pub fn is_audio(path: &str) -> bool {
+    audio_mime_type(path).is_some()
+}
+
+/// `isWorkspaceFontPreviewPath` (`packages/shared/src/filePreview.ts`).
+pub fn is_font(path: &str) -> bool {
+    matches!(extension(path).as_deref(), Some("ttf" | "otf" | "woff" | "woff2"))
+}
+
+/// Binary container preview kinds (`binaryPreviewKind` in `packages/shared/src/filePreview.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryContainerKind {
+    Archive,
+    Sqlite,
+}
+
+pub fn binary_container_kind(path: &str) -> Option<BinaryContainerKind> {
+    match extension(path).as_deref()? {
+        "zip" | "jar" | "tar" | "gz" | "tgz" => Some(BinaryContainerKind::Archive),
+        "sqlite" | "sqlite3" | "db" => Some(BinaryContainerKind::Sqlite),
+        _ => None,
+    }
 }
 
 /// The image kinds a preview decodes (a subset of `WORKSPACE_IMAGE_PREVIEW_EXTENSIONS`).

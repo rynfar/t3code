@@ -5,11 +5,18 @@
 //! decoding run on the background executor; views paint only what is on screen.
 
 mod actions;
+mod audio;
+mod binary;
 mod code;
+mod editor;
 mod explorer;
 mod explorer_rows;
+mod font;
 mod image;
+mod mermaid;
+mod notebook;
 mod preview;
+mod table;
 #[cfg(feature = "snapshot")]
 pub(crate) use preview::MarkdownFixture;
 
@@ -26,18 +33,22 @@ use serde_json::{Value, json};
 use t3_client::store;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::diff::{turn_diff_summaries, workspace_mutation_id};
-use t3_core::files::{breadcrumbs, group_thousands, is_host_path, is_markdown};
+use t3_core::files::{breadcrumbs, group_thousands, is_host_path};
 use t3_core::right_panel::{FileAttachment, SurfaceKind, breadcrumb_path_of, retained_breadcrumb_trail};
 
 pub use actions::FileWorkspace;
-pub use explorer::init;
+
+pub fn init(cx: &mut App) {
+    explorer::init(cx);
+    editor::init(cx);
+}
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::icons::Icon;
 use crate::right_panel::{Button, Variant};
 use crate::theme::{hsla, palette};
 use explorer::{Explorer, ExplorerEvent};
-use preview::Preview;
+use preview::{Preview, RenderedMode};
 
 const STORE: &str = "files";
 /// `FileExplorerPane`: default 256, between 160 and 560, leaving the file at least 256.
@@ -58,12 +69,16 @@ pub struct Root {
     pub workspace: FileWorkspace,
 }
 
-/// `t3code.fileExplorerOpen`, `t3code.fileExplorerWidth` and `t3code.renderMarkdown`.
+/// `t3code.fileExplorerOpen`, `t3code.fileExplorerWidth`, `t3code.renderMarkdown`,
+/// `t3code.renderMermaid`, `t3code.renderTable`, and `t3code.renderNotebook`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Prefs {
     explorer_open: bool,
     explorer_width: f32,
     render_markdown: bool,
+    render_mermaid: bool,
+    render_table: bool,
+    render_notebook: bool,
 }
 
 impl Prefs {
@@ -78,13 +93,23 @@ impl Prefs {
                 .filter(|width| width.is_finite())
                 .unwrap_or(EXPLORER_WIDTH),
             render_markdown: value.get("renderMarkdown").and_then(Value::as_bool).unwrap_or(false),
+            render_mermaid: value.get("renderMermaid").and_then(Value::as_bool).unwrap_or(true),
+            render_table: value.get("renderTable").and_then(Value::as_bool).unwrap_or(true),
+            render_notebook: value.get("renderNotebook").and_then(Value::as_bool).unwrap_or(true),
         }
     }
 
     fn save(&self) {
         store::save_ui_state(
             STORE,
-            &json!({ "explorerOpen": self.explorer_open, "explorerWidth": self.explorer_width, "renderMarkdown": self.render_markdown }),
+            &json!({
+                "explorerOpen": self.explorer_open,
+                "explorerWidth": self.explorer_width,
+                "renderMarkdown": self.render_markdown,
+                "renderMermaid": self.render_mermaid,
+                "renderTable": self.render_table,
+                "renderNotebook": self.render_notebook,
+            }),
         );
     }
 }
@@ -150,7 +175,12 @@ impl FilesPanel {
         })
         .detach();
         let prefs = Prefs::load();
-        preview.update(cx, |preview, cx| preview.set_render_markdown(prefs.render_markdown, cx));
+        preview.update(cx, |preview, cx| {
+            preview.set_render_markdown(prefs.render_markdown, cx);
+            preview.set_render_mermaid(prefs.render_mermaid, cx);
+            preview.set_render_table(prefs.render_table, cx);
+            preview.set_render_notebook(prefs.render_notebook, cx);
+        });
         let mut panel = FilesPanel {
             state,
             explorer,
@@ -268,8 +298,13 @@ impl FilesPanel {
     fn set_prefs(&mut self, change: impl FnOnce(&mut Prefs), cx: &mut Context<Self>) {
         change(&mut self.prefs);
         self.prefs.save();
-        let render_markdown = self.prefs.render_markdown;
-        self.preview.update(cx, |preview, cx| preview.set_render_markdown(render_markdown, cx));
+        let prefs = self.prefs;
+        self.preview.update(cx, |preview, cx| {
+            preview.set_render_markdown(prefs.render_markdown, cx);
+            preview.set_render_mermaid(prefs.render_mermaid, cx);
+            preview.set_render_table(prefs.render_table, cx);
+            preview.set_render_notebook(prefs.render_notebook, cx);
+        });
         cx.notify();
     }
 
@@ -332,9 +367,13 @@ impl FilesPanel {
                 .into_any_element();
             separator.into_iter().chain([item]).collect::<Vec<_>>()
         }));
-        let markdown = previewing && is_markdown(path);
-        let rendered = markdown && self.prefs.render_markdown;
-        let raw_text = previewing && self.preview.read(cx).shows_text() && !rendered;
+        let preview_ref = self.preview.read(cx);
+        let rendered_mode = previewing.then(|| preview_ref.rendered_mode()).flatten();
+        let rendered = previewing && preview_ref.is_rendered_active();
+        let raw_text = previewing && preview_ref.shows_text();
+        let editing = previewing && preview_ref.is_editing();
+        let dirty = previewing && preview_ref.is_dirty();
+        let can_edit = previewing && preview_ref.can_edit_current(cx);
         let host = is_host_path(path);
         let entity = cx.entity().downgrade();
         let toggle = move |run: fn(&mut FilesPanel, &mut Context<FilesPanel>)| {
@@ -353,15 +392,83 @@ impl FilesPanel {
             .gap(px(8.))
             .bg(hsla(p.background))
             .child(crumb_row)
-            .when(markdown, |this| {
+            .when_some(rendered_mode, |this, mode| {
+                let tooltip = match (mode, rendered) {
+                    (RenderedMode::Markdown, true) => "Show markdown source",
+                    (RenderedMode::Markdown, false) => "Show rendered markdown",
+                    (RenderedMode::Mermaid, true) => "Show Mermaid source",
+                    (RenderedMode::Mermaid, false) => "Show rendered diagram",
+                    (RenderedMode::Table, true) => "Show source",
+                    (RenderedMode::Table, false) => "Show table",
+                    (RenderedMode::Notebook, true) => "Show notebook JSON",
+                    (RenderedMode::Notebook, false) => "Show rendered notebook",
+                };
+                let icon = if rendered {
+                    Icon::CodeXml
+                } else if mode == RenderedMode::Table {
+                    Icon::Rows3
+                } else {
+                    Icon::Eye
+                };
                 this.child(
-                    Button::new("file-render-markdown")
+                    Button::new("file-render-toggle")
                         .variant(Variant::Toggle)
-                        .icon(if rendered { Icon::CodeXml } else { Icon::Eye })
+                        .icon(icon)
                         .icon_size(14.)
                         .pressed(rendered)
-                        .tooltip(if rendered { "Show markdown source" } else { "Show rendered markdown" })
-                        .on_click(toggle(|this, cx| this.set_prefs(|prefs| prefs.render_markdown = !prefs.render_markdown, cx))),
+                        .tooltip(tooltip)
+                        .on_click(toggle(match mode {
+                            RenderedMode::Markdown => |this, cx| {
+                                this.preview.update(cx, |p, cx| p.request_exit_edit_mode(cx));
+                                if !this.preview.read(cx).is_editing() {
+                                    this.set_prefs(|prefs| prefs.render_markdown = !prefs.render_markdown, cx);
+                                }
+                            },
+                            RenderedMode::Mermaid => |this, cx| {
+                                this.preview.update(cx, |p, cx| p.request_exit_edit_mode(cx));
+                                if !this.preview.read(cx).is_editing() {
+                                    this.set_prefs(|prefs| prefs.render_mermaid = !prefs.render_mermaid, cx);
+                                }
+                            },
+                            RenderedMode::Table => |this, cx| {
+                                this.preview.update(cx, |p, cx| p.request_exit_edit_mode(cx));
+                                if !this.preview.read(cx).is_editing() {
+                                    this.set_prefs(|prefs| prefs.render_table = !prefs.render_table, cx);
+                                }
+                            },
+                            RenderedMode::Notebook => |this, cx| {
+                                this.preview.update(cx, |p, cx| p.request_exit_edit_mode(cx));
+                                if !this.preview.read(cx).is_editing() {
+                                    this.set_prefs(|prefs| prefs.render_notebook = !prefs.render_notebook, cx);
+                                }
+                            },
+                        })),
+                )
+            })
+            .when(can_edit, |this| {
+                this.child(
+                    Button::new("file-edit-toggle")
+                        .variant(Variant::Toggle)
+                        .icon(if editing { Icon::Eye } else { Icon::Pencil })
+                        .icon_size(14.)
+                        .pressed(editing || dirty)
+                        .tooltip(if editing {
+                            "Exit edit mode"
+                        } else if dirty {
+                            "Resume editing (unsaved changes)"
+                        } else {
+                            "Edit file"
+                        })
+                        .on_click(toggle(|this, cx| {
+                            this.preview.update(cx, |preview, cx| {
+                                if preview.is_editing() {
+                                    preview.request_exit_edit_mode(cx);
+                                } else {
+                                    preview.enter_edit_mode(cx);
+                                }
+                            });
+                            cx.notify();
+                        })),
                 )
             })
             .when(raw_text, |this| {
@@ -709,6 +816,176 @@ mod tests {
             vcx.debug_bounds("attachment-open-url").is_none(),
             "attachment with neither HTTP URL nor ID should omit the Open attachment button"
         );
+
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
+
+    #[gpui::test]
+    async fn editor_saves_via_projects_write_file_and_explorer_drag_mentions_queue_to_composer(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::keymap::init(cx);
+            init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "filesystem:read", "filesystem:write"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let (panel, vcx) = cx.add_window_view(|window, cx| FilesPanel::new(state.clone(), window, cx));
+        let make_target = |path: &str| preview::Target {
+            root: Root {
+                environment: "fixture-env".into(),
+                workspace: FileWorkspace {
+                    thread_id: "menu-thread".into(),
+                    cwd: "/fixture/b".into(),
+                    project_name: "Shared repo".into(),
+                },
+            },
+            path: path.into(),
+            reveal_line: None,
+            reveal_request_id: 0,
+        };
+        let target_a = make_target("src/app.rs");
+        let target_b = make_target("scripts/tool.py");
+        let save_target_a = t3_core::files::save::FileSaveTarget::new("fixture-env", "/fixture/b", "src/app.rs");
+        let save_target_b = t3_core::files::save::FileSaveTarget::new("fixture-env", "/fixture/b", "scripts/tool.py");
+
+        let preview_entity = panel.read_with(vcx, |panel, _| panel.preview.clone());
+        let explorer_entity = panel.read_with(vcx, |panel, _| panel.explorer.clone());
+
+        // Start an in-flight write on target A (`src/app.rs`), then switch to target B (`scripts/tool.py`)
+        // and start a second concurrent write before target A's reply returns.
+        let editor_a_id = vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.root = Some(target_a.root.clone());
+                panel.shown = Some(Shown {
+                    surface_id: "s-1".into(),
+                    path: Some("src/app.rs".into()),
+                    reveal_line: None,
+                    reveal_request_id: 0,
+                    attachment: None,
+                    folder_trail: None,
+                });
+                cx.notify();
+            });
+            preview_entity.update(cx, |preview, cx| {
+                preview.load_text_for_test(target_a.clone(), "fn before() {}\n", cx);
+                preview.enter_edit_mode(cx);
+                assert_eq!(preview.editor.language, Some("rust"));
+                preview.on_editor_text_changed("fn after() {}\n".into(), cx);
+                assert!(preview.is_dirty());
+                preview.save_active_file(cx);
+            });
+            window.draw(cx).clear();
+            preview_entity.read(cx).editor.editor.as_ref().expect("rust editor state").entity_id()
+        });
+
+        let (method_a, payload_a, reply_a) = loop {
+            let req = fixture.next_request().await;
+            if req.0 == t3_core::files::WRITE_FILE {
+                break req;
+            }
+            let _ = req.2.send(Ok(json!({})));
+        };
+        assert_eq!(method_a, t3_core::files::WRITE_FILE);
+        assert_eq!(
+            payload_a,
+            json!({ "cwd": "/fixture/b", "relativePath": "src/app.rs", "contents": "fn after() {}\n" })
+        );
+
+        // Switch to a Python file while target A's write is still in flight; verify language updates,
+        // EditorState is recreated with the new grammar, and target B's write does not cancel target A's persist task.
+        let editor_b_id = vcx.update(|window, cx| {
+            preview_entity.update(cx, |preview, cx| {
+                preview.release_active_editor_on_target_change(cx);
+                preview.load_text_for_test(target_b.clone(), "print('before')\n", cx);
+                preview.enter_edit_mode(cx);
+                assert_eq!(preview.editor.language, Some("python"));
+                preview.on_editor_text_changed("print('after')\n".into(), cx);
+                preview.save_active_file(cx);
+            });
+            window.draw(cx).clear();
+            preview_entity.read(cx).editor.editor.as_ref().expect("python editor state").entity_id()
+        });
+        assert_ne!(editor_a_id, editor_b_id, "switching files must recreate EditorState with updated language");
+
+        let (method_b, payload_b, reply_b) = loop {
+            let req = fixture.next_request().await;
+            if req.0 == t3_core::files::WRITE_FILE {
+                break req;
+            }
+            let _ = req.2.send(Ok(json!({})));
+        };
+        assert_eq!(method_b, t3_core::files::WRITE_FILE);
+        assert_eq!(
+            payload_b,
+            json!({ "cwd": "/fixture/b", "relativePath": "scripts/tool.py", "contents": "print('after')\n" })
+        );
+
+        // Take both per-target persist tasks and resolve both RPCs; neither must deadlock in `saving`.
+        let (task_a, task_b) = preview_entity.update(vcx, |preview, _| {
+            (
+                preview.editor.persist_tasks.remove(&save_target_a.key()).expect("target A persist task kept"),
+                preview.editor.persist_tasks.remove(&save_target_b.key()).expect("target B persist task kept"),
+            )
+        });
+        reply_a.send(Ok(json!({ "relativePath": "src/app.rs" }))).unwrap();
+        reply_b.send(Ok(json!({ "relativePath": "scripts/tool.py" }))).unwrap();
+        task_a.await;
+        task_b.await;
+        vcx.run_until_parked();
+
+        preview_entity.read_with(vcx, |preview, _| {
+            assert!(!preview.editor.store.is_saving(&save_target_a), "target A must not deadlock in saving");
+            assert!(!preview.editor.store.is_pending(&save_target_a), "target A confirmed write must clear pending");
+            assert!(!preview.editor.store.is_saving(&save_target_b), "target B must not deadlock in saving");
+            assert!(!preview.is_dirty(), "confirmed write must clear dirty state");
+            assert_eq!(preview.current_text_contents().as_deref(), Some("print('after')\n"));
+        });
+
+        // Aborted drag clears `drag_mention.is_drag_in_progress()` on render when no drag is active.
+        vcx.update(|window, cx| {
+            explorer_entity.update(cx, |explorer, _| {
+                let _ = explorer.begin_drag_mention("src/app.rs").expect("drag mention payload");
+                assert!(explorer.drag_mention.is_drag_in_progress());
+            });
+            window.draw(cx).clear();
+        });
+        explorer_entity.read_with(vcx, |explorer, _| {
+            assert!(
+                !explorer.drag_mention.is_drag_in_progress(),
+                "aborted drag without active GPUI drag must clear drag-to-mention state"
+            );
+        });
+
+        // Explorer drag-to-mention drop emits mention into AppState::composer_mentions.
+        explorer_entity.update(vcx, |explorer, cx| {
+            let dragged = explorer.begin_drag_mention("src/app.rs").expect("drag mention payload");
+            assert_eq!(dragged.mention, "[app.rs](src/app.rs)");
+            explorer.drop_mention_to_chat(&dragged, cx);
+        });
+        state.read_with(vcx, |state, _| {
+            assert!(
+                state.composer_mentions.iter().any(|m| m.path == "src/app.rs"),
+                "dropped tree drag must queue composer mention"
+            );
+        });
 
         state.update(vcx, |state, _| state.stop_pump());
         cx.update(|cx| {

@@ -12,6 +12,7 @@ use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{Sizable, h_flex, v_flex};
 use t3_core::files::EntryKind;
+use t3_core::files::media_preview::DraggedFileMention;
 
 use super::explorer::{CONTEXT, Explorer};
 use crate::icons::Icon;
@@ -20,6 +21,33 @@ use crate::theme::{hsla, palette};
 
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 12.;
+
+/// Floating pill rendered under the cursor while dragging a file tree item (`fileTreeDragMention.ts`).
+struct DragMentionGhost {
+    label: SharedString,
+    kind: EntryKind,
+}
+
+impl Render for DragMentionGhost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let icon = if self.kind == EntryKind::Directory { Icon::Folder } else { Icon::File };
+        h_flex()
+            .px(px(10.))
+            .py(px(5.))
+            .gap(px(6.))
+            .items_center()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(hsla(p.primary).opacity(0.6))
+            .bg(hsla(p.popover))
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(hsla(p.popover_foreground))
+            .child(icon.svg().size(px(13.)).text_color(hsla(p.primary)))
+            .child(self.label.clone())
+    }
+}
 
 impl Explorer {
     fn render_subheader(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -76,8 +104,16 @@ impl Explorer {
             (EntryKind::File, ..) => Icon::File,
         };
         let path = row.path.clone();
+        let drag_path = row.path.clone();
+        let drag_payload = DraggedFileMention::from_drag(&drag_path, &[])
+            .unwrap_or_else(|| DraggedFileMention {
+                paths: vec![drag_path.clone()],
+                mention: t3_core::files::composer_file_link(&drag_path),
+                label: row.label.clone(),
+            });
         let kind = row.kind;
         let state = self.state.clone();
+        let explorer_entity = cx.entity().downgrade();
         h_flex()
             .id(ElementId::from(("file-tree-row", index)))
             .h(px(ROW_HEIGHT))
@@ -92,6 +128,15 @@ impl Explorer {
             .when(selected, |this| this.bg(hsla(p.foreground).opacity(0.12)))
             .when(!selected && cursor, |this| this.bg(hsla(p.foreground).opacity(0.07)))
             .when(!selected, |this| this.hover(|style| style.bg(hsla(p.foreground).opacity(0.07))))
+            .on_drag(drag_payload, move |dragged, _, _, cx| {
+                if let Some(explorer) = explorer_entity.upgrade() {
+                    explorer.update(cx, |this, _| {
+                        let _ = this.begin_drag_mention(&drag_path);
+                    });
+                }
+                let label: SharedString = dragged.label.clone().into();
+                cx.new(|_| DragMentionGhost { label, kind })
+            })
             .on_click(cx.listener(move |this, _, window, cx| {
                 window.focus(&this.focus, cx);
                 this.activate_row(index, cx);
@@ -138,6 +183,9 @@ impl Explorer {
 
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !cx.has_active_drag() && self.drag_mention.is_drag_in_progress() {
+            let _ = self.drag_mention.end_drag();
+        }
         if std::mem::take(&mut self.pending_reset_input) {
             self.search_input.update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -194,6 +242,36 @@ impl Render for Explorer {
                             .track_scroll(&self.scroll),
                         )
                         .vertical_scrollbar(&self.scroll),
+                )
+            })
+            .when(cx.has_active_drag() && self.drag_mention.is_drag_in_progress(), |this| {
+                let border = hsla(p.primary).opacity(0.6);
+                let hover_bg = hsla(p.primary).opacity(0.12);
+                this.child(
+                    h_flex()
+                        .id("file-tree-drop-mention")
+                        .flex_none()
+                        .h(px(34.))
+                        .mx(px(8.))
+                        .mb(px(8.))
+                        .px(px(10.))
+                        .gap(px(6.))
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(border)
+                        .bg(hsla(p.secondary))
+                        .text_xs()
+                        .text_color(hsla(p.foreground))
+                        .drag_over::<DraggedFileMention>(move |style, _, _, _| {
+                            style.bg(hover_bg).border_color(border)
+                        })
+                        .on_drop(cx.listener(|this, dragged: &DraggedFileMention, _, cx| {
+                            this.drop_mention_to_chat(dragged, cx);
+                        }))
+                        .child(Icon::MessageSquarePlus.svg().size(px(13.)).text_color(hsla(p.primary)))
+                        .child("Drop here to mention in chat"),
                 )
             })
     }
