@@ -10,8 +10,9 @@ use t3_client::store;
 use t3_core::diff::{DiffSelection, TurnDiffSummary};
 use t3_core::preview::{self, SessionSnapshot};
 use t3_core::right_panel::{
-    BrowserSnapshot, ClosedTarget, ClosedView, ProactiveEvaluationInput, ProactivePanelCoordinator, PullRequestDetailTab,
-    PullRequestTarget, Reopened, RightPanels, Surface, SurfaceKind, decode_lenient_map,
+    BrowserSnapshot, ClosedTarget, ClosedView, IssueTarget, ProactiveEvaluationInput,
+    ProactivePanelCoordinator, PullRequestDetailTab, PullRequestTarget, Reopened, RightPanels,
+    Surface, SurfaceKind, decode_lenient_map,
 };
 use t3_core::terminal::SplitDirection;
 
@@ -155,6 +156,26 @@ impl AppState {
             return;
         }
         self.mutate_panels(cx, |state, thread| state.panels.open_pull_request(thread, target));
+    }
+
+    /// Opens a single issue tab in the active thread's right panel (`openIssue`).
+    pub fn open_issue_surface(&mut self, target: IssueTarget, cx: &mut Context<Self>) {
+        if self.panel_thread().is_none() {
+            return;
+        }
+        self.mutate_panels(cx, |state, thread| state.panels.open_issue(thread, target));
+    }
+
+    /// Opens a single issue tab in a named panel key (e.g. `ISSUES_PANEL_THREAD_KEY`).
+    pub fn open_issue_surface_for_key(
+        &mut self,
+        panel_key: &str,
+        target: IssueTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panels.panels.open_issue(panel_key, target) {
+            self.save_panels(cx);
+        }
     }
 
     pub fn set_pull_request_surface_detail_tab(&mut self, thread_id: &str, surface_id: &str, tab: PullRequestDetailTab, cx: &mut Context<Self>) {

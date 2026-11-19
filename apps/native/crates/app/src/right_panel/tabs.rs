@@ -100,6 +100,7 @@ fn surface_icon(surface: &Surface) -> Icon {
         SurfaceKind::Diff => Icon::FileDiff,
         SurfaceKind::PullRequests => Icon::Link2,
         SurfaceKind::PullRequest { .. } => Icon::GitPullRequest,
+        SurfaceKind::Issue(_) => Icon::CircleDot,
         SurfaceKind::Files { .. } => Icon::Files,
         SurfaceKind::File { attachment: Some(_), .. } => Icon::Paperclip,
         SurfaceKind::File { .. } => Icon::File,

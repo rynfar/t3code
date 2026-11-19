@@ -160,8 +160,29 @@ fn entry_row(
 
     let select_ref = reference.clone();
     let select_entry = env_entry.clone();
-    let select = cx.listener(move |this, _: &ClickEvent, _, cx| {
+    let click_url = entry.url.clone();
+    let select = cx.listener(move |this, event: &ClickEvent, _, cx| {
+        let mods = event.modifiers();
+        if mods.platform || mods.control || mods.shift || mods.alt {
+            cx.open_url(&click_url);
+            return;
+        }
+        this.preview.clear();
         this.select(select_ref.clone(), select_entry.clone(), cx);
+    });
+
+    let hover_target = super::preview::IssuePreviewTarget::from_entry(
+        Some(env_entry.environment_id.clone()),
+        entry,
+    );
+    let hover = cx.listener(move |this, hovered: &bool, _, cx| {
+        let state = this.state.clone();
+        this.preview.hover(
+            &state,
+            (*hovered).then(|| hover_target.clone()),
+            |page| &mut page.preview,
+            cx,
+        );
     });
 
     let copy_text = entry.display_key.clone();
@@ -178,6 +199,7 @@ fn entry_row(
         .cursor_pointer()
         .child(issue_state_icon(&env_entry, group_idx, row_idx, cx))
         .child(row_lines(&env_entry, show_scope, show_tracker, env_label, cx))
+        .on_hover(hover)
         .on_click(select);
 
     h_flex()

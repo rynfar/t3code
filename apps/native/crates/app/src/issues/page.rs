@@ -31,12 +31,16 @@ use t3_core::issues::saved_views::{
 use t3_core::issues::wire::{
     IssueCandidates, IssueListResult, IssueRef, IssueTrackerSummary, decode, method,
 };
+use t3_core::right_panel::{ISSUES_PANEL_THREAD_KEY, IssueTarget};
 use t3_core::sidebar::grouping::EnvironmentOwner;
 
-use super::{ReadFailure, read_for_owner, settle, state_glyph};
+use super::detail::IssueDetailPanel;
+use super::preview::IssueLinkPreviewController;
+use super::{
+    HeldIssueKey, ReadFailure, hold_issue_seed, read_for_owner, settle,
+};
 use crate::app_state::{AppEvent, AppState};
 use crate::i18n::t;
-use crate::icons::Icon;
 use crate::pull_requests::controls::{Button, Size, Variant};
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
@@ -89,6 +93,8 @@ pub struct IssuesPage {
     pub(super) list: ListState,
     pub(super) selected: Option<IssueRef>,
     pub(super) selected_entry: Option<EnvironmentIssueEntry>,
+    detail: Option<Entity<IssueDetailPanel>>,
+    pub(super) preview: IssueLinkPreviewController,
     pub(super) loading_more: Option<String>,
     loading_more_gen: u64,
     pub(super) unsupported: bool,
@@ -137,6 +143,8 @@ impl IssuesPage {
                     AppEvent::Phase | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig
                 ) {
                     this.sync(cx);
+                } else if matches!(event, AppEvent::RightPanel) {
+                    this.sync_detail_from_panel(cx);
                 }
             }),
         ];
@@ -156,6 +164,8 @@ impl IssuesPage {
             list: ListState::new(0, ListAlignment::Top, px(800.)),
             selected: None,
             selected_entry: None,
+            detail: None,
+            preview: IssueLinkPreviewController::default(),
             loading_more: None,
             loading_more_gen: 0,
             unsupported: false,
@@ -780,20 +790,121 @@ impl IssuesPage {
         cx.notify();
     }
 
+    fn open_detail_pane(
+        &mut self,
+        env_id: Option<String>,
+        reference: IssueRef,
+        entry: Option<EnvironmentIssueEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let seed = entry.as_ref().map(|e| e.entry.clone());
+        if let Some(detail) = &self.detail {
+            detail.update(cx, |panel, cx| {
+                panel.retarget(env_id, reference.clone(), seed, cx);
+            });
+        } else {
+            let page_weak = cx.entity().downgrade();
+            let close_weak = page_weak.clone();
+            let on_close = std::rc::Rc::new(move |cx: &mut App| {
+                let _ = close_weak.update(cx, |page, cx| page.clear_selection(cx));
+            });
+            let on_mutated = std::rc::Rc::new(move |cx: &mut App| {
+                let _ = page_weak.update(cx, |page, cx| {
+                    page.fetch_all(IssueListRefreshMode::Background, cx);
+                });
+            });
+            let state = self.state.clone();
+            let ref_clone = reference.clone();
+            self.detail = Some(cx.new(|cx| {
+                IssueDetailPanel::new(
+                    state,
+                    env_id,
+                    ref_clone,
+                    None,
+                    seed,
+                    Some(on_close),
+                    None,
+                    Some(on_mutated),
+                    cx,
+                )
+            }));
+        }
+        self.selected = Some(reference);
+        self.selected_entry = entry;
+        cx.notify();
+    }
+
+    fn sync_detail_from_panel(&mut self, cx: &mut Context<Self>) {
+        let active_target = {
+            let state = self.state.read(cx);
+            if !state.issues_open {
+                return;
+            }
+            let panel = state.panels.panels.panel(ISSUES_PANEL_THREAD_KEY);
+            if !panel.is_open {
+                return;
+            }
+            panel.active().and_then(|surface| match &surface.kind {
+                t3_core::right_panel::SurfaceKind::Issue(target) => Some(target.as_ref().clone()),
+                _ => None,
+            })
+        };
+        let Some(target) = active_target else {
+            return;
+        };
+        let reference = target.issue_ref();
+        let env_id = target.environment_id.clone();
+        if self.selected.as_ref() == Some(&reference)
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).matches_target(env_id.as_deref(), &reference))
+        {
+            return;
+        }
+        let matched = self
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .find(|row| {
+                IssueRef::of(&row.entry) == reference
+                    && (env_id.is_none() || env_id.as_deref() == Some(row.environment_id.as_str()))
+            })
+            .cloned();
+        self.open_detail_pane(env_id, reference, matched, cx);
+    }
+
     pub(super) fn select(
         &mut self,
         reference: IssueRef,
         entry: EnvironmentIssueEntry,
         cx: &mut Context<Self>,
     ) {
-        self.selected = Some(reference);
-        self.selected_entry = Some(entry);
-        cx.notify();
+        let env_id = Some(entry.environment_id.clone());
+        if let Some(key) = HeldIssueKey::of(self.state.read(cx), env_id.as_deref(), &reference) {
+            hold_issue_seed(key, &entry.entry, cx);
+        }
+        let target = IssueTarget::from_ref(
+            env_id.clone(),
+            &reference,
+            Some(entry.entry.display_key.clone()),
+            Some(entry.entry.url.clone()),
+        );
+        self.open_detail_pane(env_id, reference, Some(entry), cx);
+        self.state.update(cx, |state, cx| {
+            state.open_issue_surface_for_key(ISSUES_PANEL_THREAD_KEY, target, cx);
+        });
     }
 
     pub(super) fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected = None;
         self.selected_entry = None;
+        self.detail = None;
+        self.state.update(cx, |state, cx| {
+            if state.panels.panels.hide(ISSUES_PANEL_THREAD_KEY) {
+                state.save_panels(cx);
+            }
+        });
         cx.notify();
     }
 
@@ -963,69 +1074,6 @@ impl IssuesPage {
             )
     }
 
-    fn render_selected_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let selected = self.selected_entry.as_ref()?;
-        let entry = &selected.entry;
-        let p = palette(cx);
-        let (icon, color) = state_glyph(&entry.state, cx);
-        let copy_key = entry.display_key.clone();
-        let open_url = entry.url.clone();
-
-        Some(
-            h_flex()
-                .id("issues-selected-bar")
-                .flex_none()
-                .mx(px(20.))
-                .mb(px(8.))
-                .px(px(12.))
-                .py(px(8.))
-                .gap(px(8.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(hsla(p.border))
-                .bg(hsla(p.card))
-                .child(icon.sized(px(14.)).text_color(color))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(hsla(p.muted_foreground))
-                        .child(entry.display_key.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(hsla(p.foreground))
-                        .child(entry.title.clone()),
-                )
-                .child(
-                    Button::new("issues-selected-copy", Variant::Outline, Size::Xs)
-                        .icon(Icon::Copy)
-                        .label(t(cx, "Copy key").to_owned())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.copy_text(copy_key.clone(), "Issue key", cx);
-                        })),
-                )
-                .child(
-                    Button::new("issues-selected-open", Variant::Outline, Size::Xs)
-                        .icon(Icon::ExternalLink)
-                        .label(t(cx, "Open in browser").to_owned())
-                        .on_click(move |_, _, cx| cx.open_url(&open_url)),
-                )
-                .child(
-                    Button::new("issues-selected-close", Variant::GhostMuted, Size::Xs)
-                        .icon(Icon::X)
-                        .tooltip(t(cx, "Clear selection").to_owned())
-                        .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
-                )
-                .into_any_element(),
-        )
-    }
-
     fn render_body(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.unsupported {
             return super::row::unsupported_state(cx).into_any_element();
@@ -1061,28 +1109,19 @@ impl Render for IssuesPage {
             .first_error()
             .filter(|_| !self.held_pages.is_empty())
             .map(str::to_owned);
-        let selected_bar = self.render_selected_bar(cx);
+        let detail = self.detail.clone();
+        let preview_card = self.preview.render_card(cx);
         let dialog = self
             .saved_view_editor
             .as_ref()
             .map(|editor| super::toolbar::render_saved_view_dialog(self, editor, cx));
 
-        div()
-            .id("issues-page")
-            .track_focus(&self.focus)
-            .relative()
-            .size_full()
+        let list_column = div()
+            .flex_1()
             .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
-            .bg(hsla(p.background))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.saved_view_editor.is_some() {
-                    this.close_saved_view_editor(cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .child(self.render_header(window, cx))
             .child(super::toolbar::render(self, window, cx))
             .children(partial_error.map(|error| {
                 let retry = cx.listener(|this, _, _, cx| this.retry_failed(cx));
@@ -1107,7 +1146,6 @@ impl Render for IssuesPage {
                             .on_click(retry),
                     )
             }))
-            .children(selected_bar)
             .child(
                 div()
                     .flex_1()
@@ -1116,7 +1154,60 @@ impl Render for IssuesPage {
                     .flex_col()
                     .px(px(8.))
                     .child(self.render_body(window, cx)),
+            );
+
+        div()
+            .id("issues-page")
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .bg(hsla(p.background))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    if this.saved_view_editor.is_some() {
+                        this.close_saved_view_editor(cx);
+                        cx.stop_propagation();
+                    } else if this.detail.is_some() {
+                        this.clear_selection(cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
+            .child(self.render_header(window, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .child(list_column)
+                    .children(detail.map(|detail| {
+                        div()
+                            .id("issues-detail-pane")
+                            .flex_none()
+                            .w(px(480.))
+                            .min_w(px(360.))
+                            .h_full()
+                            .min_h_0()
+                            .border_l_1()
+                            .border_color(hsla(p.border))
+                            .child(detail)
+                    })),
             )
+            .children(preview_card.map(|card| {
+                gpui::deferred(
+                    div()
+                        .absolute()
+                        .bottom(px(16.))
+                        .right(px(16.))
+                        .child(card),
+                )
+                .with_priority(40)
+            }))
             .children(dialog)
     }
 }
@@ -1408,6 +1499,31 @@ mod tests {
             page.sent = "old".into();
             page.send_query("after-close".into(), cx);
             assert_eq!(page.sent, "old", "send_query must not fetch after closing page");
+        });
+
+        // 4. Opening an issue via ISSUES_PANEL_THREAD_KEY while IssuesPage is active
+        // (e.g. clicking an inline issue link in an issue body/comment) visibly navigates
+        // IssuesPage's split detail pane.
+        let linked_target = IssueTarget {
+            environment_id: Some("saved-remote".into()),
+            project_id: "p-remote".into(),
+            tracker: t3_core::issues::wire::IssueTrackerKind::AzureDevOps,
+            host: Some("dev.azure.com".into()),
+            scope: "acme/Core".into(),
+            key: "77".into(),
+            display_key: Some("#77".into()),
+            url: Some("https://dev.azure.com/acme/Core/_workitems/edit/77".into()),
+        };
+        let expected_ref = linked_target.issue_ref();
+        state.update(cx, |app, cx| {
+            app.issues_open = true;
+            app.open_issue_surface_for_key(ISSUES_PANEL_THREAD_KEY, linked_target, cx);
+        });
+        cx.run_until_parked();
+        page.read_with(cx, |page, cx| {
+            assert_eq!(page.selected.as_ref(), Some(&expected_ref));
+            let detail = page.detail.as_ref().expect("detail pane opened from panel event");
+            assert!(detail.read(cx).matches_target(Some("saved-remote"), &expected_ref));
         });
     }
 }

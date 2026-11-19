@@ -15,6 +15,7 @@ use t3_core::thread_details::{DensityInputs, item_visible_at_density, resolve_ca
 
 use super::automations::AutomationsFeed;
 use super::controls::Row;
+use super::issues::LinkedIssuesFeed;
 use super::items::ITEMS;
 use super::sections::{self, Ctx};
 use super::servers::ServersFeed;
@@ -39,6 +40,7 @@ struct Inputs {
     scripts: Vec<Value>,
     no_runs_yet: bool,
     lineage: crate::lineage::Relationships,
+    issues: Vec<t3_core::issues::wire::ThreadIssueLink>,
 }
 
 fn inputs(state: &AppState, titles: &crate::lineage::ThreadTitlesFeed) -> Option<Inputs> {
@@ -53,6 +55,7 @@ fn inputs(state: &AppState, titles: &crate::lineage::ThreadTitlesFeed) -> Option
             scripts: project.scripts.clone(),
             no_runs_yet: thread.latest_run_id.is_none(),
             lineage: crate::lineage::relationships_with_titles(state, thread, Some(titles)),
+            issues: thread.issues.clone(),
         });
     }
     let project_id = state.draft_project.as_deref()?;
@@ -66,6 +69,7 @@ fn inputs(state: &AppState, titles: &crate::lineage::ThreadTitlesFeed) -> Option
         scripts: project.scripts.clone(),
         no_runs_yet: true,
         lineage: crate::lineage::Relationships::default(),
+        issues: Vec::new(),
     })
 }
 
@@ -80,6 +84,7 @@ pub struct DetailsView {
     thread: Entity<ThreadView>,
     pub(super) servers: ServersFeed,
     pub(super) automations: AutomationsFeed,
+    issues_feed: LinkedIssuesFeed,
     lineage_titles: crate::lineage::ThreadTitlesFeed,
     card_open: bool,
     inputs: Option<Inputs>,
@@ -116,6 +121,7 @@ impl DetailsView {
             cx.subscribe(&state, |this, state, event: &AppEvent, cx| match event {
                 AppEvent::Selection => {
                     this.servers.reset_pagination();
+                    this.issues_feed.reset();
                     this.picker.update(cx, |picker, cx| picker.close(cx));
                     this.lineage_titles.allow_retry();
                     this.sync_lineage_titles(this.card_open, cx);
@@ -191,6 +197,7 @@ impl DetailsView {
             thread,
             servers: ServersFeed::new(),
             automations: AutomationsFeed::new(),
+            issues_feed: LinkedIssuesFeed::new(),
             lineage_titles,
             card_open: false,
             inputs: initial,
@@ -278,6 +285,18 @@ impl Render for DetailsView {
         self.card_open = feed_active;
         self.servers.sync(&self.state, feed_active && show_servers, cx);
         self.automations.sync(&self.state, feed_active && show_automations, cx);
+        let thread_issues = self
+            .inputs
+            .as_ref()
+            .map(|inputs| inputs.issues.clone())
+            .unwrap_or_default();
+        self.issues_feed.sync(
+            &self.state,
+            feed_active && self.details.read(cx).shows("branch"),
+            &thread_issues,
+            |this| &mut this.issues_feed,
+            cx,
+        );
         self.sync_lineage_titles(feed_active, cx);
 
         if !layout.card_open || self.inputs.is_none() {
@@ -330,6 +349,27 @@ impl Render for DetailsView {
         let mut any_above = workspace.is_some();
         let version_control = sections::version_control(&ctx, any_above, density, cx);
         any_above |= version_control.is_some();
+        let show_issues = self.details.read(cx).shows("branch") && item_visible_at_density("branch", density);
+        let close_view = cx.entity().downgrade();
+        let linked_issues = show_issues
+            .then(|| {
+                self.issues_feed.render(
+                    &self.state,
+                    &thread_issues,
+                    any_above && density.is_full(),
+                    !density.is_full(),
+                    move |cx| {
+                        let _ = close_view.update(cx, |this, cx| {
+                            if popover {
+                                this.close_popover(cx);
+                            }
+                        });
+                    },
+                    cx,
+                )
+            })
+            .flatten();
+        any_above |= linked_issues.is_some();
         let servers = (show_servers && item_visible_at_density("servers", density))
             .then(|| thread_id.and_then(|id| self.servers.render(&self.state, id, any_above && density.is_full(), window, cx)))
             .flatten();
@@ -352,6 +392,7 @@ impl Render for DetailsView {
             .flatten();
         let empty = workspace.is_none()
             && version_control.is_none()
+            && linked_issues.is_none()
             && servers.is_none()
             && automations.is_none()
             && lineage.is_none()
@@ -364,6 +405,7 @@ impl Render for DetailsView {
             .w_full()
             .children(workspace)
             .children(version_control)
+            .children(linked_issues)
             .children(servers)
             .children(automations)
             .children(lineage)

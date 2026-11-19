@@ -344,7 +344,7 @@ fn decode_body(kind: &str, payload: Value) -> Result<EventBody, serde_json::Erro
         | "thread.settled" | "thread.unsettled" | "thread.snoozed" | "thread.unsnoozed"
         | "thread.auto-settle-set" | "thread.pinned" | "thread.unpinned" | "thread.pin-reordered"
         | "thread.active-reordered" | "thread.metadata-updated" | "thread.pull-request-synced"
-        | "thread.runtime-mode-updated" | "thread.interaction-mode-updated"
+        | "thread.issue-synced" | "thread.runtime-mode-updated" | "thread.interaction-mode-updated"
         | "thread.model-selection-updated" | "thread.provider-switched"
         | "thread.guest-share-updated" => EventBody::ThreadReplaced(Box::new(from(payload)?)),
         "thread.visited" | "thread.tags-updated" | "thread.marked-unread" => {
