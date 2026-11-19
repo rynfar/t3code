@@ -128,6 +128,20 @@ fn hour_labels_follow_the_clock_setting_and_name_repeated_hours() {
     assert_eq!(format_hour_short("invalid", &zone, true), "invalid");
     assert_eq!(format_hour_short("2026-11-01T05:37:00.000Z", &NewYork, true), "1 AM GMT-4");
     assert_eq!(format_hour_short("2026-11-01T06:37:00.000Z", &NewYork, false), "01:00 GMT-5");
+    assert_eq!(format_hour_short_in_zone("2026-11-01T05:37:00.000Z", Some("America/New_York"), &NewYork, true), "1 AM EDT");
+    assert_eq!(format_hour_short_in_zone("2026-11-01T06:37:00.000Z", Some("America/New_York"), &NewYork, true), "1 AM EST");
+    assert_eq!(format_hour_short_in_zone("2026-11-01T05:37:00.000Z", Some("America/New_York"), &NewYork, false), "01:00 EDT");
+    assert_eq!(format_hour_short_in_zone("2026-11-01T06:37:00.000Z", Some("America/New_York"), &NewYork, false), "01:00 EST");
+    assert_eq!(
+        format_relative_hour_short_in_zone("2026-11-01T05:37:00.000Z", "2026-11-01T20:00:00.000Z", Some("America/New_York"), &NewYork, true),
+        "1 AM EDT today"
+    );
+    assert_eq!(
+        format_relative_hour_short_in_zone("2026-11-01T06:37:00.000Z", "2026-11-02T20:00:00.000Z", Some("America/New_York"), &NewYork, true),
+        "1 AM EST yesterday"
+    );
+    // Numeric-only TZ abbreviations (e.g. America/Sao_Paulo -> "-03") fall back to GMT offset.
+    assert_eq!(format_hour_short_in_zone("2026-11-01T05:37:00.000Z", Some("America/Sao_Paulo"), &NewYork, true), "1 AM GMT-4");
     assert_eq!(format_date_time_short("2026-11-02T15:00:00.000Z", &NewYork, true), "Nov 2, 10 AM");
     assert_eq!(format_relative_hour_short("2026-11-02T15:00:00.000Z", "2026-11-02T20:00:00.000Z", &NewYork, true), "10 AM today");
     assert_eq!(format_relative_hour_short("2026-11-01T15:00:00.000Z", "2026-11-02T20:00:00.000Z", &NewYork, true), "10 AM yesterday");

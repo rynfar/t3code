@@ -279,9 +279,32 @@ fn zone_name(offset_seconds: i64) -> String {
     if rest == 0 { format!("GMT{sign}{hours}") } else { format!("GMT{sign}{hours}:{rest:02}") }
 }
 
+/// Short zone abbreviation matching `Intl.DateTimeFormat("en-US", { timeZoneName: "short" })`
+/// for repeated DST fall-back hours (`EDT` / `EST`, etc.), falling back to `GMT±H` when no
+/// IANA zone or alphabetic abbreviation is available.
+fn zone_short_name(instant: Ms, time_zone: Option<&str>, offset_seconds: i64) -> String {
+    use chrono::TimeZone;
+    use chrono_tz::{OffsetName, Tz};
+    if let Some(abbr) = time_zone
+        .and_then(|name| name.parse::<Tz>().ok())
+        .and_then(|tz| tz.timestamp_millis_opt(instant).single())
+        .and_then(|at| at.offset().abbreviation().map(str::to_owned))
+        .filter(|abbr| abbr.bytes().any(|b| b.is_ascii_alphabetic()))
+    {
+        return abbr;
+    }
+    zone_name(offset_seconds)
+}
+
 /// `formatHourShort`: `3 PM` or `15:00`. A wall-clock hour a fall-back transition repeats
 /// carries its zone, so the two buckets stay distinguishable.
 pub fn format_hour_short(hour_start: &str, zone: &dyn Zone, hour12: bool) -> String {
+    format_hour_short_in_zone(hour_start, None, zone, hour12)
+}
+
+/// `formatHourShort` with an optional IANA time-zone name so repeated fall-back hours display
+/// short zone abbreviations (e.g. `1 AM EDT`, `01:00 EST`) matching the web.
+pub fn format_hour_short_in_zone(hour_start: &str, time_zone: Option<&str>, zone: &dyn Zone, hour12: bool) -> String {
     let Some(instant) = parse_iso(hour_start) else { return hour_start.to_owned() };
     let wall = |ms: Ms| {
         let local = to_local(ms, zone);
@@ -289,7 +312,11 @@ pub fn format_hour_short(hour_start: &str, zone: &dyn Zone, hour12: bool) -> Str
     };
     let label = hour_label(to_local(instant, zone).hour, hour12);
     let repeated = [-HOUR_MS, HOUR_MS].iter().any(|offset| wall(instant + offset) == wall(instant));
-    if repeated { format!("{label} {}", zone_name(zone.offset_seconds_at(instant))) } else { label }
+    if repeated {
+        format!("{label} {}", zone_short_name(instant, time_zone, zone.offset_seconds_at(instant)))
+    } else {
+        label
+    }
 }
 
 /// `formatDateTimeShort`: `Nov 2, 3 PM` or `Nov 2, 15:00`.
@@ -302,6 +329,17 @@ pub fn format_date_time_short(instant: &str, zone: &dyn Zone, hour12: bool) -> S
 
 /// `formatRelativeHourShort`: `3 PM today`, `3 PM yesterday`, else the date and hour.
 pub fn format_relative_hour_short(hour_start: &str, relative_to: &str, zone: &dyn Zone, hour12: bool) -> String {
+    format_relative_hour_short_in_zone(hour_start, relative_to, None, zone, hour12)
+}
+
+/// `formatRelativeHourShort` with an optional IANA time-zone name for DST fall-back hours.
+pub fn format_relative_hour_short_in_zone(
+    hour_start: &str,
+    relative_to: &str,
+    time_zone: Option<&str>,
+    zone: &dyn Zone,
+    hour12: bool,
+) -> String {
     let (Some(instant), Some(reference)) = (parse_iso(hour_start), parse_iso(relative_to)) else {
         return format_date_time_short(hour_start, zone, hour12);
     };
@@ -310,8 +348,8 @@ pub fn format_relative_hour_short(hour_start: &str, relative_to: &str, zone: &dy
         days_from_civil(local.year, local.month, local.day)
     };
     match day(reference) - day(instant) {
-        0 => format!("{} today", format_hour_short(hour_start, zone, hour12)),
-        1 => format!("{} yesterday", format_hour_short(hour_start, zone, hour12)),
+        0 => format!("{} today", format_hour_short_in_zone(hour_start, time_zone, zone, hour12)),
+        1 => format!("{} yesterday", format_hour_short_in_zone(hour_start, time_zone, zone, hour12)),
         _ => format_date_time_short(hour_start, zone, hour12),
     }
 }

@@ -439,7 +439,7 @@ impl UsageView {
         let account_key = account.key.clone();
         let busy = self.reset_status.as_ref().is_some_and(|(key, status)| *key == account.key && status.is_none());
         let status = self.reset_status.as_ref().filter(|(key, _)| *key == account.key).and_then(|(_, status)| status.clone());
-        let can_manage = self.can_manage_providers();
+        let can_manage = redeem.as_ref().is_some_and(|r| self.can_manage_providers_for(&r.environment_id));
         let panel = v_flex()
             .id("usage-segment-details")
             .occlude()
@@ -578,7 +578,7 @@ impl UsageView {
                                 })))
                                 .child(
                                     ActionButton::new("usage-reset-use", "Use credit", ButtonVariant::Default, ButtonSize::Default)
-                                        .disabled(!self.can_manage_providers())
+                                        .disabled(!self.can_manage_providers_for(&redeem.environment_id))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.confirm_reset = None;
                                             this.redeem_reset(redeem.clone(), account.clone(), cx);

@@ -236,10 +236,26 @@ impl TerminalDrawer {
             resize_from: None,
             _subscriptions: vec![subscription],
         };
-        drawer.connection_changed(window, cx);
         let weak = cx.entity().downgrade();
         cx.set_global(ActiveDrawer(weak));
+        drawer.connection_changed(window, cx);
         drawer
+    }
+
+    pub(crate) fn is_active(cx: &App) -> bool {
+        active_drawer(cx).is_some()
+    }
+
+    /// `remember` (`apps/web/src/lib/terminalFocus.ts`): records that the composer holds focus for
+    /// `thread_id` (and cancels any pending terminal focus for it) so returning to the thread
+    /// restores composer focus even when its terminal drawer or panel is open.
+    pub(crate) fn record_composer_focus(thread_id: &str, cx: &mut App) {
+        cx.default_global::<FocusQueue>().0.record_composer_focus(thread_id);
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn last_focus_for_test(thread_id: &str, cx: &App) -> Option<t3_core::terminal::LastThreadFocus> {
+        cx.try_global::<FocusQueue>().and_then(|q| q.0.last_focus(thread_id).cloned())
     }
 
     pub(super) fn selected_thread(&self, cx: &App) -> Option<String> {
@@ -422,6 +438,7 @@ impl TerminalDrawer {
                 );
                 if matches!(decision, ThreadEnterFocusDecision::FocusComposer) {
                     cancel_terminal_focus(thread_id, cx);
+                    crate::composer::focus_for_thread(thread_id, window, cx);
                 }
             }
         }
@@ -601,7 +618,8 @@ impl TerminalDrawer {
     /// the thread before starting a new shell.
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((thread_id, layout)) = self.layout(cx) else { return };
-        let opening = !layout.terminal_open;
+        let was_open = layout.terminal_open;
+        let opening = !was_open;
         if opening && !self.access.read && !self.access.operate {
             return;
         }
@@ -619,6 +637,9 @@ impl TerminalDrawer {
             self.layouts.set_open(&thread_id, !layout.terminal_open);
         }
         self.changed(window, cx);
+        if was_open && !self.is_open(cx) {
+            crate::composer::focus_for_thread(&thread_id, window, cx);
+        }
     }
 
     /// Opens and focuses one of the selected thread's terminals, such as the worktree setup
@@ -750,9 +771,13 @@ impl TerminalDrawer {
                 }
             });
         }
+        let was_open = self.layouts.get(thread_id).normalized().terminal_open;
         self.layouts.close(thread_id, terminal_id);
         self.panes.remove(terminal_id);
         self.changed(window, cx);
+        if was_open && self.selected_thread(cx).as_deref() == Some(thread_id) && !self.is_open(cx) {
+            crate::composer::focus_for_thread(thread_id, window, cx);
+        }
     }
 
     pub(super) fn begin_resize(&mut self, pointer_y: f32, height: f32) {
@@ -773,4 +798,130 @@ impl TerminalDrawer {
 fn load_layouts() -> HashMap<String, ThreadTerminalLayout> {
     let Some(serde_json::Value::Object(entries)) = store::load_ui_state(STATE_NAME) else { return HashMap::new() };
     entries.into_iter().filter_map(|(thread_id, value)| Some((thread_id, serde_json::from_value(value).ok()?))).collect()
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod focus_tests {
+    use super::*;
+    use gpui::{IntoElement, Render, div};
+    use t3_core::terminal::LastThreadFocus;
+
+    struct Host {
+        composer: Entity<crate::composer::Composer>,
+        drawer: Entity<TerminalDrawer>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn composer_and_terminal_focus_restoration_across_thread_switches(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:operate", "terminal:read", "terminal:operate"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |state, cx| {
+            state.selected_thread = Some("menu-thread".into());
+            cx.emit(AppEvent::Selection);
+        });
+
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            // Same construction order as workspace.rs: Composer before TerminalDrawer.
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let drawer = cx.new(|cx| TerminalDrawer::new(state.clone(), window, cx));
+            Host { composer, drawer }
+        });
+        vcx.run_until_parked();
+
+        // Pre-open drawers on both menu-thread (and focus term-1) and sibling (fresh).
+        let (composer, drawer) = host.read_with(vcx, |h, _| (h.composer.clone(), h.drawer.clone()));
+        drawer.update_in(vcx, |drawer, window, cx| {
+            drawer.access = TerminalAccess { read: true, operate: true };
+            drawer.layouts.ensure("menu-thread", "term-1", true, Some(true));
+            drawer.layouts.ensure("sibling", "term-2", true, Some(true));
+            drawer.sync_selection(window, cx);
+            drawer.focus_active(window, cx);
+        });
+        vcx.run_until_parked();
+
+        // 1. Fresh entry into sibling with an open drawer focuses term-2, not the composer.
+        state.update(vcx, |state, cx| state.select_thread("sibling".into(), cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            assert!(!composer.read(cx).has_focus(window, cx), "fresh open drawer should take focus");
+            let pane = drawer.read(cx).panes.get("term-2").expect("term-2 pane mounted");
+            assert!(pane.focus_handle(cx).is_focused(window));
+            assert_eq!(TerminalDrawer::last_focus_for_test("sibling", cx), Some(LastThreadFocus::Terminal("term-2".into())));
+        });
+
+        // 2. Focusing the composer on sibling records composer focus; switching away and back restores composer.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| composer.focus(window, cx));
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            assert!(composer.read(cx).has_focus(window, cx));
+            assert_eq!(TerminalDrawer::last_focus_for_test("sibling", cx), Some(LastThreadFocus::Composer));
+        });
+
+        state.update(vcx, |state, cx| state.select_thread("menu-thread".into(), cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let pane = drawer.read(cx).panes.get("term-1").expect("term-1 pane mounted");
+            assert!(pane.focus_handle(cx).is_focused(window));
+        });
+
+        state.update(vcx, |state, cx| state.select_thread("sibling".into(), cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            assert!(composer.read(cx).has_focus(window, cx), "returning to sibling must restore composer focus over open drawer");
+            let pane = drawer.read(cx).panes.get("term-2").expect("term-2 pane mounted");
+            assert!(!pane.focus_handle(cx).is_focused(window));
+        });
+
+        // 3. Explicit terminal navigation overrides remembered composer focus.
+        state.update(vcx, |state, cx| state.select_thread("menu-thread".into(), cx));
+        vcx.run_until_parked();
+        vcx.update(|_, cx| request_terminal_focus_on_navigation("sibling", "term-2", cx));
+        state.update(vcx, |state, cx| state.select_thread("sibling".into(), cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            let pane = drawer.read(cx).panes.get("term-2").expect("term-2 pane mounted");
+            assert!(pane.focus_handle(cx).is_focused(window), "explicit terminal navigation must win over remembered composer");
+            assert!(!composer.read(cx).has_focus(window, cx));
+        });
+
+        // 4. Toggling the drawer closed returns focus to the composer.
+        drawer.update_in(vcx, |drawer, window, cx| drawer.toggle(window, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            assert!(!drawer.read(cx).is_open(cx));
+            assert!(composer.read(cx).has_focus(window, cx), "closing the drawer must return focus to composer");
+            assert_eq!(TerminalDrawer::last_focus_for_test("sibling", cx), Some(LastThreadFocus::Composer));
+        });
+
+        // 5. Draft thread entry focuses composer and tracks focus under `draft:checkout-a`.
+        state.update(vcx, |state, cx| state.start_draft("checkout-a", cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            assert!(composer.read(cx).has_focus(window, cx));
+            assert_eq!(TerminalDrawer::last_focus_for_test("draft:checkout-a", cx), Some(LastThreadFocus::Composer));
+        });
+
+        state.update(vcx, |state, _| state.stop_pump());
+        runtime.shutdown_background();
+    }
 }

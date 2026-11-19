@@ -418,6 +418,20 @@ impl Composer {
     }
 }
 
+pub(crate) fn focus_for_thread(thread_id: &str, window: &mut Window, cx: &mut App) {
+    let live: Vec<Entity<Composer>> = cx
+        .try_global::<RegisteredComposers>()
+        .map(|reg| reg.0.iter().filter_map(|weak| weak.upgrade()).collect())
+        .unwrap_or_default();
+    let target = live.into_iter().find(|composer| {
+        let composer = composer.read(cx);
+        composer.fixed.is_none() && composer.focus_thread_key(cx).as_deref() == Some(thread_id)
+    });
+    if let Some(composer) = target {
+        composer.update(cx, |composer, cx| composer.focus(window, cx));
+    }
+}
+
 pub(crate) fn insert_artifact_template(
     thread_id: Option<&str>,
     template: &t3_core::timeline::CodexArtifactTemplate,
@@ -573,11 +587,16 @@ impl Composer {
             }),
             cx,
         );
+        let question_focus = cx.focus_handle();
         let mut subscriptions = vec![
             cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { secondary, shift } => this.on_enter(*secondary, *shift, window, cx),
                 InputEvent::Change => this.on_prompt_change(cx),
+                InputEvent::Focus => this.record_composer_focus(cx),
                 _ => {}
+            }),
+            cx.on_focus(&question_focus, window, |this, _, cx| {
+                this.record_composer_focus(cx);
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| {
                 if *event == AppEvent::Selection && this.fixed.is_none() && this.cancel_pending_send() { cx.notify(); }
@@ -749,7 +768,7 @@ impl Composer {
             picker_dismissed: None,
             menu_dismissed: None,
             input_state: None,
-            question_focus: cx.focus_handle(),
+            question_focus,
             fresh_session_arms: HashMap::new(),
             fresh_session_seq: 0,
             keep_full_history: HashSet::new(),
@@ -789,8 +808,31 @@ impl Composer {
         composer
     }
 
+    fn focus_thread_key(&self, cx: &App) -> Option<String> {
+        if self.fixed.is_some() {
+            return None;
+        }
+        let state = self.state.read(cx);
+        state
+            .selected_thread
+            .clone()
+            .or_else(|| state.draft_project.as_deref().map(t3_core::composer::drafts::new_thread_key))
+    }
+
+    fn record_composer_focus(&self, cx: &mut App) {
+        if let Some(thread_id) = self.focus_thread_key(cx) {
+            crate::terminal::TerminalDrawer::record_composer_focus(&thread_id, cx);
+        }
+    }
+
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.record_composer_focus(cx);
         self.input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     fn read_snapshot(&self, cx: &App) -> Snapshot {
@@ -876,8 +918,9 @@ impl Composer {
             self.error = None;
             self.prompt_length_error = None;
             self.auto_advance = None;
-            if matches!(next.target, Some(Target::Draft(_)))
-                || (!cfg!(test) && self.fixed.is_none() && matches!(next.target, Some(Target::Thread(_))))
+            if !crate::terminal::TerminalDrawer::is_active(cx)
+                && (matches!(next.target, Some(Target::Draft(_)))
+                    || (!cfg!(test) && self.fixed.is_none() && matches!(next.target, Some(Target::Thread(_)))))
             {
                 self.focus(window, cx);
             }

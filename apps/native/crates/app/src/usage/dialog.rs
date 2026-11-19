@@ -25,15 +25,23 @@ impl UsageView {
         let (shown, merged, _) = self.data.shown()?;
         let model = merged.models.iter().find(|model| model.key() == key)?.clone();
         let p = palette(cx);
-        let summary = self.data.summary.clone()?;
-        let usage = merge_usage(
-            &[AnsweredUsage {
-                environment_id: self.data.environment_id.clone(),
-                label: self.data.label.clone(),
-                summary: Arc::new(summary.keep_buckets(|bucket| bucket.provider == model.provider && bucket.model == model.model)),
-            }],
-            USAGE_CONTRACT_VERSION,
-        );
+        let answered: Vec<AnsweredUsage> = self
+            .data
+            .selected_envs()
+            .into_iter()
+            .filter_map(|env| {
+                let summary = env.summary.as_ref()?;
+                Some(AnsweredUsage {
+                    environment_id: env.environment_id.clone(),
+                    label: env.label.clone(),
+                    summary: Arc::new(summary.keep_buckets(|bucket| bucket.provider == model.provider && bucket.model == model.model)),
+                })
+            })
+            .collect();
+        if answered.is_empty() {
+            return None;
+        }
+        let usage = merge_usage(&answered, USAGE_CONTRACT_VERSION);
         let unknown = model.is_cost_unknown();
         let metric = if unknown || self.data.preferences.metric == UsageMetric::Tokens { ChartMetric::Tokens } else { ChartMetric::Cost };
         let stats: Vec<(&str, String)> = [
@@ -77,7 +85,7 @@ impl UsageView {
         }
         let narrow = Self::page_width(window) < 640.;
         let model_for_price = model.model.clone();
-        let can_set_price = self.data.phase == t3_core::usage::ConnectionPhase::Connected;
+        let can_set_price = self.data.any_connected();
         let dialog = v_flex()
             .id("usage-model-dialog")
             .relative()
