@@ -1,14 +1,17 @@
 //! The Timeline tab (`PullRequestTimelineTab.tsx`): opened, commits, comments and reviews with
-//! their review threads, and the merge or close, newest first, in a virtualized list.
+//! their review and overview threads, each resolvable where the host and viewer allow
+//! (`PullRequestResolveThreadButton.tsx`), and the merge or close, newest first, in a
+//! virtualized list.
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, Styled, Window, div, list, prelude::*, px};
+use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, list, prelude::*, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::pull_requests::detail::{EventKind, TimelineEvent, build_timeline, change_request_term};
+use t3_core::pull_requests::editing::can_resolve_thread;
 use t3_core::sidebar::time::{compact_relative_label, parse_iso};
 
-use super::controls::{avatar, diff_stat, outcome_glyph};
+use super::controls::{Button, Size, Variant, avatar, diff_stat, outcome_glyph};
 use super::detail::DetailView;
 use crate::icons::Icon;
 use crate::sidebar::controller::now_ms;
@@ -76,7 +79,7 @@ fn event_icon(event: &TimelineEvent, cx: &App) -> (Icon, gpui::Hsla) {
     }
 }
 
-fn event_card(view: &mut DetailView, event: &TimelineEvent, reply: bool, cx: &mut Context<DetailView>) -> AnyElement {
+pub(super) fn event_card(view: &mut DetailView, event: &TimelineEvent, reply: bool, cx: &mut Context<DetailView>) -> AnyElement {
     let p = palette(cx);
     let (icon, color) = event_icon(event, cx);
     let actor = event.actor.as_ref().map(|actor| actor.login.clone());
@@ -85,15 +88,37 @@ fn event_card(view: &mut DetailView, event: &TimelineEvent, reply: bool, cx: &mu
         Some(outcome) => outcome.label().to_lowercase(),
         None => event.title.clone(),
     };
-    let location = event.thread.as_ref().map(|thread| match thread.line {
-        Some(line) => format!("{}:{line}", thread.path),
-        None => thread.path.clone(),
+    let location = event.thread.as_ref().and_then(|thread| {
+        let path = thread.path.as_ref()?;
+        Some(match thread.line {
+            Some(line) => format!("{path}:{line}"),
+            None => path.clone(),
+        })
     });
     let resolved = event.thread.as_ref().is_some_and(|thread| thread.is_resolved);
+    let can_write = view.can_write_source_control(cx);
+    // On the thread's first comment only, as the web places it.
+    let resolve = event.thread.as_ref().filter(|thread| !reply && can_write && view.detail.as_ref().is_some_and(|detail| can_resolve_thread(detail, thread.can_resolve))).map(|thread| {
+        let (id, resolved) = (thread.id.clone(), thread.is_resolved);
+        Button::new(SharedString::from(format!("pr-resolve-{id}")), Variant::Ghost, Size::Xs)
+            .label(if resolved { "Unresolve" } else { "Resolve" })
+            .disabled(view.resolving.contains(&id))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_thread_resolution(id.clone(), !resolved, cx)))
+    });
+    let has_words = event.body.is_some() || event.thread.as_ref().is_some_and(|thread| thread.replies.iter().any(|reply| reply.body.is_some()));
+    let add_to_chat = (!reply && matches!(event.kind, EventKind::Comment | EventKind::Review) && has_words && view.has_chat_target(cx)).then(|| {
+        let thread_id = event.thread.as_ref().map(|thread| thread.id.clone());
+        let comment_id = event.id.clone();
+        Button::new(SharedString::from(format!("pr-add-chat-{}", event.id)), Variant::GhostMuted, Size::Xs)
+            .icon(Icon::MessageSquarePlus)
+            .tooltip("Add to chat")
+            .on_click(cx.listener(move |this, _, _, cx| this.add_comment_to_chat(thread_id.as_deref(), &comment_id, cx)))
+    });
+    let scope = view.detail.as_ref().map(|detail| view.media_scope(detail, cx));
     let body = event.body.clone().map(|body| {
         if event.markdown {
             let text: Arc<str> = Arc::from(body.as_str());
-            let state = view.markdown.state(&format!("event:{}", event.id), &text, cx);
+            let state = view.markdown.state_with_media_scope(&format!("event:{}", event.id), &text, None, scope.clone(), cx);
             prose(&state, cx).into_any_element()
         } else {
             div().text_sm().text_color(hsla(p.foreground)).child(body).into_any_element()
@@ -117,7 +142,9 @@ fn event_card(view: &mut DetailView, event: &TimelineEvent, reply: bool, cx: &mu
                 .when(event.additions.is_some() || event.deletions.is_some(), |this| this.child(diff_stat(event.additions.unwrap_or(0), event.deletions.unwrap_or(0), cx)))
                 .child(div().flex_1())
                 .when(resolved, |this| this.child(div().flex_none().child("Resolved")))
-                .child(div().flex_none().whitespace_nowrap().child(when)),
+                .child(div().flex_none().whitespace_nowrap().child(when))
+                .children(add_to_chat)
+                .children(resolve),
         )
         .children(location.filter(|_| !reply).map(|location| div().font_family(mono).text_xs().text_color(hsla(p.muted_foreground)).child(location)))
         .children(body.map(|body| div().pl(px(22.)).child(body)))

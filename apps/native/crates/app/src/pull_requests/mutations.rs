@@ -1,7 +1,8 @@
 //! Pull request writes as `createPullRequestEnvironmentAtoms` runs them: one at a time in the
 //! order they were asked for (`serialPerEnvironment`; this client holds one environment), a
 //! merge's preparation inside its own turn, and one pending action per pull request that the
-//! page's quick actions and the detail panel share (`usePullRequestActionRunner`).
+//! page's quick actions and the detail panel share (`usePullRequestActionRunner`). Actions ask
+//! for the host's reply so every surface shows the result without a re-read.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -12,7 +13,7 @@ use serde_json::{Value, json};
 use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
 use t3_core::pull_requests::detail::resolve_merge_method;
-use t3_core::pull_requests::wire::{Action, Detail, MergeMethod, PrState, Stack, decode};
+use t3_core::pull_requests::wire::{Action, Detail, MergeMethod, PrState, Stack, Summary, decode, decode_summary};
 use t3_core::pull_requests::{PrRef, action_input, failure_message, method};
 use tokio::sync::{mpsc, oneshot};
 
@@ -84,10 +85,17 @@ async fn request(client: &ClientHandle, method: &'static str, payload: Value) ->
     }
 }
 
-/// `pullRequests.runAction` with the input as built.
-pub(crate) fn run_action(state: &AppState, input: Value, cx: &App) -> Read<()> {
+/// `pullRequests.runAction` with the input as built, answering with the host's reply when the
+/// server sent one (`replyWithSummary`).
+pub(crate) fn run_action(state: &AppState, input: Value, cx: &App) -> Read<Option<Summary>> {
     let client = state.client_handle()?;
-    queue(cx, async move { request(&client, method::RUN_ACTION, input).await.map(|_| ()) })
+    queue(cx, async move { decode_summary(request(&client, method::RUN_ACTION, input).await?) })
+}
+
+/// Any other pull request write (`update`, `setThreadResolution`, `setLabels`), in the same lane.
+pub(crate) fn write(state: &AppState, method: &'static str, input: Value, cx: &App) -> Read<()> {
+    let client = state.client_handle()?;
+    queue(cx, async move { request(&client, method, input).await.map(|_| ()) })
 }
 
 /// The merge method picks in force when the merge was asked for.
@@ -101,7 +109,7 @@ pub(crate) struct MergePicks {
 /// A merge of one pull request (`runAction` with `resolveMergeMethod`): the detail is re-read
 /// fresh and the merge refused unless the pull request is still open, ready, allowed, and in no
 /// stack where the host runs stack actions; then the method is chosen.
-pub(crate) fn merge(state: &AppState, reference: PrRef, picks: MergePicks, cx: &App) -> Read<()> {
+pub(crate) fn merge(state: &AppState, reference: PrRef, picks: MergePicks, cx: &App) -> Read<Option<Summary>> {
     let client = state.client_handle()?;
     queue(cx, async move {
         let mut fresh = reference.payload();
@@ -121,6 +129,6 @@ pub(crate) fn merge(state: &AppState, reference: PrRef, picks: MergePicks, cx: &
             return Err("No merge method is available for this repository.".to_owned());
         }
         let method = resolve_merge_method(&allowed, picks.current, picks.project_default, picks.last);
-        request(&client, method::RUN_ACTION, action_input(&reference, Action::Merge, Some(method))).await.map(|_| ())
+        decode_summary(request(&client, method::RUN_ACTION, action_input(&reference, Action::Merge, Some(method))).await?)
     })
 }

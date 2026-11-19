@@ -126,20 +126,34 @@ fn timeline_threads_comments_and_puts_merges_over_closes() {
         path: None,
         review_state: None,
     };
-    let reply = |id: &str, at: &str| ThreadComment { id: id.into(), author: None, body: "r".into(), created_at: at.into(), url: None };
+    let reply = |id: &str, at: &str| ThreadComment { id: id.into(), author: None, body: "r".into(), created_at: at.into(), url: None, review_url: None };
     let activity = Activity {
         comments: vec![comment("c1", "2026-01-02T00:00:00Z"), comment("c3", "2026-01-04T00:00:00Z")],
         comment_count: 2,
         comments_truncated: false,
         review_threads: vec![ReviewThread {
             id: "t".into(),
-            path: "src/a.rs".into(),
+            path: Some("src/a.rs".into()),
             line: Some(3),
+            side: Some("right".into()),
             is_resolved: true,
             is_outdated: false,
             comments: vec![reply("r2", "2026-01-03T12:00:00Z"), reply("r1", "2026-01-03T00:00:00Z")],
             comment_count: Some(4),
             next_comments_cursor: None,
+            can_resolve: None,
+        }],
+        overview_threads: vec![ReviewThread {
+            id: "o".into(),
+            path: None,
+            line: None,
+            side: None,
+            is_resolved: false,
+            is_outdated: false,
+            comments: vec![reply("o1", "2026-01-03T06:00:00Z")],
+            comment_count: None,
+            next_comments_cursor: None,
+            can_resolve: Some(false),
         }],
         commits: vec![Commit {
             oid: "abcdef1234".into(),
@@ -152,10 +166,13 @@ fn timeline_threads_comments_and_puts_merges_over_closes() {
     };
     let events = build_timeline(&pr, &activity, "pull request");
     let ids: Vec<&str> = events.iter().map(|event| event.id.as_str()).collect();
-    assert_eq!(ids, vec!["merged", "c3", "r1", "c1", "abcdef1234", "created"]);
+    assert_eq!(ids, vec!["merged", "c3", "o1", "r1", "c1", "abcdef1234", "created"]);
     assert_eq!(events[0].title, "Pull request merged");
-    assert_eq!(events[4].title, "Commit abcdef1");
-    let thread = events[2].thread.as_ref().expect("thread");
-    assert_eq!((thread.replies.len(), thread.more_replies), (1, 2));
-    assert_eq!(events[2].path.as_deref(), Some("src/a.rs"));
+    assert_eq!(events[5].title, "Commit abcdef1");
+    let thread = events[3].thread.as_ref().expect("thread");
+    assert_eq!((thread.id.as_str(), thread.replies.len(), thread.more_replies), ("t", 1, 2));
+    assert_eq!(events[3].path.as_deref(), Some("src/a.rs"));
+    // An overview thread is on the change request as a whole: no path, and its own resolve grant.
+    let overview = events[2].thread.as_ref().expect("overview thread");
+    assert_eq!((overview.id.as_str(), overview.path.as_deref(), overview.can_resolve), ("o", None, Some(false)));
 }

@@ -21,9 +21,10 @@ use crate::theme::{hsla, palette};
 
 const ROW_HEIGHT: f32 = 44.;
 
-/// A pull request the page should select when it next shows.
+/// A pull request the page should select when it next shows, and the link that named it, whose
+/// fragment says where in it to go.
 #[derive(Default)]
-pub(super) struct PendingSelection(pub Option<PrRef>);
+pub(super) struct PendingSelection(pub Option<(PrRef, Option<String>)>);
 
 impl Global for PendingSelection {}
 
@@ -125,7 +126,7 @@ impl ThreadPullRequestsPanel {
             )
             .on_click(move |_, window, cx| {
                 if let Some(reference) = reference.clone() {
-                    cx.set_global(PendingSelection(Some(reference)));
+                    cx.set_global(PendingSelection(Some((reference, None))));
                     window.dispatch_action(Box::new(OpenPullRequests), cx);
                 }
             })

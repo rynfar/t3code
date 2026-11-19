@@ -295,9 +295,60 @@ pub fn unlink_command(command_id: &str, thread_id: &str, link: &ThreadLink) -> V
     })
 }
 
+pub const LINKED_THREADS: &str = "pullRequests.linkedThreads";
+/// Signals that a thread linked or unlinked a pull request; servers that predate it reject it,
+/// and the linked threads are polled every `LINKED_THREADS_POLL_SECONDS` instead.
+pub const SUBSCRIBE_LINKED_THREAD_REFRESHES: &str = "pullRequests.subscribeLinkedThreadRefreshes";
+pub const LINKED_THREADS_POLL_SECONDS: u64 = 10;
+
+/// One thread linking a pull request (`PullRequestLinkedThreadsResult`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedThread {
+    pub id: String,
+    pub project_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub archived_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct LinkedThreads {
+    #[serde(default, deserialize_with = "lenient")]
+    pub threads: Vec<LinkedThread>,
+}
+
+/// `pullRequests.linkedThreads` for a pull request: its reference keyed the way links store it,
+/// host and repository lowercased from its url (`normalizeThreadPullRequestKey`).
+pub fn linked_threads_input(reference: &super::PrRef, url: &str) -> Value {
+    let mut input = reference.payload();
+    if let Some(link) = parse_change_request_url(url).filter(|link| link.number == reference.number) {
+        input["host"] = json!(link.host);
+        input["repository"] = json!(link.repository);
+    }
+    input
+}
+
+/// The detail header's count (`PullRequestThreadLinks`): "Linked from N threads".
+pub fn linked_threads_label(count: usize) -> String {
+    if count == 0 { "Linked threads".to_owned() } else { format!("Linked from {count} {}", if count == 1 { "thread" } else { "threads" }) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_threads_are_read_by_the_links_key_and_counted() {
+        let reference = super::super::PrRef { project_id: "p".into(), host: Some("GitHub.com".into()), repository: "Acme/App".into(), number: 42 };
+        let input = linked_threads_input(&reference, "https://GitHub.com/Acme/App/pull/42");
+        assert_eq!(input, json!({ "projectId": "p", "host": "github.com", "repository": "acme/app", "number": 42 }));
+        assert_eq!(linked_threads_input(&reference, "https://github.com/acme/app/pull/7")["repository"], "Acme/App", "another pull request's url keys nothing");
+        let decoded: LinkedThreads = serde_json::from_value(json!({ "threads": [{ "id": "t", "projectId": "p", "title": "Fix", "archivedAt": null, "settled": true }, { "bad": 1 }] })).unwrap();
+        assert_eq!(decoded.threads.len(), 1);
+        assert_eq!((linked_threads_label(0).as_str(), linked_threads_label(1).as_str(), linked_threads_label(3).as_str()), ("Linked threads", "Linked from 1 thread", "Linked from 3 threads"));
+    }
 
     #[test]
     fn parses_change_request_urls_by_route() {

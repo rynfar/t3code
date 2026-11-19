@@ -13,6 +13,8 @@ pub struct Project<'a> {
 pub struct Target {
     pub environment: String,
     pub reference: PrRef,
+    /// The link itself, whose path and fragment name the place to open (`anchor::parse_anchor`).
+    pub url: String,
 }
 
 fn text<'a>(identity: &'a Value, key: &str) -> Option<&'a str> {
@@ -92,6 +94,7 @@ pub fn resolve(url: &str, projects: &[Project<'_>], environment: Option<&str>, p
     Some(Target {
         environment: target.environment.into(),
         reference: PrRef { project_id: target.id.into(), host: Some(authority(&parsed)), repository: link.repository, number: link.number },
+        url: url.to_owned(),
     })
 }
 
@@ -118,6 +121,7 @@ mod tests {
         assert_eq!(target.reference.project_id, "side-B");
         assert_eq!(target.environment, "e");
         assert_eq!(target.reference.repository, "acme/app");
+        assert_eq!(resolve(&format!("{url}/files#r9"), &projects, Some("e"), None, None, true).unwrap().url, format!("{url}/files#r9"));
         assert!(resolve("https://unconfigured.example/acme/app/pull/7", &projects, Some("e"), None, None, true).is_none());
         assert!(resolve(url, &projects, Some("missing"), None, None, true).is_none());
         let unloaded = [Project { id: "b", environment: "e", identity: Some(&b), config_loaded: false }];
