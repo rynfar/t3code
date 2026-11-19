@@ -84,6 +84,8 @@ pub struct RightPanelView {
     terminals: Vec<(String, String, Entity<crate::terminal::PanelTerminalView>)>,
     /// One embedded detail view per open single-PR tab `(thread_id, surface_id, view)`.
     pull_request_tabs: Vec<(String, String, Entity<crate::pull_requests::DetailView>)>,
+    /// One embedded detail view per open single-issue tab `(thread_id, surface_id, view)`.
+    issue_tabs: Vec<(String, String, Entity<crate::issues::IssueDetailPanel>)>,
     /// Stateful proactive panel coordinator (`useProactivePanels.ts`).
     proactive: ProactivePanelCoordinator,
     /// Last seen `proactive_panels_enabled` setting, so toggling it in Settings re-evaluates.
@@ -185,6 +187,7 @@ impl RightPanelView {
             devices: Vec::new(),
             terminals: Vec::new(),
             pull_request_tabs: Vec::new(),
+            issue_tabs: Vec::new(),
             proactive: ProactivePanelCoordinator::default(),
             last_proactive_enabled: None,
             last_open_state: None,
@@ -763,6 +766,70 @@ impl RightPanelView {
         Some(view)
     }
 
+    /// Keeps one embedded `IssueDetailPanel` per open issue tab of the showing thread.
+    fn sync_issue_tabs(&mut self, thread_id: Option<&str>, panel: Option<&ThreadPanel>) {
+        self.issue_tabs.retain(|(tid, sid, _)| {
+            thread_id == Some(tid.as_str())
+                && panel.is_some_and(|panel| panel.surfaces.iter().any(|surface| surface.id == *sid))
+        });
+    }
+
+    fn issue_tab_pane(
+        &mut self,
+        thread_id: &str,
+        surface: &Surface,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::issues::IssueDetailPanel>> {
+        let SurfaceKind::Issue(target) = &surface.kind else {
+            return None;
+        };
+        if let Some((_, _, view)) = self
+            .issue_tabs
+            .iter()
+            .find(|(tid, sid, _)| tid == thread_id && sid == &surface.id)
+        {
+            return Some(view.clone());
+        }
+        let reference = target.issue_ref();
+        let env_id = target.environment_id.clone();
+        let state = self.state.clone();
+        let state_select = self.state.clone();
+        let on_select_pr = std::rc::Rc::new(move |pr_ref: PrRef, cx: &mut App| {
+            state_select.update(cx, |state, cx| {
+                let target = PullRequestTarget {
+                    environment_id: state.environment().map(str::to_owned),
+                    project_id: pr_ref.project_id,
+                    host: pr_ref.host,
+                    repository: pr_ref.repository,
+                    number: pr_ref.number,
+                    url: None,
+                    reveal_url: None,
+                    detail_tab: None,
+                };
+                state.open_pull_request_surface(target, cx);
+            });
+        });
+        let thread_owned = (!thread_id.starts_with("new-thread:")
+            && thread_id != t3_core::right_panel::ISSUES_PANEL_THREAD_KEY)
+            .then(|| thread_id.to_owned());
+        let view = cx.new(|cx| {
+            crate::issues::IssueDetailPanel::new(
+                state,
+                env_id,
+                reference,
+                thread_owned,
+                None,
+                None,
+                Some(on_select_pr),
+                None,
+                cx,
+            )
+        });
+        self.issue_tabs
+            .push((thread_id.to_owned(), surface.id.clone(), view.clone()));
+        Some(view)
+    }
+
     fn render_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let dragging = cx.has_active_drag();
@@ -813,6 +880,7 @@ impl Render for RightPanelView {
         self.sync_devices(thread_id.as_deref(), panel.as_ref(), cx);
         self.sync_terminals(thread_id.as_deref(), panel.as_ref(), window, cx);
         self.sync_pull_request_tabs(thread_id.as_deref(), panel.as_ref(), cx);
+        self.sync_issue_tabs(thread_id.as_deref(), panel.as_ref());
         let state = self.state.read(cx);
         let (Some(thread_id), Some(panel)) = (thread_id, panel) else {
             self.last_open_state = None;
@@ -908,6 +976,10 @@ impl Render for RightPanelView {
             Some(SurfaceKind::Diff) => self.diff.clone().cached(StyleRefinement::default().size_full()).into_any_element(),
             Some(SurfaceKind::PullRequests) => self.pull_requests.clone().into_any_element(),
             Some(SurfaceKind::PullRequest { .. }) => match panel.active().and_then(|surface| self.pull_request_tab_pane(&thread_id, surface, cx)) {
+                Some(pane) => pane.into_any_element(),
+                None => div().into_any_element(),
+            },
+            Some(SurfaceKind::Issue(_)) => match panel.active().and_then(|surface| self.issue_tab_pane(&thread_id, surface, cx)) {
                 Some(pane) => pane.into_any_element(),
                 None => div().into_any_element(),
             },

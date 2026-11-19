@@ -899,3 +899,77 @@ fn reopened_browser_snapshot_falls_back_to_browser_defaults() {
     assert_eq!(payload["colorScheme"], "dark");
     assert_eq!(payload["viewport"]["_tag"], "preset");
 }
+
+#[test]
+fn issue_surface_open_title_persistence_and_reopen() {
+    use crate::issues::wire::IssueTrackerKind;
+
+    let mut panels = RightPanels::default();
+    let gh = IssueTarget {
+        environment_id: Some("env-1".into()),
+        project_id: "proj/1".into(),
+        tracker: IssueTrackerKind::GitHub,
+        host: Some("GitHub.COM".into()),
+        scope: "Acme/Web".into(),
+        key: "42".into(),
+        display_key: None,
+        url: Some("https://github.com/acme/web/issues/42".into()),
+    };
+    assert!(panels.open_issue("t1", gh.clone()));
+    let gh_surface = panels.active_surface("t1").unwrap().clone();
+    assert_eq!(gh_surface.title(), "#42");
+    assert_eq!(
+        gh_surface.id(),
+        issue_surface_id(
+            Some("env-1"),
+            "proj/1",
+            &IssueTrackerKind::GitHub,
+            Some("github.com"),
+            "acme/web",
+            "42",
+        )
+    );
+
+    let linear = IssueTarget {
+        environment_id: None,
+        project_id: "p2".into(),
+        tracker: IssueTrackerKind::Linear,
+        host: Some("linear.app".into()),
+        scope: "ENG".into(),
+        key: "ENG-17".into(),
+        display_key: Some("ENG-17".into()),
+        url: Some("https://linear.app/acme/issue/ENG-17".into()),
+    };
+    assert!(panels.open_issue("t1", linear));
+    let linear_surface = panels.active_surface("t1").unwrap().clone();
+    assert_eq!(linear_surface.title(), "ENG-17");
+    assert_eq!(panels.panel("t1").surfaces.len(), 2);
+
+    // Reopening the GitHub issue with an explicit displayKey updates it without duplicating the tab.
+    let mut gh_updated = gh;
+    gh_updated.display_key = Some("#42".into());
+    assert!(panels.open_issue("t1", gh_updated));
+    assert_eq!(panels.panel("t1").surfaces.len(), 2);
+    assert_eq!(panels.active_surface("t1").map(Surface::id), Some(gh_surface.id()));
+
+    // Persistence round-trip + malformed issue entry dropped cleanly.
+    let mut persisted = serde_json::to_value(&panels).unwrap();
+    persisted["threads"]["t1"]["surfaces"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({ "id": "issue:bad", "kind": "issue", "projectId": "p1" }));
+    let restored = RightPanels::from_value(&persisted);
+    assert_eq!(restored.panel("t1").surfaces.len(), 2);
+    assert_eq!(restored.active_surface("t1").map(Surface::title).as_deref(), Some("#42"));
+
+    // Closing an issue surface remembers it for Cmd-Shift-T reopen.
+    let mut panels = restored;
+    let gh_id = gh_surface.id().to_owned();
+    assert!(panels.close_surface("t1", &gh_id));
+    assert_eq!(panels.closed_views().len(), 1);
+    assert_eq!(
+        panels.reopen_closed(|id| id == "t1", true, |_| true),
+        Some(Reopened::Thread("t1".into()))
+    );
+    assert_eq!(panels.active_surface("t1").map(Surface::id), Some(gh_id.as_str()));
+}

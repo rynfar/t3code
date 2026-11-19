@@ -37,6 +37,74 @@ pub struct FileAttachment {
     pub url: Option<String>,
 }
 
+/// Sentinel thread key for the Issues page's shared right panel (`ISSUES_PANEL_REF` in
+/// `apps/web/src/rightPanelStore.ts`).
+pub const ISSUES_PANEL_THREAD_KEY: &str = "issues-panel";
+
+/// Input target for opening or matching a single issue right-panel tab (`IssueSurfaceTarget`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<String>,
+    pub project_id: String,
+    pub tracker: crate::issues::wire::IssueTrackerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub scope: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl IssueTarget {
+    pub fn from_ref(
+        environment_id: Option<String>,
+        reference: &crate::issues::wire::IssueRef,
+        display_key: Option<String>,
+        url: Option<String>,
+    ) -> Self {
+        Self {
+            environment_id,
+            project_id: reference.project_id.clone(),
+            tracker: reference.tracker.clone(),
+            host: reference.host.clone(),
+            scope: reference.scope.clone(),
+            key: reference.key.clone(),
+            display_key,
+            url,
+        }
+    }
+
+    pub fn from_thread_link(
+        environment_id: Option<String>,
+        link: &crate::issues::wire::ThreadIssueLink,
+    ) -> Self {
+        Self {
+            environment_id,
+            project_id: link.project_id.clone(),
+            tracker: link.tracker.clone(),
+            host: (!link.host.is_empty()).then(|| link.host.clone()),
+            scope: link.scope.clone(),
+            key: link.key.clone(),
+            display_key: Some(link.display_key.clone()),
+            url: Some(link.url.clone()),
+        }
+    }
+
+    pub fn issue_ref(&self) -> crate::issues::wire::IssueRef {
+        crate::issues::wire::IssueRef {
+            project_id: self.project_id.clone(),
+            tracker: self.tracker.clone(),
+            host: self.host.clone(),
+            scope: self.scope.clone(),
+            key: self.key.clone(),
+        }
+    }
+}
+
 /// Input target for opening or matching a single pull-request right-panel tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +155,8 @@ pub enum SurfaceKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail_tab: Option<PullRequestDetailTab>,
     },
+    /// A single issue tab (`issue:<env><projectId>:<tracker>:<host><scope>:<key>`).
+    Issue(Box<IssueTarget>),
     /// The workspace explorer on its own, with optional breadcrumb return trail.
     #[serde(rename_all = "camelCase")]
     Files {
@@ -169,6 +239,32 @@ pub fn pull_request_surface_id(
     )
 }
 
+/// `issueSurfaceId` from `rightPanelStore.ts`.
+pub fn issue_surface_id(
+    environment_id: Option<&str>,
+    project_id: &str,
+    tracker: &crate::issues::wire::IssueTrackerKind,
+    host: Option<&str>,
+    scope: &str,
+    key: &str,
+) -> String {
+    let env = match environment_id {
+        Some(env) => format!("{}:", crate::device::encode_component(env)),
+        None => String::new(),
+    };
+    let host = match host {
+        Some(host) => format!("{}:", crate::device::encode_component(&host.to_ascii_lowercase())),
+        None => String::new(),
+    };
+    format!(
+        "issue:{env}{}:{}:{host}{}:{}",
+        crate::device::encode_component(project_id),
+        tracker.as_str(),
+        crate::device::encode_component(&scope.to_ascii_lowercase()),
+        crate::device::encode_component(key),
+    )
+}
+
 impl Surface {
     pub fn diff() -> Surface {
         Surface { id: "diff".to_owned(), kind: SurfaceKind::Diff }
@@ -201,6 +297,23 @@ impl Surface {
                 reveal_url: target.reveal_url,
                 detail_tab: target.detail_tab,
             },
+        }
+    }
+
+    /// A single issue tab (`issueSurface` in `rightPanelStore.ts`).
+    pub fn issue(mut target: IssueTarget) -> Surface {
+        target.host = target.host.map(|host| host.to_ascii_lowercase());
+        let id = issue_surface_id(
+            target.environment_id.as_deref(),
+            &target.project_id,
+            &target.tracker,
+            target.host.as_deref(),
+            &target.scope,
+            &target.key,
+        );
+        Surface {
+            id,
+            kind: SurfaceKind::Issue(Box::new(target)),
         }
     }
 
@@ -324,6 +437,13 @@ impl Surface {
             SurfaceKind::Diff => "Diff".to_owned(),
             SurfaceKind::PullRequests => "Pull requests".to_owned(),
             SurfaceKind::PullRequest { number, .. } => format!("#{number}"),
+            SurfaceKind::Issue(target) => target.display_key.clone().unwrap_or_else(|| {
+                if !target.key.is_empty() && target.key.bytes().all(|b| b.is_ascii_digit()) {
+                    format!("#{}", target.key)
+                } else {
+                    target.key.clone()
+                }
+            }),
             SurfaceKind::Files { .. } => "Files".to_owned(),
             SurfaceKind::File { relative_path, .. } => {
                 let start = relative_path.rfind(['/', '\\']).map_or(0, |index| index + 1);
@@ -424,6 +544,33 @@ impl Surface {
                     url,
                     reveal_url: None,
                     detail_tab,
+                }))
+            }
+            "issue" => {
+                let project_id = obj.get("projectId")?.as_str()?.to_owned();
+                let tracker_raw = obj.get("tracker")?.as_str()?;
+                let scope = obj.get("scope")?.as_str()?.to_owned();
+                let key = obj.get("key")?.as_str()?.to_owned();
+                if project_id.trim().is_empty()
+                    || tracker_raw.trim().is_empty()
+                    || scope.trim().is_empty()
+                    || key.trim().is_empty()
+                {
+                    return None;
+                }
+                let environment_id = obj.get("environmentId").and_then(Value::as_str).map(str::to_owned);
+                let host = obj.get("host").and_then(Value::as_str).map(str::to_owned);
+                let display_key = obj.get("displayKey").and_then(Value::as_str).map(str::to_owned);
+                let url = obj.get("url").and_then(Value::as_str).map(str::to_owned);
+                Some(Surface::issue(IssueTarget {
+                    environment_id,
+                    project_id,
+                    tracker: crate::issues::wire::IssueTrackerKind::from_wire(tracker_raw),
+                    host,
+                    scope,
+                    key,
+                    display_key,
+                    url,
                 }))
             }
             "files" | "file" => {
@@ -1180,6 +1327,28 @@ impl RightPanels {
                     *dest = reveal_url;
                 }
                 *entry = updated;
+            }
+        })
+    }
+
+    /// `openIssue` (`rightPanelStore.ts:870-883`): opens or activates an issue tab, refreshing its
+    /// optional `display_key` / `url` metadata when newly provided.
+    pub fn open_issue(&mut self, thread_id: &str, target: IssueTarget) -> bool {
+        let next_display_key = target.display_key.clone();
+        let next_url = target.url.clone();
+        let surface = Surface::issue(target);
+        let id = surface.id.clone();
+        self.update_user(thread_id, |panel| {
+            panel.upsert(surface);
+            if let Some(entry) = panel.surfaces.iter_mut().find(|entry| entry.id == id)
+                && let SurfaceKind::Issue(existing) = &mut entry.kind
+            {
+                if next_display_key.is_some() {
+                    existing.display_key = next_display_key;
+                }
+                if next_url.is_some() {
+                    existing.url = next_url;
+                }
             }
         })
     }

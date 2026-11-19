@@ -29,3 +29,35 @@ fn id_table_expands_id_keys_on_records_and_their_items_only() {
     );
     assert_eq!(take_id_table(&mut json!({"ids": "not a table"})), None);
 }
+
+#[test]
+fn id_table_preserves_thread_issue_links_on_thread_issue_synced_payload() {
+    let mut raw = json!({
+        "ids": ["thr-7", "proj-1"],
+        "type": "thread.issue-synced",
+        "payload": {
+            "id": 0,
+            "projectId": 1,
+            "issues": [{
+                "tracker": "github",
+                "host": "github.com",
+                "scope": "acme/web",
+                "key": "42",
+                "projectId": "proj-1",
+                "url": "https://github.com/acme/web/issues/42",
+                "source": "manual",
+                "linkedAt": "2026-01-01T00:00:00Z",
+                "displayKey": "#42",
+                "title": "Crash on empty input"
+            }]
+        }
+    });
+    let ids = take_id_table(&mut raw).unwrap();
+    let Some(obj) = raw.as_object_mut() else { panic!() };
+    expand_record_ids(obj, &ids);
+    let (thread_id, issues) = crate::issues::links::decode_thread_issue_synced_event(&raw).unwrap();
+    assert_eq!(thread_id, "thr-7");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].display_key, "#42");
+    assert_eq!(issues[0].project_id, "proj-1");
+}

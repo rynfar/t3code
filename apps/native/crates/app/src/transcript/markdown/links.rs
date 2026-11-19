@@ -293,7 +293,7 @@ pub fn handle_markdown_link_click_for_source(
             }
         }
         MarkdownLinkKind::External(web) => {
-            open_external_link(&web.url, action_ctx, cx);
+            open_external_link(&web.url, event.modifiers(), action_ctx, cx);
         }
         MarkdownLinkKind::Anchor(_) | MarkdownLinkKind::Unsupported => {}
     }
@@ -855,9 +855,123 @@ fn reveal_or_open_in_editor(
     }
 }
 
-fn open_external_link(url: &str, action_ctx: Option<&MarkdownActionContext>, cx: &mut App) {
-    let settings = crate::settings::client_settings(cx);
-    if settings.pull_request_links_open_in_app()
+/// Attempts to open an inline issue URL in the right panel (`openIssueLink.ts`,
+/// `pingdotgg/t3code#38269`, `pingdotgg/t3code#38854`). Returns `true` when handled (either
+/// synchronously or via an async standalone tracker lookup).
+pub fn try_open_issue_link(
+    url: &str,
+    modifiers: gpui::Modifiers,
+    action_ctx: Option<&MarkdownActionContext>,
+    cx: &mut App,
+) -> bool {
+    if modifiers.platform || modifiers.control {
+        return false;
+    }
+    let Some(ctx) = action_ctx else {
+        return false;
+    };
+    let (env_id, preferred_project, projects, supported) = {
+        let app = ctx.state.read(cx);
+        let env_id = app
+            .environments
+            .active
+            .as_deref()
+            .or_else(|| app.environment())
+            .map(str::to_owned);
+        let target_thread = resolve_action_target(ctx, app).0;
+        let preferred_project = target_thread
+            .as_deref()
+            .and_then(|id| app.thread_shell(id))
+            .map(|t| t.project_id.clone())
+            .or_else(|| app.draft_project.clone());
+        let projects = crate::issues::issue_link_projects_for(app, env_id.as_deref());
+        let supported = crate::issues::issues_supported_for(app, env_id.as_deref(), cx);
+        (env_id, preferred_project, projects, supported)
+    };
+    if !supported || projects.is_empty() {
+        return false;
+    }
+    let trackers = env_id
+        .as_deref()
+        .and_then(|id| crate::issues::cached_issue_trackers(id, cx));
+    if let Some(resolved) = t3_core::issues::links::resolve_issue_link_target(
+        url,
+        &projects,
+        preferred_project.as_deref(),
+        trackers.as_ref(),
+    ) {
+        open_resolved_issue_link(&ctx.state, resolved, cx);
+        return true;
+    }
+    if trackers.is_none() && t3_core::issues::links::is_standalone_issue_link(url) {
+        let state = ctx.state.clone();
+        let url_owned = url.to_owned();
+        let read_task = crate::issues::read_issue_trackers(state.read(cx), env_id.as_deref());
+        if read_task.is_some() {
+            cx.spawn(async move |cx| {
+                let result = crate::issues::settle(read_task).await;
+                cx.update(|cx| {
+                    if let Ok(list) = result {
+                        if let Some(id) = env_id.clone() {
+                            crate::issues::cache_issue_trackers(id, list.clone(), cx);
+                        }
+                        if let Some(resolved) = t3_core::issues::links::resolve_issue_link_target(
+                            &url_owned,
+                            &projects,
+                            preferred_project.as_deref(),
+                            Some(&list),
+                        ) {
+                            open_resolved_issue_link(&state, resolved, cx);
+                            return;
+                        }
+                    }
+                    cx.open_url(&url_owned);
+                });
+            })
+            .detach();
+            return true;
+        }
+    }
+    false
+}
+
+fn open_resolved_issue_link(
+    state: &Entity<AppState>,
+    resolved: t3_core::issues::links::ResolvedIssueLink,
+    cx: &mut App,
+) {
+    let target = t3_core::right_panel::IssueTarget::from_ref(
+        Some(resolved.environment_id),
+        &resolved.reference,
+        None,
+        Some(resolved.url),
+    );
+    state.update(cx, |app, cx| {
+        if app.issues_open {
+            app.open_issue_surface_for_key(
+                t3_core::right_panel::ISSUES_PANEL_THREAD_KEY,
+                target,
+                cx,
+            );
+        } else {
+            app.open_issue_surface(target, cx);
+        }
+    });
+}
+
+fn open_external_link(
+    url: &str,
+    modifiers: gpui::Modifiers,
+    action_ctx: Option<&MarkdownActionContext>,
+    cx: &mut App,
+) {
+    let (pr_links_in_app, browser_link_target) = {
+        let settings = crate::settings::client_settings(cx);
+        (settings.pull_request_links_open_in_app(), settings.browser_link_target())
+    };
+    if !modifiers.platform
+        && !modifiers.control
+        && pr_links_in_app
         && let Some(ctx) = action_ctx
     {
         let app = ctx.state.read(cx);
@@ -875,7 +989,11 @@ fn open_external_link(url: &str, action_ctx: Option<&MarkdownActionContext>, cx:
         }
     }
 
-    if settings.browser_link_target() == BrowserLinkTarget::App
+    if try_open_issue_link(url, modifiers, action_ctx, cx) {
+        return;
+    }
+
+    if browser_link_target == BrowserLinkTarget::App
         && let Some(previews) = crate::preview::previews(cx)
         && let Some(thread_id) = action_ctx.and_then(|c| c.thread_id.clone().or_else(|| c.state.read(cx).selected_thread.clone()))
     {
@@ -1348,6 +1466,119 @@ mod tests {
             app.server_config.config = Some(darwin_cfg(serde_json::json!(["file-manager"]), "darwin"));
             app.install_active_environment(ro_client.clone(), app.shell.clone(), app.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
             assert_eq!(macos_app_bundle_policy(app, "/Applications/Calculator.app"), MacosAppBundlePolicy::Blocked);
+        });
+    }
+
+    #[gpui::test]
+    fn inline_issue_links_open_right_panel_issue_surface_and_respect_modifiers(cx: &mut gpui::TestAppContext) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(rt.handle().clone(), cx));
+            state.update(cx, |app, _| {
+                app.environments.active = Some("env-1".into());
+                app.selected_thread = Some("thr-1".into());
+                app.server_config.config = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "environment": { "environmentId": "env-1", "label": "Mac" },
+                        "availableEditors": []
+                    }))
+                    .unwrap(),
+                );
+                app.shell.snapshot = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "snapshotSequence": 1,
+                        "projects": [{
+                            "id": "p1",
+                            "title": "Web",
+                            "workspaceRoot": "/tmp/web",
+                            "repositoryIdentity": {
+                                "canonicalKey": "github.com/acme/web",
+                                "provider": "github",
+                                "displayName": "acme/web"
+                            },
+                            "defaultModelSelection": null,
+                            "scripts": [],
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "updatedAt": "2026-01-01T00:00:00Z"
+                        }],
+                        "threads": [],
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                );
+            });
+            crate::issues::cache_issue_trackers(
+                "env-1".into(),
+                serde_json::from_value(serde_json::json!({
+                    "trackers": [{
+                        "tracker": "linear",
+                        "displayName": "Linear",
+                        "host": "linear.app",
+                        "scopeNoun": "team",
+                        "credential": { "label": "Personal API key" },
+                        "connected": true,
+                        "account": "alice",
+                        "workspace": "acme",
+                        "scopes": []
+                    }],
+                    "bindings": { "p1": { "tracker": "linear", "scope": "WEB" } }
+                }))
+                .unwrap(),
+                cx,
+            );
+            state
+        });
+
+        let ctx = MarkdownActionContext {
+            state: state.clone(),
+            owner: state.entity_id(),
+            cwd: Some("/tmp/web".into()),
+            thread_id: Some("thr-1".into()),
+            thread_view: None,
+        };
+
+        cx.update(|cx| {
+            // Cmd-click bypasses in-app issue opening.
+            assert!(!try_open_issue_link(
+                "https://github.com/acme/web/issues/42",
+                gpui::Modifiers { platform: true, ..Default::default() },
+                Some(&ctx),
+                cx,
+            ));
+            // Plain click on GitHub issue opens SurfaceKind::Issue in active thread's right panel.
+            assert!(try_open_issue_link(
+                "https://github.com/acme/web/issues/42",
+                gpui::Modifiers::default(),
+                Some(&ctx),
+                cx,
+            ));
+            let active = state.read(cx).panels.panels.active_surface("thr-1").unwrap().clone();
+            assert_eq!(active.title(), "#42");
+            assert!(matches!(
+                active.kind,
+                t3_core::right_panel::SurfaceKind::Issue(ref target) if target.key == "42"
+            ));
+
+            // Plain click on Linear issue opens Linear SurfaceKind::Issue (`#38854`).
+            assert!(try_open_issue_link(
+                "https://linear.app/acme/issue/WEB-17/fix-it",
+                gpui::Modifiers::default(),
+                Some(&ctx),
+                cx,
+            ));
+            let linear = state.read(cx).panels.panels.active_surface("thr-1").unwrap().clone();
+            assert_eq!(linear.title(), "WEB-17");
+
+            // Foreign Linear workspace stays an ordinary link.
+            assert!(!try_open_issue_link(
+                "https://linear.app/other/issue/WEB-17",
+                gpui::Modifiers::default(),
+                Some(&ctx),
+                cx,
+            ));
         });
     }
 }

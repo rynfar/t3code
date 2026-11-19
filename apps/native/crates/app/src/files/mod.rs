@@ -229,6 +229,7 @@ impl FilesPanel {
             SurfaceKind::Diff
             | SurfaceKind::PullRequests
             | SurfaceKind::PullRequest { .. }
+            | SurfaceKind::Issue(_)
             | SurfaceKind::Terminal { .. }
             | SurfaceKind::SideChat { .. }
             | SurfaceKind::Preview { .. }

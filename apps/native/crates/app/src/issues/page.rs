@@ -31,12 +31,16 @@ use t3_core::issues::saved_views::{
 use t3_core::issues::wire::{
     IssueCandidates, IssueListResult, IssueRef, IssueTrackerSummary, decode, method,
 };
+use t3_core::right_panel::{ISSUES_PANEL_THREAD_KEY, IssueTarget};
 use t3_core::sidebar::grouping::EnvironmentOwner;
 
-use super::{ReadFailure, read_for_owner, settle, state_glyph};
+use super::detail::IssueDetailPanel;
+use super::preview::IssueLinkPreviewController;
+use super::{
+    HeldIssueKey, ReadFailure, hold_issue_seed, read_for_owner, settle,
+};
 use crate::app_state::{AppEvent, AppState};
 use crate::i18n::t;
-use crate::icons::Icon;
 use crate::pull_requests::controls::{Button, Size, Variant};
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
@@ -89,6 +93,8 @@ pub struct IssuesPage {
     pub(super) list: ListState,
     pub(super) selected: Option<IssueRef>,
     pub(super) selected_entry: Option<EnvironmentIssueEntry>,
+    detail: Option<Entity<IssueDetailPanel>>,
+    pub(super) preview: IssueLinkPreviewController,
     pub(super) loading_more: Option<String>,
     loading_more_gen: u64,
     pub(super) unsupported: bool,
@@ -156,6 +162,8 @@ impl IssuesPage {
             list: ListState::new(0, ListAlignment::Top, px(800.)),
             selected: None,
             selected_entry: None,
+            detail: None,
+            preview: IssueLinkPreviewController::default(),
             loading_more: None,
             loading_more_gen: 0,
             unsupported: false,
@@ -786,6 +794,51 @@ impl IssuesPage {
         entry: EnvironmentIssueEntry,
         cx: &mut Context<Self>,
     ) {
+        let env_id = Some(entry.environment_id.clone());
+        if let Some(key) = HeldIssueKey::of(self.state.read(cx), env_id.as_deref(), &reference) {
+            hold_issue_seed(key, &entry.entry, cx);
+        }
+        let target = IssueTarget::from_ref(
+            env_id.clone(),
+            &reference,
+            Some(entry.entry.display_key.clone()),
+            Some(entry.entry.url.clone()),
+        );
+        self.state.update(cx, |state, cx| {
+            state.open_issue_surface_for_key(ISSUES_PANEL_THREAD_KEY, target, cx);
+        });
+        if let Some(detail) = &self.detail {
+            detail.update(cx, |panel, cx| {
+                panel.retarget(env_id, reference.clone(), Some(entry.entry.clone()), cx);
+            });
+        } else {
+            let page_weak = cx.entity().downgrade();
+            let close_weak = page_weak.clone();
+            let on_close = std::rc::Rc::new(move |cx: &mut App| {
+                let _ = close_weak.update(cx, |page, cx| page.clear_selection(cx));
+            });
+            let on_mutated = std::rc::Rc::new(move |cx: &mut App| {
+                let _ = page_weak.update(cx, |page, cx| {
+                    page.fetch_all(IssueListRefreshMode::Background, cx);
+                });
+            });
+            let state = self.state.clone();
+            let seed = Some(entry.entry.clone());
+            let ref_clone = reference.clone();
+            self.detail = Some(cx.new(|cx| {
+                IssueDetailPanel::new(
+                    state,
+                    env_id,
+                    ref_clone,
+                    None,
+                    seed,
+                    Some(on_close),
+                    None,
+                    Some(on_mutated),
+                    cx,
+                )
+            }));
+        }
         self.selected = Some(reference);
         self.selected_entry = Some(entry);
         cx.notify();
@@ -794,6 +847,12 @@ impl IssuesPage {
     pub(super) fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.selected = None;
         self.selected_entry = None;
+        self.detail = None;
+        self.state.update(cx, |state, cx| {
+            if state.panels.panels.hide(ISSUES_PANEL_THREAD_KEY) {
+                state.save_panels(cx);
+            }
+        });
         cx.notify();
     }
 
@@ -963,69 +1022,6 @@ impl IssuesPage {
             )
     }
 
-    fn render_selected_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let selected = self.selected_entry.as_ref()?;
-        let entry = &selected.entry;
-        let p = palette(cx);
-        let (icon, color) = state_glyph(&entry.state, cx);
-        let copy_key = entry.display_key.clone();
-        let open_url = entry.url.clone();
-
-        Some(
-            h_flex()
-                .id("issues-selected-bar")
-                .flex_none()
-                .mx(px(20.))
-                .mb(px(8.))
-                .px(px(12.))
-                .py(px(8.))
-                .gap(px(8.))
-                .rounded(px(8.))
-                .border_1()
-                .border_color(hsla(p.border))
-                .bg(hsla(p.card))
-                .child(icon.sized(px(14.)).text_color(color))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(hsla(p.muted_foreground))
-                        .child(entry.display_key.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(hsla(p.foreground))
-                        .child(entry.title.clone()),
-                )
-                .child(
-                    Button::new("issues-selected-copy", Variant::Outline, Size::Xs)
-                        .icon(Icon::Copy)
-                        .label(t(cx, "Copy key").to_owned())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.copy_text(copy_key.clone(), "Issue key", cx);
-                        })),
-                )
-                .child(
-                    Button::new("issues-selected-open", Variant::Outline, Size::Xs)
-                        .icon(Icon::ExternalLink)
-                        .label(t(cx, "Open in browser").to_owned())
-                        .on_click(move |_, _, cx| cx.open_url(&open_url)),
-                )
-                .child(
-                    Button::new("issues-selected-close", Variant::GhostMuted, Size::Xs)
-                        .icon(Icon::X)
-                        .tooltip(t(cx, "Clear selection").to_owned())
-                        .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
-                )
-                .into_any_element(),
-        )
-    }
-
     fn render_body(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.unsupported {
             return super::row::unsupported_state(cx).into_any_element();
@@ -1061,28 +1057,19 @@ impl Render for IssuesPage {
             .first_error()
             .filter(|_| !self.held_pages.is_empty())
             .map(str::to_owned);
-        let selected_bar = self.render_selected_bar(cx);
+        let detail = self.detail.clone();
+        let preview_card = self.preview.render_card(cx);
         let dialog = self
             .saved_view_editor
             .as_ref()
             .map(|editor| super::toolbar::render_saved_view_dialog(self, editor, cx));
 
-        div()
-            .id("issues-page")
-            .track_focus(&self.focus)
-            .relative()
-            .size_full()
+        let list_column = div()
+            .flex_1()
             .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
-            .bg(hsla(p.background))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.saved_view_editor.is_some() {
-                    this.close_saved_view_editor(cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .child(self.render_header(window, cx))
             .child(super::toolbar::render(self, window, cx))
             .children(partial_error.map(|error| {
                 let retry = cx.listener(|this, _, _, cx| this.retry_failed(cx));
@@ -1107,7 +1094,6 @@ impl Render for IssuesPage {
                             .on_click(retry),
                     )
             }))
-            .children(selected_bar)
             .child(
                 div()
                     .flex_1()
@@ -1116,7 +1102,60 @@ impl Render for IssuesPage {
                     .flex_col()
                     .px(px(8.))
                     .child(self.render_body(window, cx)),
+            );
+
+        div()
+            .id("issues-page")
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .bg(hsla(p.background))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    if this.saved_view_editor.is_some() {
+                        this.close_saved_view_editor(cx);
+                        cx.stop_propagation();
+                    } else if this.detail.is_some() {
+                        this.clear_selection(cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
+            .child(self.render_header(window, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .child(list_column)
+                    .children(detail.map(|detail| {
+                        div()
+                            .id("issues-detail-pane")
+                            .flex_none()
+                            .w(px(480.))
+                            .min_w(px(360.))
+                            .h_full()
+                            .min_h_0()
+                            .border_l_1()
+                            .border_color(hsla(p.border))
+                            .child(detail)
+                    })),
             )
+            .children(preview_card.map(|card| {
+                gpui::deferred(
+                    div()
+                        .absolute()
+                        .bottom(px(16.))
+                        .right(px(16.))
+                        .child(card),
+                )
+                .with_priority(40)
+            }))
             .children(dialog)
     }
 }

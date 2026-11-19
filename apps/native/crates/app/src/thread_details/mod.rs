@@ -6,6 +6,7 @@
 
 mod automations;
 pub(crate) mod controls;
+mod issues;
 mod items;
 mod sections;
 mod servers;

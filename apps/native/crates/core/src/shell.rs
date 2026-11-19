@@ -247,6 +247,10 @@ pub struct ThreadShell {
     /// `linkedPullRequest` only when `pullRequests` is absent (`threadPullRequestsOf`).
     #[serde(default, skip_serializing)]
     pub pull_requests: Vec<crate::pull_requests::link::ThreadLink>,
+    /// Issues linked to this thread (`OrchestrationV2ThreadShellJson.issues`); malformed entries are
+    /// dropped leniently so pre-linking servers and future fields never fail the shell frame.
+    #[serde(default, skip_serializing)]
+    pub issues: Vec<crate::issues::wire::ThreadIssueLink>,
 }
 
 /// Legacy single-link payload (`ThreadLinkedPullRequest` in `packages/contracts/src/threadPullRequest.ts`).
@@ -392,6 +396,9 @@ struct ThreadShellWire {
     /// Legacy single `linkedPullRequest` from older V2 payloads.
     #[serde(default, deserialize_with = "lenient_legacy_pull_request")]
     linked_pull_request: Option<LegacyLinkedPullRequest>,
+    /// Linked issues (`ThreadIssueLink[]`); absent on pre-linking servers.
+    #[serde(default, deserialize_with = "lenient_thread_issue_links")]
+    issues: Vec<crate::issues::wire::ThreadIssueLink>,
 }
 
 impl From<ThreadShellWire> for ThreadShell {
@@ -464,8 +471,22 @@ impl From<ThreadShellWire> for ThreadShell {
             last_visited_at: wire.last_visited_at,
             deleted_at: wire.deleted_at,
             pull_requests,
+            issues: wire.issues,
         }
     }
+}
+
+fn lenient_thread_issue_links<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<crate::issues::wire::ThreadIssueLink>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|item| serde_json::from_value(item.clone()).ok())
+        .collect())
 }
 
 fn present_thread_links<'de, D: serde::Deserializer<'de>>(
@@ -867,5 +888,60 @@ mod legacy_pr_tests {
         assert_eq!(thread.pull_requests.len(), 1);
         assert_eq!(thread.pull_requests[0].host, "git.corp.example");
         assert_eq!(thread.pull_requests[0].repository, "org/repo");
+    }
+
+    #[test]
+    fn decodes_thread_issues_and_drops_malformed_entries() {
+        // Pre-linking server omits `issues` -> defaults to empty.
+        let bare = base_thread(serde_json::Map::new());
+        assert!(bare.issues.is_empty());
+
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "issues".into(),
+            json!([
+                {
+                    "tracker": "github",
+                    "host": "github.com",
+                    "scope": "acme/web",
+                    "key": "19",
+                    "projectId": "proj-1",
+                    "url": "https://github.com/acme/web/issues/19",
+                    "source": "manual",
+                    "linkedAt": "2026-01-03T00:00:00Z",
+                    "displayKey": "#19",
+                    "title": "Fix hover preview"
+                },
+                { "broken": true },
+                {
+                    "tracker": "linear",
+                    "host": "linear.app",
+                    "scope": "ENG",
+                    "key": "ENG-7",
+                    "projectId": "proj-1",
+                    "url": "https://linear.app/acme/issue/ENG-7",
+                    "source": "agent",
+                    "linkedAt": "2026-01-04T00:00:00Z",
+                    "displayKey": "ENG-7",
+                    "title": "Linear task"
+                }
+            ]),
+        );
+        let thread = base_thread(extra);
+        assert_eq!(thread.issues.len(), 2);
+        assert_eq!(thread.issues[0].display_key, "#19");
+        assert_eq!(
+            thread.issues[0].source,
+            crate::issues::wire::ThreadIssueLinkSource::Manual
+        );
+        assert_eq!(thread.issues[1].display_key, "ENG-7");
+        assert_eq!(
+            thread.issues[1].tracker,
+            crate::issues::wire::IssueTrackerKind::Linear
+        );
+        assert_eq!(
+            thread.issues[1].source,
+            crate::issues::wire::ThreadIssueLinkSource::Agent
+        );
     }
 }

@@ -4,7 +4,10 @@
 //!
 //! Shared between `IS-PAGE` (`#438`) and Wave G2 `IS-DETAIL` (`#439`) / `PR-PAGE` saved views.
 
+pub mod links;
 pub mod list;
+pub mod pager;
+pub mod presentation;
 pub mod saved_views;
 pub mod selection;
 pub mod wire;
@@ -742,5 +745,443 @@ mod tests {
         assert_eq!(desc.provider.as_deref(), Some("azure-devops"));
         assert_eq!(desc.host.as_deref(), Some("dev.azure.com"));
         assert_eq!(desc.issue_scope.as_deref(), Some("acme/My Project"));
+    }
+
+    #[test]
+    fn presentation_events_write_access_and_timeline_sorting() {
+        use super::presentation::{
+            IssueStateTone, IssueTimelineItem, issue_author_label, issue_close_reason_label,
+            issue_event_sentence, issue_state_tone, issue_write_access, merge_issue_timeline,
+        };
+        use super::wire::{IssueComment, IssueEvent};
+
+        assert_eq!(issue_close_reason_label("not_planned"), "Not planned");
+        assert_eq!(issue_close_reason_label("completed"), "Completed");
+        assert_eq!(
+            issue_state_tone(&IssueState {
+                category: IssueStateCategory::Open,
+                name: "In Progress".into(),
+                close_reason: None,
+            }),
+            IssueStateTone::Open
+        );
+        assert_eq!(
+            issue_state_tone(&IssueState {
+                category: IssueStateCategory::Closed,
+                name: "Done".into(),
+                close_reason: Some("completed".into()),
+            }),
+            IssueStateTone::Completed
+        );
+        assert_eq!(
+            issue_state_tone(&IssueState {
+                category: IssueStateCategory::Closed,
+                name: "Cancelled".into(),
+                close_reason: Some("not_planned".into()),
+            }),
+            IssueStateTone::Dismissed
+        );
+
+        let closed_evt = IssueEvent {
+            id: "e1".into(),
+            kind: IssueEventKind::Closed,
+            actor: None,
+            created_at: "2026-01-02T00:00:00Z".into(),
+            detail: Some("not_planned".into()),
+        };
+        assert_eq!(issue_event_sentence(&closed_evt), "closed this as not planned");
+        let moved_evt = IssueEvent {
+            id: "e2".into(),
+            kind: IssueEventKind::StateChanged,
+            actor: None,
+            created_at: "2026-01-01T12:00:00Z".into(),
+            detail: Some("In Review".into()),
+        };
+        assert_eq!(issue_event_sentence(&moved_evt), "moved this to In Review");
+
+        let detail: IssueDetail = decode(json!({
+            "tracker": "linear",
+            "host": "linear.app",
+            "scope": "ENG",
+            "key": "ENG-5",
+            "displayKey": "ENG-5",
+            "title": "Workflow issue",
+            "url": "https://linear.app/acme/issue/ENG-5",
+            "state": { "category": "open", "name": "In Progress" },
+            "states": [
+                { "category": "open", "name": "Todo" },
+                { "category": "open", "name": "In Progress" },
+                { "category": "closed", "name": "Done", "closeReason": "completed" }
+            ],
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "projectId": "p1",
+            "projectTitle": "Core",
+            "writable": true,
+            "capabilities": {
+                "create": true, "edit": true, "comment": true, "labels": true,
+                "assignees": true, "reactions": false, "templates": false,
+                "linkedPullRequests": false, "events": true, "search": true
+            },
+            "viewerPermissions": {
+                "setState": true, "comment": true, "edit": false, "labels": true, "assignees": true
+            }
+        }))
+        .unwrap();
+
+        let access = issue_write_access(&detail, true);
+        assert!(access.blocked.is_none());
+        assert!(access.comment);
+        assert!(!access.edit);
+        assert!(!access.react);
+        assert_eq!(
+            access.states.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["Todo", "Done"]
+        );
+
+        let no_scope = issue_write_access(&detail, false);
+        assert!(no_scope.blocked.is_some());
+        assert!(!no_scope.comment);
+        assert!(no_scope.states.is_empty());
+
+        let c1 = IssueComment {
+            id: "c1".into(),
+            author: None,
+            body: "Later comment".into(),
+            created_at: "2026-01-03T00:00:00Z".into(),
+            url: None,
+            reactions: None,
+        };
+        let timeline = merge_issue_timeline(&[c1], &[closed_evt, moved_evt]);
+        assert_eq!(timeline.len(), 3);
+        assert!(matches!(&timeline[0], IssueTimelineItem::Event(e) if e.id == "e2"));
+        assert!(matches!(&timeline[1], IssueTimelineItem::Event(e) if e.id == "e1"));
+        assert!(matches!(&timeline[2], IssueTimelineItem::Comment(c) if c.id == "c1"));
+
+        assert_eq!(issue_author_label(None), "ghost");
+        assert_eq!(
+            issue_author_label(Some(&IssueActor {
+                is_bot: Some(false),
+                login: "alice".into(),
+                name: Some("Alice Smith".into()),
+                avatar_url: None,
+            })),
+            "Alice Smith (@alice)"
+        );
+    }
+
+    #[test]
+    fn comment_pager_preserves_older_comments_on_failed_refresh_and_clears_on_success() {
+        // Mirrors `pingdotgg/t3code#38489` and `pingdotgg/t3code#39000`.
+        use super::pager::IssueCommentPager;
+        use super::wire::{IssueComment, IssueCommentsPage};
+
+        let make_comment = |id: &str| IssueComment {
+            id: id.into(),
+            author: None,
+            body: format!("body {id}"),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            url: None,
+            reactions: None,
+        };
+        let detail: IssueDetail = decode(json!({
+            "tracker": "github",
+            "host": "github.com",
+            "scope": "acme/web",
+            "key": "1",
+            "displayKey": "#1",
+            "title": "Pager test",
+            "url": "https://github.com/acme/web/issues/1",
+            "state": { "category": "open", "name": "Open" },
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "projectId": "p1",
+            "projectTitle": "Web",
+            "comments": [{ "id": "c3", "body": "newest", "createdAt": "2026-01-03T00:00:00Z" }],
+            "commentsCursor": "cur-2"
+        }))
+        .unwrap();
+
+        let mut pager = IssueCommentPager::default();
+        let req = pager.begin_load_older(Some(&detail), false).unwrap();
+        assert_eq!(req.cursor, "cur-2");
+        assert!(pager.finish_load_older(
+            &req,
+            Ok(IssueCommentsPage {
+                comments: vec![make_comment("c2"), make_comment("c3")],
+                next_cursor: Some("cur-1".into()),
+            }),
+        ));
+        let view = pager.view(Some(&detail), false);
+        assert_eq!(
+            view.comments.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["c2", "c3"]
+        );
+        assert_eq!(view.next_cursor.as_deref(), Some("cur-1"));
+
+        // Failed refresh preserves previously loaded older comments (`#39000`).
+        assert!(pager.begin_refresh());
+        pager.finish_refresh(false);
+        let after_fail = pager.view(Some(&detail), false);
+        assert_eq!(
+            after_fail.comments.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["c2", "c3"]
+        );
+        assert_eq!(after_fail.next_cursor.as_deref(), Some("cur-1"));
+
+        // In-flight loadOlder racing with a successful refresh is discarded (`#38489`).
+        let stale_req = pager.begin_load_older(Some(&detail), false).unwrap();
+        assert!(pager.begin_refresh());
+        pager.finish_refresh(true);
+        assert!(!pager.finish_load_older(
+            &stale_req,
+            Ok(IssueCommentsPage {
+                comments: vec![make_comment("c1")],
+                next_cursor: None,
+            }),
+        ));
+        let after_success = pager.view(Some(&detail), false);
+        assert_eq!(
+            after_success.comments.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["c3"]
+        );
+        assert_eq!(after_success.next_cursor.as_deref(), Some("cur-2"));
+    }
+
+    #[test]
+    fn issue_link_resolution_across_all_trackers_and_thread_commands() {
+        // Mirrors `packages/client-runtime/src/issueLinks.test.ts` + `#38263`, `#38269`, `#38854`.
+        use std::collections::HashSet;
+
+        use super::links::{
+            IssueLinkProject, decode_thread_issue_synced_event, is_standalone_issue_link,
+            link_issue_command, linked_threads_label, may_contain_standalone_issue_link,
+            resolve_issue_link_target, unlink_issue_command, visible_issue_linked_threads,
+        };
+        use super::wire::{IssueLinkedThread, ThreadIssueLinkSource};
+
+        let gh_proj = |id: &str, host: &str, repo: &str| IssueLinkProject {
+            id: id.into(),
+            environment_id: "env-1".into(),
+            repository_identity: Some(json!({
+                "canonicalKey": format!("{host}/{repo}"),
+                "provider": "github",
+                "displayName": repo,
+            })),
+        };
+        let projects = vec![
+            gh_proj("p1", "github.com", "acme/api"),
+            gh_proj("p2", "github.com", "acme/web"),
+            gh_proj("ghe-bare", "github.example.com", "acme/web"),
+            gh_proj("ghe-port", "github.example.com:8443", "acme/web"),
+            gh_proj("ghe-custom", "code.acme.test", "acme/web"),
+            IssueLinkProject {
+                id: "gl".into(),
+                environment_id: "env-1".into(),
+                repository_identity: Some(json!({
+                    "canonicalKey": "gitlab.corp.test/group/sub/app",
+                    "provider": "gitlab",
+                    "displayName": "group/sub/app",
+                })),
+            },
+            IssueLinkProject {
+                id: "azdo-legacy".into(),
+                environment_id: "env-1".into(),
+                repository_identity: Some(json!({
+                    "canonicalKey": "acme.visualstudio.com/DefaultCollection/_git/Web%20App",
+                    "provider": "azure-devops",
+                    "displayName": "DefaultCollection/_git/Web%20App",
+                })),
+            },
+            IssueLinkProject {
+                id: "fj".into(),
+                environment_id: "env-1".into(),
+                repository_identity: Some(json!({
+                    "canonicalKey": "codeberg.org/team/tool",
+                    "provider": "forgejo",
+                    "displayName": "team/tool",
+                })),
+            },
+        ];
+
+        // Exact repo match & lender fallback on github.com.
+        let r_own = resolve_issue_link_target(
+            "https://github.com/acme/web/issues/7",
+            &projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_own.project_id, "p2");
+        assert_eq!(r_own.reference.key, "7");
+        let r_lend = resolve_issue_link_target(
+            "https://github.com/other/repo/issues/9",
+            &projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_lend.project_id, "p1");
+        assert_eq!(r_lend.reference.scope, "other/repo");
+
+        // Ported GHE & custom GHE hostname vouched by project (`#38269`).
+        let r_port = resolve_issue_link_target(
+            "https://github.example.com:8443/acme/web/issues/7",
+            &projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_port.project_id, "ghe-port");
+        let r_custom = resolve_issue_link_target(
+            "https://code.acme.test/acme/web/issues/7",
+            &projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_custom.project_id, "ghe-custom");
+        assert_eq!(r_custom.reference.host.as_deref(), Some("code.acme.test"));
+
+        // GitLab nested group work item.
+        let r_gl = resolve_issue_link_target(
+            "https://gitlab.corp.test/group/sub/app/-/work_items/14",
+            &projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_gl.project_id, "gl");
+        assert_eq!(r_gl.reference.tracker, IssueTrackerKind::GitLab);
+        assert_eq!(r_gl.reference.key, "14");
+
+        // Azure DevOps legacy host with DefaultCollection alias and encoded space (`#38263`).
+        let r_az = resolve_issue_link_target(
+            "https://acme.visualstudio.com/DefaultCollection/Web%20App/_workitems/edit/99",
+            &projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_az.project_id, "azdo-legacy");
+        assert_eq!(r_az.reference.scope, "web app");
+        assert_eq!(r_az.reference.key, "99");
+
+        // Forgejo / Codeberg.
+        let r_fj = resolve_issue_link_target(
+            "https://codeberg.org/team/tool/issues/3",
+            &projects,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r_fj.project_id, "fj");
+        assert_eq!(r_fj.reference.tracker, IssueTrackerKind::Forgejo);
+
+        // Linear standalone tracker (`#38854`).
+        let trackers: IssueTrackerConnectionList = decode(json!({
+            "trackers": [{
+                "tracker": "linear",
+                "displayName": "Linear",
+                "host": "linear.app",
+                "scopeNoun": "team",
+                "credential": { "label": "Personal API key" },
+                "connected": true,
+                "account": "alice",
+                "workspace": "acme",
+                "scopes": []
+            }],
+            "bindings": {
+                "p1": { "tracker": "linear", "scope": "API" },
+                "p2": { "tracker": "linear", "scope": "WEB" }
+            }
+        }))
+        .unwrap();
+        assert!(is_standalone_issue_link("https://linear.app/acme/issue/WEB-17/fix-it"));
+        assert!(may_contain_standalone_issue_link("See https://linear.app/acme/issue/WEB-17"));
+        let r_lin = resolve_issue_link_target(
+            "https://linear.app/acme/issue/WEB-17/fix-it",
+            &projects,
+            None,
+            Some(&trackers),
+        )
+        .unwrap();
+        assert_eq!(r_lin.project_id, "p2");
+        assert_eq!(r_lin.reference.scope, "WEB");
+        assert_eq!(r_lin.reference.key, "WEB-17");
+
+        // Foreign workspace, lookalike host, or PR URL stay ordinary links.
+        assert!(resolve_issue_link_target(
+            "https://linear.app/othercorp/issue/WEB-17",
+            &projects,
+            None,
+            Some(&trackers),
+        )
+        .is_none());
+        assert!(resolve_issue_link_target(
+            "https://github.com.evil.example/acme/web/issues/7",
+            &projects,
+            None,
+            Some(&trackers),
+        )
+        .is_none());
+        assert!(resolve_issue_link_target(
+            "https://github.com/acme/web/pull/7",
+            &projects,
+            None,
+            Some(&trackers),
+        )
+        .is_none());
+
+        // Commands + synced event + linked threads filter.
+        let key = ThreadIssueKey {
+            tracker: IssueTrackerKind::GitHub,
+            host: "github.com".into(),
+            scope: "acme/web".into(),
+            key: "7".into(),
+        };
+        let link_cmd = link_issue_command(
+            "cmd-1",
+            "thr-1",
+            &key,
+            "p2",
+            "https://github.com/acme/web/issues/7",
+            "#7",
+            "Bug",
+            ThreadIssueLinkSource::Manual,
+        );
+        assert_eq!(link_cmd["type"], "thread.issue.link");
+        assert_eq!(link_cmd["source"], "manual");
+        let unlink_cmd = unlink_issue_command("cmd-2", "thr-1", &key);
+        assert_eq!(unlink_cmd["type"], "thread.issue.unlink");
+
+        let synced = json!({
+            "type": "thread.issue-synced",
+            "payload": {
+                "id": "thr-1",
+                "issues": [{
+                    "tracker": "github", "host": "github.com", "scope": "acme/web", "key": "7",
+                    "projectId": "p2", "url": "https://github.com/acme/web/issues/7",
+                    "source": "manual", "linkedAt": "2026-01-01T00:00:00Z",
+                    "displayKey": "#7", "title": "Bug"
+                }]
+            }
+        });
+        let (tid, links) = decode_thread_issue_synced_event(&synced).unwrap();
+        assert_eq!(tid, "thr-1");
+        assert_eq!(links.len(), 1);
+
+        let rows = vec![
+            IssueLinkedThread { id: "t1".into(), project_id: "p1".into(), title: "A".into(), archived_at: None, settled: false },
+            IssueLinkedThread { id: "t2".into(), project_id: "p1".into(), title: "B".into(), archived_at: None, settled: false },
+        ];
+        let loaded = HashSet::from(["t1".to_owned(), "t2".to_owned()]);
+        let hidden = HashSet::from(["t2".to_owned()]);
+        assert_eq!(visible_issue_linked_threads(&rows, &loaded, &hidden, false).len(), 2);
+        let vis = visible_issue_linked_threads(&rows, &loaded, &hidden, true);
+        assert_eq!(vis.len(), 1);
+        assert_eq!(vis[0].id, "t1");
+        assert_eq!(linked_threads_label(1), "Linked from 1 thread");
+        assert_eq!(linked_threads_label(3), "Linked from 3 threads");
     }
 }
