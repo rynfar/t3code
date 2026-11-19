@@ -208,7 +208,7 @@ impl PanelTerminalView {
         });
         let terminal = terminal_id.to_owned();
         cx.subscribe_in(&pane, window, move |this, _, event: &PaneEvent, window, cx| match event {
-            PaneEvent::Exited => this.close_terminal_confirmed(&terminal, cx),
+            PaneEvent::Exited => this.close_terminal_confirmed(&terminal, window, cx),
             PaneEvent::Activated => {
                 record_terminal_focus(&this.thread_id, &terminal, cx);
                 this.activate_terminal(&terminal, window, cx);
@@ -284,18 +284,22 @@ impl PanelTerminalView {
         let terminal_id = terminal_id.to_owned();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await == Ok(0) {
-                let _ = this.update(cx, |this, cx| this.close_terminal_confirmed(&terminal_id, cx));
+                let _ = this.update_in(cx, |this, window, cx| this.close_terminal_confirmed(&terminal_id, window, cx));
             }
         })
         .detach();
     }
 
-    fn close_terminal_confirmed(&mut self, terminal_id: &str, cx: &mut Context<Self>) {
+    fn close_terminal_confirmed(&mut self, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         close_terminal_session(self.app.read(cx), &self.thread_id, terminal_id);
         self.panes.remove(terminal_id);
         let (thread_id, surface_id) = (self.thread_id.clone(), self.surface_id.clone());
         let tid = terminal_id.to_owned();
         self.app.update(cx, |state, cx| state.close_panel_terminal(&thread_id, &surface_id, &tid, cx));
+        if let Some((_, active_terminal_id, _)) = self.surface_state(cx) {
+            request_terminal_focus(&self.thread_id, &active_terminal_id, cx);
+        }
+        self.sync(window, cx);
         cx.notify();
     }
 
@@ -518,5 +522,75 @@ impl Render for PanelTerminalView {
             .when(sidebar, |this| this.child(self.render_sidebar(&terminal_ids, &active_terminal_id, cx)))
             .children(floating)
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Host {
+        panel: Entity<PanelTerminalView>,
+        _drawer: Entity<super::super::TerminalDrawer>,
+    }
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().child(self.panel.clone())
+        }
+    }
+
+    #[gpui::test]
+    async fn closing_split_panel_terminal_focuses_surviving_pane(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "terminal:operate"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let surface_id = state.update(cx, |state, cx| {
+            state.open_panel_terminal("menu-thread", "term-1", cx);
+            let surface_id = state.panels.panels.active_surface("menu-thread").unwrap().id.clone();
+            state.split_panel_terminal("menu-thread", &surface_id, "term-2", SplitDirection::Horizontal, cx);
+            surface_id
+        });
+        let window = cx.add_window(|window, cx| {
+            // Keep ActiveDrawer alive so terminal focus queue & operate permissions are active.
+            let drawer = cx.new(|cx| super::super::TerminalDrawer::new(state.clone(), window, cx));
+            let panel = cx.new(|cx| {
+                let mut view = PanelTerminalView::new(state.clone(), "menu-thread".into(), surface_id.clone(), window, cx);
+                view.set_visible(true, window, cx);
+                view
+            });
+            Host { panel, _drawer: drawer }
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |host, window, cx| {
+                host.panel.update(cx, |panel, cx| {
+                    // Focus term-2 first, then close term-2; surviving term-1 must receive window focus.
+                    panel.activate_terminal("term-2", window, cx);
+                    assert!(panel.panes.get("term-2").unwrap().focus_handle(cx).is_focused(window));
+                    panel.close_terminal_confirmed("term-2", window, cx);
+                    assert!(!panel.panes.contains_key("term-2"));
+                    assert!(
+                        panel.panes.get("term-1").unwrap().focus_handle(cx).is_focused(window),
+                        "closing split panel terminal must focus surviving active terminal pane"
+                    );
+                });
+            })
+            .unwrap();
+
+        state.update(cx, |state, _| state.stop_pump());
+        runtime.shutdown_background();
     }
 }

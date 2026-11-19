@@ -13,10 +13,11 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::{Value, json};
+use t3_core::commands::method::SERVER_UPDATE_SETTINGS;
 use t3_core::device::SETTINGS_WRITE_SCOPE;
-use t3_core::settings::ServerSettingChange;
 use t3_core::settings::providers::form::SecretSourceDraft;
 use t3_core::settings::secrets;
+use t3_core::usage::PROVIDERS_MANAGE_SCOPE;
 use t3_core::usage::limits::sources::{
     ManagementKeyValue, decode_usage_limit_sources, remove_usage_limit_source_patch, source_id_from_url, upsert_usage_limit_source_patch,
 };
@@ -26,7 +27,7 @@ use super::super::controls::{
 };
 use super::super::SettingsView;
 use super::CloseProviderDialog;
-use crate::app_state::AppState;
+use crate::app_state::AppEvent;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -34,21 +35,28 @@ const STORED_SECRET: &str = "__stored__";
 
 #[derive(Clone, PartialEq, Eq)]
 struct UsageSourceOwner {
+    scoped_saved_id: Option<String>,
     environment: String,
     connection: Option<u64>,
 }
 
 impl UsageSourceOwner {
-    fn capture(state: &AppState) -> Option<Self> {
-        state.server_config.config.as_ref()?;
+    fn capture(view: &SettingsView, cx: &App) -> Option<Self> {
+        let config = view.scoped_raw_representative_config(cx)?;
+        let state = view.state.read(cx);
+        let scoped_saved_id = view.scoped_primary_owner(cx).map(|owner| owner.saved_id);
+        let is_active = scoped_saved_id
+            .as_deref()
+            .is_none_or(|id| state.environments.active.as_deref() == Some(id));
         Some(Self {
-            environment: crate::composer::ProviderTarget::environment(state),
-            connection: state.connection_id(),
+            scoped_saved_id,
+            environment: config.environment.environment_id.clone(),
+            connection: is_active.then(|| state.connection_id()).flatten(),
         })
     }
 
-    fn current(&self, state: &AppState) -> bool {
-        Self::capture(state).as_ref() == Some(self)
+    fn current(&self, view: &SettingsView, cx: &App) -> bool {
+        Self::capture(view, cx).as_ref() == Some(self)
     }
 }
 
@@ -107,19 +115,24 @@ impl UsageSourcesState {
 }
 
 impl SettingsView {
+    fn usage_sources_may(&self, scope: &str, cx: &App) -> bool {
+        self.scoped_session(cx).is_none_or(|session| session.grants(scope))
+    }
+
     fn usage_sources_read_only(&self, cx: &App) -> bool {
-        !self.may(SETTINGS_WRITE_SCOPE, cx) || self.env_only_unavailable(cx).is_some()
+        !self.scoped_connected_now(cx)
+            || self.is_project_scope(cx)
+            || !self.usage_sources_may(PROVIDERS_MANAGE_SCOPE, cx)
     }
 
     /// Drops stale Add/Remove dialogs when the environment, connection, or write access changes.
     pub(super) fn sync_usage_sources(&mut self, cx: &App) {
-        let app = self.state.read(cx);
         let read_only = self.usage_sources_read_only(cx);
-        if self.providers.usage_sources.add.as_ref().is_some_and(|d| read_only || !d.owner.current(app)) {
+        if self.providers.usage_sources.add.as_ref().is_some_and(|d| read_only || !d.owner.current(self, cx)) {
             self.providers.usage_sources.generation += 1;
             self.providers.usage_sources.add = None;
         }
-        if self.providers.usage_sources.remove.as_ref().is_some_and(|d| read_only || !d.owner.current(app)) {
+        if self.providers.usage_sources.remove.as_ref().is_some_and(|d| read_only || !d.owner.current(self, cx)) {
             self.providers.usage_sources.remove = None;
         }
     }
@@ -138,7 +151,7 @@ impl SettingsView {
         if self.usage_sources_read_only(cx) {
             return;
         }
-        let Some(owner) = UsageSourceOwner::capture(self.state.read(cx)) else {
+        let Some(owner) = UsageSourceOwner::capture(self, cx) else {
             return;
         };
         self.providers.usage_sources.generation += 1;
@@ -305,7 +318,7 @@ impl SettingsView {
         if self
             .scoped_raw_representative_config(cx)
             .is_none_or(|c| c.environment.capabilities.secret_source_check != Some(true))
-            || !self.may(SETTINGS_WRITE_SCOPE, cx)
+            || !self.usage_sources_may(SETTINGS_WRITE_SCOPE, cx)
         {
             return;
         }
@@ -335,8 +348,7 @@ impl SettingsView {
                 Err(_) => SecretCheckStatus::Failed("Could not reach the server".to_owned()),
             };
             let _ = this.update(cx, |this, cx| {
-                let app = this.state.read(cx);
-                let current = owner.current(app);
+                let current = owner.current(this, cx);
                 let Some(dialog) = this.providers.usage_sources.add.as_mut() else {
                     return;
                 };
@@ -349,6 +361,42 @@ impl SettingsView {
         })
         .detach();
         cx.notify();
+    }
+
+    fn dispatch_usage_source_patch(
+        &self,
+        payload: Value,
+        on_done: impl FnOnce(Option<String>, &mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let active_saved = self.state.read(cx).environments.active.clone();
+        let is_active = self
+            .scoped_primary_owner(cx)
+            .is_none_or(|owner| active_saved.as_deref() == Some(owner.saved_id.as_str()));
+        let sent_at = self.state.read(cx).server_config.settings_revision();
+        let task = self.scoped_rpc(PROVIDERS_MANAGE_SCOPE, SERVER_UPDATE_SETTINGS, payload, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(reply) => {
+                    if is_active {
+                        let candidate = reply.get("settings").unwrap_or(&reply);
+                        if let Ok(settings) = serde_json::from_value::<t3_core::server_config::ServerSettings>(candidate.clone()) {
+                            this.state.update(cx, |state, cx| {
+                                if state.server_config.apply_settings_reply(settings, sent_at) {
+                                    cx.emit(AppEvent::ServerConfig);
+                                }
+                            });
+                        }
+                    }
+                    on_done(None, this, cx);
+                }
+                Err(error) => {
+                    on_done(Some(error.to_string()), this, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn usage_source_management_key(&self, dialog: &AddUsageSourceDialog, cx: &App) -> Option<ManagementKeyValue> {
@@ -379,7 +427,7 @@ impl SettingsView {
             let Some(dialog) = self.providers.usage_sources.add.as_ref() else {
                 return;
             };
-            if dialog.saving || !dialog.owner.current(self.state.read(cx)) {
+            if dialog.saving || !dialog.owner.current(self, cx) {
                 return;
             }
             let trimmed_url = dialog.url.read(cx).value().trim().to_owned();
@@ -403,39 +451,34 @@ impl SettingsView {
             .and_then(|c| c.settings.usage_limit_sources.as_object().cloned())
             .unwrap_or_default();
         let id = source_id_from_url(&trimmed_url, &existing_sources);
-        let patch = upsert_usage_limit_source_patch(&id, &trimmed_url, trimmed_label.as_deref(), &management_key);
+        let payload = upsert_usage_limit_source_patch(&id, &trimmed_url, trimmed_label.as_deref(), &management_key);
         if let Some(dialog) = self.providers.usage_sources.add.as_mut() {
             dialog.saving = true;
             dialog.error = None;
         }
         cx.notify();
-        let view = cx.entity().downgrade();
-        self.update_scoped_single_env_then(
-            ServerSettingChange::Prepared(patch),
-            move |error, cx| {
-                cx.defer(move |cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        let current = owner.current(this.state.read(cx));
-                        let Some(dialog) = this.providers.usage_sources.add.as_mut() else {
-                            return;
-                        };
-                        if !current || dialog.generation != generation {
-                            this.providers.usage_sources.add = None;
-                            cx.notify();
-                            return;
-                        }
-                        dialog.saving = false;
-                        match error {
-                            None => {
-                                this.providers.usage_sources.add = None;
-                            }
-                            Some(message) => {
-                                dialog.error = Some(message);
-                            }
-                        }
-                        cx.notify();
-                    });
-                });
+        self.dispatch_usage_source_patch(
+            payload,
+            move |error, this, cx| {
+                let current = owner.current(this, cx);
+                let Some(dialog) = this.providers.usage_sources.add.as_mut() else {
+                    return;
+                };
+                if !current || dialog.generation != generation {
+                    this.providers.usage_sources.add = None;
+                    cx.notify();
+                    return;
+                }
+                dialog.saving = false;
+                match error {
+                    None => {
+                        this.providers.usage_sources.add = None;
+                    }
+                    Some(message) => {
+                        dialog.error = Some(message);
+                    }
+                }
+                cx.notify();
             },
             cx,
         );
@@ -445,7 +488,7 @@ impl SettingsView {
         if self.usage_sources_read_only(cx) {
             return;
         }
-        let Some(owner) = UsageSourceOwner::capture(self.state.read(cx)) else {
+        let Some(owner) = UsageSourceOwner::capture(self, cx) else {
             return;
         };
         let focus = cx.focus_handle();
@@ -458,12 +501,26 @@ impl SettingsView {
         let Some(dialog) = self.providers.usage_sources.remove.take() else {
             return;
         };
-        if self.usage_sources_read_only(cx) || !dialog.owner.current(self.state.read(cx)) {
+        if self.usage_sources_read_only(cx) || !dialog.owner.current(self, cx) {
             cx.notify();
             return;
         }
-        self.update_scoped_single_env(
-            ServerSettingChange::Prepared(remove_usage_limit_source_patch(&dialog.id)),
+        let payload = remove_usage_limit_source_patch(&dialog.id);
+        self.dispatch_usage_source_patch(
+            payload,
+            |error, this, cx| {
+                if let Some(message) = error {
+                    this.state.update(cx, |state, cx| {
+                        state.show_toast(
+                            crate::toast::Toast::new(
+                                crate::toast::ToastKind::Error,
+                                format!("Could not remove usage provider: {message}"),
+                            ),
+                            cx,
+                        );
+                    });
+                }
+            },
             cx,
         );
         cx.notify();
@@ -741,7 +798,7 @@ impl SettingsView {
             return None;
         }
         let p = palette(cx);
-        let can_check = self.may(SETTINGS_WRITE_SCOPE, cx);
+        let can_check = self.usage_sources_may(SETTINGS_WRITE_SCOPE, cx);
         let status = self
             .providers
             .usage_sources
@@ -789,6 +846,7 @@ impl SettingsView {
 #[cfg(all(test, feature = "snapshot"))]
 mod tests {
     use super::*;
+    use crate::app_state::AppState;
     use serde_json::json;
 
     struct Host(Entity<SettingsView>);
@@ -941,16 +999,18 @@ mod tests {
         assert_eq!(
             payload,
             json!({
-                "usageLimitSources": {
-                    "cliproxy-hub.example.ts.net-8318": {
-                        "kind": "cliproxy",
-                        "label": "Team Hub",
-                        "url": "https://hub.example.ts.net:8318",
-                        "managementKey": {
-                            "provider": "op-work",
-                            "reference": "op://Vault/Hub/key"
-                        },
-                        "enabled": true
+                "patch": {
+                    "usageLimitSources": {
+                        "cliproxy-hub.example.ts.net-8318": {
+                            "kind": "cliproxy",
+                            "label": "Team Hub",
+                            "url": "https://hub.example.ts.net:8318",
+                            "managementKey": {
+                                "provider": "op-work",
+                                "reference": "op://Vault/Hub/key"
+                            },
+                            "enabled": true
+                        }
                     }
                 }
             })
@@ -984,7 +1044,7 @@ mod tests {
             })
             .unwrap();
 
-        // 4. Remove confirm sends `{ usageLimitSources: { [id]: null } }`.
+        // 4. Remove confirm sends `{ patch: { usageLimitSources: { [id]: null } } }`.
         window
             .update(cx, |host, window, cx| {
                 host.0.update(cx, |settings, cx| {
@@ -997,8 +1057,145 @@ mod tests {
         cx.run_until_parked();
         let (method, payload, reply) = fixture.next_request().await;
         assert_eq!(method, "server.updateSettings");
-        assert_eq!(payload, json!({ "usageLimitSources": { "cliproxy-hub.example.ts.net-8318": null } }));
+        assert_eq!(
+            payload,
+            json!({ "patch": { "usageLimitSources": { "cliproxy-hub.example.ts.net-8318": null } } })
+        );
         let _ = reply.send(Ok(json!({})));
+        cx.run_until_parked();
+
+        state.update(cx, |state, _| state.stop_pump());
+        runtime.shutdown_background();
+    }
+
+    #[gpui::test]
+    async fn usage_sources_gate_on_providers_manage_distinct_from_settings_write(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture, view, window) = install_settings_with_secrets(cx, &runtime, json!({}));
+
+        // 1. settings:write alone (no providers:manage) => read-only; Add/Remove blocked.
+        fixture
+            .grants
+            .send(Some(serde_json::from_value(json!({ "authenticated": true, "permissions": ["settings:write"] })).unwrap()))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |settings, cx| {
+                    assert!(settings.usage_sources_read_only(cx));
+                    settings.open_add_usage_source_dialog("Work Mac".into(), window, cx);
+                    assert!(settings.providers.usage_sources.add.is_none());
+                    settings.open_remove_usage_source_dialog("hub-1".into(), "Hub 1".into(), window, cx);
+                    assert!(settings.providers.usage_sources.remove.is_none());
+                });
+            })
+            .unwrap();
+
+        // 2. providers:manage alone (no settings:write) => editable, secret check blocked, save succeeds.
+        fixture
+            .grants
+            .send(Some(serde_json::from_value(json!({ "authenticated": true, "permissions": ["providers:manage"] })).unwrap()))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |settings, cx| {
+                    assert!(!settings.usage_sources_read_only(cx));
+                    settings.open_add_usage_source_dialog("Work Mac".into(), window, cx);
+                    let dialog = settings.providers.usage_sources.add.as_ref().unwrap();
+                    dialog.url.update(cx, |input, cx| input.set_value("https://hub.example.ts.net:8318", window, cx));
+                    settings.select_usage_source_secret_provider(Some("op-work".into()), window, cx);
+                    let dialog = settings.providers.usage_sources.add.as_ref().unwrap();
+                    dialog.key.update(cx, |input, cx| input.set_value("op://Vault/Hub/key", window, cx));
+                    settings.commit_usage_source_key(cx);
+                    // Secret check requires settings:write, so it must NOT fire.
+                    settings.check_usage_source_secret("op-work".into(), "op://Vault/Hub/key".into(), cx);
+                    let dialog = settings.providers.usage_sources.add.as_ref().unwrap();
+                    assert!(dialog.secret_checks.is_empty(), "checkSecretSource must stay gated on settings:write");
+                    settings.save_usage_source(cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let (method, payload, reply) = fixture.next_request().await;
+        assert_eq!(method, "server.updateSettings");
+        assert_eq!(
+            payload["patch"]["usageLimitSources"]["cliproxy-hub.example.ts.net-8318"]["managementKey"],
+            json!({ "provider": "op-work", "reference": "op://Vault/Hub/key" })
+        );
+        let _ = reply.send(Ok(json!({})));
+        cx.run_until_parked();
+
+        // 3. Non-active scoped environment with providers:manage (no settings:write) dispatches to that env.
+        let (connections, _output) = t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+            state.environments.active = Some("saved-local".into());
+            state.environments.environments = serde_json::from_value(json!([
+                {
+                    "id": "saved-local", "environmentId": "env-a", "label": "Work Mac",
+                    "httpBase": "http://127.0.0.1/saved-local", "accessToken": "", "disabled": false
+                },
+                {
+                    "id": "saved-remote", "environmentId": "env-remote", "label": "Remote Box",
+                    "httpBase": "http://127.0.0.1/saved-remote", "accessToken": "", "disabled": false
+                }
+            ]))
+            .unwrap();
+        });
+        let mut fleet_rx = state.read_with(cx, |s, _| s.connections.view());
+        let remote_grants: t3_core::auth::AuthSessionState =
+            serde_json::from_value(json!({ "authenticated": true, "permissions": ["providers:manage"] })).unwrap();
+        let (remote_client, mut remote_fixture) = t3_client::supervisor::ClientFixture::handle(remote_grants);
+        let mut remote_shell = t3_core::shell::ShellState::default();
+        remote_shell.synchronized = true;
+        let mut remote_config = t3_core::server_config::ServerConfigState::default();
+        remote_config.config = Some(
+            serde_json::from_value(json!({
+                "environment": { "environmentId": "env-remote", "label": "Remote Box", "capabilities": {} },
+                "settings": { "usageLimitSources": {} },
+                "providers": []
+            }))
+            .unwrap(),
+        );
+        let install = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "saved-remote",
+                remote_client,
+                remote_shell,
+                remote_config,
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _remote_events = runtime.spawn(install).await.unwrap();
+        let fleet = fleet_rx.borrow_and_update().clone();
+        state.update(cx, |state, cx| state.apply_fleet_view(fleet, cx));
+        cx.run_until_parked();
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |settings, cx| {
+                    settings.scope.machine = Some("env-remote".into());
+                    assert!(!settings.usage_sources_read_only(cx));
+                    settings.open_add_usage_source_dialog("Remote Box".into(), window, cx);
+                    let dialog = settings.providers.usage_sources.add.as_ref().unwrap();
+                    dialog.url.update(cx, |input, cx| input.set_value("http://remote-hub:8318", window, cx));
+                    dialog.key.update(cx, |input, cx| input.set_value("secret-key", window, cx));
+                    settings.save_usage_source(cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let (method, payload, reply) = remote_fixture.next_request().await;
+        assert_eq!(method, "server.updateSettings");
+        assert_eq!(
+            payload["patch"]["usageLimitSources"]["cliproxy-remote-hub-8318"]["managementKey"],
+            json!("secret-key")
+        );
+        let _ = reply.send(Ok(json!({})));
+        cx.run_until_parked();
+        let _ = view;
 
         state.update(cx, |state, _| state.stop_pump());
         runtime.shutdown_background();

@@ -116,7 +116,7 @@ pub fn source_id_from_url(url: &str, sources: &Map<String, Value>) -> String {
     id
 }
 
-/// Builds the `server.updateSettings` patch to add or update a CLIProxyAPI usage limit source.
+/// Builds the `server.updateSettings` payload to add or update a CLIProxyAPI usage limit source.
 pub fn upsert_usage_limit_source_patch(
     id: &str,
     url: &str,
@@ -133,14 +133,14 @@ pub fn upsert_usage_limit_source_patch(
     entry.insert("enabled".into(), json!(true));
     let mut sources = Map::new();
     sources.insert(id.to_owned(), Value::Object(entry));
-    json!({ "usageLimitSources": Value::Object(sources) })
+    json!({ "patch": { "usageLimitSources": Value::Object(sources) } })
 }
 
-/// Builds the `server.updateSettings` patch to remove a usage limit source (`{ [id]: null }`).
+/// Builds the `server.updateSettings` payload to remove a usage limit source (`{ [id]: null }`).
 pub fn remove_usage_limit_source_patch(id: &str) -> Value {
     let mut sources = Map::new();
     sources.insert(id.to_owned(), Value::Null);
-    json!({ "usageLimitSources": Value::Object(sources) })
+    json!({ "patch": { "usageLimitSources": Value::Object(sources) } })
 }
 
 #[cfg(test)]
@@ -223,19 +223,21 @@ mod tests {
         assert_eq!(
             ref_patch,
             json!({
-                "usageLimitSources": {
-                    "cliproxy-hub": {
-                        "kind": "cliproxy",
-                        "url": "https://hub.example.ts.net:8318",
-                        "managementKey": { "provider": "op-work", "reference": "op://Vault/Hub/key" },
-                        "enabled": true
+                "patch": {
+                    "usageLimitSources": {
+                        "cliproxy-hub": {
+                            "kind": "cliproxy",
+                            "url": "https://hub.example.ts.net:8318",
+                            "managementKey": { "provider": "op-work", "reference": "op://Vault/Hub/key" },
+                            "enabled": true
+                        }
                     }
                 }
             })
         );
         assert_eq!(
             remove_usage_limit_source_patch("cliproxy-hub"),
-            json!({ "usageLimitSources": { "cliproxy-hub": null } })
+            json!({ "patch": { "usageLimitSources": { "cliproxy-hub": null } } })
         );
     }
 }

@@ -595,4 +595,293 @@ mod tests {
         state.update(vcx, |state, _| state.stop_pump());
         runtime.shutdown_background();
     }
+
+    #[gpui::test]
+    async fn multi_environment_price_overrides_loads_all_targets_guards_and_retries_partial_failure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::prices::TargetSaveStatus;
+        use serde_json::Value;
+        use t3_client::supervisor::{ClientFixture, ConnectionStatus};
+        use t3_core::shell::ShellState;
+
+        struct Host(Entity<UsageView>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _active_fixture) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.update(|cx| init(state.clone(), cx));
+
+        let (connections, _output) = t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+            state.environments.active = Some("env-mac".to_owned());
+            state.environments.environments = serde_json::from_value(json!([
+                {
+                    "id": "env-mac", "environmentId": "env-mac-id", "label": "Mac Studio",
+                    "httpBase": "http://mac.invalid", "accessToken": "", "disabled": false
+                },
+                {
+                    "id": "env-linux", "environmentId": "env-linux-id", "label": "Linux Box",
+                    "httpBase": "http://linux.invalid", "accessToken": "", "disabled": false
+                }
+            ]))
+            .unwrap();
+        });
+        let mut fleet_rx = state.read_with(cx, |s, _| s.connections.view());
+        let rw_grants: t3_core::auth::AuthSessionState =
+            serde_json::from_value(json!({ "authenticated": true, "permissions": ["diagnostics:read", "settings:write"] })).unwrap();
+        let ro_grants: t3_core::auth::AuthSessionState =
+            serde_json::from_value(json!({ "authenticated": true, "permissions": ["diagnostics:read"] })).unwrap();
+        let (client_a, mut fixture_a) = ClientFixture::handle(rw_grants.clone());
+        let (client_b, mut fixture_b) = ClientFixture::handle(rw_grants.clone());
+        state.update(cx, |state, cx| {
+            state.install_active_environment(
+                client_a.clone(),
+                ShellState::default(),
+                server_config_for("env-mac-id", "Mac Studio"),
+                ConnectionStatus::Connected,
+                cx,
+            );
+        });
+        let install_a = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "env-mac",
+                client_a,
+                ShellState::default(),
+                server_config_for("env-mac-id", "Mac Studio"),
+                ConnectionStatus::Connected,
+            )
+        });
+        let install_b = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "env-linux",
+                client_b,
+                ShellState::default(),
+                server_config_for("env-linux-id", "Linux Box"),
+                ConnectionStatus::Connected,
+            )
+        });
+        let _events_a = runtime.spawn(install_a).await.unwrap();
+        let _events_b = runtime.spawn(install_b).await.unwrap();
+        let fleet = fleet_rx.borrow_and_update().clone();
+        state.update(cx, |state, cx| state.apply_fleet_view(fleet, cx));
+
+        let window = cx.add_window(|window, cx| Host(cx.new(|cx| UsageView::new(state.clone(), window, cx))));
+        let view = window.read_with(cx, |host, _| host.0.clone()).unwrap();
+        cx.run_until_parked();
+
+        async fn next_matching(
+            fixture: &mut ClientFixture,
+            host: &str,
+            model: &str,
+            expected: &str,
+        ) -> (String, Value, tokio::sync::oneshot::Sender<Result<Value, t3_client::session::RpcError>>) {
+            loop {
+                let (method, payload, reply) = fixture.next_request().await;
+                if method == expected {
+                    return (method.to_owned(), payload, reply);
+                }
+                let _ = reply.send(Ok(sample_summary(host, model, 1.0, 100)));
+            }
+        }
+
+        // 1. Open Model prices dialog: MUST fetch server.getConfig from BOTH environments.
+        let (loaded_tx, loaded_rx) = tokio::sync::oneshot::channel::<()>();
+        let loaded_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(loaded_tx)));
+        let _load_obs = cx.update(|cx| {
+            let loaded_tx = loaded_tx.clone();
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).prices.as_ref().is_some_and(|d| !d.loading)
+                    && let Some(tx) = loaded_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        window.update(cx, |host, window, cx| host.0.update(cx, |v, cx| v.open_price_overrides(None, window, cx))).unwrap();
+        cx.run_until_parked();
+
+        let (req_a, req_b) = futures::future::join(
+            next_matching(&mut fixture_a, "host-mac", "model-a", t3_core::usage::price_overrides::GET_CONFIG),
+            next_matching(&mut fixture_b, "host-linux", "model-b", t3_core::usage::price_overrides::GET_CONFIG),
+        )
+        .await;
+        assert_eq!(req_a.0, t3_core::usage::price_overrides::GET_CONFIG);
+        assert_eq!(req_b.0, t3_core::usage::price_overrides::GET_CONFIG);
+        // Mac has model-a (aliases supported); Linux has model-b (aliases NOT supported).
+        let _ = req_a.2.send(Ok(json!({
+            "environment": { "capabilities": { "usageModelAliases": true } },
+            "settings": {
+                "usagePriceOverrides": {
+                    "model-a": { "inputCostPerMillionTokens": 3.0, "outputCostPerMillionTokens": 15.0 }
+                },
+                "usageModelAliases": {}
+            }
+        })));
+        let _ = req_b.2.send(Ok(json!({
+            "environment": { "capabilities": { "usageModelAliases": false } },
+            "settings": {
+                "usagePriceOverrides": {
+                    "model-b": { "inputCostPerMillionTokens": 5.0, "outputCostPerMillionTokens": 25.0 }
+                },
+                "usageModelAliases": {}
+            }
+        })));
+        loaded_rx.await.expect("both target configs loaded");
+        cx.run_until_parked();
+
+        // Both environments' models appear in the dialog (not just targets[0]).
+        view.read_with(cx, |view, cx| {
+            let dialog = view.prices.as_ref().unwrap();
+            assert_eq!(dialog.targets.len(), 2);
+            assert_eq!(dialog.row_models_for_test(cx), vec!["model-a".to_owned(), "model-b".to_owned()]);
+        });
+
+        // 2. Editing model-a alias: Mac saves, Linux fails with "Update server to map models" (no RPC sent to Linux)
+        // and the dialog stays open!
+        let (partial_tx, partial_rx) = tokio::sync::oneshot::channel::<()>();
+        let partial_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(partial_tx)));
+        let _partial_obs = cx.update(|cx| {
+            let partial_tx = partial_tx.clone();
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).prices.as_ref().is_some_and(|d| !d.saving && d.has_failed_destinations())
+                    && let Some(tx) = partial_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |view, cx| {
+                    view.prices.as_ref().unwrap().set_row_alias_for_test("model-a", "claude-sonnet-4", window, cx);
+                    view.save_price_overrides(false, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let (method_a, payload_a, reply_a) = next_matching(
+            &mut fixture_a,
+            "host-mac",
+            "model-a",
+            t3_core::commands::method::SERVER_UPDATE_SETTINGS,
+        )
+        .await;
+        assert_eq!(method_a, t3_core::commands::method::SERVER_UPDATE_SETTINGS);
+        assert_eq!(payload_a["patch"]["usageModelAliases"]["model-a"], json!("claude-sonnet-4"));
+        assert_eq!(payload_a["patch"]["usagePriceOverrides"]["model-a"], Value::Null);
+        let _ = reply_a.send(Ok(json!({})));
+        partial_rx.await.expect("partial failure settled");
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let dialog = view.prices.as_ref().expect("dialog must stay open on partial failure");
+            assert_eq!(dialog.results.get("env-mac"), Some(&TargetSaveStatus::Saved));
+            assert_eq!(
+                dialog.results.get("env-linux"),
+                Some(&TargetSaveStatus::Failed("Update server to map models".to_owned()))
+            );
+        });
+
+        // 3. Edit model-b price: Linux lacks settings:write -> Linux fails "Read-only access" while Mac saves,
+        // then granting settings:write and calling Retry failed targets ONLY Linux and closes dialog.
+        fixture_b.grants.send(Some(ro_grants.clone())).unwrap();
+        state.update(cx, |state, cx| {
+            let fleet = std::sync::Arc::make_mut(&mut state.fleet);
+            if let Some(env) = fleet.environments.iter_mut().find(|e| e.summary.owner.saved_id == "env-linux") {
+                std::sync::Arc::make_mut(env).grants = Some(ro_grants.clone());
+            }
+            cx.emit(AppEvent::Shell);
+        });
+        cx.run_until_parked();
+
+        let (ro_tx, ro_rx) = tokio::sync::oneshot::channel::<()>();
+        let ro_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(ro_tx)));
+        let _ro_obs = cx.update(|cx| {
+            let ro_tx = ro_tx.clone();
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).prices.as_ref().is_some_and(|d| {
+                    !d.saving && d.results.get("env-linux") == Some(&TargetSaveStatus::Failed("Read-only access".to_owned()))
+                }) && let Some(tx) = ro_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        window
+            .update(cx, |host, window, cx| {
+                host.0.update(cx, |view, cx| {
+                    view.prices.as_ref().unwrap().set_row_alias_for_test("model-a", "", window, cx);
+                    view.prices.as_ref().unwrap().set_row_price_for_test("model-a", "3", "15", window, cx);
+                    view.prices.as_ref().unwrap().set_row_price_for_test("model-b", "6", "30", window, cx);
+                    view.save_price_overrides(false, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let (method_a, payload_a, reply_a) = next_matching(
+            &mut fixture_a,
+            "host-mac",
+            "model-a",
+            t3_core::commands::method::SERVER_UPDATE_SETTINGS,
+        )
+        .await;
+        assert_eq!(method_a, t3_core::commands::method::SERVER_UPDATE_SETTINGS);
+        assert_eq!(payload_a["patch"]["usagePriceOverrides"]["model-b"]["inputCostPerMillionTokens"], json!(6.0));
+        let _ = reply_a.send(Ok(json!({})));
+        ro_rx.await.expect("read-only failure recorded");
+        cx.run_until_parked();
+
+        // Grant settings:write on Linux and retry ONLY failed destinations -> closes dialog on success!
+        fixture_b.grants.send(Some(rw_grants.clone())).unwrap();
+        state.update(cx, |state, cx| {
+            let fleet = std::sync::Arc::make_mut(&mut state.fleet);
+            if let Some(env) = fleet.environments.iter_mut().find(|e| e.summary.owner.saved_id == "env-linux") {
+                std::sync::Arc::make_mut(env).grants = Some(rw_grants.clone());
+            }
+            cx.emit(AppEvent::Shell);
+        });
+        let _ = &mut fleet_rx;
+        cx.run_until_parked();
+
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let closed_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(closed_tx)));
+        let _close_obs = cx.update(|cx| {
+            let closed_tx = closed_tx.clone();
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).prices.is_none()
+                    && let Some(tx) = closed_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        window.update(cx, |host, _, cx| host.0.update(cx, |view, cx| view.save_price_overrides(true, cx))).unwrap();
+        cx.run_until_parked();
+
+        let (method_b, payload_b, reply_b) = next_matching(
+            &mut fixture_b,
+            "host-linux",
+            "model-b",
+            t3_core::commands::method::SERVER_UPDATE_SETTINGS,
+        )
+        .await;
+        assert_eq!(method_b, t3_core::commands::method::SERVER_UPDATE_SETTINGS);
+        assert_eq!(payload_b["patch"]["usagePriceOverrides"]["model-b"]["inputCostPerMillionTokens"], json!(6.0));
+        let _ = reply_b.send(Ok(json!({})));
+        closed_rx.await.expect("dialog closes once retry succeeds");
+
+        state.update(cx, |state, _| state.stop_pump());
+        runtime.shutdown_background();
+    }
 }
