@@ -86,7 +86,55 @@ fn expiry_labels_and_pairing_urls_match_the_web() {
     assert_eq!(revoked_others_label(3), "Revoked 3 clients");
 
     assert_eq!(pairing_url("http://mac.tailnet.ts.net:3773/", "ABC234").as_deref(), Some("http://mac.tailnet.ts.net:3773/pair#token=ABC234"));
+    assert_eq!(pairing_url("https://host.example.ts.net/settings", "ABC234").as_deref(), Some("https://host.example.ts.net/pair#token=ABC234"));
+    assert_eq!(pairing_url("t3code://app/settings/connections", "ABC234"), None);
     assert_eq!(pairing_url("http://127.0.0.1:3773", "ABC234"), None);
+    assert_eq!(pairing_url("http://127.0.0.2:3773", "ABC234"), None);
     assert_eq!(pairing_url("http://[::1]:3773", "ABC234"), None);
     assert_eq!(pairing_url("http://localhost:3773", "ABC234"), None);
+    assert_eq!(pairing_url("http://box.localhost:3773", "ABC234"), None);
+}
+
+#[test]
+fn relay_configure_scope_warnings_and_turn_on_rules_match_web() {
+    let std = standard_scopes();
+    assert_eq!(
+        scope_warning("terminal:operate", &std),
+        Some("Terminal commands can read or change files within the server account\u{2019}s permissions.")
+    );
+    assert_eq!(scope_warning(RELAY_CONFIGURE, &std), None);
+    let admin = administrative_scopes();
+    assert_eq!(
+        scope_warning(RELAY_CONFIGURE, &admin),
+        Some("This client can change who can issue pairing credentials.")
+    );
+
+    let unlinked = CloudLinkState::default();
+    assert!(cloud_change_replaces_link(&unlinked, true, false));
+    assert!(cloud_change_replaces_link(&unlinked, false, true));
+    assert!(!cloud_change_replaces_link(&unlinked, false, false));
+
+    let tunnel_link = CloudLinkState {
+        linked: true,
+        managed_tunnel_active: true,
+        publish_agent_activity: true,
+        ..Default::default()
+    };
+    assert!(!cloud_change_replaces_link(&tunnel_link, false, false), "unlinking only needs relay:write");
+    assert!(!cloud_change_replaces_link(&tunnel_link, true, false), "toggling publish on tunnel link only needs relay:write");
+    assert!(cloud_change_replaces_link(&tunnel_link, false, true), "dropping tunnel while keeping publish replaces link");
+    assert!(cloud_change_replaces_link(
+        &CloudLinkState { link_revoked: true, ..tunnel_link.clone() },
+        true,
+        true
+    ));
+
+    // Remote clients with relay:configure can link (`pingdotgg/t3code#38892`).
+    assert_eq!(resolve_t3_connect_turn_on(true, true, true, true, true, None), T3ConnectTurnOn::Here);
+    assert_eq!(resolve_t3_connect_turn_on(true, true, true, true, false, None), T3ConnectTurnOn::OnHost);
+    assert_eq!(resolve_t3_connect_turn_on(false, true, true, true, true, None), T3ConnectTurnOn::OnHost);
+    assert_eq!(
+        resolve_t3_connect_turn_on(true, true, true, true, true, Some("Blocked by policy")),
+        T3ConnectTurnOn::Policy("Blocked by policy".to_owned())
+    );
 }

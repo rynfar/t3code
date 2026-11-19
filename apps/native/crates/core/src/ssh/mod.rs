@@ -59,8 +59,9 @@ pub const TUNNEL_READY_PROBE_TIMEOUT_MS: u64 = 5_000;
 /// (`pingdotgg/t3code#35874`).
 pub const TUNNEL_REUSE_TIMEOUT_MS: u64 = TUNNEL_READY_PROBE_TIMEOUT_MS;
 pub const TUNNEL_SHUTDOWN_TIMEOUT_MS: u64 = 2_000;
-/// `REMOTE_LAUNCH_LOCK_WAIT_SECONDS` (`packages/ssh/src/tunnel.ts`, `pingdotgg/t3code#32587`).
-pub const REMOTE_LAUNCH_LOCK_WAIT_SECONDS: u64 = 82;
+/// `REMOTE_LAUNCH_LOCK_WAIT_SECONDS` (`packages/ssh/src/tunnel.ts`, `pingdotgg/t3code#32587`,
+/// `pingdotgg/t3code#36672`: includes `REMOTE_OWNER_WAIT_MS` = 63s for a starting server/boot service).
+pub const REMOTE_LAUNCH_LOCK_WAIT_SECONDS: u64 = 145;
 pub const TUNNEL_STDERR_TAIL_CHARS: usize = 16_384;
 const MAX_ERROR_OUTPUT_LENGTH: usize = 4_000;
 /// `DEFAULT_SSH_PASSWORD_PROMPT_TIMEOUT_MS`.
@@ -145,6 +146,21 @@ pub fn base_ssh_args(target: &SshTarget, batch_mode: bool) -> Vec<String> {
         args.extend(["-p".to_owned(), port.to_string()]);
     }
     args
+}
+
+/// `remoteLoginShellArgs` (`packages/ssh/src/tunnel.ts`, `pingdotgg/t3code#35268`):
+/// shells known to take `-l -c` with POSIX `exec` read their login profiles first so user-installed
+/// `t3` on `$PATH` is found; any other shell keeps plain `sh -l -s`.
+pub fn remote_login_shell_args(args: Option<&str>) -> Vec<String> {
+    let suffix = match args.map(str::trim).filter(|a| !a.is_empty()) {
+        Some(args) => format!(" -- {args}"),
+        None => String::new(),
+    };
+    let script = format!(
+        r#"case "${{SHELL##*/}}" in bash|zsh|ksh|fish|nu) exec "$SHELL" -l -c "exec sh -s{suffix}" ;; *) exec sh -l -s{suffix} ;; esac"#
+    );
+    let quoted = format!("'{}'", script.replace('\'', r"'\''"));
+    vec!["sh".to_owned(), "-c".to_owned(), quoted]
 }
 
 /// `runSshCommand`'s arguments. The host spec follows `--`, so an alias shaped like an option

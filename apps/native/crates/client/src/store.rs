@@ -144,6 +144,38 @@ impl SavedEnvironments {
         self.upsert_route(paired, false, Some(target))
     }
 
+    /// `EnvironmentRegistry.assertKnownAddress` for untargeted SSH onboarding
+    /// (`packages/client-runtime/src/connection/onboarding.ts`, `pingdotgg/t3code#37818`):
+    /// refuses to attach a new SSH route to an environment already saved under a different route.
+    pub fn check_ssh_onboarding_conflict(
+        &self,
+        environment_id: Option<&str>,
+        target: &t3_core::ssh::SshTarget,
+    ) -> Result<(), String> {
+        let Some(env_id) = environment_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            return Ok(());
+        };
+        let Some(saved) = self
+            .environments
+            .iter()
+            .find(|environment| environment.environment_id.as_deref() == Some(env_id))
+        else {
+            return Ok(());
+        };
+        let incoming_key = t3_core::ssh::target_connection_key(target);
+        let same_ssh = saved
+            .ssh
+            .as_ref()
+            .is_some_and(|existing| t3_core::ssh::target_connection_key(existing) == incoming_key);
+        if same_ssh {
+            return Ok(());
+        }
+        Err(format!(
+            "That address claims to be {}, which is already saved. Add it as a route from that environment's settings instead.",
+            saved.label
+        ))
+    }
+
     fn upsert_route(&mut self, paired: &Paired, local: bool, ssh: Option<t3_core::ssh::SshTarget>) -> String {
         let descriptor = paired.descriptor.as_ref();
         let environment_id = descriptor.map(|d| d.environment_id.clone()).filter(|id| !id.is_empty());
@@ -231,6 +263,9 @@ impl SavedEnvironments {
     /// Forgets an environment and its credential. Returns whether it was saved.
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.environments.len();
+        if let Some(removed) = self.environments.iter().find(|environment| environment.id == id) {
+            crate::dpop::remove_direct_credential(&removed.http_base);
+        }
         self.environments.retain(|environment| environment.id != id);
         if self.active.as_deref() == Some(id) {
             self.active = None;
@@ -241,6 +276,7 @@ impl SavedEnvironments {
     /// Drops a credential the server rejected; the entry stays so it can be paired again.
     pub fn revoke(&mut self, id: &str) {
         if let Some(environment) = self.environments.iter_mut().find(|environment| environment.id == id) {
+            crate::dpop::remove_direct_credential(&environment.http_base);
             environment.access_token = None;
         }
     }
@@ -1137,5 +1173,32 @@ mod tests {
         let second = ssh_launcher_id_in(&dir).expect("reuses launcher id");
         assert_eq!(first, second);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_onboarding_refuses_to_attach_new_ssh_route_to_saved_environment() {
+        let mut saved = SavedEnvironments::default();
+        let paired_direct = paired("https://box.example.ts.net:3773", "tok-1", "env-1", "Remote devbox");
+        saved.upsert(&paired_direct, false);
+
+        let ssh_target = t3_core::ssh::SshTarget {
+            alias: "devbox".into(),
+            hostname: "devbox.example.test".into(),
+            username: Some("developer".into()),
+            port: Some(22),
+        };
+        let err = saved
+            .check_ssh_onboarding_conflict(Some("env-1"), &ssh_target)
+            .expect_err("untargeted SSH onboarding must not overwrite an existing direct environment");
+        assert!(err.contains("Remote devbox"), "{err}");
+        assert!(err.contains("already saved"), "{err}");
+
+        // A distinct environment ID is allowed.
+        assert!(saved.check_ssh_onboarding_conflict(Some("env-new"), &ssh_target).is_ok());
+
+        // Re-adding the exact same saved SSH route is allowed.
+        let paired_ssh = paired("http://127.0.0.1:41200", "tok-2", "env-ssh", "SSH Box");
+        saved.upsert_ssh(&paired_ssh, ssh_target.clone());
+        assert!(saved.check_ssh_onboarding_conflict(Some("env-ssh"), &ssh_target).is_ok());
     }
 }

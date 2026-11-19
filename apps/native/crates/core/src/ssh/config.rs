@@ -22,15 +22,16 @@ pub trait ConfigFiles {
 /// unquoted `\ `, and `#` starting a comment only at the start of a token. Invalid quoting leaves
 /// the arguments uncertain (`None`).
 fn parse_config_line(line: &str) -> Option<(String, Option<Vec<String>>)> {
-    let line = line.trim_start();
-    let end = line.find(|c: char| c.is_whitespace() || c == '=').unwrap_or(line.len());
+    let line = line.trim_end_matches([' ', '\t', '\r', '\x0c']);
+    let line = line.trim_start_matches([' ', '\t', '\r']);
+    let end = line.find([' ', '\t', '\r', '=']).unwrap_or(line.len());
     if end == 0 {
         return None;
     }
     let directive = line[..end].to_lowercase();
-    let mut rest = line[end..].trim_start();
+    let mut rest = line[end..].trim_start_matches([' ', '\t', '\r']);
     if let Some(after) = rest.strip_prefix('=') {
-        rest = after.trim_start();
+        rest = after.trim_start_matches([' ', '\t', '\r']);
     }
     let chars: Vec<char> = rest.chars().collect();
     let mut args = Vec::new();
@@ -52,7 +53,7 @@ fn parse_config_line(line: &str) -> Option<(String, Option<Vec<String>>)> {
         } else if c == '"' || c == '\'' {
             quote = Some(c);
             token.get_or_insert_with(String::new);
-        } else if c.is_whitespace() {
+        } else if matches!(c, ' ' | '\t') {
             args.extend(token.take());
         } else if c == '#' && token.is_none() {
             break;
@@ -102,15 +103,16 @@ pub(crate) fn has_ssh_pattern(value: &str) -> bool {
     value.contains('*') || value.contains('?') || value.starts_with('!')
 }
 
-/// `globToRegExp(pattern).test(text)`: `*` is any run, `?` any one character.
+/// OpenSSH matches `Include` globs and `Host` patterns on UTF-8 bytes, so `*` matches any byte
+/// run and `?` consumes one UTF-8 byte (`pingdotgg/t3code#37840`, `pingdotgg/t3code#38184`).
 fn glob_matches(pattern: &str, text: &str) -> bool {
-    let (pattern, text): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
+    let (pattern, text) = (pattern.as_bytes(), text.as_bytes());
     let (mut p, mut t, mut star, mut mark) = (0, 0, None, 0);
     while t < text.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) && pattern[p] != '*' {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) && pattern[p] != b'*' {
             p += 1;
             t += 1;
-        } else if p < pattern.len() && pattern[p] == '*' {
+        } else if p < pattern.len() && pattern[p] == b'*' {
             star = Some(p);
             mark = t;
             p += 1;
@@ -122,7 +124,7 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    pattern[p..].iter().all(|c| *c == '*')
+    pattern[p..].iter().all(|b| *b == b'*')
 }
 
 fn expand_glob(pattern: &Path, files: &impl ConfigFiles) -> Vec<PathBuf> {
@@ -135,9 +137,16 @@ fn expand_glob(pattern: &Path, files: &impl ConfigFiles) -> Vec<PathBuf> {
         return Vec::new();
     }
     let base = base.to_string_lossy();
-    let mut matched: Vec<PathBuf> =
-        files.list(directory).into_iter().filter(|entry| glob_matches(&base, entry)).map(|entry| directory.join(entry)).filter(|path| files.exists(path)).collect();
-    matched.sort_by_key(|path| path.to_string_lossy().into_owned());
+    let mut matched: Vec<PathBuf> = files
+        .list(directory)
+        .into_iter()
+        .filter(|entry| !(entry.starts_with('.') && !base.starts_with('.')))
+        .filter(|entry| glob_matches(&base, entry))
+        .map(|entry| directory.join(entry))
+        .filter(|path| files.exists(path))
+        .collect();
+    // OpenSSH's glob sorts matches by raw UTF-8 bytes, not UTF-16 code units (`pingdotgg/t3code#38208`).
+    matched.sort_by(|left, right| left.to_string_lossy().as_bytes().cmp(right.to_string_lossy().as_bytes()));
     matched
 }
 
@@ -479,5 +488,41 @@ mod tests {
         assert_eq!(args("Host \"open"), Some(("host".to_owned(), None)));
         assert_eq!(args("   "), None);
         assert!(glob_matches("dev*box?", "dev-a-box1") && !glob_matches("dev*", "prod"));
+    }
+
+    #[test]
+    fn unicode_wildcards_utf8_include_order_and_literal_home_paths_match_openssh() {
+        // `pingdotgg/t3code#37840` & `pingdotgg/t3code#38184`: `?` consumes one UTF-8 byte in both Include globs and Host patterns.
+        assert!(glob_matches("exact??.conf", "exactø.conf"), "ø is 2 UTF-8 bytes");
+        assert!(!glob_matches("team?one.conf", "teamøone.conf"));
+        assert!(glob_matches("team?one.conf", "teamxone.conf"));
+        assert!(!glob_matches("svc?x", "svc\u{2028}x"), "U+2028 is 3 UTF-8 bytes");
+        assert!(glob_matches("svc???x", "svc\u{2028}x"));
+
+        // `pingdotgg/t3code#38208`: wildcard Include reads in UTF-8 byte order (U+E000 -> 0xEE before U+1F600 -> 0xF0),
+        // so the first HostName wins in UTF-8 order (not UTF-16 surrogate order).
+        // `pingdotgg/t3code#33288`: home paths containing `$&` / `$$` stay literal during `~` expansion.
+        let special_home = "/home/a$&b/$$";
+        let files = Files::default()
+            .file(
+                &format!("{special_home}/.ssh/config"),
+                "Include ~/.ssh/config.d/*\nInclude single.d/team?one.conf\nInclude single.d/exact??.conf\nHost svc?x\n  HostName wrong.example.com\nHost svc\u{2028}x\n  HostName correct.example.com\n",
+            )
+            .file(&format!("{special_home}/.ssh/config.d/.hidden.conf"), "Host hidden\n  HostName hidden.example.com\n")
+            .file(&format!("{special_home}/.ssh/config.d/\u{e000}.conf"), "Host ordered\n  HostName utf8-first.example.com\n")
+            .file(&format!("{special_home}/.ssh/config.d/\u{1f600}.conf"), "Host ordered\n  HostName utf16-first.example.com\n")
+            .file(&format!("{special_home}/.ssh/single.d/teamxone.conf"), "Host single-ascii\n  HostName single-ascii.example.com\n")
+            .file(&format!("{special_home}/.ssh/single.d/teamøone.conf"), "Host single-unicode\n  HostName single-unicode.example.com\n")
+            .file(&format!("{special_home}/.ssh/single.d/exactø.conf"), "Host double-byte\n  HostName double-byte.example.com\n");
+        let hosts = discover_ssh_hosts(Path::new(special_home), &files);
+        assert_eq!(
+            summary(&hosts),
+            [
+                ("double-byte", "double-byte.example.com", HostSource::SshConfig),
+                ("ordered", "utf8-first.example.com", HostSource::SshConfig),
+                ("single-ascii", "single-ascii.example.com", HostSource::SshConfig),
+                ("svc\u{2028}x", "correct.example.com", HostSource::SshConfig),
+            ]
+        );
     }
 }

@@ -146,6 +146,8 @@ pub const ANOTHER_ADDRESS: &str = "another-address";
 pub const MINT_PAIRING_CODE_TIMEOUT_MS: u64 = 8_000;
 /// `PEER_PAIRING_CODE_LABEL` in `packages/client-runtime/src/state/peerPairingCode.ts`.
 pub const PEER_PAIRING_CODE_LABEL: &str = "T3 Code link";
+/// `purpose` binding automatic pairing codes to peer links (`pingdotgg/t3code#37825`).
+pub const PEER_LINK_PURPOSE: &str = "peer-link";
 /// `MCP_APPROVAL_CODE_LABEL` in `packages/client-runtime/src/state/peerPairingCode.ts`.
 pub const MCP_APPROVAL_CODE_LABEL: &str = "App sign-in";
 
@@ -192,14 +194,35 @@ pub struct PairingCredentialResult {
     pub credential: String,
     pub expires_at: Option<String>,
     pub label: Option<String>,
+    pub purpose: Option<String>,
+    pub access: Option<String>,
 }
 
-/// Builds the `POST /api/auth/pairing-token` body for `createPeerPairingCodeCommand`.
+/// Builds the `POST /api/auth/pairing-token` body for `createPeerPairingCodeCommand`
+/// (`pingdotgg/t3code#37825`: binds automatic codes to `purpose: "peer-link"` + `access`).
 pub fn peer_pairing_code_request_body(access: &str) -> Value {
     json!({
         "label": PEER_PAIRING_CODE_LABEL,
-        "scopes": crate::settings::mcp_client_scopes(access),
+        "access": access,
+        "purpose": PEER_LINK_PURPOSE,
     })
+}
+
+/// Validates that a minted pairing credential is bound to `purpose: "peer-link"` at `expected_access`
+/// (`pingdotgg/t3code#37825`).
+pub fn validate_peer_link_credential(
+    minted: &PairingCredentialResult,
+    expected_access: &str,
+) -> Result<String, PeerPairingCodeError> {
+    if minted.purpose.as_deref() == Some(PEER_LINK_PURPOSE)
+        && minted.access.as_deref() == Some(expected_access)
+    {
+        Ok(minted.credential.clone())
+    } else {
+        Err(PeerPairingCodeError::unavailable(Some(
+            "The environment did not issue a peer-link code.".to_owned(),
+        )))
+    }
 }
 
 /// Builds the `POST /api/auth/pairing-token` body for `createMcpApprovalCodeCommand`.
@@ -223,6 +246,8 @@ pub fn decode_pairing_credential_result(value: &Value) -> Option<PairingCredenti
         credential,
         expires_at: value.get("expiresAt").and_then(Value::as_str).map(str::to_owned),
         label: value.get("label").and_then(Value::as_str).map(str::to_owned),
+        purpose: value.get("purpose").and_then(Value::as_str).map(str::to_owned),
+        access: value.get("access").and_then(Value::as_str).map(str::to_owned),
     })
 }
 
@@ -555,14 +580,18 @@ mod tests {
     #[test]
     fn peer_pairing_code_payloads_errors_and_link_machine_select_helpers_match_web() {
         let peer_body = peer_pairing_code_request_body("read-only");
-        assert_eq!(peer_body["label"], PEER_PAIRING_CODE_LABEL);
-        assert_eq!(peer_body["scopes"], json!(["orchestration:read"]));
+        assert_eq!(peer_body, json!({
+            "label": PEER_PAIRING_CODE_LABEL,
+            "access": "read-only",
+            "purpose": PEER_LINK_PURPOSE,
+        }));
 
         let full_body = peer_pairing_code_request_body("full-access");
-        assert_eq!(
-            full_body["scopes"],
-            json!(["orchestration:read", "orchestration:operate", "settings:write", "source-control:write"])
-        );
+        assert_eq!(full_body, json!({
+            "label": PEER_PAIRING_CODE_LABEL,
+            "access": "full-access",
+            "purpose": PEER_LINK_PURPOSE,
+        }));
 
         let approval_body = mcp_approval_code_request_body("approval-required");
         assert_eq!(approval_body, json!({ "label": MCP_APPROVAL_CODE_LABEL, "access": "approval-required" }));
@@ -571,11 +600,29 @@ mod tests {
             "id": "link-1",
             "credential": "AUTO-abc123",
             "expiresAt": "2026-11-19T10:00:00.000Z",
-            "label": "App sign-in"
+            "label": "App sign-in",
+            "purpose": "peer-link",
+            "access": "approval-required"
         }))
         .expect("decoded credential");
         assert_eq!(decoded.credential, "AUTO-abc123");
         assert_eq!(decoded.id.as_deref(), Some("link-1"));
+        assert_eq!(decoded.purpose.as_deref(), Some("peer-link"));
+        assert_eq!(decoded.access.as_deref(), Some("approval-required"));
+        assert_eq!(validate_peer_link_credential(&decoded, "approval-required").as_deref(), Ok("AUTO-abc123"));
+        assert_eq!(
+            validate_peer_link_credential(&decoded, "full-access").unwrap_err().reason,
+            PeerPairingCodeErrorReason::Unavailable
+        );
+        let without_purpose = decode_pairing_credential_result(&json!({
+            "credential": "AUTO-old",
+            "access": "approval-required"
+        }))
+        .expect("decoded without purpose");
+        assert_eq!(
+            validate_peer_link_credential(&without_purpose, "approval-required").unwrap_err().reason,
+            PeerPairingCodeErrorReason::Unavailable
+        );
         assert_eq!(decode_pairing_credential_result(&json!({ "credential": "   " })), None);
 
         assert_eq!(

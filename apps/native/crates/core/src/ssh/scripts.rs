@@ -5,8 +5,27 @@
 
 use super::is_exact_archive_version;
 
+/// `CLI_RELEASE_BASE_URL_ENV` (`packages/shared/src/cliRelease.ts`, `pingdotgg/t3code#31396`).
+pub const RELEASE_BASE_URL_ENV: &str = "T3CODE_RELEASE_BASE_URL";
+
 /// `cliReleaseDownloadBaseUrl` without the version segment.
-const RELEASE_BASE_URL: &str = "https://github.com/pingdotgg/t3code/releases/download";
+pub const RELEASE_BASE_URL: &str = "https://github.com/pingdotgg/t3code/releases/download";
+
+/// Resolves the release base URL from an optional override (`T3CODE_RELEASE_BASE_URL`),
+/// falling back to `RELEASE_BASE_URL` (`pingdotgg/t3code#31396`).
+pub fn resolve_release_base_url(override_url: Option<&str>) -> String {
+    override_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_owned())
+        .unwrap_or_else(|| RELEASE_BASE_URL.to_owned())
+}
+
+/// NFS-shared homes can link `~/.t3` to a directory that does not exist yet, and `mkdir -p` fails
+/// with `EEXIST` on a dangling symlink, so create its target first (`pingdotgg/t3code#39184`).
+const ENSURE_T3_HOME_SCRIPT: &str = r#"if [ -L "$HOME/.t3" ] && [ ! -e "$HOME/.t3" ]; then
+  (cd "$HOME" && mkdir -p "$(readlink .t3)")
+fi"#;
 
 /// `shellSingleQuote`.
 fn single_quote(value: &str) -> String {
@@ -22,6 +41,12 @@ T3_ARCHIVE_VERSION=@@T3_ARCHIVE_VERSION@@
 if [ -z "$T3_ARCHIVE_VERSION" ]; then
   printf 'No t3 release version was provided for the remote runtime.\n' >&2
   exit 1
+fi
+T3_SYSTEM_EXECUTABLE="$(command -v t3 2>/dev/null || true)"
+if [ -n "$T3_SYSTEM_EXECUTABLE" ] && T3_SYSTEM_VERSION="$("$T3_SYSTEM_EXECUTABLE" --version 2>/dev/null)" && [ "$T3_SYSTEM_VERSION" = "t3 v$T3_ARCHIVE_VERSION" ]; then
+  # A matching host-provided runtime supports platforms such as musl Linux,
+  # where the portable release archive cannot run (`pingdotgg/t3code#35268`).
+  exec "$T3_SYSTEM_EXECUTABLE" "$@"
 fi
 # Self-contained release archive: no Node, npm, or compiler on the remote.
 # Unpacked into the pinned-runtime layout so `t3 service install` reuses it.
@@ -85,9 +110,9 @@ if ! t3_runtime_ready; then
   t3_fetch "$T3_RELEASE_BASE_URL/v$T3_ARCHIVE_VERSION/$T3_ARCHIVE" "$T3_STAGING/$T3_ARCHIVE" 240
   T3_EXPECTED="$(grep " \*\{0,1\}$T3_ARCHIVE$" "$T3_STAGING/SHA256SUMS" | cut -d' ' -f1)"
   if command -v sha256sum >/dev/null 2>&1; then
-    T3_ACTUAL="$(sha256sum "$T3_STAGING/$T3_ARCHIVE" | cut -d' ' -f1)"
+    T3_ACTUAL="$(sha256sum < "$T3_STAGING/$T3_ARCHIVE" | cut -d' ' -f1)"
   else
-    T3_ACTUAL="$(shasum -a 256 "$T3_STAGING/$T3_ARCHIVE" | cut -d' ' -f1)"
+    T3_ACTUAL="$(shasum -a 256 < "$T3_STAGING/$T3_ARCHIVE" | cut -d' ' -f1)"
   fi
   if [ -z "$T3_EXPECTED" ] || [ "$T3_ACTUAL" != "$T3_EXPECTED" ]; then
     printf 'Checksum mismatch for %s.\n' "$T3_ARCHIVE" >&2; exit 1
@@ -129,6 +154,7 @@ RUNNER_FILE="$STATE_DIR/run-t3.sh"
 RUNNER_NEXT="$STATE_DIR/run-t3.next.$$"
 LAUNCH_LOCK="$DEFAULT_SERVER_HOME/ssh-launch/.launch.lock"
 LAUNCH_BREAK_LOCK="$LAUNCH_LOCK.break"
+@@T3_ENSURE_T3_HOME_SCRIPT@@
 mkdir -p "$STATE_DIR"
 cleanup_launch() {
   rm -f "$RUNNER_NEXT"
@@ -172,7 +198,7 @@ while ! (set -C; printf '%s\n' "$$" >"$LAUNCH_LOCK") 2>/dev/null; do
       continue
     fi
   fi
-  if [ "$LAUNCH_LOCK_WAITED" -ge 82 ]; then
+  if [ "$LAUNCH_LOCK_WAITED" -ge 145 ]; then
     printf 'Another SSH launch has held %s for too long.\n' "$LAUNCH_LOCK" >&2
     exit 1
   fi
@@ -219,6 +245,17 @@ owns_server() {
   [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
   OWNED_STARTED="$(process_started "$1")"
   [ -n "$OWNED_STARTED" ] && [ "$OWNED_STARTED" = "$(cat "$STARTED_FILE" 2>/dev/null || true)" ]
+}
+# An older client replacing a same-or-newer server would run below the database's migrations
+# (`pingdotgg/t3code#29428`).
+keeps_running_server() {
+  "$RUNNER_FILE" __ssh-helper keep-server "$DEFAULT_RUNTIME_FILE" "$REMOTE_PID" >/dev/null 2>&1
+}
+# Both are SQLite locks the OS drops with their holder: a server holds server-owner.sqlite, and
+# a boot service holds service-serving.lock from before it starts a server until it stops
+# (`pingdotgg/t3code#36672`).
+home_owned() {
+  "$RUNNER_FILE" __ssh-helper home-owned "$DEFAULT_SERVER_HOME" 2>/dev/null
 }
 resolve_default_runtime_port() {
   "$RUNNER_FILE" __ssh-helper runtime-port "$DEFAULT_RUNTIME_FILE"
@@ -311,8 +348,8 @@ if [ "$REMOTE_MANAGED" = "external" ]; then
   fi
 elif [ -n "$REMOTE_PORT" ] && server_running "$REMOTE_PID" && owns_server "$REMOTE_PID"; then
   # Reconnect owns the local tunnel, not the lifetime of an already running
-  # server. A changed runner is the update path and still replaces it.
-  if [ "$RUNNER_CHANGED" -eq 1 ]; then
+  # server. A changed runner is the update path and replaces an older server (`pingdotgg/t3code#29428`).
+  if [ "$RUNNER_CHANGED" -eq 1 ] && ! keeps_running_server; then
     kill "$REMOTE_PID" 2>/dev/null || true
     wait_for_pid_exit "$REMOTE_PID"
     REMOTE_PID=""
@@ -327,6 +364,22 @@ else
   REMOTE_PORT=""
   REMOTE_MANAGED=""
 fi
+# A server that holds the home without answering yet is still starting, and a boot service holds
+# it between two servers while it updates. Wait while the home is held (`pingdotgg/t3code#36672`).
+OWNER_WAITED=0
+OWNER_DEADLINE=$(($(date +%s) + 60))
+while [ -z "$REMOTE_PORT" ] && ! (server_running "$(cat "$PID_FILE" 2>/dev/null || true)" && owns_server "$(cat "$PID_FILE" 2>/dev/null || true)") && home_owned; do
+  if adopt_default_server; then break; fi
+  REMOTE_PID=""
+  REMOTE_PORT=""
+  REMOTE_MANAGED=""
+  if [ "$OWNER_WAITED" -ge 60 ] || [ "$(date +%s)" -ge "$OWNER_DEADLINE" ]; then
+    printf 'A T3 server or boot service holds %s but did not become ready, so no second server was started. Retry once it has started.\n' "$DEFAULT_SERVER_HOME" >&2
+    exit 1
+  fi
+  sleep 1
+  OWNER_WAITED=$((OWNER_WAITED + 1))
+done
 if [ -z "$REMOTE_PORT" ]; then
   REMOTE_PORT="$(pick_port)" || true
   if [ -z "$REMOTE_PORT" ]; then
@@ -364,6 +417,20 @@ if [ -z "$REMOTE_PORT" ]; then
     if [ "${RECORDED_INFO%% *}" = "$REMOTE_PID" ]; then
       break
     fi
+    # A host wrapper can spawn the server instead of replacing itself (`pingdotgg/t3code#35268`).
+    RUNTIME_PID="${RECORDED_INFO%% *}"
+    if [ "${RECORDED_INFO#* }" = "$REMOTE_PORT" ] && server_running "$RUNTIME_PID"; then
+      RUNTIME_ANCESTOR="$RUNTIME_PID"
+      while [ -n "$RUNTIME_ANCESTOR" ] && [ "$RUNTIME_ANCESTOR" != "1" ] && [ "$RUNTIME_ANCESTOR" != "$REMOTE_PID" ]; do
+        RUNTIME_ANCESTOR="$(ps -o ppid= -p "$RUNTIME_ANCESTOR" 2>/dev/null | tr -d '[:space:]')"
+      done
+      if [ "$RUNTIME_ANCESTOR" = "$REMOTE_PID" ]; then
+        REMOTE_PID="$RUNTIME_PID"
+        printf '%s\n' "$REMOTE_PID" >"$PID_FILE"
+        printf '%s\n' "$(process_started "$REMOTE_PID")" >"$STARTED_FILE"
+        break
+      fi
+    fi
     sleep 0.5
     RECORD_WAIT=$((RECORD_WAIT + 1))
   done
@@ -376,6 +443,7 @@ const PAIRING_SCRIPT: &str = r#"set -eu
 STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 DEFAULT_SERVER_HOME="$HOME/.t3"
 RUNNER_FILE="$STATE_DIR/run-t3.sh"
+@@T3_ENSURE_T3_HOME_SCRIPT@@
 mkdir -p "$STATE_DIR"
 cat >"$RUNNER_FILE" <<'SH'
 @@T3_RUNNER_SCRIPT@@
@@ -415,6 +483,14 @@ printf '{"stopped":true}\n'
 
 /// `buildRemoteT3RunnerScript` for a release version.
 pub fn runner_script(version: &str) -> Result<String, String> {
+    runner_script_with_release_base_url(version, None)
+}
+
+/// `buildRemoteT3RunnerScript` with an optional `T3CODE_RELEASE_BASE_URL` override (`pingdotgg/t3code#31396`).
+pub fn runner_script_with_release_base_url(
+    version: &str,
+    release_base_url: Option<&str>,
+) -> Result<String, String> {
     let version = version.trim();
     if version.is_empty() {
         return Err("A remote t3 runner needs an archive version or a node script path.".to_owned());
@@ -422,24 +498,48 @@ pub fn runner_script(version: &str) -> Result<String, String> {
     if !is_exact_archive_version(version) {
         return Err(format!("'{version}' is not an exact t3 version and cannot name a runtime directory."));
     }
-    Ok(RUNNER_SCRIPT.replace("@@T3_ARCHIVE_VERSION@@", &single_quote(version)).replace("@@T3_RELEASE_BASE_URL@@", &single_quote(RELEASE_BASE_URL)))
+    let base_url = resolve_release_base_url(release_base_url);
+    Ok(RUNNER_SCRIPT
+        .replace("@@T3_ARCHIVE_VERSION@@", &single_quote(version))
+        .replace("@@T3_RELEASE_BASE_URL@@", &single_quote(&base_url)))
 }
 
 /// The launch script, run as `sh -l -s -- <state key>`.
 pub fn launch_script(version: &str) -> Result<String, String> {
-    launch_script_with_launcher(version, None)
+    launch_script_with_options(version, None, None)
 }
 
 /// The launch script with an optional validated 32-hex launcher ID (`pingdotgg/t3code#36351`).
 pub fn launch_script_with_launcher(version: &str, launcher_id: Option<&str>) -> Result<String, String> {
+    launch_script_with_options(version, launcher_id, None)
+}
+
+/// The launch script with optional launcher ID and release base URL (`pingdotgg/t3code#31396`).
+pub fn launch_script_with_options(
+    version: &str,
+    launcher_id: Option<&str>,
+    release_base_url: Option<&str>,
+) -> Result<String, String> {
     let launcher = launcher_id.filter(|id| super::is_valid_launcher_id(id)).unwrap_or("");
     Ok(LAUNCH_SCRIPT
-        .replace("@@T3_RUNNER_SCRIPT@@", &runner_script(version)?)
+        .replace("@@T3_ENSURE_T3_HOME_SCRIPT@@", ENSURE_T3_HOME_SCRIPT)
+        .replace("@@T3_RUNNER_SCRIPT@@", &runner_script_with_release_base_url(version, release_base_url)?)
         .replace("@@T3_LAUNCHER_ID@@", &single_quote(launcher)))
 }
 
 pub fn pairing_script(state_key: &str, version: &str) -> Result<String, String> {
-    Ok(PAIRING_SCRIPT.replace("@@T3_RUNNER_SCRIPT@@", &runner_script(version)?).replace("@@T3_STATE_KEY@@", state_key))
+    pairing_script_with_release_base_url(state_key, version, None)
+}
+
+pub fn pairing_script_with_release_base_url(
+    state_key: &str,
+    version: &str,
+    release_base_url: Option<&str>,
+) -> Result<String, String> {
+    Ok(PAIRING_SCRIPT
+        .replace("@@T3_ENSURE_T3_HOME_SCRIPT@@", ENSURE_T3_HOME_SCRIPT)
+        .replace("@@T3_RUNNER_SCRIPT@@", &runner_script_with_release_base_url(version, release_base_url)?)
+        .replace("@@T3_STATE_KEY@@", state_key))
 }
 
 pub fn stop_script(state_key: &str) -> String {
@@ -474,5 +574,85 @@ mod tests {
         assert!(pairing.contains("STATE_DIR=\"$HOME/.t3/ssh-launch/native-326264c4f08c8a0c\"") && !pairing.contains("@@"));
         assert!(pairing.ends_with("auth pairing create --base-dir \"$PAIRING_BASE_DIR\" --json\n"));
         assert!(stop_script("native-x").contains("ssh-launch/native-x\"") && !stop_script("k").contains("@@"));
+    }
+
+    #[test]
+    fn ssh_scripts_support_release_mirror_matching_t3_keep_server_home_owned_and_symlink_safety() {
+        let custom = runner_script_with_release_base_url("0.1.7", Some("https://mirror.example.com/t3code/")).unwrap();
+        assert!(custom.contains("T3_RELEASE_BASE_URL='https://mirror.example.com/t3code'"));
+        assert!(custom.contains("T3_SYSTEM_EXECUTABLE=\"$(command -v t3 2>/dev/null || true)\""));
+        assert!(custom.contains("sha256sum < \"$T3_STAGING/$T3_ARCHIVE\""));
+        assert!(custom.contains("shasum -a 256 < \"$T3_STAGING/$T3_ARCHIVE\""));
+
+        let launch = launch_script_with_options("0.1.7", None, Some("https://mirror.example.com/t3code")).unwrap();
+        assert!(launch.contains("T3_RELEASE_BASE_URL='https://mirror.example.com/t3code'"));
+        assert!(launch.contains("keeps_running_server()"));
+        assert!(launch.contains("if [ \"$RUNNER_CHANGED\" -eq 1 ] && ! keeps_running_server; then"));
+        assert!(launch.contains("home_owned()"));
+        assert!(launch.contains("OWNER_WAITED=0"));
+        assert!(launch.contains("if [ -L \"$HOME/.t3\" ] && [ ! -e \"$HOME/.t3\" ]; then"));
+        assert!(launch.contains("RUNTIME_ANCESTOR"));
+        assert!(!launch.contains("@@"));
+
+        let pairing = pairing_script_with_release_base_url("k", "0.1.7", Some("https://mirror.example.com/t3code")).unwrap();
+        assert!(pairing.contains("if [ -L \"$HOME/.t3\" ] && [ ! -e \"$HOME/.t3\" ]; then"));
+        assert!(pairing.contains("T3_RELEASE_BASE_URL='https://mirror.example.com/t3code'"));
+        assert!(!pairing.contains("@@"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runner_uses_matching_host_t3_and_launch_creates_dangling_t3_symlink_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!("t3-ssh-scripts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin_dir = root.join("bin");
+        let home = root.join("home");
+        let target = root.join("shared/t3");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&target, home.join(".t3")).unwrap();
+
+        // Matching host `t3` on PATH (`pingdotgg/t3code#35268`).
+        let fake_t3 = bin_dir.join("t3");
+        std::fs::write(
+            &fake_t3,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 't3 v0.1.7\\n'; exit 0; fi\nprintf 'host-t3:%s\\n' \"$*\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_t3, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let runner_path = root.join("runner.sh");
+        std::fs::write(&runner_path, runner_script("0.1.7").unwrap()).unwrap();
+        std::fs::set_permissions(&runner_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path_env = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap_or_default());
+        let output = Command::new(&runner_path)
+            .arg("hello")
+            .env("HOME", &home)
+            .env("PATH", &path_env)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "host-t3:hello");
+
+        // Dangling `~/.t3` symlink gets its target created before `mkdir -p "$STATE_DIR"` (`pingdotgg/t3code#39184`).
+        let launch_path = root.join("launch.sh");
+        std::fs::write(
+            &launch_path,
+            launch_script_with_options("0.1.6", None, Some("http://127.0.0.1:9")).unwrap(),
+        )
+        .unwrap();
+        let launch_out = Command::new("sh")
+            .args([launch_path.to_str().unwrap(), "test-state"])
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&launch_out.stderr);
+        assert!(!stderr.contains("File exists"), "{stderr}");
+        assert!(target.join("ssh-launch/test-state").exists(), "dangling symlink target created: {stderr}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

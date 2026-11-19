@@ -65,6 +65,72 @@ pub struct ConnectView {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Extracts a human-readable address from a `CandidateRoute::id` (`direct:<url>`,
+/// `learned:<env>:<origin>@<cred>`, `ssh:<url>`) for refused-route diagnostics (`pingdotgg/t3code#33199`).
+pub(crate) fn refused_route_display_address(route_id: &str) -> String {
+    if let Some(rest) = route_id.strip_prefix("direct:") {
+        return rest.to_owned();
+    }
+    if let Some(rest) = route_id.strip_prefix("ssh:") {
+        return rest.to_owned();
+    }
+    if let Some(rest) = route_id.strip_prefix("learned:") {
+        let without_cred = rest.rsplit_once('@').map_or(rest, |(left, _)| left);
+        if let Some((_, origin)) = without_cred.split_once(':') {
+            return origin.to_owned();
+        }
+        return without_cred.to_owned();
+    }
+    route_id.to_owned()
+}
+
+/// Renders routes whose host refused this device's sign-in (`EnvironmentRoutesList.tsx`,
+/// `pingdotgg/t3code#33199`).
+fn render_refused_routes_list(refused_route_ids: &[String], cx: &App) -> Div {
+    let p = palette(cx);
+    v_flex()
+        .mt(px(8.))
+        .pt(px(8.))
+        .border_t_1()
+        .border_color(hsla(p.border).opacity(0.5))
+        .gap(px(6.))
+        .children(refused_route_ids.iter().map(|route_id| {
+            let address = refused_route_display_address(route_id);
+            v_flex()
+                .gap(px(2.))
+                .child(
+                    h_flex()
+                        .gap(px(6.))
+                        .items_center()
+                        .child(
+                            div()
+                                .px(px(4.))
+                                .py(px(1.))
+                                .rounded(px(4.))
+                                .bg(hsla(p.destructive).opacity(0.1))
+                                .text_xs()
+                                .text_color(hsla(p.destructive_foreground))
+                                .child("Sign-in refused"),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_color(hsla(p.muted_foreground))
+                                .child(address),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child("The host refused this device's sign-in. Pair this address again with Add route."),
+                )
+        }))
+}
+
 /// `ConnectionStatusDot`: an 8px dot in a 12px box. Static: the web's ping would repaint.
 pub fn status_dot(tone: Option<DotTone>, cx: &App) -> Div {
     let p = palette(cx);
@@ -463,13 +529,18 @@ impl ConnectView {
             })
     }
 
-    /// The re-pair prompt after a server rejected this device.
+    /// The re-pair prompt after a server rejected this device (`pingdotgg/t3code#38041`: asks to
+    /// pair again and names the rejected request's trace ID when present).
     fn render_rejected(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let state = self.state.read(cx);
         let rejected = state.connect.rejected.clone()?;
         let can_pair_again = rejected.ssh || (rejected.local && state.local_saved_environment().is_some_and(|local| local.id == rejected.id));
         let busy = state.connect.pairing.is_some();
         let p = palette(cx);
+        let trace_id = rejected
+            .trace_id
+            .clone()
+            .or_else(|| t3_client::status::extract_trace_id(&rejected.reason).map(str::to_owned));
         Some(
             v_flex()
                 .px(px(14.))
@@ -482,11 +553,23 @@ impl ConnectView {
                 .text_sm()
                 .text_color(hsla(p.error_foreground))
                 .child(div().font_weight(FontWeight::MEDIUM).child(format!("T3 Code on {} did not accept this device", rejected.label)))
-                .child(div().opacity(0.8).child(if can_pair_again {
-                    format!("{} Pair again to reconnect.", rejected.reason)
+                .child(div().opacity(0.85).child(if can_pair_again {
+                    format!("This device's sign-in to {} expired or was revoked. Pair again to reconnect.", rejected.label)
                 } else {
-                    format!("{} Paste a new pairing link from {} below to reconnect.", rejected.reason, rejected.label)
+                    format!(
+                        "This device's sign-in to {} expired or was revoked. Pair it again with a new pairing link from {}.",
+                        rejected.label, rejected.label
+                    )
                 }))
+                .when_some(trace_id, |this, trace| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .opacity(0.85)
+                            .child(format!("Trace ID: {trace}")),
+                    )
+                })
                 .when(can_pair_again, |this| {
                     let (id, ssh) = (rejected.id.clone(), rejected.ssh);
                     this.child(div().pt(px(2.)).child(
@@ -775,6 +858,9 @@ impl ConnectView {
             .flatten()
             .and_then(|client| client.server_config_extras().borrow().last_event_loop_stall.clone())
             .and_then(|stall| host_freeze_notice(&environment.label, Some(&stall)));
+        let refused_routes = t3_client::supervisor::refused_routes_for(&environment.http_base)
+            .borrow()
+            .clone();
         let version_skew = resolve_version_mismatch(environment.server_version.as_deref(), env!("CARGO_PKG_VERSION"));
         let busy = state.connect.pairing.is_some();
         let confirming = self.confirm_remove.as_deref() == Some(environment.id.as_str());
@@ -927,6 +1013,9 @@ impl ConnectView {
                     .child(actions),
             )
             .children(diag_panel)
+            .when(!refused_routes.is_empty(), |this| {
+                this.child(render_refused_routes_list(&refused_routes, cx))
+            })
     }
 
     fn render_saved(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1187,6 +1276,77 @@ impl Render for ConnectView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_route_display_address_extracts_direct_learned_and_ssh_origins() {
+        assert_eq!(
+            refused_route_display_address("direct:http://192.168.1.20:3773"),
+            "http://192.168.1.20:3773"
+        );
+        assert_eq!(
+            refused_route_display_address("learned:env-1:https://studio.ts.net:3773@direct:http://10.0.0.2:3773"),
+            "https://studio.ts.net:3773"
+        );
+        assert_eq!(
+            refused_route_display_address("ssh:http://127.0.0.1:41234"),
+            "http://127.0.0.1:41234"
+        );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn connect_view_renders_expired_session_trace_and_refused_routes(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            crate::settings::init(state.clone(), cx);
+            state
+        });
+        let http_base = "http://127.0.0.1:48811";
+        t3_client::supervisor::set_refused_routes_for(
+            http_base,
+            vec!["direct:http://192.168.1.44:3773".to_owned()],
+        );
+        state.update(cx, |state, _| {
+            state.environments.environments.push(SavedEnvironment {
+                id: "saved-1".into(),
+                environment_id: Some("env-1".into()),
+                label: "Studio".into(),
+                disabled: false,
+                http_base: http_base.into(),
+                access_token: Some("tok".into()),
+                server_version: Some("0.1.9".into()),
+                local: false,
+                ssh: None,
+            });
+            state.connect.rejected = Some(crate::environments::Rejected {
+                id: "saved-1".into(),
+                label: "Studio".into(),
+                reason: "This device is no longer authorized. Pair again. (Trace ID: trace-xyz)".into(),
+                trace_id: Some("trace-xyz".into()),
+                local: false,
+                ssh: false,
+            });
+        });
+        let window = cx.open_window(gpui::size(px(640.), px(720.)), |window, cx| {
+            ConnectView::new(state.clone(), window, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        t3_client::supervisor::set_refused_routes_for(http_base, Vec::new());
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
+        cx.run_until_parked();
+    }
 
     #[test]
     fn environment_machine_icon_maps_every_machine_kind() {
