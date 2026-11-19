@@ -50,18 +50,37 @@ const INLINE_CONFIRM: &str = "pr-confirm-inline";
 /// How many pull requests' last reads are kept to paint from.
 const HELD_LIMIT: usize = 32;
 
+/// Key isolating held reads per environment, project/worktree, and pull request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HeldKey {
+    environment: String,
+    project_id: String,
+    pr: String,
+}
+
+fn held_environment(state: &AppState) -> Option<&str> {
+    state.environment().or(state.environments.active.as_deref())
+}
+
+impl HeldKey {
+    fn of(state: &AppState, reference: &PrRef) -> Option<Self> {
+        let environment = held_environment(state)?.to_owned();
+        Some(HeldKey { environment, project_id: reference.project_id.clone(), pr: reference.key() })
+    }
+}
+
 /// The last detail and activity read for each recently opened pull request, so reopening one
 /// paints at once while it is read again (`pingdotgg/t3code#27798`). Bounded, least recent out.
 #[derive(Default)]
-struct Held(VecDeque<(String, Option<Detail>, Option<Activity>)>);
+struct Held(VecDeque<(HeldKey, Option<Detail>, Option<Activity>)>);
 
 impl Global for Held {}
 
-fn held(key: &str, cx: &App) -> (Option<Detail>, Option<Activity>) {
+fn held(key: &HeldKey, cx: &App) -> (Option<Detail>, Option<Activity>) {
     cx.try_global::<Held>().and_then(|held| held.0.iter().find(|(held, ..)| held == key)).map(|(_, detail, activity)| (detail.clone(), activity.clone())).unwrap_or_default()
 }
 
-fn hold(key: String, detail: Option<&Detail>, activity: Option<&Activity>, cx: &mut App) {
+fn hold(key: HeldKey, detail: Option<&Detail>, activity: Option<&Activity>, cx: &mut App) {
     let held = cx.default_global::<Held>();
     let (_, kept_detail, kept_activity) = held.0.iter().position(|(held, ..)| *held == key).and_then(|index| held.0.remove(index)).unwrap_or_default();
     held.0.push_back((key, detail.cloned().or(kept_detail), activity.cloned().or(kept_activity)));
@@ -119,8 +138,11 @@ pub struct DetailView {
     /// Where a link points, still to reach once its tab holds what it names.
     reveal: Option<Anchor>,
     pub(super) summary_scroll: ScrollHandle,
+    /// Environment this detail view belongs to, so cross-environment switches cannot pollute `Held`.
+    environment: Option<String>,
     /// Threads linking this pull request, kept while re-read so the count does not flicker.
     linked_threads: Option<Vec<LinkedThread>>,
+    linked_connection: Option<u64>,
     _linked_signal: Option<Refreshes>,
     _linked_read: Option<Task<()>>,
     /// Opens the description's and comments' media full size.
@@ -146,10 +168,14 @@ impl DetailView {
                 if matches!(event, AppEvent::Selection | AppEvent::Phase) {
                     this.disarm(cx);
                 }
+                if *event == AppEvent::Phase {
+                    this.sync_linked_threads(cx);
+                }
             }),
             cx.observe_global::<Mutations>(|_, cx| cx.notify()),
         ];
-        let (detail, activity) = held(&reference.key(), cx);
+        let environment = held_environment(state.read(cx)).map(str::to_owned);
+        let (detail, activity) = HeldKey::of(state.read(cx), &reference).map(|key| held(&key, cx)).unwrap_or_default();
         crate::media::cache(&state, cx);
         let viewer = cx.new(crate::media::MediaViewer::new);
         let mut view = DetailView {
@@ -175,7 +201,9 @@ impl DetailView {
             resolving: HashSet::new(),
             reveal: None,
             summary_scroll: ScrollHandle::new(),
+            environment,
             linked_threads: None,
+            linked_connection: None,
             _linked_signal: None,
             _linked_read: None,
             viewer,
@@ -194,13 +222,30 @@ impl DetailView {
         };
         view.rebuild_timeline();
         view.refresh(cx);
-        view.follow_linked_threads(cx);
+        view.sync_linked_threads(cx);
         view
+    }
+
+    /// Keeps the linked-threads subscription bound to the active connection: tears it down on
+    /// disconnect or connection swap, and starts it again on reconnect.
+    fn sync_linked_threads(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let connected = state.client_handle().is_some() && matches!(state.phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected));
+        let connection = state.connection_id();
+        if !connected || connection != self.linked_connection {
+            self._linked_signal = None;
+            self._linked_read = None;
+            self.linked_connection = None;
+        }
+        if connected && self._linked_signal.is_none() {
+            self.linked_connection = connection;
+            self.follow_linked_threads(cx);
+        }
     }
 
     /// Re-reads the linked threads whenever a link changes
     /// (`pullRequests.subscribeLinkedThreadRefreshes`), or every ten seconds from a server that
-    /// predates the signal. Dropping the view unsubscribes.
+    /// predates the signal. Dropping the view or disconnecting unsubscribes.
     fn follow_linked_threads(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let Some(client) = state.client_handle() else { return };
@@ -213,20 +258,22 @@ impl DetailView {
             loop {
                 match client.stream(SUBSCRIBE_LINKED_THREAD_REFRESHES, serde_json::json!({})).await {
                     Ok(mut stream) => {
-                        delay = Duration::from_secs(1);
                         while let Some(item) = stream.receiver.recv().await {
                             match item {
                                 Ok(_) => {
+                                    delay = Duration::from_secs(1);
                                     if tx.send(()).is_err() {
                                         return;
                                     }
                                 }
                                 Err(t3_client::session::RpcError::Failure(failure)) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") => return,
+                                Err(t3_client::session::RpcError::Closed) => return,
                                 Err(_) => break,
                             }
                         }
                     }
                     Err(t3_client::session::RpcError::Failure(failure)) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") => return,
+                    Err(t3_client::session::RpcError::Closed) => return,
                     Err(t3_client::session::RpcError::Failure(_)) => {
                         // Older servers reject `subscribeLinkedThreadRefreshes`; fall back to 10s polling.
                         loop {
@@ -236,7 +283,6 @@ impl DetailView {
                             }
                         }
                     }
-                    Err(t3_client::session::RpcError::Closed) => {}
                 }
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(30));
@@ -311,7 +357,11 @@ impl DetailView {
     }
 
     fn hold(&self, cx: &mut App) {
-        hold(self.reference.key(), self.detail.as_ref(), self.activity.as_ref(), cx);
+        let Some(key) = HeldKey::of(self.state.read(cx), &self.reference) else { return };
+        if self.environment.as_deref() != Some(key.environment.as_str()) {
+            return;
+        }
+        hold(key, self.detail.as_ref(), self.activity.as_ref(), cx);
     }
 
     /// Re-reads the detail, its activity and stack membership, and the patch if it was read.
@@ -686,7 +736,8 @@ impl DetailView {
         .detach();
     }
 
-    /// `labelCandidates`, read once for the label picker.
+    /// `labelCandidates`, read once for the label picker; clears the in-flight task on error so
+    /// reopening the label picker retries cleanly.
     pub(super) fn load_label_candidates(&mut self, cx: &mut Context<Self>) {
         if self._labels.is_some() {
             return;
@@ -695,10 +746,20 @@ impl DetailView {
         self._labels = Some(cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |this, cx| {
+                if result.is_err() {
+                    this._labels = None;
+                }
                 this.label_candidates = Some(result);
                 cx.notify();
             });
         }));
+    }
+
+    pub(super) fn retry_label_candidates(&mut self, cx: &mut Context<Self>) {
+        self._labels = None;
+        self.label_candidates = None;
+        self.load_label_candidates(cx);
+        cx.notify();
     }
 
     /// `PullRequestLabelPicker`'s toggle: one label on or off, shown on the detail once written.
@@ -1191,11 +1252,13 @@ mod tests {
             crate::theme::init(cx);
             crate::settings::store::init(cx);
             super::super::mutations::init(runtime.handle().clone(), cx);
-            hold(reference.key(), Some(&detail), Some(&activity), cx);
             let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
-            let view = cx.new(|cx| DetailView::new(state, WeakEntity::new_invalid(), reference.clone(), None, cx));
+            state.update(cx, |state, _| state.environments.active = Some("env-a".into()));
+            let key = HeldKey::of(state.read(cx), &reference).expect("active env keys Held");
+            hold(key, Some(&detail), Some(&activity), cx);
+            let view = cx.new(|cx| DetailView::new(state.clone(), WeakEntity::new_invalid(), reference.clone(), None, cx));
             view.update(cx, |view, cx| {
-                // Reopening paints immediately from held detail & activity without waiting on RPC.
+                // Reopening in the same environment & project paints immediately from held detail & activity.
                 assert_eq!(view.detail.as_ref().map(|d| d.title.as_str()), Some("PR Title"));
                 assert_eq!(view.activity.as_ref().map(|a| a.comments.len()), Some(1));
                 assert!(!view.timeline.is_empty());
@@ -1205,6 +1268,24 @@ mod tests {
                 assert_eq!(scope.source_control_media_repository.as_deref(), Some("upstream/repo"));
                 assert_eq!(scope.workspace_root.as_deref(), Some("/tmp/fork-checkout"));
             });
+
+            // Cross-project isolation: another project/worktree pointing at the same repo + PR # never paints `p1`'s cache.
+            let other_project_ref = PrRef { project_id: "p2".into(), ..reference.clone() };
+            let other_project_view = cx.new(|cx| DetailView::new(state.clone(), WeakEntity::new_invalid(), other_project_ref, None, cx));
+            assert!(other_project_view.read(cx).detail.is_none());
+            assert!(other_project_view.read(cx).activity.is_none());
+
+            // Cross-environment isolation: switching environments never paints `env-a`'s cached detail.
+            state.update(cx, |state, _| state.environments.active = Some("env-b".into()));
+            let other_env_view = cx.new(|cx| DetailView::new(state.clone(), WeakEntity::new_invalid(), reference.clone(), None, cx));
+            assert!(other_env_view.read(cx).detail.is_none());
+            assert!(other_env_view.read(cx).activity.is_none());
+
+            // Disconnected (`environments.active = None`) neither reads nor writes `Held`.
+            state.update(cx, |state, _| state.environments.active = None);
+            assert!(HeldKey::of(state.read(cx), &reference).is_none());
+            let disconnected_view = cx.new(|cx| DetailView::new(state, WeakEntity::new_invalid(), reference, None, cx));
+            assert!(disconnected_view.read(cx).detail.is_none());
         });
     }
 
@@ -1219,9 +1300,13 @@ mod tests {
             crate::theme::init(cx);
             crate::settings::store::init(cx);
             super::super::mutations::init(runtime.handle().clone(), cx);
-            hold(reference.key(), Some(&detail), Some(&activity), cx);
             let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
-            state.update(cx, |state, _| state.selected_thread = Some("thread-1".into()));
+            state.update(cx, |state, _| {
+                state.environments.active = Some("env-a".into());
+                state.selected_thread = Some("thread-1".into());
+            });
+            let key = HeldKey::of(state.read(cx), &reference).unwrap();
+            hold(key, Some(&detail), Some(&activity), cx);
             let view = cx.new(|cx| DetailView::new(state.clone(), WeakEntity::new_invalid(), reference.clone(), None, cx));
 
             // Action reply patches the shown detail immediately without requiring a re-read.
@@ -1258,6 +1343,29 @@ mod tests {
             let comment_chip = state.update(cx, |state, _| state.take_review_comment("thread-1"));
             assert_eq!(comment_chip.as_ref().map(|chip| chip.id.as_str()), Some("pr-comment:https://github.com/upstream/repo/pull/42:comment:c1"));
             assert_eq!(comment_chip.as_ref().map(|chip| &*chip.text), Some("bob: Please rename this helper"));
+        });
+    }
+
+    #[gpui::test]
+    fn label_candidates_failure_clears_inflight_task_so_reopening_can_retry(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let reference = sample_ref();
+        let view = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let view = cx.new(|cx| DetailView::new(state, WeakEntity::new_invalid(), reference, None, cx));
+            view.update(cx, |view, cx| view.load_label_candidates(cx));
+            view
+        });
+        // Disconnected `read()` settles synchronously with `Err(NOT_CONNECTED)` on the foreground executor.
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(matches!(view.label_candidates, Some(Err(_))));
+            assert!(view._labels.is_none(), "error must clear `_labels` so retry is not locked out");
         });
     }
 }

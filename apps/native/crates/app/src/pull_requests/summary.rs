@@ -27,7 +27,7 @@ pub fn render(view: &mut DetailView, _window: &mut Window, cx: &mut Context<Deta
     let Some(detail) = view.detail.clone() else { return div().into_any_element() };
     let p = palette(cx);
     let open = view.checks_open;
-    if detail.capabilities.labels == Some(true) {
+    if detail.capabilities.labels == Some(true) && view.label_candidates.is_none() {
         view.load_label_candidates(cx);
     }
     let description = description(view, &detail, cx);
@@ -176,11 +176,20 @@ fn label_picker(view: &DetailView, detail: &Detail, cx: &mut Context<DetailView>
     let entity = cx.entity().downgrade();
     button
         .tooltip("Change labels")
-        .dropdown_menu(move |menu, _, _| {
+        .dropdown_menu(move |menu, _, cx| {
             let note = |menu: gpui_component::menu::PopupMenu, text: &'static str| menu.item(PopupMenuItem::new(text).disabled(true));
             match &candidates {
                 None => note(menu, "Loading labels…"),
-                Some(Err(_)) => note(menu, "The labels could not be read."),
+                Some(Err(_)) => {
+                    let retry_on_open = entity.clone();
+                    cx.defer(move |cx| {
+                        let _ = retry_on_open.update(cx, |view, cx| view.retry_label_candidates(cx));
+                    });
+                    let retry_on_click = entity.clone();
+                    note(menu, "The labels could not be read.").item(PopupMenuItem::new("Retry").on_click(move |_, _, cx| {
+                        let _ = retry_on_click.update(cx, |view, cx| view.retry_label_candidates(cx));
+                    }))
+                }
                 Some(Ok(list)) if list.candidates.is_empty() => note(menu, "This repository has no labels."),
                 Some(Ok(list)) => {
                     let mut menu = menu;
