@@ -88,6 +88,7 @@ pub struct Workspace {
     menu: Entity<ContextMenu>,
     dialog: Entity<ConfirmDialog>,
     guest_share: Entity<crate::guest_share::GuestShareDialog>,
+    mcp: Entity<crate::mcp::McpDialogs>,
     palette: Entity<CommandPalette>,
     snooze: Entity<SnoozeDialog>,
     right_panel: Entity<RightPanelView>,
@@ -115,6 +116,8 @@ impl Workspace {
         let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
         thread.update(cx, |view, cx| view.bind_composer(&composer, cx));
         let palette = cx.new(|cx| CommandPalette::new(state.clone(), composer.clone(), window, cx));
+        // Subscribe before PromptLinks so `/approve-agent` and `/connect-agent` URLs route to MCP approval.
+        let mcp = cx.new(|cx| crate::mcp::McpDialogs::new(state.clone(), window, cx));
         let prompt_links = cx.new(|cx| crate::prompt_links::PromptLinks::new(state.clone(), composer.clone(), window, cx));
         let sidebar = cx.new(|cx| SidebarPane::new(state.clone(), composer.clone(), menu.clone(), dialog.clone(), snooze.clone(), window, cx));
         let lineage = cx.new(|cx| crate::lineage::ComposerLineage::new(state.clone(), cx));
@@ -239,6 +242,7 @@ impl Workspace {
             menu,
             dialog,
             guest_share,
+            mcp,
             palette,
             snooze,
             right_panel,
@@ -639,6 +643,7 @@ impl Render for Workspace {
             .child(self.menu.clone())
             .child(self.dialog.clone())
             .child(self.guest_share.clone())
+            .child(self.mcp.clone())
             .child(self.git_dialogs.clone())
             .child(self.snooze.clone())
             .child(self.palette.clone())
@@ -1224,6 +1229,7 @@ impl Workspace {
             || self.dialog.read(cx).is_open()
             || self.snooze.read(cx).is_open()
             || self.palette.read(cx).is_open()
+            || self.mcp.read(cx).is_open(cx)
             || crate::voice::is_setup_modal_open(cx)
             || self.welcome.read(cx).is_open()
             || crate::settings::overlay(window, cx).is_some()

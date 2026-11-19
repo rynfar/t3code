@@ -18,6 +18,7 @@ mod glass;
 mod home;
 mod icons;
 mod keymap;
+mod mcp;
 mod media;
 mod menus;
 mod new_thread;

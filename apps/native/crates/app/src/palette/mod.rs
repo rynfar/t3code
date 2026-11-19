@@ -217,6 +217,12 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     if state.server_config.config.is_some() {
         items.push(action("action:pull-requests", "Open pull requests", &["pull requests", "prs", "pr", "github", "review", "merge", "branch"], None));
     }
+    items.push(action(
+        "action:use-in-another-app",
+        "Use T3 Code in another app (MCP)",
+        &["mcp", "connector", "another app", "poke", "claude", "chatgpt", "grok", "muse", "instinct", "openclaw", "hermes"],
+        None,
+    ));
     if state.can_pin_projects()
         && let Some(project_id) = default_project.as_deref()
         && let Some(project) = state.shell.project(project_id)
@@ -958,7 +964,7 @@ impl CommandPalette {
         }
     }
 
-    fn activate(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn activate(&mut self, value: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(item) = self.groups.iter().flat_map(|group| &group.items).find(|item| item.value == value) {
             if item.disabled {
                 return;
@@ -1100,6 +1106,17 @@ impl CommandPalette {
                 "link-pull-request" => Box::new(crate::pull_requests::LinkPullRequest),
                 "open-thread-pull-requests" => Box::new(crate::pull_requests::ShowLinkedPullRequests),
                 "pull-requests" => Box::new(crate::pull_requests::OpenPullRequests),
+                "use-in-another-app" => {
+                    let env_id = {
+                        let state = self.state.read(cx);
+                        state
+                            .active_environment()
+                            .and_then(|env| env.environment_id.clone().or_else(|| Some(env.id.clone())))
+                            .or_else(|| state.environments.active.clone())
+                    };
+                    crate::mcp::open_use_in_another_app(env_id, window.window_handle(), cx);
+                    return;
+                }
                 "switch-environment" => Box::new(crate::menus::SwitchEnvironment),
                 "usage" => keymap::action_for("usage.open"),
                 "workspace-focus:1" => {
@@ -2278,6 +2295,14 @@ mod visit_recency_tests {
                 assert!(actions.iter().any(|item| item.value == "action:triage"));
                 assert!(actions.iter().any(|item| item.value == "action:share-thread-with-guest"));
                 assert!(actions.iter().any(|item| item.value == "action:restart-agent-session"));
+                let use_mcp = actions
+                    .iter()
+                    .find(|item| item.value == "action:use-in-another-app")
+                    .expect("use-in-another-app action");
+                assert_eq!(use_mcp.title, "Use T3 Code in another app (MCP)");
+                assert!(use_mcp.search_terms.iter().any(|t| t == "mcp"));
+                assert!(use_mcp.search_terms.iter().any(|t| t == "claude"));
+                assert!(use_mcp.search_terms.iter().any(|t| t == "poke"));
                 let focus_next = actions
                     .iter()
                     .find(|item| item.value == "action:workspace-focus:1")
