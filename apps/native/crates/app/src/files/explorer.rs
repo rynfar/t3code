@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, KeyBinding, ScrollStrategy, Subscription, Task, UniformListScrollHandle,
-    Window, actions,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, KeyBinding, ScrollStrategy, Subscription, Task,
+    UniformListScrollHandle, Window, actions,
 };
 use gpui_component::input::{InputEvent, InputState};
 use t3_core::files::{
@@ -77,6 +77,12 @@ pub struct Explorer {
     pub(super) tree_focused: bool,
     _subscription: Subscription,
 }
+
+pub(super) enum ExplorerEvent {
+    Refresh,
+}
+
+impl EventEmitter<ExplorerEvent> for Explorer {}
 
 impl Explorer {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -210,6 +216,11 @@ impl Explorer {
 
     /// Refresh: lists every listed folder again and reruns the search.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_entries(cx);
+        cx.emit(ExplorerEvent::Refresh);
+    }
+
+    pub fn refresh_entries(&mut self, cx: &mut Context<Self>) {
         if self.root.is_none() {
             return;
         }

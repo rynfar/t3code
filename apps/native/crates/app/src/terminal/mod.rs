@@ -35,11 +35,20 @@ actions!(
 const CONTEXT: &str = "Terminal";
 
 pub fn init(cx: &mut App) {
+    #[cfg(target_os = "macos")]
     cx.bind_keys([
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
         KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
         KeyBinding::new("cmd-k", Clear, Some(CONTEXT)),
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-shift-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("ctrl-insert", Copy, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("shift-insert", Paste, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-a", SelectAll, Some(CONTEXT)),
     ]);
 }
 

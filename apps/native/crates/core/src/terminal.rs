@@ -8,6 +8,7 @@
 pub mod emulator;
 mod input;
 mod layout;
+pub mod links;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-pub use input::{KeyInput, encode_key, encode_paste, paste_chunks, shortcut_data};
+pub use input::{KeyInput, TerminalShortcut, encode_key, encode_paste, local_shortcut, paste_chunks, shortcut_data};
 pub use layout::{
     MAX_TERMINALS_PER_GROUP, SplitDirection, TerminalGroup, TerminalLayouts, ThreadTerminalLayout,
     pick_existing_terminal, should_reconcile,
@@ -274,6 +275,9 @@ pub struct BufferState {
     pub has_running_subprocess: bool,
     pub version: u64,
     pub lifecycle_version: u64,
+    /// `TerminalOutputState.generation`: a new one per server attachment, so viewers replay
+    /// their measured grid after a reconnect (`pingdotgg/t3code#29696`).
+    pub generation: u64,
 }
 
 impl Default for BufferState {
@@ -285,6 +289,7 @@ impl Default for BufferState {
             has_running_subprocess: false,
             version: 0,
             lifecycle_version: 0,
+            generation: 0,
         }
     }
 }
@@ -294,13 +299,18 @@ impl BufferState {
     pub fn apply(&mut self, event: AttachEvent) -> OutputOp {
         match event {
             AttachEvent::Snapshot { snapshot } => {
+                // A later snapshot is a new server attachment, as after a socket reconnect.
                 if self.version > 0 {
                     self.lifecycle_version += 1;
+                    self.generation += 1;
                 }
                 self.reset_from(snapshot)
             }
             AttachEvent::Restarted { snapshot } => {
                 self.lifecycle_version += 1;
+                if self.version > 0 {
+                    self.generation += 1;
+                }
                 self.reset_from(snapshot)
             }
             AttachEvent::Output { data } => {
@@ -348,7 +358,31 @@ impl BufferState {
     }
 }
 
-/// Keeps the last `max` bytes, starting on a character boundary.
+/// When a session tells the PTY its measured grid again: once per output generation while the
+/// shell runs, as `createTerminalSession`'s `onAttachment` does. The generation is forgotten when
+/// the attachment ends, so the next one replays even from the same buffer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GridReplay {
+    generation: Option<u64>,
+}
+
+impl GridReplay {
+    /// Whether this buffer state starts a generation the PTY has not heard the grid for.
+    pub fn observe(&mut self, buffer: &BufferState) -> bool {
+        let next = (buffer.version > 0 && buffer.status == BufferStatus::Running).then_some(buffer.generation);
+        if next == self.generation {
+            return false;
+        }
+        self.generation = next;
+        next.is_some()
+    }
+
+    pub fn detach(&mut self) {
+        self.generation = None;
+    }
+}
+
+/// `retainedTerminalHistory`: keeps the last `max` bytes, starting on a character boundary.
 pub fn trim_to_bytes(mut text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
@@ -652,6 +686,8 @@ pub fn open_input(thread_id: &str, terminal_id: &str, location: &LaunchLocation,
 
 /// `terminal.attach`: opens the shell when the server has none. `resume` is set on every
 /// resubscription after the first reply so a terminal closed elsewhere stays closed.
+/// `maxHistoryBytes` asks the server for only the history this client keeps; older servers
+/// ignore it (`pingdotgg/t3code#33942`).
 pub fn attach_input(thread_id: &str, terminal_id: &str, location: &LaunchLocation, grid: Option<Grid>, resume: bool) -> Value {
     let mut payload = session(thread_id, terminal_id);
     payload["cwd"] = json!(location.cwd);
@@ -663,6 +699,7 @@ pub fn attach_input(thread_id: &str, terminal_id: &str, location: &LaunchLocatio
     if resume {
         payload["resume"] = json!(true);
     }
+    payload["maxHistoryBytes"] = json!(MAX_BUFFER_BYTES);
     with_grid(payload, grid)
 }
 

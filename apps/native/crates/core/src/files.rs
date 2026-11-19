@@ -5,6 +5,8 @@
 //! `packages/shared/src/composerTrigger.ts` (`serializeComposerFileLink`), and the read-error copy
 //! of `filePreviewReadErrorMessage`. The explorer tree lives in `tree`, line layout in `text`.
 
+pub mod metadata;
+pub mod position;
 mod text;
 mod tree;
 

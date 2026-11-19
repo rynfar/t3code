@@ -15,7 +15,7 @@ use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
 use t3_core::terminal::emulator::{Emulator, FairMutex, Snapshot, ThemeColors};
 use t3_core::terminal::{
-    self, AttachEvent, BufferState, BufferStatus, Grid, LaunchLocation, LifecycleCommand, OutputOp, SessionFollow, SessionMode,
+    self, AttachEvent, BufferState, BufferStatus, Grid, GridReplay, LaunchLocation, LifecycleCommand, OutputOp, SessionFollow, SessionMode,
     TerminalAccess, method,
 };
 use tokio::sync::{Notify, mpsc};
@@ -30,6 +30,7 @@ pub struct SessionCore {
     pub emulator: Emulator,
     pub buffer: BufferState,
     follow: SessionFollow,
+    replay: GridReplay,
     /// The grid the pane fits; the PTY hears it once it settles.
     pub measured: Option<Grid>,
     /// Input goes nowhere unless attached.
@@ -159,6 +160,7 @@ impl Session {
             emulator: Emulator::new(Grid::new(80, 24), theme),
             buffer: BufferState::default(),
             follow: SessionFollow::default(),
+            replay: GridReplay::default(),
             measured: None,
             read_only: true,
             shown_error: None,
@@ -274,6 +276,9 @@ impl Driver {
                 replied = false;
             }
             let observing = mode == SessionMode::Observing;
+            if observing {
+                self.shared.lock().replay.detach();
+            }
             let payload = if observing {
                 terminal::observe_input(thread_id, terminal_id)
             } else {
@@ -321,6 +326,7 @@ impl Driver {
                     }
                 },
             };
+            self.shared.lock().replay.detach();
             match end {
                 End::Disconnected => {}
                 End::Switched => continue,
@@ -346,7 +352,6 @@ impl Driver {
     }
 
     fn apply(&self, event: AttachEvent, observing: bool) {
-        let fresh = matches!(event, AttachEvent::Snapshot { .. } | AttachEvent::Restarted { .. });
         let op = {
             let mut core = self.shared.lock();
             let op = core.buffer.apply(event);
@@ -377,7 +382,12 @@ impl Driver {
         if version > 0 {
             core.announced = status;
         }
-        let resize = fresh && status == BufferStatus::Running && !observing;
+        let resize = if observing {
+            false
+        } else {
+            let core = &mut *core;
+            core.replay.observe(&core.buffer)
+        };
         let measured = core.measured;
         drop(core);
         self.dirty.notify_one();

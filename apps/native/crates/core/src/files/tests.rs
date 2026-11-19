@@ -268,3 +268,83 @@ fn file_links_carry_paths_and_lines() {
     assert_eq!(file_link_target("mailto:x@y.z"), None);
     assert_eq!(file_link_target(""), None);
 }
+
+#[test]
+fn metadata_query_paths_follow_get_file_metadata_query_atom() {
+    use super::metadata::query_path;
+    assert_eq!(query_path("src/main.rs:12:3", Some("/repo")), Some("/repo/src/main.rs".to_owned()));
+    assert_eq!(query_path("/abs/file.txt", None), Some("/abs/file.txt".to_owned()));
+    assert_eq!(query_path("~/notes.md", Some("/repo")), Some("~/notes.md".to_owned()));
+    assert_eq!(query_path(r"C:\Repo\Main.rs", None), Some(r"c:\repo\main.rs".to_owned()));
+    assert_eq!(query_path("/repo/dir/", None), Some("/repo/dir".to_owned()));
+    // Relative without a cwd, network paths and very long paths are never asked about.
+    assert_eq!(query_path("src/main.rs", None), None);
+    assert_eq!(query_path(r"\\host\share\file", None), None);
+    assert_eq!(query_path("//host/share/file", None), None);
+    assert_eq!(query_path(&format!("/{}", "a".repeat(600)), None), None);
+}
+
+#[test]
+fn metadata_decodes_in_request_order() {
+    use super::metadata::{EntryMetadata, MetadataKind, decode, request};
+    assert_eq!(request(&["/a".to_owned()]), json!({ "paths": ["/a"] }));
+    let reply = json!({ "entries": [{ "kind": "file", "byteLength": 3 }, null, { "kind": "socket" }, { "kind": 1 }] });
+    assert_eq!(
+        decode(&reply, 5).unwrap(),
+        vec![
+            Some(EntryMetadata { kind: MetadataKind::File, byte_length: Some(3), mime_type: None }),
+            None,
+            Some(EntryMetadata { kind: MetadataKind::Other, byte_length: None, mime_type: None }),
+            None,
+            None,
+        ]
+    );
+    assert!(decode(&json!({}), 1).is_err());
+}
+
+#[test]
+fn thread_metadata_keeps_hits_and_expires_misses() {
+    use super::metadata::{EntryMetadata, Lookup, MetadataCache, MetadataKind, STALE_MS};
+    let file = Some(EntryMetadata { kind: MetadataKind::File, byte_length: None, mime_type: None });
+    let mut cache = MetadataCache::default();
+    cache.retain_thread("t1");
+    assert_eq!(cache.lookup("/repo/a.rs", Some("t1"), 0), Lookup::Fetch);
+    cache.remember("/repo/a.rs", file.clone(), Some("t1"), 0);
+    cache.remember("/repo/later.rs", None, Some("t1"), 0);
+    // Within the thread a hit outlives the shared cache's staleness.
+    assert_eq!(cache.lookup("/repo/a.rs", Some("t1"), STALE_MS * 5), Lookup::Known(file.clone()));
+    // A miss is believed only until it expires: agents mention paths before creating them.
+    assert_eq!(cache.lookup("/repo/later.rs", Some("t1"), STALE_MS - 1), Lookup::Known(None));
+    assert_eq!(cache.lookup("/repo/later.rs", Some("t1"), STALE_MS), Lookup::Fetch);
+    cache.remember("/repo/later.rs", file.clone(), Some("t1"), STALE_MS);
+    assert_eq!(cache.lookup("/repo/later.rs", Some("t1"), STALE_MS * 9), Lookup::Known(file.clone()));
+    // Without a retaining thread, everything expires.
+    assert_eq!(cache.lookup("/repo/a.rs", None, STALE_MS * 5), Lookup::Fetch);
+    // Another thread reads the fresh shared entry and retains it from then on.
+    cache.retain_thread("t2");
+    cache.remember("/repo/b.rs", file.clone(), None, 100);
+    assert_eq!(cache.lookup("/repo/b.rs", Some("t2"), 200), Lookup::Known(file.clone()));
+    assert_eq!(cache.lookup("/repo/b.rs", Some("t2"), STALE_MS * 3), Lookup::Known(file.clone()));
+    // A later answer replaces what threads that already held the path retained.
+    cache.remember("/repo/b.rs", None, None, STALE_MS * 3);
+    assert_eq!(cache.lookup("/repo/b.rs", Some("t2"), STALE_MS * 3 + 1), Lookup::Known(None));
+    // Releasing the last reader drops the thread's retention.
+    cache.release_thread("t1");
+    assert_eq!(cache.lookup("/repo/a.rs", Some("t1"), STALE_MS * 5), Lookup::Fetch);
+}
+
+#[test]
+fn metadata_cache_drops_the_oldest_write_past_its_limit() {
+    use super::metadata::{CACHE_LIMIT, Lookup, MetadataCache};
+    let mut cache = MetadataCache::default();
+    for index in 0..=CACHE_LIMIT {
+        cache.remember(&format!("/f{index}"), None, None, 0);
+    }
+    assert_eq!(cache.lookup("/f0", None, 1), Lookup::Fetch);
+    assert_eq!(cache.lookup("/f1", None, 1), Lookup::Known(None));
+    // Rewriting a path makes it the newest.
+    cache.remember("/f1", None, None, 0);
+    cache.remember("/extra", None, None, 0);
+    assert_eq!(cache.lookup("/f1", None, 1), Lookup::Known(None));
+    assert_eq!(cache.lookup("/f2", None, 1), Lookup::Fetch);
+}

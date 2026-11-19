@@ -17,6 +17,7 @@ use gpui::{
     px, relative, size,
 };
 use t3_core::terminal::emulator::{CellView, CursorStyle, Snapshot};
+use t3_core::terminal::links::LinkHit;
 use t3_core::terminal::{Grid, TerminalTypography};
 use t3_core::client_settings::{ClientSettingsDoc, typography::FontRole};
 
@@ -100,6 +101,7 @@ pub(crate) struct TerminalElement<T: TerminalSurface> {
     focus: FocusHandle,
     focused: bool,
     marked: Option<SharedString>,
+    hovered_link: Option<LinkHit>,
 }
 
 impl<T: TerminalSurface> TerminalElement<T> {
@@ -112,7 +114,12 @@ impl<T: TerminalSurface> TerminalElement<T> {
         focused: bool,
         marked: Option<SharedString>,
     ) -> Self {
-        TerminalElement { pane, front, frame, rows, focus, focused, marked }
+        TerminalElement { pane, front, frame, rows, focus, focused, marked, hovered_link: None }
+    }
+
+    pub fn hovered_link(mut self, link: Option<LinkHit>) -> Self {
+        self.hovered_link = link;
+        self
     }
 }
 
@@ -247,10 +254,11 @@ impl<T: TerminalSurface> Element for TerminalElement<T> {
         let mut lines = Vec::with_capacity(frame.rows);
         for row in 0..frame.rows {
             let glyph_col = cursor_glyph.filter(|(r, _)| *r == row).map(|(_, col)| col);
-            let key = row_key(frame, row, glyph_col, style_key);
+            let hovered_cols = hovered_cols_for_row(self.hovered_link.as_ref(), row, frame.cols);
+            let key = row_key(frame, row, glyph_col, hovered_cols, style_key);
             let shaped = rows.row(key, || {
                 let mut shaped = Vec::new();
-                shape_row(frame, row, &font, font_size, cell_width, glyph_col, paint.background, window, |col, line| {
+                shape_row(frame, row, &font, font_size, cell_width, glyph_col, hovered_cols, paint.background, window, |col, line| {
                     shaped.push((col, line))
                 });
                 shaped
@@ -333,11 +341,22 @@ fn hash_color(color: Hsla, hasher: &mut impl Hasher) {
     }
 }
 
+fn hovered_cols_for_row(link: Option<&LinkHit>, row: usize, cols: usize) -> Option<(usize, usize)> {
+    let link = link?;
+    if row < link.start.0 || row > link.end.0 || cols == 0 {
+        return None;
+    }
+    let start = if row == link.start.0 { link.start.1 } else { 0 };
+    let end = if row == link.end.0 { link.end.1 } else { cols - 1 };
+    Some((start, end))
+}
+
 /// Everything `shape_row` reads for one row; equal keys shape to the same segments.
-fn row_key(frame: &Snapshot, row: usize, cursor_col: Option<usize>, style_key: u64) -> u64 {
+fn row_key(frame: &Snapshot, row: usize, cursor_col: Option<usize>, hovered_cols: Option<(usize, usize)>, style_key: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
     style_key.hash(&mut hasher);
     cursor_col.hash(&mut hasher);
+    hovered_cols.hash(&mut hasher);
     let start = row * frame.cols;
     for (offset, cell) in frame.row(row).iter().enumerate() {
         let flags = [cell.bold, cell.italic, cell.dim, cell.underline, cell.strikeout, cell.wide, cell.spacer];
@@ -380,13 +399,17 @@ fn shape_row(
     font_size: Pixels,
     cell_width: Pixels,
     cursor_col: Option<usize>,
+    hovered_cols: Option<(usize, usize)>,
     cursor_text: Hsla,
     window: &Window,
     mut emit: impl FnMut(usize, ShapedLine),
 ) {
     let cells = frame.row(row);
     let last_text = cells.iter().rposition(|cell| cell.c != ' ' || cell.underline || cell.strikeout).map_or(0, |last| last + 1);
-    let end = cursor_col.map_or(last_text, |col| last_text.max(col + 1)).min(cells.len());
+    let end = cursor_col
+        .map_or(last_text, |col| last_text.max(col + 1))
+        .max(hovered_cols.map_or(0, |(_, end)| end + 1))
+        .min(cells.len());
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
     let mut start = 0;
@@ -416,7 +439,8 @@ fn shape_row(
             style: if cell.italic { FontStyle::Italic } else { FontStyle::Normal },
             ..font.clone()
         };
-        let underline = cell.underline.then_some(UnderlineStyle { thickness: px(1.), color: Some(color), wavy: false });
+        let underline = (cell.underline || hovered_cols.is_some_and(|(start, end)| col >= start && col <= end))
+            .then_some(UnderlineStyle { thickness: px(1.), color: Some(color), wavy: false });
         let strikethrough = cell.strikeout.then_some(StrikethroughStyle { thickness: px(1.), color: Some(color) });
         let before = text.len();
         text.push(if cell.c == '\0' { ' ' } else { cell.c });
