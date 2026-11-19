@@ -970,9 +970,16 @@ impl SettingsView {
         } else {
             "Connected to a saved remote environment."
         };
-        let network = Row::new("access-network", "Network access")
-            .description(network_desc)
-            .into_any_element();
+        let remote_denial = self.pairing_denial_for(target.config.as_ref());
+        let mut network_row = Row::new("access-network", "Network access").description(network_desc);
+        if let Some(reason) = remote_denial.filter(|_| !network_accessible) {
+            network_row = network_row.below(
+                div()
+                    .pb(r(8.))
+                    .child(crate::components::managed::notice(reason, cx)),
+            );
+        }
+        let network = network_row.into_any_element();
 
         let can_read = Self::target_may(target.grants.as_ref(), ACCESS_READ);
         let can_write = Self::target_may(target.grants.as_ref(), ACCESS_WRITE);
@@ -989,13 +996,26 @@ impl SettingsView {
         // advertises `requireConnectDeviceApproval`.
         if connect_approval_row_visible(self.access.managed_tunnel_active, target.extras.require_connect_device_approval) {
             let require_approval = target.extras.require_connect_device_approval.unwrap_or(false);
+            let policy = target.config.as_ref().and_then(|c| c.managed_policy.as_ref());
+            let approval_locked = t3_core::managed_policy::setting_lock_reason(
+                policy,
+                "requireConnectDeviceApproval",
+            )
+            .or_else(|| {
+                t3_core::managed_policy::capability_denial(
+                    policy,
+                    t3_core::managed_policy::Capability::Connect,
+                )
+            });
             let toggle_client = target.client.clone();
             let toggle_target = target.saved_id.clone();
             let toggle_entity = cx.entity().downgrade();
             machine_rows.push(
                 Row::new("connect-require-approval", "Require approval for new devices")
                     .description("Devices that sign in to your T3 Connect account wait until someone already connected here approves them.")
-                    .control(
+                    .control(crate::components::managed::ManagedControl::new(
+                        "managed-connect-require-approval",
+                        approval_locked,
                         Switch::new("connect-require-approval-switch", require_approval)
                             .disabled(!can_write || self.access.approval_saving)
                             .on_change(move |next, _, cx| {
@@ -1005,7 +1025,7 @@ impl SettingsView {
                                     this.toggle_connect_device_approval(client, target, next, cx);
                                 });
                             }),
-                    )
+                    ))
                     .into_any_element(),
             );
         }
@@ -1131,15 +1151,20 @@ impl SettingsView {
             h_flex()
                 .gap(r(6.))
                 .when(peer_links_enabled, |this| {
-                    this.child(
+                    this.child(crate::components::managed::ManagedControl::new(
+                        "managed-link-machine",
+                        denial.clone(),
                         Button::new("access-link-machine", ButtonVariant::Outline, ButtonSize::Compact)
                             .icon(Icon::Link2)
                             .label("Link machine")
                             .disabled(self.access.link_machine.is_some())
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                if denied {
+                                    return;
+                                }
                                 this.open_link_machine_form(target_id_for_link.clone(), client_for_link.clone(), window, cx);
                             })),
-                    )
+                    ))
                 })
                 .child(
                     Button::new("access-revoke-others", ButtonVariant::Outline, ButtonSize::Compact)

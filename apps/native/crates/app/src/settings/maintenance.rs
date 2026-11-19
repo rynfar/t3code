@@ -217,6 +217,7 @@ impl SettingsView {
         &self,
         id: &'static str,
         on: bool,
+        disabled: bool,
         set_pressed: impl Fn(&mut Self, bool) + Copy + 'static,
         on_toggle: impl Fn(&mut Self, bool, &mut Window, &mut Context<Self>) + 'static,
         cx: &Context<Self>,
@@ -227,6 +228,9 @@ impl SettingsView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, _| {
+                    if disabled {
+                        return;
+                    }
                     window.prevent_default();
                     set_pressed(this, true);
                 }),
@@ -243,7 +247,7 @@ impl SettingsView {
                     set_pressed(this, false);
                 }),
             )
-            .child(Switch::new(id, on).on_change(move |next, window, cx| {
+            .child(Switch::new(id, on).disabled(disabled).on_change(move |next, window, cx| {
                 let _ = view.update(cx, |this, cx| {
                     set_pressed(this, false);
                     on_toggle(this, next, window, cx);
@@ -400,47 +404,54 @@ impl SettingsView {
         let updates = section(
             "Updates",
             vec![
-                Row::new("provider-update-checks", "Provider update checks")
-                    .description("Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear.")
-                    .highlighted(self.is_target("provider-update-checks"))
-                    .unavailable(env_only.clone())
-                    .reset(!settings.maintenance.enable_provider_update_checks, {
-                        let view = view.clone();
-                        move |_, _, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ProviderUpdateChecks(true).payload()), cx);
-                            });
-                        }
-                    })
-                    .control(Switch::new("provider-update-checks-switch", settings.maintenance.enable_provider_update_checks).disabled(env_only.is_some()).on_change({
+                {
+                    let lock = self.managed_setting_lock(&["enableProviderUpdateChecks"], cx);
+                    let row_unavail = lock.clone().or_else(|| env_only.clone());
+                    Row::new("provider-update-checks", "Provider update checks")
+                        .description("Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear.")
+                        .highlighted(self.is_target("provider-update-checks"))
+                        .unavailable(row_unavail.clone())
+                        .reset(lock.is_none() && !settings.maintenance.enable_provider_update_checks, {
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ProviderUpdateChecks(true).payload()), cx);
+                                });
+                            }
+                        })
+                        .control(Switch::new("provider-update-checks-switch", settings.maintenance.enable_provider_update_checks).disabled(row_unavail.is_some()).on_change({
+                            let view = view.clone();
+                            move |on, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ProviderUpdateChecks(on).payload()), cx);
+                                });
+                            }
+                        }))
+                        .into_any_element()
+                },
+                {
+                    let continue_locked = self.managed_setting_lock(&["continueThreadsAfterServerUpdate"], cx).is_some();
+                    self.apply_scoped_reset(
+                        Row::new("continue-threads-after-server-update", "Continue threads after restarts")
+                            .description("Automatically resume interrupted threads after an update, crash, or machine restart on the selected environments.")
+                            .when(!connected, |row| row.status("All selected connected environments must support restart continuation."))
+                            .highlighted(self.is_target("continue-threads-after-server-update"))
+                            .unavailable(unavailable.clone()),
+                        &["continueThreadsAfterServerUpdate"],
+                        connected && !settings.maintenance.continue_threads_after_server_update,
+                        ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(true).payload()),
+                        cx,
+                    )
+                    .control(Switch::new("continue-threads-switch", settings.maintenance.continue_threads_after_server_update).disabled(!connected || continue_locked).on_change({
                         let view = view.clone();
                         move |on, _, cx| {
                             let _ = view.update(cx, |this, cx| {
-                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ProviderUpdateChecks(on).payload()), cx);
+                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(on).payload()), cx);
                             });
                         }
                     }))
-                    .into_any_element(),
-                self.apply_scoped_reset(
-                    Row::new("continue-threads-after-server-update", "Continue threads after restarts")
-                        .description("Automatically resume interrupted threads after an update, crash, or machine restart on the selected environments.")
-                        .when(!connected, |row| row.status("All selected connected environments must support restart continuation."))
-                        .highlighted(self.is_target("continue-threads-after-server-update"))
-                        .unavailable(unavailable.clone()),
-                    &["continueThreadsAfterServerUpdate"],
-                    connected && !settings.maintenance.continue_threads_after_server_update,
-                    ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(true).payload()),
-                    cx,
-                )
-                .control(Switch::new("continue-threads-switch", settings.maintenance.continue_threads_after_server_update).disabled(!connected).on_change({
-                    let view = view.clone();
-                    move |on, _, cx| {
-                        let _ = view.update(cx, |this, cx| {
-                            this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(on).payload()), cx);
-                        });
-                    }
-                }))
-                .into_any_element(),
+                    .into_any_element()
+                },
             ],
             cx,
         );
@@ -448,29 +459,33 @@ impl SettingsView {
             "Background activity",
             vec![
                 self.background_row(&config, env_only.clone(), cx),
-                Row::new("keep-awake-while-agents-work", "Keep awake while agents work")
-                    .description("Stop the computer from going to sleep while agents are working, and let it sleep once they finish. Closing a laptop lid still puts it to sleep.")
-                    .highlighted(self.is_target("keep-awake-while-agents-work"))
-                    .unavailable(env_only.clone())
-                    .reset(!settings.maintenance.keep_awake_while_agents_work, {
-                        let view = view.clone();
-                        move |_, _, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::KeepAwakeWhileAgentsWork(true).payload()), cx);
-                            });
-                        }
-                    })
-                    .control(
-                        Switch::new("keep-awake-while-agents-work-switch", settings.maintenance.keep_awake_while_agents_work).disabled(env_only.is_some()).on_change({
+                {
+                    let lock = self.managed_setting_lock(&["keepAwakeWhileAgentsWork"], cx);
+                    let row_unavail = lock.clone().or_else(|| env_only.clone());
+                    Row::new("keep-awake-while-agents-work", "Keep awake while agents work")
+                        .description("Stop the computer from going to sleep while agents are working, and let it sleep once they finish. Closing a laptop lid still puts it to sleep.")
+                        .highlighted(self.is_target("keep-awake-while-agents-work"))
+                        .unavailable(row_unavail.clone())
+                        .reset(lock.is_none() && !settings.maintenance.keep_awake_while_agents_work, {
                             let view = view.clone();
-                            move |on, _, cx| {
+                            move |_, _, cx| {
                                 let _ = view.update(cx, |this, cx| {
-                                    this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::KeepAwakeWhileAgentsWork(on).payload()), cx);
+                                    this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::KeepAwakeWhileAgentsWork(true).payload()), cx);
                                 });
                             }
-                        }),
-                    )
-                    .into_any_element(),
+                        })
+                        .control(
+                            Switch::new("keep-awake-while-agents-work-switch", settings.maintenance.keep_awake_while_agents_work).disabled(row_unavail.is_some()).on_change({
+                                let view = view.clone();
+                                move |on, _, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::KeepAwakeWhileAgentsWork(on).payload()), cx);
+                                    });
+                                }
+                            }),
+                        )
+                        .into_any_element()
+                },
             ],
             cx,
         );
@@ -505,6 +520,9 @@ impl SettingsView {
     /// `BackgroundActivitySettingsRow`.
     fn background_row(&mut self, config: &ServerConfig, unavailable: Option<String>, cx: &mut Context<Self>) -> AnyElement {
         let settings = &config.settings.provider_panel;
+        let lock = self.managed_setting_lock(&["backgroundActivity"], cx);
+        let row_unavail = lock.clone().or(unavailable);
+        let disabled = row_unavail.is_some();
         let option = model::profile_option(settings);
         let selected = match option {
             ProfileOption::Profile(profile) => profile.as_str(),
@@ -514,7 +532,7 @@ impl SettingsView {
         options.push(SelectOption::new(model::ADVANCED_OPTION, "Advanced"));
         let view = cx.entity().downgrade();
         let select_view = view.clone();
-        let select = Select::new("background-activity-select", options).selected(selected).width(160.).on_change(move |value, window, cx| {
+        let select = Select::new("background-activity-select", options).selected(selected).width(160.).disabled(disabled).on_change(move |value, window, cx| {
             if value.as_ref() == model::ADVANCED_OPTION {
                 let _ = select_view.update(cx, |this, cx| this.open_background_dialog(window, cx));
             } else if let Some(profile) = model::parse_profile(&value) {
@@ -527,6 +545,7 @@ impl SettingsView {
             Button::new("background-activity-configure", ButtonVariant::Outline, ButtonSize::IconSm)
                 .icon(Icon::Settings)
                 .tooltip("Configure background activity")
+                .disabled(disabled)
                 .on_click(cx.listener(|this, _, window, cx| this.open_background_dialog(window, cx)))
         });
         let reset_view = view.clone();
@@ -534,8 +553,8 @@ impl SettingsView {
             .title_tooltip(model::POLICY_TOOLTIP)
             .description(model::background_description(settings))
             .highlighted(self.is_target("background-activity") || self.is_target("git-fetch-interval"))
-            .unavailable(unavailable)
-            .reset(model::background_customized(settings), move |_, _, cx| {
+            .unavailable(row_unavail)
+            .reset(lock.is_none() && model::background_customized(settings), move |_, _, cx| {
                 let _ = reset_view.update(cx, |this, cx| {
                     this.update_scoped_server(ServerSettingChange::Prepared(model::background_reset_payload()), cx);
                 });
@@ -545,7 +564,7 @@ impl SettingsView {
     }
 
     fn open_background_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.may(SETTINGS_WRITE_SCOPE, cx) {
+        if !self.may(SETTINGS_WRITE_SCOPE, cx) || self.managed_setting_lock(&["backgroundActivity"], cx).is_some() {
             return;
         }
         let focus = cx.focus_handle();
@@ -672,7 +691,7 @@ impl SettingsView {
 
     /// `RetentionControl`: a day count while on, "Off" while off, and a switch that opens a
     /// draft at eight days without saving until Enter or blur after editing.
-    fn maintenance_retention(&self, field: Field, id: &'static str, value: Option<u32>, cx: &Context<Self>) -> impl IntoElement {
+    fn maintenance_retention(&self, field: Field, id: &'static str, value: Option<u32>, disabled: bool, cx: &Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let idx = field.index();
         let on = self.maintenance.retention_drafts[idx].is_on(value);
@@ -683,7 +702,7 @@ impl SettingsView {
                     this.child(
                         h_flex()
                             .gap(r(6.))
-                            .child(div().w(r(72.)).child(Input::new(self.maintenance.input(field)).small()))
+                            .child(div().w(r(72.)).child(Input::new(self.maintenance.input(field)).small().disabled(disabled)))
                             .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("days")),
                     )
                 } else {
@@ -693,6 +712,7 @@ impl SettingsView {
             .child(self.retention_switch(
                 id,
                 on,
+                disabled,
                 move |this, pressed| this.maintenance.retention_switch_pressed[idx] = pressed,
                 move |this, next, window, cx| {
                     let saved = this.scoped_representative_config(cx).and_then(|config| field.saved(&Retention::of(&config.settings)));
@@ -742,18 +762,32 @@ impl SettingsView {
                 Self::sync_input(self.maintenance.input(field), &days.to_string(), window, cx);
             }
         }
+        let artifacts_unavail = self.scoped_unavailable(&["storageCleanup.browserArtifactsAfterDays"], unavailable.clone(), cx);
+        let logs_unavail = self.scoped_unavailable(&["storageCleanup.logsAfterDays"], unavailable, cx);
         let artifacts = section(
             "Artifacts and logs",
             vec![
                 Row::new("storage-browser-artifacts", "Delete old browser artifacts")
                     .description("Delete saved browser captures after this many days. Older capture links will no longer open.")
-                    .unavailable(unavailable.clone())
-                    .control(self.maintenance_retention(Field::Artifacts, "storage-artifacts-switch", retention.browser_artifacts_after_days, cx))
+                    .unavailable(artifacts_unavail.clone())
+                    .control(self.maintenance_retention(
+                        Field::Artifacts,
+                        "storage-artifacts-switch",
+                        retention.browser_artifacts_after_days,
+                        artifacts_unavail.is_some(),
+                        cx,
+                    ))
                     .into_any_element(),
                 Row::new("storage-logs", "Delete old rotated logs")
                     .description("Delete inactive rotated log files after this many days. Current logs are kept.")
-                    .unavailable(unavailable)
-                    .control(self.maintenance_retention(Field::Logs, "storage-logs-switch", retention.logs_after_days, cx))
+                    .unavailable(logs_unavail.clone())
+                    .control(self.maintenance_retention(
+                        Field::Logs,
+                        "storage-logs-switch",
+                        retention.logs_after_days,
+                        logs_unavail.is_some(),
+                        cx,
+                    ))
                     .into_any_element(),
             ],
             cx,

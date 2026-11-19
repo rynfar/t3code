@@ -136,6 +136,9 @@ impl ActionsState {
 
 impl SettingsView {
     fn open_action_editor(&mut self, request: EditorRequest, window: &mut Window, cx: &mut Context<Self>) {
+        if self.managed_setting_lock(&["defaultProjectScripts"], cx).is_some() {
+            return;
+        }
         let targets = self.project_targets(cx);
         let actions = &mut self.projects.actions;
         actions.import_open = false;
@@ -343,16 +346,25 @@ impl SettingsView {
     }
 
     fn import_file_script(&mut self, file: FileScript, cx: &mut Context<Self>) {
+        if self.managed_setting_lock(&["defaultProjectScripts"], cx).is_some() {
+            return;
+        }
         self.projects.actions.import_open = false;
         let input = file.import_input();
         self.submit_action(None, input.clone(), AfterSave::Import(input), cx);
     }
 
     fn delete_action(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.managed_setting_lock(&["defaultProjectScripts"], cx).is_some() {
+            return;
+        }
         self.persist_actions(ScriptsEdit::Delete { id }, AfterSave::Nothing, cx);
     }
 
     fn reset_actions(&mut self, cx: &mut Context<Self>) {
+        if self.managed_setting_lock(&["defaultProjectScripts"], cx).is_some() {
+            return;
+        }
         self.persist_actions(ScriptsEdit::Reset, AfterSave::Nothing, cx);
     }
 
@@ -386,8 +398,9 @@ impl SettingsView {
         let ids = shown.member_ids();
         let settings = &config.settings;
         let can_write = self.projects_permitted(SETTINGS_WRITE_SCOPE, cx);
+        let actions_lock = self.managed_setting_lock(&["defaultProjectScripts"], cx);
         let actions = &self.projects.actions;
-        let disabled = actions.saving || !can_write;
+        let disabled = actions.saving || !can_write || actions_lock.is_some();
         let scripts = shown_scripts(settings, ids[0]).to_vec();
         let mixed = shown.targets.iter().any(|project| self.project_config(project, cx).is_none_or(|config| shown_scripts(&config.settings, &project.project.id) != scripts));
         let keybindings = decode_resolved_keybindings(&config.keybindings);
@@ -410,8 +423,9 @@ impl SettingsView {
             .on_click(cx.listener(|this, _, window, cx| this.open_action_editor(EditorRequest::add(), window, cx)));
         let header = Row::new("project-actions-row", "Actions")
             .description(ACTIONS_DESCRIPTION)
+            .unavailable(actions_lock.clone())
             .reset_tooltip("Reset to inherited value")
-            .reset(can_write && shown.targets.iter().any(|project| self.project_config(project, cx).is_some_and(|config| scripts_overridden(&config.settings, &[&project.project.id]))), cx.listener(|this, _, _, cx| this.reset_actions(cx)))
+            .reset(actions_lock.is_none() && can_write && shown.targets.iter().any(|project| self.project_config(project, cx).is_some_and(|config| scripts_overridden(&config.settings, &[&project.project.id]))), cx.listener(|this, _, _, cx| this.reset_actions(cx)))
             .control(h_flex().flex_wrap().gap(r(6.)).children(import).child(add));
 
         let mut rows = vec![header.into_any_element()];

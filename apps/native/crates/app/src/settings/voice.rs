@@ -2336,6 +2336,7 @@ impl SettingsView {
         ];
 
         let has_server = self.scoped_representative_config(cx).is_some();
+        let proj_dict_lock = self.managed_setting_lock(&["speechProjectCustomWords"], cx);
         let scoped_project_label = self.scope_project_label(cx);
         let project_words = self.current_project_dictionary_words(cx);
         let project_editor = self.render_dictionary_editor(
@@ -2344,7 +2345,7 @@ impl SettingsView {
             &self.voice.project_term,
             self.voice.project_alias_target.as_deref(),
             &self.voice.project_alias_input,
-            !has_server,
+            !has_server || proj_dict_lock.is_some(),
             |this, window, cx| this.add_project_dictionary_terms(window, cx),
             |this, term, window, cx| {
                 this.voice.project_alias_target = Some(term);
@@ -2376,11 +2377,12 @@ impl SettingsView {
         let mut proj_dict_row = Row::new("speech-project-dictionary", proj_dict_title)
             .description(proj_dict_desc)
             .highlighted(self.is_target("speech-project-dictionary"))
+            .unavailable(proj_dict_lock.clone())
             .below(project_editor);
         if self.is_project_scope(cx) {
             let reset_view = cx.entity().downgrade();
             proj_dict_row = proj_dict_row.reset_tooltip("Reset to inherited value").reset(
-                self.has_project_override(&["speechProjectCustomWords"], cx),
+                proj_dict_lock.is_none() && self.has_project_override(&["speechProjectCustomWords"], cx),
                 move |_, _, cx| {
                     let _ = reset_view.update(cx, |this, cx| {
                         this.clear_project_overrides(&["speechProjectCustomWords"], cx);
@@ -2531,6 +2533,8 @@ impl SettingsView {
         };
         self.sync_text_generator_models(&config, cx);
         let env_only = self.env_only_unavailable(cx);
+        let row_unavail = self.scoped_unavailable(&["speechPostProcessingModelSelection"], env_only, cx);
+        let locked = row_unavail.is_some();
         let saved_cleanup = speech_post_processing_model_selection(&config.settings);
         let dedicated = saved_cleanup.is_some();
         let fallback_text_gen =
@@ -2560,6 +2564,7 @@ impl SettingsView {
                     "speech-cleanup-model",
                     &config,
                     sel,
+                    locked,
                     cx.entity().downgrade(),
                     ServerSettingChange::SpeechPostProcessingModelSelection,
                 );
@@ -2571,6 +2576,7 @@ impl SettingsView {
                             .width(200.)
                             .popup_width(260.)
                             .show_check()
+                            .disabled(locked)
                             .on_change(move |value, _, cx| {
                                 if let Some(next) = parse_selection(&value) {
                                     let _ = select_view.update(cx, |this, cx| {
@@ -2589,7 +2595,7 @@ impl SettingsView {
         }
         control = control.child(
             Switch::new("speech-cleanup-model-switch", dedicated)
-                .disabled(!dedicated && !has_provider)
+                .disabled(locked || (!dedicated && !has_provider))
                 .on_change(move |checked, _, cx| {
                     let next = if checked { switch_default.clone() } else { None };
                     let _ = switch_view.update(cx, |this, cx| {
@@ -2606,7 +2612,7 @@ impl SettingsView {
                 "Model for transcript cleanup, such as a cheaper or faster one. When disabled, use the text generation model configured for this environment.",
             )
             .highlighted(self.is_target("speech-post-processing-model"))
-            .unavailable(env_only);
+            .unavailable(row_unavail);
         if let Some(reason) = disabled_reason {
             row = row.status(reason);
         }

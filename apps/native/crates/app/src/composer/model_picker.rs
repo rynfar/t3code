@@ -75,8 +75,25 @@ pub struct PickerInput {
     pub descriptors: Vec<OptionDescriptor>,
     pub runtime_mode: RuntimeMode,
     pub runtime_modes: Vec<RuntimeMode>,
+    /// Active environment's managed policy (`useManagedPolicy`), enforcing `maxRuntimeMode`.
+    pub managed_policy: Option<serde_json::Value>,
     /// A started thread that cannot switch providers keeps this instance.
     pub locked_instance: Option<String>,
+}
+
+/// Active composer environment's managed policy for `permissions_section` without changing
+/// `composer/view.rs`'s call signature.
+#[derive(Default)]
+struct ActiveComposerManagedPolicy {
+    policy: Option<serde_json::Value>,
+}
+impl gpui::Global for ActiveComposerManagedPolicy {}
+
+pub(super) fn set_active_managed_policy(policy: Option<serde_json::Value>, cx: &mut App) {
+    if cx.try_global::<ActiveComposerManagedPolicy>().is_some_and(|g| g.policy == policy) {
+        return;
+    }
+    cx.set_global(ActiveComposerManagedPolicy { policy });
 }
 
 pub enum PickerEvent {
@@ -760,9 +777,10 @@ impl ModelPicker {
                                         this.permissions_open = false;
                                         cx.notify();
                                     }))
-                                    .child(permissions_section(
+                                    .child(permissions_section_with_policy(
                                         mode,
                                         &self.input.runtime_modes,
+                                        self.input.managed_policy.as_ref(),
                                         cx,
                                         |mode, this: &mut Self, cx: &mut Context<Self>| {
                                             this.permissions_open = false;
@@ -781,13 +799,30 @@ const LOCKED_REASON: &str =
     "This thread does not support switching providers after it has started. Start a new thread to use this model.";
 
 /// `ComposerPermissionsSection`: the modes as one segmented row, the picked one named below.
+/// Modes above an administrator's `maxRuntimeMode` ceiling stay listed, disabled with the policy's
+/// denial reason (`resolveRuntimeModeOptions` in `runtimeModeConfig.ts`).
 pub fn permissions_section<V: 'static>(
     mode: RuntimeMode,
     modes: &[RuntimeMode],
     cx: &mut Context<V>,
     on_pick: impl Fn(RuntimeMode, &mut V, &mut Context<V>) + Clone + 'static,
 ) -> impl IntoElement {
+    let policy = cx
+        .try_global::<ActiveComposerManagedPolicy>()
+        .and_then(|g| g.policy.clone());
+    permissions_section_with_policy(mode, modes, policy.as_ref(), cx, on_pick)
+}
+
+/// `ComposerPermissionsSection` with an explicit managed policy.
+pub fn permissions_section_with_policy<V: 'static>(
+    mode: RuntimeMode,
+    modes: &[RuntimeMode],
+    policy: Option<&serde_json::Value>,
+    cx: &mut Context<V>,
+    on_pick: impl Fn(RuntimeMode, &mut V, &mut Context<V>) + Clone + 'static,
+) -> gpui::Div {
     let p = palette(cx);
+    let selected_denial = t3_core::managed_policy::runtime_mode_denial(policy, mode.as_str());
     v_flex()
         .w(px(288.))
         .gap(px(6.))
@@ -796,18 +831,34 @@ pub fn permissions_section<V: 'static>(
         .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child("Permissions"))
         .child(segmented_track(cx).children(RuntimeMode::ALL.into_iter().map(|option| {
             let supported = modes.contains(&option);
+            let denial = t3_core::managed_policy::runtime_mode_denial(policy, option.as_str());
+            let disabled = !supported || denial.is_some();
+            let tooltip = denial.unwrap_or_else(|| {
+                format!("{}. {}", runtime_mode_label(option), runtime_mode_description(option))
+            });
             let on_pick = on_pick.clone();
             Segment::new(SharedString::from(format!("permission-{}", option.as_str())), option == mode)
                 .icon(runtime_mode_icon(option))
-                .disabled(!supported)
-                .tooltip(format!("{}. {}", runtime_mode_label(option), runtime_mode_description(option)))
-                .on_click(cx.listener(move |this, _, _, cx| on_pick(option, this, cx)))
+                .disabled(disabled)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !disabled {
+                        on_pick(option, this, cx);
+                    }
+                }))
         })))
         .child(
             v_flex()
                 .gap(px(2.))
                 .child(div().text_sm().text_color(hsla(p.foreground)).child(runtime_mode_label(mode)))
-                .child(div().min_h(px(32.)).text_xs().line_height(px(16.)).text_color(hsla(p.muted_foreground)).child(runtime_mode_description(mode))),
+                .child(
+                    div()
+                        .min_h(px(32.))
+                        .text_xs()
+                        .line_height(px(16.))
+                        .text_color(hsla(p.muted_foreground))
+                        .child(selected_denial.unwrap_or_else(|| runtime_mode_description(mode).to_owned())),
+                ),
         )
 }
 

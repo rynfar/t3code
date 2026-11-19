@@ -181,6 +181,7 @@ pub(super) fn model_trait_controls(
     id_prefix: &'static str,
     config: &ServerConfig,
     selection: &ModelSelection,
+    disabled: bool,
     view: WeakEntity<SettingsView>,
     change: fn(Option<ModelSelection>) -> ServerSettingChange,
 ) -> Vec<AnyElement> {
@@ -224,6 +225,7 @@ pub(super) fn model_trait_controls(
                 .width(124.)
                 .popup_width(180.)
                 .show_check()
+                .disabled(disabled)
                 .on_change(move |value, _, cx| {
                     if let Some(next_selections) =
                         traits::with_value(&all_descriptors, &option_id, OptionValue::Str(value.to_string()))
@@ -408,28 +410,32 @@ impl SettingsView {
         let env_only = self.env_only_unavailable(cx);
         let scope_project = self.is_project_scope(cx).then(|| self.scope_project_id(cx)).flatten();
         let ghq_view = cx.entity().downgrade();
+        let base_dir_lock = self.managed_setting_lock(&["addProjectBaseDirectory"], cx);
+        let base_dir_unavail = base_dir_lock.clone().or_else(|| env_only.clone());
+        let ghq_lock = self.managed_setting_lock(&["ghqCloneLayout"], cx);
+        let ghq_unavail = ghq_lock.clone().or_else(|| env_only.clone());
         let new_projects = section(
             "New projects",
             vec![
                 Row::new("add-project-starts-in", "Add project starts in")
                     .description("Leave empty to use \"~/\" when the Add Project browser opens.")
                     .highlighted(self.is_target("add-project-starts-in"))
-                    .unavailable(env_only.clone())
-                    .reset(!threads.add_project_base_directory.is_empty(), {
+                    .unavailable(base_dir_unavail.clone())
+                    .reset(base_dir_lock.is_none() && !threads.add_project_base_directory.is_empty(), {
                         let reset = update(ServerSettingChange::AddProjectBaseDirectory(String::new()));
                         move |_, _, cx| reset(cx)
                     })
-                    .control(div().w(r(288.)).child(Input::new(&self.threads.base_directory).small().disabled(env_only.is_some())))
+                    .control(div().w(r(288.)).child(Input::new(&self.threads.base_directory).small().disabled(base_dir_unavail.is_some())))
                     .into_any_element(),
                 Row::new("ghq-clone-layout", "Clone into host folders")
                     .description("Clones go to github.com/owner/repo under the folder above, like ghq.")
                     .highlighted(self.is_target("ghq-clone-layout"))
-                    .unavailable(env_only.clone())
-                    .reset(threads.ghq_clone_layout, {
+                    .unavailable(ghq_unavail.clone())
+                    .reset(ghq_lock.is_none() && threads.ghq_clone_layout, {
                         let reset = update(ServerSettingChange::GhqCloneLayout(false));
                         move |_, _, cx| reset(cx)
                     })
-                    .control(Switch::new("ghq-clone-layout-switch", threads.ghq_clone_layout).disabled(env_only.is_some()).on_change(move |checked, _, cx| {
+                    .control(Switch::new("ghq-clone-layout-switch", threads.ghq_clone_layout).disabled(ghq_unavail.is_some()).on_change(move |checked, _, cx| {
                         let _ = ghq_view.update(cx, |this, cx| this.update_scoped_server(ServerSettingChange::GhqCloneLayout(checked), cx));
                     }))
                     .into_any_element(),
@@ -445,6 +451,7 @@ impl SettingsView {
             .or_else(|| providers::project_default_selection(&providers::entries(&config, scope_project.as_deref())));
         let automatic = settings.default_model_selection.is_none();
         let model_view = cx.entity().downgrade();
+        let model_locked = self.managed_setting_lock(&["defaultModelSelection"], cx).is_some();
         let model_disabled_reason = selection.as_ref().and_then(|sel| {
             self.scoped_model_disabled_reason(&config, &sel.instance_id, &sel.model, false, cx)
         });
@@ -470,6 +477,7 @@ impl SettingsView {
                     "default-model",
                     &config,
                     selection,
+                    model_locked,
                     cx.entity().downgrade(),
                     ServerSettingChange::DefaultModelSelection,
                 );
@@ -485,6 +493,7 @@ impl SettingsView {
                                 .width(220.)
                                 .popup_width(260.)
                                 .show_check()
+                                .disabled(model_locked)
                                 .on_change(move |value, _, cx| {
                                     if let Some(selection) = parse_selection(&value) {
                                         let _ = model_view.update(cx, |this, cx| {
@@ -500,6 +509,8 @@ impl SettingsView {
         };
 
         let fallback_view = cx.entity().downgrade();
+        let fallback_lock = self.managed_setting_lock(&["fallbackModelSelection"], cx);
+        let fallback_unavail = fallback_lock.clone().or_else(|| env_only.clone());
         let fallback = settings.fallback_model_selection.clone().or(selection.clone());
         let fallback_disabled_reason = settings.fallback_model_selection.as_ref().and_then(|sel| {
             self.scoped_model_disabled_reason(&config, &sel.instance_id, &sel.model, false, cx)
@@ -507,8 +518,8 @@ impl SettingsView {
         let mut fallback_row = Row::new("fallback-model", "Fallback model")
             .description("Used for new threads when the default model's provider is out of usage.")
             .highlighted(self.is_target("fallback-model"))
-            .unavailable(env_only.clone())
-            .reset(settings.fallback_model_selection.is_some(), {
+            .unavailable(fallback_unavail.clone())
+            .reset(fallback_lock.is_none() && settings.fallback_model_selection.is_some(), {
                 let reset = update(ServerSettingChange::FallbackModelSelection(None));
                 move |_, _, cx| reset(cx)
             });
@@ -525,6 +536,7 @@ impl SettingsView {
                             "fallback-model",
                             &config,
                             explicit,
+                            fallback_unavail.is_some(),
                             cx.entity().downgrade(),
                             ServerSettingChange::FallbackModelSelection,
                         )
@@ -542,6 +554,7 @@ impl SettingsView {
                                 .width(220.)
                                 .popup_width(260.)
                                 .show_check()
+                                .disabled(fallback_unavail.is_some())
                                 .on_change(move |value, _, cx| {
                                     if let Some(selection) = parse_selection(&value) {
                                         let _ = fallback_view.update(cx, |this, cx| {
@@ -557,6 +570,29 @@ impl SettingsView {
         };
 
         let mode_view = cx.entity().downgrade();
+        let perm_locked = self.managed_setting_lock(&["defaultRuntimeMode"], cx).is_some();
+        let scoped_configs = self.scoped_all_configs(cx);
+        let runtime_mode_options: Vec<SelectOption> = RuntimeMode::ALL
+            .iter()
+            .map(|mode| {
+                let denial = if scoped_configs.is_empty() {
+                    t3_core::managed_policy::first_managed_denial(
+                        [config.managed_policy.as_ref()],
+                        |policy| t3_core::managed_policy::runtime_mode_denial(policy, mode.as_str()),
+                    )
+                } else {
+                    t3_core::managed_policy::first_managed_denial(
+                        scoped_configs.iter().map(|c| c.managed_policy.as_ref()),
+                        |policy| t3_core::managed_policy::runtime_mode_denial(policy, mode.as_str()),
+                    )
+                };
+                let description = denial.clone().unwrap_or_else(|| runtime_mode_description(*mode).to_owned());
+                SelectOption::new(mode.as_str(), runtime_mode_label(*mode))
+                    .description(description)
+                    .icon(runtime_mode_icon(*mode))
+                    .disabled_reason(denial)
+            })
+            .collect();
         let permissions_row = self
             .apply_scoped_reset(
                 Row::new("default-permissions", "Permissions")
@@ -568,29 +604,21 @@ impl SettingsView {
                 cx,
             )
             .control(
-                Select::new(
-                    "default-permissions-select",
-                    RuntimeMode::ALL
-                        .iter()
-                        .map(|mode| {
-                            SelectOption::new(mode.as_str(), runtime_mode_label(*mode))
-                                .description(runtime_mode_description(*mode))
-                                .icon(runtime_mode_icon(*mode))
-                        })
-                        .collect(),
-                )
-                .selected(settings.default_runtime_mode.as_str())
-                .popup_width(256.)
-                .on_change(move |value, _, cx| {
-                    if let Some(mode) = RuntimeMode::parse(&value) {
-                        let _ = mode_view.update(cx, |this, cx| {
-                            this.update_scoped_server(ServerSettingChange::DefaultRuntimeMode(mode), cx);
-                        });
-                    }
-                }),
+                Select::new("default-permissions-select", runtime_mode_options)
+                    .selected(settings.default_runtime_mode.as_str())
+                    .popup_width(256.)
+                    .disabled(perm_locked)
+                    .on_change(move |value, _, cx| {
+                        if let Some(mode) = RuntimeMode::parse(&value) {
+                            let _ = mode_view.update(cx, |this, cx| {
+                                this.update_scoped_server(ServerSettingChange::DefaultRuntimeMode(mode), cx);
+                            });
+                        }
+                    }),
             );
 
         let workspace_view = cx.entity().downgrade();
+        let workspace_locked = self.managed_setting_lock(&["defaultThreadEnvMode"], cx).is_some();
         let workspace_row = self
             .apply_scoped_reset(
                 Row::new("new-threads", "Workspace")
@@ -605,6 +633,7 @@ impl SettingsView {
                 Select::new("default-workspace-select", ENV_MODES.iter().map(|(mode, label)| SelectOption::new(env_mode_value(*mode), *label)).collect())
                     .selected(env_mode_value(effective_env_mode(settings)))
                     .show_check()
+                    .disabled(workspace_locked)
                     .on_change(move |value, _, cx| {
                         let mode = match value.as_ref() {
                             "local" => ThreadEnvMode::Local,
@@ -623,7 +652,13 @@ impl SettingsView {
             cx,
         );
 
-        let snooze_section = section("Snooze", vec![self.snooze_row(&threads.snooze_presets, window, cx).unavailable(env_only.clone()).into_any_element()], cx);
+        let snooze_lock = self.managed_setting_lock(&["snoozePresets"], cx);
+        let snooze_unavail = snooze_lock.clone().or_else(|| env_only.clone());
+        let snooze_section = section(
+            "Snooze",
+            vec![self.snooze_row(&threads.snooze_presets, snooze_unavail.is_some(), snooze_lock.is_some(), window, cx).unavailable(snooze_unavail).into_any_element()],
+            cx,
+        );
 
         let switch_view = cx.entity().downgrade();
         let switch = |id: &'static str, checked: bool, change: fn(bool) -> ServerSettingChange| {
@@ -632,26 +667,30 @@ impl SettingsView {
                 let _ = view.update(cx, |this, cx| this.update_scoped_server(change(checked), cx));
             })
         };
+        let auto_resume_unavail = self.scoped_unavailable(&["autoResumeLimitedThreads"], env_only.clone(), cx);
+        let snooze_limited_unavail = self.scoped_unavailable(&["snoozeLimitedThreads"], env_only.clone(), cx);
         let usage_limits = section(
             "Usage limits",
             vec![
                 Row::new("auto-resume-limited-threads", "Resume after usage limits")
                     .description("Automatically resume threads when their usage limits reset. You can cancel auto-resume in each thread.")
                     .highlighted(self.is_target("auto-resume-limited-threads"))
-                    .unavailable(env_only.clone())
-                    .control(switch("auto-resume-switch", threads.auto_resume_limited_threads, ServerSettingChange::AutoResumeLimitedThreads).disabled(env_only.is_some()))
+                    .unavailable(auto_resume_unavail.clone())
+                    .control(switch("auto-resume-switch", threads.auto_resume_limited_threads, ServerSettingChange::AutoResumeLimitedThreads).disabled(auto_resume_unavail.is_some()))
                     .into_any_element(),
                 Row::new("snooze-limited-threads", "Snooze until limits reset")
                     .description("Snooze threads until their usage limits reset. Enable auto-resume to continue the agent after the reset.")
                     .highlighted(self.is_target("snooze-limited-threads"))
-                    .unavailable(env_only.clone())
-                    .control(switch("snooze-limited-switch", threads.snooze_limited_threads, ServerSettingChange::SnoozeLimitedThreads).disabled(env_only.is_some()))
+                    .unavailable(snooze_limited_unavail.clone())
+                    .control(switch("snooze-limited-switch", threads.snooze_limited_threads, ServerSettingChange::SnoozeLimitedThreads).disabled(snooze_limited_unavail.is_some()))
                     .into_any_element(),
             ],
             cx,
         );
 
         let days = threads.sidebar_auto_settle_after_days;
+        let auto_settle_merged_locked = self.managed_setting_lock(&["sidebarAutoSettleOnMerge"], cx).is_some();
+        let auto_settle_days_lock = self.managed_setting_lock(&["sidebarAutoSettleAfterDays"], cx);
         let mut auto_settle_rows = vec![
             self.apply_scoped_reset(
                 Row::new("auto-settle-merged-threads", "Auto-settle merged threads")
@@ -662,7 +701,7 @@ impl SettingsView {
                 ServerSettingChange::AutoSettleOnMerge(true),
                 cx,
             )
-            .control(switch("auto-settle-merged-switch", threads.sidebar_auto_settle_on_merge, ServerSettingChange::AutoSettleOnMerge))
+            .control(switch("auto-settle-merged-switch", threads.sidebar_auto_settle_on_merge, ServerSettingChange::AutoSettleOnMerge).disabled(auto_settle_merged_locked))
             .into_any_element(),
             self.apply_scoped_reset(
                 Row::new("auto-settle-inactive-threads", "Auto-settle inactive threads")
@@ -673,16 +712,20 @@ impl SettingsView {
                 ServerSettingChange::AutoSettleAfterDays(Some(DEFAULT_AUTO_SETTLE_DAYS)),
                 cx,
             )
-            .control(switch("auto-settle-inactive-switch", days.is_some(), |checked| {
-                ServerSettingChange::AutoSettleAfterDays(checked.then_some(DEFAULT_AUTO_SETTLE_DAYS))
-            }))
+            .control(
+                switch("auto-settle-inactive-switch", days.is_some(), |checked| {
+                    ServerSettingChange::AutoSettleAfterDays(checked.then_some(DEFAULT_AUTO_SETTLE_DAYS))
+                })
+                .disabled(auto_settle_days_lock.is_some()),
+            )
             .into_any_element(),
         ];
         if days.is_some() {
             auto_settle_rows.push(
                 Row::new("days-before-auto-settle", "Days of inactivity before auto-settle")
                     .description("Any new activity un-settles a thread automatically.")
-                    .control(div().w(r(96.)).child(Input::new(&self.threads.auto_settle_days).small()))
+                    .unavailable(auto_settle_days_lock.clone())
+                    .control(div().w(r(96.)).child(Input::new(&self.threads.auto_settle_days).small().disabled(auto_settle_days_lock.is_some())))
                     .into_any_element(),
             );
         }
@@ -691,6 +734,7 @@ impl SettingsView {
             .iter()
             .all(|c| c.environment.capabilities.thread_auto_settlement_scope == Some(true));
         if days.is_some() && all_support_settlement_scope {
+            let keep_pr_locked = self.managed_setting_lock(&["sidebarAutoSettleKeepPullRequests"], cx).is_some();
             auto_settle_rows.push(
                 self.apply_scoped_reset(
                     Row::new("keep-threads-with-pull-requests", "Keep threads with a PR")
@@ -700,7 +744,7 @@ impl SettingsView {
                     ServerSettingChange::AutoSettleKeepPullRequests(false),
                     cx,
                 )
-                .control(switch("keep-pull-requests-switch", threads.sidebar_auto_settle_keep_pull_requests, ServerSettingChange::AutoSettleKeepPullRequests))
+                .control(switch("keep-pull-requests-switch", threads.sidebar_auto_settle_keep_pull_requests, ServerSettingChange::AutoSettleKeepPullRequests).disabled(keep_pr_locked))
                 .into_any_element(),
             );
         }
@@ -724,6 +768,7 @@ impl SettingsView {
             cx,
         );
         let text_gen_view = cx.entity().downgrade();
+        let text_gen_locked = self.managed_setting_lock(&["textGenerationModelSelection"], cx).is_some();
         let text_gen_disabled_reason = text_gen_selection.as_ref().and_then(|sel| {
             self.scoped_model_disabled_reason(&config, &sel.instance_id, &sel.model, true, cx)
         });
@@ -745,6 +790,7 @@ impl SettingsView {
                     "text-generation-model",
                     &config,
                     shown,
+                    text_gen_locked,
                     cx.entity().downgrade(),
                     ServerSettingChange::TextGenerationModelSelection,
                 );
@@ -761,6 +807,7 @@ impl SettingsView {
                                 .width(220.)
                                 .popup_width(260.)
                                 .show_check()
+                                .disabled(text_gen_locked)
                                 .on_change(move |value, _, cx| {
                                     if let Some(selection) = parse_selection(&value) {
                                         let _ = text_gen_view.update(cx, |this, cx| {
@@ -808,17 +855,20 @@ impl SettingsView {
             let streaming_view = cx.entity().downgrade();
             let reset_instructions_view = cx.entity().downgrade();
             let is_project = self.is_project_scope(cx);
+            let title_lock = self.managed_setting_lock(&["threadTitleInstructions"], cx);
             text_gen_rows.push(
                 Row::new("thread-title-instructions", "Thread title instructions")
                     .description("Appended to the prompt for new and regenerated thread titles.")
                     .highlighted(self.is_target("thread-title-instructions"))
+                    .unavailable(title_lock.clone())
                     .reset_tooltip(if is_project { "Reset to inherited value" } else { "Reset to default" })
                     .reset(
-                        if is_project {
-                            self.has_project_override(&["threadTitleInstructions"], cx)
-                        } else {
-                            !threads.thread_title_instructions.is_empty()
-                        },
+                        title_lock.is_none()
+                            && if is_project {
+                                self.has_project_override(&["threadTitleInstructions"], cx)
+                            } else {
+                                !threads.thread_title_instructions.is_empty()
+                            },
                         {
                             let reset = update(ServerSettingChange::ThreadTitleInstructions(String::new()));
                             move |_, _, cx| {
@@ -840,10 +890,11 @@ impl SettingsView {
                             .mt(r(12.))
                             .pb(r(12.))
                             .max_w(r(672.))
-                            .child(Textarea::new(&self.threads.title_instructions)),
+                            .child(Textarea::new(&self.threads.title_instructions).disabled(title_lock.is_some())),
                     )
                     .into_any_element(),
             );
+            let streaming_locked = self.managed_setting_lock(&["responseStreamingMode"], cx).is_some();
             text_gen_rows.push(
                 self.apply_scoped_reset(
                     Row::new("response-streaming", "Response streaming")
@@ -855,24 +906,25 @@ impl SettingsView {
                     cx,
                 )
                 .control(
-                        Select::new(
-                            "response-streaming-select",
-                            ResponseStreamingMode::ALL.iter().map(|mode| SelectOption::new(streaming_value(*mode), mode.label())).collect(),
-                        )
-                        .selected(streaming_value(streaming))
-                        .width(224.)
-                        .on_change(move |value, _, cx| {
-                            let mode = match value.as_ref() {
-                                "turn" => ResponseStreamingMode::Turn,
-                                "paragraph" => ResponseStreamingMode::Paragraph,
-                                _ => return,
-                            };
-                            let _ = streaming_view.update(cx, |this, cx| {
-                                this.update_scoped_server(ServerSettingChange::ResponseStreamingMode(mode), cx);
-                            });
-                        }),
+                    Select::new(
+                        "response-streaming-select",
+                        ResponseStreamingMode::ALL.iter().map(|mode| SelectOption::new(streaming_value(*mode), mode.label())).collect(),
                     )
-                    .into_any_element(),
+                    .selected(streaming_value(streaming))
+                    .width(224.)
+                    .disabled(streaming_locked)
+                    .on_change(move |value, _, cx| {
+                        let mode = match value.as_ref() {
+                            "turn" => ResponseStreamingMode::Turn,
+                            "paragraph" => ResponseStreamingMode::Paragraph,
+                            _ => return,
+                        };
+                        let _ = streaming_view.update(cx, |this, cx| {
+                            this.update_scoped_server(ServerSettingChange::ResponseStreamingMode(mode), cx);
+                        });
+                    }),
+                )
+                .into_any_element(),
             );
         }
         let text_generation = section("Text generation", text_gen_rows, cx);
@@ -1053,7 +1105,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn snooze_row(&mut self, saved: &[SnoozePreset], window: &mut Window, cx: &mut Context<Self>) -> Row {
+    fn snooze_row(&mut self, saved: &[SnoozePreset], disabled: bool, locked: bool, window: &mut Window, cx: &mut Context<Self>) -> Row {
         let p = palette(cx);
         let format = store::client(cx).timestamp_format();
         let now = Local::now();
@@ -1118,7 +1170,7 @@ impl SettingsView {
                 h_flex()
                     .flex_wrap()
                     .gap(r(8.))
-                    .child(self.snooze_fields(index, preset, replace, cx))
+                    .child(self.snooze_fields(index, preset, disabled, replace, cx))
                     .child(
                         h_flex()
                             .ml_auto()
@@ -1137,6 +1189,7 @@ impl SettingsView {
                                 Button::new(("remove-snooze", index), ButtonVariant::GhostMuted, ButtonSize::IconSm)
                                     .icon(crate::icons::Icon::X)
                                     .tooltip(format!("Remove snooze option {}", index + 1))
+                                    .disabled(disabled)
                                     .on_click(remove),
                             ),
                     ),
@@ -1173,7 +1226,7 @@ impl SettingsView {
         list = list.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(menu_text)).child(
             h_flex()
                 .gap(r(8.))
-                .child(Button::new("add-snooze-option", ButtonVariant::GhostMuted, ButtonSize::Compact).icon(crate::icons::Icon::Plus).label("Add option").disabled(full).on_click(add))
+                .child(Button::new("add-snooze-option", ButtonVariant::GhostMuted, ButtonSize::Compact).icon(crate::icons::Icon::Plus).label("Add option").disabled(disabled || full).on_click(add))
                 .children(full.then(|| div().text_xs().text_color(hsla(p.muted_foreground)).child(format!("Up to {} options", snooze::MAX_PRESETS)))),
         );
         let defaults = snooze::default_presets();
@@ -1181,7 +1234,7 @@ impl SettingsView {
         Row::new("snooze-options", "Snooze options")
             .description("Choices in every snooze menu, listed soonest first. Weekdays mean the next one after today.")
             .highlighted(self.is_target("snooze-options"))
-            .reset(!snooze::same_presets(presets, &defaults), move |_, _, cx| {
+            .reset(!locked && !snooze::same_presets(presets, &defaults), move |_, _, cx| {
                 let _ = reset_view.update(cx, |this, _| this.threads.row_memory.clear());
                 let defaults = defaults.clone();
                 save(Box::new(move |presets| *presets = defaults), cx)
@@ -1189,7 +1242,7 @@ impl SettingsView {
             .below(list)
     }
 
-    fn snooze_fields(&self, index: usize, preset: &SnoozePreset, replace: impl Fn(SnoozePreset, &mut App) + Clone + 'static, cx: &mut Context<Self>) -> impl IntoElement {
+    fn snooze_fields(&self, index: usize, preset: &SnoozePreset, disabled: bool, replace: impl Fn(SnoozePreset, &mut App) + Clone + 'static, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let memory = self.threads.row_memory.get(index).cloned().unwrap_or_default();
         let when_options = std::iter::once(SelectOption::new("after", "In"))
@@ -1204,7 +1257,7 @@ impl SettingsView {
         let when_view = cx.entity().downgrade();
         let mem_minutes = memory.minutes;
         let mem_time = memory.time.clone();
-        let when = Select::new(("snooze-when", index), when_options).selected(when_value).width(128.).on_change(move |value, _, cx| {
+        let when = Select::new(("snooze-when", index), when_options).selected(when_value).width(128.).disabled(disabled).on_change(move |value, _, cx| {
             let day = SnoozeDay::ALL.iter().copied().find(|day| day.as_str() == value.as_ref());
             if value.as_ref() != "after" && day.is_none() {
                 return;
@@ -1244,7 +1297,7 @@ impl SettingsView {
                                 Button::new(("snooze-decrease", index), ButtonVariant::Ghost, ButtonSize::IconSm)
                                     .icon(crate::icons::Icon::Minus)
                                     .tooltip("Decrease")
-                                    .disabled(amount <= 1)
+                                    .disabled(disabled || amount <= 1)
                                     .on_click(move |_, _, cx| {
                                         let next = amount.saturating_sub(1).max(1) * unit.minutes();
                                         minus(SnoozePreset::After { minutes: next }, cx);
@@ -1255,7 +1308,7 @@ impl SettingsView {
                                 Button::new(("snooze-increase", index), ButtonVariant::Ghost, ButtonSize::IconSm)
                                     .icon(crate::icons::Icon::Plus)
                                     .tooltip("Increase")
-                                    .disabled(amount >= max_amount)
+                                    .disabled(disabled || amount >= max_amount)
                                     .on_click(move |_, _, cx| {
                                         let next = (amount + 1).min(max_amount) * unit.minutes();
                                         plus(SnoozePreset::After { minutes: next }, cx);
@@ -1272,6 +1325,7 @@ impl SettingsView {
                         )
                         .selected(unit.plural())
                         .width(112.)
+                        .disabled(disabled)
                         .on_change(move |value, _, cx| {
                             if let Some(next_unit) = DurationUnit::ALL.iter().copied().find(|u| u.plural() == value.as_ref()) {
                                 let _ = unit_view.update(cx, |this, _| {
@@ -1288,7 +1342,7 @@ impl SettingsView {
             }
             SnoozePreset::At { .. } => fields
                 .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("at"))
-                .children(self.threads.time_inputs.get(index).map(|(input, _)| div().w(r(96.)).child(Input::new(input).small())))
+                .children(self.threads.time_inputs.get(index).map(|(input, _)| div().w(r(96.)).child(Input::new(input).small().disabled(disabled))))
                 .into_any_element(),
         }
     }

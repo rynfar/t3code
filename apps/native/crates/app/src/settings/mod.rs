@@ -1538,30 +1538,63 @@ impl SettingsView {
         store::update_projects(&self.state, members, edit, |_, _| {}, cx);
     }
 
+    /// `SettingsRow` (`settingsLayout.tsx:352-365`): first managed-policy lock matching any of
+    /// `paths` across all connected scoped environments (or the active environment when unscoped).
+    pub(super) fn managed_setting_lock(&self, paths: &[&str], cx: &App) -> Option<String> {
+        let configs = self.scoped_all_configs(cx);
+        if configs.is_empty() {
+            let active = self.state.read(cx).server_config.config.as_ref();
+            t3_core::managed_policy::setting_lock_reason_for_any(
+                [active.and_then(|c| c.managed_policy.as_ref())],
+                paths,
+            )
+        } else {
+            t3_core::managed_policy::setting_lock_reason_for_any(
+                configs.iter().map(|c| c.managed_policy.as_ref()),
+                paths,
+            )
+        }
+    }
+
+    /// Managed lock reason wins over other unavailability reasons (`settingsLayout.tsx:351`).
+    pub(super) fn scoped_unavailable(
+        &self,
+        paths: &[&str],
+        fallback: Option<String>,
+        cx: &App,
+    ) -> Option<String> {
+        self.managed_setting_lock(paths, cx).or(fallback)
+    }
+
     /// Wires `Row`'s reset button for a project-scoped setting: in Project/Checkout scope it
     /// appears when any of `keys` is explicitly overridden and clears the project override
     /// ("Reset to inherited value"); otherwise it resets to the environment default.
+    /// An administrator's lock on any target wins and hides the reset button (`settingsLayout.tsx`).
     pub(super) fn apply_scoped_reset(
         &self,
-        row: controls::Row,
+        mut row: controls::Row,
         keys: &'static [&'static str],
         env_customized: bool,
         env_reset: ServerSettingChange,
         cx: &Context<Self>,
     ) -> controls::Row {
+        if let Some(reason) = self.managed_setting_lock(keys, cx) {
+            return row.unavailable(Some(reason));
+        }
         let view = cx.entity().downgrade();
         if self.is_project_scope(cx) {
-            row.reset_tooltip("Reset to inherited value").reset(
+            row = row.reset_tooltip("Reset to inherited value").reset(
                 self.has_project_override(keys, cx),
                 move |_, _, cx| {
                     let _ = view.update(cx, |this, cx| this.clear_project_overrides(keys, cx));
                 },
-            )
+            );
         } else {
-            row.reset(env_customized, move |_, _, cx| {
+            row = row.reset(env_customized, move |_, _, cx| {
                 let _ = view.update(cx, |this, cx| this.update_scoped_server(env_reset.clone(), cx));
-            })
+            });
         }
+        row
     }
 
     /// Sends a unary RPC to the single scoped environment (falling back to the active client).

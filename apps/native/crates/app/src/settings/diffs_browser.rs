@@ -215,11 +215,25 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Vec<Block> {
         let config = self.scoped_representative_config(cx);
+        let all_configs = self.scoped_all_configs(cx);
         let enabled = config
             .as_ref()
             .and_then(|config| config.settings.enable_agent_browser_access)
             .unwrap_or(true);
         let available = config.is_some() && self.may("settings:write", cx);
+        let agent_browser_locked = t3_core::managed_policy::setting_lock_reason_for_any(
+            if all_configs.is_empty() {
+                vec![config.as_ref().and_then(|c| c.managed_policy.as_ref())]
+            } else {
+                all_configs.iter().map(|c| c.managed_policy.as_ref()).collect()
+            },
+            &["enableAgentBrowserAccess"],
+        );
+        let agent_browser_unavailable = agent_browser_locked.or_else(|| {
+            (!available).then(|| {
+                "Reconnect with settings write access to change agent browser access.".to_owned()
+            })
+        });
         let switch_view = cx.entity().downgrade();
         let access = section(
             "Agent access",
@@ -230,9 +244,7 @@ impl SettingsView {
                             "Allow agents to use the shared browser. Projects can override it.",
                         )
                         .highlighted(self.is_target("agent-browser-access"))
-                        .unavailable((!available).then_some(
-                            "Reconnect with settings write access to change agent browser access.",
-                        )),
+                        .unavailable(agent_browser_unavailable.clone()),
                     &["enableAgentBrowserAccess"],
                     !enabled,
                     ServerSettingChange::AgentBrowserAccess(true),
@@ -240,7 +252,7 @@ impl SettingsView {
                 )
                 .control(
                     Switch::new("agent-browser-access-switch", enabled)
-                        .disabled(!available)
+                        .disabled(agent_browser_unavailable.is_some())
                         .on_change(move |on, _, cx| {
                             let _ = switch_view.update(cx, |this, cx| {
                                 this.update_scoped_server(ServerSettingChange::AgentBrowserAccess(on), cx);
@@ -256,10 +268,31 @@ impl SettingsView {
         let reset_state = state.clone();
         let reset_input = self.browser.custom_url.clone();
         let weak = cx.entity().downgrade();
+        let cookie_import_denial = t3_core::managed_policy::capability_denial(
+            self.state
+                .read(cx)
+                .server_config
+                .config
+                .as_ref()
+                .and_then(|c| c.managed_policy.as_ref()),
+            t3_core::managed_policy::Capability::BrowserCookieImport,
+        );
         let mut browsing = vec![unavailable_group(BROWSER_UNAVAILABLE, vec![
             unavailable("browser-profiles", "Browser profiles", "Profiles separate cookies and logins. Incognito data is cleared when the app closes.", "Unavailable", self.is_target("browser") || self.is_target("browser-profiles"), cx),
             unavailable("browser-auto-show-floating-preview", "Auto-show floating preview", "Show the floating preview when an agent opens a browser or device unless the agent says otherwise.", "Unavailable", self.is_target("browser-auto-show-floating-preview"), cx),
-        ], cx).into_any_element(),
+        ], cx).into_any_element()];
+        if let Some(denial) = cookie_import_denial {
+            use gpui::InteractiveElement;
+            browsing.push(
+                div()
+                    .px(r(16.))
+                    .py(r(10.))
+                    .debug_selector(|| "managed-browser-cookie-import-notice".to_owned())
+                    .child(crate::components::managed::notice(denial, cx))
+                    .into_any_element(),
+            );
+        }
+        browsing.extend([
             Row::new("browser-link-target", "Open links in")
                 .description("Where links in the chat and terminal open. Hold \u{2318} or Ctrl while clicking a link to open it in your default browser either way.")
                 .highlighted(self.is_target("browser-link-target"))
@@ -273,7 +306,8 @@ impl SettingsView {
                     store::update_client(&reset_state, ClientSettingChange::BrowserCustomSearchUrl(String::new()), cx);
                     reset_input.update(cx, |input, cx| input.set_value("", window, cx));
                 })
-                .control(select(&state, "browser-search-engine-select", BrowserSearchEngine::ALL, doc.browser_search_engine(), BrowserSearchEngine::as_str, BrowserSearchEngine::label, ClientSettingChange::BrowserSearchEngine)).into_any_element()];
+                .control(select(&state, "browser-search-engine-select", BrowserSearchEngine::ALL, doc.browser_search_engine(), BrowserSearchEngine::as_str, BrowserSearchEngine::label, ClientSettingChange::BrowserSearchEngine)).into_any_element(),
+        ]);
         if doc.browser_search_engine() == BrowserSearchEngine::Custom {
             if !self
                 .browser

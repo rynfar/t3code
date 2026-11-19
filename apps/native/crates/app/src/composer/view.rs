@@ -398,10 +398,15 @@ impl Composer {
             return with_voice(stop_button().into_any_element());
         }
         let stage_backdrop = crate::sidebar::active_stage_backdrop_variant(self.state.read(cx), cx);
+        let runtime_mode_denial = self.runtime_mode_ceiling_denial(resolved, cx);
         let show_resume = self.snapshot.can_resume && !has_text && !editing_queued && !voice_blocks;
         if show_resume {
-            let resume_btn = RoundButton::new("send", RoundKind::Resume, "Resume thread")
-                .disabled(self.sending || !can_operate || rewinding)
+            let resume_tooltip: SharedString = runtime_mode_denial
+                .clone()
+                .map(Into::into)
+                .unwrap_or_else(|| "Resume thread".into());
+            let resume_btn = RoundButton::new("send", RoundKind::Resume, resume_tooltip)
+                .disabled(self.sending || !can_operate || rewinding || runtime_mode_denial.is_some())
                 .stage_backdrop(stage_backdrop)
                 .on_click(cx.listener(|this, _, window, cx| {
                     if this.stop_phase != StopPhase::Landed {
@@ -440,7 +445,13 @@ impl Composer {
             _ => (RoundKind::Send, "Submit message"),
         };
         let blocked = self.snapshot.setup_blocks_send || rewinding || !can_operate;
-        let disabled = self.sending || voice_preparing || (!has_text && !voice_blocks) || (resolved.model.is_none() && resolved.multi_models.is_empty()) || attachment_block.is_some() || blocked;
+        let disabled = self.sending
+            || voice_preparing
+            || (!has_text && !voice_blocks)
+            || (resolved.model.is_none() && resolved.multi_models.is_empty())
+            || attachment_block.is_some()
+            || runtime_mode_denial.is_some()
+            || blocked;
         let tooltip: SharedString = if resolved.model.is_none() && resolved.multi_models.is_empty() {
             "No provider available".into()
         } else if rewinding {
@@ -448,6 +459,8 @@ impl Composer {
         } else if self.snapshot.setup_blocks_send {
             t3_core::worktree_setup::SEND_BLOCKED.into()
         } else if let Some(reason) = attachment_block {
+            reason.into()
+        } else if let Some(reason) = runtime_mode_denial {
             reason.into()
         } else if self.sending {
             if editing_queued { "Updating queued message".into() } else { "Submitting message".into() }

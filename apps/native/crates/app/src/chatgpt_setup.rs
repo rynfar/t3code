@@ -206,6 +206,22 @@ impl ChatGptSetup {
         }
         self.app.read(cx).server_config.config.as_ref()?.settings.provider_instances.get(&self.instance)?.config.clone()
     }
+    /// `CodexSetupSection.tsx`: policy reason when Codex or its `config.setupMode` is managed.
+    pub(crate) fn managed_denial(&self, cx: &App) -> Option<String> {
+        if fixture_active(cx) {
+            return None;
+        }
+        let app = self.app.read(cx);
+        let policy = app.server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref());
+        let instance_path = format!("providerInstances.{}", self.instance);
+        t3_core::managed_policy::driver_denial(policy, "codex", "Codex")
+            .or_else(|| t3_core::managed_policy::setting_lock_reason(policy, &instance_path))
+            .or_else(|| {
+                t3_core::managed_policy::managed_instance_locks(policy, "codex")
+                    .filter(|locks| locks.config_keys.contains("setupMode"))
+                    .map(|locks| locks.reason)
+            })
+    }
     fn allowed(&self, cx: &App) -> bool {
         if fixture_active(cx) {
             return true;
@@ -214,10 +230,7 @@ impl ChatGptSetup {
             return false;
         }
         let app = self.app.read(cx);
-        let policy = app.server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref());
-        t3_core::managed_policy::driver_allowed(policy, "codex")
-            && !t3_core::managed_policy::setting_locked(policy, "providers")
-            && !t3_core::managed_policy::instance_field_locked(policy, "codex", "config.setupMode")
+        self.managed_denial(cx).is_none()
             && app.client_handle().is_some_and(|client| client.session_state().borrow().as_ref().is_some_and(|s| s.grants("providers:manage")))
     }
     fn sync_watch(&mut self, cx: &mut Context<Self>) {
@@ -681,13 +694,15 @@ impl ChatGptSetup {
                         .on_click(cx.listener(|this, _, _, cx| this.command(auth::AUTH_LOGOUT, auth::subscribe_payload(&this.instance), cx))),
                 );
         } else {
-            controls = controls.child(
+            controls = controls.child(crate::components::managed::ManagedControl::new(
+                "managed-chatgpt-connect",
+                self.managed_denial(cx),
                 Button::new("chatgpt-connect", ButtonVariant::Default, ButtonSize::Sm)
                     .icon(Icon::OpenAi)
                     .label(if profiles { "Reconnect account" } else { "Continue with ChatGPT" })
                     .disabled(!choice_enabled)
                     .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
-            );
+            ));
             if profiles {
                 controls = controls.child(
                     Button::new("chatgpt-different", ButtonVariant::GhostMuted, ButtonSize::Sm).label("Use a different account").disabled(disabled || busy).on_click(cx.listener(
@@ -787,7 +802,9 @@ impl ChatGptSetup {
                 this.picker = false;
                 cx.notify();
             })))
-            .child(
+            .child(crate::components::managed::ManagedControl::new(
+                "managed-chatgpt-picker-continue",
+                self.managed_denial(cx),
                 Button::new("chatgpt-picker-continue", ButtonVariant::Default, ButtonSize::Sm)
                     .icon(Icon::OpenAi)
                     .label("Continue with ChatGPT")
@@ -802,7 +819,7 @@ impl ChatGptSetup {
                         this.start(method, cx);
                         cx.notify();
                     })),
-            );
+            ));
         self.render_dialog("Reconnect ChatGPT".into(), "On OpenAI, sign in with the account you choose here.", body.into_any_element(), footer.into_any_element(), window, cx)
     }
     fn render_add(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1011,14 +1028,16 @@ impl Render for ChatGptSetup {
             );
         }
         if authenticated && !self.onboarding {
-            content = content.child(
+            content = content.child(crate::components::managed::ManagedControl::new(
+                "managed-chatgpt-another",
+                self.managed_denial(cx),
                 Button::new("chatgpt-another", ButtonVariant::GhostMuted, ButtonSize::Xs).label("Connect another ChatGPT account").disabled(!self.allowed(cx)).on_click(
                     cx.listener(|this, _, _, cx| {
                         this.adding = true;
                         cx.notify();
                     }),
                 ),
-            );
+            ));
         }
         if self.onboarding {
             content = content.rounded(r(8.)).border_1().border_color(hsla(p.border)).bg(hsla(p.background));

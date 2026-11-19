@@ -252,8 +252,10 @@ impl SettingsView {
         let local_tools = local_host.and_then(|h| h.tools.as_ref());
         let local_tool_err = local_host.and_then(|h| h.tool_inspection_error.as_deref());
 
+        let hub_unavail = self.scoped_unavailable(&["enableDeviceSupport"], env_only.clone(), cx);
+        let agent_lock = self.managed_setting_lock(&["enableAgentDeviceAccess"], cx);
         let view = cx.entity().downgrade();
-        let hub = Switch::new("device-hub-switch", enabled).disabled(env_only.is_some() || !can_configure || !loaded || busy || pending.is_some()).on_change({
+        let hub = Switch::new("device-hub-switch", enabled).disabled(hub_unavail.is_some() || !can_configure || !loaded || busy || pending.is_some()).on_change({
             let view = view.clone();
             move |on, _, cx| {
                 let input = if on { json!({ "enabled": true, "onboardingCompleted": true }) } else { configure_hub_payload(false) };
@@ -261,11 +263,14 @@ impl SettingsView {
             }
         });
         let agent = Switch::new("agent-device-access-switch", agent_access_effective)
-            .disabled(if is_project_scope {
-                !self.may("settings:write", cx) || config.is_none()
-            } else {
-                !can_configure || !loaded || !enabled || busy || pending.is_some()
-            })
+            .disabled(
+                agent_lock.is_some()
+                    || if is_project_scope {
+                        !self.may("settings:write", cx) || config.is_none()
+                    } else {
+                        !can_configure || !loaded || !enabled || busy || pending.is_some()
+                    },
+            )
             .on_change(move |on, _, cx| {
                 let _ = view.update(cx, |view, cx| {
                     if view.is_project_scope(cx) {
@@ -306,7 +311,7 @@ impl SettingsView {
         let hub_row = Row::new("device-hub", "Use devices")
             .description("Open simulators and emulators in the Device panel.")
             .highlighted(self.is_target("device-hub"))
-            .unavailable(env_only.clone())
+            .unavailable(hub_unavail)
             .control(h_flex().gap(r(8.)).children(hub_tool_trigger).children(hub_status).child(hub))
             .when(self.devices.tool_popover == Some(ToolPopover::Hub), |row| {
                 row.below(self.tool_version_details(ToolPopover::Hub, local_tools.map(|t| &t.hub), local_tool_err, &service, can_configure, cx))
@@ -315,8 +320,9 @@ impl SettingsView {
         let agent_row = Row::new("agent-device-access", "Agents can use devices")
             .description("New agent sessions can open and drive these devices. Projects can override it.")
             .highlighted(self.is_target("agent-device-access"))
+            .unavailable(agent_lock.clone())
             .reset_tooltip("Reset to inherited value")
-            .reset(is_project_scope && self.has_project_override(&["enableAgentDeviceAccess"], cx), move |_, _, cx| {
+            .reset(agent_lock.is_none() && is_project_scope && self.has_project_override(&["enableAgentDeviceAccess"], cx), move |_, _, cx| {
                 let _ = agent_reset_view.update(cx, |this, cx| {
                     this.clear_project_overrides(&["enableAgentDeviceAccess"], cx);
                 });

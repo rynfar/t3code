@@ -492,13 +492,25 @@ impl SettingsView {
             );
         }
 
+        let all_configs = self.scoped_all_configs(cx);
+        let scoped_policies: Vec<Option<&serde_json::Value>> = if all_configs.is_empty() {
+            vec![config.as_ref().and_then(|c| c.managed_policy.as_ref())]
+        } else {
+            all_configs.iter().map(|c| c.managed_policy.as_ref()).collect()
+        };
         let guest_enabled = config.as_ref().and_then(|c| c.settings.guest_sharing_enabled).unwrap_or(false);
+        let guest_locked = managed_policy::setting_lock_reason_for_any(
+            scoped_policies.iter().copied(),
+            &["guestSharingEnabled"],
+        );
         let connect_denial = if guest_enabled {
             None
         } else {
-            managed_policy::capability_denial(config.as_ref().and_then(|c| c.managed_policy.as_ref()), Capability::Connect)
+            managed_policy::first_managed_denial(scoped_policies.iter().copied(), |policy| {
+                managed_policy::capability_denial(policy, Capability::Connect)
+            })
         };
-        let guest_unavailable = connect_denial.or_else(|| write_unavailable.clone());
+        let guest_unavailable = guest_locked.or(connect_denial).or_else(|| write_unavailable.clone());
         let access_link = cx.entity().downgrade();
         let guest_row = Row::new("guest-links", "Guest links")
             .description_content(
@@ -521,6 +533,11 @@ impl SettingsView {
             ));
 
         let linked_enabled = config.as_ref().is_some_and(|c| c.settings.threads.linked_environments_enabled);
+        let linked_unavailable = managed_policy::setting_lock_reason_for_any(
+            scoped_policies.iter().copied(),
+            &["linkedEnvironmentsEnabled"],
+        )
+        .or_else(|| write_unavailable.clone());
         let connections_link = cx.entity().downgrade();
         let linked_row = Row::new("linked-environments-beta", "Linked environments")
             .description_content(
@@ -534,27 +551,37 @@ impl SettingsView {
                     .child("While off, nothing new starts over a link; running tasks finish."),
             )
             .highlighted(self.is_target("linked-environments-beta"))
-            .unavailable(write_unavailable.clone())
+            .unavailable(linked_unavailable.clone())
             .control(server_switch(
                 "linked-environments-switch",
                 linked_enabled,
-                !can_write,
+                !can_write || linked_unavailable.is_some(),
                 ServerSettingChange::LinkedEnvironmentsEnabled,
             ));
 
         let prompt_suggestions_enabled = config.as_ref().is_some_and(|c| c.settings.prompt_suggestions_enabled);
+        let prompt_unavailable = managed_policy::setting_lock_reason_for_any(
+            scoped_policies.iter().copied(),
+            &["promptSuggestionsEnabled"],
+        )
+        .or_else(|| write_unavailable.clone());
         let prompt_suggestions_row = Row::new("prompt-suggestions-beta", "Suggest next prompt")
             .description("Show a predicted next message in the empty composer after a Claude or Codex turn. Tab uses it. Each is an extra cached request on your plan. Needs Codex 0.165+. Claude threads update on restart.")
             .highlighted(self.is_target("prompt-suggestions-beta"))
-            .unavailable(write_unavailable.clone())
+            .unavailable(prompt_unavailable.clone())
             .control(server_switch(
                 "prompt-suggestions-switch",
                 prompt_suggestions_enabled,
-                !can_write,
+                !can_write || prompt_unavailable.is_some(),
                 ServerSettingChange::PromptSuggestionsEnabled,
             ));
 
         let simlock_enabled = config.as_ref().is_some_and(|c| c.settings.threads.simlock_device_hosts_enabled);
+        let simlock_unavailable = managed_policy::setting_lock_reason_for_any(
+            scoped_policies.iter().copied(),
+            &["simlockDeviceHostsEnabled"],
+        )
+        .or_else(|| write_unavailable.clone());
         let devices_link = cx.entity().downgrade();
         let simlock_row = Row::new("simlock-hosts", "Simlock device hosts")
             .description_content(
@@ -570,11 +597,11 @@ impl SettingsView {
                     .child("An alpha that may change or break. T3 Code never installs Simlock."),
             )
             .highlighted(self.is_target("simlock-hosts"))
-            .unavailable(write_unavailable.clone())
+            .unavailable(simlock_unavailable.clone())
             .control(server_switch(
                 "simlock-hosts-switch",
                 simlock_enabled,
-                !can_write,
+                !can_write || simlock_unavailable.is_some(),
                 ServerSettingChange::SimlockDeviceHostsEnabled,
             ));
 
@@ -592,15 +619,20 @@ impl SettingsView {
             .is_some_and(|platform| platform.os == "darwin");
         if is_mac_server {
             let fast_checkout = config.as_ref().is_some_and(|c| c.settings.threads.fast_worktree_checkout);
+            let fast_unavailable = managed_policy::setting_lock_reason_for_any(
+                scoped_policies.iter().copied(),
+                &["fastWorktreeCheckout"],
+            )
+            .or(write_unavailable);
             rows.push(
                 Row::new("worktree-fast-checkout", "Fast worktree checkout")
                     .description("On a Mac, clone new worktrees from a checkout cached in the T3 home folder instead of writing every file. Uses Git\u{2019}s normal checkout when it can\u{2019}t. Turning it off deletes the cache.")
                     .highlighted(self.is_target("worktree-fast-checkout"))
-                    .unavailable(write_unavailable)
+                    .unavailable(fast_unavailable.clone())
                     .control(div().debug_selector(|| "worktree-fast-checkout-switch".to_owned()).child(server_switch(
                         "worktree-fast-checkout-switch",
                         fast_checkout,
-                        !can_write,
+                        !can_write || fast_unavailable.is_some(),
                         ServerSettingChange::FastWorktreeCheckout,
                     )))
                     .into_any_element(),
@@ -723,5 +755,201 @@ mod tests {
         drop(vcx);
         drop(fixture);
         drop(runtime);
+    }
+
+    #[gpui::test]
+    fn managed_policy_notices_render_across_browser_connections_and_providers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "fixture-env",
+                            "label": "Studio Mac",
+                            "platform": { "os": "darwin", "arch": "arm64" }
+                        },
+                        "managedPolicy": {
+                            "organization": "Acme Corp",
+                            "lockedSettings": ["enableAgentBrowserAccess", "guestSharingEnabled", "providerInstances"],
+                            "limits": {
+                                "connect": false,
+                                "browserCookieImport": false,
+                                "providers": {
+                                    "allowedDrivers": ["codex"],
+                                    "lockedInstanceFields": {
+                                        "codex": ["environment", "config.setupMode"]
+                                    }
+                                }
+                            }
+                        },
+                        "providers": [{
+                            "instanceId": "codex",
+                            "driver": "codex",
+                            "enabled": true,
+                            "installed": true,
+                            "status": "ready",
+                            "auth": { "status": "authenticated" },
+                            "models": [{ "slug": "gpt-5", "name": "GPT-5" }]
+                        }],
+                        "settings": {
+                            "enableAgentBrowserAccess": true,
+                            "guestSharingEnabled": false
+                        }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        vcx.update(|_, cx| crate::settings::open(Section::Browser, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("managed-browser-cookie-import-notice").is_some(),
+            "Browser settings must render ManagedNotice when browserCookieImport is denied"
+        );
+
+        vcx.update(|_, cx| crate::settings::open(Section::Connections, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("managed-connect-notice").is_some(),
+            "Connections settings must render ManagedNotice when connect is denied"
+        );
+
+        vcx.update(|_, cx| crate::settings::open(Section::Providers, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("managed-provider-environment-notice").is_some(),
+            "Provider editor must render ManagedNotice when whole environment is locked"
+        );
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        runtime.shutdown_background();
+    }
+
+    #[gpui::test]
+    fn managed_locked_settings_lock_rows_across_server_settings_pages(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "fixture-env",
+                            "label": "Studio Mac",
+                            "platform": { "os": "darwin", "arch": "arm64" },
+                            "capabilities": {
+                                "storageCleanup": true,
+                                "storageCleanupRun": true,
+                                "worktreesDirectory": true
+                            }
+                        },
+                        "managedPolicy": {
+                            "organization": "Acme Corp",
+                            "lockedSettings": [
+                                "enableProviderUpdateChecks",
+                                "backgroundActivity",
+                                "storageCleanup.logsAfterDays",
+                                "defaultRuntimeMode",
+                                "snoozePresets",
+                                "worktreesDirectory",
+                                "branchNamingMode",
+                                "storageCleanup.worktreeOnDelete",
+                                "defaultAutoPull",
+                                "sourceControlWritingStyle",
+                                "speechProjectCustomWords"
+                            ],
+                            "limits": {
+                                "maxRuntimeMode": "auto-accept-edits"
+                            }
+                        },
+                        "providers": [{
+                            "instanceId": "codex",
+                            "driver": "codex",
+                            "enabled": true,
+                            "installed": true,
+                            "status": "ready",
+                            "auth": { "status": "authenticated" },
+                            "models": [{ "slug": "gpt-5", "name": "GPT-5" }]
+                        }],
+                        "settings": {}
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        let open_and_draw = |vcx: &mut gpui::VisualTestContext, section: Section| {
+            vcx.update(|_, cx| crate::settings::open(section, cx));
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        };
+
+        open_and_draw(&mut vcx, Section::Maintenance);
+        assert!(vcx.debug_bounds("provider-update-checks-unavailable").is_some());
+        assert!(vcx.debug_bounds("background-activity-unavailable").is_some());
+        assert!(vcx.debug_bounds("storage-logs-unavailable").is_some());
+
+        open_and_draw(&mut vcx, Section::Threads);
+        assert!(vcx.debug_bounds("default-permissions-unavailable").is_some());
+        assert!(vcx.debug_bounds("snooze-options-below-unavailable").is_some());
+
+        open_and_draw(&mut vcx, Section::Worktrees);
+        assert!(vcx.debug_bounds("storage-worktrees-location-unavailable").is_some());
+        assert!(vcx.debug_bounds("worktree-branch-naming-unavailable").is_some());
+        assert!(vcx.debug_bounds("worktree-on-delete-unavailable").is_some());
+
+        open_and_draw(&mut vcx, Section::SourceControl);
+        assert!(vcx.debug_bounds("automatic-pull-unavailable").is_some());
+        assert!(vcx.debug_bounds("source-control-writing-style-unavailable").is_some());
+
+        open_and_draw(&mut vcx, Section::Voice);
+        assert!(vcx.debug_bounds("speech-project-dictionary-below-unavailable").is_some());
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        runtime.shutdown_background();
     }
 }

@@ -565,6 +565,9 @@ impl SettingsView {
         };
         let merge_view = view.clone();
         let method = config.settings.pull_request_merge_method;
+        let auto_pull_locked = self.managed_setting_lock(&["defaultAutoPull"], cx).is_some();
+        let credits_locked = self.managed_setting_lock(&["removeAgentCreditsOnMerge"], cx).is_some();
+        let merge_locked = self.managed_setting_lock(&["pullRequestMergeMethod"], cx).is_some();
         section(
             "Repositories",
             vec![
@@ -577,7 +580,7 @@ impl SettingsView {
                     SourceControlChange::AutoPull(false).into_server(),
                     cx,
                 )
-                .control(switch("automatic-pull-switch", settings.default_auto_pull, SourceControlChange::AutoPull))
+                .control(switch("automatic-pull-switch", settings.default_auto_pull, SourceControlChange::AutoPull).disabled(auto_pull_locked))
                 .into_any_element(),
                 self.apply_scoped_reset(
                     Row::new("remove-agent-credits-on-merge", "Remove agent credits when merging")
@@ -588,7 +591,7 @@ impl SettingsView {
                     SourceControlChange::RemoveAgentCredits(false).into_server(),
                     cx,
                 )
-                .control(switch("remove-agent-credits-switch", settings.remove_agent_credits_on_merge, SourceControlChange::RemoveAgentCredits))
+                .control(switch("remove-agent-credits-switch", settings.remove_agent_credits_on_merge, SourceControlChange::RemoveAgentCredits).disabled(credits_locked))
                 .into_any_element(),
                 self.apply_scoped_reset(
                     Row::new("pull-request-merge-method", "Default merge method")
@@ -603,6 +606,7 @@ impl SettingsView {
                     Select::new("pull-request-merge-method-select", MERGE_METHODS.iter().map(|(value, label)| SelectOption::new(*value, *label)).collect())
                         .selected(merge_method_value(method))
                         .width(196.)
+                        .disabled(merge_locked)
                         .on_change(move |value, _, cx| {
                             if let Some(method) = parse_merge_method(&value) {
                                 let _ = merge_view.update(cx, |this, cx| {
@@ -1652,15 +1656,17 @@ impl SettingsView {
             style.mode != env_style.mode || style.custom_instructions != env_style.custom_instructions;
         let templates_differs =
             style.follow_change_request_templates != env_style.follow_change_request_templates;
+        let style_lock = self.managed_setting_lock(&["sourceControlWritingStyle"], cx);
         let writing_row = Row::new("source-control-writing-style", "Source control writing style")
             .description(style.mode.description())
-            .highlighted(self.is_target("source-control-writing-style"));
+            .highlighted(self.is_target("source-control-writing-style"))
+            .unavailable(style_lock.clone());
         let writing = if is_project_scope {
             let reset_view = view.clone();
             let env_mode = env_style.mode;
             let env_instructions = env_style.custom_instructions.clone();
             writing_row.reset_tooltip("Reset to inherited value").reset(
-                has_style_override && (style_differs || !templates_differs),
+                style_lock.is_none() && has_style_override && (style_differs || !templates_differs),
                 move |_, _, cx| {
                     let _ = reset_view.update(cx, |this, cx| {
                         if templates_differs {
@@ -1680,7 +1686,7 @@ impl SettingsView {
             )
         } else {
             let reset_view = view.clone();
-            writing_row.reset(!style.is_default_style(), move |_, _, cx| {
+            writing_row.reset(style_lock.is_none() && !style.is_default_style(), move |_, _, cx| {
                 let _ = reset_view.update(cx, |this, cx| {
                     this.update_scoped_server(SourceControlChange::ResetWritingStyle.into_server(), cx);
                 });
@@ -1690,6 +1696,7 @@ impl SettingsView {
                 Select::new("source-control-writing-style-select", WritingMode::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                     .selected(style.mode.as_str())
                     .width(196.)
+                    .disabled(style_lock.is_some())
                     .on_change(move |value, _, cx| {
                         let Some(mode) = WritingMode::parse(&value) else { return };
                         let custom_instructions = custom.then(|| instructions.read(cx).value().trim().to_owned());
@@ -1698,16 +1705,17 @@ impl SettingsView {
                         });
                     }),
             )
-            .when(custom, |row| row.below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.source_control.custom_instructions))));
+            .when(custom, |row| row.below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.source_control.custom_instructions).disabled(style_lock.is_some()))));
 
         let guides_view = view.clone();
+        let guides_unavail = self.scoped_unavailable(&["reviewGuidesEnabled"], env_only.clone(), cx);
         let mut rows = vec![
             writing.into_any_element(),
             Row::new("review-guides", "Review guides (beta)")
                 .description("Add a Guide tab to pull requests. An agent explains the changes and points out decisions that need review.")
                 .highlighted(self.is_target("review-guides"))
-                .unavailable(env_only.clone())
-                .control(Switch::new("review-guides-switch", settings.review_guides_enabled).disabled(env_only.is_some()).on_change(move |on, _, cx| {
+                .unavailable(guides_unavail.clone())
+                .control(Switch::new("review-guides-switch", settings.review_guides_enabled).disabled(guides_unavail.is_some()).on_change(move |on, _, cx| {
                     let _ = guides_view.update(cx, |this, cx| {
                         this.update_scoped_server(SourceControlChange::ReviewGuides(on).into_server(), cx);
                     });
@@ -1720,6 +1728,7 @@ impl SettingsView {
                     config,
                     ModelRow {
                         id: "review-guide-model",
+                        setting_key: "reviewGuideModelSelection",
                         title: "Review guide model",
                         description: "Model that reads a pull request to write its review guide. It reads the change itself over many steps, so a stronger model helps. Off uses the source control writer model.",
                         selection: settings.review_guide_model_selection.clone(),
@@ -1731,6 +1740,7 @@ impl SettingsView {
                     cx,
                 ),
             );
+            let review_instructions_locked = self.managed_setting_lock(&["reviewGuideInstructions"], cx).is_some();
             rows.push(
                 self.apply_scoped_reset(
                     Row::new("review-guide-instructions", "Review guide instructions")
@@ -1740,19 +1750,20 @@ impl SettingsView {
                     SourceControlChange::ReviewGuideInstructions(String::new()).into_server(),
                     cx,
                 )
-                .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.source_control.review_instructions)))
+                .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.source_control.review_instructions).disabled(review_instructions_locked)))
                 .into_any_element(),
             );
         }
         let templates_view = view.clone();
         let templates_row = Row::new("follow-change-request-templates", "Follow change request templates")
             .description("Use the repository's template for change request descriptions when available.")
-            .highlighted(self.is_target("follow-change-request-templates"));
+            .highlighted(self.is_target("follow-change-request-templates"))
+            .unavailable(style_lock.clone());
         let templates_row = if is_project_scope {
             let reset_view = view.clone();
             let env_templates = env_style.follow_change_request_templates;
             templates_row.reset_tooltip("Reset to inherited value").reset(
-                has_style_override && templates_differs,
+                style_lock.is_none() && has_style_override && templates_differs,
                 move |_, _, cx| {
                     let _ = reset_view.update(cx, |this, cx| {
                         if style_differs {
@@ -1768,7 +1779,7 @@ impl SettingsView {
             )
         } else {
             let reset_view = view.clone();
-            templates_row.reset(!style.follow_change_request_templates, move |_, _, cx| {
+            templates_row.reset(style_lock.is_none() && !style.follow_change_request_templates, move |_, _, cx| {
                 let _ = reset_view.update(cx, |this, cx| {
                     this.update_scoped_server(SourceControlChange::FollowTemplates(true).into_server(), cx);
                 });
@@ -1776,7 +1787,7 @@ impl SettingsView {
         };
         let advanced_rows = vec![
             templates_row
-                .control(Switch::new("follow-change-request-templates-switch", style.follow_change_request_templates).on_change(move |on, _, cx| {
+                .control(Switch::new("follow-change-request-templates-switch", style.follow_change_request_templates).disabled(style_lock.is_some()).on_change(move |on, _, cx| {
                     let _ = templates_view.update(cx, |this, cx| {
                         this.update_scoped_server(SourceControlChange::FollowTemplates(on).into_server(), cx);
                     });
@@ -1786,6 +1797,7 @@ impl SettingsView {
                 config,
                 ModelRow {
                     id: "source-control-writer-model",
+                    setting_key: "sourceControlWriterModelSelection",
                     title: "Source control writer model",
                     description: "Model for source control text and branch or bookmark names. When disabled, use the text generation model configured for this environment.",
                     selection: settings.source_control_writer_model_selection.clone(),
@@ -1807,13 +1819,15 @@ impl SettingsView {
 
     /// A "use a separate model" switch with the model select beside it while on.
     fn model_row(&self, config: &ServerConfig, row: ModelRow, options: &[SelectOption], cx: &Context<Self>) -> AnyElement {
-        let ModelRow { id, title, description, selection, seed, allow_text_generators, change } = row;
+        let ModelRow { id, setting_key, title, description, selection, seed, allow_text_generators, change } = row;
+        let lock = self.managed_setting_lock(&[setting_key], cx);
+        let locked = lock.is_some();
         let switch_view = cx.entity().downgrade();
         let on = selection.is_some();
         let disabled_reason = selection.as_ref().and_then(|sel| {
             self.scoped_model_disabled_reason(config, &sel.instance_id, &sel.model, allow_text_generators, cx)
         });
-        let toggle = Switch::new(SharedString::from(format!("{id}-switch")), on).on_change(move |on, _, cx| {
+        let toggle = Switch::new(SharedString::from(format!("{id}-switch")), on).disabled(locked).on_change(move |on, _, cx| {
             let next = if on { seed.clone() } else { None };
             if on && next.is_none() {
                 return;
@@ -1835,6 +1849,7 @@ impl SettingsView {
                 .width(200.)
                 .popup_width(260.)
                 .show_check()
+                .disabled(locked)
                 .on_change(move |value, _, cx| {
                     if let Some(selection) = parse_selection(&value) {
                         let _ = select_view.update(cx, |this, cx| {
@@ -1847,6 +1862,7 @@ impl SettingsView {
         let mut row = Row::new(id, title)
             .description(description)
             .highlighted(self.is_target(id))
+            .unavailable(lock)
             .when(empty, |row| row.status("No text generation providers available."));
         if !empty && let Some(reason) = disabled_reason {
             row = row.status(reason);
@@ -1857,6 +1873,7 @@ impl SettingsView {
 
 struct ModelRow {
     id: &'static str,
+    setting_key: &'static str,
     title: &'static str,
     description: &'static str,
     selection: Option<t3_core::model::ModelSelection>,
