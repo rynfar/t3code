@@ -11,6 +11,7 @@ use gpui::{
     UniformListScrollHandle, Window, actions,
 };
 use gpui_component::input::{InputEvent, InputState};
+use t3_core::files::media_preview::{DragMentionController, DraggedFileMention};
 use t3_core::files::{
     Entry, EntryKind, FileTree, LIST_ENTRIES, SEARCH_ENTRIES, TreeRow, decode_listing, decode_search, list_entries_request,
     search_entries_request,
@@ -75,6 +76,7 @@ pub struct Explorer {
     pub(super) focus: FocusHandle,
     /// Whether the tree had focus at the last render: the cursor row shows only then.
     pub(super) tree_focused: bool,
+    pub(super) drag_mention: DragMentionController,
     _subscription: Subscription,
 }
 
@@ -114,8 +116,28 @@ impl Explorer {
             scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle().tab_stop(true),
             tree_focused: false,
+            drag_mention: DragMentionController::default(),
             _subscription: subscription,
         }
+    }
+
+    pub(super) fn begin_drag_mention(&mut self, path: &str) -> Option<DraggedFileMention> {
+        if let Some(selected) = &self.selected {
+            self.drag_mention.set_selection(vec![selected.clone()]);
+        } else {
+            self.drag_mention.set_selection(Vec::new());
+        }
+        self.drag_mention.start_drag(Some(path))
+    }
+
+    pub(super) fn drop_mention_to_chat(&mut self, dragged: &DraggedFileMention, cx: &mut Context<Self>) {
+        let _ = self.drag_mention.end_drag();
+        self.state.update(cx, |state, cx| {
+            for path in &dragged.paths {
+                state.add_file_to_chat(path, cx);
+            }
+        });
+        cx.notify();
     }
 
     pub fn set_root(&mut self, root: Option<Root>, cx: &mut Context<Self>) {
