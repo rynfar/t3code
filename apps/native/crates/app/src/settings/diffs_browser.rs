@@ -6,7 +6,7 @@ use gpui::{
     App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Styled, Subscription,
     Window, div,
 };
-use gpui_component::Sizable;
+use gpui_component::{ActiveTheme, Sizable, h_flex};
 use gpui_component::input::{Input, InputEvent, InputState};
 use t3_core::client_settings::{
     BrowserLinkTarget, BrowserSearchEngine, ClientSettingChange, DiffColorScheme, valid_search_template,
@@ -21,6 +21,7 @@ use super::controls::{
 use super::{Block, SettingsView, store};
 use crate::app_state::AppState;
 use crate::icons::Icon;
+use crate::theme::{hsla, palette};
 
 const BROWSER_UNAVAILABLE: &str = "Browser profiles and cookie import, floating previews, viewport, zoom, appearance, and recordings require the Electron desktop app. They aren't available in the native client yet.";
 const PR_UNAVAILABLE: &str = "Proactive panels aren't available in the native client yet.";
@@ -32,7 +33,7 @@ const ADVANCED: &[&str] = &[
 ];
 
 pub(super) struct BrowserState {
-    custom_url: Entity<InputState>,
+    pub(super) custom_url: Entity<InputState>,
     advanced: bool,
     _subscription: Subscription,
 }
@@ -153,7 +154,24 @@ impl SettingsView {
                 .description("Choose colors for additions and deletions, including change counts.")
                 .highlighted(self.is_target("diff-color-scheme"))
                 .reset(doc.diff_color_scheme() != DiffColorScheme::default(), reset(&state, ClientSettingChange::DiffColorScheme(DiffColorScheme::default())))
-                .control(select(&state, "diff-colors-select", DiffColorScheme::ALL, doc.diff_color_scheme(), DiffColorScheme::as_str, DiffColorScheme::label, ClientSettingChange::DiffColorScheme).label(if doc.diff_color_scheme() == DiffColorScheme::RedGreen { "Red & green" } else { "Blue & orange" }).popup_width(208.)).into_any_element(),
+                .control({
+                    let active_scheme = doc.diff_color_scheme();
+                    select(&state, "diff-colors-select", DiffColorScheme::ALL, active_scheme, DiffColorScheme::as_str, DiffColorScheme::label, ClientSettingChange::DiffColorScheme)
+                        .render_icon(move |value, cx| {
+                            let p = palette(cx);
+                            let dark = cx.theme().mode.is_dark();
+                            let (first, second) = diff_swatch_colors(value, active_scheme, dark, &p);
+                            Some(
+                                h_flex()
+                                    .gap(r(4.))
+                                    .child(div().size(r(8.)).rounded_full().bg(hsla(first)))
+                                    .child(div().size(r(8.)).rounded_full().bg(hsla(second)))
+                                    .into_any_element(),
+                            )
+                        })
+                        .label(if active_scheme == DiffColorScheme::RedGreen { "Red & green" } else { "Blue & orange" })
+                        .popup_width(208.)
+                }).into_any_element(),
         ], cx);
         let pr_links_state = state.clone();
         let prs = section("Pull requests", vec![
@@ -161,7 +179,7 @@ impl SettingsView {
                 unavailable("proactive-panels", "Open pull requests and changes panels proactively", "Open linked pull requests first. Otherwise, open Changes for edits to at least 3 files or 50 lines.", "Unavailable", self.is_target("proactive-panels"), cx),
             ], cx).into_any_element(),
             Row::new("pull-request-links-open-in-app", "Open pull requests in T3 Code")
-                .description("Clicking a pull request link in an HTML page opens it in T3 Code. Turn off to open pull request links like any other link, on your git host.")
+                .description("Clicking a pull request link opens it in T3 Code. Turn off to open pull request links like any other link, on your git host.")
                 .highlighted(self.is_target("pull-request-links-open-in-app"))
                 .reset(!doc.pull_request_links_open_in_app(), reset(&state, ClientSettingChange::PullRequestLinksOpenInApp(true)))
                 .control(Switch::new("pull-request-links-open-in-app-switch", doc.pull_request_links_open_in_app()).on_change(move |on, _, cx| store::update_client(&pr_links_state, ClientSettingChange::PullRequestLinksOpenInApp(on), cx))).into_any_element(),
@@ -243,7 +261,7 @@ impl SettingsView {
             unavailable("browser-auto-show-floating-preview", "Auto-show floating preview", "Show the floating preview when an agent opens a browser or device unless the agent says otherwise.", "Unavailable", self.is_target("browser-auto-show-floating-preview"), cx),
         ], cx).into_any_element(),
             Row::new("browser-link-target", "Open links in")
-                .description("Where links in HTML pages open. Hold ⌘ or Ctrl while clicking a link to open it in your default browser either way.")
+                .description("Where links in the chat and terminal open. Hold \u{2318} or Ctrl while clicking a link to open it in your default browser either way.")
                 .highlighted(self.is_target("browser-link-target"))
                 .reset(doc.browser_link_target() != BrowserLinkTarget::default(), reset(&state, ClientSettingChange::BrowserLinkTarget(BrowserLinkTarget::default())))
                 .control(select(&state, "browser-link-target-select", BrowserLinkTarget::ALL, doc.browser_link_target(), BrowserLinkTarget::as_str, BrowserLinkTarget::label, ClientSettingChange::BrowserLinkTarget)).into_any_element(),
@@ -379,5 +397,46 @@ impl SettingsView {
                 cx,
             ),
         )]
+    }
+}
+
+/// Resolves each diff color scheme option's own swatch pair `(first, second)` without letting
+/// the currently active scheme overwrite the inactive option's dots in the dropdown popup.
+fn diff_swatch_colors(option_value: &str, active_scheme: DiffColorScheme, dark: bool, p: &crate::theme::Palette) -> (u32, u32) {
+    if option_value == "blue-orange" {
+        (p.blue_orange_diff_addition, p.blue_orange_diff_deletion)
+    } else if active_scheme == DiffColorScheme::RedGreen {
+        (p.diff_deletion, p.diff_addition)
+    } else {
+        let base = crate::theme::BUILT_IN_THEMES
+            .iter()
+            .find_map(|theme| if dark { theme.dark } else { theme.light })
+            .unwrap_or(*p);
+        (base.diff_deletion, base.diff_addition)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_swatch_colors_distinguish_both_options_regardless_of_active_scheme() {
+        let base = crate::theme::BUILT_IN_THEMES[0].dark.expect("default dark palette");
+        let mut blue_active = base;
+        blue_active.diff_addition = base.blue_orange_diff_addition;
+        blue_active.diff_deletion = base.blue_orange_diff_deletion;
+
+        let rg_when_rg = diff_swatch_colors("red-green", DiffColorScheme::RedGreen, true, &base);
+        let bo_when_rg = diff_swatch_colors("blue-orange", DiffColorScheme::RedGreen, true, &base);
+        assert_eq!(rg_when_rg, (base.diff_deletion, base.diff_addition));
+        assert_eq!(bo_when_rg, (base.blue_orange_diff_addition, base.blue_orange_diff_deletion));
+        assert_ne!(rg_when_rg, bo_when_rg);
+
+        let rg_when_bo = diff_swatch_colors("red-green", DiffColorScheme::BlueOrange, true, &blue_active);
+        let bo_when_bo = diff_swatch_colors("blue-orange", DiffColorScheme::BlueOrange, true, &blue_active);
+        assert_eq!(rg_when_bo, (base.diff_deletion, base.diff_addition));
+        assert_eq!(bo_when_bo, (base.blue_orange_diff_addition, base.blue_orange_diff_deletion));
+        assert_ne!(rg_when_bo, bo_when_bo);
     }
 }

@@ -1,19 +1,34 @@
-//! General, Chat and Labs: per-device settings from `GeneralSettingsPanel`, `ChatSettingsPanel`
-//! and `LegacyFeaturesSection` in `web/src/components/settings/SettingsPanels.tsx`, with
-//! `NotificationSettings.tsx`. Copy and defaults match the web.
+//! General, Chat and Labs: per-device and server-scoped settings from `GeneralSettingsPanel`,
+//! `ChatSettingsPanel` (`web/src/components/settings/SettingsPanels.tsx`),
+//! `NotificationSettings.tsx`, and `LabsSettingsPanel.tsx`. Copy and defaults match the web.
 
-use gpui::{App, Context, Entity, IntoElement, SharedString};
+use gpui::{App, Context, Entity, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, div};
+use gpui_component::h_flex;
 use t3_core::client_settings::{
     ClientSettingChange, ClientSettingsDoc, NOTIFICATION_MODES, ProjectGroupingMode, ProjectSortOrder, QuitConfirmationMode,
     TimestampFormat, ToolCallVisibility, notification_mode_value, project_grouping_from_toggle,
 };
 use t3_core::composer::{FollowUpBehavior, SendShortcut};
+use t3_core::managed_policy::{self, Capability};
+use t3_core::settings::ServerSettingChange;
+use t3_core::settings::search::Section;
 
-use super::controls::{Row, Select, SelectOption, Switch, section};
+use super::controls::{
+    Button, ButtonSize, ButtonVariant, InlineButton, InlineTone, Row, Select, SelectOption, Switch, r, section, unavailable_group,
+};
 use super::{Block, SettingsView, store};
 use crate::app_state::AppState;
+use crate::icons::Icon;
+use crate::theme::{hsla, palette};
 
 const MODIFIER: &str = if cfg!(target_os = "macos") { "\u{2318}" } else { "Ctrl" };
+const RICH_TEXT_UNAVAILABLE: &str = "Rich text formatting in the composer isn't available in the native client yet.";
+const SIMLOCK_URL: &str = "https://incubator.callstack.com/simlock/";
+
+#[derive(Default)]
+pub(crate) struct ChatState {
+    advanced: bool,
+}
 
 fn literal_options<T: Copy>(all: &[T], value: fn(T) -> &'static str, label: fn(T) -> &'static str) -> Vec<SelectOption> {
     all.iter().map(|item| SelectOption::new(value(*item), label(*item))).collect()
@@ -102,13 +117,6 @@ impl SettingsView {
                                 }
                             }),
                     )
-                    .into_any_element(),
-                Row::new("boring-sidebar", "Boring sidebar")
-                    .control(switch(state, "boring-sidebar-switch", doc.boring_sidebar_enabled(), ClientSettingChange::BoringSidebarEnabled))
-                    .into_any_element(),
-                Row::new("boring-sidebar-multiline", "Two-line folder rows")
-                    .description("In the boring sidebar, show folder threads on two lines: the title, then the branch, pull request, and agent.")
-                    .control(switch(state, "boring-sidebar-multiline-switch", doc.boring_sidebar_multiline_rows(), ClientSettingChange::BoringSidebarMultilineRows))
                     .into_any_element(),
                 Row::new("working-shelf", "Working section")
                     .description("Fold working and monitoring threads into a Working section. They return to the top of the inbox when they need you. The boring sidebar in Labs has no Working section.")
@@ -202,7 +210,8 @@ impl SettingsView {
     }
 
     pub(super) fn chat(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
-        let composer = self.doc(cx).composer();
+        let doc = self.doc(cx).clone();
+        let composer = doc.composer();
         let state = &self.state;
         let shortcut_options = vec![
             SelectOption::new("enter", "Enter"),
@@ -224,28 +233,67 @@ impl SettingsView {
         .into();
         let shortcut_state = state.clone();
         let follow_up_state = state.clone();
-        let composer_section = section(
-            "Composer",
-            vec![
-                Row::new("send-shortcut", "Send shortcut")
-                    .description("Choose when Enter sends a prompt or inserts a new line")
-                    .highlighted(self.is_target("send-shortcut"))
-                    .reset(composer.send_shortcut != SendShortcut::default(), reset(state, ClientSettingChange::SendShortcut(SendShortcut::default())))
-                    .control(Select::new("send-shortcut-select", shortcut_options).selected(shortcut_value).popup_width(280.).show_check().on_change(
-                        move |value, _, cx| {
-                            let shortcut = match value.as_ref() {
-                                "enter" => SendShortcut::Enter,
-                                "mod-enter-multiline" => SendShortcut::ModEnterMultiline,
-                                "mod-enter" => SendShortcut::ModEnter,
-                                _ => return,
-                            };
-                            store::update_client(&shortcut_state, ClientSettingChange::SendShortcut(shortcut), cx);
-                        },
-                    ))
+        let advanced = self.chat_ui.advanced || self.is_target("skills-in-slash-menu");
+        let weak = cx.entity().downgrade();
+        let mut composer_rows = vec![
+            unavailable_group(
+                RICH_TEXT_UNAVAILABLE,
+                vec![
+                    Row::new("composer-rich-text", "Rich text composer")
+                        .description("Show formatted Markdown as you type.")
+                        .highlighted(self.is_target("composer-rich-text"))
+                        .control(Switch::new("composer-rich-text-switch", false).disabled(true))
+                        .into_any_element(),
+                ],
+                cx,
+            )
+            .into_any_element(),
+            Row::new("send-shortcut", "Send shortcut")
+                .description("Choose when Enter sends a prompt or inserts a new line")
+                .highlighted(self.is_target("send-shortcut"))
+                .reset(composer.send_shortcut != SendShortcut::default(), reset(state, ClientSettingChange::SendShortcut(SendShortcut::default())))
+                .control(Select::new("send-shortcut-select", shortcut_options).selected(shortcut_value).popup_width(280.).show_check().on_change(
+                    move |value, _, cx| {
+                        let shortcut = match value.as_ref() {
+                            "enter" => SendShortcut::Enter,
+                            "mod-enter-multiline" => SendShortcut::ModEnterMultiline,
+                            "mod-enter" => SendShortcut::ModEnter,
+                            _ => return,
+                        };
+                        store::update_client(&shortcut_state, ClientSettingChange::SendShortcut(shortcut), cx);
+                    },
+                ))
+                .into_any_element(),
+            div()
+                .px(r(16.))
+                .py(r(8.))
+                .child(
+                    Button::new("chat-composer-advanced", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                        .icon(if advanced { Icon::ChevronDown } else { Icon::ChevronRight })
+                        .label("Advanced")
+                        .on_click(move |_, _, cx| {
+                            let _ = weak.update(cx, |view, cx| {
+                                view.chat_ui.advanced = !advanced;
+                                if view.is_target("skills-in-slash-menu") {
+                                    view.target = None;
+                                }
+                                cx.notify();
+                            });
+                        }),
+                )
+                .into_any_element(),
+        ];
+        if advanced {
+            composer_rows.push(
+                Row::new("skills-in-slash-menu", "Show skills in slash menu")
+                    .description("Also include skills in the / command menu. Skills always appear when you type $.")
+                    .highlighted(self.is_target("skills-in-slash-menu"))
+                    .reset(!doc.show_skills_in_slash_menu(), reset(state, ClientSettingChange::ShowSkillsInSlashMenu(true)))
+                    .control(switch(state, "skills-in-slash-menu-switch", doc.show_skills_in_slash_menu(), ClientSettingChange::ShowSkillsInSlashMenu))
                     .into_any_element(),
-            ],
-            cx,
-        );
+            );
+        }
+        let composer_section = section("Composer", composer_rows, cx);
         let follow_ups = section(
             "Follow-ups",
             vec![
@@ -273,7 +321,7 @@ impl SettingsView {
             ],
             cx,
         );
-        let visibility = self.doc(cx).tool_call_visibility();
+        let visibility = doc.tool_call_visibility();
         let visibility_state = state.clone();
         let activity = section(
             "Activity",
@@ -303,14 +351,283 @@ impl SettingsView {
             cx,
         );
         vec![
-            Block::new(&["composer", "send-shortcut"], composer_section),
+            Block::new(&["composer", "composer-rich-text", "send-shortcut", "skills-in-slash-menu"], composer_section),
             Block::new(&["follow-ups", "follow-up-behavior"], follow_ups),
             Block::new(&["activity", "tool-call-visibility"], activity),
         ]
     }
 
-    pub(super) fn labs(&mut self, _cx: &mut Context<Self>) -> Vec<Block> {
-        // #33131: legacy plan mode and context window meter toggles were removed.
-        Vec::new()
+    pub(super) fn labs(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
+        let p = palette(cx);
+        let doc = self.doc(cx).clone();
+        let config = self.state.read(cx).server_config.config.clone();
+        let can_write = config.is_some() && self.may("settings:write", cx);
+        let write_unavailable = (!can_write).then_some("Reconnect with settings write access to change this setting.");
+        let state = self.state.clone();
+        let server_switch = |id: &'static str, checked: bool, disabled: bool, change: fn(bool) -> ServerSettingChange| {
+            let state = state.clone();
+            Switch::new(id, checked)
+                .disabled(disabled)
+                .on_change(move |checked, _, cx| store::update_server(&state, change(checked), cx))
+        };
+
+        let boring_enabled = doc.boring_sidebar_enabled();
+        let mut boring_row = Row::new("boring-sidebar", "Boring sidebar")
+            .description("Group sidebar threads into project folders. Pinned threads stay on top, and Snoozed and Settled stay below the folders.")
+            .highlighted(self.is_target("boring-sidebar"))
+            .control(switch(&self.state, "boring-sidebar-switch", boring_enabled, ClientSettingChange::BoringSidebarEnabled));
+        if boring_enabled {
+            boring_row = boring_row.below(
+                div()
+                    .mt(r(8.))
+                    .mb(r(8.))
+                    .border_l_2()
+                    .border_color(hsla(p.border).opacity(0.6))
+                    .pl(r(12.))
+                    .child(
+                        Row::new("boring-sidebar-multiline", "Two-line folder rows")
+                            .description("Show folder threads on two lines: the title, then the branch, pull request, and agent.")
+                            .highlighted(self.is_target("boring-sidebar-multiline"))
+                            .control(switch(
+                                &self.state,
+                                "boring-sidebar-multiline-switch",
+                                doc.boring_sidebar_multiline_rows(),
+                                ClientSettingChange::BoringSidebarMultilineRows,
+                            )),
+                    ),
+            );
+        }
+
+        let guest_enabled = config.as_ref().and_then(|c| c.settings.guest_sharing_enabled).unwrap_or(false);
+        let connect_denial = if guest_enabled {
+            None
+        } else {
+            managed_policy::capability_denial(config.as_ref().and_then(|c| c.managed_policy.as_ref()), Capability::Connect)
+        };
+        let guest_unavailable = connect_denial.or_else(|| write_unavailable.map(str::to_owned));
+        let access_link = cx.entity().downgrade();
+        let guest_row = Row::new("guest-links", "Guest links")
+            .description_content(
+                h_flex()
+                    .flex_wrap()
+                    .gap_x(r(4.))
+                    .child("Share a thread with a guest who watches it live in a browser and sends messages you approve. Needs T3 Connect: sign in and link this machine in")
+                    .child(InlineButton::new("labs-open-access", "Sharing & access", InlineTone::Muted).on_click(move |_, _, cx| {
+                        let _ = access_link.update(cx, |view, cx| view.navigate(Section::Access, None, cx));
+                    }))
+                    .child("Turning it off stops every guest link."),
+            )
+            .highlighted(self.is_target("guest-links"))
+            .unavailable(guest_unavailable.clone())
+            .control(server_switch(
+                "guest-links-switch",
+                guest_enabled,
+                guest_unavailable.is_some(),
+                ServerSettingChange::GuestSharingEnabled,
+            ));
+
+        let linked_enabled = config.as_ref().is_some_and(|c| c.settings.threads.linked_environments_enabled);
+        let connections_link = cx.entity().downgrade();
+        let linked_row = Row::new("linked-environments-beta", "Linked environments")
+            .description_content(
+                h_flex()
+                    .flex_wrap()
+                    .gap_x(r(4.))
+                    .child("Let agents here work on your other machines, and theirs here. Turn it on for each machine, then link them in")
+                    .child(InlineButton::new("labs-open-connections", "Connections", InlineTone::Muted).on_click(move |_, _, cx| {
+                        let _ = connections_link.update(cx, |view, cx| view.navigate(Section::Connections, None, cx));
+                    }))
+                    .child("While off, nothing new starts over a link; running tasks finish."),
+            )
+            .highlighted(self.is_target("linked-environments-beta"))
+            .unavailable(write_unavailable)
+            .control(server_switch(
+                "linked-environments-switch",
+                linked_enabled,
+                !can_write,
+                ServerSettingChange::LinkedEnvironmentsEnabled,
+            ));
+
+        let prompt_suggestions_enabled = config.as_ref().is_some_and(|c| c.settings.prompt_suggestions_enabled);
+        let prompt_suggestions_row = Row::new("prompt-suggestions-beta", "Suggest next prompt")
+            .description("Show a predicted next message in the empty composer after a Claude or Codex turn. Tab uses it. Each is an extra cached request on your plan. Needs Codex 0.165+. Claude threads update on restart.")
+            .highlighted(self.is_target("prompt-suggestions-beta"))
+            .unavailable(write_unavailable)
+            .control(server_switch(
+                "prompt-suggestions-switch",
+                prompt_suggestions_enabled,
+                !can_write,
+                ServerSettingChange::PromptSuggestionsEnabled,
+            ));
+
+        let simlock_enabled = config.as_ref().is_some_and(|c| c.settings.threads.simlock_device_hosts_enabled);
+        let devices_link = cx.entity().downgrade();
+        let simlock_row = Row::new("simlock-hosts", "Simlock device hosts")
+            .description_content(
+                h_flex()
+                    .flex_wrap()
+                    .gap_x(r(4.))
+                    .child("Let the Device panel lease simulators and emulators from your own")
+                    .child(InlineButton::new("labs-open-simlock", "Simlock", InlineTone::Muted).on_click(|_, _, cx| cx.open_url(SIMLOCK_URL)))
+                    .child("pool, added in")
+                    .child(InlineButton::new("labs-open-devices", "Devices", InlineTone::Muted).on_click(move |_, _, cx| {
+                        let _ = devices_link.update(cx, |view, cx| view.navigate(Section::Devices, None, cx));
+                    }))
+                    .child("An alpha that may change or break. T3 Code never installs Simlock."),
+            )
+            .highlighted(self.is_target("simlock-hosts"))
+            .unavailable(write_unavailable)
+            .control(server_switch(
+                "simlock-hosts-switch",
+                simlock_enabled,
+                !can_write,
+                ServerSettingChange::SimlockDeviceHostsEnabled,
+            ));
+
+        let mut rows = vec![
+            boring_row.into_any_element(),
+            guest_row.into_any_element(),
+            linked_row.into_any_element(),
+            prompt_suggestions_row.into_any_element(),
+            simlock_row.into_any_element(),
+        ];
+
+        let is_mac_server = config
+            .as_ref()
+            .and_then(|c| c.environment.platform.as_ref())
+            .is_some_and(|platform| platform.os == "darwin");
+        if is_mac_server {
+            let fast_checkout = config.as_ref().is_some_and(|c| c.settings.threads.fast_worktree_checkout);
+            rows.push(
+                Row::new("worktree-fast-checkout", "Fast worktree checkout")
+                    .description("On a Mac, clone new worktrees from a checkout cached in the T3 home folder instead of writing every file. Uses Git\u{2019}s normal checkout when it can\u{2019}t. Turning it off deletes the cache.")
+                    .highlighted(self.is_target("worktree-fast-checkout"))
+                    .unavailable(write_unavailable)
+                    .control(div().debug_selector(|| "worktree-fast-checkout-switch".to_owned()).child(server_switch(
+                        "worktree-fast-checkout-switch",
+                        fast_checkout,
+                        !can_write,
+                        ServerSettingChange::FastWorktreeCheckout,
+                    )))
+                    .into_any_element(),
+            );
+        }
+
+        let beta = section("Beta", rows, cx);
+        vec![Block::new(
+            &[
+                "beta",
+                "boring-sidebar",
+                "boring-sidebar-multiline",
+                "guest-links",
+                "linked-environments-beta",
+                "prompt-suggestions-beta",
+                "simlock-hosts",
+                "worktree-fast-checkout",
+            ],
+            beta,
+        )]
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use gpui::{Context, IntoElement, ParentElement, Render, Styled, Window, div};
+    use serde_json::json;
+    use t3_core::settings::search::Section;
+
+    struct SettingsFrame;
+    impl Render for SettingsFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().children(crate::settings::overlay(window, cx))
+        }
+    }
+
+    #[gpui::test]
+    fn general_chat_and_labs_render_with_platform_and_policy_gates(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.executor().allow_parking();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "settings:write"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "fixture-env",
+                            "label": "Studio Mac",
+                            "platform": { "os": "darwin", "arch": "arm64" }
+                        },
+                        "managedPolicy": {
+                            "organization": "Acme Corp",
+                            "limits": { "connect": false }
+                        },
+                        "settings": {
+                            "guestSharingEnabled": false,
+                            "linkedEnvironmentsEnabled": true,
+                            "promptSuggestionsEnabled": true,
+                            "simlockDeviceHostsEnabled": false,
+                            "fastWorktreeCheckout": true
+                        }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        for section in [Section::General, Section::Chat, Section::Labs] {
+            vcx.update(|_, cx| crate::settings::open(section, cx));
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        }
+        // Fast worktree checkout switch is present on macOS.
+        assert!(vcx.debug_bounds("worktree-fast-checkout-switch").is_some());
+
+        // Switching platform to Linux hides the macOS-only Fast worktree checkout row.
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "fixture-env",
+                            "label": "Linux Box",
+                            "platform": { "os": "linux", "arch": "x64" }
+                        }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("worktree-fast-checkout-switch").is_none());
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        drop(runtime);
     }
 }

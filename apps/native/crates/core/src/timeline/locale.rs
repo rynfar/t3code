@@ -1,8 +1,15 @@
 //! Intl's numeric hour/minute options (`apps/web/src/timestampFormat.ts`).
 
 use std::fmt;
-use icu_calendar::Gregorian;
-use icu_datetime::{DateTimeFormatterPreferences, NoCalendarFormatter, fieldsets::T, input::Time, pattern::{DateTimePattern, DayPeriodNameLength, FixedCalendarDateTimeNames}, preferences::HourCycle};
+use icu_calendar::{Date, Gregorian};
+use icu_datetime::{
+    DateTimeFormatterPreferences, FixedCalendarDateTimeFormatter, NoCalendarFormatter,
+    fieldsets::{MD, T, YMD},
+    input::Time,
+    options::YearStyle,
+    pattern::{DateTimePattern, DayPeriodNameLength, FixedCalendarDateTimeNames},
+    preferences::HourCycle,
+};
 use icu_decimal::{DecimalFormatter, input::Decimal};
 use icu_locale_core::{Locale, extensions::unicode::Key};
 use writeable::{Part, PartsWrite, TryWriteable, Writeable};
@@ -38,6 +45,8 @@ struct ClockFormat {
 pub struct IntlTimestampClock {
     formats: [ClockFormat; 3],
     hours: [String; 25],
+    md: FixedCalendarDateTimeFormatter<Gregorian, MD>,
+    ymd: FixedCalendarDateTimeFormatter<Gregorian, YMD>,
 }
 
 fn pattern_fields(formatter: &NoCalendarFormatter<T>) -> (Option<Cycle>, Option<DayPeriodNameLength>) {
@@ -101,10 +110,29 @@ impl IntlTimestampClock {
             Some(ClockFormat { formatter, best_pattern, cycle, width, day_periods })
         };
         let decimal = DecimalFormatter::try_new((&locale).into(), Default::default()).ok()?;
+        let md = FixedCalendarDateTimeFormatter::try_new(prefs, MD::short()).ok()?;
+        let ymd = FixedCalendarDateTimeFormatter::try_new(prefs, YMD::short().with_year_style(YearStyle::Full)).ok()?;
         Some(Self {
             formats: [make(cycles[0])?, make(cycles[1])?, make(cycles[2])?],
             hours: std::array::from_fn(|hour| decimal.format(&Decimal::from(hour as u8)).to_string()),
+            md,
+            ymd,
         })
+    }
+
+    pub fn numeric_date(&self, local: LocalTime, include_year: bool) -> String {
+        let Ok(date) = Date::try_new_gregorian(local.year as i32, local.month as u8, local.day as u8) else {
+            return if include_year {
+                format!("{}/{}/{}", local.month, local.day, local.year)
+            } else {
+                format!("{}/{}", local.month, local.day)
+            };
+        };
+        if include_year {
+            self.ymd.format(&date).to_string()
+        } else {
+            self.md.format(&date).to_string()
+        }
     }
 
     pub fn time(&self, local: LocalTime, format: TimestampFormat) -> String {
@@ -180,5 +208,40 @@ mod tests {
             }
         }
         assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
+    }
+
+    #[test]
+    fn numeric_dates_use_locale_order_separators_and_numerals() {
+        let local = to_local(parse_iso("2026-07-03T00:30:00Z").unwrap(), &FixedZone(0));
+        // en-US: M/d and M/d/y
+        let en_us = IntlTimestampClock::new("en-US").unwrap();
+        assert_eq!(en_us.numeric_date(local, false), "7/3");
+        assert_eq!(en_us.numeric_date(local, true), "7/3/2026");
+
+        // en-GB: dd/MM and dd/MM/y
+        let en_gb = IntlTimestampClock::new("en-GB").unwrap();
+        assert_eq!(en_gb.numeric_date(local, false), "03/07");
+        assert_eq!(en_gb.numeric_date(local, true), "03/07/2026");
+
+        // de-DE: day before month with dots (not US English 7/3/2026)
+        let de_de = IntlTimestampClock::new("de-DE").unwrap();
+        assert!(de_de.numeric_date(local, false).contains('.'));
+        assert!(de_de.numeric_date(local, true).ends_with("2026"));
+        assert!(de_de.numeric_date(local, true).starts_with('3') || de_de.numeric_date(local, true).starts_with("03"));
+
+        // fr-CA: ISO-like year-month-day with hyphens
+        let fr_ca = IntlTimestampClock::new("fr-CA").unwrap();
+        assert!(fr_ca.numeric_date(local, false).contains('-'));
+        assert_eq!(fr_ca.numeric_date(local, true), "2026-07-03");
+
+        // ja-JP: year first with slashes
+        let ja_jp = IntlTimestampClock::new("ja-JP").unwrap();
+        assert!(ja_jp.numeric_date(local, false).contains('/'));
+        assert!(ja_jp.numeric_date(local, true).starts_with("2026/"));
+
+        // ar-EG: Arabic-Indic digits
+        let ar_eg = IntlTimestampClock::new("ar-EG").unwrap();
+        assert!(ar_eg.numeric_date(local, false).contains('٣'));
+        assert!(ar_eg.numeric_date(local, true).contains("٢٠٢٦"));
     }
 }

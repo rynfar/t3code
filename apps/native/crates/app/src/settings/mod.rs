@@ -536,6 +536,8 @@ pub struct SettingsView {
     pub(crate) maintenance: maintenance::MaintenanceState,
     pub(crate) diagnostics: diagnostics::DiagnosticsState,
     pub(crate) devices: devices::DevicesState,
+    chat_ui: general::ChatState,
+    about: about::AboutState,
     browser: diffs_browser::BrowserState,
     typography: typography::TypographyState,
     appearance_ui: appearance::AppearanceState,
@@ -590,6 +592,8 @@ impl SettingsView {
             maintenance: maintenance::MaintenanceState::new(window, cx),
             diagnostics: diagnostics::DiagnosticsState::new(window, cx),
             devices: devices::DevicesState::new(cx),
+            chat_ui: general::ChatState::default(),
+            about: about::AboutState::new(window, cx),
             browser: diffs_browser::BrowserState::new(window, cx),
             typography: typography::TypographyState::new(window, cx),
             appearance_ui: appearance::AppearanceState::new(cx),
@@ -652,6 +656,9 @@ impl SettingsView {
         if section != Section::Worktrees {
             self.worktrees.leave();
         }
+        if section != Section::About {
+            self.about.leave();
+        }
         if section == Section::Diagnostics {
             if changed {
                 self.diagnostics.reset();
@@ -710,7 +717,11 @@ impl SettingsView {
             dialog.update(cx,|dialog,cx|dialog.close(window,cx));
             return;
         }
-        if self.projects.actions.dismiss()
+        if self.dismiss_about_overlay(window, cx) || self.dismiss_auto_settle_days(window, cx) {
+            return;
+        }
+        if self.archive.dismiss()
+            || self.projects.actions.dismiss()
             || self.secrets.dismiss()
             || self.maintenance.dismiss()
             || self.dismiss_maintenance_retention(window, cx)
@@ -837,7 +848,15 @@ impl SettingsView {
         if self.typography.text_field_focused(window, cx) || self.projects.picker.as_ref().is_some_and(|picker| picker.text_field_focused(window, cx)) {
             return true;
         }
-        [&self.search, &self.threads.base_directory, &self.threads.auto_settle_days, &self.keybindings.filter, &self.keybindings.when_input]
+        [
+            &self.search,
+            &self.threads.base_directory,
+            &self.threads.auto_settle_days,
+            &self.browser.custom_url,
+            &self.about.licenses_search,
+            &self.keybindings.filter,
+            &self.keybindings.when_input,
+        ]
             .into_iter()
             .chain(self.threads.time_inputs())
             .chain(self.providers.inputs())
@@ -849,7 +868,7 @@ impl SettingsView {
             .chain(self.maintenance.inputs())
             .chain(self.diagnostics.inputs())
             .any(|input| input.focus_handle(cx).is_focused(window))
-            || [&self.worktrees.instructions, self.scheduled.textarea(), &self.projects.actions.command]
+            || [&self.threads.title_instructions, &self.worktrees.instructions, self.scheduled.textarea(), &self.projects.actions.command]
                 .into_iter()
                 .chain(self.source_control.textareas())
                 .any(|input| input.focus_handle(cx).is_focused(window))
@@ -1025,6 +1044,27 @@ impl SettingsView {
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        let licenses_open = self.section == Section::About && self.about.licenses_open;
+        let section_crumb = if licenses_open {
+            div()
+                .id("settings-breadcrumb-about")
+                .cursor_pointer()
+                .text_color(hsla(p.muted_foreground))
+                .hover(|this| this.text_color(hsla(p.foreground)))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.about.leave();
+                    cx.notify();
+                }))
+                .child(self.section.label())
+                .into_any_element()
+        } else {
+            div()
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hsla(p.foreground))
+                .child(self.section.label())
+                .into_any_element()
+        };
         h_flex()
             .h(r(48.))
             .flex_none()
@@ -1041,7 +1081,11 @@ impl SettingsView {
                     .text_sm()
                     .child(div().text_color(hsla(p.muted_foreground)).child("Settings"))
                     .child(div().text_color(hsla(p.icon_muted)).child("/"))
-                    .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.section.label())),
+                    .child(section_crumb)
+                    .when(licenses_open, |this| {
+                        this.child(div().text_color(hsla(p.icon_muted)).child("/"))
+                            .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Open-source licenses"))
+                    }),
             )
             .child(
                 Button::new("close-settings", ButtonVariant::Ghost, ButtonSize::IconSm)

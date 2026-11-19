@@ -76,7 +76,7 @@ impl LocaleFormats {
             self.dates[usize::from(include_year)].stringFromDate(&date).to_string()
         }
         #[cfg(not(target_os = "macos"))]
-        { if include_year { format!("{}/{}/{}", local.month, local.day, local.year) } else { format!("{}/{}", local.month, local.day) } }
+        { self.clock.numeric_date(local, include_year) }
     }
 }
 

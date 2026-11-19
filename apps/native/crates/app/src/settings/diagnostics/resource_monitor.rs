@@ -13,6 +13,7 @@ pub(super) struct MonitorState {
     stream: Option<Task<()>>,
     connection: Option<u64>,
     collapsed: HashSet<Identity>,
+    signaling: HashSet<Identity>,
     fixture: bool,
 }
 impl MonitorState {
@@ -25,6 +26,7 @@ impl MonitorState {
         self.history.reset();
         self.retry.reset();
         self.collapsed.clear();
+        self.signaling.clear();
     }
 }
 
@@ -150,6 +152,86 @@ impl SettingsView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// `signalProcess` in `ResourceTelemetryDiagnostics.tsx`: SIGKILL asks first; per-identity
+    /// pending guard and connection-epoch check prevent duplicate or cross-environment signals.
+    fn request_monitor_signal(&mut self, identity: Identity, signal: Signal, cx: &mut Context<Self>) {
+        if !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) || self.diagnostics.monitor.signaling.contains(&identity) {
+            return;
+        }
+        let connection = self.diagnostics.monitor.connection;
+        self.diagnostics.monitor.signaling.insert(identity.clone());
+        cx.notify();
+        if signal == Signal::Kill {
+            let (title, description) = model::kill_confirmation(identity.pid);
+            let confirm_view = cx.entity().downgrade();
+            let cancel_view = cx.entity().downgrade();
+            let confirm_id = identity.clone();
+            let cancel_id = identity.clone();
+            let opened = crate::dialog::ask_available_cancellable(
+                title,
+                description,
+                "Confirm",
+                move |_, cx| {
+                    // Defer so `AppState` is no longer borrowed by `ConfirmDialog::resolve`.
+                    cx.defer(move |cx| {
+                        let _ = confirm_view.update(cx, |this, cx| {
+                            if this.diagnostics.monitor.connection != connection || !this.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+                                this.diagnostics.monitor.signaling.remove(&confirm_id);
+                                cx.notify();
+                                return;
+                            }
+                            this.send_monitor_signal(confirm_id, signal, connection, cx);
+                        });
+                    });
+                },
+                move |_, cx| {
+                    cx.defer(move |cx| {
+                        let _ = cancel_view.update(cx, |this, cx| {
+                            this.diagnostics.monitor.signaling.remove(&cancel_id);
+                            cx.notify();
+                        });
+                    });
+                },
+                cx,
+            );
+            if !opened {
+                self.diagnostics.monitor.signaling.remove(&identity);
+                cx.notify();
+            }
+            return;
+        }
+        self.send_monitor_signal(identity, signal, connection, cx);
+    }
+
+    fn send_monitor_signal(&mut self, identity: Identity, signal: Signal, connection: Option<u64>, cx: &mut Context<Self>) {
+        if self.diagnostics.monitor.connection != connection || !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) {
+            self.diagnostics.monitor.signaling.remove(&identity);
+            cx.notify();
+            return;
+        }
+        let payload = monitor::signal_payload(&identity, signal.as_str());
+        let task = self.state.read(cx).rpc(model::SIGNAL_PROCESS, payload);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.diagnostics.monitor.signaling.remove(&identity);
+                let toast = match result {
+                    Err(error) => Some(
+                        Toast::new(ToastKind::Error, model::signal_failure_title(signal))
+                            .description(failure_text(&error, &format!("Failed to send {}.", signal.as_str()))),
+                    ),
+                    Ok(reply) => monitor::signal_failure_message(&reply, signal.as_str(), identity.pid)
+                        .map(|message| Toast::new(ToastKind::Error, model::signal_failure_title(signal)).description(message)),
+                };
+                if let Some(toast) = toast {
+                    this.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn resource_monitor_blocks(&mut self, window: &Window, cx: &mut Context<Self>) -> Vec<Block> {
@@ -681,6 +763,38 @@ impl SettingsView {
             }
             row = row.child(cell);
         }
+        if matches!(kind, MonitorTable::Live) {
+            let process = state.feed.snapshot.as_ref()?.processes.get(index)?;
+            let kill_width = kind.columns().last().map(|(_, width)| *width).unwrap_or(0.06);
+            let kill_cell = if monitor::can_signal(process.category) {
+                let identity = process.identity.clone();
+                let int_id = identity.clone();
+                let kill_id = identity.clone();
+                let disabled = !self.may(model::ENVIRONMENT_MAINTAIN_SCOPE, cx) || state.signaling.contains(&identity);
+                Self::cell(kill_width, true).flex_none().pr(r(16.)).child(
+                    h_flex()
+                        .gap(r(6.))
+                        .child(
+                            InlineButton::new(("resource-int", index), "INT", InlineTone::Muted)
+                                .tooltip("Send SIGINT")
+                                .disabled(disabled)
+                                .on_click(cx.listener(move |this, _, _, cx| this.request_monitor_signal(int_id.clone(), Signal::Int, cx))),
+                        )
+                        .child(
+                            InlineButton::new(("resource-kill", index), "KILL", InlineTone::Destructive)
+                                .tooltip("Send SIGKILL")
+                                .disabled(disabled)
+                                .on_click(cx.listener(move |this, _, _, cx| this.request_monitor_signal(kill_id.clone(), Signal::Kill, cx))),
+                        ),
+                )
+            } else {
+                Self::cell(kill_width, true)
+                    .flex_none()
+                    .pr(r(16.))
+                    .child(div().text_size(r(10.)).text_color(hsla(p.muted_foreground).opacity(0.35)).child("-"))
+            };
+            row = row.child(kill_cell);
+        }
         Some(row.into_any_element())
     }
 }
@@ -701,7 +815,7 @@ impl MonitorTable {
     }
     fn min_width(self) -> f32 {
         match self {
-            Self::Live => 1260.,
+            Self::Live => 1320.,
             Self::History => 1020.,
             Self::Attribution => 720.,
         }
@@ -709,16 +823,17 @@ impl MonitorTable {
     fn columns(self) -> &'static [(&'static str, f32)] {
         match self {
             Self::Live => &[
-                ("Process", 0.22),
+                ("Process", 0.20),
                 ("Category", 0.10),
                 ("CPU", 0.07),
                 ("CPU Time", 0.08),
                 ("Memory", 0.09),
-                ("Read/s", 0.09),
-                ("Write/s", 0.09),
-                ("Read Total", 0.10),
+                ("Read/s", 0.08),
+                ("Write/s", 0.08),
+                ("Read Total", 0.09),
                 ("Write Total", 0.09),
-                ("PID", 0.07),
+                ("PID", 0.06),
+                ("Kill", 0.06),
             ],
             Self::History => &[
                 ("Process", 0.24),
@@ -733,5 +848,158 @@ impl MonitorTable {
             ],
             Self::Attribution => &[("Component", 0.22), ("Operation", 0.28), ("Logical Read", 0.14), ("Logical Write", 0.14), ("Count", 0.10), ("Time", 0.12)],
         }
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use gpui::{Focusable, Render, div, prelude::*};
+    use serde_json::json;
+    use t3_core::resource_telemetry::{Category, Identity, can_signal};
+    use t3_core::settings::diagnostics::Signal;
+    use t3_core::settings::search::Section;
+
+    use super::*;
+
+    struct TestFrame {
+        dialog: gpui::Entity<crate::dialog::ConfirmDialog>,
+    }
+    impl Render for TestFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .children(crate::settings::overlay(window, cx))
+                .child(self.dialog.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn process_signal_actions_send_sigint_and_confirm_sigkill(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let drive = |vcx: &mut gpui::VisualTestContext| {
+            vcx.run_until_parked();
+            runtime.block_on(async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            });
+            vcx.run_until_parked();
+        };
+        cx.executor().allow_parking();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "environment:maintain"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+        });
+        let dialog = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+        let frame_dialog = dialog.clone();
+        let window = cx.add_window(|_, _| TestFrame { dialog: frame_dialog });
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| crate::settings::open(Section::Diagnostics, cx));
+        drive(&mut vcx);
+        let view = vcx.read(|cx| cx.global::<crate::settings::Host>().view.clone().expect("settings view open"));
+        let id = Identity { pid: 4242, start_time_ms: 1_731_888_000_000 };
+
+        assert!(can_signal(Category::ProviderRoot));
+        assert!(!can_signal(Category::Server));
+
+        // SIGINT dispatches immediately and guards in-flight signaling until settled.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.request_monitor_signal(id.clone(), Signal::Int, cx);
+                assert!(view.diagnostics.monitor.signaling.contains(&id));
+            });
+        });
+        drive(&mut vcx);
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.signalProcess").expect("SIGINT RPC sent");
+        assert_eq!(payload["pid"], json!(4242));
+        assert_eq!(payload["startTimeMs"], json!(1_731_888_000_000_i64));
+        assert_eq!(payload["signal"], json!("SIGINT"));
+        let _ = reply.send(Ok(json!({ "ok": true })));
+        drive(&mut vcx);
+        view.read_with(&vcx, |view, _| assert!(!view.diagnostics.monitor.signaling.contains(&id)));
+
+        // SIGKILL opens confirmation dialog first; cancelling does not send RPC.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.request_monitor_signal(id.clone(), Signal::Kill, cx);
+            });
+        });
+        drive(&mut vcx);
+        assert!(vcx.read(|cx| crate::dialog::is_open(cx)));
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.signalProcess"));
+        vcx.update(|window, cx| {
+            let focus = dialog.focus_handle(cx);
+            window.focus(&focus, cx);
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.simulate_keystrokes("escape");
+        drive(&mut vcx);
+        assert!(!vcx.read(|cx| crate::dialog::is_open(cx)));
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.signalProcess"));
+        view.read_with(&vcx, |view, _| assert!(!view.diagnostics.monitor.signaling.contains(&id)));
+
+        // Confirming SIGKILL dispatches server.signalProcess with SIGKILL.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.request_monitor_signal(id.clone(), Signal::Kill, cx);
+            });
+        });
+        drive(&mut vcx);
+        vcx.update(|window, cx| {
+            let focus = dialog.focus_handle(cx);
+            window.focus(&focus, cx);
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.simulate_keystrokes("enter");
+        drive(&mut vcx);
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.signalProcess").expect("SIGKILL RPC sent");
+        assert_eq!(payload["signal"], json!("SIGKILL"));
+        let _ = reply.send(Ok(json!({ "ok": true })));
+        drive(&mut vcx);
+        view.read_with(&vcx, |view, _| assert!(!view.diagnostics.monitor.signaling.contains(&id)));
+
+        // Missing environment:maintain never sends RPCs.
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        drive(&mut vcx);
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.request_monitor_signal(id.clone(), Signal::Int, cx);
+            });
+        });
+        drive(&mut vcx);
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.signalProcess"));
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        drop(runtime);
     }
 }
