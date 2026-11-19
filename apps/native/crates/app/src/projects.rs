@@ -477,6 +477,13 @@ impl ProjectDialogs {
         true
     }
 
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn add_to_machine_summary_for_test(&self) -> Option<(String, String, Option<String>)> {
+        let modal = self.add_to_machine.as_ref()?;
+        let target = modal.targets.get(modal.selected_target_idx).map(|t| t.saved_id.clone());
+        Some((modal.source_saved_id.clone(), modal.workspace_root.clone(), target))
+    }
+
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.clone = None;
         self.add_to_machine = None;
@@ -2454,11 +2461,12 @@ mod tests {
                 }
             })
         });
-        let (_, streams) = fixture.take_requests();
-        let (_, stream_reply) = streams
-            .into_iter()
-            .find(|(m, _)| *m == SUBSCRIBE_PROJECT_CLONES)
-            .expect("subscribeProjectClones stream opened");
+        let stream_reply = loop {
+            let (m, r) = fixture.next_stream().await;
+            if m == SUBSCRIBE_PROJECT_CLONES {
+                break r;
+            }
+        };
         let (stream_handle, stream_tx) = t3_client::session::StreamHandle::fixture();
         assert!(stream_reply.send(Ok(stream_handle)).is_ok());
         drop(stream_tx);
@@ -2845,11 +2853,12 @@ mod tests {
         started_toast_rx.await.unwrap();
         vcx.run_until_parked();
 
-        let (_, streams) = fixture.take_requests();
-        let (_, stream_reply) = streams
-            .into_iter()
-            .find(|(m, _)| *m == SUBSCRIBE_PROJECT_CLONES)
-            .expect("relay subscribes to project clones");
+        let stream_reply = loop {
+            let (m, r) = fixture.next_stream().await;
+            if m == SUBSCRIBE_PROJECT_CLONES {
+                break r;
+            }
+        };
         let (stream_handle, stream_tx) = t3_client::session::StreamHandle::fixture();
         assert!(stream_reply.send(Ok(stream_handle)).is_ok());
         stream_tx

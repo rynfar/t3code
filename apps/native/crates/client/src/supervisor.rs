@@ -228,6 +228,23 @@ impl ClientFixture {
         }
     }
 
+    pub async fn next_stream(&mut self) -> (&'static str, oneshot::Sender<Result<StreamHandle, RpcError>>) {
+        loop {
+            match self.commands.recv().await.expect("fixture stream channel closed") {
+                Command::Stream { method, reply, .. } => return (method, reply),
+                Command::Request { reply, .. } => {
+                    let _ = reply.send(Ok(serde_json::json!({})));
+                }
+                Command::OpenThread(_)
+                | Command::CloseThread(_)
+                | Command::CloseAllThreads
+                | Command::RefreshSessionState
+                | Command::RetryNow
+                | Command::Wakeup(_) => {}
+            }
+        }
+    }
+
     pub fn take_commands(&mut self) -> Vec<&'static str> {
         let mut commands = Vec::new();
         while let Ok(command) = self.commands.try_recv() {

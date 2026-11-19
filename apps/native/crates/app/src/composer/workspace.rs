@@ -345,8 +345,8 @@ impl Composer {
             }
             let offer_auto = self.can_offer_auto_balance(&host, cx);
             let auto_offset = usize::from(offer_auto);
-            let has_add = !host.add_targets.is_empty();
-            let count = auto_offset + host.options.len() + usize::from(has_add);
+            let add_count = host.add_targets.len();
+            let count = auto_offset + host.options.len() + add_count;
             self.workspace.host_highlighted = self.workspace.host_highlighted.min(count - 1);
             match key {
                 MenuKey::Up => self.workspace.host_highlighted = (self.workspace.host_highlighted + count - 1) % count,
@@ -366,8 +366,13 @@ impl Composer {
                         .cloned()
                     {
                         self.select_host(option, window, cx);
-                    } else if has_add && self.workspace.host_highlighted == auto_offset + host.options.len() {
-                        self.open_add_project_to_machine(window, cx);
+                    } else if let Some(target) = self
+                        .workspace
+                        .host_highlighted
+                        .checked_sub(auto_offset + host.options.len())
+                        .and_then(|idx| host.add_targets.get(idx))
+                    {
+                        self.open_add_project_to_machine(Some(target.saved_id.clone()), window, cx);
                     }
                 }
                 MenuKey::Delete => return false,
@@ -785,9 +790,32 @@ impl Composer {
         runtime.or(saved).unwrap_or(saved_id).to_owned()
     }
 
-    fn open_add_project_to_machine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_add_project_to_machine(
+        &mut self,
+        target_saved_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.workspace.host_open = false;
-        window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx);
+        let host = self.host_options(cx);
+        let source = host
+            .active
+            .as_ref()
+            .filter(|opt| !opt.project_id.is_empty())
+            .map(|opt| (opt.saved_id.clone(), opt.project_id.clone()))
+            .or_else(|| {
+                let project_id = self.snapshot.project_id.clone()?;
+                let saved_id = self.state.read(cx).environments.active.clone().unwrap_or_default();
+                Some((saved_id, project_id))
+            });
+        if let Some((source_saved_id, project_id)) = source {
+            let target = target_saved_id.or_else(|| host.add_targets.first().map(|t| t.saved_id.clone()));
+            self.state.update(cx, |state, cx| {
+                state.open_add_project_to_machine(source_saved_id, project_id, target, cx);
+            });
+        } else {
+            window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx);
+        }
         cx.notify();
     }
 
@@ -857,11 +885,8 @@ impl Composer {
                 .map(|scoped| &scoped.project)
                 .or_else(|| state.shell.project(pid))
             {
-                active_remote_url = project
-                    .repository_identity
-                    .as_ref()
-                    .and_then(|identity| identity.pointer("/locator/remoteUrl").and_then(serde_json::Value::as_str))
-                    .is_some_and(|url| !url.is_empty());
+                active_remote_url =
+                    t3_core::projects::extract_project_remote_url(project.repository_identity.as_ref()).is_some();
             }
             for group in state.project_groups_for(GroupConsumer::DraftPicker, cx) {
                 let matches = group.registrations.iter().any(|reg| {
@@ -873,12 +898,9 @@ impl Composer {
                 logical_project_key = Some(group.key.clone());
                 for reg in group.registrations {
                     if !active_remote_url {
-                        active_remote_url = reg
-                            .project
-                            .repository_identity
-                            .as_ref()
-                            .and_then(|identity| identity.pointer("/locator/remoteUrl").and_then(serde_json::Value::as_str))
-                            .is_some_and(|url| !url.is_empty());
+                        active_remote_url =
+                            t3_core::projects::extract_project_remote_url(reg.project.repository_identity.as_ref())
+                                .is_some();
                     }
                     let is_primary = primary_id == Some(reg.owner.saved_id.as_str())
                         || state.environments.environments.iter().any(|e| e.id == reg.owner.saved_id && e.local);
@@ -1475,14 +1497,40 @@ impl Composer {
             );
         }
         if !host.add_targets.is_empty() {
-            popup = popup.child(
-                div().mt(px(4.)).pt(px(4.)).border_t_1().border_color(hsla(p.border)).child(
+            let mut section = div().mt(px(4.)).pt(px(4.)).border_t_1().border_color(hsla(p.border));
+            if host.add_targets.len() == 1 {
+                let target_id = host.add_targets[0].saved_id.clone();
+                section = section.child(
                     MenuItem::new("host-add-machine", "Add to another machine")
                         .icon(Icon::Plus, hsla(p.muted_foreground))
                         .highlighted(self.workspace.host_highlighted == add_index)
-                        .on_click(cx.listener(|this, _, window, cx| this.open_add_project_to_machine(window, cx))),
-                ),
-            );
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_add_project_to_machine(Some(target_id.clone()), window, cx)
+                        })),
+                );
+            } else {
+                section = section.child(
+                    div()
+                        .px(px(8.))
+                        .py(px(4.))
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child("Add to another machine"),
+                );
+                for (offset, target) in host.add_targets.iter().enumerate() {
+                    let target_id = target.saved_id.clone();
+                    let target_icon = environment_machine_icon(state, &target.saved_id);
+                    section = section.child(
+                        MenuItem::new(("host-add-machine", offset), target.label.clone())
+                            .icon(target_icon, hsla(p.muted_foreground))
+                            .highlighted(self.workspace.host_highlighted == add_index + offset)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_add_project_to_machine(Some(target_id.clone()), window, cx)
+                            })),
+                    );
+                }
+            }
+            popup = popup.child(section);
         }
         Some(
             div()
@@ -1824,5 +1872,192 @@ impl Composer {
         self.sync_menu(true, cx);
         self.focus(window, cx);
         cx.notify();
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod add_to_machine_tests {
+    use super::*;
+    use crate::app_state::AppEvent;
+    use gpui::{Render, size};
+    use serde_json::json;
+
+    #[gpui::test]
+    async fn composer_add_to_another_machine_opens_project_dialog_for_active_host_project(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+
+        state.update(cx, |s, cx| {
+            let mut snapshot = s.shell.snapshot.clone().unwrap_or_default();
+            snapshot.projects.push(
+                serde_json::from_value(json!({
+                    "id": "proj-src",
+                    "title": "t3code",
+                    "workspaceRoot": "/repo/t3code",
+                    "repositoryIdentity": {
+                        "canonicalKey": "github.com/pingdotgg/t3code",
+                        "displayName": "pingdotgg/t3code",
+                        "rootPath": "/repo/t3code",
+                        "locator": { "remoteUrl": "https://github.com/pingdotgg/t3code.git" }
+                    },
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-02T00:00:00Z"
+                }))
+                .unwrap(),
+            );
+            s.shell.snapshot = Some(snapshot);
+            s.shell.synchronized = true;
+            s.server_config.config = Some(
+                serde_json::from_value(json!({
+                    "environment": { "environmentId": "fixture-env", "label": "MacBook Pro", "capabilities": {} },
+                    "providers": [],
+                    "settings": {},
+                    "issues": [],
+                    "keybindings": []
+                }))
+                .unwrap(),
+            );
+            s.environments.environments[0].local = true;
+            s.environments.environments[0].label = "MacBook Pro".into();
+            s.environments.environments.push(
+                serde_json::from_value(json!({
+                    "id": "remote-1",
+                    "label": "Build Box",
+                    "httpBase": "http://remote.invalid",
+                    "environmentId": "env-remote"
+                }))
+                .unwrap(),
+            );
+
+            let owner_local = t3_core::sidebar::grouping::EnvironmentOwner {
+                saved_id: "saved-fixture".into(),
+                canonical_id: Some("fixture-env".into()),
+                generation: 1,
+                connection_generation: 1,
+                shell_generation: 1,
+            };
+            let owner_remote = t3_core::sidebar::grouping::EnvironmentOwner {
+                saved_id: "remote-1".into(),
+                canonical_id: Some("env-remote".into()),
+                generation: 1,
+                connection_generation: 1,
+                shell_generation: 1,
+            };
+            let mut config_remote = t3_core::server_config::ServerConfigState::default();
+            config_remote.config = Some(
+                serde_json::from_value(json!({
+                    "environment": { "environmentId": "env-remote", "label": "Build Box", "capabilities": {} },
+                    "providers": [],
+                    "settings": {},
+                    "issues": [],
+                    "keybindings": []
+                }))
+                .unwrap(),
+            );
+            let grants: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+                "authenticated": true,
+                "scopes": ["source-control:write", "orchestration:read"]
+            }))
+            .unwrap();
+            let mut remote_shell = t3_core::shell::ShellState::default();
+            remote_shell.synchronized = true;
+            s.fleet = std::sync::Arc::new(t3_client::environments::FleetView {
+                revision: 1,
+                environments: vec![
+                    std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                        summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                            owner_local,
+                            &s.shell,
+                            &s.server_config,
+                        )),
+                        status: t3_client::supervisor::ConnectionStatus::Connected,
+                        config: s.server_config.clone(),
+                        grants: Some(grants.clone()),
+                        settings_revision: 0,
+                        keybindings_revision: 0,
+                    }),
+                    std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                        summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                            owner_remote,
+                            &remote_shell,
+                            &config_remote,
+                        )),
+                        status: t3_client::supervisor::ConnectionStatus::Connected,
+                        config: config_remote,
+                        grants: Some(grants),
+                        settings_revision: 0,
+                        keybindings_revision: 0,
+                    }),
+                ],
+            });
+            s.sidebar.grouping_projects = s
+                .fleet
+                .environments
+                .iter()
+                .flat_map(|entry| entry.summary.projects.iter().cloned())
+                .collect();
+            s.sidebar.grouping_threads = s
+                .fleet
+                .environments
+                .iter()
+                .flat_map(|entry| entry.summary.threads.iter().cloned())
+                .collect();
+            s.rebuild_sidebar(cx);
+            s.start_draft("proj-src", cx);
+            cx.emit(AppEvent::Shell);
+        });
+
+        struct Host {
+            composer: Entity<Composer>,
+            dialogs: Entity<crate::projects::ProjectDialogs>,
+        }
+        impl Render for Host {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                // Keep `Composer`'s native macOS `Input` out of `TestWindow::draw` so `set_text_content_type`
+                // does not call unimplemented `TestWindow::window_handle`.
+                div().size_full().child(self.dialogs.clone())
+            }
+        }
+
+        let (host, vcx) = cx.add_window_view(|window, cx| Host {
+            composer: cx.new(|cx| Composer::new(state.clone(), window, cx)),
+            dialogs: cx.new(|cx| crate::projects::ProjectDialogs::new(state.clone(), window, cx)),
+        });
+        vcx.update(|window, cx| {
+            window.resize(size(px(960.), px(640.)));
+            let composer = host.read(cx).composer.clone();
+            let options = composer.read(cx).host_options(cx);
+            assert_eq!(options.add_targets.len(), 1);
+            assert_eq!(options.add_targets[0].saved_id, "remote-1");
+            composer.update(cx, |c, cx| {
+                c.open_host(window, cx);
+                assert!(c.workspace_key(MenuKey::Down, window, cx));
+                assert!(c.workspace_key(MenuKey::Accept, window, cx));
+            });
+            window.blur();
+        });
+        vcx.run_until_parked();
+
+        vcx.read_entity(&host, |h, cx| {
+            let dialogs = h.dialogs.read(cx);
+            assert!(dialogs.is_open(), "Add to another machine must open ProjectDialogs");
+            let summary = dialogs
+                .add_to_machine_summary_for_test()
+                .expect("AddProjectToMachineDialog must be active");
+            assert_eq!(summary.0, "saved-fixture");
+            assert_eq!(summary.1, "/repo/t3code");
+            assert_eq!(summary.2.as_deref(), Some("remote-1"));
+        });
+
+        cx.update(|cx| {
+            state.update(cx, |s, _| s.stop_pump());
+        });
+        runtime.shutdown_background();
     }
 }
