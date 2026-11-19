@@ -1,32 +1,38 @@
 //! One browser tab's stream and the page drawn from it, as `browser/ServerBrowserSurface.tsx`
 //! shows it: the control bar (who drives the tab, Take or Release control), the newest frame
 //! scaled to fit, pointer, wheel and key input in page pixels while this viewer has control, the
-//! agent's cursor (`AgentCursorMark`) while it does not, page dialogs, and the host setup and
-//! refused states. Frames decode on the network runtime; only the newest waits, and the view
-//! repaints once per decoded frame, never on a timer.
+//! agent's cursor (`AgentCursorMark`) while it does not, page dialogs, file picker uploads with
+//! stale-picker withdrawal on drop/stop (`pingdotgg/t3code#29655`), file downloads, region/point
+//! annotation selection (`pingdotgg/t3code#34796`), and the host setup and refused states.
+//! Frames decode on the network runtime; only the newest waits, and the view repaints once per
+//! decoded frame, never on a timer.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Corners, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ParentElement, Pixels,
-    Render, RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Task, Window, canvas, div, point, prelude::*, px, size,
+    IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ParentElement,
+    PathPromptOptions, Pixels, Render, RenderImage, ScrollDelta, ScrollWheelEvent, Styled, Task, Window, canvas, div, point, prelude::*, px, size,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_client::preview_stream::{Frame, PreviewStream, StreamEvent, StreamSender, StreamTarget};
+use t3_client::preview_stream::{Frame, PreviewStream, StreamEvent, StreamSender, StreamTarget, download_file, upload_file_chooser};
+use t3_core::preview::annotation::{AnnotationRegion, AnnotationTarget};
 use t3_core::preview::stream::{
-    AGENT_CURSOR_ACTIVE_MS, Control, Controller, HostSetup, KeyAction, MouseAction, MouseButton as PageButton, Pointer, RESIZE_THROTTLE_MS, StreamInput,
-    StreamMessage, Viewport, WHEEL_LINE_PX, control_label, cursor_position, dom_key, fit, grow_cap, may_send, modifiers, page_point,
+    AGENT_CURSOR_ACTIVE_MS, Control, Controller, FileChooserOffer, HostSetup, KeyAction, MouseAction, MouseButton as PageButton, Pointer,
+    RESIZE_THROTTLE_MS, StreamInput, StreamMessage, UploadFile, Viewport, WHEEL_LINE_PX, control_label, cursor_position, dom_key, fit, grow_cap,
+    may_send, modifiers, page_point,
 };
 
+use super::annotation::crop_frame_to_png;
 use super::{Abort, Previews};
 use crate::app_state::AppState;
 use crate::composer::controls::{Button as BarButton, ButtonSize as BarSize, ButtonVariant as BarVariant};
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
+use crate::toast::{Toast, ToastKind};
 
 /// The control bar: an `xs` button with `py-1` and its bottom border, held with or without the
 /// button so overlays below it never shift.
@@ -36,26 +42,31 @@ pub const CONTROL_BAR_HEIGHT: f32 = 33.;
 /// per animation frame.
 const INPUT_FLUSH_MS: u64 = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FrameEvent {
     /// Control, connection or the first frame changed; the chrome row follows.
     Changed,
+    /// User picked a region or point on the streamed page while annotation mode is active.
+    Picked(AnnotationTarget),
+    /// User pressed Escape while annotation pick mode is active (`pingdotgg/t3code#34796`).
+    CancelPick,
 }
 
 struct Decoded {
     image: Arc<RenderImage>,
     size: (u32, u32),
+    jpeg: Frame,
 }
 
-fn decode(bytes: &[u8]) -> Option<Decoded> {
-    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).ok()?;
+fn decode(bytes: Frame) -> Option<Decoded> {
+    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).ok()?;
     let size = (image.width(), image.height());
     let mut pixels = image.into_rgba8();
     // GPUI's atlas takes BGRA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    Some(Decoded { image: Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])), size })
+    Some(Decoded { image: Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])), size, jpeg: bytes })
 }
 
 /// The open connection; dropping it closes the socket and stops decoding.
@@ -73,14 +84,17 @@ pub struct FrameView {
     tab_id: String,
     focus: FocusHandle,
     visible: bool,
+    follow_size: bool,
     live: Option<Live>,
     image: Option<Arc<RenderImage>>,
+    latest_jpeg: Option<Frame>,
     /// The frame before `image`, freed once the next one replaces it so the atlas never drops a
     /// tile the last drawn scene still uses.
     retired: Option<Arc<RenderImage>>,
     frame_size: (u32, u32),
     viewport: Option<Viewport>,
     control: Option<Control>,
+    file_chooser: Option<FileChooserOffer>,
     host_setup: Option<HostSetup>,
     refused: bool,
     gone: bool,
@@ -100,6 +114,9 @@ pub struct FrameView {
     pointer_task: Option<Task<()>>,
     prompt: Entity<InputState>,
     prompt_for: Option<(String, String)>,
+    /// Annotation region/point selection mode over the streamed frame.
+    pick_mode: bool,
+    pick_drag: Option<((f64, f64), (f64, f64))>,
 }
 
 impl EventEmitter<FrameEvent> for FrameView {}
@@ -151,12 +168,15 @@ impl FrameView {
             tab_id,
             focus: cx.focus_handle(),
             visible: false,
+            follow_size: true,
             live: None,
             image: None,
+            latest_jpeg: None,
             retired: None,
             frame_size: (0, 0),
             viewport: None,
             control: None,
+            file_chooser: None,
             host_setup: None,
             refused: false,
             gone: false,
@@ -173,6 +193,8 @@ impl FrameView {
             pointer_task: None,
             prompt: cx.new(|cx| InputState::new(window, cx)),
             prompt_for: None,
+            pick_mode: false,
+            pick_drag: None,
         }
     }
 
@@ -182,6 +204,39 @@ impl FrameView {
 
     pub fn has_frame(&self) -> bool {
         self.image.is_some()
+    }
+
+    pub fn panel_size(&self) -> Option<(f64, f64)> {
+        let bounds = self.bounds?;
+        Some((f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height))))
+    }
+
+    pub fn set_follow_size(&mut self, follow_size: bool) {
+        if self.follow_size != follow_size {
+            self.follow_size = follow_size;
+            if follow_size {
+                self.sent_size = None;
+                self.send_resize();
+            }
+        }
+    }
+
+    pub fn set_pick_mode(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pick_mode == active {
+            return;
+        }
+        self.pick_mode = active;
+        self.pick_drag = None;
+        if active {
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
+    }
+
+    /// Crops the selected annotation region (or full frame) from the latest streamed JPEG into PNG.
+    pub fn capture_annotation_png(&self, target: &AnnotationTarget) -> Option<Vec<u8>> {
+        let jpeg = self.latest_jpeg.as_ref()?;
+        crop_frame_to_png(jpeg, self.viewport, target)
     }
 
     /// A state the page cannot show through (host setup, refused): drawn over the empty state.
@@ -226,7 +281,7 @@ impl FrameView {
         let decoder = runtime.spawn(async move {
             while frames.changed().await.is_ok() {
                 let Some(bytes): Option<Frame> = frames.borrow_and_update().clone() else { continue };
-                let Ok(Some(image)) = tokio::task::spawn_blocking(move || decode(&bytes)).await else { continue };
+                let Ok(Some(image)) = tokio::task::spawn_blocking(move || decode(bytes)).await else { continue };
                 if decoded_tx.send(Some(Arc::new(image))).is_err() {
                     return;
                 }
@@ -261,6 +316,7 @@ impl FrameView {
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.live = None;
+        self.file_chooser = None;
         self.clear_input();
         if self.control.take().is_some() {
             cx.emit(FrameEvent::Changed);
@@ -270,6 +326,7 @@ impl FrameView {
 
     fn reconnect(&mut self, cx: &mut Context<Self>) {
         self.live = None;
+        self.file_chooser = None;
         self.connect(cx);
     }
 
@@ -279,6 +336,7 @@ impl FrameView {
             cx.drop_image(stale, None);
         }
         self.retired = self.image.replace(frame.image.clone());
+        self.latest_jpeg = Some(frame.jpeg.clone());
         self.frame_size = frame.size;
         if first {
             cx.emit(FrameEvent::Changed);
@@ -290,25 +348,36 @@ impl FrameView {
         match event {
             StreamEvent::Connected(connected) => {
                 if !connected {
+                    self.file_chooser = None;
                     self.control = None;
                     self.clear_input();
                     cx.emit(FrameEvent::Changed);
                     cx.notify();
                 }
             }
+            StreamEvent::FileChooser(offer) => {
+                if self.file_chooser != offer {
+                    self.file_chooser = offer;
+                    cx.notify();
+                }
+            }
             StreamEvent::Message(message) => self.on_message(message, cx),
             StreamEvent::Gone => {
                 self.gone = true;
+                self.file_chooser = None;
                 self.live = None;
+                cx.notify();
             }
             StreamEvent::HostSetup(setup) => {
                 self.host_setup = Some(setup);
+                self.file_chooser = None;
                 self.live = None;
                 cx.emit(FrameEvent::Changed);
                 cx.notify();
             }
             StreamEvent::Refused => {
                 self.refused = true;
+                self.file_chooser = None;
                 self.live = None;
                 cx.emit(FrameEvent::Changed);
                 cx.notify();
@@ -353,8 +422,126 @@ impl FrameView {
                 let thread = self.thread_id.clone();
                 self.previews.update(cx, |previews, cx| previews.popup(&thread, &tab_id, cx));
             }
-            StreamMessage::Download { .. } | StreamMessage::FileChooser { .. } | StreamMessage::FileChooserClosed { .. } | StreamMessage::Unknown => {}
+            StreamMessage::Download { id, file_name, .. } => {
+                self.save_download(id, file_name, cx);
+            }
+            StreamMessage::FileChooser { .. } | StreamMessage::FileChooserClosed { .. } | StreamMessage::Unknown => {}
         }
+    }
+
+    /// Prompts for a local destination and downloads a preview artifact from the server.
+    pub fn save_download(&self, download_id: String, file_name: String, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let connection = state.connection_id();
+        let Some(client) = state.client_handle() else { return };
+        let credentials = client.credentials().clone();
+        let runtime = state.runtime().clone();
+        let thread_id = self.thread_id.clone();
+        let tab_id = self.tab_id.clone();
+        let dir = std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let suggested = if file_name.trim().is_empty() { "download" } else { file_name.as_str() };
+        let prompt = cx.prompt_for_new_path(&dir, Some(suggested));
+        let app_state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(path))) = prompt.await else { return };
+            let fetched = runtime.spawn(async move { download_file(&credentials, &thread_id, &tab_id, &download_id).await }).await;
+            let result: Result<(), String> = match fetched {
+                Ok(Ok(bytes)) => {
+                    cx.background_executor()
+                        .spawn(async move { std::fs::write(&path, bytes).map_err(|err| err.to_string()) })
+                        .await
+                }
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(err.to_string()),
+            };
+            cx.update(|cx| {
+                app_state.update(cx, |state, cx| {
+                    if state.connection_id() != connection {
+                        return;
+                    }
+                    match result {
+                        Ok(()) => state.show_toast(Toast::new(ToastKind::Success, format!("Downloaded {file_name}")), cx),
+                        Err(err) => state.show_toast(Toast::new(ToastKind::Error, "Could not save download").description(err), cx),
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn answer_file_chooser(&mut self, files: Vec<UploadFile>, cx: &mut Context<Self>) {
+        let Some(offer) = self.file_chooser.take() else { return };
+        cx.notify();
+        let state = self.state.read(cx);
+        let connection = state.connection_id();
+        let Some(client) = state.client_handle() else { return };
+        let credentials = client.credentials().clone();
+        let runtime = state.runtime().clone();
+        let thread_id = self.thread_id.clone();
+        let tab_id = self.tab_id.clone();
+        let app_state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            let result = runtime
+                .spawn(async move { upload_file_chooser(&credentials, &thread_id, &tab_id, &offer.id, &files).await })
+                .await;
+            let err = match result {
+                Ok(Ok(())) => return,
+                Ok(Err(err)) => err,
+                Err(err) => err.to_string(),
+            };
+            cx.update(|cx| {
+                app_state.update(cx, |state, cx| {
+                    if state.connection_id() != connection {
+                        return;
+                    }
+                    state.show_toast(Toast::new(ToastKind::Error, "Could not send the files to the page").description(err), cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn open_file_chooser_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(offer) = self.file_chooser.clone() else { return };
+        let connection = self.state.read(cx).connection_id();
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: offer.multiple,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else { return };
+            if paths.is_empty() {
+                return;
+            }
+            let files: Vec<UploadFile> = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .filter_map(|path| {
+                            let bytes = std::fs::read(&path).ok()?;
+                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
+                            Some(UploadFile { name, mime_type: "application/octet-stream".to_owned(), bytes })
+                        })
+                        .collect()
+                })
+                .await;
+            if !files.is_empty() {
+                let _ = this.update(cx, |this, cx| {
+                    if this.state.read(cx).connection_id() == connection
+                        && this.file_chooser.as_ref().is_some_and(|current| current.id == offer.id)
+                    {
+                        this.answer_file_chooser(files, cx);
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     fn clear_input(&mut self) {
@@ -393,6 +580,9 @@ impl FrameView {
     }
 
     fn send_resize(&mut self) {
+        if !self.follow_size {
+            return;
+        }
         let Some(bounds) = self.bounds else { return };
         let size = (f32::from(bounds.size.width).round() as u32, f32::from(bounds.size.height).round() as u32);
         if self.sent_size == Some(size) {
@@ -405,10 +595,17 @@ impl FrameView {
 
     /// A window position as a page point, `None` outside the frame unless `clamp`.
     fn page_at(&self, position: gpui::Point<Pixels>, clamp: bool) -> Option<t3_core::preview::stream::PagePoint> {
-        let (bounds, viewport) = (self.bounds?, self.viewport?);
-        if self.image.is_none() || !self.controlled() {
+        if !self.controlled() {
             return None;
         }
+        self.frame_point(position, clamp)
+    }
+
+    /// Maps window coordinates into page CSS px regardless of controller ownership (used for
+    /// annotation selection even when watching an agent's tab).
+    fn frame_point(&self, position: gpui::Point<Pixels>, clamp: bool) -> Option<t3_core::preview::stream::PagePoint> {
+        let (bounds, viewport) = (self.bounds?, self.viewport?);
+        self.image.as_ref()?;
         let box_size = (f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height)));
         let at = (f64::from(f32::from(position.x - bounds.origin.x)), f64::from(f32::from(position.y - bounds.origin.y)));
         page_point(box_size, self.frame_size, viewport, at, clamp)
@@ -432,6 +629,16 @@ impl FrameView {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+        if self.pick_mode {
+            if event.button == MouseButton::Left
+                && let Some(at) = self.frame_point(event.position, false)
+            {
+                cx.stop_propagation();
+                self.pick_drag = Some(((at.x, at.y), (at.x, at.y)));
+                cx.notify();
+            }
+            return;
+        }
         if let MouseButton::Navigate(direction) = event.button {
             // Thumb buttons drive this tab's history, never the page.
             self.send(StreamInput::History { delta: if direction == NavigationDirection::Back { -1 } else { 1 } });
@@ -455,6 +662,21 @@ impl FrameView {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if self.pick_mode {
+            if event.button == MouseButton::Left
+                && let Some((start, last)) = self.pick_drag.take()
+            {
+                let end = self.frame_point(event.position, true).map_or(last, |at| (at.x, at.y));
+                let target = self
+                    .viewport
+                    .and_then(|viewport| AnnotationRegion::from_drag(start, end, viewport))
+                    .map_or(AnnotationTarget::Point { x: end.0, y: end.1 }, AnnotationTarget::Region);
+                self.pick_mode = false;
+                cx.emit(FrameEvent::Picked(target));
+                cx.notify();
+            }
+            return;
+        }
         let Some(button) = page_button(event.button) else { return };
         if self.pressed & button.bit() == 0 {
             return;
@@ -475,6 +697,15 @@ impl FrameView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.pick_mode {
+            if let Some((start, _)) = self.pick_drag
+                && let Some(at) = self.frame_point(event.position, true)
+            {
+                self.pick_drag = Some((start, (at.x, at.y)));
+                cx.notify();
+            }
+            return;
+        }
         let Some(at) = self.page_at(event.position, self.pressed != 0) else { return };
         self.pending_move = Some(StreamInput::Mouse {
             action: MouseAction::Move,
@@ -489,6 +720,9 @@ impl FrameView {
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pick_mode {
+            return;
+        }
         let Some(at) = self.page_at(event.position, false) else { return };
         cx.stop_propagation();
         // GPUI reports content motion; DOM deltas are scroll motion, the other way.
@@ -506,6 +740,16 @@ impl FrameView {
     }
 
     fn key(&mut self, action: KeyAction, keystroke: &gpui::Keystroke, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pick_mode {
+            if action == KeyAction::Down && keystroke.key == "escape" {
+                cx.stop_propagation();
+                self.pick_mode = false;
+                self.pick_drag = None;
+                cx.emit(FrameEvent::CancelPick);
+                cx.notify();
+            }
+            return;
+        }
         // Only the page's own focus types into it; a dialog's prompt field inside this view keeps its keys.
         if !self.controlled() || !self.focus.is_focused(window) {
             return;
@@ -608,6 +852,111 @@ impl FrameView {
         )
     }
 
+    fn render_pick_overlay(&self, cx: &App) -> Option<impl IntoElement> {
+        if !self.pick_mode {
+            return None;
+        }
+        let p = palette(cx);
+        let drag_box = self.pick_drag.and_then(|(start, end)| {
+            let bounds = self.bounds?;
+            let viewport = self.viewport?;
+            let box_size = (f64::from(f32::from(bounds.size.width)), f64::from(f32::from(bounds.size.height)));
+            let fit = fit(box_size, self.frame_size)?;
+            if !(viewport.width > 0. && viewport.height > 0.) {
+                return None;
+            }
+            let x0 = start.0.min(end.0).clamp(0., viewport.width);
+            let y0 = start.1.min(end.1).clamp(0., viewport.height);
+            let x1 = start.0.max(end.0).clamp(0., viewport.width);
+            let y1 = start.1.max(end.1).clamp(0., viewport.height);
+            let left = fit.left + x0 * fit.width / viewport.width;
+            let top = fit.top + y0 * fit.height / viewport.height;
+            let width = ((x1 - x0) * fit.width / viewport.width).max(2.);
+            let height = ((y1 - y0) * fit.height / viewport.height).max(2.);
+            Some(
+                div()
+                    .absolute()
+                    .left(px(left as f32))
+                    .top(px(top as f32))
+                    .w(px(width as f32))
+                    .h(px(height as f32))
+                    .rounded(px(4.))
+                    .border_2()
+                    .border_color(hsla(p.primary))
+                    .bg(hsla(p.primary).opacity(0.16)),
+            )
+        });
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .cursor_crosshair()
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(10.))
+                        .left(px(10.))
+                        .px(px(10.))
+                        .py(px(5.))
+                        .rounded(px(999.))
+                        .border_1()
+                        .border_color(hsla(p.border))
+                        .bg(hsla(p.popover))
+                        .shadow_sm()
+                        .text_xs()
+                        .text_color(hsla(p.foreground))
+                        .child("Click or drag a region to annotate · Esc to cancel"),
+                )
+                .children(drag_box),
+        )
+    }
+
+    fn render_file_chooser(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let offer = self.file_chooser.as_ref()?;
+        if !self.controlled() {
+            return None;
+        }
+        let p = palette(cx);
+        let multiple = offer.multiple;
+        Some(
+            v_flex()
+                .id("preview-file-chooser")
+                .absolute()
+                .top(px(8.))
+                .left(px(8.))
+                .right(px(8.))
+                .gap(px(8.))
+                .p(px(12.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(hsla(p.border))
+                .bg(hsla(p.background))
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(hsla(p.foreground))
+                        .child(if multiple { "The page asks for files." } else { "The page asks for a file." }),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("preview-file-chooser-cancel", ButtonVariant::Outline, ButtonSize::Sm)
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.answer_file_chooser(Vec::new(), cx))),
+                        )
+                        .child(
+                            Button::new("preview-file-chooser-choose", ButtonVariant::Default, ButtonSize::Sm)
+                                .label(if multiple { "Choose files" } else { "Choose file" })
+                                .on_click(cx.listener(|this, _, _, cx| this.open_file_chooser_dialog(cx))),
+                        ),
+                ),
+        )
+    }
+
     fn render_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let control = self.control.as_ref()?;
         let dialog = control.dialog.as_ref()?;
@@ -702,6 +1051,16 @@ impl FrameView {
                 })))
         })
     }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn file_chooser_for_test(&self) -> Option<&FileChooserOffer> {
+        self.file_chooser.as_ref()
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn inject_stream_event_for_test(&mut self, event: StreamEvent, cx: &mut Context<Self>) {
+        self.on_event(event, cx);
+    }
 }
 
 impl Render for FrameView {
@@ -766,6 +1125,8 @@ impl Render for FrameView {
                     .on_scroll_wheel(cx.listener(Self::scroll))
                     .child(page)
                     .children(self.render_cursor(cx))
+                    .children(self.render_pick_overlay(cx))
+                    .children(self.render_file_chooser(cx))
                     .children(self.render_dialog(cx))
                     .children(self.render_blocker(cx)),
             )

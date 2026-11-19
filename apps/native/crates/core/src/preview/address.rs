@@ -1,9 +1,12 @@
-//! The address bar and the recently used list. Ports `normalizePreviewUrl` and
-//! `resolveAddressBarInput` from `packages/shared/src/preview.ts`, and the per-project history
-//! of `apps/web/src/browserHistoryStore.ts` (`upsertHistoryEntry`, `evictExcessProjects`,
-//! `normalizeHistoryUrl`) with the labels of `PreviewRecentUrlCard.tsx`.
+//! The address bar and recently used history. Ports `normalizePreviewUrl` and
+//! `resolveAddressBarInput` from `packages/shared/src/preview.ts`, per-project history and
+//! Incognito exclusion from `apps/web/src/browserHistoryStore.ts` (`pingdotgg/t3code#34859`),
+//! and labels from `PreviewRecentUrlCard.tsx`.
 
 use serde::{Deserialize, Serialize};
+
+use super::viewport::{INCOGNITO_BROWSER_PROFILE_ID, is_incognito_profile};
+use super::{NavStatus, SessionSnapshot};
 
 /// `PreviewUrlNormalizationError`; every reason reads the same to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,11 +189,49 @@ const HISTORY_MAX_TITLE_LENGTH: usize = 512;
 /// The empty state shows this many (`PreviewEmptyState`).
 pub const RECENT_SHOWN: usize = 8;
 
-/// `normalizeHistoryUrl`.
-fn history_url(raw: &str) -> Option<String> {
-    let url = url::Url::parse(raw.trim()).ok().filter(|url| matches!(url.scheme(), "http" | "https"))?;
+/// `isHistoryProfile` (`PreviewView.tsx`, `pingdotgg/t3code#34859`): Incognito visits stay out
+/// of the project's persisted history.
+pub fn is_history_profile(profile_id: Option<&str>) -> bool {
+    !is_incognito_profile(profile_id)
+}
+
+/// `normalizeHistoryUrl`: normalizes to http(s) and strips embedded credentials.
+pub fn normalize_history_url(raw: &str) -> Option<String> {
+    let normalized = normalize_preview_url(raw).ok()?;
+    let mut url = url::Url::parse(&normalized).ok()?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     let href = url.to_string();
     (href.len() <= HISTORY_MAX_URL_LENGTH).then_some(href)
+}
+
+fn normalize_hostname(host: &str) -> String {
+    host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1" | "0.0.0.0" | "::")
+        || host.ends_with(".localhost")
+}
+
+fn visit_lookup_key(normalized: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(normalized) else { return normalized.to_owned() };
+    if let Some(host) = parsed.host_str().map(normalize_hostname)
+        && is_loopback_host(&host)
+    {
+        let _ = parsed.set_host(Some("local"));
+    }
+    parsed.to_string()
+}
+
+fn title_lookup_key(normalized: &str) -> String {
+    let key = visit_lookup_key(normalized);
+    let Ok(mut parsed) = url::Url::parse(&key) else { return key };
+    let path = parsed.path().to_owned();
+    if path != "/" && path.ends_with('/') {
+        parsed.set_path(path.trim_end_matches('/'));
+    }
+    parsed.to_string()
 }
 
 /// Recently used addresses per project, newest first.
@@ -205,35 +246,80 @@ impl BrowserHistory {
         self.by_project.get(project).map_or(&[], Vec::as_slice)
     }
 
-    /// `recordVisit`: moves the address to the front, keeping a title it already had.
+    /// `recordVisit`: moves the address to the front, keeping a title it already had and
+    /// deduplicating loopback hosts.
     pub fn record(&mut self, project: &str, raw: &str, now_ms: i64) -> bool {
-        let Some(url) = history_url(raw) else { return false };
+        let Some(url) = normalize_history_url(raw) else { return false };
+        let key = visit_lookup_key(&url);
         let entries = self.by_project.entry(project.to_owned()).or_default();
-        let title = entries.iter().find(|entry| entry.url == url).and_then(|entry| entry.title.clone());
-        entries.retain(|entry| entry.url != url);
-        entries.insert(0, HistoryEntry { url, last_visited_at: now_ms, title });
+        let existing = entries.iter().find(|entry| visit_lookup_key(&entry.url) == key).cloned();
+        let title = existing.as_ref().and_then(|entry| entry.title.clone());
+        let stored_url = existing
+            .as_ref()
+            .filter(|entry| {
+                let existing_local = url::Url::parse(&entry.url).ok().and_then(|u| u.host_str().map(normalize_hostname)).is_some_and(|h| is_loopback_host(&h));
+                let next_local = url::Url::parse(&url).ok().and_then(|u| u.host_str().map(normalize_hostname)).is_some_and(|h| is_loopback_host(&h));
+                existing_local || !next_local
+            })
+            .map_or(url, |entry| entry.url.clone());
+        entries.retain(|entry| visit_lookup_key(&entry.url) != key);
+        entries.insert(0, HistoryEntry { url: stored_url, last_visited_at: now_ms, title });
         entries.truncate(HISTORY_MAX_ENTRIES_PER_PROJECT);
         self.evict();
         true
     }
 
-    /// A loaded page names the entry it was opened from.
-    pub fn set_title(&mut self, project: &str, raw: &str, title: &str) -> bool {
-        let (Some(url), Some(entries)) = (history_url(raw), self.by_project.get_mut(project)) else { return false };
-        let title = title.trim();
-        let Some(entry) = entries.iter_mut().find(|entry| entry.url == url) else { return false };
-        let next = (!title.is_empty()).then(|| title.chars().take(HISTORY_MAX_TITLE_LENGTH).collect::<String>());
-        if entry.title == next || next.is_none() {
+    /// `recordVisitForThread` gated by `is_history_profile`: Incognito visits are ignored.
+    pub fn record_for_profile(&mut self, project: &str, profile_id: Option<&str>, raw: &str, now_ms: i64) -> bool {
+        if !is_history_profile(profile_id) {
             return false;
         }
-        entry.title = next;
+        self.record(project, raw, now_ms)
+    }
+
+    /// A loaded page names the entry it was opened from (`setTitleForUrl`).
+    pub fn set_title(&mut self, project: &str, raw: &str, title: &str) -> bool {
+        let (Some(url), Some(entries)) = (normalize_history_url(raw), self.by_project.get_mut(project)) else {
+            return false;
+        };
+        let title = title.trim();
+        if title.is_empty() {
+            return false;
+        }
+        let key = title_lookup_key(&url);
+        let Some(entry) = entries.iter_mut().find(|entry| title_lookup_key(&entry.url) == key) else {
+            return false;
+        };
+        let next: String = title.chars().take(HISTORY_MAX_TITLE_LENGTH).collect();
+        if entry.title.as_deref() == Some(next.as_str()) {
+            return false;
+        }
+        entry.title = Some(next);
         true
+    }
+
+    /// `recordPreviewTitles` (`browserHistoryStore.ts`, `pingdotgg/t3code#34859`): applies settled
+    /// page titles oldest-first so the newest settle wins, skipping Incognito tabs completely.
+    pub fn record_settled_titles(&mut self, project: &str, sessions: &[SessionSnapshot]) -> bool {
+        let mut ordered: Vec<&SessionSnapshot> = sessions.iter().collect();
+        ordered.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let mut changed = false;
+        for session in ordered {
+            if session.profile_id.as_deref() == Some(INCOGNITO_BROWSER_PROFILE_ID) {
+                continue;
+            }
+            if let NavStatus::Success { url, title } = &session.nav_status {
+                changed |= self.set_title(project, url, title);
+            }
+        }
+        changed
     }
 
     pub fn remove(&mut self, project: &str, url: &str) -> bool {
         let Some(entries) = self.by_project.get_mut(project) else { return false };
+        let normalized = normalize_history_url(url);
         let before = entries.len();
-        entries.retain(|entry| entry.url != url);
+        entries.retain(|entry| entry.url != url && normalized.as_deref() != Some(entry.url.as_str()));
         let removed = entries.len() != before;
         if entries.is_empty() {
             self.by_project.remove(project);
@@ -302,5 +388,47 @@ mod tests {
         }
         assert!(history.recent("p").is_empty());
         assert_eq!(history.recent("24").len(), 1);
+    }
+
+    #[test]
+    fn incognito_visits_and_titles_stay_out_of_project_history() {
+        let mut history = BrowserHistory::default();
+        assert!(!is_history_profile(Some(INCOGNITO_BROWSER_PROFILE_ID)));
+        assert!(is_history_profile(Some("default")));
+        assert!(is_history_profile(None));
+
+        // Incognito visits are ignored.
+        assert!(!history.record_for_profile("p", Some(INCOGNITO_BROWSER_PROFILE_ID), "https://secret.test/", 1));
+        assert!(history.recent("p").is_empty());
+
+        // Normal visits strip credentials and accept normal settled titles, never Incognito titles.
+        assert!(history.record_for_profile("p", Some("default"), "https://user:pass@a.test/path", 2));
+        assert_eq!(history.recent("p")[0].url, "https://a.test/path");
+
+        let incognito_session = SessionSnapshot::decode(serde_json::json!({
+            "threadId": "t1",
+            "tabId": "tab-inc",
+            "navStatus": { "_tag": "Success", "url": "https://a.test/path", "title": "Private Title" },
+            "canGoBack": false,
+            "canGoForward": false,
+            "profileId": "incognito",
+            "updatedAt": "2026-11-12T00:00:02Z"
+        }))
+        .unwrap();
+        assert!(!history.record_settled_titles("p", &[incognito_session]));
+        assert_eq!(history.recent("p")[0].title, None);
+
+        let normal_session = SessionSnapshot::decode(serde_json::json!({
+            "threadId": "t1",
+            "tabId": "tab-pub",
+            "navStatus": { "_tag": "Success", "url": "https://a.test/path/", "title": "Public Title" },
+            "canGoBack": false,
+            "canGoForward": false,
+            "profileId": "default",
+            "updatedAt": "2026-11-12T00:00:03Z"
+        }))
+        .unwrap();
+        assert!(history.record_settled_titles("p", &[normal_session]));
+        assert_eq!(history.recent("p")[0].title.as_deref(), Some("Public Title"));
     }
 }
