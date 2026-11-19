@@ -69,10 +69,20 @@ fn resource_history_bars_and_depths() {
 /// Outputs of the web's `formatDuration` and `formatCpuTime` for the same inputs.
 #[test]
 fn durations_match_the_web() {
-    for (ms, label) in [(1000., "1 s"), (1500., "1.50 s"), (10_000., "10 s"), (12_345., "12.3 s"), (999.6, "1000 ms"), (12., "12 ms")] {
+    for (ms, label) in [(1000., "1 s"), (1500., "1.50 s"), (10_000., "10 s"), (12_345., "12.3 s"), (999.6, "1 s"), (999.4, "999 ms"), (12., "12 ms")] {
         assert_eq!(format_duration(ms), label);
     }
-    for (seconds, label) in [(0., "0s"), (5.5, "5.50s"), (12., "12s"), (61., "1.02m"), (600., "10m"), (3600., "1h"), (7322., "2.03h")] {
+    for (seconds, label) in [
+        (0., "0s"),
+        (5.5, "5.50s"),
+        (12., "12s"),
+        (59.97, "1m"),
+        (61., "1.02m"),
+        (600., "10m"),
+        (3599.9, "1h"),
+        (3600., "1h"),
+        (7322., "2.03h"),
+    ] {
         assert_eq!(format_cpu_time(seconds), label);
     }
     assert_eq!(percent(1.25), "1.3%", "toFixed rounds an exact tie up");

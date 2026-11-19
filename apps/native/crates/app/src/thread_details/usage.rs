@@ -8,7 +8,10 @@ use t3_core::server_config::UsageLimits;
 use t3_core::timeline::{format_upcoming, parse_iso_ms};
 use t3_core::usage::context_window::{compaction_message, context_window_snapshot, format_context_tokens};
 use t3_core::usage::format::format_count;
-use t3_core::usage::limits::{LimitPace, collect_provider_usage_limits, format_duration, limits_notice, pace_of, remaining_percent};
+use t3_core::usage::limits::{
+    LimitPace, collect_provider_usage_limits, format_duration, limits_notice, pace_of, pace_remaining_percent,
+    remaining_percent,
+};
 
 use super::controls::section_with_options;
 use crate::app_state::AppState;
@@ -82,7 +85,7 @@ fn usage_bar(bar: &BarSpec, cx: &App) -> AnyElement {
             )
         })
         .when_some(bar.tick_frac, |el, frac| {
-            el.child(div().absolute().top(px(-3.)).h(px(9.)).left(relative(frac)).w(px(1.)).bg(hsla(p.foreground).opacity(0.6)))
+            el.child(div().absolute().top(px(-3.)).h(px(9.)).left(relative(frac.clamp(0.01, 0.99))).w(px(1.)).bg(hsla(p.foreground).opacity(0.75)))
         })
         .into_any_element()
 }
@@ -94,11 +97,16 @@ fn usage_row(
     tone: Option<UsageTone>,
     value: String,
     tooltip: String,
+    opens_usage: bool,
     cx: &App,
 ) -> AnyElement {
     let p = palette(cx);
     let id = id.into();
-    let tip: SharedString = tooltip.into();
+    let tip: SharedString = if opens_usage {
+        format!("{tooltip}\nOpen usage").into()
+    } else {
+        tooltip.into()
+    };
     let value_color = match tone {
         Some(UsageTone::Error) => hsla(p.error_foreground),
         Some(UsageTone::Warning) => hsla(p.warning_foreground),
@@ -114,6 +122,9 @@ fn usage_row(
         .px(px(10.))
         .rounded(px(8.))
         .text_xs()
+        .when(opens_usage, |this| {
+            this.cursor_pointer().on_click(|_, _, cx| crate::usage::open(cx))
+        })
         .hover(|style| style.bg(super::controls::hover_fill(cx)))
         .tooltip(move |window, cx| tooltip_view(tip.clone(), window, cx))
         .child(div().max_w(px(112.)).flex_none().truncate().text_color(hsla(p.muted_foreground)).child(label))
@@ -129,7 +140,7 @@ pub(super) fn usage_limits_section(app: &AppState, draft_provider: Option<&str>,
     let timestamp_format = crate::settings::store::client(cx).timestamp_format();
     let zone = crate::timestamp::viewer_zone();
     let rows: Vec<AnyElement> = if let Some(notice) = limits_notice(&limits) {
-        vec![usage_row("details-usage-unavailable", "Limits".to_owned(), None, None, "Unavailable".to_owned(), notice, cx)]
+        vec![usage_row("details-usage-unavailable", "Limits".to_owned(), None, None, "Unavailable".to_owned(), notice, true, cx)]
     } else if limits.windows.is_empty() {
         return None;
     } else {
@@ -138,6 +149,8 @@ pub(super) fn usage_limits_section(app: &AppState, draft_provider: Option<&str>,
             .iter()
             .map(|win| {
                 let left = remaining_percent(win);
+                let pace = pace_of(win, now);
+                let time_left = pace_remaining_percent(win, now);
                 let (tone, bar_color) = if left <= 10 {
                     (Some(UsageTone::Error), hsla(p.error))
                 } else if left <= 20 {
@@ -146,6 +159,11 @@ pub(super) fn usage_limits_section(app: &AppState, draft_provider: Option<&str>,
                     (None, hsla(p.foreground).opacity(0.8))
                 };
                 let mut tip_lines = vec![format!("{}: {left}% left", win.label)];
+                if let (Some(pace), Some(time_left)) = (pace, time_left) {
+                    tip_lines.push(format!("{} \u{00b7} {time_left}% of the window left", pace_label(pace)));
+                } else if let Some(pace) = pace {
+                    tip_lines.push(pace_label(pace).to_owned());
+                }
                 if let Some(resets_at) = win.resets_at.as_deref()
                     && let Some(resets_ms) = parse_iso_ms(resets_at)
                     && resets_ms > now
@@ -158,16 +176,18 @@ pub(super) fn usage_limits_section(app: &AppState, draft_provider: Option<&str>,
                         tip_lines.push(format!("Resets in {duration} \u{00b7} {upcoming}"));
                     }
                 }
-                if let Some(pace) = pace_of(win, now) {
-                    tip_lines.push(pace_label(pace).to_owned());
-                }
                 usage_row(
                     format!("details-usage-{}", win.id),
                     win.label.clone(),
-                    Some(BarSpec { fill_pct: left as f32, color: bar_color, tick_frac: None }),
+                    Some(BarSpec {
+                        fill_pct: left as f32,
+                        color: bar_color,
+                        tick_frac: time_left.map(|pct| (pct as f32 / 100.).clamp(0., 1.)),
+                    }),
                     tone,
                     format!("{left}%"),
                     tip_lines.join("\n"),
+                    true,
                     cx,
                 )
             })
@@ -209,6 +229,6 @@ pub(super) fn context_window_section(app: &AppState, separated: bool, essential:
     }
 
     let bar = used.map(|pct| BarSpec { fill_pct: pct as f32, color: bar_color, tick_frac: tick });
-    let row = usage_row("details-context-window", "Context".to_owned(), bar, tone, value, tip_lines.join("\n"), cx);
+    let row = usage_row("details-context-window", "Context".to_owned(), bar, tone, value, tip_lines.join("\n"), false, cx);
     Some(section_with_options(separated, None, essential, cx).child(row).into_any_element())
 }

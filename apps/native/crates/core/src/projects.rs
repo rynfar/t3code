@@ -597,15 +597,35 @@ pub fn clone_url_repository_path(url: &str) -> Option<String> {
     Some(segments.join("/"))
 }
 
-/// `getAddProjectInitialQuery`.
+/// `getAddProjectInitialQuery` (`pingdotgg/t3code#37691`, `pingdotgg/t3code#38510`):
+/// a bare relative setting such as `Desktop/dev` opens the picker under `~/`.
+/// Folder browsers navigate `~/` but not `~\` home paths.
 pub fn add_project_initial_query(base_directory: Option<&str>) -> String {
     let trimmed = base_directory.map(str::trim).unwrap_or("");
     if trimmed.is_empty() {
-        "~/".to_owned()
-    } else if has_trailing_separator(trimmed) {
+        return "~/".to_owned();
+    }
+    let is_explicit_relative = trimmed == "."
+        || trimmed == ".."
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with(".\\")
+        || trimmed.starts_with("..\\");
+    let is_anchored = trimmed == "~"
+        || is_unix_absolute(trimmed)
+        || is_windows_drive(trimmed)
+        || trimmed.starts_with("\\\\")
+        || trimmed.starts_with("~/")
+        || is_explicit_relative;
+    let anchored = if is_anchored {
         trimmed.to_owned()
     } else {
-        format!("{trimmed}{}", preferred_separator(trimmed))
+        format!("~/{trimmed}")
+    };
+    if has_trailing_separator(&anchored) {
+        anchored
+    } else {
+        format!("{anchored}{}", preferred_separator(&anchored))
     }
 }
 
@@ -944,16 +964,117 @@ pub fn browse_path(query: &str, windows: bool) -> Option<BrowsePath> {
     })
 }
 
-/// `filterFilesystemBrowseEntries`: prefix match, hidden folders only when the leaf starts with a dot.
-pub fn filter_browse_entries<'a>(entries: &'a [BrowseEntry], filter: &str) -> Vec<&'a BrowseEntry> {
-    let lower = filter.to_lowercase();
-    let show_hidden = filter.starts_with('.');
-    entries.iter().filter(|entry| entry.name.to_lowercase().starts_with(&lower) && (show_hidden || !entry.name.starts_with('.'))).collect()
+fn score_browse_subsequence(value: &str, query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let v: Vec<char> = value.chars().collect();
+    let q: Vec<char> = query.chars().collect();
+    let mut qi = 0usize;
+    let mut first_match: Option<usize> = None;
+    let mut prev_match: Option<usize> = None;
+    let mut gap_penalty = 0usize;
+    for (vi, &ch) in v.iter().enumerate() {
+        if ch != q[qi] {
+            continue;
+        }
+        if first_match.is_none() {
+            first_match = Some(vi);
+        }
+        if let Some(prev) = prev_match {
+            gap_penalty += vi - prev - 1;
+        }
+        prev_match = Some(vi);
+        qi += 1;
+        if qi == q.len() {
+            let first = first_match.unwrap_or(0);
+            let span_penalty = (vi - first + 1).saturating_sub(q.len());
+            let length_penalty = v.len().saturating_sub(q.len()).min(64);
+            return Some(first * 2 + gap_penalty * 3 + span_penalty + length_penalty);
+        }
+    }
+    None
 }
 
-/// `getFilesystemBrowseTabCompletion`: one match enters it, several extend to their common prefix.
+fn score_browse_query_match(value: &str, query: &str) -> Option<usize> {
+    if value.is_empty() || query.is_empty() {
+        return None;
+    }
+    let v_len = value.chars().count();
+    let q_len = query.chars().count();
+    let penalty = v_len.saturating_sub(q_len).min(64);
+    if value == query {
+        return Some(0);
+    }
+    if value.starts_with(query) {
+        return Some(1_000 + penalty);
+    }
+    let mut best_boundary: Option<usize> = None;
+    for marker in [' ', '-', '_', '.'] {
+        let needle = format!("{marker}{query}");
+        if let Some(byte_idx) = value.find(&needle) {
+            let char_idx = value[..byte_idx].chars().count() + 1;
+            best_boundary = Some(best_boundary.map_or(char_idx, |best| best.min(char_idx)));
+        }
+    }
+    if let Some(boundary_idx) = best_boundary {
+        return Some(2_000 + boundary_idx * 2 + penalty);
+    }
+    if let Some(byte_idx) = value.find(query) {
+        let char_idx = value[..byte_idx].chars().count();
+        return Some(3_000 + char_idx * 2 + penalty);
+    }
+    score_browse_subsequence(value, query).map(|fuzzy| 4_000 + fuzzy)
+}
+
+/// `filterFilesystemBrowseEntries` (`pingdotgg/t3code#26376`): matches exact, prefix, word
+/// boundary, substring, and fuzzy subsequence matches; hidden folders appear only when the leaf
+/// starts with a dot.
+pub fn filter_browse_entries<'a>(entries: &'a [BrowseEntry], filter: &str) -> Vec<&'a BrowseEntry> {
+    use unicode_normalization::UnicodeNormalization;
+    let lower_query = filter.to_lowercase();
+    let lower_nfc_query = filter.nfc().collect::<String>().to_lowercase();
+    let show_hidden = filter.starts_with('.');
+    let candidates: Vec<&'a BrowseEntry> = entries
+        .iter()
+        .filter(|entry| show_hidden || !entry.name.starts_with('.'))
+        .collect();
+    if lower_query.is_empty() {
+        return candidates;
+    }
+    let mut scored: Vec<(&'a BrowseEntry, usize)> = candidates
+        .into_iter()
+        .filter_map(|entry| {
+            let raw_lower = entry.name.to_lowercase();
+            let nfc_lower = entry.name.nfc().collect::<String>().to_lowercase();
+            let raw_score = score_browse_query_match(&raw_lower, &lower_query);
+            let nfc_score = score_browse_query_match(&nfc_lower, &lower_nfc_query);
+            let score = match (raw_score, nfc_score) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }?;
+            Some((entry, score))
+        })
+        .collect();
+    scored.sort_by_key(|(_, score)| *score);
+    scored.into_iter().map(|(entry, _)| entry).collect()
+}
+
+/// `getFilesystemBrowseTabCompletion` (`pingdotgg/t3code#37925`): considers only prefix-matching
+/// entries so Tab still completes a folder name when the visible list includes fuzzy matches.
 pub fn browse_tab_completion(visible: &[&BrowseEntry], filter: &str) -> Option<(String, bool)> {
-    let (first, rest) = visible.split_first()?;
+    use unicode_normalization::UnicodeNormalization;
+    let lower_query = filter.to_lowercase();
+    let lower_nfc_query = filter.nfc().collect::<String>().to_lowercase();
+    let prefix_entries: Vec<&BrowseEntry> = visible
+        .iter()
+        .copied()
+        .filter(|entry| {
+            entry.name.to_lowercase().starts_with(&lower_query)
+                || entry.name.nfc().collect::<String>().to_lowercase().starts_with(&lower_nfc_query)
+        })
+        .collect();
+    let (first, rest) = prefix_entries.split_first()?;
     if rest.is_empty() {
         return Some((first.name.clone(), true));
     }
@@ -965,7 +1086,9 @@ pub fn browse_tab_completion(visible: &[&BrowseEntry], filter: &str) -> Option<(
     }
     let name: String = prefix.into_iter().collect();
     let lower = name.to_lowercase();
-    (lower.chars().count() > filter.chars().count() && visible.iter().all(|entry| entry.name.to_lowercase().starts_with(&lower))).then_some((name, false))
+    (lower.chars().count() > lower_query.chars().count()
+        && prefix_entries.iter().all(|entry| entry.name.to_lowercase().starts_with(&lower)))
+    .then_some((name, false))
 }
 
 /// `inferProjectTitleFromPath`: the last path segment.
@@ -1046,7 +1169,9 @@ mod tests {
     fn entries_filter_by_prefix_and_hide_dotfiles() {
         let entries = [entry("src"), entry(".git"), entry("Scripts"), entry("docs")];
         let names = |filter: &str| filter_browse_entries(&entries, filter).iter().map(|e| e.name.clone()).collect::<Vec<_>>();
-        assert_eq!(names("s"), ["src", "Scripts"]);
+        assert_eq!(names("s"), ["src", "Scripts", "docs"]);
+        assert_eq!(names("sc"), ["Scripts", "src"]);
+        assert_eq!(names("scr"), ["Scripts"]);
         assert_eq!(names(""), ["src", "Scripts", "docs"]);
         assert_eq!(names("."), [".git"]);
     }
@@ -1239,5 +1364,48 @@ mod tests {
             write_project_file_request("/dst", "apps/web/.env", "KEY=1"),
             json!({ "cwd": "/dst", "relativePath": "apps/web/.env", "contents": "KEY=1" })
         );
+    }
+
+    #[test]
+    fn add_project_initial_query_anchors_bare_relative_under_home_and_skips_backslash_home() {
+        assert_eq!(add_project_initial_query(None), "~/");
+        assert_eq!(add_project_initial_query(Some("")), "~/");
+        assert_eq!(add_project_initial_query(Some("Desktop/dev")), "~/Desktop/dev/");
+        assert_eq!(add_project_initial_query(Some("~")), "~/");
+        assert_eq!(add_project_initial_query(Some("~/code")), "~/code/");
+        assert_eq!(add_project_initial_query(Some("./local")), "./local/");
+        assert_eq!(add_project_initial_query(Some("/var/repos")), "/var/repos/");
+        // Folder browsers do not treat `~\` as a home prefix (`pingdotgg/t3code#38510`).
+        assert_eq!(add_project_initial_query(Some("~\\work")), "~/~\\work\\");
+    }
+
+    #[test]
+    fn browse_filter_matches_substrings_and_fuzzy_and_tab_completes_prefixes_only() {
+        let entries = vec![
+            BrowseEntry { name: "zebra-pkg".into(), full_path: "/zebra-pkg".into() },
+            BrowseEntry { name: "packages".into(), full_path: "/packages".into() },
+            BrowseEntry { name: "pack-tools".into(), full_path: "/pack-tools".into() },
+            BrowseEntry { name: "alpha_pack".into(), full_path: "/alpha_pack".into() },
+            BrowseEntry { name: "p_a_c_k".into(), full_path: "/p_a_c_k".into() },
+            BrowseEntry { name: ".pack-hidden".into(), full_path: "/.pack-hidden".into() },
+        ];
+        // Substring, boundary, and fuzzy matches all surface in tiered order (`pingdotgg/t3code#26376`).
+        let visible = filter_browse_entries(&entries, "pack");
+        let names: Vec<&str> = visible.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names[0], "packages");
+        assert_eq!(names[1], "pack-tools");
+        assert!(names.contains(&"alpha_pack"));
+        assert!(names.contains(&"p_a_c_k"));
+        assert!(!names.contains(&".pack-hidden"));
+        assert!(!names.contains(&"zebra-pkg"));
+
+        // Tab completion ignores non-prefix fuzzy matches (`pingdotgg/t3code#37925`).
+        let docs_entries = [
+            BrowseEntry { name: "my-docs".into(), full_path: "/my-docs".into() },
+            BrowseEntry { name: "docs".into(), full_path: "/docs".into() },
+        ];
+        let single_prefix = filter_browse_entries(&docs_entries, "do");
+        assert_eq!(single_prefix.len(), 2);
+        assert_eq!(browse_tab_completion(&single_prefix, "do"), Some(("docs".into(), true)));
     }
 }

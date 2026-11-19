@@ -56,9 +56,13 @@ fn formats_web_units_and_process_name_fallback() {
     assert_eq!(bytes(1023.6 * 1024.), "1.00 MB");
     assert_eq!(cpu_time(10_000.), "10s");
     assert_eq!(cpu_time(1_234.), "1.23s");
+    assert_eq!(cpu_time(59_970.), "1m");
     assert_eq!(cpu_time(60_000.), "1m");
+    assert_eq!(cpu_time(3_599_900.), "1h");
     assert_eq!(duration_micros(1250.), "1.25 ms");
     assert_eq!(sample_interval(2000), "2 seconds");
+    assert_eq!(sampling_status(0), "Sampling on demand");
+    assert_eq!(sampling_status(2000), "Sampling every 2 seconds");
     assert_eq!(attribution_time(0.), "0s");
     assert_eq!(attribution_time(1200.), "1.20s");
     assert_eq!(process_name(&Process { command: "'/usr/bin/node' app.js".into(), ..Default::default() }), "node");

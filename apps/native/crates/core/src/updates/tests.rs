@@ -588,3 +588,62 @@ fn provider_pill_sorts_by_recency_and_ties_favor_failure_over_warning_and_succes
     let after_dismiss = provider_pill(&[failed, newer_success], None, &HashSet::from([pill.key])).unwrap();
     assert_eq!(after_dismiss.tone, Tone::Error);
 }
+
+#[test]
+fn does_not_offer_nightly_build_to_stable_desktop_app() {
+    let stable_desktop = config(json!({
+        "environment": {
+            "serverVersion": "0.1.9",
+            "capabilities": {
+                "serverSelfUpdate": "desktop-managed",
+                "desktopAppUpdate": true
+            }
+        }
+    }));
+    let plan = collect(
+        &[Machine {
+            id: "stable-desktop",
+            label: "stable-desktop",
+            config: Some(&stable_desktop),
+            connected: true,
+            hosted_by_this_app: false,
+            can_maintain: true,
+            can_manage_providers: true,
+            updating: false,
+        }],
+        "0.1.10-nightly.20261116.4761",
+    );
+    assert!(plan.servers.is_empty());
+    assert_eq!(plan.rows.len(), 1);
+    assert_eq!(plan.rows[0].skipped.as_deref(), Some("on the stable channel"));
+}
+
+#[test]
+fn local_switch_block_reason_allows_switch_when_local_environment_is_off() {
+    let stable = ChannelSwitchRelease {
+        channel: UpdateTrack::Latest,
+        version: "0.1.4".into(),
+        database_migration: Some(70),
+    };
+    let nightly = "0.1.4-nightly.20261027.3796";
+    let windows = HostedServerState { connected: true, database_migration: Some(69) };
+
+    assert_eq!(local_switch_block_reason(nightly, &stable, &[windows], 1, true), None);
+    assert!(
+        local_switch_block_reason(
+            nightly,
+            &stable,
+            &[windows, HostedServerState { connected: true, database_migration: Some(72) }],
+            2,
+            true,
+        )
+        .unwrap()
+        .contains("does not support yet")
+    );
+    assert_eq!(
+        local_switch_block_reason(nightly, &stable, &[], 0, true).as_deref(),
+        Some("its server is not connected, so its database cannot be checked")
+    );
+    // Local environment off -> no locally hosted server is restarted (`pingdotgg/t3code#32048`).
+    assert_eq!(local_switch_block_reason(nightly, &stable, &[], 0, false), None);
+}

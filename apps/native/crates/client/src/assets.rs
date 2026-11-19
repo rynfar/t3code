@@ -108,6 +108,32 @@ pub async fn mint_media_url_with_fallback(
     Err(UNAVAILABLE.into())
 }
 
+/// Fetches an environment theme's full-size background image (`pingdotgg/t3code#36680`):
+/// mints a signed `environment-theme-background` URL via `assets.createUrl` and downloads up to
+/// 16 MiB via `asset::fetch_asset`.
+pub async fn fetch_theme_background(client: &ClientHandle, theme_id: &str) -> Result<Vec<u8>, String> {
+    let request = t3_core::themes::background::create_background_url_request(theme_id);
+    let minted = client
+        .request(t3_core::media::CREATE_ASSET_URL, request)
+        .await
+        .map_err(|error| {
+            tracing::debug!(%error, theme_id, "assets.createUrl failed for theme background");
+            UNAVAILABLE.to_owned()
+        })?;
+    let asset = decode_asset_url(&minted)?;
+    let bytes = crate::asset::fetch_asset(
+        client.environment(),
+        &asset.relative_url,
+        t3_core::themes::background::MAX_BACKGROUND_BYTES,
+    )
+    .await
+    .map_err(|error| {
+        tracing::debug!(%error, theme_id, "theme background asset fetch failed");
+        UNAVAILABLE.to_owned()
+    })?;
+    Ok(bytes)
+}
+
 pub async fn fetch_signed_media(client: &ClientHandle, relative_url: &str) -> Result<MediaBytes, String> {
     if relative_url.starts_with("http://") || relative_url.starts_with("https://") {
         return Ok(MediaBytes { bytes: get(relative_url).await?, dimensions: None });

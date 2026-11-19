@@ -416,7 +416,7 @@ impl ServiceState {
         let message = match (remote, platform) {
             (Some(host), _) if host.kind == HostKind::Eas => {
                 let kind = if platform == Platform::Ios { "iOS Simulators" } else { "Android emulators" };
-                format!("{} starts {kind} in the cloud with EAS Simulator.", host.label)
+                format!("{} starts {kind} in the cloud with Expo Simulators.", host.label)
             }
             (_, Platform::Ios) => format!("Xcode and iOS Simulator are available{location}."),
             (_, Platform::Android) => format!("The Android SDK and Emulator are available{location}."),

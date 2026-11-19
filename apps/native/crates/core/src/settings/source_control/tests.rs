@@ -256,3 +256,64 @@ fn accounts_grouping_host_choices_and_sign_in_prompt_follow_web() {
         json!({ "sourceControlHosts": { "github": { "hosts": { "github.com": { "enabled": false } } } } })
     );
 }
+
+#[test]
+fn issue_tracker_summary_describes_disconnected_rejected_and_linked_states() {
+    use crate::issues::wire::{
+        IssueTrackerConnection, IssueTrackerKind, IssueTrackerProjectBinding,
+        StandaloneIssueTrackerCredential,
+    };
+    use std::collections::HashMap;
+
+    let mut tracker = IssueTrackerConnection {
+        tracker: IssueTrackerKind::Linear,
+        display_name: "Linear".into(),
+        host: "linear.app".into(),
+        scope_noun: "team".into(),
+        credential: StandaloneIssueTrackerCredential {
+            label: "Personal API key".into(),
+            help_url: Some("https://linear.app/settings/api".into()),
+        },
+        connected: false,
+        account: None,
+        detail: None,
+        workspace: None,
+        scopes: Vec::new(),
+    };
+    assert_eq!(
+        issue_tracker_summary(&tracker, &HashMap::new()),
+        "Not connected. Add a personal api key to list its issues."
+    );
+
+    tracker.connected = true;
+    assert_eq!(
+        issue_tracker_summary(&tracker, &HashMap::new()),
+        "The saved credential was rejected."
+    );
+    tracker.detail = Some("Token expired".into());
+    assert_eq!(issue_tracker_summary(&tracker, &HashMap::new()), "Token expired");
+
+    tracker.account = Some("alex@example.com".into());
+    assert_eq!(
+        issue_tracker_summary(&tracker, &HashMap::new()),
+        "Connected as alex@example.com · no projects linked yet. Pick a team for a project to list its issues."
+    );
+
+    let mut bindings = HashMap::new();
+    bindings.insert(
+        "p1".into(),
+        IssueTrackerProjectBinding { tracker: IssueTrackerKind::Linear, scope: "ENG".into() },
+    );
+    assert_eq!(
+        issue_tracker_summary(&tracker, &bindings),
+        "Connected as alex@example.com · 1 project linked"
+    );
+    bindings.insert(
+        "p2".into(),
+        IssueTrackerProjectBinding { tracker: IssueTrackerKind::Linear, scope: "OPS".into() },
+    );
+    assert_eq!(
+        issue_tracker_summary(&tracker, &bindings),
+        "Connected as alex@example.com · 2 projects linked"
+    );
+}

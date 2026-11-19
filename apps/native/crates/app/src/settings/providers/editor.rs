@@ -661,18 +661,31 @@ impl SettingsView {
                 .into_any_element()
         };
 
+        let saving = self.providers.saving_custom_model;
         let add_row = (can_add && self.providers.adding_custom_model).then(|| {
             h_flex()
                 .mt(r(12.))
                 .gap(r(8.))
-                .child(div().flex_1().child(Input::new(&self.providers.custom_model).small()))
-                .child(Button::new("add-custom-model-confirm", ButtonVariant::Outline, ButtonSize::Sm).label("Add").on_click(cx.listener(|this, _, window, cx| this.add_custom_model(window, cx))))
-                .child(Button::new("add-custom-model-cancel", ButtonVariant::Ghost, ButtonSize::Sm).label("Cancel").on_click(cx.listener(|this, _, window, cx| {
-                    this.providers.adding_custom_model = false;
-                    this.providers.custom_model_error = None;
-                    this.providers.custom_model.update(cx, |input, cx| input.set_value("", window, cx));
-                    cx.notify();
-                })))
+                .child(div().flex_1().child(Input::new(&self.providers.custom_model).small().disabled(saving)))
+                .child(
+                    Button::new("add-custom-model-confirm", ButtonVariant::Outline, ButtonSize::Sm)
+                        .label(if saving { "Adding…" } else { "Add" })
+                        .disabled(saving)
+                        .on_click(cx.listener(|this, _, window, cx| this.add_custom_model(window, cx))),
+                )
+                .child(
+                    Button::new("add-custom-model-cancel", ButtonVariant::Ghost, ButtonSize::Sm)
+                        .label("Cancel")
+                        .disabled(saving)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.providers.adding_custom_model = false;
+                            this.providers.saving_custom_model = false;
+                            this.providers.custom_model_save_gen = this.providers.custom_model_save_gen.wrapping_add(1);
+                            this.providers.custom_model_error = None;
+                            this.providers.custom_model.update(cx, |input, cx| input.set_value("", window, cx));
+                            cx.notify();
+                        })),
+                )
         });
         let error = self.providers.custom_model_error.clone().map(|error| div().mt(r(8.)).text_xs().text_color(hsla(p.destructive_foreground)).child(error));
 
@@ -837,21 +850,77 @@ impl SettingsView {
     }
 
     pub(super) fn add_custom_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.providers.saving_custom_model {
+            return;
+        }
         let Some(instance_id) = self.selected_instance_id(cx) else { return };
+        self.reconcile_custom_model_saves(cx);
         let typed = self.providers.custom_model.read(cx).value().to_string();
-        let validated = {
-            let Some(config) = self.scoped_raw_representative_config(cx) else { return };
-            let instance = config.settings.provider_instances.get(&instance_id).cloned().unwrap_or_else(|| t3_core::server_config::ProviderInstanceConfig { driver: instance_id.clone(), ..Default::default() });
-            let live = config.provider(&instance_id).map(|provider| provider.models.as_slice()).unwrap_or_default();
-            model::validate_custom_model(&typed, live, &model::custom_models(&instance))
+        let Some((env_id, driver, effective_entries, validated)) = ({
+            self.scoped_raw_representative_config(cx).map(|config| {
+                let env_id = config.environment.environment_id.clone();
+                let instance = config.settings.provider_instances.get(&instance_id).cloned().unwrap_or_else(|| {
+                    t3_core::server_config::ProviderInstanceConfig { driver: instance_id.clone(), ..Default::default() }
+                });
+                let live = config.provider(&instance_id).map(|provider| provider.models.as_slice()).unwrap_or_default();
+                let effective_entries = self.effective_custom_model_entries(&env_id, &instance_id, &instance);
+                let effective_models = model::custom_models_from_entries(&instance.driver, &effective_entries);
+                let validated = model::validate_custom_model(&typed, live, &effective_models);
+                (env_id, instance.driver, effective_entries, validated)
+            })
+        }) else {
+            return;
         };
         match validated {
             Ok(slug) => {
-                self.update_instance(&instance_id, model::InstanceEdit::AddCustomModel(slug.to_string()), cx);
-                self.providers.adding_custom_model = false;
+                let next_entries = model::custom_entries_with_added(&effective_entries, &slug);
+                let queue_key = Self::custom_model_queue_key(&env_id, &instance_id);
+                let save_id = self
+                    .providers
+                    .custom_model_saves
+                    .entry(queue_key.clone())
+                    .or_default()
+                    .push(&driver, next_entries.clone());
+                self.providers.saving_custom_model = true;
                 self.providers.custom_model_error = None;
-                self.providers.model_filter.update(cx, |input, cx| input.set_value("", window, cx));
-                self.providers.custom_model.update(cx, |input, cx| input.set_value("", window, cx));
+                let save_gen = self.providers.custom_model_save_gen;
+                let view = cx.entity().downgrade();
+                let window_handle = window.window_handle();
+                self.update_instance_then(
+                    &instance_id,
+                    model::InstanceEdit::SetCustomModels(next_entries),
+                    move |error, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if let Some(queue) = this.providers.custom_model_saves.get_mut(&queue_key) {
+                                queue.settle(save_id, error.is_none());
+                            }
+                            if this.providers.custom_model_save_gen == save_gen {
+                                this.providers.saving_custom_model = false;
+                                match &error {
+                                    None => {
+                                        this.providers.adding_custom_model = false;
+                                        this.providers.custom_model_error = None;
+                                    }
+                                    Some(message) => {
+                                        this.providers.custom_model_error = Some(message.clone());
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        });
+                        if error.is_none() {
+                            let _ = window_handle.update(cx, |_, window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    if this.providers.custom_model_save_gen == save_gen {
+                                        this.providers.model_filter.update(cx, |input, cx| input.set_value("", window, cx));
+                                        this.providers.custom_model.update(cx, |input, cx| input.set_value("", window, cx));
+                                    }
+                                });
+                            });
+                        }
+                    },
+                    cx,
+                );
             }
             Err(error) => self.providers.custom_model_error = Some(error),
         }
@@ -860,12 +929,41 @@ impl SettingsView {
 
     /// `handleRemove`: drops the model, and its place in the order and favorites.
     fn remove_custom_model(&mut self, instance_id: &str, slug: &str, cx: &mut Context<Self>) {
-        self.update_instance(instance_id, model::InstanceEdit::RemoveCustomModel(slug.to_owned()), cx);
-        let (order, favorite) = {
-            let Some(config) = self.scoped_raw_representative_config(cx) else { return };
+        self.reconcile_custom_model_saves(cx);
+        let Some((env_id, driver, next_entries, order, favorite)) = self.scoped_raw_representative_config(cx).map(|config| {
+            let env_id = config.environment.environment_id.clone();
+            let instance = config.settings.provider_instances.get(instance_id).cloned().unwrap_or_else(|| {
+                t3_core::server_config::ProviderInstanceConfig { driver: instance_id.to_owned(), ..Default::default() }
+            });
+            let effective_entries = self.effective_custom_model_entries(&env_id, instance_id, &instance);
+            let next_entries = model::custom_entries_with_removed(&effective_entries, slug);
             let (_, order) = model::instance_preferences(&config.settings, instance_id);
-            (order, model::instance_favorites(&config.settings, instance_id).iter().any(|model| model == slug))
+            let favorite = model::instance_favorites(&config.settings, instance_id).iter().any(|model| model == slug);
+            (env_id, instance.driver, next_entries, order, favorite)
+        }) else {
+            return;
         };
+        let queue_key = Self::custom_model_queue_key(&env_id, instance_id);
+        let save_id = self
+            .providers
+            .custom_model_saves
+            .entry(queue_key.clone())
+            .or_default()
+            .push(&driver, next_entries.clone());
+        let view = cx.entity().downgrade();
+        self.update_instance_then(
+            instance_id,
+            model::InstanceEdit::SetCustomModels(next_entries),
+            move |error, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if let Some(queue) = this.providers.custom_model_saves.get_mut(&queue_key) {
+                        queue.settle(save_id, error.is_none());
+                    }
+                    cx.notify();
+                });
+            },
+            cx,
+        );
         if order.iter().any(|model| model == slug) {
             let next: Vec<String> = order.into_iter().filter(|model| model != slug).collect();
             self.update_scoped_single_env(ServerSettingChange::Prepared(model::order_payload(instance_id, &next)), cx);
@@ -873,6 +971,7 @@ impl SettingsView {
         if favorite {
             self.update_scoped_single_env(ServerSettingChange::Prepared(model::favorite_payload(instance_id, slug, false)), cx);
         }
+        cx.notify();
     }
 
     fn move_model(&mut self, instance_id: &str, slug: &str, down: bool, cx: &mut Context<Self>) {
@@ -882,7 +981,8 @@ impl SettingsView {
             let live = config.provider(instance_id).map(|provider| provider.models.as_slice()).unwrap_or_default();
             let favorites = model::instance_favorites(&config.settings, instance_id);
             let (hidden, order) = model::instance_preferences(&config.settings, instance_id);
-            let grouped = model::group_models(model::models_for_display(live, &model::custom_models(&instance)), &favorites, &hidden, &order);
+            let custom = self.effective_custom_models(&config.environment.environment_id, instance_id, &instance);
+            let grouped = model::group_models(model::models_for_display(live, &custom), &favorites, &hidden, &order);
             model::moved_order(&grouped, slug, down)
         };
         if let Some(order) = order {

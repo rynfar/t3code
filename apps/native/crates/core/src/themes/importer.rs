@@ -61,8 +61,14 @@ pub(super) fn pair_vscode_themes_with(themes: Vec<ThemeDefinition>, paired_id: i
         dark,
     } in groups
     {
-        if light.len() == 1 && dark.len() == 1 {
-            let file = serde_json::json!({"version":1,"name":key,"appearance":"light","colors":light[0].colors,"variants":{"dark":dark[0].colors}});
+        if light.len() == 1
+            && dark.len() == 1
+            && (light[0].css.is_none() || dark[0].css.is_none() || light[0].css == dark[0].css)
+        {
+            let mut file = serde_json::json!({"version":1,"name":key,"appearance":"light","colors":light[0].colors,"variants":{"dark":dark[0].colors}});
+            if let Some(css) = light[0].css.as_ref().or(dark[0].css.as_ref()) {
+                file["css"] = serde_json::Value::String(css.clone());
+            }
             if let Ok(mut paired) = decode(&file, false) {
                 paired.id = paired_id(&light[0], &dark[0], &paired);
                 out.push((order, paired));
@@ -114,15 +120,40 @@ pub fn resolve_label_collisions(
 
 pub const MAX_FILE_BYTES: u64 = 256 * 1024;
 pub const READ_FAILURE: &str = "Could not read that file. Paste the JSON below instead.";
+
+/// `formatBytes` from `apps/web/src/lib/formatBytes.ts` (`pingdotgg/t3code#30330`): picks the unit
+/// after rounding so 1023.6 KB formats as `"1.00 MB"`, never `"1024 KB"`.
+pub fn format_bytes(bytes: u64) -> String {
+    fn format_scaled(value: f64) -> String {
+        if value >= 100. {
+            format!("{value:.0}")
+        } else if value >= 10. {
+            format!("{value:.1}")
+        } else {
+            format!("{value:.2}")
+        }
+    }
+    if bytes < 1_024 {
+        return format!("{bytes} B");
+    }
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let mut next = bytes as f64 / 1_024.;
+    let mut unit_index = 0;
+    while format_scaled(next).parse::<f64>().unwrap_or(0.) >= 1_024. && unit_index < UNITS.len() - 1 {
+        next /= 1_024.;
+        unit_index += 1;
+    }
+    format!("{} {}", format_scaled(next), UNITS[unit_index])
+}
+
 pub fn oversized(bytes: u64) -> Option<String> {
-    let size = if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024. * 1024.))
-    } else if bytes >= 1024 {
-        format!("{} KB", (bytes as f64 / 1024.).round())
-    } else {
-        format!("{bytes} bytes")
-    };
-    (bytes > MAX_FILE_BYTES).then(|| format!("That file is {size}. Theme files are only a few KB, so this one was not read (limit 256 KB)."))
+    (bytes > MAX_FILE_BYTES).then(|| {
+        format!(
+            "That file is {}. Theme files are only a few KB, so this one was not read (limit {}).",
+            format_bytes(bytes),
+            format_bytes(MAX_FILE_BYTES),
+        )
+    })
 }
 pub fn humanize(raw: &str) -> String {
     let s = raw.trim();
@@ -143,18 +174,7 @@ pub fn humanize(raw: &str) -> String {
         .join(" ")
 }
 fn rename(theme: &ThemeDefinition, name: &str) -> Result<ThemeDefinition, String> {
-    let mut file = serde_json::json!({
-        "version": 1,
-        "name": name.chars().take(48).collect::<String>(),
-        "appearance": theme.appearance,
-        "colors": theme.colors,
-        "variants": theme.variants,
-        "managed": theme.managed,
-    });
-    if let Some(css) = &theme.css {
-        file["css"] = serde_json::Value::String(css.clone());
-    }
-    decode(&file, false)
+    super::rename_theme(theme, name)
 }
 pub struct Batch {
     pub themes: Vec<ThemeDefinition>,
@@ -662,6 +682,51 @@ mod session_tests {
             oversized(256 * 1024 + 1).unwrap(),
             "That file is 256 KB. Theme files are only a few KB, so this one was not read (limit 256 KB)."
         );
-        assert!(oversized(1024 * 1024).unwrap().contains("1.0 MB"));
+        assert!(oversized(1024 * 1024).unwrap().contains("1.00 MB"));
+        // Just under 1 MB must not say "1024 KB" (`pingdotgg/t3code#30330`).
+        assert!(oversized(1024 * 1024 - 1).unwrap().contains("1.00 MB"));
+        assert!(!oversized(1024 * 1024 - 1).unwrap().contains("1024 KB"));
+    }
+
+    #[test]
+    fn batch_pairing_and_renaming_preserve_custom_css() {
+        let with_css = |name: &str, dark: bool, css: Option<&str>| {
+            let mut file = json!({
+                "version": 1,
+                "name": name,
+                "appearance": if dark { "dark" } else { "light" },
+                "colors": standard(dark),
+            });
+            if let Some(css) = css {
+                file["css"] = json!(css);
+            }
+            decode(&file, false).unwrap()
+        };
+
+        // Matching / single-sided CSS pairs and keeps CSS (`pingdotgg/t3code#38134`).
+        let paired = pair_vscode_themes(vec![
+            with_css("Aurora Light", false, Some(":root { --accent: #112233; }")),
+            with_css("Aurora Dark", true, None),
+        ]);
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0].css.as_deref(), Some(":root { --accent: #112233; }"));
+
+        // Conflicting CSS stays as two separate themes (`pingdotgg/t3code#38134`).
+        let split = pair_vscode_themes(vec![
+            with_css("Aurora Light", false, Some(":root { --accent: #111111; }")),
+            with_css("Aurora Dark", true, Some(":root { --accent: #222222; }")),
+        ]);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].css.as_deref(), Some(":root { --accent: #111111; }"));
+        assert_eq!(split[1].css.as_deref(), Some(":root { --accent: #222222; }"));
+
+        // Same-named themes renamed during batch collision resolution keep CSS (`pingdotgg/t3code#38139`).
+        let renamed = resolve_label_collisions(vec![
+            (with_css("Shared", true, Some(":root { --a: #111; }")), Some("first-one.json".into())),
+            (with_css("Shared", true, Some(":root { --a: #222; }")), Some("second-one.json".into())),
+        ]);
+        assert_eq!(renamed.len(), 2);
+        assert_eq!(renamed[0].css.as_deref(), Some(":root { --a: #111; }"));
+        assert_eq!(renamed[1].css.as_deref(), Some(":root { --a: #222; }"));
     }
 }

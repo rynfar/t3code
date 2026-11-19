@@ -226,6 +226,36 @@ pub async fn run_with_progress(
     view: watch::Receiver<Arc<FleetView>>,
     events: Option<mpsc::UnboundedSender<UpdateEvent>>,
 ) -> UpdateEverythingResult {
+    let mut staged_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>> =
+        std::collections::HashMap::new();
+    // Stage servers that advertise `serverUpdateStaging` while providers install (`pingdotgg/t3code#35346`).
+    if !plan.providers.is_empty() {
+        let current_view = view.borrow().clone();
+        for server in &plan.servers {
+            let supports_staging = current_view
+                .environment(&server.environment_id)
+                .and_then(|e| e.config.config.as_ref())
+                .is_some_and(|c| c.environment.capabilities.server_update_staging == Some(true));
+            if !supports_staging {
+                continue;
+            }
+            if let Ok(packet) = packet(&destinations, &server.environment_id, "environment:maintain")
+                && let Ok(destination) = &packet.receipt
+            {
+                let client = destination.client.clone();
+                let target_version = server.target_version.clone();
+                let handle = tokio::spawn(async move {
+                    let _ = client
+                        .request(
+                            "server.updateServer",
+                            json!({ "targetVersion": target_version, "stageOnly": true }),
+                        )
+                        .await;
+                });
+                staged_handles.insert(server.environment_id.clone(), handle);
+            }
+        }
+    }
     let mut provider_outcomes = Vec::new();
     let mut provider_failures_by_env: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -322,6 +352,7 @@ pub async fn run_with_progress(
         .collect();
     execute_server_targets(
         targets,
+        staged_handles,
         unresolved_provider,
         &provider_outcomes,
         &provider_failures_by_env,
@@ -361,6 +392,7 @@ pub async fn run_channel_switch_with_progress(
     let provider_failures_by_env = std::collections::HashMap::new();
     execute_server_targets(
         targets,
+        std::collections::HashMap::new(),
         false,
         &[],
         &provider_failures_by_env,
@@ -373,6 +405,7 @@ pub async fn run_channel_switch_with_progress(
 
 async fn execute_server_targets(
     targets: Vec<(ServerTarget, ServerRequestOptions)>,
+    mut staged_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
     unresolved_provider: bool,
     provider_outcomes: &[ProviderOutcome],
     provider_failures_by_env: &std::collections::HashMap<String, String>,
@@ -380,46 +413,56 @@ async fn execute_server_targets(
     view: &watch::Receiver<Arc<FleetView>>,
     events: Option<&mpsc::UnboundedSender<UpdateEvent>>,
 ) -> UpdateEverythingResult {
-    let mut server_outcomes: Vec<(String, ServerOutcome)> = Vec::new();
-    for (target, options) in targets {
-        let provider_failure = provider_failures_by_env.get(&target.environment_id).cloned();
-        let outcome = if unresolved_provider {
-            ServerOutcome::Failed(
-                "server restart withheld because a provider update is unresolved".into(),
-            )
-        } else {
-            match packet(destinations, &target.environment_id, "environment:maintain") {
-                Ok(packet) => match update_server_with_events(
-                    packet,
-                    &target,
-                    view,
-                    &options,
-                    events,
-                )
-                .await
+    let futures: Vec<_> = targets
+        .into_iter()
+        .map(|(target, options)| {
+            let stage_handle = staged_handles.remove(&target.environment_id);
+            let provider_failure = provider_failures_by_env.get(&target.environment_id).cloned();
+            async move {
+                // Each server awaits only its own staging task before applying its update (`#35346`).
+                if let Some(handle) = stage_handle {
+                    let _ = handle.await;
+                }
+                let outcome = if unresolved_provider {
+                    ServerOutcome::Failed(
+                        "server restart withheld because a provider update is unresolved".into(),
+                    )
+                } else {
+                    match packet(destinations, &target.environment_id, "environment:maintain") {
+                        Ok(packet) => match update_server_with_events(
+                            packet,
+                            &target,
+                            view,
+                            &options,
+                            events,
+                        )
+                        .await
+                        {
+                            Ok(()) => ServerOutcome::Updated,
+                            Err(error) => ServerOutcome::Failed(error),
+                        },
+                        Err(error) => ServerOutcome::Failed(error),
+                    }
+                };
+                if let Some(tx) = events
+                    && !options.track_only
                 {
-                    Ok(()) => ServerOutcome::Updated,
-                    Err(error) => ServerOutcome::Failed(error),
-                },
-                Err(error) => ServerOutcome::Failed(error),
+                    let (failure, server_updated) = match &outcome {
+                        ServerOutcome::Updated | ServerOutcome::Skipped => (provider_failure.clone(), true),
+                        ServerOutcome::Failed(message) => (Some(message.clone()), false),
+                    };
+                    let _ = tx.send(UpdateEvent::MachineSettled {
+                        environment_id: target.environment_id.clone(),
+                        failure,
+                        server_updated,
+                        provider_failure,
+                    });
+                }
+                (target.label, outcome)
             }
-        };
-        if let Some(tx) = events
-            && !options.track_only
-        {
-            let (failure, server_updated) = match &outcome {
-                ServerOutcome::Updated | ServerOutcome::Skipped => (provider_failure.clone(), true),
-                ServerOutcome::Failed(message) => (Some(message.clone()), false),
-            };
-            let _ = tx.send(UpdateEvent::MachineSettled {
-                environment_id: target.environment_id.clone(),
-                failure,
-                server_updated,
-                provider_failure,
-            });
-        }
-        server_outcomes.push((target.label.clone(), outcome));
-    }
+        })
+        .collect();
+    let server_outcomes = futures::future::join_all(futures).await;
     let refs: Vec<(&str, &ServerOutcome)> = server_outcomes
         .iter()
         .map(|(label, outcome)| (label.as_str(), outcome))

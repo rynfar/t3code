@@ -650,6 +650,14 @@ impl SettingsView {
         let body = v_flex()
             .key_context("ProviderDialog")
             .on_action(cx.listener(|this, _: &CloseProviderDialog, _, cx| this.close_usage_source_dialogs(cx)))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                // Enter anywhere in the Add CLIProxyAPI hub dialog submits (`pingdotgg/t3code#36755`).
+                if event.keystroke.key == "enter" && !event.keystroke.modifiers.shift {
+                    this.commit_usage_source_key(cx);
+                    this.save_usage_source(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .gap(r(16.))
             .child(v_flex().gap(r(6.)).child(field_label("Hub URL")).child(Input::new(&url_input).small().disabled(saving)))
             .child(v_flex().gap(r(6.)).child(field_label("Management key")).child(key_control))

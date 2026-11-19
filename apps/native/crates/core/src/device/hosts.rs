@@ -122,7 +122,7 @@ impl EasHostConfig {
     pub fn new(id: &str) -> EasHostConfig {
         EasHostConfig {
             id: id.to_owned(),
-            label: "EAS Simulator".to_owned(),
+            label: "Expo Simulators".to_owned(),
             app_id: None,
             access_token: SecretValue::default(),
             max_session_minutes: 30,

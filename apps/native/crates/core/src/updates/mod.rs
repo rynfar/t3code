@@ -193,18 +193,14 @@ pub fn collect(machines: &[Machine<'_>], target_version: &str) -> Plan {
             && !config.is_some_and(|c| c.environment.capabilities.desktop_app_update == Some(true))
         {
             Some("needs a newer desktop app".into())
-        } else if capability != Some("desktop-managed")
-            && config
-                .is_some_and(|c| channel(&c.environment.server_version) != channel(target_version))
+        } else if let Some(server_channel) = config.map(|c| channel(&c.environment.server_version))
+            && server_channel != channel(target_version)
+            && (capability != Some("desktop-managed") || server_channel == "stable")
         {
-            Some(format!(
-                "on the {} channel",
-                channel(
-                    config
-                        .map(|c| c.environment.server_version.as_str())
-                        .unwrap_or_default()
-                )
-            ))
+            // A desktop app installs its own track's newest release. Nightly builds run ahead of
+            // Stable, so a Nightly host behind a Stable target has something newer; a Stable host
+            // may not (`pingdotgg/t3code#37490`).
+            Some(format!("on the {server_channel} channel"))
         } else {
             None
         };
@@ -524,6 +520,37 @@ pub fn channel_switch_block_reason(
         ));
     }
     None
+}
+
+/// Connection and database migration state for one locally hosted backend (`localSwitchBlockReason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostedServerState {
+    pub connected: bool,
+    pub database_migration: Option<u64>,
+}
+
+/// `localSwitchBlockReason` (`updateEverything.logic.ts`, `pingdotgg/t3code#32048`):
+/// reinstalling this app restarts every server it hosts, so each database must allow the switch.
+/// With Local environment off this app runs no server, so its reinstall restarts none.
+pub fn local_switch_block_reason(
+    app_version: &str,
+    release: &ChannelSwitchRelease,
+    hosted: &[HostedServerState],
+    backend_count: usize,
+    local_environment_enabled: bool,
+) -> Option<String> {
+    if !local_environment_enabled || is_on_track(app_version, release.channel) {
+        return None;
+    }
+    if hosted.is_empty()
+        || hosted.len() < backend_count
+        || hosted.iter().any(|server| !server.connected)
+    {
+        return Some("its server is not connected, so its database cannot be checked".into());
+    }
+    hosted
+        .iter()
+        .find_map(|server| channel_switch_block_reason(app_version, release, server.database_migration))
 }
 
 fn track_switch_move(config: &ServerConfig, same_track: bool) -> Result<&str, String> {

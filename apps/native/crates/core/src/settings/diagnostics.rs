@@ -254,24 +254,29 @@ fn fixed(value: f64, digits: usize) -> String {
     }
 }
 
-/// `formatDuration`: milliseconds under a second, then seconds.
+/// `formatDiagnosticsDuration` (`pingdotgg/t3code#29377`): milliseconds when rounded value is
+/// under a second (so 999.6 ms reads `"1 s"`, never `"1000 ms"`), then seconds.
 pub fn format_duration(ms: f64) -> String {
-    if ms < 1000. {
-        return format!("{} ms", ms.round());
+    let rounded = ms.round();
+    if rounded < 1000. {
+        return format!("{rounded} ms");
     }
     format!("{} s", fixed(ms / 1000., if ms >= 10_000. { 1 } else { 2 }))
 }
 
-/// `formatCpuTime`: seconds, minutes, then hours.
+/// `formatCpuTime` (`pingdotgg/t3code#29395`): picks the unit after rounding so 59.97 seconds
+/// never reads `"60s"` and 3599.9 seconds never reads `"60m"`.
 pub fn format_cpu_time(seconds: f64) -> String {
-    if seconds < 60. {
-        return format!("{}s", fixed(seconds, if seconds >= 10. { 1 } else { 2 }));
+    let short_seconds = fixed(seconds, if seconds >= 10. { 1 } else { 2 });
+    if short_seconds.parse::<f64>().unwrap_or(seconds) < 60. {
+        return format!("{short_seconds}s");
     }
     let minutes = seconds / 60.;
-    if minutes < 60. {
-        return format!("{}m", fixed(minutes, if minutes >= 10. { 1 } else { 2 }));
+    let short_minutes = fixed(minutes, if minutes >= 10. { 1 } else { 2 });
+    if short_minutes.parse::<f64>().unwrap_or(minutes) < 60. {
+        return format!("{short_minutes}m");
     }
-    format!("{}h", fixed(minutes / 60., 2))
+    format!("{}h", fixed(seconds / 3600., 2))
 }
 
 pub fn percent(value: f64) -> String {

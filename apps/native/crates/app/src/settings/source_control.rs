@@ -14,12 +14,17 @@ use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaSta
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::{Map, Value, json};
 use t3_core::device::hosts::SecretValue;
+use t3_core::issues::wire::{
+    IssueTrackerBindProjectInput, IssueTrackerConnectInput, IssueTrackerConnection, IssueTrackerConnectionList,
+    IssueTrackerKind, IssueTrackerProjectBinding, method as issue_method,
+};
 use t3_core::server_config::ServerConfig;
+use t3_core::settings::search::Section;
 use t3_core::settings::source_control::{
     self, AppSignInDef, DISCOVER, Discovery, DiscoveryItem, Dot, HostCredentialsDef, HostDefinition, HostFieldDef, MERGE_METHODS, SIGN_IN_CANCEL,
     SIGN_IN_START, SIGN_IN_WAIT, SignInPrompt, SourceControlChange, WritingMode, decode_discovery, decode_sign_in_prompt, group_host_accounts,
-    has_secret_value, host_definition, merge_method_value, next_host_account_choices, parse_merge_method, read_host_credential_settings,
-    read_host_fields,
+    has_secret_value, host_definition, issue_tracker_summary, merge_method_value, next_host_account_choices, parse_merge_method,
+    read_host_credential_settings, read_host_fields,
 };
 
 use super::controls::{
@@ -34,6 +39,7 @@ use crate::theme::{hsla, palette};
 
 const STORED_SECRET: &str = "__stored__";
 const ACTIVE_ACCOUNT: &str = "__active__";
+const UNBOUND_SCOPE: &str = "__unbound__";
 
 /// `badge.tsx` tints the settings pages use.
 #[derive(Clone, Copy)]
@@ -102,6 +108,13 @@ struct GenericHostState {
     _subscriptions: Vec<Subscription>,
 }
 
+struct IssueTrackerDraft {
+    input: Entity<InputState>,
+    busy: bool,
+    failure: Option<String>,
+    _subscription: Subscription,
+}
+
 pub(crate) struct SourceControlState {
     pub(crate) custom_instructions: Entity<TextareaState>,
     pub(crate) review_instructions: Entity<TextareaState>,
@@ -110,6 +123,13 @@ pub(crate) struct SourceControlState {
     /// Which connection the scan belongs to, so a reconnect scans again.
     scanned_for: Option<u64>,
     scanning: bool,
+    /// Standalone issue trackers (`issueTrackers.list`, `pingdotgg/t3code#19274`).
+    trackers: Option<Result<IssueTrackerConnectionList, String>>,
+    trackers_for: Option<u64>,
+    trackers_loading: bool,
+    trackers_expanded: HashSet<String>,
+    tracker_drafts: HashMap<String, IssueTrackerDraft>,
+    binding_pending: HashSet<String>,
     advanced: bool,
     revealed_accounts: HashSet<String>,
     expanded_providers: HashSet<String>,
@@ -141,6 +161,13 @@ impl SourceControlState {
                     this.commit_review_instructions(cx);
                 }
             }),
+            // A CLI login made outside T3 Code changes nothing the client subscribes to, so
+            // returning to the window rescans hosting CLIs (`pingdotgg/t3code#37509`).
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() && this.section == Section::SourceControl && !this.source_control.scanning {
+                    this.scan_source_control(true, cx);
+                }
+            }),
         ];
         SourceControlState {
             custom_instructions,
@@ -148,6 +175,12 @@ impl SourceControlState {
             discovery: None,
             scanned_for: None,
             scanning: false,
+            trackers: None,
+            trackers_for: None,
+            trackers_loading: false,
+            trackers_expanded: HashSet::new(),
+            tracker_drafts: HashMap::new(),
+            binding_pending: HashSet::new(),
             advanced: false,
             revealed_accounts: HashSet::new(),
             expanded_providers: HashSet::new(),
@@ -306,6 +339,442 @@ impl SettingsView {
         if self.source_control.review_instructions.focus_handle(cx).is_focused(window) {
             self.commit_review_instructions(cx);
         }
+    }
+
+    /// `issueTrackerEnvironment.connections` (`issueTrackers.list`, `pingdotgg/t3code#19274`).
+    fn load_issue_trackers(&mut self, force: bool, cx: &mut Context<Self>) {
+        let connection = self.state.read(cx).connection_id();
+        if self.source_control.trackers_for != connection {
+            self.source_control.trackers = None;
+            self.source_control.tracker_drafts.clear();
+            self.source_control.binding_pending.clear();
+        }
+        if self.source_control.trackers_loading
+            || (!force && connection.is_some() && self.source_control.trackers_for == connection)
+        {
+            return;
+        }
+        let Some(task) = self.state.read(cx).request(
+            issue_method::TRACKERS_LIST,
+            json!({}),
+            |value| serde_json::from_value::<IssueTrackerConnectionList>(value).map_err(|e| e.to_string()),
+        ) else {
+            return;
+        };
+        self.source_control.trackers_loading = true;
+        self.source_control.trackers_for = connection;
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                if this.state.read(cx).connection_id() != connection {
+                    return;
+                }
+                this.source_control.trackers_loading = false;
+                this.source_control.trackers = Some(result);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn connect_issue_tracker(&mut self, tracker: IssueTrackerKind, token: Option<String>, cx: &mut Context<Self>) {
+        let key = tracker.as_str().to_owned();
+        let connection = self.state.read(cx).connection_id();
+        let Some(draft) = self.source_control.tracker_drafts.get_mut(&key) else {
+            return;
+        };
+        if draft.busy {
+            return;
+        }
+        draft.busy = true;
+        draft.failure = None;
+        let payload = serde_json::to_value(IssueTrackerConnectInput { tracker, token }).unwrap_or_default();
+        let Some(task) = self.state.read(cx).request(
+            issue_method::TRACKERS_CONNECT,
+            payload,
+            |value| serde_json::from_value::<IssueTrackerConnection>(value).map_err(|e| e.to_string()),
+        ) else {
+            if let Some(draft) = self.source_control.tracker_drafts.get_mut(&key) {
+                draft.busy = false;
+                draft.failure = Some("Not connected to server.".into());
+            }
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |this, cx| {
+                if this.state.read(cx).connection_id() != connection {
+                    return;
+                }
+                if let Some(draft) = this.source_control.tracker_drafts.get_mut(&key) {
+                    draft.busy = false;
+                    match result {
+                        Ok(_) => {
+                            draft.failure = None;
+                        }
+                        Err(message) => {
+                            draft.failure = Some(message);
+                        }
+                    }
+                }
+                this.load_issue_trackers(true, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn bind_issue_tracker_project(
+        &mut self,
+        project_id: String,
+        tracker: IssueTrackerKind,
+        scope: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.source_control.binding_pending.contains(&project_id) {
+            return;
+        }
+        let connection = self.state.read(cx).connection_id();
+        self.source_control.binding_pending.insert(project_id.clone());
+        let binding = (scope != UNBOUND_SCOPE).then_some(IssueTrackerProjectBinding { tracker, scope });
+        let payload = serde_json::to_value(IssueTrackerBindProjectInput {
+            project_id: project_id.clone(),
+            binding,
+        })
+        .unwrap_or_default();
+        let Some(task) = self.state.read(cx).request(issue_method::TRACKERS_BIND_PROJECT, payload, |_| Ok(())) else {
+            self.source_control.binding_pending.remove(&project_id);
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let _ = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.source_control.binding_pending.remove(&project_id);
+                if this.state.read(cx).connection_id() == connection {
+                    this.load_issue_trackers(true, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// `IssueTrackerSettings` (`apps/web/src/components/settings/IssueTrackerSettings.tsx`,
+    /// `pingdotgg/t3code#19274`).
+    fn issue_trackers_block(
+        &mut self,
+        _config: &ServerConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Block> {
+        let p = palette(cx);
+        let can_edit = self.may(SETTINGS_WRITE_SCOPE, cx) && !self.is_project_scope(cx);
+        let list = match &self.source_control.trackers {
+            None if self.source_control.trackers_loading => {
+                let loading = vec![
+                    div()
+                        .px(r(16.))
+                        .py(r(12.))
+                        .child(muted_text("Loading issue trackers\u{2026}", cx))
+                        .into_any_element(),
+                ];
+                return Some(Block::new(&["issue-trackers"], section("Issue trackers", loading, cx)));
+            }
+            None => return None,
+            Some(Err(error)) => {
+                let row = Row::new("issue-trackers-error", "Could not load issue trackers")
+                    .description(error.clone())
+                    .control(
+                        Button::new("issue-trackers-retry", ButtonVariant::Outline, ButtonSize::Xs)
+                            .label("Retry")
+                            .on_click(cx.listener(|this, _, _, cx| this.load_issue_trackers(true, cx))),
+                    )
+                    .into_any_element();
+                return Some(Block::new(&["issue-trackers"], section("Issue trackers", vec![row], cx)));
+            }
+            Some(Ok(list)) if list.trackers.is_empty() => return None,
+            Some(Ok(list)) => list.clone(),
+        };
+
+        let projects: Vec<(String, String)> = {
+            let app = self.state.read(cx);
+            app.shell
+                .snapshot
+                .as_ref()
+                .map(|snap| {
+                    snap.projects
+                        .iter()
+                        .filter(|project| project.archived_at.is_none() && !app.is_scratch_project(&project.id))
+                        .map(|project| (project.id.clone(), project.title.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(list.trackers.len());
+        for tracker in list.trackers {
+            let key = tracker.tracker.as_str().to_owned();
+            if !self.source_control.tracker_drafts.contains_key(&key) {
+                let placeholder = if tracker.connected {
+                    "Configured (enter a new key to replace)"
+                } else {
+                    "Paste credential"
+                };
+                let input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder));
+                let tracker_for_enter = tracker.tracker.clone();
+                let key_for_enter = key.clone();
+                let subscription = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| match event {
+                    InputEvent::PressEnter { .. } => {
+                        let next = input.read(cx).value().trim().to_owned();
+                        if !next.is_empty() {
+                            this.connect_issue_tracker(tracker_for_enter.clone(), Some(next), cx);
+                        }
+                    }
+                    InputEvent::Change => {
+                        if let Some(draft) = this.source_control.tracker_drafts.get_mut(&key_for_enter) {
+                            draft.failure = None;
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                });
+                self.source_control.tracker_drafts.insert(
+                    key.clone(),
+                    IssueTrackerDraft {
+                        input,
+                        busy: false,
+                        failure: None,
+                        _subscription: subscription,
+                    },
+                );
+            }
+            let usable = tracker.connected && tracker.account.is_some();
+            let expanded = self.source_control.trackers_expanded.contains(&key);
+            let summary = issue_tracker_summary(&tracker, &list.bindings);
+            let dot = if usable { Dot::Success } else { Dot::Muted };
+            let tracker_icon = crate::issues::tracker_icon(&tracker.tracker);
+            let toggle_key = key.clone();
+
+            let header = h_flex()
+                .w_full()
+                .justify_between()
+                .gap(r(12.))
+                .px(r(16.))
+                .py(r(12.))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(r(4.))
+                        .child(
+                            h_flex()
+                                .gap(r(8.))
+                                .items_center()
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w(r(20.))
+                                        .h(r(20.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(super::controls::icon(tracker_icon, 16., hsla(p.foreground).opacity(0.8)))
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(gpui::px(-1.))
+                                                .left(gpui::px(-1.))
+                                                .w(r(7.))
+                                                .h(r(7.))
+                                                .rounded_full()
+                                                .bg(dot_color(dot, cx)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(hsla(p.foreground))
+                                        .truncate()
+                                        .child(tracker.display_name.clone()),
+                                )
+                                .when(tracker.connected && tracker.account.is_none(), |this| {
+                                    this.child(tone_badge("Credential rejected", Tone::Error, cx))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .line_height(r(18.))
+                                .text_color(hsla(p.muted_foreground))
+                                .child(summary),
+                        ),
+                )
+                .child(
+                    Button::new(
+                        SharedString::from(format!("issue-tracker-toggle-{key}")),
+                        ButtonVariant::GhostMuted,
+                        ButtonSize::IconXs,
+                    )
+                    .icon(if expanded { Icon::ChevronUp } else { Icon::ChevronDown })
+                    .tooltip(format!("Toggle {} details", tracker.display_name))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.source_control.trackers_expanded.remove(&toggle_key) {
+                            this.source_control.trackers_expanded.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                    })),
+                );
+
+            let mut item = v_flex().w_full().child(header);
+            if expanded {
+                let (input, busy, failure) = {
+                    let draft = &self.source_control.tracker_drafts[&key];
+                    (draft.input.clone(), draft.busy, draft.failure.clone())
+                };
+                let disabled = !can_edit || busy;
+                let draft_text = input.read(cx).value().trim().to_owned();
+                let save_tracker = tracker.tracker.clone();
+                let save_text = draft_text.clone();
+                let disconnect_tracker = tracker.tracker.clone();
+                let help_url = tracker.credential.help_url.clone();
+
+                let mut desc = v_flex().gap(r(4.)).child(
+                    h_flex()
+                        .gap(r(6.))
+                        .items_center()
+                        .child(muted_text("Stored on the server.", cx))
+                        .when_some(help_url, |this, url| {
+                            this.child(
+                                Button::new(
+                                    SharedString::from(format!("issue-tracker-help-{key}")),
+                                    ButtonVariant::GhostMuted,
+                                    ButtonSize::Xs,
+                                )
+                                .label("Create one")
+                                .trailing(Icon::ExternalLink)
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                            )
+                        }),
+                );
+                if let Some(failure) = failure {
+                    desc = desc.child(div().text_xs().text_color(hsla(p.destructive)).child(failure));
+                }
+
+                let credential_control = h_flex()
+                    .gap(r(6.))
+                    .items_center()
+                    .on_key_down(stop_slash_shortcut)
+                    .child(div().w(r(180.)).child(Input::new(&input).small().disabled(disabled)))
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("issue-tracker-save-{key}")),
+                            ButtonVariant::Outline,
+                            ButtonSize::Xs,
+                        )
+                        .label("Save")
+                        .disabled(disabled || draft_text.is_empty())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.connect_issue_tracker(save_tracker.clone(), Some(save_text.clone()), cx);
+                        })),
+                    )
+                    .when(tracker.connected, |this| {
+                        this.child(
+                            Button::new(
+                                SharedString::from(format!("issue-tracker-disconnect-{key}")),
+                                ButtonVariant::DestructiveOutline,
+                                ButtonSize::IconXs,
+                            )
+                            .icon(Icon::X)
+                            .tooltip(format!("Disconnect {}", tracker.display_name))
+                            .disabled(disabled)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.connect_issue_tracker(disconnect_tracker.clone(), None, cx);
+                            })),
+                        )
+                    });
+
+                let mut details = v_flex()
+                    .w_full()
+                    .pb(r(8.))
+                    .child(
+                        Row::new(
+                            SharedString::from(format!("issue-tracker-cred-{key}")),
+                            tracker.credential.label.clone(),
+                        )
+                        .below(desc)
+                        .control(credential_control),
+                    );
+
+                if usable && !projects.is_empty() && !tracker.scopes.is_empty() {
+                    details = details.child(
+                        Row::new(
+                            SharedString::from(format!("issue-tracker-projects-{key}")),
+                            "Projects",
+                        )
+                        .description(format!(
+                            "Pick the {} {} whose issues each project lists beside its repository's own.",
+                            tracker.display_name, tracker.scope_noun
+                        )),
+                    );
+                    for (project_id, project_title) in &projects {
+                        let bound = list.bindings.get(project_id);
+                        let current_scope = bound
+                            .filter(|b| b.tracker == tracker.tracker)
+                            .map(|b| b.scope.as_str())
+                            .unwrap_or(UNBOUND_SCOPE);
+                        let mut options = vec![SelectOption::new(UNBOUND_SCOPE, "Not bound")];
+                        for scope in &tracker.scopes {
+                            options.push(SelectOption::new(
+                                scope.key.clone(),
+                                format!("{} ({})", scope.name, scope.key),
+                            ));
+                        }
+                        let is_pending = self.source_control.binding_pending.contains(project_id);
+                        let view = cx.entity().downgrade();
+                        let bind_project_id = project_id.clone();
+                        let bind_tracker = tracker.tracker.clone();
+                        details = details.child(
+                            Row::new(
+                                SharedString::from(format!("issue-tracker-bind-{key}-{project_id}")),
+                                project_title.clone(),
+                            )
+                            .control(
+                                Select::new(
+                                    SharedString::from(format!("issue-tracker-scope-{key}-{project_id}")),
+                                    options,
+                                )
+                                .selected(current_scope)
+                                .width(220.)
+                                .disabled(disabled || is_pending)
+                                .on_change(move |next, _, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.bind_issue_tracker_project(
+                                            bind_project_id.clone(),
+                                            bind_tracker.clone(),
+                                            next.to_string(),
+                                            cx,
+                                        );
+                                    });
+                                }),
+                            ),
+                        );
+                    }
+                }
+                item = item.child(details);
+            }
+            rows.push(item.into_any_element());
+        }
+
+        Some(Block::new(
+            &["issue-trackers"],
+            section("Issue trackers", rows, cx),
+        ))
     }
 
     /// `sourceControlEnvironment.discovery`, run when the page opens on a connection and on Rescan.
@@ -533,11 +1002,15 @@ impl SettingsView {
             )];
         };
         self.scan_source_control(false, cx);
+        self.load_issue_trackers(false, cx);
         let settings = &config.settings.source_control;
         Self::sync_textarea(&self.source_control.custom_instructions, &settings.source_control_writing_style.custom_instructions, window, cx);
         Self::sync_textarea(&self.source_control.review_instructions, &settings.review_guide_instructions, window, cx);
 
         let mut blocks = vec![Block::new(&["automatic-pull", "remove-agent-credits-on-merge", "pull-request-merge-method"], self.repositories_section(&config, cx))];
+        if let Some(trackers_block) = self.issue_trackers_block(&config, window, cx) {
+            blocks.push(trackers_block);
+        }
         blocks.extend(self.discovery_blocks(&config, window, cx));
         blocks.push(Block::new(
             &[

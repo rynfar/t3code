@@ -16,7 +16,7 @@ mod form;
 mod text_generators;
 mod usage_sources;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -175,7 +175,11 @@ pub(crate) struct ProvidersState {
     /// The credentials form, keyed by the flow and interaction it answers.
     credentials: Option<(String, CredentialInputs)>,
     adding_custom_model: bool,
+    saving_custom_model: bool,
+    custom_model_save_gen: u64,
     custom_model_error: Option<String>,
+    /// Per-(environment, instance) pending custom-model saves layered before config-stream echoes.
+    custom_model_saves: HashMap<String, model::CustomModelSaveQueue>,
     /// The models list renders only the rows in view, from `model_rows`.
     models_list: ListState,
     model_rows: editor::ModelRows,
@@ -209,6 +213,9 @@ impl ProvidersState {
         self.chatgpt=None;
         self.auth=None;
         self.install=None;
+        self.saving_custom_model = false;
+        self.custom_model_save_gen = self.custom_model_save_gen.wrapping_add(1);
+        self.custom_model_saves.clear();
     }
 
     pub(super) fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
@@ -231,12 +238,12 @@ impl ProvidersState {
                 }
             }),
             cx.subscribe_in(&custom_model, window, |this, input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => this.add_custom_model(window, cx),
+                InputEvent::PressEnter { .. } if !this.providers.saving_custom_model => this.add_custom_model(window, cx),
                 InputEvent::Change if this.providers.custom_model_error.is_some() => {
                     this.providers.custom_model_error = None;
                     cx.notify();
                 }
-                InputEvent::Blur if input.read(cx).value().trim().is_empty() => {
+                InputEvent::Blur if !this.providers.saving_custom_model && input.read(cx).value().trim().is_empty() => {
                     this.providers.adding_custom_model = false;
                     cx.notify();
                 }
@@ -285,7 +292,10 @@ impl ProvidersState {
             terminal_line,
             credentials: None,
             adding_custom_model: false,
+            saving_custom_model: false,
+            custom_model_save_gen: 0,
             custom_model_error: None,
+            custom_model_saves: HashMap::new(),
             models_list: ListState::new(0, ListAlignment::Top, px(128.)),
             model_rows: editor::ModelRows::default(),
             email_revealed: false,
@@ -453,7 +463,7 @@ impl SettingsView {
             .map(|(row, view, accent)| {
                 let provider = live.iter().find(|provider| provider.instance_id == row.instance_id).cloned();
                 let instance = row.instance();
-                let custom_models = model::custom_models(&instance);
+                let custom_models = self.effective_custom_models(&config.environment.environment_id, &row.instance_id, &instance);
                 let favorites = model::instance_favorites(settings, &row.instance_id);
                 let (hidden, order) = model::instance_preferences(settings, &row.instance_id);
                 let models = model::group_models(model::models_for_display(provider.as_ref().map(|provider| provider.models.as_slice()).unwrap_or_default(), &custom_models), &favorites, &hidden, &order);
@@ -482,6 +492,7 @@ impl SettingsView {
         if self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()) { self.providers.dialog=None; self.providers.auth=None; }
         self.sync_usage_sources(cx);
         self.sync_provider_removal(window, cx);
+        self.reconcile_custom_model_saves(cx);
         let Some(data) = self.page_data(cx) else {
             self.providers.auth = None;
             self.providers.install = None;
@@ -1113,6 +1124,8 @@ impl SettingsView {
             self.providers.editor_owner = owner;
             self.providers.form.reset();
             self.providers.adding_custom_model = false;
+            self.providers.saving_custom_model = false;
+            self.providers.custom_model_save_gen = self.providers.custom_model_save_gen.wrapping_add(1);
             self.providers.custom_model_error = None;
             self.providers.advisory_open = None;
             self.providers.model_filter.update(cx, |input, cx| input.set_value("", window, cx));
@@ -1263,6 +1276,83 @@ impl SettingsView {
             return;
         }
         self.update_scoped_single_env(ServerSettingChange::ProviderInstance { instance_id: instance_id.to_owned(), edit }, cx);
+    }
+
+    pub(super) fn custom_model_queue_key(env_id: &str, instance_id: &str) -> String {
+        format!("{env_id}\0{instance_id}")
+    }
+
+    pub(super) fn reconcile_custom_model_saves(&mut self, cx: &App) {
+        let Some(config) = self.scoped_raw_representative_config(cx) else { return };
+        let env_id = config.environment.environment_id.as_str();
+        let prefix = format!("{env_id}\0");
+        self.providers.custom_model_saves.retain(|key, queue| {
+            if let Some(instance_id) = key.strip_prefix(&prefix) {
+                let instance = config
+                    .settings
+                    .provider_instances
+                    .get(instance_id)
+                    .cloned()
+                    .unwrap_or_else(|| t3_core::server_config::ProviderInstanceConfig {
+                        driver: instance_id.to_owned(),
+                        ..Default::default()
+                    });
+                let stored = model::custom_model_entries(&instance);
+                queue.reconcile_stored(&instance.driver, &stored);
+            }
+            !queue.is_empty()
+        });
+    }
+
+    pub(super) fn effective_custom_model_entries(
+        &self,
+        env_id: &str,
+        instance_id: &str,
+        instance: &t3_core::server_config::ProviderInstanceConfig,
+    ) -> Vec<Value> {
+        let stored = model::custom_model_entries(instance);
+        let key = Self::custom_model_queue_key(env_id, instance_id);
+        self.providers
+            .custom_model_saves
+            .get(&key)
+            .map_or_else(|| stored.clone(), |queue| queue.current_entries(&stored).to_vec())
+    }
+
+    pub(super) fn effective_custom_models(
+        &self,
+        env_id: &str,
+        instance_id: &str,
+        instance: &t3_core::server_config::ProviderInstanceConfig,
+    ) -> Vec<model::CustomModel> {
+        let entries = self.effective_custom_model_entries(env_id, instance_id, instance);
+        model::custom_models_from_entries(&instance.driver, &entries)
+    }
+
+    /// Saves an edit of one instance and invokes `on_done` once the RPC settles (`None` on success,
+    /// `Some(reason)` on failure or guard denial).
+    pub(super) fn update_instance_then(
+        &mut self,
+        instance_id: &str,
+        edit: model::InstanceEdit,
+        on_done: impl FnOnce(Option<String>, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(c) = self.scoped_raw_representative_config(cx) {
+            let instance_path = format!("providerInstances.{instance_id}");
+            if let Some(reason) = t3_core::managed_policy::setting_lock_reason(c.managed_policy.as_ref(), &instance_path) {
+                on_done(Some(reason), cx);
+                return;
+            }
+        }
+        if !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx) {
+            on_done(Some("This connection lacks permission to manage providers.".to_owned()), cx);
+            return;
+        }
+        self.update_scoped_single_env_then(
+            ServerSettingChange::ProviderInstance { instance_id: instance_id.to_owned(), edit },
+            on_done,
+            cx,
+        );
     }
 
     /// Resets a project-level provider enablement override back to inherit the device setting

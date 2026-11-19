@@ -486,12 +486,19 @@ fn close(window: &mut Window, cx: &mut App) {
 
 fn finish_close(window: &mut Window, cx: &mut App) {
     let host = cx.global_mut::<Host>();
-    host.view = None;
+    let closing = host.view.take();
     host.pending = None;
     host.pending_project = None;
     host.pending_scheduled_task = None;
     host.pending_provider = None;
     let previous = host.previous_focus.take();
+    if let Some(view) = closing {
+        view.update(cx, |view, cx| {
+            if let Some(dialog) = view.appearance_ui.import.take() {
+                dialog.update(cx, |dialog, cx| dialog.cancel_pending(cx));
+            }
+        });
+    }
     store::clear_error(cx);
     if let Some(previous) = previous {
         window.focus(&previous, cx);
@@ -741,6 +748,11 @@ impl SettingsView {
                     cx.notify();
                 }
             }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() && this.section == Section::Connections {
+                    this.refresh_visible_peer_links(cx);
+                }
+            }),
             Self::intercept_result_keys(cx),
         ];
         let mut view = SettingsView {
@@ -814,6 +826,9 @@ impl SettingsView {
         if section == Section::Archived {
             self.load_archive(cx);
         }
+        if section == Section::Connections {
+            self.refresh_visible_peer_links(cx);
+        }
         if section != Section::ScheduledTasks {
             self.scheduled.stream = None;
         }
@@ -822,6 +837,11 @@ impl SettingsView {
         }
         if section != Section::Projects {
             self.projects.actions.close();
+        }
+        if section != Section::Appearance
+            && let Some(dialog) = self.appearance_ui.import.take()
+        {
+            dialog.update(cx, |dialog, cx| dialog.cancel_pending(cx));
         }
         if section != Section::Secrets {
             self.secrets.dismiss();
@@ -2260,7 +2280,7 @@ impl SettingsView {
             Section::Diffs => self.diffs_page(cx),
             Section::Browser => self.browser_page(window, cx),
             Section::SnapShot => self.snapshots_page(cx),
-            Section::Appearance => self.appearance(cx),
+            Section::Appearance => self.appearance(window, cx),
             Section::Chat => self.chat(cx),
             Section::Labs => self.labs(cx),
             Section::Threads => self.threads_page(window, cx),

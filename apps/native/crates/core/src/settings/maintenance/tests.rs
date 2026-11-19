@@ -33,6 +33,14 @@ fn change_payloads_patch_one_key() {
     assert_eq!(MaintenanceChange::KeepAwakeWhileAgentsWork(false).payload(), json!({ "patch": { "keepAwakeWhileAgentsWork": false } }));
     assert_eq!(MaintenanceChange::BrowserArtifactsAfterDays(Some(9000)).payload(), json!({ "patch": { "storageCleanup": { "browserArtifactsAfterDays": 3650 } } }));
     assert_eq!(MaintenanceChange::LogsAfterDays(None).payload(), json!({ "patch": { "storageCleanup": { "logsAfterDays": null } } }));
+    assert_eq!(
+        MaintenanceChange::UsageHistoryRetentionDays(UsageHistoryRetentionDays::Days(30)).payload(),
+        json!({ "patch": { "usageHistoryRetentionDays": 30 } })
+    );
+    assert_eq!(
+        MaintenanceChange::UsageHistoryRetentionDays(UsageHistoryRetentionDays::Unlimited).payload(),
+        json!({ "patch": { "usageHistoryRetentionDays": "unlimited" } })
+    );
 }
 
 #[test]

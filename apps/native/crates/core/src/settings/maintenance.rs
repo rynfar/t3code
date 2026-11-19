@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 
 use super::providers::background::{Profile, ProviderPanelSettings, Resolved, preset};
 use super::worktrees::{CleanupRules, MAX_RETENTION_DAYS};
-use crate::server_config::ServerSettings;
+use crate::server_config::{ServerSettings, UsageHistoryRetentionDays};
 
 pub const GET_STORAGE_CLEANUP_REPORT: &str = "server.getStorageCleanupReport";
 pub const RUN_STORAGE_CLEANUP: &str = "server.runStorageCleanup";
@@ -52,6 +52,7 @@ pub enum MaintenanceChange {
     KeepAwakeWhileAgentsWork(bool),
     BrowserArtifactsAfterDays(Option<u32>),
     LogsAfterDays(Option<u32>),
+    UsageHistoryRetentionDays(UsageHistoryRetentionDays),
 }
 
 impl MaintenanceChange {
@@ -72,6 +73,13 @@ impl MaintenanceChange {
             }
             MaintenanceChange::LogsAfterDays(days) => {
                 json!({ "storageCleanup": { "logsAfterDays": clamp(days) } })
+            }
+            MaintenanceChange::UsageHistoryRetentionDays(retention) => {
+                let value = match retention {
+                    UsageHistoryRetentionDays::Days(days) => json!(days.clamp(1, MAX_RETENTION_DAYS)),
+                    UsageHistoryRetentionDays::Unlimited => json!("unlimited"),
+                };
+                json!({ "usageHistoryRetentionDays": value })
             }
         };
         json!({ "patch": patch })
