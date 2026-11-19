@@ -838,6 +838,7 @@ index 1111111..2222222 100644
 
     pub(super) fn with_comment_editor(&self, row: Option<DiffRow>, code: AnyElement, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let code = self.with_saved_comments(row, code, cx);
+        let code = self.with_inline_review_threads(row, code, cx);
         let Some(editor) = &self.comments.editor else { return code };
         let Some(selection) = editor.comment.selection else { return code };
         let Some(view) = &self.view else { return code };
@@ -1107,6 +1108,136 @@ index 1111111..2222222 100644
                                 this.state.update(cx, |state, cx| state.remove_review_comment(&thread, id.clone(), cx))
                             })),
                     )
+            }))
+            .into_any_element()
+    }
+
+    fn with_inline_review_threads(&self, row: Option<DiffRow>, code: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        if self.review_threads.is_empty() {
+            return code;
+        }
+        let Some(view) = &self.view else { return code };
+        let mut threads: Vec<(usize, Side, u32, t3_core::diff::InlineReviewThread)> = Vec::new();
+        let mut seen = HashSet::<String>::new();
+        let mut collect_for = |file: usize, hunk: usize, line_ix: usize, side: Side| {
+            let Some(diff) = view.parsed.files().get(file) else { return };
+            let Some(diff_line) = diff.hunks.get(hunk).and_then(|h| h.lines.get(line_ix)) else {
+                return;
+            };
+            let number = match side {
+                Side::Additions => diff_line.new_line,
+                Side::Deletions => diff_line.old_line,
+            };
+            let Some(number) = number else { return };
+            for thread in self.review_threads.visible_threads(diff, view.layout, side, number) {
+                if seen.insert(thread.id.clone()) {
+                    threads.push((file, side, number, thread.clone()));
+                }
+            }
+        };
+        match row {
+            Some(DiffRow::Line { file, hunk, line }) => {
+                if let Some(diff_line) = view
+                    .parsed
+                    .files()
+                    .get(file)
+                    .and_then(|f| f.hunks.get(hunk))
+                    .and_then(|h| h.lines.get(line))
+                {
+                    let side = if diff_line.kind == LineKind::Deletion {
+                        Side::Deletions
+                    } else {
+                        Side::Additions
+                    };
+                    collect_for(file, hunk, line, side);
+                }
+            }
+            Some(DiffRow::Split { file, hunk, left, right }) => {
+                if let Some(left_ix) = left {
+                    collect_for(file, hunk, left_ix, Side::Deletions);
+                }
+                if let Some(right_ix) = right {
+                    collect_for(file, hunk, right_ix, Side::Additions);
+                }
+            }
+            _ => {}
+        }
+        if threads.is_empty() {
+            return code;
+        }
+        let p = palette(cx);
+        v_flex()
+            .w_full()
+            .child(code)
+            .children(threads.into_iter().map(|(file_ix, side, line_number, thread)| {
+                let resolved = thread.is_resolved;
+                let border = if resolved {
+                    hsla(p.border)
+                } else {
+                    hsla(p.primary).opacity(0.55)
+                };
+                let bg = if resolved {
+                    hsla(p.muted).opacity(0.35)
+                } else {
+                    hsla(p.primary).opacity(0.045)
+                };
+                v_flex()
+                    .w_full()
+                    .gap(px(6.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .border_l_2()
+                    .border_color(border)
+                    .bg(bg)
+                    .when(resolved, |card| {
+                        card.child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(hsla(p.muted_foreground))
+                                        .child("Resolved conversation"),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    Button::new(
+                                        format!("diff-collapse-resolved-{}", thread.id),
+                                        ButtonVariant::Ghost,
+                                        ButtonSize::Xs,
+                                    )
+                                    .label("Hide")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_resolved_review_threads(file_ix, side, line_number, cx);
+                                    })),
+                                ),
+                        )
+                    })
+                    .children(thread.comments.into_iter().map(|comment| {
+                        let author = comment
+                            .author
+                            .as_ref()
+                            .map(|a| a.login.clone())
+                            .unwrap_or_else(|| "ghost".to_owned());
+                        v_flex()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(hsla(p.muted_foreground))
+                                    .child(author),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .line_height(px(18.))
+                                    .text_color(hsla(p.foreground))
+                                    .child(gpui::SharedString::from(comment.body)),
+                            )
+                    }))
             }))
             .into_any_element()
     }

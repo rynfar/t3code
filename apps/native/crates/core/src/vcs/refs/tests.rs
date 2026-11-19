@@ -295,3 +295,35 @@ fn hover_pins_enter_target_across_results_and_pointer_leave_respects_keyboard_na
     assert!(highlight.leave_pointer());
     assert!(highlight.choice.is_none());
 }
+
+#[test]
+fn offline_ref_snapshot_seeds_empty_listing_and_pr_choice_sits_at_index_zero() {
+    assert!(can_use_offline_refs_cache(&list_refs("/repo", None, None, 100)));
+    assert!(can_use_offline_refs_cache(&json!({"cwd":"/repo","limit":100,"refresh":true})));
+    assert!(!can_use_offline_refs_cache(&list_refs("/repo", Some("feat"), None, 100)));
+    assert!(!can_use_offline_refs_cache(&list_refs("/repo", None, Some(100), 100)));
+    assert!(!can_use_offline_refs_cache(&json!({"cwd":"/repo","limit":100,"refKind":"remote"})));
+
+    let mut list = RefListing::default();
+    assert!(list.seed_offline_snapshot("", page(&["main", "feat/a"], Some(100))));
+    assert!(!list.loaded, "offline seed keeps loaded=false until a live refresh finishes");
+    assert_eq!(list.refs.len(), 2);
+    assert_eq!(list.next_cursor, Some(100));
+    assert!(!list.seed_offline_snapshot("", page(&["other"], None)), "must not clobber populated listing");
+
+    let pr_ref = Some("https://github.com/org/repo/pull/42");
+    assert_eq!(
+        RefChoice::at_with_pr(&list.refs, &[0, 1], pr_ref, None, 0),
+        Some(RefChoice::CheckoutPullRequest("https://github.com/org/repo/pull/42".into()))
+    );
+    assert_eq!(
+        RefChoice::at_with_pr(&list.refs, &[0, 1], pr_ref, None, 1),
+        Some(RefChoice::Ref("main".into()))
+    );
+    let mut highlight = RefHighlight::default();
+    highlight.update_with_pr(&list, &[0, 1], pr_ref, None, "https://github.com/org/repo/pull/42");
+    assert_eq!(
+        highlight.choice,
+        Some(RefChoice::CheckoutPullRequest("https://github.com/org/repo/pull/42".into()))
+    );
+}

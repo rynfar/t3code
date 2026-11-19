@@ -3,7 +3,7 @@
 
 use gpui::{AnyElement, Context, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px, relative, uniform_list};
 use gpui_component::{h_flex, v_flex};
-use t3_core::diff::{ChangeKind, TreeRowKind};
+use t3_core::diff::{ChangeKind, FileViewedState, TreeRowKind};
 
 use super::DiffPanel;
 use crate::icons::Icon;
@@ -76,11 +76,23 @@ impl DiffPanel {
             }
             TreeRowKind::File { file, change } => {
                 let file = *file;
-                let selected = self
+                let file_path = self
                     .view
                     .as_ref()
                     .and_then(|view| view.parsed.files().get(file))
-                    .is_some_and(|diff| self.selected_file.as_deref() == Some(diff.path()));
+                    .map(|diff| diff.path());
+                let selected = file_path.is_some_and(|path| self.selected_file.as_deref() == Some(path));
+                let viewed_state = self
+                    .viewed_enabled()
+                    .then(|| file_path.map(|path| self.file_viewed_state(path)))
+                    .flatten();
+                let open_review_count = file_path.map_or(0, |path| {
+                    self.review_threads
+                        .threads()
+                        .iter()
+                        .filter(|t| t.path == path && !t.is_resolved)
+                        .count()
+                });
                 let (letter, color) = match change {
                     ChangeKind::New => ("A", p.diff_addition_foreground),
                     ChangeKind::Deleted => ("D", p.diff_deletion_foreground),
@@ -88,10 +100,28 @@ impl DiffPanel {
                     ChangeKind::Modified => ("M", p.diff_modified_icon),
                 };
                 base.pl(px(8. + 12. * row.depth as f32 + 16.))
-                    .text_color(hsla(p.foreground).opacity(0.85))
+                    .text_color(hsla(p.foreground).opacity(if viewed_state == Some(FileViewedState::Viewed) { 0.55 } else { 0.85 }))
                     .when(selected, |this| this.bg(hsla(p.foreground).opacity(0.12)))
                     .on_click(cx.listener(move |this, _, _, cx| this.reveal_file(file, cx)))
                     .child(div().flex_1().min_w_0().truncate().child(label))
+                    .when(open_review_count > 0, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .px(px(4.))
+                                .rounded_full()
+                                .bg(hsla(p.primary).opacity(0.16))
+                                .text_size(px(10.))
+                                .text_color(hsla(p.primary))
+                                .child(open_review_count.to_string()),
+                        )
+                    })
+                    .when(viewed_state == Some(FileViewedState::Viewed), |this| {
+                        this.child(Icon::Check.svg().size(px(11.)).text_color(hsla(p.primary)))
+                    })
+                    .when(viewed_state == Some(FileViewedState::Stale), |this| {
+                        this.child(div().flex_none().size(px(6.)).rounded_full().bg(hsla(p.warning)))
+                    })
                     .child(div().flex_none().text_size(px(11.)).text_color(hsla(color)).child(letter))
                     .into_any_element()
             }

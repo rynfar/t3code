@@ -10,10 +10,12 @@ use gpui::{
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use t3_core::git_actions::terminology;
+use t3_core::vcs::change_request_reference::parse_pull_request_reference;
 use t3_core::vcs::refs::{RefChoice, RefHighlight};
 use t3_core::vcs::{RefFilter, VcsRef, branch_selection_target, ref_badge, sanitize_new_ref_name};
 
-use super::{GitEvent, GitStore};
+use super::{GitDialogs, GitEvent, GitStore};
 use crate::composer::controls::{Float, floating, menu_surface};
 use crate::icons::Icon;
 use crate::sidebar::is_composing;
@@ -22,18 +24,22 @@ use crate::thread_details::controls::{MenuRow, ROW_WIDTH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Item {
+    CheckoutPr(String),
     Ref(VcsRef),
     Create(String),
 }
 
 pub struct BranchPicker {
     git: Entity<GitStore>,
+    dialogs: Option<Entity<GitDialogs>>,
     input: Entity<InputState>,
     open: bool,
     highlighted: RefHighlight,
     closed_at: Option<Instant>,
     debounce: Option<Task<()>>,
     filter: RefFilter,
+    /// The parsed PR reference a "Checkout pull request" row opens, when the query names one.
+    checkout_pr: Option<String>,
     /// The ref name a "Create" row would make, when the query offers one.
     create: Option<String>,
     scroll: UniformListScrollHandle,
@@ -75,16 +81,23 @@ impl BranchPicker {
         ];
         BranchPicker {
             git,
+            dialogs: None,
             input,
             open: false,
             highlighted: RefHighlight::default(),
             closed_at: None,
             debounce: None,
             filter: RefFilter::default(),
+            checkout_pr: None,
             create: None,
             scroll: UniformListScrollHandle::new(),
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn with_dialogs(mut self, dialogs: Entity<GitDialogs>) -> Self {
+        self.dialogs = Some(dialogs);
+        self
     }
 
     pub fn is_open(&self) -> bool {
@@ -128,33 +141,56 @@ impl BranchPicker {
         let query = self.input.read(cx).value().trim().to_owned();
         let git = self.git.read(cx);
         self.filter.update(&git.refs.refs, git.refs.revision, &query.to_lowercase());
+        self.checkout_pr = (git.can_change_branch() && self.dialogs.is_some())
+            .then(|| parse_pull_request_reference(&query))
+            .flatten();
         let name = sanitize_new_ref_name(&query);
         // An exact match also matches the query, so the filtered rows are enough to rule it out.
         let exists = self.filter.indices().iter().any(|&index| git.refs.refs[index].name == name);
         self.create = (!query.is_empty() && !exists && git.can_change_branch()).then_some(name);
-        self.highlighted.update(&git.refs, self.filter.indices(), self.create.as_deref(), &query);
+        self.highlighted
+            .update_with_pr(&git.refs, self.filter.indices(), self.checkout_pr.as_deref(), self.create.as_deref(), &query);
     }
 
     fn item_count(&self) -> usize {
-        self.filter.indices().len() + usize::from(self.create.is_some())
+        usize::from(self.checkout_pr.is_some()) + self.filter.indices().len() + usize::from(self.create.is_some())
     }
 
     fn item(&self, index: usize, cx: &Context<Self>) -> Option<Item> {
-        match self.filter.indices().get(index) {
+        let offset = usize::from(self.checkout_pr.is_some());
+        if let Some(reference) = &self.checkout_pr
+            && index == 0
+        {
+            return Some(Item::CheckoutPr(reference.clone()));
+        }
+        let ref_index_pos = index.checked_sub(offset)?;
+        match self.filter.indices().get(ref_index_pos) {
             Some(&ref_index) => self.git.read(cx).refs.refs.get(ref_index).cloned().map(Item::Ref),
-            None => self.create.clone().filter(|_| index == self.filter.indices().len()).map(Item::Create),
+            None => self.create.clone().filter(|_| ref_index_pos == self.filter.indices().len()).map(Item::Create),
         }
     }
 
-    fn activate(&mut self, choice: RefChoice, _window: &mut Window, cx: &mut Context<Self>) {
+    fn activate(&mut self, choice: RefChoice, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_items(cx);
-        let Some(index) = choice.index_in(&self.git.read(cx).refs.refs, self.filter.indices(), self.create.as_deref()) else { return };
+        let Some(index) = choice.index_in_with_pr(
+            &self.git.read(cx).refs.refs,
+            self.filter.indices(),
+            self.checkout_pr.as_deref(),
+            self.create.as_deref(),
+        ) else {
+            return;
+        };
         let Some(item) = self.item(index, cx) else { return };
         self.close(cx);
-        self.git.update(cx, |git, cx| match &item {
-            Item::Ref(target) => git.select_ref(target, cx),
-            Item::Create(name) => git.create_ref(name, cx),
-        });
+        match item {
+            Item::CheckoutPr(reference) => {
+                if let Some(dialogs) = &self.dialogs {
+                    dialogs.update(cx, |dialogs, cx| dialogs.open_checkout_pr(Some(reference), window, cx));
+                }
+            }
+            Item::Ref(target) => self.git.update(cx, |git, cx| git.select_ref(&target, cx)),
+            Item::Create(name) => self.git.update(cx, |git, cx| git.create_ref(&name, cx)),
+        }
     }
 
     fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -162,13 +198,15 @@ impl BranchPicker {
         let count = self.item_count();
         if count > 0 {
             let refs = &self.git.read(cx).refs.refs;
-            let current = self.highlighted.choice.as_ref().and_then(|choice| choice.index_in(refs, self.filter.indices(), self.create.as_deref()));
+            let current = self.highlighted.choice.as_ref().and_then(|choice| {
+                choice.index_in_with_pr(refs, self.filter.indices(), self.checkout_pr.as_deref(), self.create.as_deref())
+            });
             let index = match current {
                 Some(index) => (index as isize + delta).rem_euclid(count as isize) as usize,
                 None if delta < 0 => count - 1,
                 None => 0,
             };
-            if let Some(choice) = RefChoice::at(refs, self.filter.indices(), self.create.as_deref(), index) {
+            if let Some(choice) = RefChoice::at_with_pr(refs, self.filter.indices(), self.checkout_pr.as_deref(), self.create.as_deref(), index) {
                 self.highlighted.select(choice);
             }
             self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
@@ -181,6 +219,12 @@ impl BranchPicker {
         let p = palette(cx);
         let id = ElementId::Name(format!("branch-picker-{index}").into());
         let (row, enabled) = match &item {
+            Item::CheckoutPr(reference) => {
+                let terms = terminology(self.git.read(cx).status.as_ref().and_then(|s| s.provider_kind()));
+                let row = MenuRow::new(id, SharedString::from(format!("Checkout {} ({reference})", terms.singular)))
+                    .trailing(div().text_size(px(10.)).text_color(hsla(p.muted_foreground).opacity(0.6)).child(terms.short_label));
+                (row, true)
+            }
             Item::Ref(target) => {
                 let git = self.git.read(cx);
                 let checkout = git.target.as_ref();
@@ -193,7 +237,11 @@ impl BranchPicker {
             }
             Item::Create(name) => (MenuRow::new(id, SharedString::from(format!("Create new ref \"{name}\""))), true),
         };
-        let choice = match &item { Item::Ref(item) => RefChoice::Ref(item.name.clone()), Item::Create(name) => RefChoice::Create(name.clone()) };
+        let choice = match &item {
+            Item::CheckoutPr(reference) => RefChoice::CheckoutPullRequest(reference.clone()),
+            Item::Ref(item) => RefChoice::Ref(item.name.clone()),
+            Item::Create(name) => RefChoice::Create(name.clone()),
+        };
         let highlighted = self.highlighted.choice.as_ref() == Some(&choice);
         let hover_choice = choice.clone();
         let row = row.highlighted(highlighted).on_mouse_move(cx.listener(move |this, _, _, cx| {

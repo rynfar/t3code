@@ -326,12 +326,16 @@ impl SettingsView {
             return;
         };
         let Some(card) = cx.global_mut::<PendingScriptEditor>().0.take() else { return };
-        let request = match card.script_id {
-            None => Some(EditorRequest::add()),
-            Some(id) => self.project_config(target, cx).and_then(|config| {
-                let keybindings = decode_resolved_keybindings(&config.keybindings);
-                shown_scripts(&config.settings, &target.project.id).iter().find(|script| script.id == id).map(|script| EditorRequest::edit(script, &keybindings))
-            }),
+        let request = if let Some(prefilled) = card.request {
+            Some(prefilled)
+        } else {
+            match card.script_id {
+                None => Some(EditorRequest::add()),
+                Some(id) => self.project_config(target, cx).and_then(|config| {
+                    let keybindings = decode_resolved_keybindings(&config.keybindings);
+                    shown_scripts(&config.settings, &target.project.id).iter().find(|script| script.id == id).map(|script| EditorRequest::edit(script, &keybindings))
+                }),
+            }
         };
         if request.is_some() {
             self.projects.actions.pending = request;
@@ -904,6 +908,7 @@ mod tests {
             cx.set_global(PendingScriptEditor(Some(ScriptEditorRequest {
                 project_id: "proj-second".into(),
                 script_id: Some("second-dev".into()),
+                request: None,
             })));
             state
         });

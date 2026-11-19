@@ -50,6 +50,8 @@ struct Header {
     plus: Option<Option<String>>,
     rename_from: Option<String>,
     rename_to: Option<String>,
+    old_object_id: Option<String>,
+    new_object_id: Option<String>,
     new_file: bool,
     deleted_file: bool,
     copied: bool,
@@ -111,6 +113,11 @@ impl<'a> Parser<'a> {
                 header.new_file = true;
             } else if line.starts_with("deleted file mode") {
                 header.deleted_file = true;
+            } else if let Some(rest) = line.strip_prefix("index ") {
+                if let Some((old_id, new_id)) = parse_index_object_ids(rest) {
+                    header.old_object_id = old_id;
+                    header.new_object_id = new_id;
+                }
             } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
                 header.binary = true;
             } else if header.git_old.is_none() && header.minus.is_none() && !is_extended_header(line) {
@@ -237,8 +244,20 @@ fn build_file(header: Header, hunks: Vec<Hunk>) -> FileDiff {
         new_path: if change == ChangeKind::Deleted { None } else { new_path },
         change,
         binary: header.binary,
-        hunks: hunks.into(),
+        hunks: super::FileHunks::with_object_ids(hunks, header.old_object_id, header.new_object_id),
     }
+}
+
+/// Parses `index <old>..<new>[ <mode>]` into `(old_object_id, new_object_id)`, omitting all-zero hashes.
+fn parse_index_object_ids(rest: &str) -> Option<(Option<String>, Option<String>)> {
+    let range = rest.split_whitespace().next()?;
+    let (old, new) = range.split_once("..")?;
+    let clean = |oid: &str| {
+        let trimmed = oid.trim();
+        (!trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) && !trimmed.bytes().all(|b| b == b'0'))
+            .then(|| trimmed.to_owned())
+    };
+    Some((clean(old), clean(new)))
 }
 
 /// `@@ -a,b +c,d @@ context`; a missing count means 1.
@@ -351,7 +370,7 @@ fn take_quoted(text: &str) -> (String, &str) {
     (String::from_utf8_lossy(&out).into_owned(), "")
 }
 
-fn expand_tabs(text: &str) -> Arc<str> {
+pub(super) fn expand_tabs(text: &str) -> Arc<str> {
     if !text.contains('\t') {
         return Arc::from(text);
     }

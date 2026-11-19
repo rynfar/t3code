@@ -74,7 +74,8 @@ fn run_quick_action(quick: &QuickAction, git: &Entity<GitStore>, dialogs: &Entit
     match quick.kind {
         QuickActionKind::Pull => git.update(cx, |git, cx| git.pull(cx)),
         QuickActionKind::Run(action) => dialogs.update(cx, |dialogs, cx| dialogs.request_action(ActionRequest::new(action), window, cx)),
-        QuickActionKind::Publish | QuickActionKind::Hint => {}
+        QuickActionKind::Publish => dialogs.update(cx, |dialogs, cx| dialogs.open_publish(window, cx)),
+        QuickActionKind::Hint => {}
     }
 }
 
@@ -130,10 +131,7 @@ pub fn git_actions_row(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, no_
     let disabled_reason = if !can_write {
         Some("This connection cannot change source control.".to_owned())
     } else {
-        match quick.kind {
-            QuickActionKind::Publish => Some("Publishing a repository is not available in this app yet.".to_owned()),
-            _ => quick.disabled_reason(),
-        }
+        quick.disabled_reason()
     };
     let primary = match disabled_reason {
         Some(reason) => Row::new("git-quick-action", quick.label.clone()).icon(icon).disabled(true).tooltip(reason),
@@ -161,9 +159,11 @@ fn menu_has_notice(store: &GitStore) -> bool {
 fn menu_trigger(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, cx: &App) -> impl IntoElement {
     let store = git.read(cx);
     let running = store.is_running();
+    let can_write = store.can_write_source_control();
     let has_primary_remote = store.status.as_ref().is_some_and(|status| status.local.has_primary_remote);
+    let can_publish = can_write && store.status.as_ref().is_some_and(|status| status.local.is_repo && !status.local.has_primary_remote);
     let menu_items = build_menu_items(store.status.as_ref(), running, has_primary_remote);
-    let has_content = has_usable_menu_content(&menu_items, store.can_write_source_control(), false, menu_has_notice(store));
+    let has_content = has_usable_menu_content(&menu_items, can_write, can_publish, menu_has_notice(store));
     let (git, dialogs) = (git.clone(), dialogs.clone());
     MenuTrigger::new("git-actions-menu", "Git action options").disabled(running || !has_content).dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, cx| {
         git.update(cx, |git, cx| git.refresh_status(false, cx));
@@ -173,6 +173,7 @@ fn menu_trigger(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, cx: &App) 
         let busy = store.is_running();
         let can_write = store.can_write_source_control();
         let has_primary_remote = status.as_ref().is_some_and(|status| status.local.has_primary_remote);
+        let can_publish = can_write && status.as_ref().is_some_and(|status| status.local.is_repo && !status.local.has_primary_remote);
         let terms = terminology(status.as_ref().and_then(|status| status.provider_kind()));
         let status_error = store.status_error.clone();
         let mut menu = menu.min_w(px(ROW_WIDTH));
@@ -200,6 +201,15 @@ fn menu_trigger(git: &Entity<GitStore>, dialogs: &Entity<GitDialogs>, cx: &App) 
                 }
             };
             menu = menu.item(entry);
+        }
+        if can_publish {
+            let dialogs = dialogs.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Publish repository...")
+                    .icon(menu_icon(Icon::CloudUpload))
+                    .disabled(busy)
+                    .on_click(move |_, window, cx| dialogs.update(cx, |dialogs, cx| dialogs.open_publish(window, cx))),
+            );
         }
         let note = |text: String, color: gpui::Hsla| PopupMenuItem::element(move |_, _| div().text_xs().text_color(color).child(text.clone())).disabled(true);
         if let Some(status) = status.as_ref() {

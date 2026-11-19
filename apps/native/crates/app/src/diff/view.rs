@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use t3_core::diff::{DiffRow, DiffSession, FileDiff, Layout, ParsedPatch, TreeRow, file_rows, file_tree_rows_shown, parse_patch};
+use t3_core::diff::{DiffRow, DiffSession, FileDiff, Layout, ParsedPatch, TreeRow, file_rows, file_rows_with_trailing, file_tree_rows_shown, parse_patch};
 
 /// One fetched patch, parsed off the UI thread.
 pub struct Parsed {
@@ -215,6 +215,37 @@ impl View {
 
     pub fn folded_keys(&self) -> HashSet<String> {
         self.keys.iter().zip(&self.folded).filter(|(_, folded)| **folded).map(|(key, _)| key.clone()).collect()
+    }
+
+    /// Replaces one file's parsed hunks after hidden context expansion, returning the row range
+    /// to splice in the virtualized list.
+    pub fn replace_expanded_file(&mut self, file: usize, expanded: FileDiff, trailing_hidden: u32) -> Option<(Range<usize>, usize)> {
+        let ParsedPatch::Files(mut files) = self.parsed.patch.clone() else {
+            return None;
+        };
+        if file >= files.len() {
+            return None;
+        }
+        files[file] = expanded;
+        let next_parsed = Parsed::from_patch(
+            ParsedPatch::Files(files),
+            self.parsed.truncated,
+            self.parsed.totals,
+            self.parsed.base_ref.clone(),
+            self.parsed.head_ref.clone(),
+        );
+        let next_rows = if self.is_hidden(file) {
+            Arc::new(Vec::new())
+        } else {
+            Arc::new(file_rows_with_trailing(0, &next_parsed.files()[file], self.folded[file], self.layout, trailing_hidden))
+        };
+        let old = self.starts[file]..self.starts[file + 1];
+        let count = next_rows.len();
+        self.digits[file] = gutter_digits(&next_parsed.files()[file]);
+        self.rows[file] = next_rows;
+        self.parsed = next_parsed;
+        self.recount(file + 1);
+        Some((old, count))
     }
 
     pub fn rebuild_tree(&mut self, tree_collapsed: &HashSet<String>) {

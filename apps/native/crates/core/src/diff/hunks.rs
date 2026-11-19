@@ -11,24 +11,13 @@ struct Data {
     line_count: usize,
     max_line_len: usize,
     gutter_digits: usize,
+    old_object_id: Option<String>,
+    new_object_id: Option<String>,
 }
 
 impl From<Vec<Hunk>> for FileHunks {
     fn from(hunks: Vec<Hunk>) -> Self {
-        let line_count = hunks.iter().map(|h| h.lines.len()).sum();
-        let max_line_len = hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.len()).max().unwrap_or(0);
-        let largest = hunks
-            .iter()
-            .map(|h| h.old_start.saturating_add(h.old_count).max(h.new_start.saturating_add(h.new_count)))
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        Self(Arc::new(Data {
-            hunks,
-            line_count,
-            max_line_len,
-            gutter_digits: largest.ilog10() as usize + 1,
-        }))
+        Self::with_object_ids(hunks, None, None)
     }
 }
 
@@ -48,6 +37,24 @@ impl<'a> IntoIterator for &'a FileHunks {
 }
 
 impl FileHunks {
+    pub fn with_object_ids(hunks: Vec<Hunk>, old_object_id: Option<String>, new_object_id: Option<String>) -> Self {
+        let line_count = hunks.iter().map(|h| h.lines.len()).sum();
+        let max_line_len = hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.len()).max().unwrap_or(0);
+        let largest = hunks
+            .iter()
+            .map(|h| h.old_start.saturating_add(h.old_count).max(h.new_start.saturating_add(h.new_count)))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        Self(Arc::new(Data {
+            hunks,
+            line_count,
+            max_line_len,
+            gutter_digits: largest.ilog10() as usize + 1,
+            old_object_id,
+            new_object_id,
+        }))
+    }
     pub fn shares_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -59,5 +66,11 @@ impl FileHunks {
     }
     pub fn line_count(&self) -> usize {
         self.0.line_count
+    }
+    pub fn old_object_id(&self) -> Option<&str> {
+        self.0.old_object_id.as_deref()
+    }
+    pub fn new_object_id(&self) -> Option<&str> {
+        self.0.new_object_id.as_deref()
     }
 }

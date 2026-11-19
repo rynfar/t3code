@@ -24,10 +24,31 @@ pub fn invalidates_refs(method: &str) -> bool {
     )
 }
 
-#[derive(Debug, Default)]
+/// Whether `input` is the unfiltered first page eligible for the persisted offline ref snapshot
+/// (`canUseVcsRefsCache` in `packages/client-runtime/src/state/vcs.ts`).
+pub fn can_use_offline_refs_cache(input: &Value) -> bool {
+    input.get("query").is_none_or(Value::is_null)
+        && input.get("cursor").is_none_or(Value::is_null)
+        && input.get("includeMatchingRemoteRefs").is_none_or(Value::is_null)
+        && input.get("refKind").is_none_or(Value::is_null)
+        && input.get("limit").and_then(Value::as_u64) == Some(super::REF_PAGE_LIMIT)
+}
+
+#[derive(Debug)]
 pub struct RefCache {
     revision: u64,
     server_revisions: BTreeMap<String, u64>,
+    persisted_cache_readable: bool,
+}
+
+impl Default for RefCache {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            server_revisions: BTreeMap::new(),
+            persisted_cache_readable: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +67,15 @@ impl RefCache {
     pub fn revision(&self) -> u64 {
         self.revision
     }
+
+    pub fn persisted_cache_readable(&self) -> bool {
+        self.persisted_cache_readable
+    }
+
+    pub fn set_persisted_cache_readable(&mut self, readable: bool) {
+        self.persisted_cache_readable = readable;
+    }
+
     pub fn settle(&mut self, method: &str) -> bool {
         if !invalidates_refs(method) {
             return false;
@@ -140,6 +170,19 @@ impl RefListing {
         })
     }
 
+    /// Seeds the listing from a persisted offline ref snapshot when nothing live has loaded yet
+    /// (`cachedRefs` in `packages/client-runtime/src/state/vcs.ts`).
+    pub fn seed_offline_snapshot(&mut self, query: &str, snapshot: super::ListRefsResult) -> bool {
+        if !query.is_empty() || !self.query.is_empty() || self.loaded || !self.refs.is_empty() {
+            return false;
+        }
+        self.refs = snapshot.refs;
+        self.next_cursor = snapshot.next_cursor;
+        self.total = snapshot.total_count;
+        self.revision += 1;
+        true
+    }
+
     pub fn finish(&mut self, request: &RefLoad, result: Result<Vec<super::ListRefsResult>, String>) -> bool {
         if request.id != self.request || !self.loading {
             return false;
@@ -183,12 +226,33 @@ impl RefListing {
 /// Combobox item values, retained by identity while mounted pages refresh (`BranchPicker.tsx`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefChoice {
+    CheckoutPullRequest(String),
     Ref(String),
     Create(String),
 }
 
 impl RefChoice {
     pub fn at(refs: &[super::VcsRef], indices: &[usize], create: Option<&str>, index: usize) -> Option<Self> {
+        Self::at_with_pr(refs, indices, None, create, index)
+    }
+
+    pub fn at_with_pr(
+        refs: &[super::VcsRef],
+        indices: &[usize],
+        checkout_pr: Option<&str>,
+        create: Option<&str>,
+        index: usize,
+    ) -> Option<Self> {
+        if let Some(reference) = checkout_pr {
+            if index == 0 {
+                return Some(Self::CheckoutPullRequest(reference.to_owned()));
+            }
+            let ref_ix = index - 1;
+            return indices
+                .get(ref_ix)
+                .map(|&idx| Self::Ref(refs[idx].name.clone()))
+                .or_else(|| create.filter(|_| ref_ix == indices.len()).map(|name| Self::Create(name.to_owned())));
+        }
         indices
             .get(index)
             .map(|&index| Self::Ref(refs[index].name.clone()))
@@ -196,9 +260,21 @@ impl RefChoice {
     }
 
     pub fn index_in(&self, refs: &[super::VcsRef], indices: &[usize], create: Option<&str>) -> Option<usize> {
+        self.index_in_with_pr(refs, indices, None, create)
+    }
+
+    pub fn index_in_with_pr(
+        &self,
+        refs: &[super::VcsRef],
+        indices: &[usize],
+        checkout_pr: Option<&str>,
+        create: Option<&str>,
+    ) -> Option<usize> {
+        let offset = usize::from(checkout_pr.is_some());
         match self {
-            Self::Ref(name) => indices.iter().position(|&index| refs[index].name == *name),
-            Self::Create(name) => (create == Some(name.as_str())).then_some(indices.len()),
+            Self::CheckoutPullRequest(reference) => (checkout_pr == Some(reference.as_str())).then_some(0),
+            Self::Ref(name) => indices.iter().position(|&index| refs[index].name == *name).map(|pos| pos + offset),
+            Self::Create(name) => (create == Some(name.as_str())).then_some(indices.len() + offset),
         }
     }
 }
@@ -255,10 +331,22 @@ impl RefHighlight {
     }
 
     pub fn update(&mut self, listing: &RefListing, indices: &[usize], create: Option<&str>, query: &str) {
+        self.update_with_pr(listing, indices, None, create, query);
+    }
+
+    pub fn update_with_pr(
+        &mut self,
+        listing: &RefListing,
+        indices: &[usize],
+        checkout_pr: Option<&str>,
+        create: Option<&str>,
+        query: &str,
+    ) {
         if self.automatic {
-            self.choice = RefChoice::at(&listing.refs, indices, create, 0);
+            self.choice = RefChoice::at_with_pr(&listing.refs, indices, checkout_pr, create, 0);
             let search_pending = listing.query != super::sanitize_new_ref_name(query) || !listing.loaded || listing.loading;
-            self.automatic = search_pending || !matches!(self.choice.as_ref(), Some(RefChoice::Ref(_)));
+            self.automatic = search_pending
+                || !matches!(self.choice.as_ref(), Some(RefChoice::Ref(_) | RefChoice::CheckoutPullRequest(_)));
         }
     }
 }
