@@ -28,7 +28,6 @@ use crate::app_state::{AppEvent, Phase};
 use crate::composer::controls::{floating_shadow, kbd};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
-use crate::toast::{Toast, ToastKind};
 
 /// The draft id of the "New keybinding" row.
 const NEW_ROW: &str = "new";
@@ -92,9 +91,10 @@ pub(crate) struct KeybindingsState {
     menu: Option<String>,
     /// The command being saved (`savingCommand`).
     saving: Option<String>,
-    /// Latest `keybindings.*` config warning returned by a server keybindings reply.
+    /// Latest `keybindings.*` config warning from `ServerConfig.issues` or a keybindings reply.
     config_issue: Option<String>,
     config_issue_connection: Option<u64>,
+    config_issue_revision: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -135,6 +135,7 @@ impl KeybindingsState {
             saving: None,
             config_issue: None,
             config_issue_connection: None,
+            config_issue_revision: None,
             _subscriptions: subscriptions,
         }
     }
@@ -412,22 +413,18 @@ impl SettingsView {
                 match result {
                     Ok(reply) => {
                         let issue = model::keybinding_issue_message(&reply);
-                        if this.state.read(cx).connection_id() == conn_id {
-                            this.keybindings.config_issue = issue.clone();
-                            this.keybindings.config_issue_connection = issue.as_ref().and(conn_id);
-                        }
                         state.update(cx, |state, cx| {
                             if state.server_config.apply_keybindings_reply(&reply, sent_at) {
                                 state.sync_server_config(cx);
                                 cx.emit(AppEvent::ServerConfig);
                             }
-                            if let Some(message) = issue {
-                                state.show_toast(
-                                    Toast::new(ToastKind::Warning, "Invalid keybindings configuration").description(message),
-                                    cx,
-                                );
-                            }
                         });
+                        if this.state.read(cx).connection_id() == conn_id {
+                            this.keybindings.config_issue = issue.clone();
+                            this.keybindings.config_issue_connection = issue.as_ref().and(conn_id);
+                            this.keybindings.config_issue_revision =
+                                issue.as_ref().map(|_| this.state.read(cx).server_config.keybindings_revision());
+                        }
                         if let Some(id) = done {
                             if id == NEW_ROW {
                                 this.keybindings.adding = false;
@@ -467,10 +464,25 @@ impl SettingsView {
 
     fn sync_config_issue(&mut self, cx: &App) {
         let connected = self.connected(cx);
-        let conn_id = self.state.read(cx).connection_id();
-        if !connected || conn_id != self.keybindings.config_issue_connection {
+        let state = self.state.read(cx);
+        let conn_id = state.connection_id();
+        if !connected {
             self.keybindings.config_issue = None;
             self.keybindings.config_issue_connection = None;
+            self.keybindings.config_issue_revision = None;
+            return;
+        }
+        let rev = state.server_config.keybindings_revision();
+        if let Some(live) = state.server_config.config.as_ref().and_then(|config| config.keybindings_issue_message()) {
+            self.keybindings.config_issue = Some(live.to_owned());
+            self.keybindings.config_issue_connection = conn_id;
+            self.keybindings.config_issue_revision = Some(rev);
+            return;
+        }
+        if conn_id != self.keybindings.config_issue_connection || self.keybindings.config_issue_revision != Some(rev) {
+            self.keybindings.config_issue = None;
+            self.keybindings.config_issue_connection = None;
+            self.keybindings.config_issue_revision = None;
         }
     }
 
@@ -1332,10 +1344,40 @@ mod tests {
                 assert!(!view.dismiss_keybinding_overlay(window, cx));
                 assert!(!view.keybindings.filter.read(cx).focus_handle(cx).is_focused(window));
 
-                // Config issue clears on connection change or disconnect.
+                // Config issue syncs from live `ServerConfig.issues` and clears on stream fix, connection change, or disconnect.
                 let conn_id = state.read(cx).connection_id();
+                state.update(cx, |state, _| {
+                    let event: t3_core::server_config::ServerConfigStreamEvent = serde_json::from_value(serde_json::json!({
+                        "version": 1,
+                        "type": "keybindingsUpdated",
+                        "payload": {
+                            "keybindings": [],
+                            "issues": [{ "kind": "keybindings.invalid-entry", "message": "Bad entry from stream", "index": 0 }]
+                        }
+                    }))
+                    .unwrap();
+                    assert!(state.server_config.apply(event));
+                });
+                view.sync_config_issue(cx);
+                assert_eq!(view.keybindings.config_issue.as_deref(), Some("Bad entry from stream"));
+
+                // Clearing issues on the live stream clears the warning banner automatically.
+                state.update(cx, |state, _| {
+                    let event: t3_core::server_config::ServerConfigStreamEvent = serde_json::from_value(serde_json::json!({
+                        "version": 1,
+                        "type": "keybindingsUpdated",
+                        "payload": { "keybindings": [], "issues": [] }
+                    }))
+                    .unwrap();
+                    assert!(state.server_config.apply(event));
+                });
+                view.sync_config_issue(cx);
+                assert!(view.keybindings.config_issue.is_none());
+
+                let rev = state.read(cx).server_config.keybindings_revision();
                 view.keybindings.config_issue = Some("Bad entry".to_owned());
                 view.keybindings.config_issue_connection = conn_id;
+                view.keybindings.config_issue_revision = Some(rev);
                 view.sync_config_issue(cx);
                 assert_eq!(view.keybindings.config_issue.as_deref(), Some("Bad entry"));
                 view.keybindings.config_issue_connection = Some(conn_id.unwrap_or_default().wrapping_add(1));
@@ -1344,6 +1386,7 @@ mod tests {
 
                 view.keybindings.config_issue = Some("Stale".to_owned());
                 view.keybindings.config_issue_connection = conn_id;
+                view.keybindings.config_issue_revision = Some(rev);
                 state.update(cx, |state, _| state.phase = Phase::Unpaired);
                 view.sync_config_issue(cx);
                 assert!(view.keybindings.config_issue.is_none());

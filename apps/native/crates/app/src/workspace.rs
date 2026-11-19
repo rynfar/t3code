@@ -4,9 +4,11 @@
 
 use std::time::Duration;
 
-use gpui::{ ClickEvent, Context, DragMoveEvent, EmptyView, Entity, IntoElement, ParentElement, Render, Styled, Subscription, Task, Window, WindowControlArea, div, prelude::*, px};
+use gpui::{ ClickEvent, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled, Subscription, Task, Window, WindowControlArea, div, prelude::*, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::supervisor::ConnectionStatus;
+use t3_core::keybindings::{WorkspaceFocusArea, next_workspace_focus_area};
+use t3_core::settings::keybindings::{KeybindingsUpdateToastController, KeybindingsUpdateToastDecision};
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::chat_header::{self, ChatHeader};
@@ -18,8 +20,10 @@ use crate::context_menu::ContextMenu;
 use crate::dialog::ConfirmDialog;
 use crate::icons::Icon;
 use crate::keymap::{
-    self, CopyThreadReference, CycleAppearance, JumpToThread1, JumpToThread2, JumpToThread3, JumpToThread4, JumpToThread5, JumpToThread6, JumpToThread7, JumpToThread8,
-    JumpToThread9, NextThread, PinThread, PreviousThread, RegenerateThreadTitle, SelectTheme, SettleThread, StopThread, ToggleCommandPalette, ToggleFilePicker, ToggleProjectSearch, ToggleSidebar, UndoThreadAction, Unimplemented,
+    self, CopyThreadReference, CycleAppearance, FocusNextWorkspaceArea, FocusPreviousWorkspaceArea, JumpToThread1, JumpToThread2, JumpToThread3,
+    JumpToThread4, JumpToThread5, JumpToThread6, JumpToThread7, JumpToThread8, JumpToThread9, NextThread, PinThread, PreviousThread,
+    RegenerateThreadTitle, SelectTheme, SendBackground, SettleThread, StopThread, ToggleCommandPalette, ToggleFilePicker, ToggleProjectSearch,
+    ToggleSidebar, UndoThreadAction, Unimplemented,
 };
 use crate::palette::{CommandPalette, Mode as PaletteMode};
 use crate::right_panel::RightPanelView;
@@ -43,10 +47,24 @@ pub fn sidebar_inline_width(state: &AppState, viewport_width: f32) -> f32 {
 
 struct SidebarResize;
 
+struct WorkspaceAreaFocus {
+    sidebar: FocusHandle,
+    conversation: FocusHandle,
+    composer: FocusHandle,
+    terminal: FocusHandle,
+    right_panel: FocusHandle,
+    home: FocusHandle,
+    last_area: Option<WorkspaceFocusArea>,
+}
+
 pub struct Workspace {
     state: Entity<AppState>,
     focus_observer: Entity<crate::announcements::FocusObserver>,
     _star_focus: Entity<crate::github_star_prompt::FocusObserver>,
+    area_focus: WorkspaceAreaFocus,
+    keybindings_toast: KeybindingsUpdateToastController,
+    seen_keybindings_updated_seq: u64,
+    seen_keybindings_connection: Option<u64>,
     sidebar: Entity<SidebarPane>,
     thread: Entity<ThreadView>,
     composer: Entity<Composer>,
@@ -129,11 +147,18 @@ impl Workspace {
             );
             state.set_sidebar_viewport(viewport, cx);
         });
+        let (initial_kb_seq, initial_kb_conn) = {
+            let s = state.read(cx);
+            (s.server_config.keybindings_updated_seq(), s.connection_id())
+        };
         let subscriptions = vec![
-            cx.subscribe(&state, |_, state, event: &AppEvent, cx| {
+            cx.subscribe(&state, |this, state, event: &AppEvent, cx| {
                 // Navigating from the sheet closes it, as the web's thread and project rows do.
                 if matches!(event, AppEvent::Selection) {
                     state.update(cx, |state, cx| state.close_sidebar_sheet(cx));
+                }
+                if matches!(event, AppEvent::ServerConfig | AppEvent::Phase) {
+                    this.handle_keybindings_config_toast(cx);
                 }
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel | AppEvent::SidebarVisibility) {
                     cx.notify();
@@ -166,6 +191,18 @@ impl Workspace {
             state,
             focus_observer,
             _star_focus: star_focus,
+            area_focus: WorkspaceAreaFocus {
+                sidebar: cx.focus_handle(),
+                conversation: cx.focus_handle(),
+                composer: cx.focus_handle(),
+                terminal: cx.focus_handle(),
+                right_panel: cx.focus_handle(),
+                home: cx.focus_handle(),
+                last_area: None,
+            },
+            keybindings_toast: KeybindingsUpdateToastController::default(),
+            seen_keybindings_updated_seq: initial_kb_seq,
+            seen_keybindings_connection: initial_kb_conn,
             sidebar,
             thread,
             composer,
@@ -304,6 +341,8 @@ impl Render for Workspace {
         let maximized = panel.is_some_and(|panel| panel.is_open && panel.maximized);
         let terminal_open = self.terminal.read(cx).is_open(cx);
         let draft_thread_route = !has_thread && has_draft;
+        let composer_requires_modifier = (has_thread || has_draft)
+            && t3_core::composer::requires_modifier(state.client_settings.send_shortcut, &self.composer.read(cx).prompt_text(cx));
         let drawer = self.terminal.clone();
         let details_layout = thread_details::layout(&self.state, window, cx);
         let on_pull_requests = state.pull_requests_open;
@@ -357,7 +396,17 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenPermissions, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.open_permissions(window, cx));
             }))
-            .key_context(keymap::root_context_with(right_panel_open, running, terminal_open, preview_open, draft_thread_route))
+            .key_context(keymap::root_context_full(
+                right_panel_open,
+                running,
+                terminal_open,
+                preview_open,
+                draft_thread_route,
+                composer_requires_modifier,
+            ))
+            .on_action(cx.listener(|this, _: &FocusNextWorkspaceArea, window, cx| this.move_workspace_focus(true, window, cx)))
+            .on_action(cx.listener(|this, _: &FocusPreviousWorkspaceArea, window, cx| this.move_workspace_focus(false, window, cx)))
+            .on_action(cx.listener(|this, _: &SendBackground, window, cx| this.send_background(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.state.update(cx, |state, cx| state.toggle_sidebar_or_sheet(cx))))
             .on_action(cx.listener(|this, _: &SelectTheme, window, cx| this.palette.update(cx, |palette, cx| palette.open_change_theme(window, cx))))
             .on_action(cx.listener(|this, _: &CycleAppearance, _, cx| this.cycle_appearance(cx)))
@@ -463,6 +512,7 @@ impl Render for Workspace {
             .when(sidebar_width > 0., |this| {
                 this.child(
                     div()
+                        .track_focus(&self.area_focus.sidebar)
                         .w(px(sidebar_width))
                         .h_full()
                         .flex_none()
@@ -494,19 +544,21 @@ impl Render for Workspace {
                                         .relative()
                                         .flex_1()
                                         .min_h_0()
-                                        .child(div().size_full().child(self.thread.clone()))
+                                        .child(div().track_focus(&self.area_focus.conversation).size_full().child(self.thread.clone()))
                                         .child(ThreadView::floating_bottom_overlay(
                                             &self.thread,
                                             self.composer_overlay_height.clone(),
                                             v_flex()
                                                 .w_full()
                                                 .child(self.lineage.clone())
-                                                .when(!composer_replaced, |this| this.child(self.composer.clone())),
+                                                .when(!composer_replaced, |this| {
+                                                    this.child(div().track_focus(&self.area_focus.composer).w_full().child(self.composer.clone()))
+                                                }),
                                         )),
                                 )
                                 .child(self.details.clone()),
                         )
-                        .child(self.terminal.clone())
+                        .child(div().track_focus(&self.area_focus.terminal).w_full().child(self.terminal.clone()))
                     })
                     .when(has_draft, |this| {
                         this.child(
@@ -515,15 +567,17 @@ impl Render for Workspace {
                                 .flex_1()
                                 .min_h_0()
                                 .pr(px(details_layout.lane_inset))
-                                .child(div().flex_1().min_h_0().child(self.draft.clone()))
+                                .child(div().track_focus(&self.area_focus.composer).flex_1().min_h_0().child(self.draft.clone()))
                                 .child(self.details.clone()),
                         )
-                        .child(self.terminal.clone())
+                        .child(div().track_focus(&self.area_focus.terminal).w_full().child(self.terminal.clone()))
                     })
-                    .when(!has_thread && !has_draft, |this| this.child(div().flex_1().min_h_0().child(self.home.clone()))),
+                    .when(!has_thread && !has_draft, |this| {
+                        this.child(div().track_focus(&self.area_focus.home).flex_1().min_h_0().child(self.home.clone()))
+                    }),
                 )
             })
-            .when(!on_pull_requests, |this| this.child(self.right_panel.clone()))
+            .when(!on_pull_requests, |this| this.child(div().track_focus(&self.area_focus.right_panel).h_full().child(self.right_panel.clone())))
             .when(sidebar_width > 0., |this| this.child(self.render_sidebar_rail(sidebar_width, cx)))
             .when_some(sheet, |this, width| this.child(self.render_sidebar_sheet(width, cx)))
             .child(self.render_sidebar_toggle(cx))
@@ -624,6 +678,7 @@ impl Workspace {
             )
             .child(
                 div()
+                    .track_focus(&self.area_focus.sidebar)
                     .absolute()
                     .top_0()
                     .bottom_0()
@@ -853,5 +908,131 @@ impl Workspace {
                 state.sidebar.model = model;
             }
         });
+    }
+
+    /// `startKeybindingsUpdateToasts` (`KeybindingsUpdateToast.tsx`): shows a deduplicated warning
+    /// toast on live `keybindingsUpdated` stream events that carry `keybindings.*` config issues.
+    fn handle_keybindings_config_toast(&mut self, cx: &mut Context<Self>) {
+        let (conn_id, seq, issues) = {
+            let state = self.state.read(cx);
+            (
+                state.connection_id(),
+                state.server_config.keybindings_updated_seq(),
+                state.server_config.config.as_ref().map(|config| config.issues.clone()).unwrap_or_default(),
+            )
+        };
+        if conn_id != self.seen_keybindings_connection {
+            self.seen_keybindings_connection = conn_id;
+            self.seen_keybindings_updated_seq = seq;
+            self.keybindings_toast.reset();
+            return;
+        }
+        if seq == self.seen_keybindings_updated_seq {
+            return;
+        }
+        self.seen_keybindings_updated_seq = seq;
+        if let Some(KeybindingsUpdateToastDecision::InvalidConfiguration(message)) =
+            self.keybindings_toast.handle(&issues, crate::sidebar::controller::now_ms())
+        {
+            self.state.update(cx, |state, cx| {
+                state.show_toast(
+                    crate::toast::Toast::new(crate::toast::ToastKind::Warning, "Invalid keybindings configuration")
+                        .description(message),
+                    cx,
+                );
+            });
+        }
+    }
+
+    /// `workspace.focusNext` / `workspace.focusPrevious` (`workspaceFocus.ts`): cycles focus
+    /// between visible top-level workspace regions without escaping active modals or overlays.
+    fn move_workspace_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let overlay_open = self.menu.read(cx).is_open()
+            || self.dialog.read(cx).is_open()
+            || self.snooze.read(cx).is_open()
+            || self.palette.read(cx).is_open()
+            || crate::updates::overlay(cx).is_some()
+            || crate::voice::is_setup_modal_open(cx)
+            || self.welcome.read(cx).is_open()
+            || crate::settings::overlay(window, cx).is_some()
+            || crate::usage::overlay(window, cx).is_some()
+            || crate::theme_editor::overlay(window, cx).is_some();
+        if overlay_open {
+            return;
+        }
+        let state = self.state.read(cx);
+        let viewport = f32::from(window.viewport_size().width);
+        let sidebar_visible = sidebar_inline_width(state, viewport) > 0. || state.sidebar_sheet.is_open();
+        let on_pull_requests = state.pull_requests_open;
+        let has_thread = state.selected_thread.is_some();
+        let has_draft = !has_thread && state.draft_project.is_some();
+        let panel = state.panel_thread().as_deref().map(|thread| state.panels.panels.panel(thread));
+        let right_panel_open = panel.is_some_and(|panel| panel.is_open);
+        let maximized = panel.is_some_and(|panel| panel.is_open && panel.maximized);
+        let terminal_open = self.terminal.read(cx).is_open(cx);
+
+        let mut visible = Vec::new();
+        if sidebar_visible {
+            visible.push(WorkspaceFocusArea::Sidebar);
+        }
+        if on_pull_requests {
+            visible.push(WorkspaceFocusArea::PullRequests);
+        } else if !maximized {
+            if has_thread {
+                visible.push(WorkspaceFocusArea::Conversation);
+                if !self.composer_replaced {
+                    visible.push(WorkspaceFocusArea::Composer);
+                }
+            } else if has_draft {
+                visible.push(WorkspaceFocusArea::Composer);
+            } else {
+                visible.push(WorkspaceFocusArea::Home);
+            }
+            if (has_thread || has_draft) && terminal_open {
+                visible.push(WorkspaceFocusArea::Terminal);
+            }
+        }
+        if !on_pull_requests && right_panel_open {
+            visible.push(WorkspaceFocusArea::RightPanel);
+        }
+
+        let current = visible.iter().copied().find(|area| match area {
+            WorkspaceFocusArea::Sidebar => self.area_focus.sidebar.contains_focused(window, cx),
+            WorkspaceFocusArea::Conversation => self.area_focus.conversation.contains_focused(window, cx),
+            WorkspaceFocusArea::Composer => self.area_focus.composer.contains_focused(window, cx),
+            WorkspaceFocusArea::Terminal => self.area_focus.terminal.contains_focused(window, cx),
+            WorkspaceFocusArea::RightPanel => self.area_focus.right_panel.contains_focused(window, cx),
+            WorkspaceFocusArea::PullRequests => self.pull_requests.read(cx).focus_handle(cx).contains_focused(window, cx),
+            WorkspaceFocusArea::Home => self.area_focus.home.contains_focused(window, cx),
+        });
+        let Some(next) = next_workspace_focus_area(&visible, current.or(self.area_focus.last_area), forward) else {
+            return;
+        };
+        self.area_focus.last_area = Some(next);
+        match next {
+            WorkspaceFocusArea::Sidebar => window.focus(&self.area_focus.sidebar, cx),
+            WorkspaceFocusArea::Conversation => window.focus(&self.area_focus.conversation, cx),
+            WorkspaceFocusArea::Composer => self.composer.update(cx, |composer, cx| composer.focus(window, cx)),
+            WorkspaceFocusArea::Terminal => window.focus(&self.area_focus.terminal, cx),
+            WorkspaceFocusArea::RightPanel => window.focus(&self.area_focus.right_panel, cx),
+            WorkspaceFocusArea::PullRequests => {
+                let handle = self.pull_requests.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            }
+            WorkspaceFocusArea::Home => window.focus(&self.area_focus.home, cx),
+        }
+    }
+
+    /// `composer.sendBackground`: starts a draft thread in the background and keeps the draft open.
+    fn send_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_replaced {
+            return;
+        }
+        let state = self.state.read(cx);
+        if state.selected_thread.is_none() && state.draft_project.is_some() {
+            self.composer.update(cx, |composer, cx| {
+                composer.submit(t3_core::composer::SubmitIntent::Background, window, cx);
+            });
+        }
     }
 }
