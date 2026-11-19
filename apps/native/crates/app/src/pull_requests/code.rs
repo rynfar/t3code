@@ -78,29 +78,22 @@ pub struct CodeTab {
     last_requested_cursor: Option<String>,
 }
 
+pub struct CodeTabInit<'a> {
+    pub detail: Option<&'a Detail>,
+    pub activity: Option<&'a Activity>,
+    pub can_write: bool,
+    pub prefetched: Option<DiffResult>,
+}
+
 impl CodeTab {
     pub fn new(
         state: Entity<AppState>,
         detail_view: WeakEntity<DetailView>,
         reference: PrRef,
-        detail: Option<&Detail>,
-        activity: Option<&Activity>,
-        can_write: bool,
+        init: CodeTabInit<'_>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_prefetched(state, detail_view, reference, detail, activity, can_write, None, cx)
-    }
-
-    pub fn new_with_prefetched(
-        state: Entity<AppState>,
-        detail_view: WeakEntity<DetailView>,
-        reference: PrRef,
-        detail: Option<&Detail>,
-        activity: Option<&Activity>,
-        can_write: bool,
-        prefetched: Option<DiffResult>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+        let CodeTabInit { detail, activity, can_write, prefetched } = init;
         let panel = cx.new(|cx| DiffPanel::detached(state.clone(), cx));
         let this = cx.entity().downgrade();
         let rows = panel.downgrade();
@@ -808,7 +801,15 @@ mod tests {
             crate::theme::init(cx);
             crate::settings::store::init(cx);
             let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
-            let code = cx.new(|cx| CodeTab::new(state, WeakEntity::new_invalid(), reference, Some(&detail), Some(&activity), true, cx));
+            let code = cx.new(|cx| {
+                CodeTab::new(
+                    state,
+                    WeakEntity::new_invalid(),
+                    reference,
+                    CodeTabInit { detail: Some(&detail), activity: Some(&activity), can_write: true, prefetched: None },
+                    cx,
+                )
+            });
 
             // Full PR diff keeps inline comment drafting and PR-head review threads active.
             assert_eq!(code.read(cx).commit_review_active(), (true, 1));
@@ -867,7 +868,13 @@ mod tests {
             crate::settings::store::init(cx);
             let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
             let code = cx.new(|cx| {
-                CodeTab::new_with_prefetched(state, WeakEntity::new_invalid(), reference, None, None, true, Some(prefetched), cx)
+                CodeTab::new(
+                    state,
+                    WeakEntity::new_invalid(),
+                    reference,
+                    CodeTabInit { detail: None, activity: None, can_write: true, prefetched: Some(prefetched) },
+                    cx,
+                )
             });
             let tab = code.read(cx);
             assert_eq!(tab.slices.len(), 1);

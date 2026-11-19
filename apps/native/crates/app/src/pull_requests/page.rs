@@ -17,32 +17,36 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use t3_client::store;
+use t3_client::supervisor::ConnectionStatus;
 use t3_core::issues::saved_views::{
     create_saved_view, decode_saved_views, delete_saved_view, rename_saved_view,
     update_saved_view_preferences,
 };
 use t3_core::pull_requests::assignment::{
-    AssignableProject, AssignedProjectColumnRow, EnvironmentInfo, HostAvailability, project_assignment_rows, remember_hosts, reset_hosts,
+    AssignableProject, AssignedProjectColumnRow, EnvironmentInfo, HostAvailability,
+    project_assignment_rows_with_unreachable, pull_request_project_queries_with_unreachable,
+    remember_hosts, reset_hosts,
 };
 use t3_core::pull_requests::cache::{LIST_CACHE_KEY, PersistedListCache, PersistedStatsCache, STATS_CACHE_KEY};
 use t3_core::pull_requests::editing::patch_list_entry;
-use t3_core::pull_requests::list::{Group, Shown, entry_key, needs_stats, shown_groups};
+use t3_core::pull_requests::list::{Group, Shown, entry_key, merge_pull_request_lists, needs_stats, shown_groups};
 use t3_core::pull_requests::query::parse_query;
 use t3_core::pull_requests::saved_views::{
     PR_SAVED_VIEWS_KEY, PR_SAVED_VIEW_PLACEHOLDER, PrSavedView, apply_saved_view_patch,
 };
-use t3_core::pull_requests::wire::{Action, Activity, Detail, FilterOptions, ListResult, ListStats, MergeMethod, PrState, Stack, Summary, decode};
+use t3_core::pull_requests::wire::{Action, Activity, Detail, FilterOptions, ListResult, ListStats, MergeMethod, PrState, ProviderSummary, Stack, Summary, decode};
 use t3_core::pull_requests::{
     ListPreferences, MAX_PAGE_SIZE, PAGE_SIZE, PREFERENCES_KEY, PrRef, SEARCH_DEBOUNCE_MS, action_done_label, action_failed_label, action_input, list_accepts, list_input, method,
     project_default_merge_method, stats_inputs,
 };
+use t3_core::sidebar::grouping::EnvironmentOwner;
 
 use super::controls::{Button, Size, Variant};
 use super::detail::{DetailView, has_held_detail, prefetch_into_held};
 use super::mutations::{self, MergePicks, Mutations};
 use super::preview::{LinkPreviewController, PreviewTarget};
 use super::thread_panel::PendingSelection;
-use super::{read, settle};
+use super::{read, read_for_owner, settle};
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::sidebar::controller::now_ms;
@@ -97,6 +101,62 @@ impl Drop for Refreshes {
 const REFRESH_RETRY_MIN: Duration = Duration::from_secs(1);
 const REFRESH_RETRY_MAX: Duration = Duration::from_secs(30);
 
+struct PrFleetTarget {
+    owner: Option<EnvironmentOwner>,
+    connected: bool,
+}
+
+struct FleetInventory {
+    projects: Vec<AssignableProject>,
+    env_ids: Vec<String>,
+    envs: Vec<EnvironmentInfo>,
+    targets: HashMap<String, PrFleetTarget>,
+    unreachable: HashSet<String>,
+}
+
+/// Merges multi-environment `pullRequests.list` results using `merge_pull_request_lists` so
+/// cross-server duplicates are collapsed by `entry.url` (`pingdotgg/t3code#37704`).
+fn merge_fleet_list_results(answers: &[(String, ListResult)]) -> ListResult {
+    let slices: Vec<(&str, &[t3_core::pull_requests::wire::ListEntry])> = answers
+        .iter()
+        .map(|(env_id, result)| (env_id.as_str(), result.entries.as_slice()))
+        .collect();
+    let entries = merge_pull_request_lists(&slices).into_iter().map(|item| item.entry).collect();
+    let mut viewers: HashMap<String, String> = HashMap::new();
+    let mut providers: HashMap<String, ProviderSummary> = HashMap::new();
+    let mut errors = Vec::new();
+    let mut truncated = false;
+    let mut next_cursors: HashMap<String, String> = HashMap::new();
+    for (_, answer) in answers {
+        for (host, login) in &answer.viewers {
+            viewers.entry(host.clone()).or_insert_with(|| login.clone());
+        }
+        for provider in &answer.providers {
+            providers
+                .entry(provider.host.clone())
+                .and_modify(|held| {
+                    held.project_count += provider.project_count;
+                    held.searches_on_host = held.searches_on_host && provider.searches_on_host;
+                    held.configured = held.configured || provider.configured;
+                })
+                .or_insert_with(|| provider.clone());
+        }
+        errors.extend(answer.errors.iter().cloned());
+        truncated |= answer.truncated;
+        for (k, v) in &answer.next_cursors {
+            next_cursors.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    ListResult {
+        entries,
+        viewers,
+        providers: providers.into_values().collect(),
+        errors,
+        truncated,
+        next_cursors,
+    }
+}
+
 pub(super) struct SavedViewEditor {
     pub editing_id: Option<String>,
     pub input: Entity<InputState>,
@@ -131,6 +191,8 @@ pub struct PullRequestsPage {
     restat: bool,
     /// Host availability and stacked project-assignment column state (`pullRequestProjectAssignment.logic.ts`).
     host_availability: HostAvailability,
+    /// Environments whose latest fleet PR list read failed or are disconnected (`pingdotgg/t3code#34088`).
+    unreachable_environments: HashSet<String>,
     projects_column_open: bool,
     /// Per-project counts preserved across project-scoped reads, keyed by `(env, unfiltered_scope_key)`.
     project_counts_scope: Option<(String, String)>,
@@ -209,6 +271,7 @@ impl PullRequestsPage {
             requested: HashSet::new(),
             restat: false,
             host_availability: HashMap::new(),
+            unreachable_environments: HashSet::new(),
             projects_column_open: true,
             project_counts_scope: None,
             project_counts: HashMap::new(),
@@ -553,12 +616,65 @@ impl PullRequestsPage {
         self.fetch(None, false, cx);
     }
 
-    /// `refreshing` re-reads the first page under rows that later cursors added.
+    /// `refreshing` re-reads the first page under rows that later cursors added. Queries across
+    /// all reachable fleet environments using `pull_request_project_queries_with_unreachable`
+    /// (`pingdotgg/t3code#34088`) and deduplicates cross-server results by URL (`pingdotgg/t3code#37704`).
     fn fetch(&mut self, cursors: Option<HashMap<String, String>>, refreshing: bool, cx: &mut Context<Self>) {
         let appending = cursors.is_some();
         let key = self.scope_key();
+        let state = self.state.read(cx);
+        let FleetInventory { projects, env_ids, targets, unreachable, .. } = self.fleet_inventory(cx);
+        if targets.len() > 1 {
+            let slices = pull_request_project_queries_with_unreachable(
+                &projects,
+                &env_ids,
+                Some(&self.host_availability),
+                Some(&unreachable),
+            );
+            let mut dispatched = Vec::new();
+            for slice in slices {
+                let Some(target) = targets.get(&slice.environment_id).filter(|t| t.connected) else {
+                    continue;
+                };
+                if let Some(scoped) = self.prefs.project_id.as_deref() {
+                    let owns_scoped = match &slice.project_ids {
+                        Some(ids) => ids.iter().any(|id| id == scoped),
+                        None => projects
+                            .iter()
+                            .any(|p| p.environment_id == slice.environment_id && p.id == scoped),
+                    };
+                    if !owns_scoped {
+                        continue;
+                    }
+                }
+                let mut input = list_input(&self.prefs, &self.sent, self.data.page_size, cursors.as_ref());
+                if self.prefs.project_id.is_none()
+                    && let Some(project_ids) = &slice.project_ids
+                    && let Some(obj) = input.as_object_mut()
+                {
+                    obj.insert("projectIds".into(), serde_json::json!(project_ids));
+                }
+                let task = read_for_owner(state, target.owner.as_ref(), method::LIST, input, decode::<ListResult>);
+                dispatched.push((slice.environment_id, task));
+            }
+            if !dispatched.is_empty() {
+                self.data.pending = true;
+                self.data.loading_more = appending;
+                self._list = Some(cx.spawn(async move |this, cx| {
+                    let mut settled = Vec::with_capacity(dispatched.len());
+                    for (env_id, task) in dispatched {
+                        settled.push((env_id, settle(task).await));
+                    }
+                    let _ = this.update(cx, |this, cx| {
+                        this.apply_fleet_lists(key, appending, refreshing, settled, cx);
+                    });
+                }));
+                cx.notify();
+                return;
+            }
+        }
         let input = list_input(&self.prefs, &self.sent, self.data.page_size, cursors.as_ref());
-        let task = read(self.state.read(cx), method::LIST, input, decode::<ListResult>);
+        let task = read(state, method::LIST, input, decode::<ListResult>);
         self.data.pending = true;
         self.data.loading_more = appending;
         self._list = Some(cx.spawn(async move |this, cx| {
@@ -566,6 +682,44 @@ impl PullRequestsPage {
             let _ = this.update(cx, |this, cx| this.apply_list(key, appending, refreshing, result, cx));
         }));
         cx.notify();
+    }
+
+    /// Merges multi-environment `pullRequests.list` responses, deduplicating PRs across servers
+    /// by URL (`pingdotgg/t3code#37704`) and tracking unreachable environments (`pingdotgg/t3code#34088`).
+    pub(crate) fn apply_fleet_lists(
+        &mut self,
+        key: String,
+        appending: bool,
+        refreshing: bool,
+        answers: Vec<(String, Result<ListResult, String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if key != self.scope_key() {
+            return;
+        }
+        let mut ok_answers: Vec<(String, ListResult)> = Vec::new();
+        let mut first_error: Option<String> = None;
+        for (env_id, outcome) in answers {
+            match outcome {
+                Ok(result) => {
+                    self.unreachable_environments.remove(&env_id);
+                    self.host_availability = remember_hosts(&self.host_availability, &[(env_id.as_str(), &result.providers, now_ms())]);
+                    ok_answers.push((env_id, result));
+                }
+                Err(error) => {
+                    self.unreachable_environments.insert(env_id);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if ok_answers.is_empty() {
+            self.apply_list(key, appending, refreshing, Err(first_error.unwrap_or_else(|| super::NOT_CONNECTED.to_owned())), cx);
+            return;
+        }
+        let merged = merge_fleet_list_results(&ok_answers);
+        self.apply_list(key, appending, refreshing, Ok(merged), cx);
     }
 
     fn apply_list(&mut self, key: String, appending: bool, refreshing: bool, result: Result<ListResult, String>, cx: &mut Context<Self>) {
@@ -727,6 +881,7 @@ impl PullRequestsPage {
         self.stats.clear();
         self.requested.clear();
         self.row_stacks.clear();
+        self.unreachable_environments.clear();
         self.host_availability = reset_hosts(&self.host_availability);
         if let Some(env) = self.environment_key(cx) {
             self.list_cache.clear_environment(&env);
@@ -1052,12 +1207,89 @@ impl PullRequestsPage {
         self.state.update(cx, |state, cx| state.show_toast(toast, cx));
     }
 
-    /// Computes the project-assignment rows and `"All projects"` total for the active environment
-    /// (matching the server `PullRequestsPage::fetch` queries, so foreign fleet projects are never
-    /// shown with bogus `0` counts or misrouted on click).
-    pub(crate) fn assignment_rows(&self, cx: &App) -> (Vec<AssignedProjectColumnRow>, usize) {
+    fn fleet_inventory(&self, cx: &App) -> FleetInventory {
         let state = self.state.read(cx);
-        let env_id = self.environment_key(cx).unwrap_or_else(|| "local".into());
+        let active_id = self.environment_key(cx);
+        let mut unreachable = self.unreachable_environments.clone();
+        if !state.fleet.environments.is_empty() {
+            let mut env_ids: Vec<String> = Vec::new();
+            let mut envs: Vec<EnvironmentInfo> = Vec::new();
+            let mut targets: HashMap<String, PrFleetTarget> = HashMap::new();
+            let mut projects: Vec<AssignableProject> = Vec::new();
+            let mut ordered: Vec<_> = state
+                .fleet
+                .environments
+                .iter()
+                .filter(|env| {
+                    !state
+                        .environments
+                        .environments
+                        .iter()
+                        .any(|saved| saved.id == env.summary.owner.saved_id && saved.disabled)
+                })
+                .collect();
+            // Active environment sorts first so it is preferred when sharing repositories.
+            ordered.sort_by_key(|env| {
+                let is_active = active_id.as_deref().is_some_and(|id| {
+                    env.summary.owner.saved_id == id || env.summary.owner.canonical_id.as_deref() == Some(id)
+                });
+                !is_active
+            });
+            for env in ordered {
+                let env_id = env.summary.owner.saved_id.clone();
+                let label = env
+                    .config
+                    .config
+                    .as_ref()
+                    .map(|c| c.environment.label.clone())
+                    .filter(|l| !l.trim().is_empty())
+                    .or_else(|| {
+                        state
+                            .environments
+                            .environments
+                            .iter()
+                            .find(|saved| saved.id == env_id)
+                            .map(|saved| saved.label.clone())
+                    })
+                    .unwrap_or_else(|| env_id.clone());
+                let connected = env.status == ConnectionStatus::Connected;
+                if !connected {
+                    unreachable.insert(env_id.clone());
+                }
+                env_ids.push(env_id.clone());
+                envs.push(EnvironmentInfo { environment_id: env_id.clone(), label: label.clone() });
+                targets.insert(
+                    env_id.clone(),
+                    PrFleetTarget {
+                        owner: Some(env.summary.owner.clone()),
+                        connected,
+                    },
+                );
+                for scoped in &env.summary.projects {
+                    if scoped.project.archived_at.is_some() {
+                        continue;
+                    }
+                    let repo_key = scoped
+                        .project
+                        .repository_identity
+                        .as_ref()
+                        .and_then(|id| id.get("canonicalKey").and_then(serde_json::Value::as_str))
+                        .map(str::to_owned);
+                    let host = repo_key.as_deref().and_then(|key| key.split('/').next()).map(str::to_owned);
+                    projects.push(AssignableProject {
+                        id: scoped.project.id.clone(),
+                        environment_id: env_id.clone(),
+                        title: scoped.project.title.clone(),
+                        workspace_root: scoped.project.workspace_root.clone(),
+                        repository_key: repo_key,
+                        host,
+                    });
+                }
+            }
+            return FleetInventory { projects, env_ids, envs, targets, unreachable };
+        }
+
+        let env_id = active_id.unwrap_or_else(|| "local".into());
         let env_label = state
             .server_config
             .config
@@ -1065,8 +1297,12 @@ impl PullRequestsPage {
             .map(|c| c.environment.label.clone())
             .or_else(|| state.active_environment().map(|e| e.label.clone()))
             .unwrap_or_else(|| "Local".to_owned());
+        let connected = state.client_handle().is_some()
+            && matches!(state.phase, crate::app_state::Phase::Online(ConnectionStatus::Connected));
         let env_ids = vec![env_id.clone()];
         let envs = vec![EnvironmentInfo { environment_id: env_id.clone(), label: env_label }];
+        let mut targets = HashMap::new();
+        targets.insert(env_id.clone(), PrFleetTarget { owner: None, connected });
         let mut projects: Vec<AssignableProject> = Vec::new();
         if let Some(snapshot) = &state.shell.snapshot {
             for project in snapshot.projects.iter().filter(|p| p.archived_at.is_none()) {
@@ -1086,7 +1322,23 @@ impl PullRequestsPage {
                 });
             }
         }
-        let rows = project_assignment_rows(&projects, &env_ids, &envs, Some(&self.host_availability), &self.project_counts, &self.project_unavailable);
+        FleetInventory { projects, env_ids, envs, targets, unreachable }
+    }
+
+    /// Computes the project-assignment rows and `"All projects"` total across all fleet environments,
+    /// yielding shared repositories away from unreachable or unconfigured environments
+    /// (`pingdotgg/t3code#34088`).
+    pub(crate) fn assignment_rows(&self, cx: &App) -> (Vec<AssignedProjectColumnRow>, usize) {
+        let FleetInventory { projects, env_ids, envs, unreachable, .. } = self.fleet_inventory(cx);
+        let rows = project_assignment_rows_with_unreachable(
+            &projects,
+            &env_ids,
+            &envs,
+            Some(&self.host_availability),
+            &self.project_counts,
+            &self.project_unavailable,
+            Some(&unreachable),
+        );
         let total = self.all_projects_total.unwrap_or_else(|| self.data.result.as_ref().map_or(0, |r| r.entries.len()));
         (rows, total)
     }
@@ -1476,6 +1728,172 @@ mod tests {
             page.delete_active_saved_view(&id, cx);
             assert!(page.saved_views.is_empty());
             assert!(page.selected_view_id.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn fleet_multi_environment_assignment_failover_and_cross_server_url_dedupe(cx: &mut gpui::TestAppContext) {
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| {
+                let make_env = |saved: &str, canonical: &str, label: &str, status: ConnectionStatus, projects: serde_json::Value| {
+                    let mut config = t3_core::server_config::ServerConfigState::default();
+                    config.apply(
+                        serde_json::from_value(json!({
+                            "type": "snapshot",
+                            "config": {
+                                "environment": { "environmentId": canonical, "label": label },
+                                "cwd": "/tmp",
+                                "providers": []
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                    let mut shell = t3_core::shell::ShellState::default();
+                    shell.synchronized = true;
+                    shell.snapshot = Some(
+                        serde_json::from_value(json!({
+                            "snapshotSequence": 1,
+                            "projects": projects,
+                            "threads": [],
+                            "updatedAt": "2026-01-02T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    );
+                    let owner = EnvironmentOwner {
+                        saved_id: saved.into(),
+                        canonical_id: Some(canonical.into()),
+                        generation: 1,
+                        connection_generation: 1,
+                        shell_generation: 1,
+                    };
+                    Arc::new(t3_client::environments::EnvironmentView {
+                        summary: Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(owner, &shell, &config)),
+                        status,
+                        config,
+                        grants: None,
+                        settings_revision: 0,
+                        keybindings_revision: 0,
+                    })
+                };
+
+                let project_json = |id: &str, title: &str, repo: &str| {
+                    json!({
+                        "id": id,
+                        "title": title,
+                        "workspaceRoot": format!("/tmp/{id}"),
+                        "repositoryIdentity": {
+                            "canonicalKey": format!("github.com/{repo}"),
+                            "provider": "github",
+                            "displayName": repo
+                        },
+                        "defaultModelSelection": null,
+                        "scripts": [],
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    })
+                };
+
+                state.environments.active = Some("saved-local".into());
+                state.fleet = Arc::new(t3_client::environments::FleetView {
+                    revision: 1,
+                    environments: vec![
+                        make_env(
+                            "saved-local",
+                            "canon-local",
+                            "MacBook",
+                            ConnectionStatus::Reconnecting { reason: "offline".into(), attempt: 1 },
+                            json!([
+                                project_json("p-shared-local", "Shared", "acme/shared"),
+                                project_json("p-only-local", "OnlyLocal", "acme/only-local")
+                            ]),
+                        ),
+                        make_env(
+                            "saved-remote",
+                            "canon-remote",
+                            "Linux Box",
+                            ConnectionStatus::Connected,
+                            json!([project_json("p-shared-remote", "Shared", "acme/shared")]),
+                        ),
+                    ],
+                });
+            });
+            state
+        });
+
+        let (page, cx) = cx.add_window_view(|window, cx| PullRequestsPage::new(state.clone(), window, cx));
+        let make_pr = |project_id: &str, number: u64, title: &str, url: &str| -> serde_json::Value {
+            json!({
+                "provider": "github", "host": "github.com", "projectId": project_id, "projectTitle": "Shared",
+                "repository": "acme/shared", "number": number, "title": title,
+                "url": url, "author": { "login": "alice" },
+                "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 3, "deletions": 1,
+                "viewerReviewRequested": false, "headBranch": "feat", "baseBranch": "main",
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z"
+            })
+        };
+
+        page.update(cx, |page, cx| {
+            // 1. Disconnected active env yields shared repo to connected remote env (`#34088`),
+            // while keeping its exclusive repository assigned to itself.
+            let (rows, _) = page.assignment_rows(cx);
+            let shared = rows.iter().find(|r| r.project_title == "Shared").expect("shared row");
+            assert_eq!(shared.environment_id, "saved-remote");
+            assert_eq!(shared.project_id, "p-shared-remote");
+            let local_only = rows.iter().find(|r| r.project_title == "OnlyLocal").expect("local-only row");
+            assert_eq!(local_only.environment_id, "saved-local");
+
+            // 2. Cross-server URL deduplication (`#37704`): identical PR URL from two servers
+            // collapses to a single row while preserving the preferred server's copy.
+            let key = page.scope_key();
+            let local_list: ListResult = decode(json!({
+                "entries": [make_pr("p-shared-local", 42, "From MacBook", "https://github.com/acme/shared/pull/42")],
+                "providers": [], "errors": [], "hasMore": false
+            }))
+            .unwrap();
+            let remote_list: ListResult = decode(json!({
+                "entries": [
+                    make_pr("p-shared-remote", 42, "From Linux", "https://github.com/acme/shared/pull/42"),
+                    make_pr("p-shared-remote", 43, "Remote Only", "https://github.com/acme/shared/pull/43")
+                ],
+                "providers": [], "errors": [], "hasMore": false
+            }))
+            .unwrap();
+            page.apply_fleet_lists(
+                key.clone(),
+                false,
+                false,
+                vec![("saved-local".into(), Ok(local_list)), ("saved-remote".into(), Ok(remote_list.clone()))],
+                cx,
+            );
+            let entries = &page.data.result.as_ref().unwrap().entries;
+            assert_eq!(entries.len(), 2);
+            let pr42 = entries.iter().find(|e| e.number == 42).unwrap();
+            assert_eq!(pr42.title, "From MacBook");
+
+            // 3. Partial fleet failure marks the failing env unreachable while still painting the
+            // healthy env's rows (`#34088`), and clears when it recovers.
+            page.apply_fleet_lists(
+                key,
+                false,
+                false,
+                vec![
+                    ("saved-local".into(), Err("environment offline".into())),
+                    ("saved-remote".into(), Ok(remote_list)),
+                ],
+                cx,
+            );
+            assert!(page.unreachable_environments.contains("saved-local"));
+            assert!(!page.unreachable_environments.contains("saved-remote"));
+            assert_eq!(page.data.result.as_ref().unwrap().entries.len(), 2);
+            assert!(page.data.error.is_none());
         });
     }
 }

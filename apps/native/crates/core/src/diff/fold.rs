@@ -154,7 +154,7 @@ pub fn cut_line_note(omitted_characters: usize) -> String {
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (ix, ch) in digits.chars().enumerate() {
         let remaining = digits.len() - ix;
-        if ix > 0 && remaining % 3 == 0 {
+        if ix > 0 && remaining.is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(ch);

@@ -543,6 +543,18 @@ diff --git a/src/app.test.ts b/src/app.test.ts
         assert!(panel.is_collapsed(0));
         panel.toggle_hide_test_files(cx);
         assert!(!panel.is_collapsed(1), "hidden test file kept its open choice across Collapse All");
+
+        // Revealing a hidden test file keeps it visible in this PR, but switching to another PR
+        // clears `revealed_path` so the test file is hidden again there.
+        panel.toggle_hide_test_files(cx);
+        panel.reveal_file_path(1, FileRevealTarget::file("src/app.test.ts"), cx);
+        assert_eq!(panel.revealed_path.as_deref(), Some("src/app.test.ts"));
+        let next_parsed = Parsed::new(patch, false, None, None, None);
+        panel.show_external(
+            External { key: "pr:13".into(), parsed: Some(next_parsed), pending: false, error: None },
+            cx,
+        );
+        assert!(panel.revealed_path.is_none(), "switching external scope clears revealed_path");
     });
 }
 

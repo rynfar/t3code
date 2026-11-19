@@ -126,13 +126,15 @@ pub struct DiffPanel {
     withheld_readable: bool,
     /// Files whose loaded diff has server-truncated long lines (`…[N more characters]`), disabling hunk expansion.
     cut_line_files: HashSet<String>,
-    on_load_withheld: Option<Rc<dyn Fn(String, &mut gpui::App)>>,
+    on_load_withheld: Option<LoadWithheldCallback>,
     last_viewed_file_key: Option<String>,
     _viewed_flush: Option<Task<()>>,
     /// Inline review conversations and resolved-avatar expansion state (`pingdotgg/t3code#34644`).
     pub(super) review_threads: InlineReviewThreadsState,
     _subscription: Subscription,
 }
+
+type LoadWithheldCallback = Rc<dyn Fn(String, &mut gpui::App)>;
 
 /// On-demand load status for a file withheld from an oversized PR diff (`pingdotgg/t3code#37007`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +305,9 @@ impl DiffPanel {
 
     /// The pull request Code tab uses the same initial fold preference as thread diffs.
     pub fn show_external(&mut self, external: External, cx: &mut Context<Self>) {
+        if self.external.as_ref().map(|existing| existing.key.as_str()) != Some(external.key.as_str()) {
+            self.revealed_path = None;
+        }
         self.external = Some(external);
         self.rebuild(cx);
         cx.notify();
@@ -343,6 +348,7 @@ impl DiffPanel {
             self.expansions.clear();
             self.expansion_scope_key = None;
             self.file_reveal.reset();
+            self.revealed_path = None;
             self.scroll_restore = ScrollRestore::default();
             self._grants = None;
             if let Some(client) = self.state.read(cx).client_handle() {
@@ -369,6 +375,7 @@ impl DiffPanel {
             self.workspace_mutation = None;
             self.selected_file = None;
             self.file_reveal.reset();
+            self.revealed_path = None;
             self.tree_collapsed.clear();
             self.branch_commits = None;
             self.branch_commits_error = None;
@@ -726,6 +733,7 @@ impl DiffPanel {
         }
         if self.scroll_restore.current_scope() != Some(scope_key.as_str()) {
             self.file_reveal.reset();
+            self.revealed_path = None;
         }
         if let DiffSelection::Turn { file_path: Some(path), reveal_request_id, .. } = &self.selection {
             self.file_reveal.request(&scope_key, *reveal_request_id, FileRevealTarget::file(path));

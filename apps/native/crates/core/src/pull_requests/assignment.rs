@@ -337,8 +337,36 @@ pub fn project_assignment_rows(
     pr_counts: &HashMap<String, usize>,
     unavailable_projects: &std::collections::HashSet<String>,
 ) -> Vec<AssignedProjectColumnRow> {
+    project_assignment_rows_with_unreachable(
+        projects,
+        environment_ids,
+        environments,
+        host_availability,
+        pr_counts,
+        unavailable_projects,
+        None,
+    )
+}
+
+/// Variant of [`project_assignment_rows`] that yields shared repositories away from unreachable
+/// environments (`pingdotgg/t3code#34088`).
+pub fn project_assignment_rows_with_unreachable(
+    projects: &[AssignableProject],
+    environment_ids: &[String],
+    environments: &[EnvironmentInfo],
+    host_availability: Option<&HostAvailability>,
+    pr_counts: &HashMap<String, usize>,
+    unavailable_projects: &std::collections::HashSet<String>,
+    unreachable_environment_ids: Option<&HashSet<String>>,
+) -> Vec<AssignedProjectColumnRow> {
     let preferred = environment_ids.first().map(String::as_str);
-    let assignment = assign_projects_to_environments(projects, environment_ids, preferred, host_availability);
+    let assignment = assign_projects_to_environments_with_unreachable(
+        projects,
+        environment_ids,
+        preferred,
+        host_availability,
+        unreachable_environment_ids,
+    );
     let env_labels: HashMap<&str, &str> = environments.iter().map(|e| (e.environment_id.as_str(), e.label.as_str())).collect();
     let mut rows = Vec::new();
     for env_id in environment_ids {

@@ -1020,6 +1020,11 @@ impl DetailView {
         let add_names: Vec<String> = changes.add.iter().map(|c| c.name.clone()).collect();
         let remove_names: Vec<String> = changes.remove.iter().map(|c| c.name.clone()).collect();
 
+        // Snapshot prior state before optimistic paint so failure rolls back synchronously
+        // even while offline or if the follow-up refresh fails (`pingdotgg/t3code#32774`).
+        let previous_labels = self.detail.as_ref().map(|detail| detail.labels.clone());
+        let previous_candidates = self.label_candidates.clone();
+
         // Optimistic immediate paint (`pingdotgg/t3code#32774`).
         let mut candidates = self.label_candidates.take();
         let held: &mut [_] = match candidates.as_mut() {
@@ -1058,6 +1063,11 @@ impl DetailView {
             let _ = this.update(cx, |this, cx| {
                 this.label_pending = false;
                 if let Some(error) = failed {
+                    if let (Some(prev_labels), Some(detail)) = (previous_labels, this.detail.as_mut()) {
+                        detail.labels = prev_labels;
+                    }
+                    this.label_candidates = previous_candidates;
+                    this.hold(cx);
                     let description = if error.trim().is_empty() {
                         "The host refused it. Check that you have triage access on this repository.".to_owned()
                     } else {
@@ -1162,7 +1172,15 @@ impl DetailView {
             let activity = self.activity.clone();
             let can_write = self.can_write_source_control(cx);
             let prefetched = self.prefetched_diff.take();
-            self.code = Some(cx.new(|cx| CodeTab::new_with_prefetched(state, detail_view, reference, detail.as_ref(), activity.as_ref(), can_write, prefetched, cx)));
+            self.code = Some(cx.new(|cx| {
+                CodeTab::new(
+                    state,
+                    detail_view,
+                    reference,
+                    super::code::CodeTabInit { detail: detail.as_ref(), activity: activity.as_ref(), can_write, prefetched },
+                    cx,
+                )
+            }));
         }
         if tab == Tab::Guide {
             if let Some(guide) = &self.guide {
@@ -1465,17 +1483,21 @@ impl DetailView {
             return;
         }
         let mut current = HashMap::new();
-        for source in [self.reviewer_candidates.as_ref(), self.reviewer_search_result.as_ref()].into_iter().flatten() {
-            if let Ok(list) = source {
-                for candidate in &list.candidates {
-                    current.insert(Self::reviewer_draft_key(candidate), candidate.is_requested);
-                }
+        for list in [self.reviewer_candidates.as_ref(), self.reviewer_search_result.as_ref()].into_iter().flatten().flatten() {
+            for candidate in &list.candidates {
+                current.insert(Self::reviewer_draft_key(candidate), candidate.is_requested);
             }
         }
         let changes = draft.changes(|key, item| current.get(key).copied().unwrap_or(item.is_requested));
         if changes.is_empty() {
             return;
         }
+        // Snapshot prior state before optimistic paint so failure rolls back synchronously
+        // even while offline or if the follow-up refresh fails (`pingdotgg/t3code#32774`).
+        let previous_reviewers = self.detail.as_ref().map(|detail| detail.reviewers.clone());
+        let previous_candidates = self.reviewer_candidates.clone();
+        let previous_search = self.reviewer_search_result.clone();
+
         // Optimistic immediate paint (`pingdotgg/t3code#32774`).
         for candidate in &changes.add {
             if let Some(Ok(list)) = self.reviewer_candidates.as_mut() {
@@ -1546,6 +1568,12 @@ impl DetailView {
                         this.refresh(cx);
                     }
                     Some(err) => {
+                        if let (Some(prev_reviewers), Some(detail)) = (previous_reviewers, this.detail.as_mut()) {
+                            detail.reviewers = prev_reviewers;
+                        }
+                        this.reviewer_candidates = previous_candidates;
+                        this.reviewer_search_result = previous_search;
+                        this.hold(cx);
                         let desc = if err.trim().is_empty() {
                             "The host refused it. Check that you have write access on this repository, and that they still have access to it.".to_owned()
                         } else {
@@ -2837,12 +2865,13 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let reference = sample_ref();
         let detail = sample_detail();
-        cx.update(|cx| {
+        let view = cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
             crate::settings::store::init(cx);
             super::super::mutations::init(runtime.handle().clone(), cx);
             let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| state.environments.active = Some("env-a".into()));
             let view = cx.new(|cx| DetailView::new(state, WeakEntity::new_invalid(), reference, None, cx));
             view.update(cx, |view, cx| {
                 view.detail = Some(detail);
@@ -2887,6 +2916,19 @@ mod tests {
                 }
                 assert_eq!(view.pending_reactions_for("__pr__", "sig").get(&ReactionContent::ThumbsUp), Some(&false));
             });
+            view
+        });
+        // Disconnected write settles with Err(NOT_CONNECTED) -> optimistic label batch synchronously rolls back to `["docs"]`.
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            let names: Vec<&str> = view.detail.as_ref().unwrap().labels.iter().map(|l| l.name.as_str()).collect();
+            assert_eq!(names, vec!["docs"], "failed batch label write must synchronously restore prior labels");
+            let key = HeldKey::of(view.state.read(cx), &view.reference).unwrap();
+            let (held_detail, _) = held(&key, cx);
+            let held_detail = held_detail.unwrap();
+            let held_names: Vec<&str> = held_detail.labels.iter().map(|l| l.name.as_str()).collect();
+            assert_eq!(held_names, vec!["docs"], "Held cache must also roll back on batch label failure");
         });
     }
 }

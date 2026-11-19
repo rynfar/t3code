@@ -67,7 +67,7 @@ fn normalize_comment_anchor(anchor: &str) -> String {
     COMMENT_ANCHOR.replace(anchor, "discussion_r$1").into_owned()
 }
 
-static PATH_TAB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)/(?:pull|-/merge_requests)/\d+/([a-z]+)(?:/(.*))?$").unwrap());
+static PATH_TAB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)/(?:pulls?|-/merge_requests)/\d+/([a-z]+)(?:/(.*))?$").unwrap());
 static FULL_SHA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^[a-f0-9]{40}/?$").unwrap());
 
 /// GitHub pull request tabs and their GitLab merge request equivalents.
@@ -327,7 +327,7 @@ fn sha1_digest(input: &[u8]) -> [u8; 20] {
     out
 }
 
-static LINK_COMMIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)/(?:pull|-/merge_requests)/\d+/(?:commits|diffs)/([a-f0-9]{40})/?$").unwrap());
+static LINK_COMMIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)/(?:pulls?|-/merge_requests)/\d+/(?:commits|diffs)/([a-f0-9]{40})/?$").unwrap());
 
 /// `pullRequestLinkCommit`: the commit a GitHub PR commit link or GitLab MR `?commit_id=` link names.
 pub fn link_commit(url: &str) -> Option<String> {
@@ -355,8 +355,12 @@ mod tests {
         assert_eq!(parse_anchor(PR), None);
         assert_eq!(parse_anchor("not a url"), None);
         assert_eq!(parse_anchor(&format!("{PR}/files")), Some(Anchor::Code));
+        assert_eq!(parse_anchor("https://codeberg.org/acme/app/pulls/7/files"), Some(Anchor::Code));
         assert_eq!(parse_anchor(&format!("{PR}/commits")), Some(Anchor::Commits));
-        assert_eq!(parse_anchor(&format!("{PR}/commits/{}", "a".repeat(40))), Some(Anchor::Code));
+        let sha = "a".repeat(40);
+        assert_eq!(parse_anchor(&format!("{PR}/commits/{sha}")), Some(Anchor::Code));
+        assert_eq!(parse_anchor(&format!("https://codeberg.org/acme/app/pulls/7/commits/{sha}")), Some(Anchor::Code));
+        assert_eq!(link_commit(&format!("https://codeberg.org/acme/app/pulls/7/commits/{sha}#diff-abcR5")).as_deref(), Some(sha.as_str()));
         assert_eq!(parse_anchor(&format!("{PR}/commits/abc")), None);
         assert_eq!(parse_anchor(&format!("{PR}/checks")), Some(Anchor::Checks));
         assert_eq!(parse_anchor("https://gitlab.com/acme/app/-/merge_requests/3/pipelines"), Some(Anchor::Checks));

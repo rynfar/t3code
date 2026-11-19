@@ -20,8 +20,11 @@ mod toolbar;
 
 use gpui::{App, Context, Entity, Window, actions};
 use serde_json::Value;
+use t3_client::environments::DestinationError;
 use t3_client::session::RpcError;
+use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::pull_requests::failure_message;
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use tokio::task::JoinHandle;
 
 pub(crate) use detail::{DetailView, Tab as DetailTab};
@@ -74,6 +77,38 @@ pub(crate) fn read<T: Send + 'static>(state: &AppState, method: &'static str, pa
             Err(RpcError::Closed) => Err(NOT_CONNECTED.to_owned()),
         }
     }))
+}
+
+/// One PR RPC read targeting a fleet environment via `connections.destination`, or falling back
+/// to the active `client_handle` when `owner` is `None`.
+pub(crate) fn read_for_owner<T: Send + 'static>(
+    state: &AppState,
+    owner: Option<&EnvironmentOwner>,
+    method: &'static str,
+    payload: Value,
+    decode: fn(Value) -> Result<T, String>,
+) -> Read<T> {
+    if let Some(owner) = owner {
+        let dest_fut = state.connections.destination(owner, ORCHESTRATION_READ_SCOPE);
+        return Some(state.runtime().spawn(async move {
+            let client = match dest_fut.await {
+                Ok(dest) => dest.client,
+                Err(error) => {
+                    return Err(match error {
+                        DestinationError::Denied => "Permission required for this environment.".to_owned(),
+                        DestinationError::Disconnected | DestinationError::Unsynchronized => NOT_CONNECTED.to_owned(),
+                        DestinationError::Missing | DestinationError::Stale => "This environment is no longer available.".to_owned(),
+                    });
+                }
+            };
+            match client.request(method, payload).await {
+                Ok(value) => decode(value),
+                Err(RpcError::Failure(failure)) => Err(failure_message(failure.tag.as_deref(), &failure.error, &failure.message)),
+                Err(RpcError::Closed) => Err(NOT_CONNECTED.to_owned()),
+            }
+        }));
+    }
+    read(state, method, payload, decode)
 }
 
 pub(crate) async fn settle<T>(task: Read<T>) -> Result<T, String> {

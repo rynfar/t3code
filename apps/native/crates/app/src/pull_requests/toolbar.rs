@@ -118,14 +118,39 @@ fn filters_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, c
     let hosts: Vec<String> = page.data.result.as_ref().map(|result| result.providers.iter().map(|provider| provider.host.clone()).collect()).unwrap_or_default();
     let unavailable: Vec<(String, String)> =
         page.data.result.as_ref().map(|result| result.errors.iter().map(|error| (error.project_id.clone(), error.message.clone())).collect()).unwrap_or_default();
-    let projects: Vec<(String, String)> = page
-        .state
-        .read(cx)
-        .shell
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.projects.iter().filter(|project| project.archived_at.is_none()).map(|project| (project.id.clone(), project.title.clone())).collect())
-        .unwrap_or_default();
+    let state = page.state.read(cx);
+    let projects: Vec<(String, String, bool)> = if !state.fleet.environments.is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        state
+            .fleet
+            .environments
+            .iter()
+            .filter(|env| {
+                !state
+                    .environments
+                    .environments
+                    .iter()
+                    .any(|saved| saved.id == env.summary.owner.saved_id && saved.disabled)
+            })
+            .flat_map(|env| env.summary.projects.iter())
+            .filter(|scoped| scoped.project.archived_at.is_none() && seen.insert(scoped.project.id.clone()))
+            .map(|scoped| (scoped.project.id.clone(), scoped.project.title.clone(), scoped.project.pinned_at.is_some()))
+            .collect()
+    } else {
+        state
+            .shell
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .projects
+                    .iter()
+                    .filter(|project| project.archived_at.is_none())
+                    .map(|project| (project.id.clone(), project.title.clone(), project.pinned_at.is_some()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     Button::new("pr-filters", Variant::Outline, Size::Default).icon(Icon::ListFilter).label("Filters").count(prefs.filter_count()).dropdown_menu(move |menu, window, cx| {
         let menu = radio(menu, Radio { label: "State", options: ListState::ALL.iter().map(|s| (*s, s.label().to_owned())).collect(), current: prefs.state, set: |p, v| p.state = v }, &entity, window, cx);
         let menu = radio(menu, Radio { label: "Involvement", options: Involvement::ALL.iter().map(|i| (*i, i.label().to_owned())).collect(), current: prefs.involvement, set: |p, v| p.involvement = v }, &entity, window, cx)
@@ -217,11 +242,13 @@ fn filters_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, c
                 })
             });
         }
-        let mut ordered = projects.clone();
-        ordered.sort_by_key(|(id, _)| unavailable.iter().any(|(project, _)| project == id));
+        let ordered = order_filter_projects(projects.clone(), &unavailable);
         let project_entity = entity.clone();
         let current_project = prefs.project_id.clone();
-        let shown_project = current_project.as_ref().and_then(|id| projects.iter().find(|(pid, _)| pid == id)).map_or("All projects".to_owned(), |(_, title)| title.clone());
+        let shown_project = current_project
+            .as_ref()
+            .and_then(|id| ordered.iter().find(|(pid, _)| pid == id))
+            .map_or("All projects".to_owned(), |(_, title)| title.clone());
         let unavailable = unavailable.clone();
         menu.separator().submenu(format!("Project · {shown_project}"), window, cx, move |menu, _, _| {
             let entity = project_entity.clone();
@@ -440,4 +467,36 @@ pub(super) fn render_saved_view_dialog(
                 ),
         )
         .into_any_element()
+}
+
+/// Orders project filter entries with pinned projects first and unavailable projects last
+/// (`pingdotgg/t3code#29871`).
+fn order_filter_projects(
+    mut projects: Vec<(String, String, bool)>,
+    unavailable: &[(String, String)],
+) -> Vec<(String, String)> {
+    projects.sort_by_key(|(id, _, pinned)| {
+        let blocked = unavailable.iter().any(|(project, _)| project == id);
+        (blocked, !*pinned)
+    });
+    projects.into_iter().map(|(id, title, _)| (id, title)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_filter_lists_pinned_projects_first_and_unavailable_last() {
+        let projects = vec![
+            ("p-regular".into(), "Regular".into(), false),
+            ("p-pinned".into(), "Pinned".into(), true),
+            ("p-blocked-pinned".into(), "Blocked Pinned".into(), true),
+            ("p-second".into(), "Second".into(), false),
+        ];
+        let unavailable = vec![("p-blocked-pinned".into(), "offline".into())];
+        let ordered = order_filter_projects(projects, &unavailable);
+        let ids: Vec<&str> = ordered.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["p-pinned", "p-regular", "p-second", "p-blocked-pinned"]);
+    }
 }
