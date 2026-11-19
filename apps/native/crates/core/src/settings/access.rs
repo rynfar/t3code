@@ -82,6 +82,80 @@ pub fn toggle_scope(selected: &mut Vec<String>, scope: &str, on: bool) {
     selected.sort_by_key(|scope| SCOPE_OPTIONS.iter().position(|(candidate, _, _)| candidate == scope).unwrap_or(usize::MAX));
 }
 
+/// Inline warning displayed under sensitive scopes when selected in the create-link dialog
+/// (`AuthorizedClientsSettings.tsx`, `pingdotgg/t3code#37823`).
+pub fn scope_warning(scope: &str, selected: &[String]) -> Option<&'static str> {
+    if !selected.iter().any(|candidate| candidate == scope) {
+        return None;
+    }
+    match scope {
+        crate::auth::TERMINAL_OPERATE_SCOPE => {
+            Some("Terminal commands can read or change files within the server account\u{2019}s permissions.")
+        }
+        RELAY_CONFIGURE => Some("This client can change who can issue pairing credentials."),
+        _ => None,
+    }
+}
+
+/// Whether `session` holds `relay:configure` (`useEnvironmentCanConfigureRelay`, `pingdotgg/t3code#37823`).
+pub fn can_configure_relay(session: &crate::auth::AuthSessionState) -> bool {
+    session.grants(RELAY_CONFIGURE)
+}
+
+/// Decoded subset of `GET /api/connect/link-state` (`EnvironmentCloudLinkStateResult`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CloudLinkState {
+    pub linked: bool,
+    pub link_revoked: bool,
+    pub managed_tunnel_active: bool,
+    pub publish_agent_activity: bool,
+    /// Server's own answer for whether this session may configure/link T3 Connect here (`pingdotgg/t3code#37823`, `pingdotgg/t3code#38892`).
+    pub linkable_here: Option<bool>,
+}
+
+/// Whether reaching `(desired_managed_tunnel, desired_publish)` links or relinks the environment,
+/// which requires `relay:configure` (`cloudChangeReplacesLink` in `t3ConnectState.ts`, `pingdotgg/t3code#37823`).
+/// Unlinking and preference changes on the current link only require `relay:write`.
+pub fn cloud_change_replaces_link(
+    state: &CloudLinkState,
+    desired_managed_tunnel: bool,
+    desired_publish: bool,
+) -> bool {
+    (desired_managed_tunnel || desired_publish)
+        && (!state.linked
+            || state.link_revoked
+            || state.managed_tunnel_active != desired_managed_tunnel)
+}
+
+/// `T3ConnectTurnOn` (`apps/web/src/cloud/t3ConnectState.ts`, `pingdotgg/t3code#37823`, `pingdotgg/t3code#38892`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum T3ConnectTurnOn {
+    Here,
+    OnHost,
+    Policy(String),
+}
+
+/// Whether this client can turn on T3 Connect for the environment, and if not, why.
+/// Remote clients with `relay:read`, `relay:write`, and `relay:configure` can link (`pingdotgg/t3code#38892`).
+pub fn resolve_t3_connect_turn_on(
+    linkable_here: bool,
+    cloud_configured: bool,
+    can_read_relay: bool,
+    can_write_relay: bool,
+    can_configure_relay: bool,
+    connect_denial: Option<&str>,
+) -> T3ConnectTurnOn {
+    if let Some(reason) = connect_denial {
+        return T3ConnectTurnOn::Policy(reason.to_owned());
+    }
+    if linkable_here && cloud_configured && can_read_relay && can_write_relay && can_configure_relay {
+        T3ConnectTurnOn::Here
+    } else {
+        T3ConnectTurnOn::OnHost
+    }
+}
+
 /// What the create dialog warns about under the checkboxes.
 pub fn scopes_notice(selected: &[String]) -> Option<(&'static str, bool)> {
     if selected.is_empty() {
@@ -300,18 +374,22 @@ pub fn revoked_others_label(count: u64) -> String {
     if count == 1 { "Revoked 1 other client".to_owned() } else { format!("Revoked {count} clients") }
 }
 
-/// `<server>/pair#token=<credential>`, or `None` for a loopback server another device cannot reach.
+/// `<server>/pair#token=<credential>`, or `None` for non-HTTP(S) addresses (such as desktop
+/// `t3code://` URLs, `pingdotgg/t3code#38442`) and loopback hosts another device cannot reach.
 pub fn pairing_url(http_base: &str, credential: &str) -> Option<String> {
-    let base = http_base.trim_end_matches('/');
-    let authority = base.split("://").nth(1).unwrap_or(base).split('/').next().unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        Some(rest) => rest.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
+    let parsed = url::Url::parse(http_base.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    Some(format!("{base}/pair#token={credential}"))
+    let host = parsed.host_str()?;
+    if crate::pairing::is_loopback_host(host) {
+        return None;
+    }
+    let mut url = parsed;
+    url.set_path("/pair");
+    url.set_query(None);
+    url.set_fragment(Some(&format!("token={credential}")));
+    Some(url.into())
 }
 
 #[cfg(test)]

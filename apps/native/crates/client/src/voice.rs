@@ -56,6 +56,15 @@ pub enum VoiceClientError {
     Stream(String),
 }
 
+impl From<crate::auth::AuthedHttpError> for VoiceClientError {
+    fn from(error: crate::auth::AuthedHttpError) -> Self {
+        match error {
+            crate::auth::AuthedHttpError::Auth(err) => Self::Auth(err),
+            crate::auth::AuthedHttpError::Http(err) => Self::Http(err),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum CloudSpeechKeyInput {
@@ -207,13 +216,11 @@ impl VoiceClient {
     /// `POST /api/voice/models/prepare`
     pub async fn prepare_model(&self) -> Result<(), VoiceClientError> {
         let url = voice_http_url(&self.credentials.http_base, &["api", "voice", "models", "prepare"], &[])?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.credentials.access_token)
-            .timeout(DEFAULT_TIMEOUT)
-            .send()
-            .await?;
+        let url_str = url.as_str().to_owned();
+        let response = crate::auth::send_authed_request(&self.credentials, "POST", &url_str, || {
+            self.http.post(url.clone()).timeout(DEFAULT_TIMEOUT)
+        })
+        .await?;
         self.ensure_success(response).await?;
         Ok(())
     }
@@ -273,14 +280,12 @@ impl VoiceClient {
             &["api", "voice", "cloud", provider.as_str(), "key"],
             &[],
         )?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.credentials.access_token)
-            .timeout(DEFAULT_TIMEOUT)
-            .json(&json!({ "key": key.into_json() }))
-            .send()
-            .await?;
+        let url_str = url.as_str().to_owned();
+        let payload = json!({ "key": key.into_json() });
+        let response = crate::auth::send_authed_request(&self.credentials, "POST", &url_str, || {
+            self.http.post(url.clone()).timeout(DEFAULT_TIMEOUT).json(&payload)
+        })
+        .await?;
         self.ensure_success(response).await?;
         Ok(())
     }
@@ -298,16 +303,16 @@ impl VoiceClient {
         options: &SpeechTranscriptionOptions,
     ) -> Result<EnvironmentSpeechTranscriptionResult, VoiceClientError> {
         let url = voice_http_url(&self.credentials.http_base, &["api", "voice", "transcribe"], &[])?;
+        let url_str = url.as_str().to_owned();
         let body = encode_speech_pcm_request(pcm_bytes, options)?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.credentials.access_token)
-            .timeout(LONG_OPERATION_TIMEOUT)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
+        let response = crate::auth::send_authed_request(&self.credentials, "POST", &url_str, || {
+            self.http
+                .post(url.clone())
+                .timeout(LONG_OPERATION_TIMEOUT)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body.clone())
+        })
+        .await?;
         self.decode_json(response).await
     }
 
@@ -334,16 +339,16 @@ impl VoiceClient {
             &["api", "voice", "cloud", provider.as_str(), "transcribe"],
             &query,
         )?;
+        let url_str = url.as_str().to_owned();
         let body = encode_speech_pcm_request(pcm_bytes, options)?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.credentials.access_token)
-            .timeout(CLOUD_TRANSCRIBE_TIMEOUT)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
+        let response = crate::auth::send_authed_request(&self.credentials, "POST", &url_str, || {
+            self.http
+                .post(url.clone())
+                .timeout(CLOUD_TRANSCRIBE_TIMEOUT)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body.clone())
+        })
+        .await?;
         self.decode_json(response).await
     }
 
@@ -373,13 +378,11 @@ impl VoiceClient {
         timeout: Duration,
     ) -> Result<T, VoiceClientError> {
         let url = voice_http_url(&self.credentials.http_base, segments, query)?;
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(&self.credentials.access_token)
-            .timeout(timeout)
-            .send()
-            .await?;
+        let url_str = url.as_str().to_owned();
+        let response = crate::auth::send_authed_request(&self.credentials, "GET", &url_str, || {
+            self.http.get(url.clone()).timeout(timeout)
+        })
+        .await?;
         self.decode_json(response).await
     }
 
@@ -390,14 +393,11 @@ impl VoiceClient {
         timeout: Duration,
     ) -> Result<T, VoiceClientError> {
         let url = voice_http_url(&self.credentials.http_base, segments, &[])?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.credentials.access_token)
-            .timeout(timeout)
-            .json(body)
-            .send()
-            .await?;
+        let url_str = url.as_str().to_owned();
+        let response = crate::auth::send_authed_request(&self.credentials, "POST", &url_str, || {
+            self.http.post(url.clone()).timeout(timeout).json(body)
+        })
+        .await?;
         self.decode_json(response).await
     }
 

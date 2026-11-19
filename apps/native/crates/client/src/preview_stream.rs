@@ -106,14 +106,18 @@ pub async fn upload_file_chooser(
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|err| err.to_string())?;
-    let response = client
-        .post(&url)
-        .bearer_auth(&credentials.access_token)
-        .header(reqwest::header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
-        .body(body)
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    let response = crate::auth::send_authed_request(credentials, "POST", &url, || {
+        client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, &content_type)
+            .body(body.clone())
+    })
+    .await
+    .map_err(|err| match err {
+        crate::auth::AuthedHttpError::Auth(e) => e.to_string(),
+        crate::auth::AuthedHttpError::Http(e) => e.to_string(),
+    })?;
     if !response.status().is_success() {
         let message = response.text().await.unwrap_or_default();
         return Err(if message.trim().is_empty() { "The upload was refused.".to_owned() } else { message });
@@ -134,12 +138,12 @@ pub async fn download_file(
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|err| err.to_string())?;
-    let response = client
-        .get(&url)
-        .bearer_auth(&credentials.access_token)
-        .send()
+    let response = crate::auth::send_authed_request(credentials, "GET", &url, || client.get(&url))
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| match err {
+            crate::auth::AuthedHttpError::Auth(e) => e.to_string(),
+            crate::auth::AuthedHttpError::Http(e) => e.to_string(),
+        })?;
     let status = response.status();
     if !status.is_success() {
         let message = response.text().await.unwrap_or_default();

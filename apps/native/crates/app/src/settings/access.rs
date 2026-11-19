@@ -29,8 +29,11 @@ use t3_core::pairing::{
 };
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::access::{
-    self, ACCESS_READ, ACCESS_WRITE, AccessState, ClientSession, PairingLink, READ_ONLY_SCOPES, SCOPE_OPTIONS, expires_label, pairing_token_body,
-    pairing_url, scope_count, shown_scopes, standard_scopes, toggle_scope,
+    self, ACCESS_READ, ACCESS_WRITE, AccessState, ClientSession, CloudLinkState, PairingLink,
+    READ_ONLY_SCOPES, SCOPE_OPTIONS, T3ConnectTurnOn, can_configure_relay,
+    cloud_change_replaces_link, expires_label, pairing_token_body, pairing_url,
+    resolve_t3_connect_turn_on, scope_count, scope_warning, shown_scopes, standard_scopes,
+    toggle_scope,
 };
 use t3_core::settings::peer_link_create_payload;
 
@@ -44,6 +47,7 @@ use crate::theme::{hsla, palette};
 
 const QR_SIZE: f32 = 168.;
 const RELAY_READ: &str = "relay:read";
+const RELAY_WRITE: &str = "relay:write";
 const CLOUD_CONNECT_SESSION_SUBJECT: &str = "cloud-connect";
 
 fn now_ms() -> i64 {
@@ -172,6 +176,8 @@ pub(crate) struct AccessPageState {
     extras_watcher: Option<(String, TargetStream)>,
     /// Whether `GET /api/connect/link-state` reports an active managed T3 Connect tunnel.
     managed_tunnel_active: bool,
+    /// Full decoded `GET /api/connect/link-state` (`pingdotgg/t3code#37823`, `pingdotgg/t3code#38892`).
+    cloud_link_state: Option<CloudLinkState>,
     /// Keyed by `(saved_id, connection_generation)`.
     link_state_task: Option<(String, u64, Task<()>)>,
     create: Option<CreateLink>,
@@ -182,7 +188,7 @@ pub(crate) struct AccessPageState {
     /// Credentials of links this client created, known only in memory (`credentialsById`).
     credentials: HashMap<String, String>,
     sharing: Option<String>,
-    /// Newest link created on this target: stays visible while the client list is folded (`#30498`).
+    /// Newest link created on this target: stays visible while the client list is folded (`pingdotgg/t3code#30498`).
     newest_pairing_link_id: Option<String>,
     /// Whether the Authorized clients section is expanded (`FoldedSettingsSection` defaults folded).
     clients_open: bool,
@@ -214,6 +220,7 @@ impl AccessPageState {
             stream: None,
             extras_watcher: None,
             managed_tunnel_active: false,
+            cloud_link_state: None,
             link_state_task: None,
             create: None,
             link_machine: None,
@@ -246,6 +253,7 @@ impl AccessPageState {
         self.stream = None;
         self.extras_watcher = None;
         self.managed_tunnel_active = false;
+        self.cloud_link_state = None;
         self.link_state_task = None;
         self.create = None;
         self.link_machine = None;
@@ -327,11 +335,12 @@ fn regular_visible_links<'a>(access: &'a AccessState, connect: &ConnectDevicesSt
         .collect()
 }
 
-/// Picks the pairing URL base for a link: prefers an advertised non-loopback `directEndpoint`
-/// (e.g., Tailscale Serve, `pingdotgg/t3code#35543`) when the connected address is loopback.
+/// Picks the pairing URL base for a link: prefers an advertised reachable HTTP(S) `directEndpoint`
+/// (e.g., Tailscale Serve, `pingdotgg/t3code#35543`) when the connected address is loopback or
+/// non-HTTP(S) such as desktop `t3code://` (`pingdotgg/t3code#38442`).
 fn effective_pairing_address<'a>(address: &'a str, direct_endpoints: &'a [String]) -> &'a str {
-    if t3_core::pairing::is_loopback_url(address)
-        && let Some(endpoint) = direct_endpoints.iter().find(|url| !t3_core::pairing::is_loopback_url(url))
+    if pairing_url(address, "probe").is_none()
+        && let Some(endpoint) = direct_endpoints.iter().find(|url| pairing_url(url, "probe").is_some())
     {
         return endpoint.as_str();
     }
@@ -606,6 +615,7 @@ impl SettingsView {
         let can_read_relay = Self::target_may(target.grants.as_ref(), RELAY_READ);
         if !can_read_relay {
             self.access.managed_tunnel_active = false;
+            self.access.cloud_link_state = None;
             self.access.link_state_task = None;
             return;
         }
@@ -621,16 +631,17 @@ impl SettingsView {
         let expected = target_id.clone();
         let fetch = runtime.spawn(async move { client.get_access("/api/connect/link-state").await });
         let task = cx.spawn(async move |this, cx| {
-            let active = fetch.await.ok().and_then(|res| res.ok()).is_some_and(|body| {
-                let linked = body.get("linked").and_then(Value::as_bool).unwrap_or(false);
-                let revoked = body.get("linkRevoked").and_then(Value::as_bool).unwrap_or(false);
-                body.get("managedTunnelActive")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(linked && !revoked)
+            let link_state = fetch.await.ok().and_then(|res| res.ok()).map(|body| {
+                let mut decoded = serde_json::from_value::<CloudLinkState>(body.clone()).unwrap_or_default();
+                if body.get("managedTunnelActive").is_none() {
+                    decoded.managed_tunnel_active = decoded.linked && !decoded.link_revoked;
+                }
+                decoded
             });
             let _ = this.update(cx, |this, cx| {
                 if this.access.active_target.as_deref() == Some(expected.as_str()) {
-                    this.access.managed_tunnel_active = active;
+                    this.access.managed_tunnel_active = link_state.as_ref().is_some_and(|s| s.managed_tunnel_active);
+                    this.access.cloud_link_state = link_state;
                     cx.notify();
                 }
             });
@@ -699,7 +710,7 @@ impl SettingsView {
                 if let (Some(id), Some(credential)) = (reply.get("id").and_then(Value::as_str), reply.get("credential").and_then(Value::as_str)) {
                     this.access.credentials.insert(id.to_owned(), credential.to_owned());
                     this.access.sharing = Some(id.to_owned());
-                    // `#30498`: keep newest link visible without expanding the client list.
+                    // `pingdotgg/t3code#30498`: keep newest link visible without expanding the client list.
                     this.access.newest_pairing_link_id = Some(id.to_owned());
                 }
                 this.access.create = None;
@@ -991,6 +1002,56 @@ impl SettingsView {
         let permissions = disclosure("access-permissions", "Permissions", self.access.permissions_open, vec![self.permissions_row(target.grants.as_ref(), cx)], toggle, cx);
 
         let mut machine_rows = vec![version, network];
+        // T3 Connect relay configuration access (`pingdotgg/t3code#37823`, `pingdotgg/t3code#38892`):
+        // linking or replacing a relay configuration requires `relay:configure`; remote clients
+        // carrying `relay:read` + `relay:write` + `relay:configure` are allowed to link.
+        if let Some(link_state) = &self.access.cloud_link_state {
+            let policy = target.config.as_ref().and_then(|c| c.managed_policy.as_ref());
+            let connect_denial = t3_core::managed_policy::capability_denial(
+                policy,
+                t3_core::managed_policy::Capability::Connect,
+            );
+            let can_read_relay = Self::target_may(target.grants.as_ref(), RELAY_READ);
+            let can_write_relay = Self::target_may(target.grants.as_ref(), RELAY_WRITE);
+            let has_configure_relay = target.grants.as_ref().is_some_and(can_configure_relay);
+            let needs_configure = !has_configure_relay
+                && cloud_change_replaces_link(
+                    link_state,
+                    !link_state.managed_tunnel_active,
+                    link_state.publish_agent_activity,
+                );
+            let turn_on = resolve_t3_connect_turn_on(
+                link_state.linkable_here.unwrap_or(true),
+                true,
+                can_read_relay,
+                can_write_relay,
+                has_configure_relay,
+                connect_denial.as_deref(),
+            );
+            let relay_desc = match turn_on {
+                T3ConnectTurnOn::Policy(reason) => Some(reason),
+                T3ConnectTurnOn::Here if link_state.managed_tunnel_active => {
+                    Some("T3 Connect is linked and configurable from this client.".to_owned())
+                }
+                T3ConnectTurnOn::Here => {
+                    Some("This client has relay configuration permission to link T3 Connect.".to_owned())
+                }
+                T3ConnectTurnOn::OnHost if needs_configure => {
+                    Some("This connection needs the relay configuration permission to configure T3 Connect.".to_owned())
+                }
+                T3ConnectTurnOn::OnHost if link_state.link_revoked => {
+                    Some("This environment was removed from T3 Connect. Run `t3 connect link` on the host to link it again.".to_owned())
+                }
+                T3ConnectTurnOn::OnHost => None,
+            };
+            if let Some(desc) = relay_desc {
+                machine_rows.push(
+                    Row::new("access-relay-configure", "T3 Connect")
+                        .description(desc)
+                        .into_any_element(),
+                );
+            }
+        }
         // `ConnectionsSettings.tsx:1304-1311` + `SavedEnvironmentRows.tsx:746`: render the
         // T3 Connect device-approval switch only when the managed tunnel is active and the server
         // advertises `requireConnectDeviceApproval`.
@@ -1275,7 +1336,7 @@ impl SettingsView {
             && let Some(newest_id) = self.access.newest_pairing_link_id.as_deref()
             && let Some(newest) = links.iter().find(|link| link.id == newest_id)
         {
-            // `#30498`: show the newly created pairing link (with share/QR panel open) without expanding the client list.
+            // `pingdotgg/t3code#30498`: show the newly created pairing link (with share/QR panel open) without expanding the client list.
             rows.push(self.link_row(newest, effective_address, now, can_write, target, cx));
         }
 
@@ -1902,6 +1963,7 @@ impl SettingsView {
             )
             .child(div().grid().grid_cols(2).gap(r(8.)).children(SCOPE_OPTIONS.iter().filter(|(scope, _, _)| allowed(scope)).map(|(scope, title, description)| {
                 let checked = create.scopes.iter().any(|candidate| candidate == scope);
+                let warning = scope_warning(scope, &create.scopes);
                 let scope = *scope;
                 h_flex()
                     .id(scope)
@@ -1914,7 +1976,10 @@ impl SettingsView {
                         v_flex()
                             .min_w_0()
                             .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(*title))
-                            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(*description)),
+                            .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(*description))
+                            .when_some(warning, |this, text| {
+                                this.child(div().text_xs().text_color(hsla(p.warning_foreground)).child(text))
+                            }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(create) = this.access.create.as_mut().filter(|create| !create.creating) {
@@ -2406,5 +2471,23 @@ mod tests {
         drop(fixture);
         drop(runtime);
         cx.run_until_parked();
+    }
+
+    #[test]
+    fn effective_pairing_address_skips_loopback_and_t3code_scheme() {
+        let endpoints = vec![
+            "t3code://app/settings".to_owned(),
+            "http://127.0.0.1:3773".to_owned(),
+            "https://studio.tail.ts.net:3773".to_owned(),
+        ];
+        assert_eq!(
+            effective_pairing_address("t3code://app/settings/connections", &endpoints),
+            "https://studio.tail.ts.net:3773"
+        );
+        assert_eq!(
+            effective_pairing_address("http://127.0.0.1:3773", &endpoints),
+            "https://studio.tail.ts.net:3773"
+        );
+        assert_eq!(pairing_url("t3code://app/settings/connections", "CODE1"), None);
     }
 }

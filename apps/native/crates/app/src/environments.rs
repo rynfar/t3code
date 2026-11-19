@@ -44,6 +44,8 @@ pub struct Rejected {
     pub id: String,
     pub label: String,
     pub reason: String,
+    /// Rejected request's trace ID when the server reported one (`pingdotgg/t3code#38041`).
+    pub trace_id: Option<String>,
     pub local: bool,
     /// Reached over SSH, which can pair it again.
     pub ssh: bool,
@@ -166,14 +168,15 @@ impl AppState {
     }
 
     /// "Add environment" over SSH: starts T3 Code on the host, pairs over SSH, saves the
-    /// environment, and connects it.
+    /// environment, and connects it. Untargeted onboarding guards saved environment routes so an
+    /// already-saved environment is not silently given a new SSH route (`pingdotgg/t3code#37818`).
     pub fn add_ssh(&mut self, target: SshTarget, cx: &mut Context<Self>) {
         if self.connect.pairing.is_some() {
             return;
         }
         let ssh = self.ssh.clone();
         let task = self.runtime().spawn(async move { ssh.provision(&target, None).await.map_err(|error| error.to_string()) });
-        self.await_pairing(PairingSource::Ssh, task, |state, pairing, cx| state.adopt_ssh(pairing, cx), cx);
+        self.await_pairing(PairingSource::Ssh, task, |state, pairing, cx| state.adopt_ssh(pairing, true, cx), cx);
     }
 
     /// Pairs a saved SSH environment again over SSH, refusing a host that now reaches another
@@ -186,7 +189,7 @@ impl AppState {
         let Some(target) = environment.ssh else { return };
         let (ssh, expected) = (self.ssh.clone(), environment.environment_id);
         let task = self.runtime().spawn(async move { ssh.provision(&target, expected.as_deref()).await.map_err(|error| error.to_string()) });
-        self.await_pairing(PairingSource::Ssh, task, |state, pairing, cx| state.adopt_ssh(pairing, cx), cx);
+        self.await_pairing(PairingSource::Ssh, task, |state, pairing, cx| state.adopt_ssh(pairing, false, cx), cx);
     }
 
     fn await_pairing<T: Send + 'static>(
@@ -262,7 +265,17 @@ impl AppState {
     }
 
     /// Saves a pairing made over SSH and connects to it through its tunnel.
-    fn adopt_ssh(&mut self, pairing: SshPairing, cx: &mut Context<Self>) {
+    fn adopt_ssh(&mut self, pairing: SshPairing, untargeted: bool, cx: &mut Context<Self>) {
+        if untargeted
+            && let Err(message) = self.environments.check_ssh_onboarding_conflict(
+                pairing.paired.descriptor.as_ref().map(|d| d.environment_id.as_str()),
+                &pairing.target,
+            )
+        {
+            self.stop_ssh(pairing.target);
+            self.fail_pairing(PairingSource::Ssh, message, cx);
+            return;
+        }
         let alias = pairing.target.alias.clone();
         let id = self.environments.upsert_ssh(&pairing.paired, pairing.target);
         self.persist_environments();
@@ -411,9 +424,13 @@ impl AppState {
     }
 
     /// Whether this client is currently connected to `environment_id` with a session authorized to
-    /// mint one-use pairing codes (`access:write`).
+    /// mint one-use pairing codes (`access:write`) on a host that supports peer-link codes (`pingdotgg/t3code#37825`).
     pub fn can_mint_pairing_code_on(&self, environment_id: &str) -> bool {
-        self.peer_pairing_credentials(environment_id).is_ok()
+        let Ok(creds) = self.peer_pairing_credentials(environment_id) else {
+            return false;
+        };
+        auth::descriptor_capabilities(&creds.http_base)
+            .is_none_or(|caps| caps.peer_link_pairing_codes)
     }
 
     /// `mintPairingCodeOn` (`apps/web/src/state/peerPairingCode.ts`):
@@ -874,12 +891,31 @@ impl AppState {
         });
     }
 
-    /// "Remove from this device": forgets the environment and its credential.
+    /// "Remove from this device": forgets the environment and its credential, and withdraws any
+    /// active permission-update notice toast for it (`pingdotgg/t3code#38980`).
     pub fn remove_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let was_active = self.environments.active.as_deref() == Some(id) && self.client_handle().is_some();
         let ssh = self.environments.get(id).and_then(|environment| environment.ssh.clone());
+        let canonical_id = self
+            .environments
+            .get(id)
+            .and_then(|environment| environment.environment_id.clone())
+            .filter(|cid| !cid.is_empty())
+            .or_else(|| {
+                self.fleet
+                    .environment(id)
+                    .and_then(|view| view.config.config.as_ref())
+                    .map(|cfg| cfg.environment.environment_id.clone())
+                    .filter(|cid| !cid.is_empty())
+            });
         if !self.environments.remove(id) {
             return;
+        }
+        self.withdraw_toast_by_key(&format!("permission-update:{id}"), cx);
+        if let Some(cid) = canonical_id
+            && cid != id
+        {
+            self.withdraw_toast_by_key(&format!("permission-update:{cid}"), cx);
         }
         self.persist_environments();
         self.connections.remove(id);
@@ -940,8 +976,14 @@ impl AppState {
     /// The server rejected this device: drop the credential, keep the entry, and prompt to pair
     /// again. Runs inside the event pump, which ends on its own once the client stops.
     pub(crate) fn environment_credentials_rejected(&mut self, id: &str, reason: String, cx: &mut Context<Self>) {
+        let trace_id = t3_client::status::extract_trace_id(&reason).map(str::to_owned);
         let rejected = self.environments.get(id).map(|environment| Rejected {
-            id: id.into(), label: environment.label.clone(), reason, local: environment.local, ssh: environment.ssh.is_some(),
+            id: id.into(),
+            label: environment.label.clone(),
+            reason,
+            trace_id,
+            local: environment.local,
+            ssh: environment.ssh.is_some(),
         });
         self.environments.revoke(id);
         self.persist_environments();

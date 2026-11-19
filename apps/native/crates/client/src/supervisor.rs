@@ -23,8 +23,9 @@ use tokio::task::JoinHandle;
 use crate::auth::{self, AuthError, Credentials};
 use crate::routes::{
     BETTER_ROUTE_CHECK_INTERVAL, BETTER_ROUTE_COOLDOWN, CandidateRoute, ROUTE_CHECK_HEAD_START,
-    ROUTE_CHECK_TIMEOUT, ReportedEndpoint, RouteAttemptError, RouteCheck, SILENT_ROUTE_BACKOFF_MAX,
-    connect_over_routes, merge_learned_routes, normalize_http_base,
+    ROUTE_CHECK_TIMEOUT, ReportedEndpoint, RouteAttemptError, RouteCheck, RouteConnectResult,
+    SILENT_ROUTE_BACKOFF_MAX, connect_over_routes, merge_learned_routes, merge_refused_routes,
+    normalize_http_base,
 };
 use crate::session::{OpenError, RpcError, Session, StreamHandle};
 use crate::wakeups::{
@@ -49,8 +50,8 @@ pub enum ConnectionStatus {
 }
 
 /// Extra fields read from raw `subscribeServerConfig` frames without modifying `t3-core`'s
-/// `ServerConfig` schema: Connect device approval toggle (`#36419`), auth policy & direct
-/// endpoints (`#35543` Tailscale Serve), socket thread pagination (`#33306`), and recent
+/// `ServerConfig` schema: Connect device approval toggle (`pingdotgg/t3code#36419`), auth policy & direct
+/// endpoints (`pingdotgg/t3code#35543` Tailscale Serve), socket thread pagination (`pingdotgg/t3code#33306`), and recent
 /// host event-loop stall (`hostFreeze.ts`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServerConfigExtras {
@@ -61,7 +62,7 @@ pub struct ServerConfigExtras {
     pub thread_snapshot_pagination: bool,
     pub secret_references: bool,
     pub last_event_loop_stall: Option<crate::status::ServerEventLoopStall>,
-    /// Accurate `subscribeServerConfig`-scoped clock sample `(server_time_ms, requested_at_ms, received_at_ms)` (`#36420`).
+    /// Accurate `subscribeServerConfig`-scoped clock sample `(server_time_ms, requested_at_ms, received_at_ms)` (`pingdotgg/t3code#36420`).
     pub clock_sample: Option<(Option<i64>, i64, i64)>,
 }
 
@@ -145,6 +146,37 @@ pub fn set_server_config_extras_for(http_base: &str, extras: ServerConfigExtras)
     extras_sender(http_base).send_replace(extras);
 }
 
+type RefusedRoutesSender = Arc<watch::Sender<Vec<String>>>;
+
+/// Saved route IDs whose host refused this device's sign-in while another route connected
+/// (`refusedRouteIds` in `supervisor.ts`, `pingdotgg/t3code#33199`), keyed by environment `http_base`.
+fn refused_routes_sender(http_base: &str) -> RefusedRoutesSender {
+    static REFUSED: OnceLock<RwLock<HashMap<String, RefusedRoutesSender>>> = OnceLock::new();
+    let map = REFUSED.get_or_init(|| RwLock::new(HashMap::new()));
+    let key = normalize_http_base(http_base);
+    if let Ok(read) = map.read()
+        && let Some(tx) = read.get(&key)
+    {
+        return tx.clone();
+    }
+    let mut write = map.write().unwrap_or_else(|p| p.into_inner());
+    write
+        .entry(key)
+        .or_insert_with(|| Arc::new(watch::channel(Vec::new()).0))
+        .clone()
+}
+
+/// Live route IDs whose host refused this device's sign-in (`pingdotgg/t3code#33199`).
+pub fn refused_routes_for(http_base: &str) -> watch::Receiver<Vec<String>> {
+    refused_routes_sender(http_base).subscribe()
+}
+
+/// Test helper: publishes synthetic refused route IDs for `http_base`.
+/// Test/runtime helper mirroring [`set_server_config_extras_for`].
+pub fn set_refused_routes_for(http_base: &str, route_ids: Vec<String>) {
+    refused_routes_sender(http_base).send_replace(route_ids);
+}
+
 #[derive(Clone)]
 pub struct ClientHandle {
     pub(crate) refs: crate::vcs::RefState,
@@ -162,6 +194,11 @@ impl ClientHandle {
     /// Live extras decoded from `subscribeServerConfig` snapshots and settings updates.
     pub fn server_config_extras(&self) -> watch::Receiver<ServerConfigExtras> {
         extras_sender(&self.credentials.http_base).subscribe()
+    }
+
+    /// Live route IDs whose host refused this device's sign-in (`pingdotgg/t3code#33199`).
+    pub fn refused_route_ids(&self) -> watch::Receiver<Vec<String>> {
+        refused_routes_sender(&self.credentials.http_base).subscribe()
     }
 
     /// Optimistically updates `requireConnectDeviceApproval` after `server.updateSettings` succeeds.
@@ -441,6 +478,7 @@ pub fn start_with_routes(
     let (grants, session_state) = watch::channel(None);
     let (generations, connection_generation) = watch::channel(0);
     let config_extras_tx = extras_sender(&credentials.http_base);
+    let refused_routes_tx = refused_routes_sender(&credentials.http_base);
     let handle = ClientHandle {
         refs: Default::default(),
         commands,
@@ -461,6 +499,7 @@ pub fn start_with_routes(
                 grants,
                 generations,
                 config_extras_tx,
+                refused_routes_tx,
             ) => {},
         }
     });
@@ -512,8 +551,10 @@ async fn supervise(
     grants: watch::Sender<Option<AuthSessionState>>,
     generations: watch::Sender<u64>,
     config_extras: Arc<watch::Sender<ServerConfigExtras>>,
+    refused_routes_tx: Arc<watch::Sender<Vec<String>>>,
 ) {
     let mut routes = initial_candidate_routes(&credentials, alternate_routes, prepare.is_some());
+    let mut refused_routes: Vec<String> = Vec::new();
     let mut preferred_route_id: Option<String> = None;
     let mut last_route_switch: Option<Instant> = None;
     let mut wakeup_rx = wakeups::subscribe();
@@ -562,7 +603,11 @@ async fn supervise(
             Err(PrepareError::Blocked(reason)) => Err(ConnectError::Blocked(reason)),
         };
         let (reason, is_approval) = match outcome {
-            Ok((active_route, session)) => {
+            Ok(RouteConnectResult { route: active_route, value: session, refused_route_ids }) => {
+                refused_routes = merge_refused_routes(&refused_routes, &refused_route_ids, |id| {
+                    id != active_route.id && routes.iter().any(|route| route.id == id)
+                });
+                refused_routes_tx.send_replace(refused_routes.clone());
                 let active_credentials = Credentials {
                     http_base: active_route.http_base.clone(),
                     access_token: credentials.access_token.clone(),
@@ -574,8 +619,11 @@ async fn supervise(
                 fetch.start();
                 let end = run_session(
                     &session,
+                    &active_credentials,
                     &active_route,
                     &mut routes,
+                    &mut refused_routes,
+                    &refused_routes_tx,
                     &mut expected_environment_id,
                     last_route_switch,
                     &mut resume,
@@ -604,12 +652,14 @@ async fn supervise(
                     SessionEnd::Dropped => return,
                 }
             }
-            Err(ConnectError::Unauthorized(reason)) => {
+            Err(ConnectError::Unauthorized { reason, .. }) => {
+                refused_routes_tx.send_replace(Vec::new());
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::NeedsPairing { reason })).await;
                 return;
             }
             Err(ConnectError::ApprovalPending(reason)) => (reason, true),
             Err(ConnectError::Unsupported { reason, server_outdated }) => {
+                refused_routes_tx.send_replace(Vec::new());
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Unsupported { reason: reason.clone(), server_outdated })).await;
                 match wait_draining(None, &mut commands, &mut wakeup_rx, &mut resume).await {
                     WaitOutcome::Elapsed | WaitOutcome::RetryNow => {
@@ -622,6 +672,7 @@ async fn supervise(
                 }
             }
             Err(ConnectError::Blocked(reason)) => {
+                refused_routes_tx.send_replace(Vec::new());
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Blocked { reason: reason.clone() })).await;
                 match wait_draining(None, &mut commands, &mut wakeup_rx, &mut resume).await {
                     WaitOutcome::Elapsed | WaitOutcome::RetryNow => {
@@ -635,6 +686,7 @@ async fn supervise(
             }
             Err(ConnectError::Transient(reason)) => (reason, false),
         };
+        refused_routes_tx.send_replace(Vec::new());
         attempt += 1;
         last_failure = reason.clone();
         awaiting_approval = is_approval;
@@ -657,7 +709,7 @@ async fn supervise(
 }
 
 enum ConnectError {
-    Unauthorized(String),
+    Unauthorized { reason: String, clock_skew: bool },
     ApprovalPending(String),
     Unsupported { reason: String, server_outdated: bool },
     Blocked(String),
@@ -671,7 +723,7 @@ enum PrepareOutcome {
 }
 
 enum ConnectOutcome {
-    Done(Result<(CandidateRoute, Session), ConnectError>),
+    Done(Result<RouteConnectResult<Session>, ConnectError>),
     RetryNow,
     Dropped,
 }
@@ -729,7 +781,7 @@ async fn prepare_draining(
 
 /// Runs multi-route `connect` while listening for handle drop, `RetryNow`, or backoff-resetting
 /// OS wake so a stalled ticket or dead route never blocks recovery (`pingdotgg/t3code#34623`,
-/// `#24932`, `wakeups.ts`).
+/// `pingdotgg/t3code#24932`, `wakeups.ts`).
 async fn connect_draining(
     credentials: &Credentials,
     routes: &[CandidateRoute],
@@ -784,7 +836,7 @@ async fn connect_routes(
     credentials: &Credentials,
     routes: &[CandidateRoute],
     expected_environment_id: Option<&str>,
-) -> Result<(CandidateRoute, Session), ConnectError> {
+) -> Result<RouteConnectResult<Session>, ConnectError> {
     let expected = expected_environment_id.map(str::to_owned);
     let token = credentials.access_token.clone();
     connect_over_routes(
@@ -811,7 +863,10 @@ async fn connect_routes(
                 match connect(&route_creds, expected_environment_id).await {
                     Ok(session) => Ok(session),
                     Err(err @ ConnectError::Unsupported { .. }) => Err(RouteAttemptError::Unsupported(err)),
-                    Err(err @ (ConnectError::Unauthorized(_) | ConnectError::Blocked(_))) => {
+                    Err(err @ ConnectError::Unauthorized { clock_skew: false, .. }) => {
+                        Err(RouteAttemptError::Refused(err))
+                    }
+                    Err(err @ (ConnectError::Unauthorized { clock_skew: true, .. } | ConnectError::Blocked(_))) => {
                         Err(RouteAttemptError::Blocked(err))
                     }
                     Err(err @ (ConnectError::Transient(_) | ConnectError::ApprovalPending(_))) => {
@@ -847,12 +902,22 @@ async fn connect(
         }
     }
     let ticket = auth::issue_rpc_ticket(credentials).await.map_err(|error| match error {
-        AuthError::Unauthorized | AuthError::Rejected(_) => ConnectError::Unauthorized(error.to_string()),
+        AuthError::Unauthorized | AuthError::Rejected(_) => ConnectError::Unauthorized {
+            reason: error.to_string(),
+            clock_skew: false,
+        },
+        AuthError::AuthRefused { clock_skew, .. } => ConnectError::Unauthorized {
+            reason: error.to_string(),
+            clock_skew,
+        },
         AuthError::ConnectApprovalPending { message, .. } => ConnectError::ApprovalPending(message),
         other => ConnectError::Transient(other.to_string()),
     })?;
     Session::connect(&auth::socket_url(credentials, &ticket)).await.map_err(|error| match error {
-        OpenError::Unauthorized => ConnectError::Unauthorized(error.to_string()),
+        OpenError::Unauthorized => ConnectError::Unauthorized {
+            reason: error.to_string(),
+            clock_skew: false,
+        },
         // Only a server on a newer protocol answers 426 to ours, unless it says otherwise.
         OpenError::Incompatible { server_protocol } => {
             let mismatch = server_protocol.and_then(mismatch_with).unwrap_or(ProtocolMismatch::ClientOutdated);
@@ -1003,9 +1068,14 @@ async fn next_wake_probe(probe: &mut Option<RunningWakeProbe>) -> WakeProbeResul
     }
 }
 
+struct BetterRouteProbeResult {
+    ready: Option<String>,
+    refused: Vec<String>,
+}
+
 struct RunningBetterRouteProbe {
     task: JoinHandle<()>,
-    rx: oneshot::Receiver<Option<String>>,
+    rx: oneshot::Receiver<BetterRouteProbeResult>,
 }
 
 impl RunningBetterRouteProbe {
@@ -1025,28 +1095,47 @@ fn better_ranked_routes(routes: &[CandidateRoute], active_route: &CandidateRoute
     better
 }
 
+/// Preflights better-ranked routes: checks the descriptor and tests authorization so a route whose
+/// host refuses this device's sign-in is surfaced in `refusedRouteIds` (`pingdotgg/t3code#33199`).
 fn spawn_better_route_probe(
     candidates: Vec<CandidateRoute>,
     expected_environment_id: Option<String>,
+    access_token: String,
 ) -> RunningBetterRouteProbe {
     let (tx, rx) = oneshot::channel();
     let task = tokio::spawn(async move {
+        let mut refused = Vec::new();
         for candidate in candidates {
             if let Ok(descriptor) = auth::fetch_descriptor_timeout(&candidate.http_base, ROUTE_CHECK_TIMEOUT).await
                 && expected_environment_id
                     .as_deref()
                     .is_none_or(|wanted| descriptor.environment_id.is_empty() || descriptor.environment_id == wanted)
             {
-                let _ = tx.send(Some(candidate.id));
-                return;
+                let route_creds = Credentials {
+                    http_base: candidate.http_base.clone(),
+                    access_token: access_token.clone(),
+                };
+                match auth::issue_rpc_ticket(&route_creds).await {
+                    Ok(_) => {
+                        let _ = tx.send(BetterRouteProbeResult {
+                            ready: Some(candidate.id),
+                            refused,
+                        });
+                        return;
+                    }
+                    Err(error) if error.is_host_credential_refusal() => {
+                        refused.push(candidate.id);
+                    }
+                    Err(_) => {}
+                }
             }
         }
-        let _ = tx.send(None);
+        let _ = tx.send(BetterRouteProbeResult { ready: None, refused });
     });
     RunningBetterRouteProbe { task, rx }
 }
 
-async fn next_better_route_probe(probe: &mut Option<RunningBetterRouteProbe>) -> Option<String> {
+async fn next_better_route_probe(probe: &mut Option<RunningBetterRouteProbe>) -> BetterRouteProbeResult {
     match probe.as_mut() {
         Some(running) => match (&mut running.rx).await {
             Ok(result) => {
@@ -1060,6 +1149,41 @@ async fn next_better_route_probe(probe: &mut Option<RunningBetterRouteProbe>) ->
         },
         None => std::future::pending().await,
     }
+}
+
+/// Keeps a direct DPoP session's access token fresh while its socket is open
+/// (`renewDpopBeforeExpiry` in `packages/client-runtime/src/authorization/service.ts`,
+/// `pingdotgg/t3code#37990`).
+fn spawn_direct_dpop_renewal(credentials: Credentials) -> Option<JoinHandle<()>> {
+    let (_, initial) = crate::dpop::find_direct_credential(&credentials.http_base, &credentials.access_token)?;
+    Some(tokio::spawn(async move {
+        let mut expires_at = initial.expires_at_epoch_ms;
+        loop {
+            let now = crate::dpop::now_epoch_ms();
+            let floor_ms = if now < expires_at {
+                5_000
+            } else {
+                crate::dpop::DPOP_ACCESS_TOKEN_REFRESH_SKEW_MS
+            };
+            let wait_ms = expires_at
+                .saturating_sub(crate::dpop::DPOP_ACCESS_TOKEN_REFRESH_SKEW_MS)
+                .saturating_sub(now)
+                .max(floor_ms);
+            tokio::time::sleep(Duration::from_millis(wait_ms as u64)).await;
+            match auth::renew_direct_dpop_token(&credentials, None).await {
+                Ok(renewed) => {
+                    expires_at = expires_at.max(renewed.expires_at_epoch_ms);
+                }
+                Err(error) if error.is_host_credential_refusal() => {
+                    tracing::warn!(http_base = %credentials.http_base, %error, "direct DPoP renewal refused; stopping background renewal");
+                    break;
+                }
+                Err(error) => {
+                    tracing::debug!(http_base = %credentials.http_base, %error, "direct DPoP renewal transient failure; will retry");
+                }
+            }
+        }
+    }))
 }
 
 fn next_better_route_deadline(
@@ -1281,8 +1405,11 @@ fn absorb_learned_routes(
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     session: &Session,
+    active_credentials: &Credentials,
     active_route: &CandidateRoute,
     routes: &mut Vec<CandidateRoute>,
+    refused_routes: &mut Vec<String>,
+    refused_routes_tx: &watch::Sender<Vec<String>>,
     expected_environment_id: &mut Option<String>,
     last_route_switch: Option<Instant>,
     resume: &mut Resume,
@@ -1292,6 +1419,7 @@ async fn run_session(
     fetch: &mut SessionStateFetch<'_>,
     config_extras: &watch::Sender<ServerConfigExtras>,
 ) -> SessionEnd {
+    let dpop_renewal_task = spawn_direct_dpop_renewal(active_credentials.clone());
     let config_requested_at_ms = wall_now_ms();
     let mut preprocessor = ServerConfigPreprocessor::default();
     let mut environment_label: Option<String> = None;
@@ -1426,11 +1554,22 @@ async fn run_session(
                 better_route_deadline = None;
                 let better = better_ranked_routes(routes, active_route);
                 if !better.is_empty() {
-                    better_route_probe = Some(spawn_better_route_probe(better, expected_environment_id.clone()));
+                    better_route_probe = Some(spawn_better_route_probe(
+                        better,
+                        expected_environment_id.clone(),
+                        active_credentials.access_token.clone(),
+                    ));
                 }
             }
             better_result = next_better_route_probe(&mut better_route_probe) => {
-                if let Some(better_id) = better_result {
+                if !better_result.refused.is_empty() {
+                    let merged = merge_refused_routes(refused_routes, &better_result.refused, |_| true);
+                    if merged != *refused_routes {
+                        *refused_routes = merged;
+                        refused_routes_tx.send_replace(refused_routes.clone());
+                    }
+                }
+                if let Some(better_id) = better_result.ready {
                     break SessionEnd::SwitchRoute(better_id);
                 }
                 better_route_backoff = (better_route_backoff * 2).min(SILENT_ROUTE_BACKOFF_MAX);
@@ -1523,6 +1662,9 @@ async fn run_session(
             reason = session.closed() => break SessionEnd::Closed(reason),
         }
     };
+    if let Some(task) = dpop_renewal_task {
+        task.abort();
+    }
     if let Some(probe) = wake_probe {
         probe.abort();
     }
@@ -2016,17 +2158,59 @@ mod parity_tests {
         assert!(matches!(outcome, PrepareOutcome::RetryNow));
 
         // 4. `better_ranked_routes` + `spawn_better_route_probe` discovers a higher-ranked
-        // candidate answering with the expected `environmentId`.
+        // candidate answering with the expected `environmentId`, and reports routes whose host
+        // refuses this device's sign-in (`pingdotgg/t3code#33199`).
         let wan_active = CandidateRoute::saved("https://remote.example.com:3773");
         let local_better = CandidateRoute::saved(server.credentials().http_base);
         let better = better_ranked_routes(&[wan_active.clone(), local_better.clone()], &wan_active);
         assert_eq!(better.len(), 1);
         assert_eq!(better[0].id, local_better.id);
-        let mut probe = Some(spawn_better_route_probe(better, Some("env-wake".into())));
+        let mut probe = Some(spawn_better_route_probe(
+            better.clone(),
+            Some("env-wake".into()),
+            server.credentials().access_token,
+        ));
         let winner = tokio::time::timeout(Duration::from_secs(3), next_better_route_probe(&mut probe))
             .await
             .expect("better-route probe completes");
-        assert_eq!(winner.as_deref(), Some(local_better.id.as_str()));
+        assert_eq!(winner.ready.as_deref(), Some(local_better.id.as_str()));
+        assert!(winner.refused.is_empty());
+
+        // When a better route's host answers its descriptor but refuses our credential (401),
+        // preflight surfaces it in `refused` (`pingdotgg/t3code#33199`).
+        let refusing = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refusing_base = format!("http://{}", refusing.local_addr().unwrap());
+        let refusing_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = refusing.accept().await else { break };
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let (status, body) = if head.starts_with("GET /.well-known/t3/environment ") {
+                    (200, r#"{"environmentId":"env-wake","label":"Refusing","serverVersion":"0.1.9","orchestrationProtocolVersion":2}"#)
+                } else {
+                    (401, r#"{"code":"auth_invalid","reason":"invalid_credential","traceId":"trace-refused"}"#)
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let refusing_route = CandidateRoute::saved(refusing_base);
+        let mut refused_probe = Some(spawn_better_route_probe(
+            vec![refusing_route.clone()],
+            Some("env-wake".into()),
+            "expired-token".into(),
+        ));
+        let refused_result = tokio::time::timeout(Duration::from_secs(3), next_better_route_probe(&mut refused_probe))
+            .await
+            .expect("refused better-route probe completes");
+        refusing_task.abort();
+        assert_eq!(refused_result.ready, None);
+        assert_eq!(refused_result.refused, vec![refusing_route.id]);
     }
 
     #[test]

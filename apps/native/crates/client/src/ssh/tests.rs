@@ -236,7 +236,12 @@ async fn provisioning_launches_the_server_forwards_a_port_and_pairs_over_ssh() {
     assert_eq!(pairing.paired.descriptor.map(|descriptor| descriptor.environment_id), Some("env-devbox".to_owned()));
     let launches = fixture.lines("launches");
     assert_eq!(launches.len(), 1);
-    assert!(launches[0].ends_with(&format!("-p 2222 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- julius@devbox sh -l -s -- {}", core::native_state_key(&resolved))), "{}", launches[0]);
+    let expected_remote = core::remote_login_shell_args(Some(&core::native_state_key(&resolved))).join(" ");
+    assert!(
+        launches[0].ends_with(&format!("-p 2222 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- julius@devbox {expected_remote}")),
+        "{}",
+        launches[0]
+    );
     let tunnels: Vec<String> = fixture.lines("calls").into_iter().filter(|call| call.contains(" -N ")).collect();
     assert_eq!(tunnels.len(), 1);
     assert!(tunnels[0].ends_with(&format!("-L {port}:127.0.0.1:3774 -- julius@devbox")), "{}", tunnels[0]);

@@ -1840,12 +1840,33 @@ mod tests {
                     let first_line = raw.lines().next().unwrap_or("").to_owned();
                     let body_str = raw.split("\r\n\r\n").nth(1).unwrap_or("");
                     let body_json = serde_json::from_str::<Value>(body_str).unwrap_or(Value::Null);
-                    calls_bg.lock().unwrap().push((first_line, body_json));
-                    let (status, reply) = replies
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or((200, json!({})));
+                    let (status, reply) = if first_line.starts_with("GET /.well-known/t3-environment") {
+                        (
+                            200u16,
+                            json!({
+                                "environmentId": "vps-1",
+                                "label": "Build VPS",
+                                "serverVersion": "0.1.9",
+                                "capabilities": { "peerLinkPairingCodes": true }
+                            }),
+                        )
+                    } else {
+                        calls_bg.lock().unwrap().push((first_line, body_json.clone()));
+                        let (status, mut reply) = replies
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or((200, json!({})));
+                        if status == 200
+                            && let Some(obj) = reply.as_object_mut()
+                        {
+                            obj.entry("purpose".to_owned()).or_insert_with(|| json!("peer-link"));
+                            if let Some(access) = body_json.get("access").cloned() {
+                                obj.insert("access".to_owned(), access);
+                            }
+                        }
+                        (status, reply)
+                    };
                     let body = reply.to_string();
                     let resp = format!(
                         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -2091,7 +2112,8 @@ mod tests {
             recorded.iter().any(|(req, body)| {
                 req.starts_with("POST /api/auth/pairing-token")
                     && body["label"] == "T3 Code link"
-                    && body["scopes"].is_array()
+                    && body["purpose"] == "peer-link"
+                    && body["access"].is_string()
             }),
             "expected POST /api/auth/pairing-token from mint_pairing_code_on, got: {recorded:?}"
         );

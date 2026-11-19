@@ -10,7 +10,9 @@ publish.workspace = true
 test-support = []
 
 [dependencies]
+base64 = "0.22"
 rand = "0.8"
+ring = "0.17.14"
 t3-core.workspace = true
 anyhow.workspace = true
 dirs.workspace = true

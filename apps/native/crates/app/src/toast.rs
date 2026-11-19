@@ -546,6 +546,20 @@ impl AppState {
         }
     }
 
+    /// Withdraws any toast with `key` without persisting dismissal state (`pingdotgg/t3code#38980`:
+    /// removing an environment connection withdraws its permission-update notice without marking it
+    /// permanently dismissed).
+    pub fn withdraw_toast_by_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let before = self.toasts.entries.len();
+        self.toasts.entries.retain(|entry| entry.toast.key.as_deref() != Some(key));
+        if self.toasts.entries.is_empty() {
+            self.toasts.hovered = false;
+        }
+        if self.toasts.entries.len() != before {
+            cx.emit(AppEvent::Notice);
+        }
+    }
+
     pub(crate) fn mark_toast_copied(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(entry) = self.toasts.entries.iter_mut().find(|entry| entry.id == id) {
             entry.copied = true;
@@ -1226,6 +1240,42 @@ mod tests {
         assert_eq!(
             t3_client::store::load_ui_state(&format!("permission-update-dismissed-{env_key}")).and_then(|v| v.as_bool()),
             Some(true)
+        );
+
+        // `pingdotgg/t3code#38980`: removing a saved environment withdraws its permission-update toast without
+        // persisting permanent dismissal.
+        let removed_saved_id = "removed-legacy-saved";
+        let removed_env_id = "removed-legacy-env-id";
+        state.update(cx, |state, cx| {
+            state.environments.environments.push(t3_client::store::SavedEnvironment {
+                id: removed_saved_id.into(),
+                environment_id: Some(removed_env_id.into()),
+                label: "Old Box".into(),
+                disabled: false,
+                http_base: "http://127.0.0.1:4199".into(),
+                access_token: Some("tok".into()),
+                server_version: None,
+                local: false,
+                ssh: None,
+            });
+            state.show_toast(
+                Toast::new(ToastKind::Warning, "Permissions have changed for Old Box")
+                    .permission_update(removed_env_id),
+                cx,
+            );
+        });
+        assert!(state.read_with(cx, |state, _| {
+            state.toasts.entries.iter().any(|e| e.toast.permission_update_env.as_deref() == Some(removed_env_id))
+        }));
+        state.update(cx, |state, cx| state.remove_environment(removed_saved_id, cx));
+        assert!(state.read_with(cx, |state, _| {
+            !state.toasts.entries.iter().any(|e| e.toast.permission_update_env.as_deref() == Some(removed_env_id))
+        }));
+        let _ = t3_client::store::github_star_prompt(t3_client::store::StarPromptStorage::Read).await;
+        assert_eq!(
+            t3_client::store::load_ui_state(&format!("permission-update-dismissed-{removed_env_id}")).and_then(|v| v.as_bool()),
+            None,
+            "withdrawing on environment removal must not persist permanent dismissal"
         );
 
         state.update(cx, |state, _| state.stop_pump());

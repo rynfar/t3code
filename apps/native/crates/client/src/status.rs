@@ -233,6 +233,18 @@ pub struct Diagnosis {
     pub facts: Vec<(String, String)>,
 }
 
+/// Extracts a rejected request's trace ID when encoded in an error reason (`(Trace ID: <id>)` or
+/// `Trace ID: <id>`, `pingdotgg/t3code#38041`).
+pub fn extract_trace_id(reason: &str) -> Option<&str> {
+    let after = reason.split("Trace ID:").nth(1)?;
+    let trimmed = after.trim_start();
+    let end = trimmed
+        .find(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | ';'))
+        .unwrap_or(trimmed.len());
+    let id = &trimmed[..end];
+    (!id.is_empty()).then_some(id)
+}
+
 /// `headline`, `hops`, `facts`, and `steps` of `diagnosis.ts` for the server hop of a direct route.
 pub fn diagnose(status: &ConnectionStatus, host: &str) -> Option<Diagnosis> {
     let host = if host.trim().is_empty() { "this environment" } else { host };
@@ -247,6 +259,9 @@ pub fn diagnose(status: &ConnectionStatus, host: &str) -> Option<Diagnosis> {
         facts.push(("Attempt".to_owned(), attempt.to_string()));
     }
     if let Some(reason) = status.error() {
+        if let Some(trace_id) = extract_trace_id(reason) {
+            facts.push(("Trace ID".to_owned(), trace_id.to_owned()));
+        }
         facts.push(("Detail".to_owned(), reason.to_owned()));
     }
 
@@ -276,7 +291,9 @@ pub fn diagnose(status: &ConnectionStatus, host: &str) -> Option<Diagnosis> {
         ConnectionStatus::NeedsPairing { .. } => (
             format!("T3 Code on {host} did not accept this device"),
             vec![device_ok, server_failed],
-            vec!["Pair again to reconnect.".to_owned()],
+            vec![format!(
+                "This device's sign-in to {host} expired or was revoked. Pair it again with a new pairing link from {host}."
+            )],
         ),
         // The device hop: this device could not ready the route (an SSH tunnel) to the server.
         ConnectionStatus::Blocked { reason } => (
@@ -356,6 +373,17 @@ mod tests {
         let copied = connection_diagnosis_text("devbox", &diag);
         assert!(copied.contains("devbox: This device could not prepare the connection"));
         assert!(copied.contains("✕ This device (Failed)"));
+
+        // `pingdotgg/t3code#38041`: expired-session diagnosis asks to pair again and names the rejected request's trace ID.
+        let expired = ConnectionStatus::NeedsPairing {
+            reason: "This device is no longer authorized. Pair again. (Trace ID: trace-1)".into(),
+        };
+        let expired_diag = diagnose(&expired, "Studio").expect("expired diagnosis");
+        let joined_steps = expired_diag.steps.join(" ");
+        assert!(!joined_steps.contains("Make sure T3 Code is running"));
+        assert!(joined_steps.contains("Pair it again with a new pairing link from Studio."));
+        assert!(expired_diag.facts.iter().any(|(k, v)| k == "Trace ID" && v == "trace-1"));
+        assert!(connection_diagnosis_text("Studio", &expired_diag).contains("Trace ID: trace-1"));
     }
 
     #[test]

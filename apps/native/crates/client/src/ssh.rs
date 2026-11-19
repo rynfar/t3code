@@ -439,11 +439,23 @@ async fn start_tunnel(program: &Path, life: &Lifecycle, target: &SshTarget, loca
 }
 
 /// `launchOrReuseRemoteServer`.
-async fn launch_remote(program: &Path, life: &Lifecycle, target: &SshTarget, auth: Auth, version: &str, launcher_id: Option<&str>) -> Result<LaunchResult, SshError> {
+async fn launch_remote(
+    program: &Path,
+    life: &Lifecycle,
+    target: &SshTarget,
+    auth: Auth,
+    version: &str,
+    launcher_id: Option<&str>,
+    release_base_url: Option<&str>,
+) -> Result<LaunchResult, SshError> {
     let state_key = core::native_state_key(target);
+    let remote_owned = core::remote_login_shell_args(Some(&state_key));
+    let remote_refs: Vec<&str> = remote_owned.iter().map(String::as_str).collect();
     let spec = CommandSpec {
-        remote: &["sh", "-l", "-s", "--", state_key.as_str()],
-        stdin: Some(scripts::launch_script_with_launcher(version, launcher_id).map_err(SshError)?),
+        remote: &remote_refs,
+        stdin: Some(
+            scripts::launch_script_with_options(version, launcher_id, release_base_url).map_err(SshError)?,
+        ),
         timeout: millis(core::ARCHIVE_LAUNCH_TIMEOUT_MS),
         ..Default::default()
     };
@@ -454,11 +466,23 @@ async fn launch_remote(program: &Path, life: &Lifecycle, target: &SshTarget, aut
 }
 
 /// `issueRemotePairingToken`.
-async fn issue_pairing_token(program: &Path, life: &Lifecycle, target: &SshTarget, auth: Auth, version: &str) -> Result<String, SshError> {
+async fn issue_pairing_token(
+    program: &Path,
+    life: &Lifecycle,
+    target: &SshTarget,
+    auth: Auth,
+    version: &str,
+    release_base_url: Option<&str>,
+) -> Result<String, SshError> {
     let state_key = core::native_state_key(target);
+    let remote_owned = core::remote_login_shell_args(None);
+    let remote_refs: Vec<&str> = remote_owned.iter().map(String::as_str).collect();
     let spec = CommandSpec {
-        remote: &["sh", "-s"],
-        stdin: Some(scripts::pairing_script(&state_key, version).map_err(SshError)?),
+        remote: &remote_refs,
+        stdin: Some(
+            scripts::pairing_script_with_release_base_url(&state_key, version, release_base_url)
+                .map_err(SshError)?,
+        ),
         timeout: millis(core::ARCHIVE_LAUNCH_TIMEOUT_MS),
         ..Default::default()
     };
@@ -526,6 +550,8 @@ struct Inner {
     in_flight: Arc<watch::Sender<usize>>,
     groups: Arc<Mutex<std::collections::HashSet<u32>>>,
     version: Mutex<Option<String>>,
+    /// Explicit release mirror override (`T3CODE_RELEASE_BASE_URL`, `pingdotgg/t3code#31396`).
+    release_base_url: Option<String>,
     state: Mutex<State>,
     /// One per target, so a reconnect never reuses a server while its stop is pending.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -561,10 +587,24 @@ impl SshEnvironments {
     /// password fails as it would in batch mode.
     pub fn new(prompts: Option<mpsc::UnboundedSender<PasswordRequest>>) -> Self {
         let program = std::env::var_os("T3_NATIVE_SSH_BIN").filter(|program| !program.is_empty()).map_or_else(|| PathBuf::from("ssh"), PathBuf::from);
-        Self::with_program(program, prompts, None)
+        let release_base_url = std::env::var(scripts::RELEASE_BASE_URL_ENV)
+            .ok()
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty());
+        Self::with_program_and_release_url(program, prompts, None, release_base_url)
     }
 
+    #[cfg(test)]
     fn with_program(program: PathBuf, prompts: Option<mpsc::UnboundedSender<PasswordRequest>>, version: Option<String>) -> Self {
+        Self::with_program_and_release_url(program, prompts, version, None)
+    }
+
+    fn with_program_and_release_url(
+        program: PathBuf,
+        prompts: Option<mpsc::UnboundedSender<PasswordRequest>>,
+        version: Option<String>,
+        release_base_url: Option<String>,
+    ) -> Self {
         let inner = Inner {
             program,
             prompts,
@@ -572,6 +612,7 @@ impl SshEnvironments {
             in_flight: Arc::new(watch::Sender::new(0)),
             groups: Arc::default(),
             version: Mutex::new(version),
+            release_base_url,
             state: Mutex::default(),
             locks: Mutex::default(),
         };
@@ -727,8 +768,14 @@ impl SshEnvironments {
             state.routes.insert(key.clone(), key.clone());
         }
         let (program, life) = (&self.inner.program, self.life());
+        let release_base_url = self.inner.release_base_url.as_deref();
         let pairing_token = if issue_pairing {
-            Some(self.with_auth(&key, &resolved, |auth| issue_pairing_token(program, &life, &resolved, auth, &version)).await?)
+            Some(
+                self.with_auth(&key, &resolved, |auth| {
+                    issue_pairing_token(program, &life, &resolved, auth, &version, release_base_url)
+                })
+                .await?,
+            )
         } else {
             None
         };
@@ -752,7 +799,20 @@ impl SshEnvironments {
         }
         let (program, life) = (&self.inner.program, self.life());
         let launcher_id = crate::store::ssh_launcher_id();
-        let launched = self.with_auth(key, target, |auth| launch_remote(program, &life, target, auth, version, launcher_id.as_deref())).await?;
+        let release_base_url = self.inner.release_base_url.as_deref();
+        let launched = self
+            .with_auth(key, target, |auth| {
+                launch_remote(
+                    program,
+                    &life,
+                    target,
+                    auth,
+                    version,
+                    launcher_id.as_deref(),
+                    release_base_url,
+                )
+            })
+            .await?;
         let mut moved = false;
         let tunnel = loop {
             match self.with_auth(key, target, |auth| start_tunnel(program, &life, target, port, launched.remote_port, auth)).await {

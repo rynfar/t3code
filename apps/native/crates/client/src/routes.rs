@@ -427,26 +427,66 @@ pub enum RouteCheck {
     Unchecked,
 }
 
+/// Result of preflighting a candidate route (`RoutePreflight`, `pingdotgg/t3code#33199`):
+/// `Unprepared` means the route answered its check but could not be prepared;
+/// `Refused` means its host refused this device's credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutePreflight {
+    Ready,
+    Refused,
+    Unprepared,
+    Silent,
+    Unchecked,
+}
+
 /// Outcome of trying to connect over one route.
 pub enum RouteAttemptError<E> {
     /// Server protocol incompatibility — same server on every route, stop immediately.
     Unsupported(E),
+    /// Host answered and refused this device's credential (`isHostCredentialRefusal`, `pingdotgg/t3code#33199`).
+    /// Recorded in `refused_route_ids` if another route connects.
+    Refused(E),
     /// Non-transient block (unauthorized / blocked) — try other routes unless none succeed.
     Blocked(E),
     /// Transient failure — try remaining routes and retain first transient failure if all fail.
     Transient(E),
 }
 
+/// Connected route plus any earlier routes whose host refused this device's sign-in (`pingdotgg/t3code#33199`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteConnectResult<T> {
+    pub route: CandidateRoute,
+    pub value: T,
+    pub refused_route_ids: Vec<String>,
+}
+
+/// `mergeRefusedRoutes` (`packages/client-runtime/src/connection/supervisor.ts`, `pingdotgg/t3code#33199`):
+/// merges newly refused route IDs while keeping only those that satisfy `keep` and deduplicating.
+pub fn merge_refused_routes(
+    existing: &[String],
+    newly_refused: &[String],
+    keep: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in existing.iter().chain(newly_refused.iter()) {
+        if keep(id) && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
 /// `connectOverRoutes` (`packages/client-runtime/src/connection/driver.ts:71-141`):
 /// Probes candidate routes in parallel when more than one usable route exists, gives preferred
 /// routes a `head_start` before falling through to slower routes, stops immediately on protocol
-/// mismatch, and falls back to late-answering routes before giving up.
+/// mismatch, tracks routes whose host refused this device's sign-in (`pingdotgg/t3code#33199`), and falls back
+/// to late-answering routes before giving up.
 pub async fn connect_over_routes<T, E, CheckFn, CheckFut, ConnFn, ConnFut>(
     routes: &[CandidateRoute],
     head_start: Duration,
     check_route: CheckFn,
     mut connect_route: ConnFn,
-) -> Result<(CandidateRoute, T), Option<E>>
+) -> Result<RouteConnectResult<T>, Option<E>>
 where
     CheckFn: Fn(CandidateRoute) -> CheckFut,
     CheckFut: Future<Output = RouteCheck> + Send + 'static,
@@ -460,10 +500,17 @@ where
     if candidates.len() == 1 {
         let route = candidates[0].clone();
         return match connect_route(route.clone()).await {
-            Ok(value) => Ok((route, value)),
-            Err(RouteAttemptError::Unsupported(err) | RouteAttemptError::Blocked(err) | RouteAttemptError::Transient(err)) => {
-                Err(Some(err))
-            }
+            Ok(value) => Ok(RouteConnectResult {
+                route,
+                value,
+                refused_route_ids: Vec::new(),
+            }),
+            Err(
+                RouteAttemptError::Unsupported(err)
+                | RouteAttemptError::Refused(err)
+                | RouteAttemptError::Blocked(err)
+                | RouteAttemptError::Transient(err),
+            ) => Err(Some(err)),
         };
     }
 
@@ -476,6 +523,7 @@ where
 
     let mut transient: Option<E> = None;
     let mut blocked: Option<E> = None;
+    let mut refused_route_ids: Vec<String> = Vec::new();
     let mut silent_indices: Vec<usize> = Vec::new();
 
     for (index, route) in candidates.iter().enumerate() {
@@ -505,7 +553,11 @@ where
         match connect_route(route.clone()).await {
             Ok(value) => {
                 abort_remaining(&mut checks);
-                return Ok((route.clone(), value));
+                return Ok(RouteConnectResult {
+                    route: route.clone(),
+                    value,
+                    refused_route_ids,
+                });
             }
             Err(RouteAttemptError::Unsupported(err)) => {
                 abort_remaining(&mut checks);
@@ -514,6 +566,14 @@ where
             Err(RouteAttemptError::Transient(err)) => {
                 if transient.is_none() {
                     transient = Some(err);
+                }
+            }
+            Err(RouteAttemptError::Refused(err)) => {
+                if !refused_route_ids.contains(&route.id) {
+                    refused_route_ids.push(route.id.clone());
+                }
+                if blocked.is_none() {
+                    blocked = Some(err);
                 }
             }
             Err(RouteAttemptError::Blocked(err)) => {
@@ -539,12 +599,27 @@ where
     }
 
     for &index in &answered_late {
-        match connect_route(candidates[index].clone()).await {
-            Ok(value) => return Ok((candidates[index].clone(), value)),
+        let route = &candidates[index];
+        match connect_route(route.clone()).await {
+            Ok(value) => {
+                return Ok(RouteConnectResult {
+                    route: route.clone(),
+                    value,
+                    refused_route_ids,
+                });
+            }
             Err(RouteAttemptError::Unsupported(err)) => return Err(Some(err)),
             Err(RouteAttemptError::Transient(err)) => {
                 if transient.is_none() {
                     transient = Some(err);
+                }
+            }
+            Err(RouteAttemptError::Refused(err)) => {
+                if !refused_route_ids.contains(&route.id) {
+                    refused_route_ids.push(route.id.clone());
+                }
+                if blocked.is_none() {
+                    blocked = Some(err);
                 }
             }
             Err(RouteAttemptError::Blocked(err)) => {
@@ -558,14 +633,29 @@ where
     // Only attempt still-silent routes when no earlier route already produced a retryable transient error.
     if transient.is_none() {
         for &index in &still_silent {
-            match connect_route(candidates[index].clone()).await {
-                Ok(value) => return Ok((candidates[index].clone(), value)),
+            let route = &candidates[index];
+            match connect_route(route.clone()).await {
+                Ok(value) => {
+                    return Ok(RouteConnectResult {
+                        route: route.clone(),
+                        value,
+                        refused_route_ids,
+                    });
+                }
                 Err(RouteAttemptError::Unsupported(err)) => return Err(Some(err)),
                 Err(RouteAttemptError::Transient(err)) => {
                     if transient.is_none() {
                         transient = Some(err);
                     }
                     break;
+                }
+                Err(RouteAttemptError::Refused(err)) => {
+                    if !refused_route_ids.contains(&route.id) {
+                        refused_route_ids.push(route.id.clone());
+                    }
+                    if blocked.is_none() {
+                        blocked = Some(err);
+                    }
                 }
                 Err(RouteAttemptError::Blocked(err)) => {
                     if blocked.is_none() {
@@ -643,7 +733,7 @@ mod tests {
         let live = CandidateRoute::saved("https://studio.ts.net:3773");
         let routes = vec![dead.clone(), live.clone()];
         let mut tried = Vec::new();
-        let (chosen, value) = connect_over_routes(
+        let result = connect_over_routes(
             &routes,
             Duration::from_millis(40),
             |route| async move {
@@ -667,9 +757,40 @@ mod tests {
         )
         .await
         .expect("fallback route succeeds");
-        assert_eq!(chosen.http_base, live.http_base);
-        assert_eq!(value, "connected-tailnet");
+        assert_eq!(result.route.http_base, live.http_base);
+        assert_eq!(result.value, "connected-tailnet");
+        assert!(result.refused_route_ids.is_empty());
         assert_eq!(tried, vec!["https://studio.ts.net:3773"]);
+    }
+
+    #[tokio::test]
+    async fn connect_over_routes_records_refused_routes_when_fallback_succeeds() {
+        let refused = CandidateRoute::saved("http://192.168.1.10:3773");
+        let live = CandidateRoute::saved("https://studio.ts.net:3773");
+        let routes = vec![refused.clone(), live.clone()];
+        let result = connect_over_routes(
+            &routes,
+            Duration::from_millis(50),
+            |_| async { RouteCheck::Answered },
+            |route| async move {
+                if route.http_base.contains("192.168.1.10") {
+                    Err(RouteAttemptError::Refused("sign-in refused"))
+                } else {
+                    Ok::<_, RouteAttemptError<&'static str>>("connected-tailnet")
+                }
+            },
+        )
+        .await
+        .expect("fallback connects after refused route");
+        assert_eq!(result.route.id, live.id);
+        assert_eq!(result.refused_route_ids, vec![refused.id.clone()]);
+
+        let merged = merge_refused_routes(
+            std::slice::from_ref(&refused.id),
+            &[live.id.clone(), refused.id.clone()],
+            |id| id != live.id,
+        );
+        assert_eq!(merged, vec![refused.id]);
     }
 
     #[tokio::test]

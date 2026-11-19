@@ -81,13 +81,20 @@ pub async fn fetch_history_page_with(credentials: &Credentials, thread_id: &str,
 
 async fn fetch_authed_json(credentials: &Credentials, url: url::Url) -> Result<Value, String> {
     let client = reqwest::Client::builder().timeout(TIMEOUT).build().map_err(|_| FALLBACK.to_owned())?;
-    let response = client
-        .get(url)
-        .bearer_auth(&credentials.access_token)
-        .header(PROTOCOL_HEADER, ORCHESTRATION_PROTOCOL_VERSION.to_string())
-        .send()
-        .await
-        .map_err(describe)?;
+    let url_str = url.as_str().to_owned();
+    let response = crate::auth::send_authed_request(credentials, "GET", &url_str, || {
+        client
+            .get(url.clone())
+            .header(PROTOCOL_HEADER, ORCHESTRATION_PROTOCOL_VERSION.to_string())
+    })
+    .await
+    .map_err(|error| match error {
+        crate::auth::AuthedHttpError::Http(err) => describe(err),
+        crate::auth::AuthedHttpError::Auth(err) if err.is_host_credential_refusal() => {
+            "This device is no longer authorized. Pair again.".into()
+        }
+        crate::auth::AuthedHttpError::Auth(err) => err.to_string(),
+    })?;
     let status = response.status();
     let body = response.bytes().await.map_err(describe)?;
     if status.as_u16() == 401 || status.as_u16() == 403 {

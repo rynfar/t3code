@@ -7057,11 +7057,13 @@ name = "t3-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs",
  "futures",
  "libc",
  "rand 0.8.7",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "t3-core",
