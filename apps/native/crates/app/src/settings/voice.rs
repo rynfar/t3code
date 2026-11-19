@@ -88,6 +88,7 @@ struct CloudVoiceDialog {
     error: Option<String>,
     focus: FocusHandle,
     seq: u64,
+    _subscriptions: Vec<Subscription>,
 }
 
 pub(crate) struct VoiceState {
@@ -99,7 +100,7 @@ pub(crate) struct VoiceState {
     mic_test_error: Option<String>,
     mic_test_samples: Vec<f32>,
     mic_test_pcm: Option<Arc<Mutex<Vec<f32>>>>,
-    mic_test_device_id: String,
+    mic_test_device_id: Option<String>,
     mic_test_capture: Option<Box<dyn AudioCaptureSession>>,
     mic_test_playback: Option<Box<dyn AudioPlaybackSession>>,
     _mic_test_task: Option<Task<()>>,
@@ -225,7 +226,7 @@ impl VoiceState {
             mic_test_error: None,
             mic_test_samples: Vec::new(),
             mic_test_pcm: None,
-            mic_test_device_id: String::new(),
+            mic_test_device_id: None,
             mic_test_capture: None,
             mic_test_playback: None,
             _mic_test_task: None,
@@ -321,6 +322,13 @@ fn system_preferred_languages() -> Vec<String> {
 }
 
 impl SettingsView {
+    pub(super) fn leave_voice(&mut self, cx: &mut Context<Self>) {
+        if let Some(ctrl) = self.voice.model_test_controller.as_ref() {
+            ctrl.update(cx, |controller, cx| controller.cancel(cx));
+        }
+        self.voice.leave();
+    }
+
     pub(super) fn dismiss_voice_overlay(
         &mut self,
         window: &mut Window,
@@ -394,7 +402,7 @@ impl SettingsView {
         self.voice.stop_mic_test_resources();
         self.voice.mic_test_error = None;
         self.voice.mic_test_samples.clear();
-        self.voice.mic_test_device_id = device_id.clone();
+        self.voice.mic_test_device_id = Some(device_id.clone());
         self.voice.mic_test_phase = MicrophoneTestPhase::Starting;
         cx.notify();
 
@@ -461,10 +469,6 @@ impl SettingsView {
                                 if hit_limit {
                                     this.finish_mic_test_capture(None, &pcm_buf, LOOPBACK_SECONDS as f32, cx);
                                     return false;
-                                }
-                                // Keep latest captured buffer synced for manual Stop.
-                                if let Ok(guard) = pcm_buf.lock() {
-                                    this.voice.mic_test_samples = guard.clone();
                                 }
                                 this.voice.mic_test_phase =
                                     MicrophoneTestPhase::Recording { elapsed_secs: elapsed, level };
@@ -964,6 +968,18 @@ impl SettingsView {
             InputState::new(window, cx).placeholder("Search transcription models")
         });
         let key_input = cx.new(|cx| InputState::new(window, cx).placeholder("Enter API key").masked(true));
+        let subscriptions = vec![
+            cx.subscribe_in(&model_search, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&key_input, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        ];
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let seq = self.voice.cloud_dialog.as_ref().map_or(1, |d| d.seq + 1);
@@ -990,6 +1006,7 @@ impl SettingsView {
             error: None,
             focus,
             seq,
+            _subscriptions: subscriptions,
         });
         self.load_cloud_dialog_keys(credentials.clone(), seq, cx);
         if provider == CloudSpeechProvider::Openrouter {
@@ -1451,11 +1468,12 @@ impl SettingsView {
         let devices_known = self.voice.devices.iter().any(|d| !d.device_id.is_empty());
         let perm_status = audio_platform(cx).permission_status();
 
-        if !self.voice.mic_test_device_id.is_empty() && self.voice.mic_test_device_id != selected_mic_id {
+        if self.voice.mic_test_device_id.as_deref().is_some_and(|id| id != selected_mic_id) {
             self.voice.stop_mic_test_resources();
             self.voice.mic_test_samples.clear();
+            self.voice.mic_test_error = None;
             self.voice.mic_test_phase = MicrophoneTestPhase::Idle;
-            self.voice.mic_test_device_id = selected_mic_id.clone();
+            self.voice.mic_test_device_id = Some(selected_mic_id.clone());
         }
 
         let mic_list = v_flex()
@@ -3327,7 +3345,9 @@ impl SettingsView {
                                     .child(Input::new(&dialog.model_search).small())
                                     .child(
                                         v_flex()
+                                            .id("voice-cloud-openrouter-models")
                                             .max_h(r(180.))
+                                            .overflow_y_scroll()
                                             .rounded(r(8.))
                                             .border_1()
                                             .border_color(hsla(p.border))
@@ -3751,6 +3771,164 @@ mod tests {
             );
         });
 
+        // Switching away from "System default" ("") to a named mic resets phase, samples, and error.
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.start_mic_test(String::new(), cx);
+            });
+            mock_audio.emit_pcm(vec![0.25; 800]);
+            view.update(cx, |view, cx| {
+                view.stop_mic_test_recording(cx);
+                view.voice.mic_test_error = Some("stale error".into());
+                assert!(matches!(view.voice.mic_test_phase, MicrophoneTestPhase::Ready { .. }));
+                assert!(!view.voice.mic_test_samples.is_empty());
+            });
+            store::update_client(
+                &state,
+                ClientSettingChange::VoiceMicrophones(vec![
+                    t3_core::voice_input::VoiceMicrophoneEntry::Device {
+                        device_id: "mock-mic-1".into(),
+                        label: "Studio USB Mic".into(),
+                    },
+                    t3_core::voice_input::VoiceMicrophoneEntry::Default,
+                ]),
+                cx,
+            );
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        view.read_with(&vcx, |view, _| {
+            assert_eq!(view.voice.mic_test_phase, MicrophoneTestPhase::Idle);
+            assert!(view.voice.mic_test_samples.is_empty());
+            assert!(view.voice.mic_test_error.is_none());
+            assert_eq!(view.voice.mic_test_device_id.as_deref(), Some("mock-mic-1"));
+        });
+
+        // Cloud dialog subscribes to InputEvent::Change on model_search and key_input, notifying
+        // SettingsView so OpenRouter filtering and Save validation stay live.
+        let notify_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notify_counter = notify_count.clone();
+        let _obs = vcx.update(|_, cx| {
+            cx.observe(&view, move |_, _| {
+                notify_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_cloud_dialog(
+                    "mac-env".into(),
+                    "Mac".into(),
+                    Credentials {
+                        http_base: "http://127.0.0.1:1".into(),
+                        access_token: "tok".into(),
+                    },
+                    CloudSpeechProvider::Openrouter,
+                    false,
+                    true,
+                    window,
+                    cx,
+                );
+                let d = view.voice.cloud_dialog.as_mut().unwrap();
+                d.keys_state = CloudLoad::Loaded(CloudSpeechKeys {
+                    openai: false,
+                    xai: false,
+                    openrouter: Some(false),
+                });
+                d.models_state = CloudLoad::Loaded(vec![
+                    CloudSpeechModel {
+                        id: "openai/whisper-large".into(),
+                        name: "Whisper Large".into(),
+                    },
+                    CloudSpeechModel {
+                        id: "google/gemini-2.5-flash".into(),
+                        name: "Gemini Flash".into(),
+                    },
+                ]);
+                d.selected_model = "google/gemini-2.5-flash".into();
+            });
+        });
+        vcx.run_until_parked();
+        notify_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            let model_search = view.read(cx).voice.cloud_dialog.as_ref().unwrap().model_search.clone();
+            // Before typing a key, validation rejects submit.
+            let before = {
+                let d = view.read(cx).voice.cloud_dialog.as_ref().unwrap();
+                let models = match &d.models_state {
+                    CloudLoad::Loaded(m) => Some(m.as_slice()),
+                    _ => None,
+                };
+                validate_cloud_voice_config(
+                    d.provider,
+                    d.active,
+                    Some(false),
+                    d.key_input.read(cx).value().as_str(),
+                    false,
+                    d.can_manage,
+                    &d.selected_model,
+                    None,
+                    models,
+                )
+            };
+            assert!(!before.can_submit);
+
+            model_search.update(cx, |i, cx| i.insert("gemini", window, cx));
+        });
+        vcx.run_until_parked();
+        assert!(notify_count.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        notify_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            let key_input = view.read(cx).voice.cloud_dialog.as_ref().unwrap().key_input.clone();
+            key_input.update(cx, |i, cx| i.insert("sk-or-test-key-1234", window, cx));
+        });
+        vcx.run_until_parked();
+        assert!(notify_count.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        vcx.update(|window, cx| {
+            let d = view.read(cx).voice.cloud_dialog.as_ref().unwrap();
+            let query = d.model_search.read(cx).value().trim().to_lowercase();
+            let models = match &d.models_state {
+                CloudLoad::Loaded(m) => m.as_slice(),
+                _ => &[],
+            };
+            let matched: Vec<&str> = models
+                .iter()
+                .filter(|m| m.name.to_lowercase().contains(&query) || m.id.to_lowercase().contains(&query))
+                .map(|m| m.id.as_str())
+                .collect();
+            assert_eq!(matched, vec!["google/gemini-2.5-flash"]);
+            let after = validate_cloud_voice_config(
+                d.provider,
+                d.active,
+                Some(false),
+                d.key_input.read(cx).value().as_str(),
+                false,
+                d.can_manage,
+                &d.selected_model,
+                None,
+                Some(models),
+            );
+            assert!(after.can_submit);
+            // Render overlay with scrollable OpenRouter model list cleanly.
+            window.refresh();
+            window.draw(cx).clear();
+            view.update(cx, |v, cx| {
+                v.dismiss_voice_overlay(window, cx);
+            });
+        });
+
+        // Leaving Voice cancels any active model_test_controller and closes model_test_open.
+        vcx.update(|window, cx| {
+            let ctrl = view.update(cx, |view, cx| {
+                view.voice.model_test_open = true;
+                view.ensure_model_test_controller("mac-env", cx)
+            });
+            ctrl.update(cx, |c, cx| c.start(window, cx));
+            view.update(cx, |view, cx| view.leave_voice(cx));
+            assert!(!view.read(cx).voice.model_test_open);
+            assert_eq!(ctrl.read(cx).state().phase, VoiceInputPhase::Idle);
+        });
+
+        drop(_obs);
         drop(view);
         vcx.update(|window, cx| crate::settings::finish_close(window, cx));
         state.update(&mut vcx, |state, _| state.stop_pump());

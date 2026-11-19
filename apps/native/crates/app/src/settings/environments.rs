@@ -6,9 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, FontWeight, IntoElement,
-    ParentElement, SharedString, Styled, Window, div, prelude::*,
+    ParentElement, SharedString, Styled, Subscription, Window, div, prelude::*,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Sizable, h_flex, v_flex};
 use serde_json::{Value, json};
 use t3_client::auth::{ORCHESTRATION_PROTOCOL_VERSION, post_access};
@@ -62,6 +62,7 @@ struct LinkEnvironmentDialog {
     error: Option<String>,
     mint_failed: HashSet<String>,
     focus: FocusHandle,
+    _subscriptions: Vec<Subscription>,
 }
 
 struct ForgetPeerLinkConfirm {
@@ -384,6 +385,18 @@ impl SettingsView {
         let pairing_code = cx.new(|cx| {
             InputState::new(window, cx).placeholder("From Sharing & access there, or t3 pair")
         });
+        let subscriptions = vec![
+            cx.subscribe_in(&address, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&pairing_code, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        ];
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         self.environments.link_dialog = Some(LinkEnvironmentDialog {
@@ -397,6 +410,7 @@ impl SettingsView {
             error: None,
             mint_failed: HashSet::new(),
             focus,
+            _subscriptions: subscriptions,
         });
         cx.notify();
     }
@@ -1260,6 +1274,30 @@ impl SettingsView {
         blocks
     }
 
+    fn link_dialog_ready(&self, cx: &App) -> bool {
+        let Some(dialog) = self.environments.link_dialog.as_ref() else {
+            return false;
+        };
+        let machines = self.linkable_machines_for(&dialog.host_saved_id, &dialog.host_env_id, cx);
+        let selected = dialog
+            .choice
+            .clone()
+            .or_else(|| machines.is_empty().then(|| ANOTHER_ADDRESS.to_owned()));
+        let machine = selected
+            .as_deref()
+            .and_then(|sel| machines.iter().find(|m| m.id == sel));
+        let needs_address = selected.is_some() && machine.is_none_or(|m| m.urls.is_empty());
+        let can_mint = !needs_address
+            && machine.is_some_and(|m| {
+                !dialog.mint_failed.contains(&m.id) && self.can_mint_on_machine(&m.id, cx).is_some()
+            });
+        let address_val = dialog.address.read(cx).value().trim().to_owned();
+        let code_val = dialog.pairing_code.read(cx).value().trim().to_owned();
+        selected.is_some()
+            && (!needs_address || !address_val.is_empty())
+            && (can_mint || !code_val.is_empty())
+    }
+
     pub(super) fn environments_dialog_overlay(
         &self,
         window: &Window,
@@ -1336,10 +1374,7 @@ impl SettingsView {
                 !dialog.mint_failed.contains(&m.id) && self.can_mint_on_machine(&m.id, cx).is_some()
             });
         let address_val = dialog.address.read(cx).value().trim().to_owned();
-        let code_val = dialog.pairing_code.read(cx).value().trim().to_owned();
-        let ready = selected.is_some()
-            && (!needs_address || !address_val.is_empty())
-            && (can_mint || !code_val.is_empty());
+        let ready = self.link_dialog_ready(cx);
         let busy = dialog.busy;
         let weak_choice = cx.entity().downgrade();
         let weak_access = cx.entity().downgrade();
@@ -1666,17 +1701,44 @@ mod tests {
             assert!(matches!(loaded, PeerLinksLoad::Loaded { links, .. } if links.len() == 1 && links[0].label == "Build VPS"));
         });
 
-        // Link dialog sends peerLinks.link with address + code + access.
+        // Link dialog subscribes to InputEvent::Change on address & pairing_code, notifies
+        // SettingsView, flips Link button readiness from false -> true, and sends peerLinks.link.
+        let notify_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notify_counter = notify_count.clone();
+        let _obs = vcx.update(|_, cx| {
+            cx.observe(&view, move |_, _| {
+                notify_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
         vcx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.open_link_dialog("mac-env".into(), "mac-env".into(), window, cx);
                 let d = view.environments.link_dialog.as_mut().unwrap();
                 d.choice = Some(ANOTHER_ADDRESS.to_owned());
-                d.address.update(cx, |i, cx| i.set_value("https://box2.ts.net", window, cx));
-                d.pairing_code.update(cx, |i, cx| i.set_value("PAIR-1234", window, cx));
-                view.submit_link_dialog(cx);
             });
+            assert!(!view.read(cx).link_dialog_ready(cx));
         });
+        vcx.run_until_parked();
+        notify_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            let address = view.read(cx).environments.link_dialog.as_ref().unwrap().address.clone();
+            address.update(cx, |i, cx| i.insert("https://box2.ts.net", window, cx));
+        });
+        vcx.run_until_parked();
+        assert!(notify_count.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert!(!view.read_with(&vcx, |v, cx| v.link_dialog_ready(cx)));
+        notify_count.store(0, std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            let pairing_code = view.read(cx).environments.link_dialog.as_ref().unwrap().pairing_code.clone();
+            pairing_code.update(cx, |i, cx| i.insert("PAIR-1234", window, cx));
+        });
+        vcx.run_until_parked();
+        assert!(notify_count.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        vcx.update(|_, cx| {
+            assert!(view.read(cx).link_dialog_ready(cx));
+            view.update(cx, |view, cx| view.submit_link_dialog(cx));
+        });
+        drop(_obs);
         drive(&mut vcx);
         let (requests, _) = fixture.take_requests();
         let (_, payload, reply) = requests

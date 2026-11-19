@@ -39,11 +39,9 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::settings::search::{self, Features, SearchAvailability, SearchItem, Section};
 use t3_core::settings::{
-    ALL_ENVIRONMENTS_VALUE, ALL_PROJECTS_VALUE, ScopeCheckout, ScopeEnvironment,
-    ScopeProjectGroup, SettingsScopeSearch, is_device_only_section, project_scope_menu_groups,
-    select_checkout_axis, select_environment_axis, select_project_axis,
-    settings_scope_checkout_choices, settings_scope_checkout_label,
-    settings_scope_environment_label,
+    ALL_PROJECTS_VALUE, ScopeCheckout, ScopeProjectGroup, SettingsScopeSearch,
+    select_checkout_axis, select_project_axis, settings_scope_checkout_choices,
+    settings_scope_checkout_label,
 };
 
 use crate::app_state::{AppEvent, AppState};
@@ -387,7 +385,12 @@ fn search_availability_for(state: &AppState) -> SearchAvailability {
     let has_fast_worktree_checkout_environment = active_config
         .and_then(|c| c.environment.platform.as_ref())
         .is_some_and(|platform| platform.os == "darwin");
-    let has_text_generators_environment = active_config.is_some();
+    let has_text_generators_environment = active_config.is_some_and(|c| {
+        c.managed_policy
+            .as_ref()
+            .and_then(|policy| policy.pointer("/limits/providers/allowedDrivers"))
+            .is_none()
+    });
     let has_multiple_environments = state.environments.environments.len() >= 2;
     SearchAvailability {
         has_environment,
@@ -779,7 +782,7 @@ impl SettingsView {
             self.environments.leave();
         }
         if section != Section::Voice {
-            self.voice.leave();
+            self.leave_voice(cx);
         }
         if section == Section::Diagnostics {
             if changed {
@@ -864,6 +867,7 @@ impl SettingsView {
             return;
         }
         self.commit_focused_field(window, cx);
+        self.leave_voice(cx);
         finish_close(window, cx);
     }
 
@@ -1173,157 +1177,112 @@ impl SettingsView {
             .into_any_element()
     }
 
-    fn scope_environments(&self, cx: &App) -> Vec<ScopeEnvironment> {
+    /// Projects belonging to the active environment, used where per-project overrides are wired
+    /// (currently Voice project dictionary).
+    fn active_env_project_groups(&self, cx: &App) -> Vec<ScopeProjectGroup> {
         let state = self.state.read(cx);
-        let mut envs: Vec<ScopeEnvironment> = state
-            .environments
-            .environments
-            .iter()
-            .map(|saved| {
-                let fleet = state.fleet.environment(&saved.id);
-                let env_id = fleet
-                    .and_then(|v| v.config.config.as_ref())
-                    .map(|c| c.environment.environment_id.clone())
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| saved.id.clone());
-                let label = fleet
-                    .and_then(|v| v.config.config.as_ref())
-                    .map(|c| c.environment.label.clone())
-                    .filter(|l| !l.trim().is_empty())
-                    .or_else(|| (!saved.label.trim().is_empty()).then(|| saved.label.clone()))
-                    .unwrap_or_else(|| saved.address());
-                let connected = fleet
-                    .is_some_and(|v| v.status == t3_client::supervisor::ConnectionStatus::Connected)
-                    || (state.environments.active.as_deref() == Some(saved.id.as_str())
-                        && matches!(
-                            state.phase,
-                            crate::app_state::Phase::Online(
-                                t3_client::supervisor::ConnectionStatus::Connected
-                            )
-                        ));
-                ScopeEnvironment {
-                    environment_id: env_id,
-                    label,
-                    display_url: saved.address(),
-                    connected,
-                }
-            })
-            .collect();
-        if envs.is_empty()
-            && let Some(config) = state.server_config.config.as_ref()
-        {
-            envs.push(ScopeEnvironment {
-                environment_id: config.environment.environment_id.clone(),
-                label: if config.environment.label.trim().is_empty() {
-                    "This environment".to_owned()
-                } else {
-                    config.environment.label.clone()
-                },
-                display_url: String::new(),
-                connected: true,
-            });
-        }
-        envs
-    }
-
-    fn scope_project_groups(&self, cx: &App) -> Vec<ScopeProjectGroup> {
+        let active_env_id = state
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.environment.environment_id.as_str())
+            .filter(|id| !id.is_empty());
+        let active_saved_id = state.environments.active.as_deref();
         self.project_groups(cx)
             .into_iter()
             .filter(|group| !group.is_scratch)
-            .map(|group| {
-                let workspace_root = group
-                    .members
-                    .first()
-                    .map(|m| m.project.project.workspace_root.clone())
-                    .unwrap_or_default();
-                let members = group
+            .filter_map(|group| {
+                let members: Vec<ScopeCheckout> = group
                     .members
                     .into_iter()
+                    .filter(|member| {
+                        let owner = &member.project.owner;
+                        active_env_id.is_some_and(|id| owner.identity() == id)
+                            || active_saved_id.is_some_and(|id| owner.saved_id == id)
+                            || (active_env_id.is_none() && active_saved_id.is_none())
+                    })
                     .map(|member| ScopeCheckout {
                         environment_id: member.project.owner.identity(),
                         physical_project_key: member.physical_key,
                         workspace_root: member.project.project.workspace_root,
                     })
                     .collect();
-                ScopeProjectGroup {
+                let workspace_root = members.first()?.workspace_root.clone();
+                Some(ScopeProjectGroup {
                     project_key: group.key,
                     display_name: group.label,
                     workspace_root,
                     archived: group.archived,
                     members,
-                }
+                })
             })
             .collect()
     }
 
     pub(super) fn scope_project_id(&self, cx: &App) -> Option<String> {
         let project_key = self.scope.project.as_deref()?;
+        let state = self.state.read(cx);
+        let active_env_id = state
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.environment.environment_id.as_str())
+            .filter(|id| !id.is_empty());
+        let active_saved_id = state.environments.active.as_deref();
         let groups = self.project_groups(cx);
         let group = groups.iter().find(|g| g.key == project_key)?;
+        let active_members = || {
+            group.members.iter().filter(|m| {
+                let owner = &m.project.owner;
+                active_env_id.is_some_and(|id| owner.identity() == id)
+                    || active_saved_id.is_some_and(|id| owner.saved_id == id)
+                    || (active_env_id.is_none() && active_saved_id.is_none())
+            })
+        };
         if let Some(checkout) = self.scope.checkout.as_deref()
-            && let Some(member) = group.members.iter().find(|m| m.physical_key == checkout)
+            && let Some(member) = active_members().find(|m| m.physical_key == checkout)
         {
             return Some(member.project.project.id.clone());
         }
-        if let Some(machine) = self.scope.machine.as_deref()
-            && let Some(member) = group
-                .members
-                .iter()
-                .find(|m| m.project.owner.identity() == machine)
-        {
-            return Some(member.project.project.id.clone());
-        }
-        group.members.first().map(|m| m.project.project.id.clone())
+        active_members().next().map(|m| m.project.project.id.clone())
     }
 
     pub(super) fn scope_project_label(&self, cx: &App) -> Option<String> {
         let project_key = self.scope.project.as_deref()?;
-        self.project_groups(cx)
+        self.active_env_project_groups(cx)
             .into_iter()
-            .find(|g| g.key == project_key)
-            .map(|g| g.label)
+            .find(|g| g.project_key == project_key)
+            .map(|g| g.display_name)
     }
 
-    /// `SettingsScopeSentence.tsx`: shows `"Applying settings for [project] across/on [env]"`
-    /// on scoped sections (hides on device-only sections like Appearance, Chat, Keybindings, About).
+    /// `SettingsScopeSentence.tsx`: rendered only on sections that genuinely honor `self.scope`
+    /// (`Section::Voice` project dictionary on the active environment), never over unwired global
+    /// panels where changing the banner would have no effect.
     fn render_scope_sentence(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if is_device_only_section(self.section) {
+        if self.section != Section::Voice {
             return None;
         }
-        let envs = self.scope_environments(cx);
-        let groups = self.scope_project_groups(cx);
-        if envs.len() <= 1 && groups.is_empty() {
+        let groups = self.active_env_project_groups(cx);
+        if groups.is_empty() {
             return None;
         }
         let p = palette(cx);
-        let menu_groups = project_scope_menu_groups(&groups, self.scope.machine.as_deref());
-        let selected_project = self.scope.project.as_deref().and_then(|key| {
-            groups.iter().find(|g| g.project_key == key)
-        });
+        let selected_project = self
+            .scope
+            .project
+            .as_deref()
+            .and_then(|key| groups.iter().find(|g| g.project_key == key));
         let project_value = selected_project
             .map(|g| g.project_key.clone())
             .unwrap_or_else(|| ALL_PROJECTS_VALUE.to_owned());
         let mut project_options = vec![SelectOption::new(ALL_PROJECTS_VALUE, "All projects")];
-        for g in menu_groups {
+        for g in &groups {
             let label = if g.archived {
                 format!("{} (archived)", g.display_name)
             } else {
                 g.display_name.clone()
             };
             project_options.push(SelectOption::new(g.project_key.clone(), label));
-        }
-
-        let env_value = self
-            .scope
-            .machine
-            .as_deref()
-            .filter(|id| envs.iter().any(|e| e.environment_id == *id))
-            .unwrap_or(ALL_ENVIRONMENTS_VALUE)
-            .to_owned();
-        let mut env_options = vec![SelectOption::new(ALL_ENVIRONMENTS_VALUE, "All environments")];
-        for env in &envs {
-            let label = settings_scope_environment_label(env, &envs);
-            env_options.push(SelectOption::new(env.environment_id.clone(), label));
         }
 
         let checkouts: Vec<ScopeCheckout> = selected_project
@@ -1373,16 +1332,7 @@ impl SettingsView {
                 )
         });
 
-        let preposition = if env_value == ALL_ENVIRONMENTS_VALUE {
-            "across"
-        } else {
-            "on"
-        };
         let weak_proj = cx.entity().downgrade();
-        let weak_env = cx.entity().downgrade();
-        let show_project_picker = !groups.is_empty();
-        let show_env_picker = envs.len() > 1;
-
         Some(
             h_flex()
                 .id("settings-scope-sentence")
@@ -1400,43 +1350,19 @@ impl SettingsView {
                     div()
                         .text_xs()
                         .text_color(hsla(p.muted_foreground))
-                        .child("Applying settings for"),
+                        .child("Project dictionary scope:"),
                 )
-                .when(show_project_picker, |this| {
-                    this.child(
-                        Select::new("settings-scope-project", project_options)
-                            .selected(project_value)
-                            .width(168.)
-                            .on_change(move |value, _, cx| {
-                                let _ = weak_proj.update(cx, |this, cx| {
-                                    this.scope = select_project_axis(&this.scope, &value);
-                                    if this.section == Section::Projects {
-                                        this.select_project(this.scope.project.clone(), cx);
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                })
-                .when(show_env_picker, |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(hsla(p.muted_foreground))
-                            .child(preposition),
-                    )
-                    .child(
-                        Select::new("settings-scope-environment", env_options)
-                            .selected(env_value)
-                            .width(168.)
-                            .on_change(move |value, _, cx| {
-                                let _ = weak_env.update(cx, |this, cx| {
-                                    this.scope = select_environment_axis(&this.scope, &value);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                })
+                .child(
+                    Select::new("settings-scope-project", project_options)
+                        .selected(project_value)
+                        .width(168.)
+                        .on_change(move |value, _, cx| {
+                            let _ = weak_proj.update(cx, |this, cx| {
+                                this.scope = select_project_axis(&this.scope, &value);
+                                cx.notify();
+                            });
+                        }),
+                )
                 .children(checkout_select)
                 .into_any_element(),
         )
@@ -1756,25 +1682,36 @@ mod shell_tests {
             window.refresh();
             window.draw(cx).clear();
         });
-        // Device-only section hides the scope sentence.
+        // Device-only (Appearance) and unwired global panels (Threads) do not render a misleading
+        // scope banner.
         assert!(vcx.debug_bounds("settings-scope-sentence").is_none());
-
-        // Scoped section (Voice) renders the scope sentence when multiple environments exist.
-        vcx.update(|_, cx| open(Section::Voice, cx));
+        vcx.update(|_, cx| open(Section::Threads, cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
             window.refresh();
             window.draw(cx).clear();
         });
-        assert!(vcx.debug_bounds("settings-scope-sentence").is_some());
+        assert!(vcx.debug_bounds("settings-scope-sentence").is_none());
 
-        // Search availability includes darwin fast-worktree-checkout and multi-env items.
+        // Search availability includes darwin fast-worktree-checkout, voice, text-generators, and
+        // multi-env items, and hides text-generators when managedPolicy restricts allowedDrivers.
         vcx.update(|window, cx| {
             let view = cx.global::<Host>().view.clone().expect("settings view open");
             let items = view.read(cx).search_items(cx);
             assert!(items.iter().any(|i| i.id == "worktree-fast-checkout"));
             assert!(items.iter().any(|i| i.id == "voice-microphone"));
             assert!(items.iter().any(|i| i.id == "load-balancing"));
+            assert!(items.iter().any(|i| i.id == "text-generators"));
+
+            state.update(cx, |state, cx| {
+                state.server_config.config.as_mut().unwrap().managed_policy = Some(json!({
+                    "organization": "Acme",
+                    "limits": { "providers": { "allowedDrivers": ["codex"] } }
+                }));
+                cx.emit(AppEvent::ServerConfig);
+            });
+            let restricted = view.read(cx).search_items(cx);
+            assert!(!restricted.iter().any(|i| i.id == "text-generators"));
 
             // Navigating to Diagnostics sets nav_parent to Maintenance, and navigating to
             // load-balancing auto-reveals its folded section.
