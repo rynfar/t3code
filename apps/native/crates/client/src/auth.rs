@@ -238,8 +238,12 @@ pub async fn pair_with_link(link: &PairingLink) -> Result<Paired, AuthError> {
     } else {
         None
     };
+    let env_id = descriptor
+        .as_ref()
+        .map(|d| d.environment_id.as_str())
+        .filter(|id| !id.is_empty());
     let credentials = if let Some(proof) = dpop_proof {
-        redeem_pairing_with_dpop(link, &proof).await?
+        redeem_pairing_with_dpop(link, &proof, env_id).await?
     } else {
         dpop::remove_direct_credential(&link.http_base);
         redeem_pairing(link).await?
@@ -247,7 +251,11 @@ pub async fn pair_with_link(link: &PairingLink) -> Result<Paired, AuthError> {
     Ok(Paired { credentials, descriptor })
 }
 
-async fn redeem_pairing_with_dpop(link: &PairingLink, dpop_proof: &str) -> Result<Credentials, AuthError> {
+async fn redeem_pairing_with_dpop(
+    link: &PairingLink,
+    dpop_proof: &str,
+    environment_id: Option<&str>,
+) -> Result<Credentials, AuthError> {
     let host = link.http_base.clone();
     let token_url = format!("{}/oauth/token", link.http_base.trim_end_matches('/'));
     let response = http()
@@ -281,10 +289,11 @@ async fn redeem_pairing_with_dpop(link: &PairingLink, dpop_proof: &str) -> Resul
         let expires_in_secs = token.expires_in.unwrap_or(3600).max(0);
         dpop::put_direct_credential(
             &link.http_base,
-            DpopConnectionCredential {
-                access_token: token.access_token.clone(),
-                expires_at_epoch_ms: now_epoch_ms().saturating_add(expires_in_secs.saturating_mul(1_000)),
-            },
+            DpopConnectionCredential::new(
+                token.access_token.clone(),
+                now_epoch_ms().saturating_add(expires_in_secs.saturating_mul(1_000)),
+                environment_id.map(str::to_owned),
+            ),
         );
     } else {
         dpop::remove_direct_credential(&link.http_base);
@@ -326,18 +335,24 @@ pub async fn redeem_pairing(link: &PairingLink) -> Result<Credentials, AuthError
     Ok(Credentials { http_base: link.http_base.clone(), access_token: token.access_token })
 }
 
-/// Renews a direct DPoP credential for `http_base` via `POST /oauth/token` with
+/// Renews a direct DPoP credential for `credentials` via `POST /oauth/token` with
 /// `subject_token_type = urn:ietf:params:oauth:token-type:access_token` (`directDpopToken` in
 /// `packages/client-runtime/src/authorization/service.ts`, `pingdotgg/t3code#37980`, `pingdotgg/t3code#37990`).
-/// Requests for the same host share one lock without waiting on other hosts.
+/// Requests for the same saved host share one lock without waiting on other hosts, even across
+/// alternate routes or relocated ports.
 pub async fn renew_direct_dpop_token(
-    http_base: &str,
+    credentials: &Credentials,
     rejected_access_token: Option<&str>,
 ) -> Result<DpopConnectionCredential, AuthError> {
-    let lock = dpop::direct_renewal_lock(http_base);
+    let Some((store_key, _)) = dpop::find_direct_credential(&credentials.http_base, &credentials.access_token) else {
+        return Err(AuthError::Unauthorized);
+    };
+    let lock = dpop::direct_renewal_lock(&store_key);
     let _guard = lock.lock().await;
 
-    let Some(current) = dpop::get_direct_credential(http_base) else {
+    let Some((store_key, current)) =
+        dpop::find_direct_credential(&credentials.http_base, &credentials.access_token)
+    else {
         return Err(AuthError::Unauthorized);
     };
     let now = now_epoch_ms();
@@ -351,7 +366,7 @@ pub async fn renew_direct_dpop_token(
         trace_id: None,
         clock_skew: false,
     })?;
-    let token_url = format!("{}/oauth/token", http_base.trim_end_matches('/'));
+    let token_url = format!("{}/oauth/token", credentials.http_base.trim_end_matches('/'));
     let proof = key
         .create_proof("POST", &token_url, None)
         .map_err(|message| AuthError::AuthRefused {
@@ -359,7 +374,7 @@ pub async fn renew_direct_dpop_token(
             trace_id: None,
             clock_skew: false,
         })?;
-    let host = http_base.to_owned();
+    let host = credentials.http_base.clone();
     let response = http()
         .post(&token_url)
         .header("DPoP", proof)
@@ -386,11 +401,11 @@ pub async fn renew_direct_dpop_token(
         .await
         .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
     let expires_in_secs = token.expires_in.unwrap_or(3600).max(0);
-    let renewed = DpopConnectionCredential {
-        access_token: token.access_token,
-        expires_at_epoch_ms: now_epoch_ms().saturating_add(expires_in_secs.saturating_mul(1_000)),
-    };
-    dpop::put_direct_credential(http_base, renewed.clone());
+    let renewed = current.renewed(
+        token.access_token,
+        now_epoch_ms().saturating_add(expires_in_secs.saturating_mul(1_000)),
+    );
+    dpop::update_direct_credential(&store_key, renewed.clone());
     Ok(renewed)
 }
 
@@ -436,8 +451,8 @@ async fn resolve_http_auth_headers(
     url: &str,
     rejected_access_token: Option<&str>,
 ) -> Result<(String, Option<String>, Option<String>), AuthError> {
-    if dpop::get_direct_credential(&credentials.http_base).is_some() {
-        let cred = renew_direct_dpop_token(&credentials.http_base, rejected_access_token).await?;
+    if dpop::find_direct_credential(&credentials.http_base, &credentials.access_token).is_some() {
+        let cred = renew_direct_dpop_token(credentials, rejected_access_token).await?;
         let key = dpop::device_key().map_err(|message| AuthError::AuthRefused {
             message,
             trace_id: None,
@@ -457,6 +472,48 @@ async fn resolve_http_auth_headers(
         ));
     }
     Ok((format!("Bearer {}", credentials.access_token), None, None))
+}
+
+/// Error from [`send_authed_request`]: either DPoP auth/renewal failed or the HTTP transport errored.
+#[derive(Debug)]
+pub enum AuthedHttpError {
+    Auth(AuthError),
+    Http(reqwest::Error),
+}
+
+/// Sends an HTTP request built by `build`, attaching `Authorization` (`DPoP` or `Bearer`) and
+/// `DPoP` proof headers. If a DPoP-authenticated request receives HTTP 401, renews the direct
+/// DPoP access token once and retries with a fresh proof (`pingdotgg/t3code#37990`).
+pub async fn send_authed_request<F>(
+    credentials: &Credentials,
+    method: &str,
+    url: &str,
+    mut build: F,
+) -> Result<reqwest::Response, AuthedHttpError>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut rejected: Option<String> = None;
+    for attempt in 0..2 {
+        let (auth_header, dpop_header, used_dpop_token) =
+            resolve_http_auth_headers(credentials, method, url, rejected.as_deref())
+                .await
+                .map_err(AuthedHttpError::Auth)?;
+        let mut request = build().header(reqwest::header::AUTHORIZATION, auth_header);
+        if let Some(proof) = dpop_header {
+            request = request.header("DPoP", proof);
+        }
+        let response = request.send().await.map_err(AuthedHttpError::Http)?;
+        if response.status().as_u16() == 401
+            && attempt == 0
+            && let Some(used) = used_dpop_token
+        {
+            rejected = Some(used);
+            continue;
+        }
+        return Ok(response);
+    }
+    unreachable!("two attempts always return on attempt 1")
 }
 
 /// Mints a single-use RPC ticket. Servers that predate ticket audiences answer 404 on the
@@ -716,14 +773,29 @@ pub async fn mint_mcp_approval_code(
 
 pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
     let mut url = url::Url::parse(&websocket_base(&credentials.http_base)).expect("valid ws base");
-    url.query_pairs_mut()
-        .append_pair("wsTicket", ticket)
-        .append_pair("clientSurface", "desktop")
-        .append_pair("clientAppVersion", env!("CARGO_PKG_VERSION"))
-        .append_pair("clientDeviceType", "desktop")
-        .append_pair("clientOs", client_os())
-        .append_pair("connectionMethod", "direct")
-        .append_pair(SOCKET_FRAME_PARTS_QUERY_PARAM, "1");
+    let dpop_proof = if dpop::find_direct_credential(&credentials.http_base, &credentials.access_token).is_some() {
+        dpop::ws_url_to_http_htu(&url).and_then(|http_htu| {
+            dpop::device_key()
+                .ok()
+                .and_then(|key| key.create_proof("GET", &http_htu, Some(ticket)).ok())
+        })
+    } else {
+        None
+    };
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("wsTicket", ticket);
+        if let Some(proof) = dpop_proof.as_deref() {
+            pairs.append_pair("dpop", proof);
+        }
+        pairs
+            .append_pair("clientSurface", "desktop")
+            .append_pair("clientAppVersion", env!("CARGO_PKG_VERSION"))
+            .append_pair("clientDeviceType", "desktop")
+            .append_pair("clientOs", client_os())
+            .append_pair("connectionMethod", "direct")
+            .append_pair(SOCKET_FRAME_PARTS_QUERY_PARAM, "1");
+    }
     append_orchestration_protocol(url.as_str()).expect("valid ws url")
 }
 
@@ -933,6 +1005,47 @@ mod auth_tests {
             Some("dpop-renewed-tok".to_owned())
         );
 
+        // WebSocket URL attaches a DPoP upgrade proof bound to GET, http(s)://.../ws, and the ticket.
+        let ws_url = url::Url::parse(&socket_url(&paired.credentials, &ticket)).unwrap();
+        let ws_dpop = ws_url
+            .query_pairs()
+            .find(|(k, _)| k == "dpop")
+            .map(|(_, v)| v.into_owned())
+            .expect("DPoP upgrade proof query param");
+        let device_thumb = dpop::device_key().unwrap().thumbprint().to_owned();
+        dpop::verify_dpop_proof(
+            &ws_dpop,
+            "GET",
+            &format!("{base}/ws"),
+            now_epoch_ms() / 1000,
+            Some(&device_thumb),
+            Some(&ticket),
+            None,
+        )
+        .expect("valid WebSocket upgrade DPoP proof");
+
+        // Alternate route holding the saved seed token also produces a valid DPoP upgrade proof for its own htu.
+        let alt_creds = Credentials {
+            http_base: "https://fallback.ts.net:3773".into(),
+            access_token: paired.credentials.access_token.clone(),
+        };
+        let alt_ws = url::Url::parse(&socket_url(&alt_creds, &ticket)).unwrap();
+        let alt_dpop = alt_ws
+            .query_pairs()
+            .find(|(k, _)| k == "dpop")
+            .map(|(_, v)| v.into_owned())
+            .expect("DPoP proof on alternate route");
+        dpop::verify_dpop_proof(
+            &alt_dpop,
+            "GET",
+            "https://fallback.ts.net:3773/ws",
+            now_epoch_ms() / 1000,
+            Some(&device_thumb),
+            Some(&ticket),
+            None,
+        )
+        .expect("valid alternate-route WebSocket DPoP proof");
+
         let captured = server.await.unwrap();
         assert_eq!(captured.len(), 3);
         dpop::remove_direct_credential(&base);
@@ -1073,5 +1186,105 @@ mod auth_tests {
         );
 
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_authed_request_uses_dpop_across_relocated_route_and_retries_on_401() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alt_base = format!("http://{}", listener.local_addr().unwrap());
+        let original_base = format!("http://127.0.0.1:{}", 50000 + (uuid::Uuid::new_v4().as_u128() % 8000));
+        let seed = format!("seed-dpop-http-{}", uuid::Uuid::new_v4().simple());
+        let renewed = format!("renewed-dpop-http-{}", uuid::Uuid::new_v4().simple());
+        let device_thumb = dpop::device_key().unwrap().thumbprint().to_owned();
+
+        // Store DPoP credential under original_base (simulating SSH/multi-route origin mismatch).
+        dpop::put_direct_credential(
+            &original_base,
+            DpopConnectionCredential::new(seed.clone(), now_epoch_ms() + 3_600_000, Some("env-http".into())),
+        );
+
+        let expected_alt_base = alt_base.clone();
+        let expected_seed = seed.clone();
+        let expected_renewed = renewed.clone();
+        let server = tokio::spawn(async move {
+            // 1. Initial GET on alternate route sends DPoP <seed>, receives 401.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req1 = read_http_request(&mut sock).await;
+            assert!(req1.starts_with("GET /api/threads/t1/history "));
+            assert_eq!(header_value(&req1, "authorization"), Some(format!("DPoP {expected_seed}").as_str()));
+            let p1 = header_value(&req1, "dpop").expect("DPoP header on first attempt");
+            dpop::verify_dpop_proof(
+                p1,
+                "GET",
+                &format!("{expected_alt_base}/api/threads/t1/history"),
+                now_epoch_ms() / 1000,
+                Some(&device_thumb),
+                Some(&expected_seed),
+                None,
+            )
+            .expect("valid first DPoP proof");
+            write_json(&mut sock, 401, serde_json::json!({ "error": "expired" })).await;
+
+            // 2. Renewal POST /oauth/token on alternate route.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req2 = read_http_request(&mut sock).await;
+            assert!(req2.starts_with("POST /oauth/token "));
+            let p2 = header_value(&req2, "dpop").expect("DPoP header on renewal");
+            dpop::verify_dpop_proof(
+                p2,
+                "POST",
+                &format!("{expected_alt_base}/oauth/token"),
+                now_epoch_ms() / 1000,
+                Some(&device_thumb),
+                None,
+                None,
+            )
+            .expect("valid renewal DPoP proof");
+            write_json(
+                &mut sock,
+                200,
+                serde_json::json!({
+                    "access_token": expected_renewed,
+                    "token_type": "DPoP",
+                    "expires_in": 3600
+                }),
+            )
+            .await;
+
+            // 3. Retry GET carries renewed DPoP token + fresh proof and succeeds.
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req3 = read_http_request(&mut sock).await;
+            assert!(req3.starts_with("GET /api/threads/t1/history "));
+            assert_eq!(header_value(&req3, "authorization"), Some(format!("DPoP {expected_renewed}").as_str()));
+            let p3 = header_value(&req3, "dpop").expect("DPoP header on retry");
+            dpop::verify_dpop_proof(
+                p3,
+                "GET",
+                &format!("{expected_alt_base}/api/threads/t1/history"),
+                now_epoch_ms() / 1000,
+                Some(&device_thumb),
+                Some(&expected_renewed),
+                None,
+            )
+            .expect("valid retry DPoP proof");
+            write_json(&mut sock, 200, serde_json::json!({ "ok": true })).await;
+        });
+
+        let alt_creds = Credentials {
+            http_base: alt_base.clone(),
+            access_token: seed.clone(),
+        };
+        let url = format!("{alt_base}/api/threads/t1/history");
+        let client = reqwest::Client::new();
+        let resp = send_authed_request(&alt_creds, "GET", &url, || client.get(&url))
+            .await
+            .expect("DPoP HTTP retry succeeds");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            dpop::get_direct_credential(&original_base).map(|c| c.access_token),
+            Some(renewed)
+        );
+        server.await.unwrap();
+        dpop::remove_direct_credential_matching(&original_base, Some(&seed));
     }
 }

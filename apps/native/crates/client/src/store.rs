@@ -199,9 +199,15 @@ impl SavedEnvironments {
                 .map(|d| d.server_version.clone())
                 .filter(|version| !version.is_empty())
                 .or_else(|| previous.as_ref().and_then(|environment| environment.server_version.clone())),
-            local: ssh.is_none() && (local || previous.is_some_and(|environment| environment.local)),
+            local: ssh.is_none() && (local || previous.as_ref().is_some_and(|environment| environment.local)),
             ssh,
         };
+        if let Some(prev) = previous.as_ref()
+            && prev.http_base != *http_base
+            && prev.access_token.as_deref() != Some(paired.credentials.access_token.as_str())
+        {
+            crate::dpop::remove_direct_credential_matching(&prev.http_base, prev.access_token.as_deref());
+        }
         match self.environments.iter_mut().find(|entry| entry.id == id) {
             Some(entry) => *entry = environment,
             None => self.environments.push(environment),
@@ -215,7 +221,13 @@ impl SavedEnvironments {
     pub fn relocate(&mut self, id: &str, http_base: &str) -> bool {
         match self.environments.iter_mut().find(|environment| environment.id == id) {
             Some(environment) if environment.http_base != http_base => {
+                let previous_http_base = environment.http_base.clone();
                 environment.http_base = http_base.to_owned();
+                crate::dpop::relocate_direct_credential(
+                    &previous_http_base,
+                    http_base,
+                    environment.access_token.as_deref(),
+                );
                 true
             }
             _ => false,
@@ -264,7 +276,7 @@ impl SavedEnvironments {
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.environments.len();
         if let Some(removed) = self.environments.iter().find(|environment| environment.id == id) {
-            crate::dpop::remove_direct_credential(&removed.http_base);
+            crate::dpop::remove_direct_credential_matching(&removed.http_base, removed.access_token.as_deref());
         }
         self.environments.retain(|environment| environment.id != id);
         if self.active.as_deref() == Some(id) {
@@ -276,7 +288,7 @@ impl SavedEnvironments {
     /// Drops a credential the server rejected; the entry stays so it can be paired again.
     pub fn revoke(&mut self, id: &str) {
         if let Some(environment) = self.environments.iter_mut().find(|environment| environment.id == id) {
-            crate::dpop::remove_direct_credential(&environment.http_base);
+            crate::dpop::remove_direct_credential_matching(&environment.http_base, environment.access_token.as_deref());
             environment.access_token = None;
         }
     }

@@ -45,6 +45,47 @@ pub struct DpopPublicJwk {
 pub struct DpopConnectionCredential {
     pub access_token: String,
     pub expires_at_epoch_ms: i64,
+    /// Original access token returned when this host paired, kept so callers holding the saved
+    /// environment's initial token (across renewals, alternate routes, or SSH port relocations)
+    /// still resolve this DPoP credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_token: Option<String>,
+    /// Immediately superseded access token, so concurrent in-flight requests resolve cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<String>,
+}
+
+impl DpopConnectionCredential {
+    pub fn new(access_token: String, expires_at_epoch_ms: i64, environment_id: Option<String>) -> Self {
+        Self {
+            seed_token: Some(access_token.clone()),
+            previous_access_token: None,
+            environment_id,
+            access_token,
+            expires_at_epoch_ms,
+        }
+    }
+
+    /// Whether `token` identifies this credential (current, initial saved seed, or just-replaced).
+    pub fn matches_token(&self, token: &str) -> bool {
+        !token.is_empty()
+            && (self.access_token == token
+                || self.seed_token.as_deref() == Some(token)
+                || self.previous_access_token.as_deref() == Some(token))
+    }
+
+    /// Returns a renewed copy preserving `seed_token` and recording the replaced token.
+    pub fn renewed(&self, access_token: String, expires_at_epoch_ms: i64) -> Self {
+        Self {
+            seed_token: self.seed_token.clone().or_else(|| Some(self.access_token.clone())),
+            previous_access_token: Some(self.access_token.clone()),
+            environment_id: self.environment_id.clone(),
+            access_token,
+            expires_at_epoch_ms,
+        }
+    }
 }
 
 /// `ConnectionCredential` (`packages/client-runtime/src/connection/catalog.ts`).
@@ -63,6 +104,21 @@ pub fn normalize_dpop_htu(url: &str) -> Option<String> {
     parsed.set_fragment(None);
     parsed.set_query(None);
     Some(parsed.into())
+}
+
+/// Maps a WebSocket URL (`ws://` / `wss://`) to the HTTP(S) `htu` the server verifies on upgrade
+/// (`packages/client-runtime/src/authorization/remote.ts`, `pingdotgg/t3code#37990`).
+pub fn ws_url_to_http_htu(ws_url: &Url) -> Option<String> {
+    let mut http_url = ws_url.clone();
+    match http_url.scheme() {
+        "wss" => http_url.set_scheme("https").ok()?,
+        "ws" => http_url.set_scheme("http").ok()?,
+        "https" | "http" => {}
+        _ => return None,
+    }
+    http_url.set_fragment(None);
+    http_url.set_query(None);
+    Some(http_url.into())
 }
 
 /// RFC 7638 JWK thumbprint: SHA-256 over required EC members in lexicographic order
@@ -421,8 +477,36 @@ pub fn get_direct_credential(http_base: &str) -> Option<DpopConnectionCredential
     map.get(&key).cloned()
 }
 
+/// Resolves the stored direct DPoP credential for `(http_base, access_token)` across route switches,
+/// token renewals, and SSH/local port relocations (`pingdotgg/t3code#37990`).
+///
+/// Returns `(canonical_store_key, credential)` so renewals update the canonical entry and serialize
+/// on its lock even when the active request targets an alternate route origin.
+pub fn find_direct_credential(http_base: &str, access_token: &str) -> Option<(String, DpopConnectionCredential)> {
+    let key = normalize_host_key(http_base);
+    let base = crate::store::base();
+    let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard
+        .entry(base.clone())
+        .or_insert_with(|| base.as_deref().map(load_credentials_file).unwrap_or_default());
+    if let Some(cred) = map.get(&key)
+        && (access_token.is_empty() || cred.matches_token(access_token))
+    {
+        return Some((key, cred.clone()));
+    }
+    if !access_token.is_empty()
+        && let Some((found_key, cred)) = map.iter().find(|(_, cred)| cred.matches_token(access_token))
+    {
+        return Some((found_key.clone(), cred.clone()));
+    }
+    None
+}
+
 /// Persists a direct DPoP credential for `http_base` (and writes privately to `<home>/dpop-credentials.json`).
-pub fn put_direct_credential(http_base: &str, credential: DpopConnectionCredential) {
+pub fn put_direct_credential(http_base: &str, mut credential: DpopConnectionCredential) {
+    if credential.seed_token.is_none() {
+        credential.seed_token = Some(credential.access_token.clone());
+    }
     let key = normalize_host_key(http_base);
     let base = crate::store::base();
     let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -435,27 +519,83 @@ pub fn put_direct_credential(http_base: &str, credential: DpopConnectionCredenti
     }
 }
 
+/// Updates an existing canonical DPoP credential entry in place (e.g. after automatic renewal on
+/// either the primary or an alternate route).
+pub fn update_direct_credential(store_key: &str, mut credential: DpopConnectionCredential) {
+    if credential.seed_token.is_none() {
+        credential.seed_token = Some(credential.access_token.clone());
+    }
+    let key = normalize_host_key(store_key);
+    let base = crate::store::base();
+    let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard
+        .entry(base.clone())
+        .or_insert_with(|| base.as_deref().map(load_credentials_file).unwrap_or_default());
+    map.insert(key, credential);
+    if let Some(dir) = base.as_deref() {
+        save_credentials_file(dir, map);
+    }
+}
+
+/// Migrates a stored DPoP credential when a saved environment moves to a new address (e.g., an SSH
+/// tunnel reserving a new ephemeral port or a local server restarting on a different port).
+pub fn relocate_direct_credential(old_http_base: &str, new_http_base: &str, access_token: Option<&str>) {
+    let old_key = normalize_host_key(old_http_base);
+    let new_key = normalize_host_key(new_http_base);
+    if old_key == new_key {
+        return;
+    }
+    let base = crate::store::base();
+    let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard
+        .entry(base.clone())
+        .or_insert_with(|| base.as_deref().map(load_credentials_file).unwrap_or_default());
+    let existing = map.remove(&old_key).or_else(|| {
+        let token = access_token.filter(|t| !t.is_empty())?;
+        let found_key = map
+            .iter()
+            .find(|(_, cred)| cred.matches_token(token))
+            .map(|(k, _)| k.clone())?;
+        map.remove(&found_key)
+    });
+    if let Some(cred) = existing {
+        map.insert(new_key, cred);
+        if let Some(dir) = base.as_deref() {
+            save_credentials_file(dir, map);
+        }
+    }
+}
+
 /// Removes any stored direct DPoP credential for `http_base` (e.g. when re-pairing as Bearer or revoking).
 pub fn remove_direct_credential(http_base: &str) {
+    remove_direct_credential_matching(http_base, None);
+}
+
+/// Removes any stored direct DPoP credential keyed by `http_base` or matching `access_token`.
+pub fn remove_direct_credential_matching(http_base: &str, access_token: Option<&str>) {
     let key = normalize_host_key(http_base);
     let base = crate::store::base();
     let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
     let map = guard
         .entry(base.clone())
         .or_insert_with(|| base.as_deref().map(load_credentials_file).unwrap_or_default());
-    if map.remove(&key).is_some()
-        && let Some(dir) = base.as_deref()
-    {
+    let mut removed = map.remove(&key).is_some();
+    if let Some(token) = access_token.filter(|t| !t.is_empty()) {
+        let before = map.len();
+        map.retain(|_, cred| !cred.matches_token(token));
+        removed |= map.len() != before;
+    }
+    if removed && let Some(dir) = base.as_deref() {
         save_credentials_file(dir, map);
     }
 }
 
-/// Per-host async renewal lock (`directTokenLocks` in `packages/client-runtime/src/authorization/service.ts`):
+/// Per-credential async renewal lock (`directTokenLocks` in `packages/client-runtime/src/authorization/service.ts`):
 /// requests for the same host share one renewal without waiting on other hosts.
-pub fn direct_renewal_lock(http_base: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub fn direct_renewal_lock(store_key: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = normalize_host_key(http_base);
+    let key = normalize_host_key(store_key);
     locks
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -576,5 +716,48 @@ mod tests {
             br#"{"crv":"P-256","kty":"EC","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}"#,
         );
         assert_eq!(compute_dpop_jwk_thumbprint(&jwk), expected);
+
+        let wss = Url::parse("wss://studio.ts.net:3773/ws?wsTicket=abc#frag").unwrap();
+        assert_eq!(ws_url_to_http_htu(&wss).as_deref(), Some("https://studio.ts.net:3773/ws"));
+        let ws = Url::parse("ws://127.0.0.1:3773/ws?wsTicket=abc").unwrap();
+        assert_eq!(ws_url_to_http_htu(&ws).as_deref(), Some("http://127.0.0.1:3773/ws"));
+    }
+
+    #[test]
+    fn dpop_store_survives_route_switch_renewal_and_relocation() {
+        let initial_base = format!("http://127.0.0.1:{}", 49000 + (uuid::Uuid::new_v4().as_u128() % 9000));
+        let fallback_base = format!("https://studio-{}.ts.net:3773", uuid::Uuid::new_v4().simple());
+        let relocated_base = format!("http://127.0.0.1:{}", 58000 + (uuid::Uuid::new_v4().as_u128() % 5000));
+        let seed = format!("seed-tok-{}", uuid::Uuid::new_v4().simple());
+        let renewed_tok = format!("renewed-tok-{}", uuid::Uuid::new_v4().simple());
+
+        let initial = DpopConnectionCredential::new(seed.clone(), 1_900_000_000_000, Some("env-1".into()));
+        put_direct_credential(&initial_base, initial);
+
+        // Alternate route resolves by seed token.
+        let (key, found) = find_direct_credential(&fallback_base, &seed).expect("alternate route matches seed");
+        assert_eq!(key, initial_base);
+        assert_eq!(found.access_token, seed);
+
+        // Renewing updates the canonical entry while keeping the initial seed token matchable.
+        let next = found.renewed(renewed_tok.clone(), 2_000_000_000_000);
+        update_direct_credential(&key, next);
+        let (_, via_seed) = find_direct_credential(&fallback_base, &seed).expect("stale seed resolves renewed");
+        assert_eq!(via_seed.access_token, renewed_tok);
+
+        // Unrelated Bearer token on the same origin must not inherit the DPoP credential.
+        assert!(find_direct_credential(&initial_base, "unrelated-bearer-token").is_none());
+
+        // SSH/local relocation migrates the key cleanly without leaving an orphan.
+        relocate_direct_credential(&initial_base, &relocated_base, Some(&seed));
+        assert!(get_direct_credential(&initial_base).is_none());
+        let (relocated_key, relocated) =
+            find_direct_credential(&relocated_base, &seed).expect("relocated key resolves");
+        assert_eq!(relocated_key, relocated_base);
+        assert_eq!(relocated.access_token, renewed_tok);
+
+        // Removal by matching token cleans up regardless of base.
+        remove_direct_credential_matching(&initial_base, Some(&seed));
+        assert!(find_direct_credential(&relocated_base, &seed).is_none());
     }
 }

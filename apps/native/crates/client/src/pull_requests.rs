@@ -29,14 +29,21 @@ pub async fn fetch_diff(credentials: &Credentials, payload: Value) -> Result<Val
     let failure = |message: &str| HttpFailure { tag: None, error: Value::Null, message: message.to_owned() };
     let url = diff_url(&credentials.http_base).ok_or_else(|| failure(FALLBACK))?;
     let client = reqwest::Client::builder().timeout(TIMEOUT).build().map_err(|_| failure(FALLBACK))?;
-    let response = client.post(url).bearer_auth(&credentials.access_token).json(&payload).send().await.map_err(|error| {
-        if error.is_timeout() {
+    let url_str = url.as_str().to_owned();
+    let response = crate::auth::send_authed_request(credentials, "POST", &url_str, || {
+        client.post(url.clone()).json(&payload)
+    })
+    .await
+    .map_err(|error| match error {
+        crate::auth::AuthedHttpError::Http(err) if err.is_timeout() => {
             failure(&format!("The server did not answer within {}s.", TIMEOUT.as_secs()))
-        } else if error.is_connect() {
-            failure("Could not reach the server.")
-        } else {
-            failure(FALLBACK)
         }
+        crate::auth::AuthedHttpError::Http(err) if err.is_connect() => failure("Could not reach the server."),
+        crate::auth::AuthedHttpError::Http(_) => failure(FALLBACK),
+        crate::auth::AuthedHttpError::Auth(err) if err.is_host_credential_refusal() => {
+            failure("This environment session is no longer valid. Pair again.")
+        }
+        crate::auth::AuthedHttpError::Auth(err) => failure(&err.to_string()),
     })?;
     let status = response.status();
     let body = response.bytes().await.map_err(|_| failure(FALLBACK))?;

@@ -1154,8 +1154,8 @@ async fn next_better_route_probe(probe: &mut Option<RunningBetterRouteProbe>) ->
 /// Keeps a direct DPoP session's access token fresh while its socket is open
 /// (`renewDpopBeforeExpiry` in `packages/client-runtime/src/authorization/service.ts`,
 /// `pingdotgg/t3code#37990`).
-fn spawn_direct_dpop_renewal(http_base: String) -> Option<JoinHandle<()>> {
-    let initial = crate::dpop::get_direct_credential(&http_base)?;
+fn spawn_direct_dpop_renewal(credentials: Credentials) -> Option<JoinHandle<()>> {
+    let (_, initial) = crate::dpop::find_direct_credential(&credentials.http_base, &credentials.access_token)?;
     Some(tokio::spawn(async move {
         let mut expires_at = initial.expires_at_epoch_ms;
         loop {
@@ -1170,16 +1170,16 @@ fn spawn_direct_dpop_renewal(http_base: String) -> Option<JoinHandle<()>> {
                 .saturating_sub(now)
                 .max(floor_ms);
             tokio::time::sleep(Duration::from_millis(wait_ms as u64)).await;
-            match auth::renew_direct_dpop_token(&http_base, None).await {
+            match auth::renew_direct_dpop_token(&credentials, None).await {
                 Ok(renewed) => {
                     expires_at = expires_at.max(renewed.expires_at_epoch_ms);
                 }
                 Err(error) if error.is_host_credential_refusal() => {
-                    tracing::warn!(%http_base, %error, "direct DPoP renewal refused; stopping background renewal");
+                    tracing::warn!(http_base = %credentials.http_base, %error, "direct DPoP renewal refused; stopping background renewal");
                     break;
                 }
                 Err(error) => {
-                    tracing::debug!(%http_base, %error, "direct DPoP renewal transient failure; will retry");
+                    tracing::debug!(http_base = %credentials.http_base, %error, "direct DPoP renewal transient failure; will retry");
                 }
             }
         }
@@ -1419,7 +1419,7 @@ async fn run_session(
     fetch: &mut SessionStateFetch<'_>,
     config_extras: &watch::Sender<ServerConfigExtras>,
 ) -> SessionEnd {
-    let dpop_renewal_task = spawn_direct_dpop_renewal(active_route.http_base.clone());
+    let dpop_renewal_task = spawn_direct_dpop_renewal(active_credentials.clone());
     let config_requested_at_ms = wall_now_ms();
     let mut preprocessor = ServerConfigPreprocessor::default();
     let mut environment_label: Option<String> = None;
