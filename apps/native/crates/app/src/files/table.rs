@@ -1,9 +1,12 @@
 //! Virtualized CSV/TSV delimited table preview with sortable and resizable columns.
 //! Ports `apps/web/src/components/files/DelimitedTablePreview.tsx` and `VirtualTablePreview.tsx`.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
     AnyElement, Context, DragMoveEvent, EmptyView, FontWeight, IntoElement, ParentElement, Pixels,
-    ScrollWheelEvent, SharedString, Styled, UniformListScrollHandle, Window, div, prelude::*, px,
+    ScrollWheelEvent, SharedString, Styled, UniformListScrollHandle, Window, canvas, div, prelude::*, px,
     uniform_list,
 };
 use gpui_component::scroll::ScrollableElement;
@@ -32,7 +35,8 @@ pub struct TableView {
     pub(super) table: Option<DelimitedTable>,
     scroll: UniformListScrollHandle,
     h_offset: Pixels,
-    viewport_width: f32,
+    resize_anchor_x: f32,
+    viewport_width: Rc<Cell<f32>>,
 }
 
 impl TableView {
@@ -43,7 +47,8 @@ impl TableView {
             table: None,
             scroll: UniformListScrollHandle::new(),
             h_offset: px(0.),
-            viewport_width: 0.,
+            resize_anchor_x: 0.,
+            viewport_width: Rc::new(Cell::new(0.)),
         }
     }
 
@@ -149,7 +154,7 @@ impl Preview {
                             },
                         )
                         .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
-                            this.table.viewport_width = f32::from(event.position.x);
+                            this.table.resize_anchor_x = f32::from(event.position.x);
                         })),
                 )
         });
@@ -256,7 +261,13 @@ impl Preview {
                         .size_full()
                         .track_scroll(&self.table.scroll),
                     )
-                    .vertical_scrollbar(&self.table.scroll),
+                    .vertical_scrollbar(&self.table.scroll)
+                    .child({
+                        let viewport_width = self.table.viewport_width.clone();
+                        canvas(move |bounds, _, _| viewport_width.set(f32::from(bounds.size.width)), |_, _, _, _| {})
+                            .absolute()
+                            .size_full()
+                    }),
             )
             .into_any_element()
     }
@@ -328,7 +339,7 @@ impl Preview {
 
     fn resize_table_column(&mut self, event: &DragMoveEvent<ColumnResize>, _: &mut Window, cx: &mut Context<Self>) {
         let drag = *event.drag(cx);
-        let anchor_x = if drag.start_x != 0. { drag.start_x } else { self.table.viewport_width };
+        let anchor_x = if drag.start_x != 0. { drag.start_x } else { self.table.resize_anchor_x };
         let delta = f32::from(event.event.position.x) - anchor_x;
         if let Some(table) = self.table.table.as_mut() {
             table.resize_column(drag.column, drag.start_width + delta);
@@ -344,7 +355,8 @@ impl Preview {
         }
         let Some(table) = self.table.table.as_ref() else { return };
         let total = table.total_width(ROW_GUTTER_WIDTH);
-        let max = px((total - 320.).max(0.));
+        let visible = self.table.viewport_width.get().max(120.);
+        let max = px((total - visible).max(0.));
         let next = (self.table.h_offset - dx).clamp(px(0.), max);
         if next != self.table.h_offset {
             self.table.h_offset = next;

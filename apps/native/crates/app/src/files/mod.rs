@@ -848,7 +848,7 @@ mod tests {
             .unwrap();
 
         let (panel, vcx) = cx.add_window_view(|window, cx| FilesPanel::new(state.clone(), window, cx));
-        let target = preview::Target {
+        let make_target = |path: &str| preview::Target {
             root: Root {
                 environment: "fixture-env".into(),
                 workspace: FileWorkspace {
@@ -857,49 +857,124 @@ mod tests {
                     project_name: "Shared repo".into(),
                 },
             },
-            path: "src/app.rs".into(),
+            path: path.into(),
             reveal_line: None,
             reveal_request_id: 0,
         };
+        let target_a = make_target("src/app.rs");
+        let target_b = make_target("scripts/tool.py");
+        let save_target_a = t3_core::files::save::FileSaveTarget::new("fixture-env", "/fixture/b", "src/app.rs");
+        let save_target_b = t3_core::files::save::FileSaveTarget::new("fixture-env", "/fixture/b", "scripts/tool.py");
 
         let preview_entity = panel.read_with(vcx, |panel, _| panel.preview.clone());
         let explorer_entity = panel.read_with(vcx, |panel, _| panel.explorer.clone());
 
-        let persist_task = vcx.update(|window, cx| {
-            let task = preview_entity.update(cx, |preview, cx| {
-                preview.load_text_for_test(target, "fn before() {}\n", cx);
+        // Start an in-flight write on target A (`src/app.rs`), then switch to target B (`scripts/tool.py`)
+        // and start a second concurrent write before target A's reply returns.
+        let editor_a_id = vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.root = Some(target_a.root.clone());
+                panel.shown = Some(Shown {
+                    surface_id: "s-1".into(),
+                    path: Some("src/app.rs".into()),
+                    reveal_line: None,
+                    reveal_request_id: 0,
+                    attachment: None,
+                    folder_trail: None,
+                });
+                cx.notify();
+            });
+            preview_entity.update(cx, |preview, cx| {
+                preview.load_text_for_test(target_a.clone(), "fn before() {}\n", cx);
                 preview.enter_edit_mode(cx);
+                assert_eq!(preview.editor.language, Some("rust"));
                 preview.on_editor_text_changed("fn after() {}\n".into(), cx);
                 assert!(preview.is_dirty());
                 preview.save_active_file(cx);
-                preview.editor._persist_task.take().expect("writeFile persist task spawned")
             });
             window.draw(cx).clear();
-            task
+            preview_entity.read(cx).editor.editor.as_ref().expect("rust editor state").entity_id()
         });
 
-        let (method, payload, reply) = loop {
+        let (method_a, payload_a, reply_a) = loop {
             let req = fixture.next_request().await;
             if req.0 == t3_core::files::WRITE_FILE {
                 break req;
             }
             let _ = req.2.send(Ok(json!({})));
         };
-        assert_eq!(method, t3_core::files::WRITE_FILE);
+        assert_eq!(method_a, t3_core::files::WRITE_FILE);
         assert_eq!(
-            payload,
+            payload_a,
             json!({ "cwd": "/fixture/b", "relativePath": "src/app.rs", "contents": "fn after() {}\n" })
         );
-        reply.send(Ok(json!({ "relativePath": "src/app.rs" }))).unwrap();
 
-        persist_task.await;
+        // Switch to a Python file while target A's write is still in flight; verify language updates,
+        // EditorState is recreated with the new grammar, and target B's write does not cancel target A's persist task.
+        let editor_b_id = vcx.update(|window, cx| {
+            preview_entity.update(cx, |preview, cx| {
+                preview.release_active_editor_on_target_change(cx);
+                preview.load_text_for_test(target_b.clone(), "print('before')\n", cx);
+                preview.enter_edit_mode(cx);
+                assert_eq!(preview.editor.language, Some("python"));
+                preview.on_editor_text_changed("print('after')\n".into(), cx);
+                preview.save_active_file(cx);
+            });
+            window.draw(cx).clear();
+            preview_entity.read(cx).editor.editor.as_ref().expect("python editor state").entity_id()
+        });
+        assert_ne!(editor_a_id, editor_b_id, "switching files must recreate EditorState with updated language");
+
+        let (method_b, payload_b, reply_b) = loop {
+            let req = fixture.next_request().await;
+            if req.0 == t3_core::files::WRITE_FILE {
+                break req;
+            }
+            let _ = req.2.send(Ok(json!({})));
+        };
+        assert_eq!(method_b, t3_core::files::WRITE_FILE);
+        assert_eq!(
+            payload_b,
+            json!({ "cwd": "/fixture/b", "relativePath": "scripts/tool.py", "contents": "print('after')\n" })
+        );
+
+        // Take both per-target persist tasks and resolve both RPCs; neither must deadlock in `saving`.
+        let (task_a, task_b) = preview_entity.update(vcx, |preview, _| {
+            (
+                preview.editor.persist_tasks.remove(&save_target_a.key()).expect("target A persist task kept"),
+                preview.editor.persist_tasks.remove(&save_target_b.key()).expect("target B persist task kept"),
+            )
+        });
+        reply_a.send(Ok(json!({ "relativePath": "src/app.rs" }))).unwrap();
+        reply_b.send(Ok(json!({ "relativePath": "scripts/tool.py" }))).unwrap();
+        task_a.await;
+        task_b.await;
         vcx.run_until_parked();
+
         preview_entity.read_with(vcx, |preview, _| {
+            assert!(!preview.editor.store.is_saving(&save_target_a), "target A must not deadlock in saving");
+            assert!(!preview.editor.store.is_pending(&save_target_a), "target A confirmed write must clear pending");
+            assert!(!preview.editor.store.is_saving(&save_target_b), "target B must not deadlock in saving");
             assert!(!preview.is_dirty(), "confirmed write must clear dirty state");
-            assert_eq!(preview.current_text_contents().as_deref(), Some("fn after() {}\n"));
+            assert_eq!(preview.current_text_contents().as_deref(), Some("print('after')\n"));
         });
 
-        // Explorer drag-to-mention emits mention into AppState::composer_mentions.
+        // Aborted drag clears `drag_mention.is_drag_in_progress()` on render when no drag is active.
+        vcx.update(|window, cx| {
+            explorer_entity.update(cx, |explorer, _| {
+                let _ = explorer.begin_drag_mention("src/app.rs").expect("drag mention payload");
+                assert!(explorer.drag_mention.is_drag_in_progress());
+            });
+            window.draw(cx).clear();
+        });
+        explorer_entity.read_with(vcx, |explorer, _| {
+            assert!(
+                !explorer.drag_mention.is_drag_in_progress(),
+                "aborted drag without active GPUI drag must clear drag-to-mention state"
+            );
+        });
+
+        // Explorer drag-to-mention drop emits mention into AppState::composer_mentions.
         explorer_entity.update(vcx, |explorer, cx| {
             let dragged = explorer.begin_drag_mention("src/app.rs").expect("drag mention payload");
             assert_eq!(dragged.mention, "[app.rs](src/app.rs)");

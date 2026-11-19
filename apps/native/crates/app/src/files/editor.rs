@@ -3,6 +3,7 @@
 //! Ports `EditableFileSurface` in `FilePreviewPanel.tsx`, `fileSaveCoordinator.ts`,
 //! `fileSaveSessions.ts`, `fileEditorDismissal.ts`, and `fileContentRevision.ts`.
 
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
@@ -57,20 +58,20 @@ pub struct FileEditorController {
     loaded_text: String,
     /// Last confirmed server text (for Discard restoration).
     server_text: String,
-    language: Option<&'static str>,
+    pub(super) language: Option<&'static str>,
     wrap: bool,
     pub(super) store: FileSaveSessionStore,
     pub(super) save_error: Option<String>,
     pub(super) pending_dismiss: Option<PendingDismiss>,
     pub(super) can_write: bool,
-    editor: Option<Entity<EditorState>>,
+    pub(super) editor: Option<Entity<EditorState>>,
     /// Suppresses `InputEvent::Change` callbacks caused by programmatic `set_value`.
     syncing_value: bool,
     needs_sync: bool,
     needs_focus: bool,
     _input_sub: Option<Subscription>,
-    _debounce_task: Option<Task<()>>,
-    pub(super) _persist_task: Option<Task<()>>,
+    debounce_tasks: HashMap<String, Task<()>>,
+    pub(super) persist_tasks: HashMap<String, Task<()>>,
     _grants_task: Option<Task<()>>,
 }
 
@@ -92,8 +93,8 @@ impl FileEditorController {
             needs_sync: false,
             needs_focus: false,
             _input_sub: None,
-            _debounce_task: None,
-            _persist_task: None,
+            debounce_tasks: HashMap::new(),
+            persist_tasks: HashMap::new(),
             _grants_task: None,
         }
     }
@@ -192,10 +193,16 @@ impl Preview {
             .unwrap_or_else(|| server_contents.clone());
         let can_write = self.editor.can_write;
         let effects = self.editor.store.acquire(&save_target, can_write, now_ms());
+        let next_language = t3_core::files::syntax_language(&target.path);
+        let switching_editor = self.editor.target.as_ref() != Some(&save_target) || self.editor.language != next_language;
+        if switching_editor {
+            self.editor.editor = None;
+            self.editor._input_sub = None;
+        }
         self.editor.target = Some(save_target);
         self.editor.server_text = server_contents;
         self.editor.loaded_text = initial;
-        self.editor.language = t3_core::files::syntax_language(&target.path);
+        self.editor.language = next_language;
         self.editor.editing = true;
         self.editor.pending_dismiss = None;
         self.editor.save_error = None;
@@ -269,9 +276,10 @@ impl Preview {
             self.run_save_effects(effects, cx);
         }
         self.editor.editing = false;
+        self.editor.editor = None;
+        self.editor._input_sub = None;
         self.editor.pending_dismiss = None;
         self.editor.save_error = None;
-        self.editor._debounce_task = None;
     }
 
     fn finish_exit_edit_mode(&mut self, cx: &mut Context<Self>) {
@@ -281,8 +289,9 @@ impl Preview {
             self.run_save_effects(effects, cx);
         }
         self.editor.editing = false;
+        self.editor.editor = None;
+        self.editor._input_sub = None;
         self.editor.pending_dismiss = None;
-        self.editor._debounce_task = None;
         cx.notify();
     }
 
@@ -301,26 +310,31 @@ impl Preview {
     fn run_save_effects(&mut self, effects: Vec<TargetedSaveEffect>, cx: &mut Context<Self>) {
         for targeted in effects {
             let target = targeted.target;
+            let key = target.key();
             match targeted.effect {
                 SaveEffect::CancelDebounce => {
-                    self.editor._debounce_task = None;
+                    self.editor.debounce_tasks.remove(&key);
                 }
                 SaveEffect::ScheduleDebounce { delay_ms, token } => {
-                    self.editor._debounce_task = Some(cx.spawn(async move |this, cx| {
+                    let remove_key = key.clone();
+                    let task = cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(Duration::from_millis(delay_ms)).await;
                         let _ = this.update(cx, |this, cx| {
+                            this.editor.debounce_tasks.remove(&remove_key);
                             let can_write = this.editor.can_write;
                             let next = this.editor.store.on_debounce_fired(&target, token, can_write);
                             this.run_save_effects(next, cx);
                             cx.notify();
                         });
-                    }));
+                    });
+                    self.editor.debounce_tasks.insert(key, task);
                 }
                 SaveEffect::Persist { revision, contents } => {
                     self.persist_file(target, revision, contents, cx);
                 }
                 SaveEffect::PendingChanged(false) => {
-                    if self.editor.pending_dismiss == Some(PendingDismiss::ExitEditMode)
+                    if self.editor.target.as_ref() == Some(&target)
+                        && self.editor.pending_dismiss == Some(PendingDismiss::ExitEditMode)
                         && !self.editor.is_dirty()
                         && !self.editor.is_saving()
                     {
@@ -339,10 +353,13 @@ impl Preview {
         contents: String,
         cx: &mut Context<Self>,
     ) {
+        let key = target.key();
         let state = self.state.read(cx);
         let Some(client) = state.client_handle() else {
             let next = self.editor.store.on_persist_result(&target, revision, &contents, false, false, now_ms());
-            self.editor.save_error = Some("Not connected to the server.".to_owned());
+            if self.editor.target.as_ref() == Some(&target) {
+                self.editor.save_error = Some("Not connected to the server.".to_owned());
+            }
             self.run_save_effects(next, cx);
             return;
         };
@@ -355,16 +372,20 @@ impl Preview {
             }
         });
         let saved_contents = contents.clone();
-        self.editor._persist_task = Some(cx.spawn(async move |this, cx| {
+        let finish_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
             let result = request
                 .await
                 .unwrap_or_else(|_| Err(WriteFailure::message("The file could not be saved.")));
             let _ = this.update(cx, |this, cx| {
+                this.editor.persist_tasks.remove(&finish_key);
                 let can_write = this.editor.can_write;
                 match result {
                     Ok(_) => {
-                        this.editor.save_error = None;
-                        this.editor.server_text = saved_contents.clone();
+                        if this.editor.target.as_ref() == Some(&target) {
+                            this.editor.save_error = None;
+                            this.editor.server_text = saved_contents.clone();
+                        }
                         this.apply_saved_text_locally(&target, &saved_contents, cx);
                         let next = this.editor.store.on_persist_result(
                             &target,
@@ -378,7 +399,9 @@ impl Preview {
                     }
                     Err(failure) => {
                         let description = failure.describe();
-                        this.editor.save_error = Some(description.clone());
+                        if this.editor.target.as_ref() == Some(&target) {
+                            this.editor.save_error = Some(description.clone());
+                        }
                         this.state.update(cx, |state, cx| {
                             state.show_toast(
                                 Toast::new(ToastKind::Error, "Could not save file").description(description),
@@ -398,7 +421,8 @@ impl Preview {
                 }
                 cx.notify();
             });
-        }));
+        });
+        self.editor.persist_tasks.insert(key, task);
     }
 
     pub(super) fn render_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {

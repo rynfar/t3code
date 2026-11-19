@@ -183,6 +183,9 @@ impl Explorer {
 
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !cx.has_active_drag() && self.drag_mention.is_drag_in_progress() {
+            let _ = self.drag_mention.end_drag();
+        }
         if std::mem::take(&mut self.pending_reset_input) {
             self.search_input.update(cx, |input, cx| input.set_value("", window, cx));
         }
