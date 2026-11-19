@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     let mut metadata = client.stream(method::SUBSCRIBE_METADATA, serde_json::json!({})).await?;
     if let Some(Ok(item)) = metadata.receiver.recv().await {
         match serde_json::from_value::<MetadataEvent>(item)? {
-            MetadataEvent::Snapshot { terminals } => println!("metadata: snapshot with {} terminal(s)", terminals.len()),
+            MetadataEvent::Snapshot { terminals, .. } => println!("metadata: snapshot with {} terminal(s)", terminals.len()),
             other => println!("metadata: {other:?}"),
         }
     }

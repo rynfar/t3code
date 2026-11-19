@@ -299,6 +299,15 @@ impl PartialEq for ServerTime {
     }
 }
 
+/// `ServerProviderSubProvider`: a backend a provider's models run on, such as one of fx's.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSubProvider {
+    pub name: String,
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+}
+
 /// `ServerProvider`: one provider instance as the server reports it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -328,6 +337,12 @@ pub struct ServerProvider {
     pub supports_text_generation: Option<bool>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub models: Vec<ProviderModel>,
+    /// Pickers group `models` under these, in order, by `sub_provider`.
+    #[serde(default, deserialize_with = "lenient_option_vec")]
+    pub sub_providers: Option<Vec<ProviderSubProvider>>,
+    /// Set for the one failed check that follows a ready one: pickers keep offering `models`.
+    #[serde(default)]
+    pub models_retained: Option<bool>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub usage_limits: Option<UsageLimits>,
     /// `false` when the provider cannot rewind its conversation ("Edit from here").
@@ -346,6 +361,9 @@ pub struct ServerProvider {
     /// Per-cwd commands and skills. Left out for clients that fetch them on demand.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub workspace_snapshots: Vec<WorkspaceSnapshot>,
+    /// Set when the server rescanned a workspace after a session start and its skills or commands changed.
+    #[serde(default)]
+    pub workspace_rescanned_at: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
@@ -726,6 +744,48 @@ pub struct ProjectSettingsOverrides {
     pub raw: serde_json::Map<String, Value>,
 }
 
+/// Default `usageHistoryRetentionDays` from `packages/contracts/src/settings.ts`.
+pub const DEFAULT_USAGE_HISTORY_RETENTION_DAYS: u32 = 92;
+
+/// `UsageHistoryRetentionDays` (`packages/contracts/src/settings.ts`): a positive integer number
+/// of days or `"unlimited"`, defaulting to 92.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageHistoryRetentionDays {
+    Days(u32),
+    Unlimited,
+}
+
+impl Default for UsageHistoryRetentionDays {
+    fn default() -> Self {
+        UsageHistoryRetentionDays::Days(DEFAULT_USAGE_HISTORY_RETENTION_DAYS)
+    }
+}
+
+impl Serialize for UsageHistoryRetentionDays {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            UsageHistoryRetentionDays::Days(days) => serializer.serialize_u32(*days),
+            UsageHistoryRetentionDays::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UsageHistoryRetentionDays {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match Value::deserialize(d)? {
+            Value::String(ref s) if s == "unlimited" => Ok(UsageHistoryRetentionDays::Unlimited),
+            Value::Number(ref n) => {
+                if let Some(days) = n.as_u64().and_then(|v| u32::try_from(v).ok()).filter(|&v| v > 0) {
+                    Ok(UsageHistoryRetentionDays::Days(days))
+                } else {
+                    Err(serde::de::Error::custom("usageHistoryRetentionDays must be a positive integer or \"unlimited\""))
+                }
+            }
+            _ => Err(serde::de::Error::custom("usageHistoryRetentionDays must be a positive integer or \"unlimited\"")),
+        }
+    }
+}
+
 /// `ServerSettings`: the subset the composer reads. Absent keys take the contract's defaults.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -786,6 +846,9 @@ pub struct ServerSettings {
     /// The Usage page asks for summaries through this filter.
     #[serde(default, deserialize_with = "lenient_option")]
     pub usage_model_filter: Option<crate::usage::UsageModelFilter>,
+    /// How many days of usage history to retain, or `"unlimited"` (default 92).
+    #[serde(default, deserialize_with = "lenient")]
+    pub usage_history_retention_days: UsageHistoryRetentionDays,
     #[serde(flatten)]
     pub threads: crate::settings::ThreadSettings,
     #[serde(flatten)]
@@ -920,6 +983,9 @@ pub struct ServerConfig {
     pub server_time: ServerTime,
     #[serde(default)]
     pub cwd: String,
+    /// The machine's own name, which file URIs from its shells may carry. Older servers omit it.
+    #[serde(default)]
+    pub hostname: Option<String>,
     /// `ResolvedKeybindingsConfig`, kept raw for the keymap (ledger KB-USER).
     #[serde(default)]
     pub keybindings: Value,
@@ -1116,6 +1182,10 @@ pub struct ServerProviderDelta {
     pub supports_text_generation: Option<bool>,
     #[serde(default, deserialize_with = "lenient_option_vec")]
     pub models: Option<Vec<ProviderModel>>,
+    #[serde(default, deserialize_with = "lenient_option_vec")]
+    pub sub_providers: Option<Vec<ProviderSubProvider>>,
+    #[serde(default)]
+    pub models_retained: Option<bool>,
     #[serde(default, deserialize_with = "lenient_option")]
     pub usage_limits: Option<UsageLimits>,
     #[serde(default)]
@@ -1130,6 +1200,8 @@ pub struct ServerProviderDelta {
     pub loaded_catalog_digest: Option<String>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub workspace_snapshots: Vec<WorkspaceSnapshot>,
+    #[serde(default)]
+    pub workspace_rescanned_at: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
@@ -1178,6 +1250,8 @@ pub fn apply_server_provider_deltas(
                 availability: delta.availability,
                 supports_text_generation: delta.supports_text_generation,
                 models,
+                sub_providers: delta.sub_providers,
+                models_retained: delta.models_retained,
                 usage_limits: delta.usage_limits,
                 supports_conversation_rollback: delta.supports_conversation_rollback,
                 slash_commands,
@@ -1185,6 +1259,7 @@ pub fn apply_server_provider_deltas(
                 catalog_digest: delta.catalog_digest,
                 loaded_catalog_digest: delta.loaded_catalog_digest,
                 workspace_snapshots: delta.workspace_snapshots,
+                workspace_rescanned_at: delta.workspace_rescanned_at,
                 version: delta.version,
                 version_advisory: delta.version_advisory,
                 compatibility_advisory: delta.compatibility_advisory,

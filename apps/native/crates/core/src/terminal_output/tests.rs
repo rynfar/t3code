@@ -139,3 +139,33 @@ fn origin_counts_the_plain_bytes_the_tail_dropped() {
     state.append("klmnopqrst", 16);
     assert_eq!((state.text.as_str(), state.origin), ("efghijklmnopqrst", 11));
 }
+
+#[test]
+fn wide_glyphs_combining_marks_and_split_surrogates_track_columns() {
+    // Wide CJK glyphs occupy two columns: overwriting either half clears the other cell to space.
+    assert_eq!(text(&["你好\rX"]), "X 好");
+    assert_eq!(text(&["你好\u{1b}[2GX"]), " X好");
+    assert_eq!(text(&["你好\u{1b}[3GX"]), "你X ");
+    // Combining marks have zero width and move or drop with their base character.
+    assert_eq!(text(&["e\u{0301}x\r!"]), "!x");
+    assert_eq!(text(&["e\u{0301}x\u{1b}[2G!"]), "e\u{0301}!");
+    // Trimming a line never leaves a detached combining mark at the front.
+    let trimmed = fold(&["abce\u{0301}fg"], 3);
+    assert_eq!((trimmed.text.as_str(), trimmed.truncated), ("fg", true));
+    // A lone high surrogate at chunk end carries over into pending and joins its low surrogate.
+    let mut split = TerminalOutputState::default();
+    split.append_utf16(&[b'a' as u16, 0xd83d], TERMINAL_OUTPUT_TAIL_CHARS);
+    assert_eq!(split.text, "a");
+    assert_eq!(split.pending.as_slice(), &[0xd83d]);
+    split.append_utf16(&[0xde00, b'b' as u16], TERMINAL_OUTPUT_TAIL_CHARS);
+    assert_eq!(split.text, "a😀b");
+    assert!(split.pending.is_empty());
+    // Resume text compares cursor col against display width, not UTF-16 length.
+    let mut wide_state = TerminalOutputState::default();
+    wide_state.append("你好", TERMINAL_OUTPUT_TAIL_CHARS);
+    assert_eq!(wide_state.resume_text(), "你好");
+    wide_state.append("\u{1b}[2G", TERMINAL_OUTPUT_TAIL_CHARS);
+    assert_eq!(wide_state.resume_text(), "你好\u{1b}[2G");
+    // Plain-text stripping handles colon-delimited SGR sub-parameters.
+    assert_eq!(terminal_output_plain_text("\u{1b}[38:2::10:20:30mhi\u{1b}[0m"), "hi");
+}

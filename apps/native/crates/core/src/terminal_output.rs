@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+mod width;
+
 /// Default command tail, in UTF-16 code units (`TERMINAL_OUTPUT_TAIL_CHARS`).
 pub const TERMINAL_OUTPUT_TAIL_CHARS: usize = 64 * 1024;
 /// `terminalOutputSpans`' default cap on styled spans.
@@ -62,17 +64,20 @@ struct Run {
     text: Vec<u16>,
 }
 
-/// A line's runs with their total length cached, as `lineLengths` caches it.
+/// A line's runs with their total UTF-16 length (`lineLengths`) and display column width
+/// (`lineWidths`) cached.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Line {
     runs: Vec<Run>,
     len: usize,
+    width: usize,
 }
 
 impl Line {
     fn new(runs: Vec<Run>) -> Line {
         let len = runs.iter().map(|run| run.text.len()).sum();
-        Line { runs, len }
+        let width = runs.iter().map(|run| text_width(&run.text)).sum();
+        Line { runs, len, width }
     }
 
     fn utf8_len(&self) -> usize {
@@ -101,8 +106,44 @@ fn units(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
 }
 
+fn is_high_surrogate(unit: u16) -> bool {
+    (0xd800..=0xdbff).contains(&unit)
+}
+
 fn is_low_surrogate(unit: u16) -> bool {
     (0xdc00..=0xdfff).contains(&unit)
+}
+
+fn is_ascii_units(units: &[u16]) -> bool {
+    units.iter().all(|&unit| unit < 0x80)
+}
+
+/// Next JavaScript code point (`for (const character of text)` / `codePointAt`) and its UTF-16
+/// code unit count (2 for a valid surrogate pair, 1 otherwise).
+fn next_code_point(units: &[u16], index: usize) -> (u32, usize) {
+    let first = units[index];
+    if is_high_surrogate(first)
+        && let Some(&second) = units.get(index + 1)
+        && is_low_surrogate(second)
+    {
+        let cp = 0x10000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00);
+        return (cp, 2);
+    }
+    (u32::from(first), 1)
+}
+
+fn text_width(units: &[u16]) -> usize {
+    if is_ascii_units(units) {
+        return units.len();
+    }
+    let mut total = 0;
+    let mut index = 0;
+    while index < units.len() {
+        let (cp, step) = next_code_point(units, index);
+        total += width::code_point_width(cp);
+        index += step;
+    }
+    total
 }
 
 fn sgr(pen: &str) -> Vec<u16> {
@@ -111,21 +152,49 @@ fn sgr(pen: &str) -> Vec<u16> {
 
 fn slice_line(line: &Line, start: usize, end: usize) -> Vec<Run> {
     let mut out = Vec::new();
-    let mut offset = 0;
+    let mut col = 0;
+    let mut base = 0;
+    let mut base_end = 0;
     for run in &line.runs {
-        let run_end = offset + run.text.len();
-        if run_end > start && offset < end {
-            let from = start.saturating_sub(offset);
-            let to = run.text.len().min(end - offset);
-            // An empty slice only arises when `start > end`, where every caller drops it.
-            if from < to {
-                out.push(Run { pen: run.pen.clone(), text: run.text[from..to].to_vec() });
+        if is_ascii_units(&run.text) {
+            let run_end = col + run.text.len();
+            if run_end > start && col < end {
+                let from = start.saturating_sub(col);
+                let to = run.text.len().min(end - col);
+                if from < to {
+                    push_run(&mut out, Run { pen: run.pen.clone(), text: run.text[from..to].to_vec() });
+                }
             }
+            base = run_end.saturating_sub(1);
+            base_end = run_end;
+            col = run_end;
+            continue;
         }
-        offset = run_end;
-        if offset >= end {
-            break;
+        let mut text = Vec::new();
+        let mut index = 0;
+        while index < run.text.len() {
+            let (cp, step) = next_code_point(&run.text, index);
+            let char_width = width::code_point_width(cp);
+            if char_width > 0 {
+                base = col;
+                base_end = col + char_width;
+            }
+            if char_width == 0 {
+                if base >= start && base < end && base_end <= end {
+                    text.extend_from_slice(&run.text[index..index + step]);
+                }
+            } else if col < end && col + char_width > start {
+                // Overwriting either half of a wide glyph clears that glyph's other cell.
+                if col >= start && col + char_width <= end {
+                    text.extend_from_slice(&run.text[index..index + step]);
+                } else {
+                    text.extend(spaces(end.min(col + char_width) - start.max(col)));
+                }
+            }
+            col += char_width;
+            index += step;
         }
+        push_run(&mut out, Run { pen: run.pen.clone(), text });
     }
     out
 }
@@ -140,20 +209,42 @@ fn push_run(runs: &mut Vec<Run>, run: Run) {
     }
 }
 
-fn trim_line_start(runs: &mut Vec<Run>, count: usize) {
+/// Trims at least `count` UTF-16 code units from the start of `line`, advancing past any detached
+/// low surrogate or zero-width mark. Returns `(removed_width, removed_utf8_bytes)`.
+fn trim_line_start(line: &mut Line, count: usize) -> (usize, usize) {
+    let mut removed_width = 0;
+    let mut removed_units = 0;
+    let mut removed_utf8 = 0;
     let mut dropped = 0;
     let mut remaining = count;
-    while remaining > 0 && dropped < runs.len() {
-        let run = &mut runs[dropped];
-        if run.text.len() <= remaining {
-            remaining -= run.text.len();
-            dropped += 1;
-        } else {
-            run.text.drain(..remaining);
-            remaining = 0;
+    while dropped < line.runs.len() {
+        let run = &mut line.runs[dropped];
+        let mut cut = remaining.min(run.text.len());
+        // A retained tail must start at a complete character, with no detached marks.
+        while cut < run.text.len() {
+            let code = run.text[cut];
+            let (cp, step) = next_code_point(&run.text, cut);
+            if !is_low_surrogate(code) && width::code_point_width(cp) != 0 {
+                break;
+            }
+            cut += step;
         }
+        removed_width += text_width(&run.text[..cut]);
+        removed_units += cut;
+        removed_utf8 += utf8_len(&run.text[..cut]);
+        remaining = remaining.saturating_sub(cut);
+        if cut < run.text.len() {
+            run.text.drain(..cut);
+            break;
+        }
+        dropped += 1;
     }
-    runs.drain(..dropped);
+    if dropped > 0 {
+        line.runs.drain(..dropped);
+    }
+    line.len -= removed_units;
+    line.width -= removed_width;
+    (removed_width, removed_utf8)
 }
 
 fn spaces(count: usize) -> Vec<u16> {
@@ -161,34 +252,35 @@ fn spaces(count: usize) -> Vec<u16> {
 }
 
 fn write_line(line: &Line, col: usize, text: &[u16], pen: &str) -> Vec<Run> {
+    let width = text_width(text);
     let mut runs = Vec::new();
-    for run in slice_line(line, 0, col.min(line.len)) {
+    for run in slice_line(line, 0, col.min(line.width)) {
         push_run(&mut runs, run);
     }
-    if col > line.len {
-        push_run(&mut runs, Run { pen: String::new(), text: spaces(col - line.len) });
+    if col > line.width {
+        push_run(&mut runs, Run { pen: String::new(), text: spaces(col - line.width) });
     }
     push_run(&mut runs, Run { pen: pen.to_owned(), text: text.to_vec() });
-    for run in slice_line(line, col + text.len(), line.len) {
+    for run in slice_line(line, col + width, line.width) {
         push_run(&mut runs, run);
     }
     runs
 }
 
-/// Erase in line: 0 cursor to end, 1 start to cursor, anything else the whole line.
+/// Erase in line: 0 cursor to end, 1 start to cursor, 2 whole line.
 fn erase_line(line: &Line, col: usize, mode: f64) -> Line {
     if mode == 0. {
         return Line::new(slice_line(line, 0, col));
     }
     if mode == 1. {
         let mut runs = Vec::new();
-        push_run(&mut runs, Run { pen: String::new(), text: spaces((col + 1).min(line.len)) });
-        for run in slice_line(line, col + 1, line.len) {
+        push_run(&mut runs, Run { pen: String::new(), text: spaces((col + 1).min(line.width)) });
+        for run in slice_line(line, col + 1, line.width) {
             push_run(&mut runs, run);
         }
         return Line::new(runs);
     }
-    Line::default()
+    if mode == 2. { Line::default() } else { line.clone() }
 }
 
 fn serialize_line(line: &Line, out: &mut Vec<u16>) {
@@ -483,39 +575,31 @@ struct Terminal {
 impl Terminal {
     fn write(&mut self, text: &[u16]) {
         let line = &mut self.lines[self.row];
-        if self.col == line.len {
+        let width = text_width(text);
+        if self.col == line.width {
             push_run(&mut line.runs, Run { pen: self.pen.clone(), text: text.to_vec() });
             line.len += text.len();
+            line.width += width;
         } else {
             *line = Line::new(write_line(line, self.col, text, &self.pen));
         }
-        self.col += text.len();
+        self.col += width;
         if line.runs.len() > MAX_LINE_RUNS {
             // Flatten old runs so later trimming stays cheap.
             let keep = line.runs.len() - MAX_LINE_RUNS / 8;
             let plain: Vec<u16> = line.runs[..keep].iter().flat_map(|run| run.text.iter().copied()).collect();
             line.runs.splice(..keep, [Run { pen: String::new(), text: plain }]);
         }
-        // Trim each write to max_chars columns so results do not depend on chunk boundaries.
+        // The output budget is UTF-16 units; cursor positions are terminal columns.
         if line.len > self.max_chars {
-            let mut removed = line.len - self.max_chars;
-            // The lost start moves the window's start on: a line this long fills the tail, so
-            // nothing above it is drawn while the offsets after it stay put.
-            let head: Vec<u16> = line.runs.iter().flat_map(|run| run.text.iter().copied()).take(removed + 1).collect();
-            trim_line_start(&mut line.runs, removed);
-            // Never start on a lone low surrogate.
-            if line.runs.first().and_then(|run| run.text.first()).is_some_and(|&unit| is_low_surrogate(unit)) {
-                trim_line_start(&mut line.runs, 1);
-                removed += 1;
-            }
-            self.window_start += utf8_len(&head[..removed]);
-            line.len -= removed;
+            let (removed_width, removed_utf8) = trim_line_start(line, line.len - self.max_chars);
+            self.window_start += removed_utf8;
             self.dropped = true;
-            self.col = self.col.saturating_sub(removed);
+            self.col = self.col.saturating_sub(removed_width);
             if let Some((row, col)) = self.saved
                 && row == self.row
             {
-                self.saved = Some((row, col.saturating_sub(removed)));
+                self.saved = Some((row, col.saturating_sub(removed_width)));
             }
         }
     }
@@ -555,12 +639,14 @@ impl Terminal {
         let last_row = (self.lines.len() - 1) as f64;
         self.row = row.min(last_row).max(0.) as usize;
         // A huge column (ESC[999999999C) would otherwise pad a line past any string limit.
-        self.col = col.min(TERMINAL_OUTPUT_TAIL_CHARS as f64).max(0.) as usize;
+        self.col = col.min((2 * TERMINAL_OUTPUT_TAIL_CHARS) as f64).max(0.) as usize;
     }
 
     fn csi(&mut self, params: &str, final_byte: u16) {
-        if params.starts_with(['?', '>', '=']) {
-            return; // Mode switches (cursor visibility, bracketed paste).
+        if !params.bytes().all(|b| b.is_ascii_digit() || b == b';' || b == b':')
+            || (final_byte != b'm' as u16 && params.contains(':'))
+        {
+            return;
         }
         let numbers = if params.is_empty() { Vec::new() } else { csi_params(params) };
         if final_byte == b'm' as u16 {
@@ -598,7 +684,7 @@ impl Terminal {
                         self.dropped = true;
                     }
                     self.settled.clear();
-                } else {
+                } else if mode == 2. {
                     self.lines = vec![Line::default()];
                     self.row = 0;
                     self.col = 0;
@@ -674,6 +760,14 @@ impl Terminal {
             }
             index += 1;
         }
+        if let Some(&last) = input.last()
+            && is_high_surrogate(last)
+        {
+            if input.len() - 1 > printable {
+                self.write(&input[printable..input.len() - 1]);
+            }
+            return vec![last];
+        }
         if input.len() > printable {
             self.write(&input[printable..]);
         }
@@ -725,8 +819,14 @@ fn tail(text: &[u16], max_chars: usize) -> (Vec<u16>, bool) {
 impl TerminalOutputState {
     /// `appendTerminalOutput`, in place.
     pub fn append(&mut self, chunk: &str, max_chars: usize) {
+        let units: Vec<u16> = chunk.encode_utf16().collect();
+        self.append_utf16(&units, max_chars);
+    }
+
+    /// `appendTerminalOutput` on raw UTF-16 code units, preserving split surrogate pairs across chunks.
+    pub fn append_utf16(&mut self, chunk: &[u16], max_chars: usize) {
         let mut input = std::mem::take(&mut self.pending);
-        input.extend(chunk.encode_utf16());
+        input.extend_from_slice(chunk);
         if input.is_empty() {
             return;
         }
@@ -756,14 +856,14 @@ impl TerminalOutputState {
                 let keep = budget.clamp(0, length as i64) as usize;
                 if keep < length {
                     truncated = true;
-                    terminal.lines[row] = Line::new(slice_line(&terminal.lines[row], length - keep, length));
+                    let (removed_width, _) = trim_line_start(&mut terminal.lines[row], length - keep);
                     if let Some((saved_row, col)) = terminal.saved
                         && saved_row == row
                     {
-                        terminal.saved = Some((saved_row, col.saturating_sub(length - keep)));
+                        terminal.saved = Some((saved_row, col.saturating_sub(removed_width)));
                     }
                 }
-                budget -= keep as i64;
+                budget -= terminal.lines[row].len as i64;
             }
         }
         if terminal.dropped {
@@ -794,9 +894,53 @@ impl TerminalOutputState {
         };
     }
 
-    /// The unfinished escape carried into the next chunk.
+    /// The unfinished escape or lone high surrogate carried into the next chunk.
     pub fn pending(&self) -> String {
         String::from_utf16_lossy(&self.pending)
+    }
+
+    /// `terminalOutputResumeText`: rebuilds state from empty, including cursor/style/pending
+    /// escapes, so later raw chunks fold identically.
+    pub fn resume_text(&self) -> String {
+        let screen = &self.screen;
+        let last_row = screen.lines.len() - 1;
+        // Moves are relative to the last line, and a viewer only holds the lines in `text`.
+        let mut reachable = 0;
+        let mut cursor = 0;
+        while reachable < LIVE_LINES - 1 {
+            let Some(newline) = self.text[cursor..].find('\n') else { break };
+            reachable += 1;
+            cursor += newline + 1;
+        }
+        let up = |row: usize| (last_row - row).min(reachable);
+        let go_to = |row: usize, col: usize| {
+            let mut out = String::new();
+            let u = up(row);
+            if u > 0 {
+                out.push_str(&format!("\u{1b}[{u}A"));
+            }
+            out.push_str(&format!("\u{1b}[{}G", col + 1));
+            out
+        };
+        let mut suffix = String::new();
+        if let Some((saved_row, saved_col)) = screen.saved {
+            suffix.push_str(&go_to(saved_row, saved_col));
+            suffix.push_str("\u{1b}7");
+            let u = up(saved_row);
+            if u > 0 {
+                suffix.push_str(&format!("\u{1b}[{u}B"));
+            }
+        }
+        if screen.saved.is_some()
+            || screen.row < last_row
+            || screen.col != screen.lines[screen.row].width
+        {
+            suffix.push_str(&go_to(screen.row, screen.col));
+        }
+        if !screen.pen.is_empty() {
+            suffix.push_str(&format!("\u{1b}[0;{}m", screen.pen));
+        }
+        format!("{}{suffix}{}", self.text, self.pending())
     }
 }
 
@@ -1047,7 +1191,7 @@ pub fn terminal_output_plain_text(text: &str) -> String {
     while let Some(at) = rest.find("\u{1b}[") {
         out.push_str(&rest[..at]);
         let after = &rest[at + 2..];
-        let params = after.bytes().take_while(|b| b.is_ascii_digit() || *b == b';').count();
+        let params = after.bytes().take_while(|b| b.is_ascii_digit() || *b == b';' || *b == b':').count();
         if after.as_bytes().get(params) == Some(&b'm') {
             rest = &after[params + 1..];
         } else {

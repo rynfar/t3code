@@ -403,6 +403,7 @@ pub enum ClientSettingChange {
     BoringSidebarMultilineRows(bool),
     ConfirmThreadUnpin(bool),
     ConfirmThreadArchive(bool),
+    ConfirmTerminalClose(bool),
     ConfirmThreadDelete(bool),
     ConfirmQuit(QuitConfirmationMode),
     TimestampFormat(TimestampFormat),
@@ -442,6 +443,7 @@ pub enum ClientSettingChange {
     SpeechLanguage(String),
     SpeechTranslateToEnglish(bool),
     SpeechSilenceFiltering(bool),
+    SpeechStreaming(bool),
     SpeechRemoveFillerWords(bool),
     SpeechCustomWords(Vec<crate::voice_input::SpeechCustomWordEntry>),
     SpeechPostProcessingPrompt(crate::voice_input::SpeechPostProcessingPromptSettings),
@@ -490,6 +492,7 @@ impl ClientSettingChange {
             ClientSettingChange::BoringSidebarMultilineRows(on) => ("boringSidebarMultilineRows", Value::Bool(*on)),
             ClientSettingChange::ConfirmThreadUnpin(on) => ("confirmThreadUnpin", Value::Bool(*on)),
             ClientSettingChange::ConfirmThreadArchive(on) => ("confirmThreadArchive", Value::Bool(*on)),
+            ClientSettingChange::ConfirmTerminalClose(on) => ("confirmTerminalClose", Value::Bool(*on)),
             ClientSettingChange::ConfirmThreadDelete(on) => ("confirmThreadDelete", Value::Bool(*on)),
             ClientSettingChange::ConfirmQuit(mode) => ("confirmQuit", text(mode.as_str())),
             ClientSettingChange::TimestampFormat(format) => ("timestampFormat", text(format.as_str())),
@@ -548,6 +551,7 @@ impl ClientSettingChange {
             ClientSettingChange::SpeechLanguage(language) => ("speechLanguage", text(language)),
             ClientSettingChange::SpeechTranslateToEnglish(on) => ("speechTranslateToEnglish", Value::Bool(*on)),
             ClientSettingChange::SpeechSilenceFiltering(on) => ("speechSilenceFiltering", Value::Bool(*on)),
+            ClientSettingChange::SpeechStreaming(on) => ("speechStreaming", Value::Bool(*on)),
             ClientSettingChange::SpeechRemoveFillerWords(on) => ("speechRemoveFillerWords", Value::Bool(*on)),
             ClientSettingChange::SpeechCustomWords(words) => (
                 "speechCustomWords",
@@ -814,6 +818,10 @@ impl ClientSettingsDoc {
         self.flag("confirmThreadArchive", false)
     }
 
+    pub fn confirm_terminal_close(&self) -> bool {
+        self.flag("confirmTerminalClose", true)
+    }
+
     pub fn confirm_thread_delete(&self) -> bool {
         self.flag("confirmThreadDelete", true)
     }
@@ -976,6 +984,10 @@ impl ClientSettingsDoc {
 
     pub fn speech_silence_filtering(&self) -> bool {
         self.flag("speechSilenceFiltering", true)
+    }
+
+    pub fn speech_streaming(&self) -> bool {
+        self.flag("speechStreaming", true)
     }
 
     pub fn speech_remove_filler_words(&self) -> bool {

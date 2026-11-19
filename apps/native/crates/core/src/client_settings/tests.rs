@@ -566,3 +566,23 @@ fn environment_identification_and_composer_context_helpers_match_web() {
     assert!(!should_show_composer_context_strip(false, true, true, false, false));
     assert!(!should_show_composer_context_strip(true, true, false, true, true));
 }
+
+#[test]
+fn confirm_terminal_close_and_speech_streaming_default_true_and_round_trip() {
+    let mut doc = ClientSettingsDoc::default();
+    assert!(doc.confirm_terminal_close());
+    assert!(doc.speech_streaming());
+
+    assert!(doc.apply(&ClientSettingChange::ConfirmTerminalClose(false)));
+    assert!(!doc.confirm_terminal_close());
+    assert!(doc.apply(&ClientSettingChange::SpeechStreaming(false)));
+    assert!(!doc.speech_streaming());
+
+    let reread = ClientSettingsDoc::from_json(&doc.to_json());
+    assert!(!reread.confirm_terminal_close());
+    assert!(!reread.speech_streaming());
+
+    let invalid = ClientSettingsDoc::from_json(r#"{"confirmTerminalClose":"nope","speechStreaming":0}"#);
+    assert!(invalid.confirm_terminal_close());
+    assert!(invalid.speech_streaming());
+}

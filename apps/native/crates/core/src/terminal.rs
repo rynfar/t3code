@@ -14,7 +14,7 @@ pub mod links;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub use focus::{LastThreadFocus, PendingFocus, TerminalFocusQueue, ThreadEnterFocusDecision};
@@ -36,6 +36,8 @@ pub mod method {
 }
 
 pub const DEFAULT_TERMINAL_ID: &str = "term-1";
+/// Longest `data` one `terminal.write` carries, in UTF-16 code units (`TERMINAL_WRITE_MAX_LENGTH`).
+pub const TERMINAL_WRITE_MAX_LENGTH: usize = 65_536;
 /// `DEFAULT_MAX_TERMINAL_BUFFER_BYTES`: history replayed into a fresh emulator is cut to this.
 pub const MAX_BUFFER_BYTES: usize = 512 * 1024;
 pub const MAX_COLS: u16 = 1000;
@@ -98,6 +100,9 @@ pub struct SessionSnapshot {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
+    /// Why the shell failed to start, kept so later attachments can show it.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -158,7 +163,11 @@ pub enum AttachEvent {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum MetadataEvent {
-    Snapshot { terminals: Vec<TerminalSummary> },
+    Snapshot {
+        terminals: Vec<TerminalSummary>,
+        #[serde(default)]
+        manager_id: Option<String>,
+    },
     Upsert { terminal: TerminalSummary },
     Remove { thread_id: String, terminal_id: String },
     #[serde(other)]
@@ -168,7 +177,7 @@ pub enum MetadataEvent {
 /// `applyTerminalMetadataStreamEvent`. Upserts move the terminal to the end, as the web does.
 pub fn apply_metadata(current: &mut Vec<TerminalSummary>, event: MetadataEvent) {
     match event {
-        MetadataEvent::Snapshot { terminals } => *current = terminals,
+        MetadataEvent::Snapshot { terminals, .. } => *current = terminals,
         MetadataEvent::Remove { thread_id, terminal_id } => {
             current.retain(|t| t.thread_id != thread_id || t.terminal_id != terminal_id);
         }
@@ -347,7 +356,7 @@ impl BufferState {
             self.grid = Some(Grid::new(cols, rows));
         }
         self.status = BufferStatus::from_session(snapshot.status);
-        self.error = None;
+        self.error = snapshot.error;
         self.version += 1;
         OutputOp::Reset(trim_to_bytes(snapshot.history, MAX_BUFFER_BYTES))
     }
@@ -709,9 +718,40 @@ pub fn observe_input(thread_id: &str, terminal_id: &str) -> Value {
     session(thread_id, terminal_id)
 }
 
+/// `TerminalWriteInput` (`packages/contracts/src/terminal.ts`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalWriteInput {
+    pub thread_id: String,
+    pub terminal_id: String,
+    pub data: String,
+    /// `data` holds one byte per UTF-16 code unit; older servers write it as UTF-8 text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<bool>,
+    /// A renderer's answer to a terminal query (DA, DSR, DECRQM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<bool>,
+}
+
 pub fn write_input(thread_id: &str, terminal_id: &str, data: &str) -> Value {
+    write_input_with_options(thread_id, terminal_id, data, None, None)
+}
+
+pub fn write_input_with_options(
+    thread_id: &str,
+    terminal_id: &str,
+    data: &str,
+    binary: Option<bool>,
+    reply: Option<bool>,
+) -> Value {
     let mut payload = session(thread_id, terminal_id);
     payload["data"] = json!(data);
+    if let Some(binary) = binary {
+        payload["binary"] = json!(binary);
+    }
+    if let Some(reply) = reply {
+        payload["reply"] = json!(reply);
+    }
     payload
 }
 

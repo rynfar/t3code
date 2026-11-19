@@ -71,7 +71,7 @@ pub use requests::{
     secret_request_sources,
 };
 pub use detail::{
-    GET_TURN_ITEM, MAX_TOOL_OUTPUT_IMAGES, ToolCallLines, command_output_text, decode_detail, detail_request, detail_revision, format_tool_value, needs_detail_fetch,
+    GET_TURN_ITEM, MAX_TOOL_OUTPUT_IMAGES, ToolCallLines, command_item_output, decode_detail, detail_request, detail_revision, format_tool_value, needs_detail_fetch,
     open_command_items, read_tool_output_image, turn_item_has_detail, turn_item_output_images, turn_item_output_text,
 };
 pub use inspector::{

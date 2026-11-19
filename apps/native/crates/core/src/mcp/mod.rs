@@ -25,6 +25,7 @@ use crate::server_config::RuntimeMode;
 pub const SETTINGS_WRITE_SCOPE: &str = "settings:write";
 pub const RELAY_READ_SCOPE: &str = "relay:read";
 pub const RELAY_WRITE_SCOPE: &str = "relay:write";
+pub const RELAY_CONFIGURE_SCOPE: &str = "relay:configure";
 pub const MCP_APPROVAL_CODE_LABEL: &str = "App sign-in";
 pub const PAIRING_CODE_ALPHABET: &str = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 pub const PAIRING_CODE_LENGTH: usize = 12;

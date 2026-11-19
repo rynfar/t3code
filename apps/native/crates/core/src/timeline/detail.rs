@@ -126,6 +126,66 @@ fn format_json_value(value: &Value) -> Option<String> {
     (json != "{}" && json != "[]").then_some(json)
 }
 
+/// `hasLossyJsonNumber`: `JSON.parse` rounds integers beyond `2^53 - 1` and overflows to
+/// `Infinity`, so reformatting would change the value.
+fn has_lossy_json_number(json: &str) -> bool {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    let bytes = json.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                if bytes[i] == b'-' {
+                    i += 1;
+                }
+                let digits_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == digits_start {
+                    continue;
+                }
+                if i < bytes.len() && bytes[i] == b'.' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                if i < bytes.len() && matches!(bytes[i], b'e' | b'E') {
+                    i += 1;
+                    if i < bytes.len() && matches!(bytes[i], b'+' | b'-') {
+                        i += 1;
+                    }
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+                let token = &json[start..i];
+                let value = token.parse::<f64>().unwrap_or(f64::INFINITY);
+                if !value.is_finite() || (value.fract() == 0.0 && value.abs() > MAX_SAFE_INTEGER) {
+                    return true;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// `prettyJsonText`: a JSON document, or JSON lines, pretty-printed; any other text as is.
 fn pretty_json_text(text: &str) -> String {
     let trimmed = js_trim(text);
@@ -133,12 +193,12 @@ fn pretty_json_text(text: &str) -> String {
         return text.to_owned();
     }
     if let Some(whole) = json_text::parse(trimmed) {
-        return json_text::stringify_pretty(&whole);
+        return if has_lossy_json_number(trimmed) { text.to_owned() } else { json_text::stringify_pretty(&whole) };
     }
     let documents: Option<Vec<Value>> = trimmed.split('\n').filter(|line| !js_trim(line).is_empty()).map(|line| json_text::parse(js_trim(line))).collect();
     match documents {
-        Some(documents) => documents.iter().map(json_text::stringify_pretty).collect::<Vec<_>>().join("\n\n"),
-        None => text.to_owned(),
+        Some(documents) if !has_lossy_json_number(trimmed) => documents.iter().map(json_text::stringify_pretty).collect::<Vec<_>>().join("\n\n"),
+        _ => text.to_owned(),
     }
 }
 
@@ -267,10 +327,26 @@ pub fn decode_detail(mut value: Value) -> Result<Option<TurnItem>, serde_json::E
     }
 }
 
-/// `commandOutputText`: Claude's `{"stdout","stderr","interrupted"}` envelope as plain text.
-pub fn command_output_text(output: &str) -> Option<String> {
-    if js_trim(output).is_empty() {
-        return None;
+/// Only early Claude nightly rows stored raw Bash envelopes; rows carry no build stamp, so start
+/// time is the only discriminator (`CLAUDE_RAW_BASH_RESULT_CUTOFF` in `packages/shared/src/commandOutput.ts`).
+const CLAUDE_RAW_BASH_RESULT_CUTOFF: &str = "2026-10-08T00:00:00Z";
+
+fn stores_raw_claude_bash_result(item: &TurnItem) -> bool {
+    if item.native_item_ref.as_ref().and_then(|native| native.driver.as_deref()) != Some("claudeAgent") {
+        return false;
+    }
+    let timestamp = item.started_at.as_deref().unwrap_or(item.updated_at.as_str());
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(timestamp) else { return false };
+    let cutoff = chrono::DateTime::parse_from_rfc3339(CLAUDE_RAW_BASH_RESULT_CUTOFF).expect("valid RFC3339 cutoff");
+    at < cutoff
+}
+
+/// `commandItemOutput`: the stored bytes, except early Claude rows' raw Bash envelopes.
+pub fn command_item_output(item: &TurnItem) -> Option<String> {
+    let TurnItemKind::CommandExecution { output, .. } = &item.kind else { return None };
+    let output = output.as_deref()?;
+    if !stores_raw_claude_bash_result(item) {
+        return Some(output.to_owned());
     }
     if !output.trim_start_matches(json_text::is_js_whitespace).starts_with("{\"stdout\"") {
         return Some(output.to_owned());
@@ -279,8 +355,13 @@ pub fn command_output_text(output: &str) -> Option<String> {
         parsed.get("stdout").is_some_and(Value::is_string) && parsed.get("stderr").is_some_and(Value::is_string) && parsed.get("interrupted").is_some_and(Value::is_boolean)
     });
     let Some(parsed) = envelope else { return Some(output.to_owned()) };
-    let text = ["stdout", "stderr"].iter().filter_map(|key| parsed[*key].as_str()).filter(|part| !js_trim(part).is_empty()).collect::<Vec<_>>().join("\n");
-    (!text.is_empty()).then_some(text)
+    let out = parsed["stdout"].as_str().filter(|part| !js_trim(part).is_empty()).unwrap_or("");
+    let err = parsed["stderr"].as_str().filter(|part| !js_trim(part).is_empty()).unwrap_or("");
+    Some(if !out.is_empty() && !err.is_empty() && !out.ends_with('\n') {
+        format!("{out}\n{err}")
+    } else {
+        format!("{out}{err}")
+    })
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -290,7 +371,7 @@ fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 /// `turnItemOutputText`.
 pub fn turn_item_output_text(item: &TurnItem) -> Option<String> {
     match &item.kind {
-        TurnItemKind::CommandExecution { output, .. } => output.as_deref().and_then(command_output_text),
+        TurnItemKind::CommandExecution { .. } => command_item_output(item).filter(|text| !js_trim(text).is_empty()),
         TurnItemKind::DynamicTool { output_omitted: true, .. } => None,
         TurnItemKind::DynamicTool { output, viewed_image_path, .. } => {
             if let Some(object) = output.as_ref().and_then(Value::as_object)

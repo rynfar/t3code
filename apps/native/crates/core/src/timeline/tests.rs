@@ -891,7 +891,14 @@ fn withheld_output_is_requested_by_revision_and_decoded() {
     let item = decode_detail(fetched.take()).expect("decodes").expect("present");
     assert!(matches!(&item.kind, crate::turn_item::TurnItemKind::CommandExecution { output: Some(output), .. } if output == "a\nb"));
     assert!(decode_detail(serde_json::json!({ "item": null })).expect("decodes").is_none());
-    assert_eq!(command_output_text(r#"{"stdout":"out","stderr":"","interrupted":false}"#).as_deref(), Some("out"));
+    let claude_item: crate::turn_item::TurnItem = serde_json::from_value(serde_json::json!({
+        "id": "cmd", "threadId": "t", "runId": "r", "nodeId": null, "parentItemId": null, "ordinal": 1, "status": "completed",
+        "title": null, "startedAt": "2026-10-04T00:00:00Z", "completedAt": null, "updatedAt": "2026-10-04T00:00:09Z",
+        "nativeItemRef": { "nativeId": "n1", "driver": "claudeAgent" },
+        "type": "command_execution", "input": "ls", "output": r#"{"stdout":"out","stderr":"","interrupted":false}"#,
+    }))
+    .expect("item decodes");
+    assert_eq!(command_item_output(&claude_item).as_deref(), Some("out"));
 }
 
 /// `threadFind.ts` counting and wrapping, and stepping inside the navigation window.

@@ -145,7 +145,30 @@ pub fn supports_shared_settings_sync(connected: bool, has_server_config: bool) -
     connected && has_server_config
 }
 
-/// `requiredScopesForServerSettingsPatch` (`packages/contracts/src/settings.ts:1990-2019`):
+/// `isSecretReference` (`packages/contracts/src/settingsSecretValue.ts`).
+pub fn is_secret_reference(value: &Value) -> bool {
+    let Some(object) = value.as_object() else { return false };
+    let Some(provider) = object.get("provider").and_then(Value::as_str) else { return false };
+    let Some(reference) = object.get("reference").and_then(Value::as_str) else { return false };
+    provider == provider.trim()
+        && reference == reference.trim()
+        && crate::settings::secrets::is_slug(provider)
+        && !reference.is_empty()
+        && reference.encode_utf16().count() <= 1024
+        && !reference.contains(['\r', '\n'])
+}
+
+/// `containsSecretReference` (`packages/contracts/src/settingsSecretValue.ts`): whether a secret
+/// reference appears anywhere in `value`, such as a settings patch or an RPC payload.
+pub fn contains_secret_reference(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => is_secret_reference(value) || map.values().any(contains_secret_reference),
+        Value::Array(items) => items.iter().any(contains_secret_reference),
+        _ => false,
+    }
+}
+
+/// `requiredScopesForServerSettingsPatch` (`packages/contracts/src/settings.ts`):
 /// determines the exact auth scopes a `server.updateSettings` payload requires.
 pub fn required_scopes_for_server_settings_payload(payload: &Value) -> Vec<&'static str> {
     let mut changes_settings = false;
@@ -154,7 +177,9 @@ pub fn required_scopes_for_server_settings_payload(payload: &Value) -> Vec<&'sta
         .is_some_and(|v| !v.is_null());
     let mut changes_access = false;
 
-    if let Some(patch) = payload.get("patch").and_then(Value::as_object) {
+    if let Some(patch_value) = payload.get("patch")
+        && let Some(patch) = patch_value.as_object()
+    {
         for (key, value) in patch {
             match key.as_str() {
                 "requireConnectDeviceApproval" => changes_access = true,
@@ -172,6 +197,10 @@ pub fn required_scopes_for_server_settings_payload(payload: &Value) -> Vec<&'sta
                 }
                 _ => changes_settings = true,
             }
+        }
+        // A reference can name any secret the store holds; choosing where one goes is provider authority.
+        if contains_secret_reference(patch_value) {
+            changes_providers = true;
         }
     }
 
@@ -358,5 +387,25 @@ mod tests {
             })),
             vec!["providers:manage"]
         );
+        // Any secret reference anywhere inside a settings patch also requires `providers:manage`.
+        assert_eq!(
+            required_scopes_for_server_settings_payload(&json!({
+                "patch": {
+                    "cloudSpeechCredentials": {
+                        "openai": { "provider": "1password", "reference": "op://vault/openai/key" }
+                    }
+                }
+            })),
+            vec!["settings:write", "providers:manage"]
+        );
+        assert!(contains_secret_reference(&json!([
+            { "nested": { "provider": "op", "reference": "op://vault/item" } }
+        ])));
+        assert!(!contains_secret_reference(&json!({
+            "provider": "bad slug!", "reference": "op://vault/item"
+        })));
+        assert!(!contains_secret_reference(&json!({
+            "provider": "op", "reference": "line1\nline2"
+        })));
     }
 }

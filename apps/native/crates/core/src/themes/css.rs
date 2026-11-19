@@ -12,7 +12,7 @@ use std::ops::Range;
 use super::{Colors, color};
 
 /// `THEME_CSS_MAX_LENGTH` from `packages/contracts/src/server.ts`.
-pub const MAX_CSS_LEN: usize = 20_000;
+pub const MAX_CSS_LEN: usize = 100_000;
 
 /// Checks `css.length <= THEME_CSS_MAX_LENGTH` in UTF-16 code units, matching JavaScript.
 pub fn is_valid_length(css: &str) -> bool {
