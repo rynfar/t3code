@@ -107,6 +107,44 @@ pub fn init(cx: &mut App) {
     install(cx);
 }
 
+/// Builds `Preferences` from a `ClientSettingsDoc`, shared by first-frame boot and runtime edits.
+pub fn preferences_from_doc(doc: &t3_core::client_settings::ClientSettingsDoc) -> Preferences {
+    Preferences {
+        theme: doc.theme(),
+        mode: doc.appearance_mode(),
+        interface_font_size: doc.interface_font_size() as f32,
+        typography: doc.typography(),
+        chat_width: doc.chat_width(),
+        diff_color_scheme: doc.diff_color_scheme(),
+        contrast: doc.appearance_contrast(),
+        glass: doc.glass_opacity(),
+        halves: themes::halves(doc),
+        custom: themes::library(doc),
+    }
+}
+
+/// Applies saved preferences and cached environment themes (`t3code:environment-themes:v1`)
+/// before the initial window opens so the very first frame paints the user's selected theme
+/// without a light/dark or stock-palette flash (`pingdotgg/t3code#36042`).
+pub fn init_from_doc(doc: &t3_core::client_settings::ClientSettingsDoc, cx: &mut App) {
+    let preferences = preferences_from_doc(doc);
+    let cached_environment = themes::default_sync::stored_environment_themes(doc);
+    let state = cx.global_mut::<ThemeState>();
+    state.preferences = preferences;
+    state.environment = cached_environment;
+    state.saved = None;
+    install(cx);
+    let mode = if is_dark(cx) { ThemeMode::Dark } else { ThemeMode::Light };
+    Theme::change(mode, None, cx);
+}
+
+/// Loads saved client settings from `T3_NATIVE_HOME` and installs them before window creation.
+pub fn boot_saved(cx: &mut App) {
+    let raw = t3_client::store::load_client_settings().unwrap_or_default();
+    let doc = t3_core::client_settings::ClientSettingsDoc::from_json(&raw);
+    init_from_doc(&doc, cx);
+}
+
 pub fn preferences(cx: &App) -> &Preferences {
     &cx.global::<ThemeState>().preferences
 }
@@ -189,11 +227,12 @@ fn derived(theme: &ThemePreference, dark: bool, prefs: &Preferences, environment
     let definition = themes::half_theme(theme, &prefs.halves, dark, &prefs.custom, environment);
     let selected = definition.map(|t| t.id.as_str());
     let roles = definition.and_then(|t| t.half(dark));
+    let theme_css = definition.and_then(|t| t.css.as_deref());
     let base = selected
         .and_then(|id| BUILT_IN_THEMES.iter().find(|t| t.id == id))
         .and_then(|t| if dark { t.dark } else { t.light })
         .unwrap_or(if dark { tokens::DARK } else { tokens::LIGHT });
-    let Ok(colors) = themes::palette_for(selected, roles, dark, prefs.contrast, prefs.glass) else {
+    let Ok(colors) = themes::palette_for_with_css(selected, roles, theme_css, dark, prefs.contrast, prefs.glass) else {
         return base;
     };
     let mut value = serde_json::to_value(base).expect("serializable palette");
@@ -330,7 +369,15 @@ fn install(cx: &mut App) {
             .filter(|p| p.input == input && Rc::ptr_eq(&p.saved, &saved))
             .cloned();
         let prepared = cached.or_else(|| {
-            let values = themes::palette(Some(&input.colors), input.dark, preferences.contrast, preferences.glass).ok()?;
+            let values = themes::palette_for_with_css(
+                None,
+                Some(&input.colors),
+                input.css.as_deref(),
+                input.dark,
+                preferences.contrast,
+                preferences.glass,
+            )
+            .ok()?;
             let base = if input.dark { tokens::DARK } else { tokens::LIGHT };
             let mut value = serde_json::to_value(base).ok()?;
             value.as_object_mut()?.extend(values.into_iter().map(|(k, v)| (k, v.into())));
@@ -500,7 +547,12 @@ pub fn revision(cx: &App) -> usize {
 
 /// Prepared once per editor change; rendering only reads the installed palette.
 pub fn preview(colors: Option<(&themes::Colors, bool)>, cx: &mut App) {
-    let input = colors.map(|(colors, dark)| themes::editor::Preview::new(dark, colors));
+    preview_with_css(colors.map(|(c, dark)| (c, None, dark)), cx);
+}
+
+/// Prepared once per editor change, including live custom-property CSS overrides.
+pub fn preview_with_css(colors: Option<(&themes::Colors, Option<&str>, bool)>, cx: &mut App) {
+    let input = colors.map(|(colors, css, dark)| themes::editor::Preview::new_with_css(dark, colors, css));
     if cx.global::<ThemeState>().preview == input {
         return;
     }
@@ -566,4 +618,68 @@ pub(crate) fn syntax_style(capture: &str, dark: bool) -> Option<gpui::HighlightS
         font_weight: style.bold.then_some(gpui::FontWeight::BOLD),
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_component::ActiveTheme;
+    use t3_core::client_settings::ClientSettingsDoc;
+
+    #[gpui::test]
+    fn first_frame_boot_paints_saved_environment_theme_and_css_before_connect(cx: &mut gpui::TestAppContext) {
+        let mut published = themes::environment(&[json!({
+            "id": "nightfall",
+            "name": "Nightfall",
+            "appearance": "dark",
+            "canvas": "#1a1b26",
+            "accent": "#7aa2f7",
+            "css": ":root { --primary: #ff44aa; } .dark { --background: #101118; }"
+        })]);
+        let nightfall = published.pop().unwrap();
+        let doc = ClientSettingsDoc::from_json(
+            &json!({
+                "t3code:theme": "nightfall",
+                "t3code:theme-appearance-mode": "dark",
+                "fontSizeInterface": 18,
+                themes::ENVIRONMENT_THEMES_STORAGE_KEY: [nightfall],
+            })
+            .to_string(),
+        );
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init(cx);
+            init_from_doc(&doc, cx);
+
+            assert!(cx.theme().is_dark(), "saved dark environment theme activates dark mode immediately");
+            assert_eq!(environment_themes(cx).len(), 1);
+            assert_eq!(palette(cx).background, 0x1011_18ff);
+            assert_eq!(palette(cx).primary, 0xff44_aaff);
+            assert_eq!(cx.theme().font_size, px(18.));
+        });
+    }
+
+    #[gpui::test]
+    fn live_css_preview_overrides_palette_and_restores_on_clear(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init(cx);
+            let before_bg = palette(cx).background;
+            let before_primary = palette(cx).primary;
+            let colors = themes::standard(true);
+
+            preview_with_css(
+                Some((&colors, Some(".dark { --background: #223344; --primary: #55ee88; }"), true)),
+                cx,
+            );
+            assert!(cx.theme().is_dark());
+            assert_eq!(palette(cx).background, 0x2233_44ff);
+            assert_eq!(palette(cx).primary, 0x55ee_88ff);
+
+            preview(None, cx);
+            assert_eq!(palette(cx).background, before_bg);
+            assert_eq!(palette(cx).primary, before_primary);
+        });
+    }
 }

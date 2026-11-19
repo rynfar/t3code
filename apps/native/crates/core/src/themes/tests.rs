@@ -396,3 +396,90 @@ fn editor_preview_ignores_name_and_invalid_color_changes() {
     assert!(!preview.update(session.dark,session.colors()));
     session.set_appearance(true,&ClientSettingsDoc::default());assert!(preview.update(session.dark,session.colors()));
 }
+
+#[test]
+fn theme_css_round_trips_validates_length_and_applies_to_palettes() {
+    let raw_css = ":root { --background: #102030; } .dark { --app-theme-canvas: #050607; --primary: #abcdef; }";
+    let theme = decode(
+        &json!({
+            "version": 1,
+            "name": "Styled",
+            "appearance": "dark",
+            "colors": {"canvas": "#111111"},
+            "css": raw_css
+        }),
+        false,
+    )
+    .unwrap();
+    assert_eq!(theme.css.as_deref(), Some(raw_css));
+
+    let exported = serialize(&theme);
+    let reimported = import(&exported).unwrap();
+    assert_eq!(reimported.css.as_deref(), Some(raw_css));
+
+    let oversized = "a".repeat(css::MAX_CSS_LEN + 1);
+    assert!(
+        decode(
+            &json!({"version": 1, "name": "TooLong", "appearance": "dark", "colors": {"canvas": "#111111"}, "css": oversized}),
+            false
+        )
+        .is_err()
+    );
+
+    let env = environment(&[json!({
+        "id": "env-styled",
+        "name": "Env Styled",
+        "appearance": "dark",
+        "canvas": "#111111",
+        "accent": "#2266aa",
+        "css": raw_css
+    })]);
+    assert_eq!(env.len(), 1);
+    assert!(env[0].managed);
+    assert_eq!(env[0].css.as_deref(), Some(raw_css));
+
+    let dark_pal = palette_for_with_css(
+        Some(&theme.id),
+        Some(&theme.colors),
+        theme.css.as_deref(),
+        true,
+        100,
+        80,
+    )
+    .unwrap();
+    assert_eq!(dark_pal["background"], 0x102030ff);
+    assert_eq!(dark_pal["primary"], 0xabcdefff);
+}
+
+#[test]
+fn editor_css_merges_and_detects_conflicts_matching_web() {
+    let mut doc = ClientSettingsDoc::default();
+    let mut create = editor::Session::new(None, None, None, false);
+    create.set_name("Aurora".into(), &doc);
+    create.set_css(":root { --primary: #112233; }".into());
+    let saved = create.prepare_save(&doc).unwrap();
+    assert_eq!(saved.theme.css.as_deref(), Some(":root { --primary: #112233; }"));
+    doc.apply(&crate::client_settings::ClientSettingChange::ThemePatch(saved.patch));
+
+    // Merging with empty draft CSS keeps the target's CSS.
+    let mut merge_keep = editor::Session::new(None, None, None, true);
+    merge_keep.set_name("Aurora".into(), &doc);
+    assert_eq!(merge_keep.effective_css(&doc), ":root { --primary: #112233; }");
+    let merged = merge_keep.prepare_save(&doc).unwrap();
+    assert_eq!(merged.theme.css.as_deref(), Some(":root { --primary: #112233; }"));
+
+    // Merging with conflicting draft CSS fails with the web's message.
+    let mut merge_conflict = editor::Session::new(None, None, None, true);
+    merge_conflict.set_name("Aurora".into(), &doc);
+    merge_conflict.set_css(":root { --primary: #ff0000; }".into());
+    let err = merge_conflict.prepare_save(&doc).unwrap_err();
+    assert_eq!(err, "“Aurora” has different custom CSS. Use the same CSS or pick another name.");
+}
+
+#[test]
+fn resolve_supports_legacy_builtin_theme_aliases() {
+    assert_eq!(resolve("t3-grove", &[], &[]).map(|t| t.id.as_str()), Some("grove"));
+    assert_eq!(resolve("t3-chat-dark", &[], &[]).map(|t| t.id.as_str()), Some("t3-chat"));
+    assert_eq!(canonical_theme_preference("t3-grove"), "grove");
+    assert_eq!(canonical_theme_preference("t3-chat-dark"), "t3-chat-dark");
+}

@@ -965,11 +965,52 @@ impl AppState {
         }).detach();
     }
 
-    /// Applies the server config's keybindings and capabilities (`subscribeServerConfig`).
+    /// Applies the server config's keybindings, capabilities, environment themes, and
+    /// generation-tracked default theme/appearance (`subscribeServerConfig`, `useEnvironmentTheme.ts`,
+    /// `useDefaultTheme.ts`).
     pub(crate) fn sync_server_config(&mut self, cx: &mut Context<Self>) {
         let Some(config) = self.server_config.config.as_ref() else { return };
         self.sidebar.capabilities.auto_settle_opt_out = config.environment.capabilities.thread_auto_settle_opt_out == Some(true);
-        crate::theme::set_environment_themes(&config.environment_theme_definitions, cx);
+        if config.environment_themes_received || !config.environment_theme_definitions.is_empty() {
+            crate::theme::set_environment_themes(&config.environment_theme_definitions, cx);
+        }
+        let entity = cx.entity();
+        cx.spawn(async move |_, cx| {
+            cx.update(|cx| {
+                let patch = {
+                    let Some(doc) = crate::settings::store::try_client(cx) else { return };
+                    let Some(config) = entity.read(cx).server_config.config.as_ref() else { return };
+                    let mut patch = serde_json::Map::new();
+                    if config.environment_themes_received {
+                        patch.extend(t3_core::themes::default_sync::environment_themes_patch(
+                            doc,
+                            &config.environment_theme_definitions,
+                        ));
+                    }
+                    let defaults = t3_core::themes::default_sync::DefaultThemeSettings {
+                        environment_id: &config.environment.environment_id,
+                        default_theme: &config.settings.default_theme,
+                        default_theme_set_at: &config.settings.default_theme_set_at,
+                        default_appearance: &config.settings.default_appearance,
+                        default_appearance_set_at: &config.settings.default_appearance_set_at,
+                    };
+                    patch.extend(t3_core::themes::default_sync::adopt_defaults_patch(
+                        doc,
+                        &defaults,
+                        crate::theme::environment_themes(cx),
+                    ));
+                    patch
+                };
+                if !patch.is_empty() {
+                    crate::settings::store::update_client(
+                        &entity,
+                        t3_core::client_settings::ClientSettingChange::ThemePatch(patch),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
         let keybindings = config.keybindings.clone();
         crate::keymap::install(&keybindings, cx);
         self.rebuild_sidebar(cx);
@@ -3907,5 +3948,151 @@ mod deletion_tests {
             !fixture.take_commands().contains(&t3_core::commands::method::DISPATCH_COMMAND),
             "migration must dispatch at most once per thread"
         );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn sync_server_config_preserves_cached_themes_persists_live_and_adopts_defaults(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use serde_json::json;
+        use t3_core::client_settings::{AppearanceMode, ClientSettingChange, ThemePreference};
+        use t3_core::server_config::ServerConfigStreamEvent;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+
+        let cached_theme = t3_core::themes::environment(&[json!({
+            "id": "cached-night",
+            "name": "Cached Night",
+            "appearance": "dark",
+            "canvas": "#101218",
+            "accent": "#5588ff"
+        })]);
+        cx.update(|cx| {
+            crate::theme::set_environment_themes(&cached_theme, cx);
+        });
+
+        // 1. Initial Snapshot before EnvironmentThemesUpdated must preserve cached boot themes
+        //    and must not mark an unresolved defaultTheme as applied.
+        let snapshot: ServerConfigStreamEvent = serde_json::from_value(json!({
+            "version": 1,
+            "type": "snapshot",
+            "config": {
+                "environment": {"environmentId": "env-theme-1", "label": "Env 1"},
+                "settings": {
+                    "defaultTheme": "nightfall",
+                    "defaultThemeSetAt": "2026-11-13T10:00:00.000Z",
+                    "defaultAppearance": "",
+                    "defaultAppearanceSetAt": ""
+                }
+            }
+        }))
+        .unwrap();
+        state.update(cx, |state, cx| {
+            state.server_config.apply(snapshot.prepare());
+            state.sync_server_config(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(crate::theme::environment_themes(cx).len(), 1);
+            assert_eq!(crate::theme::environment_themes(cx)[0].id, "cached-night");
+            assert_eq!(
+                crate::settings::store::client(cx).theme(),
+                ThemePreference::Default(AppearanceMode::System)
+            );
+        });
+
+        // 2. EnvironmentThemesUpdated arrives with "nightfall" (single-appearance dark + CSS):
+        //    persists t3code:environment-themes:v1 and adopts defaultTheme + dark mode.
+        let env_update: ServerConfigStreamEvent = serde_json::from_value(json!({
+            "version": 1,
+            "type": "environmentThemesUpdated",
+            "payload": {
+                "themes": [{
+                    "id": "nightfall",
+                    "name": "Nightfall",
+                    "appearance": "dark",
+                    "canvas": "#1a1b26",
+                    "accent": "#7aa2f7",
+                    "css": ".dark { --primary: #22cc99; }"
+                }]
+            }
+        }))
+        .unwrap();
+        state.update(cx, |state, cx| {
+            state.server_config.apply(env_update.prepare());
+            state.sync_server_config(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let doc = crate::settings::store::client(cx);
+            assert_eq!(doc.theme(), ThemePreference::Named("nightfall".into()));
+            assert_eq!(doc.appearance_mode(), AppearanceMode::Dark);
+            let stored = t3_core::themes::default_sync::stored_environment_themes(doc);
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].id, "nightfall");
+            assert_eq!(crate::theme::palette(cx).primary, 0x22cc_99ff);
+        });
+
+        // 3. Local override survives repeat sync of the same generation, and explicit empty
+        //    EnvironmentThemesUpdated clears the stored environment theme cache.
+        cx.update(|cx| {
+            crate::settings::store::update_client(
+                &state,
+                ClientSettingChange::Theme(ThemePreference::Named("grove".into())),
+                cx,
+            );
+        });
+        let clear_update: ServerConfigStreamEvent = serde_json::from_value(json!({
+            "version": 1,
+            "type": "environmentThemesUpdated",
+            "payload": { "themes": [] }
+        }))
+        .unwrap();
+        state.update(cx, |state, cx| {
+            state.server_config.apply(clear_update.prepare());
+            state.sync_server_config(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let doc = crate::settings::store::client(cx);
+            assert_eq!(doc.theme(), ThemePreference::Named("grove".into()));
+            assert!(crate::theme::environment_themes(cx).is_empty());
+            assert!(t3_core::themes::default_sync::stored_environment_themes(doc).is_empty());
+        });
+
+        // 4. Server explicitly sets defaultAppearance = "light" with a new timestamp.
+        let appearance_update: ServerConfigStreamEvent = serde_json::from_value(json!({
+            "version": 1,
+            "type": "settingsUpdated",
+            "payload": {
+                "settings": {
+                    "defaultTheme": "nightfall",
+                    "defaultThemeSetAt": "2026-11-13T10:00:00.000Z",
+                    "defaultAppearance": "light",
+                    "defaultAppearanceSetAt": "2026-11-14T10:00:00.000Z"
+                }
+            }
+        }))
+        .unwrap();
+        state.update(cx, |state, cx| {
+            state.server_config.apply(appearance_update.prepare());
+            state.sync_server_config(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let doc = crate::settings::store::client(cx);
+            assert_eq!(doc.theme(), ThemePreference::Named("grove".into()));
+            assert_eq!(doc.appearance_mode(), AppearanceMode::Light);
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        std::mem::forget(runtime);
     }
 }

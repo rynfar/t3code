@@ -416,6 +416,9 @@ impl SettingsView {
             });
 
         let width_state = self.state.clone();
+        let math_enabled = doc.math_rendering_enabled();
+        let math_state = self.state.clone();
+        let math_reset_state = self.state.clone();
         let interface = section(
             "Interface",
             vec![
@@ -448,6 +451,18 @@ impl SettingsView {
                         }),
                     )
                     .into_any_element(),
+                Row::new("math-rendering", "Render math")
+                    .description("Typeset LaTeX math, such as $x^2$ or \\[x^2\\], in messages and Markdown previews. The composer keeps TeX source editable.")
+                    .highlighted(self.is_target("math-rendering"))
+                    .reset(math_enabled, move |_, _, cx| {
+                        store::update_client(&math_reset_state, ClientSettingChange::MathRenderingEnabled(false), cx)
+                    })
+                    .control(
+                        super::controls::Switch::new("math-rendering-switch", math_enabled).on_change(move |checked, _, cx| {
+                            store::update_client(&math_state, ClientSettingChange::MathRenderingEnabled(checked), cx);
+                        }),
+                    )
+                    .into_any_element(),
             ],
             cx,
         );
@@ -456,7 +471,16 @@ impl SettingsView {
 
         vec![
             Block::new(&["appearance", "color-scheme", "theme"], colors),
-            Block::new(&["appearance-interface", "chat-width", "setting-appearance-contrast", "setting-glass-opacity"], interface),
+            Block::new(
+                &[
+                    "appearance-interface",
+                    "chat-width",
+                    "setting-appearance-contrast",
+                    "setting-glass-opacity",
+                    "math-rendering",
+                ],
+                interface,
+            ),
             Block::new(
                 &[
                     "typography",

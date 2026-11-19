@@ -1,6 +1,8 @@
 //! Theme library, decoding and palette application from `web/src/themePalette.ts`,
 //! `ThemeSettings.tsx`, `appearanceContrast.ts` and `index.css`.
 mod color;
+pub mod css;
+pub mod default_sync;
 pub mod editor;
 pub mod importer;
 pub mod json_field;
@@ -17,6 +19,7 @@ use std::{collections::BTreeMap, sync::LazyLock};
 pub type Colors = BTreeMap<String, String>;
 pub const LIBRARY_KEY: &str = "t3code:themes:v1";
 pub const HALVES_KEY: &str = "t3code:theme-halves:v1";
+pub use default_sync::ENVIRONMENT_THEMES_STORAGE_KEY;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Collection {
@@ -36,6 +39,8 @@ pub struct ThemeDefinition {
     pub collection: Option<Collection>,
     #[serde(default)]
     pub managed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub css: Option<String>,
 }
 impl ThemeDefinition {
     pub fn half(&self, dark: bool) -> Option<&Colors> {
@@ -191,6 +196,19 @@ pub fn decode(value: &Value, stored: bool) -> Result<ThemeDefinition, String> {
     } else {
         None
     };
+    let theme_css = match v.get("css") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) if css::is_valid_length(text) => {
+            (!text.is_empty()).then(|| text.clone())
+        }
+        Some(_) if stored => None,
+        Some(_) => {
+            return Err(format!(
+                "Theme CSS must be text of {} characters or fewer.",
+                css::MAX_CSS_LEN
+            ));
+        }
+    };
     Ok(ThemeDefinition {
         id,
         label: name.trim().into(),
@@ -199,6 +217,7 @@ pub fn decode(value: &Value, stored: bool) -> Result<ThemeDefinition, String> {
         variants,
         collection,
         managed: v.get("managed") == Some(&Value::Bool(true)),
+        css: theme_css,
     })
 }
 pub fn library(doc: &ClientSettingsDoc) -> Vec<ThemeDefinition> {
@@ -281,11 +300,40 @@ pub fn environment(values: &[Value]) -> Vec<ThemeDefinition> {
                 }
                 file["variants"] = Value::Object(valid);
             }
+            if seeds.is_some() && v.get("colors").is_none() && v.get("variants").is_none() {
+                file["managed"] = Value::Bool(true);
+            }
+            if let Some(raw_css) = v.get("css").and_then(Value::as_str)
+                && css::is_valid_length(raw_css)
+                && !raw_css.is_empty()
+            {
+                file["css"] = Value::String(raw_css.to_owned());
+            } else {
+                file.as_object_mut().map(|o| o.remove("css"));
+            }
             decode(&file, false).ok()
         })
         .collect()
 }
+pub fn normalize_theme_id(id: &str) -> &str {
+    match id {
+        "t3-chat-dark" => "t3-chat",
+        "t3-grove" => "grove",
+        "t3-ocean" => "ocean",
+        "t3-ember" => "ember",
+        "t3-iris" => "iris",
+        other => other,
+    }
+}
+pub fn canonical_theme_preference(theme: &str) -> String {
+    if theme == "t3-chat-dark" {
+        theme.to_owned()
+    } else {
+        normalize_theme_id(theme).to_owned()
+    }
+}
 pub fn resolve<'a>(id: &str, custom: &'a [ThemeDefinition], environment: &'a [ThemeDefinition]) -> Option<&'a ThemeDefinition> {
+    let id = normalize_theme_id(id);
     builtins().iter().chain(custom).chain(environment).find(|t| t.id == id)
 }
 pub fn selected_half<'a>(theme: &'a ThemePreference, halves: &'a BTreeMap<String, String>, dark: bool) -> Option<&'a str> {
@@ -293,6 +341,34 @@ pub fn selected_half<'a>(theme: &'a ThemePreference, halves: &'a BTreeMap<String
 }
 pub fn palette(roles: Option<&Colors>, dark: bool, contrast: u32, glass: u32) -> Result<BTreeMap<String, u32>, String> {
     palette_for(None, roles, dark, contrast, glass)
+}
+pub fn palette_for_with_css(
+    id: Option<&str>,
+    roles: Option<&Colors>,
+    theme_css: Option<&str>,
+    dark: bool,
+    contrast: u32,
+    glass: u32,
+) -> Result<BTreeMap<String, u32>, String> {
+    let Some(raw_css) = theme_css.filter(|s| !s.trim().is_empty()) else {
+        return palette_for(id, roles, dark, contrast, glass);
+    };
+    let parsed = css::ParsedCss::parse(raw_css);
+    let base_roles = roles.unwrap_or(&DATA.standard[usize::from(dark)]);
+    let role_overrides = parsed.role_overrides(dark, base_roles);
+    let merged_roles;
+    let effective_roles = if role_overrides.is_empty() {
+        roles
+    } else {
+        let mut next = base_roles.clone();
+        next.extend(role_overrides);
+        merged_roles = next;
+        Some(&merged_roles)
+    };
+    let mut out = palette_for(id, effective_roles, dark, contrast, glass)?;
+    let token_overrides = parsed.token_overrides(dark, effective_roles.unwrap_or(&DATA.standard[usize::from(dark)]));
+    out.extend(token_overrides);
+    Ok(out)
 }
 pub fn palette_for(
     id: Option<&str>,

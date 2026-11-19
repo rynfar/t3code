@@ -143,10 +143,18 @@ pub fn humanize(raw: &str) -> String {
         .join(" ")
 }
 fn rename(theme: &ThemeDefinition, name: &str) -> Result<ThemeDefinition, String> {
-    decode(
-        &serde_json::json!({"version":1,"name":name.chars().take(48).collect::<String>(),"appearance":theme.appearance,"colors":theme.colors,"variants":theme.variants,"managed":theme.managed}),
-        false,
-    )
+    let mut file = serde_json::json!({
+        "version": 1,
+        "name": name.chars().take(48).collect::<String>(),
+        "appearance": theme.appearance,
+        "colors": theme.colors,
+        "variants": theme.variants,
+        "managed": theme.managed,
+    });
+    if let Some(css) = &theme.css {
+        file["css"] = serde_json::Value::String(css.clone());
+    }
+    decode(&file, false)
 }
 pub struct Batch {
     pub themes: Vec<ThemeDefinition>,
