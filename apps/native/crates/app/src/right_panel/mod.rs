@@ -149,6 +149,12 @@ impl RightPanelView {
             }
             _ => {}
         });
+        let initial_sheet_mode = {
+            let viewport = f32::from(window.viewport_size().width);
+            let app = state.read(cx);
+            let maximized = app.panel_thread().is_some_and(|id| app.panels.panels.panel(&id).maximized);
+            is_sheet_mode(viewport) && !maximized
+        };
         let mut view = RightPanelView {
             state,
             diff,
@@ -161,7 +167,7 @@ impl RightPanelView {
             pull_request_tabs: Vec::new(),
             proactive: ProactivePanelCoordinator::default(),
             last_proactive_enabled: None,
-            in_sheet_mode: false,
+            in_sheet_mode: initial_sheet_mode,
             renaming_device: None,
             add_menu_open: false,
             add_menu_dismissed: None,
@@ -750,16 +756,24 @@ impl RightPanelView {
 
 impl Render for RightPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
+        let thread_id = state.panel_thread();
+        let panel = thread_id.as_deref().map(|thread_id| state.panels.panels.panel(thread_id).clone());
+        let viewport = f32::from(window.viewport_size().width);
+        // Match `ChatView.tsx:1074`: maximized panels render full-width inline (since `workspace.rs`
+        // hides the center column when `panel.maximized` is true) and keep the restore button visible.
+        // Update `in_sheet_mode` before early-returning for a closed panel so window resizes while
+        // closed never leave proactive panel suppression stuck.
+        let sheet_mode = is_sheet_mode(viewport) && !panel.as_ref().is_some_and(|panel| panel.maximized);
+        let sheet_mode_changed = self.in_sheet_mode != sheet_mode;
+        self.in_sheet_mode = sheet_mode;
         let proactive_enabled = crate::settings::store::try_client(cx).is_some_and(|doc| doc.proactive_panels_enabled());
-        if self.last_proactive_enabled != Some(proactive_enabled) {
+        if self.last_proactive_enabled != Some(proactive_enabled) || sheet_mode_changed {
             let weak = cx.entity().downgrade();
             cx.defer(move |cx| {
                 let _ = weak.update(cx, |this, cx| this.evaluate_proactive(cx));
             });
         }
-        let state = self.state.read(cx);
-        let thread_id = state.panel_thread();
-        let panel = thread_id.as_deref().map(|thread_id| state.panels.panels.panel(thread_id).clone());
         self.sync_previews(thread_id.as_deref(), panel.as_ref(), window, cx);
         self.sync_devices(thread_id.as_deref(), panel.as_ref(), cx);
         self.sync_terminals(thread_id.as_deref(), panel.as_ref(), window, cx);
@@ -769,11 +783,6 @@ impl Render for RightPanelView {
         if !panel.is_open {
             return div().into_any_element();
         }
-        let viewport = f32::from(window.viewport_size().width);
-        // Match `ChatView.tsx:1074`: maximized panels render full-width inline (since `workspace.rs`
-        // hides the center column when `panel.maximized` is true) and keep the restore button visible.
-        let sheet_mode = is_sheet_mode(viewport) && !panel.maximized;
-        self.in_sheet_mode = sheet_mode;
         let stored = state.panels.panels.width(&thread_id).unwrap_or(DEFAULT_WIDTH);
         let width = if sheet_mode {
             sheet_width(viewport)
@@ -1257,6 +1266,19 @@ mod tests {
         vcx.run_until_parked();
         state.read_with(&vcx, |state, _| {
             assert!(!state.panels.panels.is_open("menu-thread"), "Escape should dismiss sheet");
+        });
+
+        // Widening above 980px while the panel is closed must clear `in_sheet_mode` so proactive
+        // opens are not left stuck suppressed; shrinking back while closed must re-enable it.
+        vcx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            assert!(!panel.read(cx).in_sheet_mode, "widening while closed must clear in_sheet_mode");
+        });
+        vcx.simulate_resize(gpui::size(px(800.), px(700.)));
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            assert!(panel.read(cx).in_sheet_mode, "shrinking while closed must set in_sheet_mode");
         });
 
         state.update(&mut vcx, |state, _| state.stop_pump());

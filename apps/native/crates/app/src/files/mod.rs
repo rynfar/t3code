@@ -436,7 +436,7 @@ impl FilesPanel {
     fn render_attachment(&self, attachment: &FileAttachment, cx: &mut Context<Self>) -> gpui::AnyElement {
         let p = palette(cx);
         let size_label = format!("{} bytes", group_thousands(attachment.size_bytes));
-        let open_url = attachment.url.clone().filter(|u| u.starts_with("http://") || u.starts_with("https://"));
+        let open_target = attachment_open_target(attachment);
         v_flex()
             .size_full()
             .min_h_0()
@@ -491,17 +491,48 @@ impl FilesPanel {
                             .text_color(hsla(p.muted_foreground))
                             .child(format!("{} ({size_label})", attachment.mime_type)),
                     )
-                    .when_some(open_url, |this, url| {
+                    .when_some(open_target, |this, target| {
                         this.child(
-                            Button::new("attachment-open-url")
-                                .icon(Icon::ExternalLink)
-                                .label("Open attachment")
-                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                            div()
+                                .debug_selector(|| "attachment-open-url".into())
+                                .child(
+                                    Button::new("attachment-open-url")
+                                        .icon(Icon::ExternalLink)
+                                        .label("Open attachment")
+                                        .on_click(move |_, _, cx| match &target {
+                                            AttachmentOpenTarget::Url(url) => cx.open_url(url),
+                                            AttachmentOpenTarget::ServerAsset(attachment_id) => {
+                                                crate::media::open_asset(
+                                                    &t3_core::media::AssetResource::Attachment {
+                                                        attachment_id: attachment_id.clone(),
+                                                    },
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                ),
                         )
                     }),
             )
             .into_any_element()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachmentOpenTarget {
+    Url(String),
+    ServerAsset(String),
+}
+
+fn attachment_open_target(attachment: &FileAttachment) -> Option<AttachmentOpenTarget> {
+    if let Some(url) = attachment.url.as_ref().filter(|u| u.starts_with("http://") || u.starts_with("https://")) {
+        return Some(AttachmentOpenTarget::Url(url.clone()));
+    }
+    let id = attachment.id.trim();
+    if !id.is_empty() {
+        return Some(AttachmentOpenTarget::ServerAsset(id.to_owned()));
+    }
+    None
 }
 
 impl Render for FilesPanel {
@@ -567,5 +598,122 @@ impl Render for FilesPanel {
                     }),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_open_target_falls_back_to_server_asset_when_url_absent() {
+        let with_url = FileAttachment {
+            id: "att-1".into(),
+            name: "spec.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size_bytes: 128,
+            url: Some("https://example.com/spec.pdf".into()),
+        };
+        assert_eq!(
+            attachment_open_target(&with_url),
+            Some(AttachmentOpenTarget::Url("https://example.com/spec.pdf".into()))
+        );
+
+        let server_only = FileAttachment {
+            id: "att-server-42".into(),
+            name: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size_bytes: 256,
+            url: None,
+        };
+        assert_eq!(
+            attachment_open_target(&server_only),
+            Some(AttachmentOpenTarget::ServerAsset("att-server-42".into()))
+        );
+
+        let unsafe_url_falls_back_to_id = FileAttachment {
+            id: "att-server-43".into(),
+            name: "note.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 12,
+            url: Some("javascript:alert(1)".into()),
+        };
+        assert_eq!(
+            attachment_open_target(&unsafe_url_falls_back_to_id),
+            Some(AttachmentOpenTarget::ServerAsset("att-server-43".into()))
+        );
+
+        let unopenable = FileAttachment {
+            id: "   ".into(),
+            name: "orphan.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            size_bytes: 4,
+            url: None,
+        };
+        assert_eq!(attachment_open_target(&unopenable), None);
+    }
+
+    #[gpui::test]
+    fn server_backed_attachment_without_http_url_renders_open_attachment_button(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::keymap::init(cx);
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::store::init(cx);
+            installed
+        });
+        state.update(cx, |state, cx| {
+            state.panels.panels = t3_core::right_panel::RightPanels::default();
+            state.select_thread("menu-thread", cx);
+            state.open_attachment(
+                FileAttachment {
+                    id: "att-server-99".into(),
+                    name: "trace.log".into(),
+                    mime_type: "text/plain".into(),
+                    size_bytes: 512,
+                    url: None,
+                },
+                cx,
+            );
+        });
+
+        let (panel, vcx) = cx.add_window_view(|window, cx| FilesPanel::new(state.clone(), window, cx));
+        vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.sync(cx));
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("attachment-open-url").is_some(),
+            "server-backed attachment without HTTP URL must still render the Open attachment button"
+        );
+
+        // Empty ID + no URL renders no Open attachment button.
+        state.update(vcx, |state, cx| {
+            state.open_attachment(
+                FileAttachment {
+                    id: String::new(),
+                    name: "orphan.bin".into(),
+                    mime_type: "application/octet-stream".into(),
+                    size_bytes: 4,
+                    url: None,
+                },
+                cx,
+            );
+        });
+        vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.sync(cx));
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("attachment-open-url").is_none(),
+            "attachment with neither HTTP URL nor ID should omit the Open attachment button"
+        );
+
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
     }
 }
