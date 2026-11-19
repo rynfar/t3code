@@ -458,9 +458,9 @@ fn node_key(node: &mdast::Node) -> String {
         }
         mdast::Node::Code(c) => {
             "code".hash(&mut hasher);
+            c.position.as_ref().map(|p| p.start.offset).hash(&mut hasher);
             c.lang.hash(&mut hasher);
             c.meta.hash(&mut hasher);
-            c.value.hash(&mut hasher);
         }
         mdast::Node::List(l) => {
             "list".hash(&mut hasher);
@@ -1379,5 +1379,88 @@ mod wheel_propagation_tests {
         assert_eq!(bubbled_horizontal.get(), 0, "horizontal wheel inside table must not bubble to swipe handler");
         vcx.simulate_event(wheel_event(table_pos, 0.0, -24.0));
         assert_eq!(bubbled_vertical.get(), 2, "vertical wheel inside table must still bubble");
+    }
+
+    #[gpui::test]
+    fn code_node_key_distinguishes_identical_blocks_and_is_stable_while_streaming(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+        });
+
+        struct ProbeHarness {
+            entity: Entity<TextViewState>,
+            ext: MarkdownExtensions,
+        }
+        impl Render for ProbeHarness {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(500.))
+                    .child(TextView::new(&self.entity).markdown_extensions(self.ext.clone()))
+            }
+        }
+
+        let nested_views: NestedViews = Arc::new(Mutex::new(HashMap::new()));
+        let action_ctx: SharedActionContext = Arc::new(Mutex::new(None));
+        let code_meta: SharedCodeMeta = Arc::new(Mutex::new(CodeFenceMetaMap::default()));
+        let math_enabled: SharedMathEnabled = Arc::new(AtomicBool::new(false));
+        let ext = attach_extensions_inner(
+            MarkdownExtensions::default(),
+            action_ctx,
+            nested_views.clone(),
+            code_meta,
+            math_enabled,
+            None,
+            true,
+            true,
+            false,
+        );
+
+        let two_identical = "```sh\necho hi\n```\n\n```sh\necho hi\n```\n";
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            let entity = cx.new(|cx| TextViewState::markdown(two_identical, cx).selectable(true));
+            ProbeHarness { entity, ext: ext.clone() }
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let mut initial_keys: Vec<String> = nested_views
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with("code:"))
+            .cloned()
+            .collect();
+        initial_keys.sort();
+        assert_eq!(
+            initial_keys.len(),
+            2,
+            "two identical code blocks at different offsets must produce distinct keyed states: {initial_keys:?}"
+        );
+
+        // Append a streamed line to the second block (keeping both blocks' start offsets fixed).
+        nested_views.lock().unwrap().clear();
+        let streamed = "```sh\necho hi\n```\n\n```sh\necho hi\necho more\n```\n";
+        vcx.update(|window, cx| {
+            view.update(cx, |h, cx| {
+                h.entity.update(cx, |tv, cx| tv.set_text(streamed, cx));
+            });
+            window.draw(cx).clear();
+        });
+        let mut streamed_keys: Vec<String> = nested_views
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with("code:"))
+            .cloned()
+            .collect();
+        streamed_keys.sort();
+        assert_eq!(
+            streamed_keys, initial_keys,
+            "streaming content into a code block at the same start offset must keep its keyed state stable"
+        );
     }
 }

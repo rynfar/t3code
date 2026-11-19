@@ -740,6 +740,10 @@ impl Render for Workspace {
                         cx.stop_propagation();
                         return;
                     }
+                    if this.project_dialogs.update(cx, |dialogs, cx| dialogs.dismiss(cx)) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     let overlay_open = this.menu.read(cx).is_open()
                         || this.dialog.read(cx).is_open()
                         || this.snooze.read(cx).is_open()

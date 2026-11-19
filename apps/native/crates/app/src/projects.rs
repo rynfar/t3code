@@ -443,6 +443,7 @@ struct AddToMachineState {
     selected_files: BTreeMap<String, ProjectIgnoredFile>,
     submitting: bool,
     error: Option<String>,
+    search_seq: u64,
     _list_task: Option<Task<()>>,
     _input_subs: Vec<Subscription>,
 }
@@ -466,6 +467,14 @@ impl ProjectDialogs {
 
     pub(crate) fn is_open(&self) -> bool {
         self.clone.is_some() || self.add_to_machine.is_some()
+    }
+
+    pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.is_open() {
+            return false;
+        }
+        self.close(cx);
+        true
     }
 
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
@@ -698,13 +707,25 @@ impl ProjectDialogs {
                                     });
                                     return;
                                 };
+                                let mut terminal = false;
+                                let mut stream_err: Option<String> = None;
                                 while let Some(frame) = handle.receiver.recv().await {
-                                    let Ok(value) = frame else { break };
+                                    let value = match frame {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            stream_err = Some(error.to_string());
+                                            break;
+                                        }
+                                    };
                                     let snapshots = serde_json::from_value::<Vec<ProjectCloneSnapshot>>(value).unwrap_or_default();
                                     let Some(matched) = snapshots.into_iter().find(|s| s.project_id == watched_id) else {
                                         continue;
                                     };
                                     let done = matched.phase == ProjectClonePhase::Done;
+                                    terminal = matches!(
+                                        matched.phase,
+                                        ProjectClonePhase::Done | ProjectClonePhase::Failed | ProjectClonePhase::Cancelled
+                                    );
                                     let display = project_clone_display_name(&matched);
                                     let dest = matched.destination_path.clone();
                                     let keep_going = this.update(cx, |this, cx| {
@@ -730,6 +751,30 @@ impl ProjectDialogs {
                                     if !matches!(keep_going, Ok(true)) {
                                         break;
                                     }
+                                }
+                                if !terminal {
+                                    let reason = stream_err.unwrap_or_else(|| {
+                                        "Lost connection while monitoring clone progress.".to_owned()
+                                    });
+                                    let _ = this.update(cx, |this, cx| {
+                                        if let Some(modal) = this.clone.as_mut()
+                                            && let Some(active) = modal.active_clone.as_mut()
+                                            && active.project_id == watched_id
+                                        {
+                                            let already_terminal = active.snapshot.as_ref().is_some_and(|s| {
+                                                matches!(
+                                                    s.phase,
+                                                    ProjectClonePhase::Done
+                                                        | ProjectClonePhase::Failed
+                                                        | ProjectClonePhase::Cancelled
+                                                )
+                                            });
+                                            if !already_terminal {
+                                                active.action_error = Some(reason);
+                                                cx.notify();
+                                            }
+                                        }
+                                    });
                                 }
                             })
                         });
@@ -922,6 +967,7 @@ impl ProjectDialogs {
             selected_files: BTreeMap::new(),
             submitting: false,
             error: None,
+            search_seq: 0,
             _list_task: None,
             _input_subs: vec![dest_sub, search_sub],
         });
@@ -930,9 +976,10 @@ impl ProjectDialogs {
     }
 
     fn fetch_ignored_files(&mut self, query: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let (source_saved_id, cwd) = {
-            let Some(modal) = self.add_to_machine.as_ref() else { return };
-            (modal.source_saved_id.clone(), modal.workspace_root.clone())
+        let (source_saved_id, cwd, seq) = {
+            let Some(modal) = self.add_to_machine.as_mut() else { return };
+            modal.search_seq = modal.search_seq.wrapping_add(1);
+            (modal.source_saved_id.clone(), modal.workspace_root.clone(), modal.search_seq)
         };
         let is_initial = query.is_none();
         let active_saved = self.state.read(cx).environments.active.clone().unwrap_or_default();
@@ -958,6 +1005,9 @@ impl ProjectDialogs {
             };
             let _ = this.update(cx, |this, cx| {
                 let Some(modal) = this.add_to_machine.as_mut() else { return };
+                if modal.search_seq != seq {
+                    return;
+                }
                 modal.loading_files = false;
                 match result {
                     Ok(list) => {
@@ -1009,11 +1059,17 @@ impl ProjectDialogs {
             modal.file_query = query.clone();
             let trimmed = query.trim();
             if trimmed.is_empty() {
+                modal.search_seq = modal.search_seq.wrapping_add(1);
+                modal._list_task = None;
+                modal.loading_files = false;
                 modal.shown_files = modal.all_files.clone();
                 false
             } else if modal.truncated {
                 true
             } else {
+                modal.search_seq = modal.search_seq.wrapping_add(1);
+                modal._list_task = None;
+                modal.loading_files = false;
                 let needle = trimmed.to_ascii_lowercase();
                 modal.shown_files = modal
                     .all_files
@@ -1217,58 +1273,117 @@ impl ProjectDialogs {
                 }
             };
 
-            // Step 3: Close dialog and notify user that clone started.
+            // Step 3: Close dialog, notify user that clone started, and select draft when targeting active machine.
             let _ = this.update(cx, |this, cx| {
                 this.add_to_machine = None;
                 cx.notify();
             });
+            let total_files = reads.len();
+            let target_is_active = target.saved_id == active_saved;
+            let clone_toast_desc = if total_files == 0 {
+                started.cwd.clone()
+            } else {
+                let plural = if total_files == 1 { "file" } else { "files" };
+                format!("{} — will copy {total_files} ignored {plural} after clone", started.cwd)
+            };
+            state_entity.update(cx, |s, cx| {
+                s.show_toast(
+                    Toast::new(ToastKind::Info, format!("Cloning {title} to {}", target.label))
+                        .description(clone_toast_desc),
+                    cx,
+                );
+                if target_is_active {
+                    s.start_draft(&started.project_id, cx);
+                }
+            });
             if reads.is_empty() {
-                state_entity.update(cx, |s, cx| {
-                    s.show_toast(
-                        Toast::new(ToastKind::Info, format!("Cloning {title} to {}", target.label))
-                            .description(started.cwd.clone()),
-                        cx,
-                    );
-                });
                 return;
             }
 
             // Step 4: Wait for the clone to finish on the target machine, then relay each file via `projects.writeFile`.
+            #[derive(Debug)]
+            enum CloneWaitOutcome {
+                Done,
+                Failed(String),
+                Cancelled,
+                Disconnected,
+            }
+
             let relay_project_id = started.project_id.clone();
             let relay_cwd = started.cwd.clone();
             let relay_client = target_client.clone();
             let relay_runtime = runtime.clone();
             let target_label = target.label.clone();
-            let total_files = reads.len();
 
-            let clone_ready = relay_runtime
+            let outcome = relay_runtime
                 .spawn(async move {
                     let Ok(mut stream) = relay_client.stream(SUBSCRIBE_PROJECT_CLONES, serde_json::json!({})).await else {
-                        return true;
+                        // Older servers that predate `subscribeProjectClones` complete synchronously in `projectClone.start`.
+                        return CloneWaitOutcome::Done;
                     };
                     let mut seen = false;
                     while let Some(frame) = stream.receiver.recv().await {
-                        let Ok(value) = frame else { return false };
+                        let value = match frame {
+                            Ok(value) => value,
+                            Err(err) => return CloneWaitOutcome::Failed(err.to_string()),
+                        };
                         let snapshots = serde_json::from_value::<Vec<ProjectCloneSnapshot>>(value).unwrap_or_default();
                         if let Some(clone) = snapshots.into_iter().find(|s| s.project_id == relay_project_id) {
                             seen = true;
-                            if clone.phase == ProjectClonePhase::Done {
-                                return true;
-                            }
-                            if matches!(clone.phase, ProjectClonePhase::Failed | ProjectClonePhase::Cancelled) {
-                                return false;
+                            match clone.phase {
+                                ProjectClonePhase::Done => return CloneWaitOutcome::Done,
+                                ProjectClonePhase::Failed => {
+                                    return CloneWaitOutcome::Failed(
+                                        clone.error.unwrap_or_else(|| "Clone failed on target machine.".to_owned()),
+                                    );
+                                }
+                                ProjectClonePhase::Cancelled => return CloneWaitOutcome::Cancelled,
+                                ProjectClonePhase::Running | ProjectClonePhase::Unknown => {}
                             }
                         } else if seen {
-                            return false;
+                            return CloneWaitOutcome::Failed("Clone stopped before completing.".to_owned());
                         }
                     }
-                    false
+                    CloneWaitOutcome::Disconnected
                 })
                 .await
-                .unwrap_or(false);
+                .unwrap_or(CloneWaitOutcome::Disconnected);
 
-            if !clone_ready {
-                return;
+            match outcome {
+                CloneWaitOutcome::Done => {}
+                CloneWaitOutcome::Failed(reason) => {
+                    let plural = if total_files == 1 { "file" } else { "files" };
+                    state_entity.update(cx, |s, cx| {
+                        s.show_toast(
+                            Toast::new(ToastKind::Error, format!("Clone failed on {target_label}"))
+                                .description(format!("{reason} ({total_files} ignored {plural} were not copied.)")),
+                            cx,
+                        );
+                    });
+                    return;
+                }
+                CloneWaitOutcome::Cancelled => {
+                    let plural = if total_files == 1 { "file" } else { "files" };
+                    state_entity.update(cx, |s, cx| {
+                        s.show_toast(
+                            Toast::new(ToastKind::Warning, format!("Clone cancelled on {target_label}"))
+                                .description(format!("{total_files} ignored {plural} were not copied.")),
+                            cx,
+                        );
+                    });
+                    return;
+                }
+                CloneWaitOutcome::Disconnected => {
+                    let plural = if total_files == 1 { "file" } else { "files" };
+                    state_entity.update(cx, |s, cx| {
+                        s.show_toast(
+                            Toast::new(ToastKind::Error, format!("Could not confirm clone on {target_label}"))
+                                .description(format!("Lost clone progress stream; {total_files} ignored {plural} were not copied.")),
+                            cx,
+                        );
+                    });
+                    return;
+                }
             }
 
             let mut failed: Vec<String> = Vec::new();
@@ -1652,6 +1767,11 @@ impl ProjectDialogs {
                 .p(px(16.))
                 .bg(hsla(p.dialog_backdrop))
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close(cx)))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" && this.dismiss(cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .child(
                     div()
                         .id("clone-project-dialog")
@@ -1741,6 +1861,11 @@ impl ProjectDialogs {
                 .p(px(16.))
                 .bg(hsla(p.dialog_backdrop))
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close(cx)))
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" && this.dismiss(cx) {
+                        cx.stop_propagation();
+                    }
+                }))
                 .child(
                     div()
                         .id("add-to-machine-dialog")
@@ -2311,8 +2436,56 @@ mod tests {
             window.draw(cx).clear();
         });
 
+        // Prematurely closing `subscribeProjectClones` before a terminal phase sets an inline error
+        // instead of leaving `active_clone` stuck spinning.
+        let (stream_err_tx, stream_err_rx) = futures::channel::oneshot::channel::<()>();
+        let stream_err_tx = std::cell::RefCell::new(Some(stream_err_tx));
+        let _stream_err_sub = vcx.update(|_, cx| {
+            cx.observe(&dialogs, move |d, cx| {
+                if d.read(cx)
+                    .clone
+                    .as_ref()
+                    .and_then(|m| m.active_clone.as_ref())
+                    .and_then(|a| a.action_error.as_ref())
+                    .is_some()
+                    && let Some(tx) = stream_err_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        let (_, streams) = fixture.take_requests();
+        let (_, stream_reply) = streams
+            .into_iter()
+            .find(|(m, _)| *m == SUBSCRIBE_PROJECT_CLONES)
+            .expect("subscribeProjectClones stream opened");
+        let (stream_handle, stream_tx) = t3_client::session::StreamHandle::fixture();
+        assert!(stream_reply.send(Ok(stream_handle)).is_ok());
+        drop(stream_tx);
+        stream_err_rx.await.unwrap();
+        vcx.read_entity(&dialogs, |d, _| {
+            let err = d
+                .clone
+                .as_ref()
+                .and_then(|m| m.active_clone.as_ref())
+                .and_then(|a| a.action_error.as_deref());
+            assert!(
+                err.is_some_and(|msg| msg.contains("Lost connection")),
+                "premature stream close must surface an error, got {err:?}"
+            );
+        });
+
+        // Escape dismisses the modal even while in `active_clone` progress view (no `Input` focused).
+        vcx.update(|_, cx| {
+            assert!(dialogs.update(cx, |d, cx| d.dismiss(cx)));
+        });
+        vcx.read_entity(&dialogs, |d, _| {
+            assert!(!d.is_open(), "dismiss closes active clone progress modal");
+        });
+
         drop(_err_sub);
         drop(_active_sub);
+        drop(_stream_err_sub);
         cx.update(|cx| {
             state.update(cx, |s, _| s.stop_pump());
         });
@@ -2487,6 +2660,223 @@ mod tests {
             assert_eq!(latest.kind, ToastKind::Success);
             assert_eq!(latest.title, "Copied 1 ignored file to Studio");
         });
+
+        drop(_listed_sub);
+        drop(_toast_sub);
+        cx.update(|cx| {
+            state.update(cx, |s, _| s.stop_pump());
+        });
+        drop(fixture);
+        runtime.shutdown_background();
+    }
+
+    #[gpui::test]
+    async fn add_to_machine_stale_remote_search_and_failed_relay_clone_toast(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        state.update(cx, |s, _| {
+            let mut snapshot = s.shell.snapshot.clone().unwrap_or_default();
+            snapshot.projects.push(
+                serde_json::from_value(json!({
+                    "id": "proj-src",
+                    "title": "web",
+                    "workspaceRoot": "/repo/apps/web",
+                    "repositoryIdentity": {
+                        "canonicalKey": "github.com/pingdotgg/t3code",
+                        "displayName": "pingdotgg/t3code",
+                        "rootPath": "/repo",
+                        "origin": { "remoteUrl": "https://github.com/pingdotgg/t3code.git" }
+                    },
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "updatedAt": "2026-01-02T00:00:00Z"
+                }))
+                .unwrap(),
+            );
+            s.shell.snapshot = Some(snapshot);
+            s.shell.synchronized = true;
+        });
+
+        let (dialogs, vcx) = cx.add_window_view(|window, cx| ProjectDialogs::new(state.clone(), window, cx));
+        vcx.update(|window, cx| {
+            window.resize(size(px(960.), px(680.)));
+            dialogs.update(cx, |d, cx| {
+                d.open_add_to_machine_modal(String::new(), "proj-src".into(), None, window, cx);
+                if let Some(m) = d.add_to_machine.as_mut() {
+                    m.targets.push(MachineTarget {
+                        saved_id: state.read(cx).environments.active.clone().unwrap_or_default(),
+                        environment_id: "env-target".into(),
+                        label: "Studio".into(),
+                        add_project_base_directory: Some("~/code".into()),
+                        ghq_clone_layout: true,
+                    });
+                }
+                d.select_machine_target(0, window, cx);
+            });
+            window.blur();
+        });
+        vcx.run_until_parked();
+
+        // 1. Answer initial listing with `truncated: true` so queries trigger remote searches.
+        let (_, _, initial_reply) = loop {
+            let (m, p, r) = fixture.next_request().await;
+            if m == PROJECTS_LIST_IGNORED_FILES {
+                break (m, p, r);
+            }
+            let _ = r.send(Ok(json!({})));
+        };
+        let (listed_tx, listed_rx) = futures::channel::oneshot::channel::<()>();
+        let listed_tx = std::cell::RefCell::new(Some(listed_tx));
+        let _listed_sub = vcx.update(|_, cx| {
+            cx.observe(&dialogs, move |d, cx| {
+                if d.read(cx).add_to_machine.as_ref().is_some_and(|m| !m.loading_files)
+                    && let Some(tx) = listed_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        initial_reply
+            .send(Ok(json!({
+                "files": [
+                    { "path": ".env.local", "byteLength": 128 },
+                    { "path": "local.notes", "byteLength": 64 }
+                ],
+                "truncated": true
+            })))
+            .unwrap();
+        listed_rx.await.unwrap();
+
+        // 2. Start a remote search, then clear the query BEFORE the remote response arrives.
+        vcx.update(|window, cx| {
+            dialogs.update(cx, |d, cx| d.on_ignored_file_query_changed("secret".into(), window, cx));
+        });
+        vcx.run_until_parked();
+        let (_, remote_payload, stale_reply) = loop {
+            let (m, p, r) = fixture.next_request().await;
+            if m == PROJECTS_LIST_IGNORED_FILES {
+                break (m, p, r);
+            }
+            let _ = r.send(Ok(json!({})));
+        };
+        assert_eq!(remote_payload["query"], "secret");
+
+        vcx.update(|window, cx| {
+            dialogs.update(cx, |d, cx| d.on_ignored_file_query_changed(String::new(), window, cx));
+        });
+        // Deliver the stale remote response; it must be discarded and must not overwrite `shown_files`.
+        let _ = stale_reply.send(Ok(json!({
+            "files": [{ "path": "secret.txt", "byteLength": 32 }],
+            "truncated": false
+        })));
+        vcx.run_until_parked();
+        vcx.read_entity(&dialogs, |d, _| {
+            let m = d.add_to_machine.as_ref().expect("dialog open");
+            assert!(!m.loading_files, "clearing search clears loading_files");
+            let paths: Vec<&str> = m.shown_files.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(paths, vec![".env.local", "local.notes"]);
+        });
+
+        // 3. Submit relay, observe "Cloning web to Studio" start toast, then push a Failed clone snapshot
+        //    and assert an error toast reports both the clone failure and skipped ignored files.
+        let (started_toast_tx, started_toast_rx) = futures::channel::oneshot::channel::<()>();
+        let started_toast_tx = std::cell::RefCell::new(Some(started_toast_tx));
+        let (failed_toast_tx, failed_toast_rx) = futures::channel::oneshot::channel::<(ToastKind, String, Option<String>)>();
+        let failed_toast_tx = std::cell::RefCell::new(Some(failed_toast_tx));
+        let _toast_sub = vcx.update(|_, cx| {
+            cx.subscribe(&state, move |s, _event: &AppEvent, cx| {
+                if let Some(latest) = s.read(cx).toasts.latest() {
+                    if latest.title == "Cloning web to Studio"
+                        && let Some(tx) = started_toast_tx.borrow_mut().take()
+                    {
+                        let _ = tx.send(());
+                    }
+                    if latest.title == "Clone failed on Studio"
+                        && let Some(tx) = failed_toast_tx.borrow_mut().take()
+                    {
+                        let _ = tx.send((
+                            latest.kind,
+                            latest.title.to_string(),
+                            latest.description.as_ref().map(|d| d.to_string()),
+                        ));
+                    }
+                }
+            })
+        });
+
+        vcx.update(|window, cx| {
+            dialogs.update(cx, |d, cx| d.submit_add_to_machine(window, cx));
+        });
+        vcx.run_until_parked();
+
+        let (_, _, read_reply) = loop {
+            let (m, p, r) = fixture.next_request().await;
+            if m == PROJECTS_READ_FILE {
+                break (m, p, r);
+            }
+            let _ = r.send(Ok(json!({})));
+        };
+        read_reply
+            .send(Ok(json!({
+                "relativePath": ".env.local",
+                "contents": "SECRET=1\n",
+                "byteLength": 9,
+                "truncated": false
+            })))
+            .unwrap();
+
+        let (_, _, clone_reply) = loop {
+            let (m, p, r) = fixture.next_request().await;
+            if m == PROJECT_CLONE_START {
+                break (m, p, r);
+            }
+            let _ = r.send(Ok(json!({})));
+        };
+        clone_reply
+            .send(Ok(json!({
+                "projectId": "proj-fail",
+                "cwd": "/studio/code/github.com/pingdotgg/t3code",
+                "remoteUrl": "https://github.com/pingdotgg/t3code.git"
+            })))
+            .unwrap();
+        started_toast_rx.await.unwrap();
+        vcx.run_until_parked();
+
+        let (_, streams) = fixture.take_requests();
+        let (_, stream_reply) = streams
+            .into_iter()
+            .find(|(m, _)| *m == SUBSCRIBE_PROJECT_CLONES)
+            .expect("relay subscribes to project clones");
+        let (stream_handle, stream_tx) = t3_client::session::StreamHandle::fixture();
+        assert!(stream_reply.send(Ok(stream_handle)).is_ok());
+        stream_tx
+            .send(Ok(json!([{
+                "projectId": "proj-fail",
+                "remoteUrl": "https://github.com/pingdotgg/t3code.git",
+                "destinationPath": "/studio/code/github.com/pingdotgg/t3code",
+                "phase": "failed",
+                "stage": "connecting",
+                "error": "auth failed"
+            }])))
+            .await
+            .unwrap();
+
+        let (kind, title, desc) = failed_toast_rx.await.unwrap();
+        assert_eq!(kind, ToastKind::Error);
+        assert_eq!(title, "Clone failed on Studio");
+        assert!(
+            desc.as_deref()
+                .is_some_and(|d| d.contains("auth failed") && d.contains("1 ignored file")),
+            "failed clone toast must report error and skipped files, got {desc:?}"
+        );
+        let (remaining_reqs, _) = fixture.take_requests();
+        assert!(
+            !remaining_reqs.iter().any(|(m, _, _)| *m == PROJECTS_WRITE_FILE),
+            "must not write ignored files when clone failed"
+        );
 
         drop(_listed_sub);
         drop(_toast_sub);
