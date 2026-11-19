@@ -378,6 +378,17 @@ fn turn_one_uses_the_full_thread_diff() {
 }
 
 #[test]
+fn a_turn_diff_cut_off_at_the_size_limit_is_truncated() {
+    let cut = format!("{MODIFIED}{CHECKPOINT_DIFF_TRUNCATED_MARKER}");
+    assert!(is_checkpoint_diff_truncated(&cut));
+    assert!(!is_checkpoint_diff_truncated(MODIFIED));
+    assert!(!is_checkpoint_diff_truncated("[truncated]"), "only the server's marker counts");
+    let parsed = files(&cut);
+    assert_eq!(parsed.len(), 1, "the files before the marker still render");
+    assert_eq!(parsed[0].path(), "src/main.rs");
+}
+
+#[test]
 fn diff_preview_picks_the_requested_source() {
     let (method, payload) = diff_preview_request("/repo", Some("main"), true);
     assert_eq!(method, "review.getDiffPreview");
@@ -398,6 +409,30 @@ fn diff_preview_picks_the_requested_source() {
 
     let tree = decode_diff_preview(&result, PreviewSourceKind::WorkingTree).expect("working tree");
     assert_eq!((tree.diff.as_str(), tree.totals), ("w", None));
+}
+
+#[test]
+fn commit_scope_requests_commits_and_builds_host_urls() {
+    let (method, payload) = branch_commits_request("/repo", Some("main"));
+    assert_eq!(method, "review.getBranchCommits");
+    assert_eq!(payload, json!({ "cwd": "/repo", "baseRef": "main" }));
+    let decoded = decode_branch_commits(&json!({
+        "commits": [{ "sha": "abcdef1234567890", "subject": "Add thing", "committedAt": "2026-01-01T00:00:00Z" }],
+        "truncated": true
+    }))
+    .unwrap();
+    assert_eq!(decoded.commits.len(), 1);
+    assert!(decoded.truncated);
+    let sel = DiffSelection::commit(&DiffSelection::Branch { base_ref: Some("main".into()) }, None, "abcdef1234567890");
+    assert_eq!(DiffScope::resolve(&sel, &[]).label(&[]), "Commit abcdef1");
+    let back_to_branch = DiffSelection::git(&sel, None, false);
+    assert_eq!(back_to_branch, DiffSelection::Branch { base_ref: Some("main".into()) });
+    let sha = "a".repeat(40);
+    let github = json!({ "provider": "github", "canonicalKey": "github.com/acme/app", "locator": { "remoteUrl": "https://github.com/acme/app.git" } });
+    assert_eq!(project_commit_url(Some(&github), &sha).as_deref(), Some(format!("https://github.com/acme/app/commit/{sha}").as_str()));
+    let gitlab = json!({ "provider": "gitlab", "canonicalKey": "gitlab.com/acme/sub/app", "locator": { "remoteUrl": "git@gitlab.com:acme/sub/app.git" } });
+    assert_eq!(project_commit_url(Some(&gitlab), &sha).as_deref(), Some(format!("https://gitlab.com/acme/sub/app/-/commit/{sha}").as_str()));
+    assert_eq!(project_commit_url(Some(&github), "short"), None);
 }
 
 #[test]
@@ -895,4 +930,37 @@ fn lazy_batches_resume_after_jumping_past_pending_and_unmeasured_headers() {
     assert!(review_boundary_near(25, 20, None, 160., 600.), "unmeasured visible header uses retained height estimates");
     assert!(!review_boundary_near(100, 20, None, 2560., 600.));
     assert!(!review_boundary_near(25, 20, Some(1500.), 160., 600.), "measured geometry wins over estimates");
+}
+
+#[test]
+fn server_config_shell_reveal_gates_file_context_menu() {
+    let base: crate::server_config::ServerConfig = serde_json::from_value(json!({
+        "environment": { "environmentId": "env-1", "label": "Local", "platform": { "os": "linux", "arch": "x86_64", "machine": "linux" } },
+        "availableEditors": ["file-manager", "cursor"]
+    }))
+    .unwrap();
+    let without_cap = FileContextMenuCapabilities::from_server(
+        &base.available_editors,
+        "linux",
+        base.shell_reveal_in_file_manager,
+        base.shell_reveal_in_file_manager_kind.as_deref(),
+    );
+    assert!(without_cap.can_open_default);
+    assert_eq!(without_cap.reveal_label, None);
+    assert_eq!(without_cap.editors, vec![("cursor".into(), "Cursor".into())]);
+
+    let wsl: crate::server_config::ServerConfig = serde_json::from_value(json!({
+        "environment": { "environmentId": "env-1", "label": "WSL", "platform": { "os": "linux", "arch": "x86_64", "machine": "linux" } },
+        "availableEditors": ["file-manager"],
+        "shellRevealInFileManager": true,
+        "shellRevealInFileManagerKind": "file-explorer"
+    }))
+    .unwrap();
+    let with_wsl = FileContextMenuCapabilities::from_server(
+        &wsl.available_editors,
+        "linux",
+        wsl.shell_reveal_in_file_manager,
+        wsl.shell_reveal_in_file_manager_kind.as_deref(),
+    );
+    assert_eq!(with_wsl.reveal_label, Some("Reveal in File Explorer"));
 }

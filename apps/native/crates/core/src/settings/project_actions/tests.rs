@@ -53,6 +53,8 @@ fn scripts_build_from_the_form_and_release_claimed_roles() {
     );
     let plain = build_project_script("dev", &ScriptInput { name: "Dev".into(), command: "bun dev".into(), wait_for_setup: true, ..Default::default() });
     assert_eq!(serde_json::to_value(&plain).unwrap(), json!({"id": "dev", "name": "Dev", "command": "bun dev", "icon": "play", "runOnWorktreeCreate": false}));
+    let stopping = build_project_script("dev", &ScriptInput { name: "Dev".into(), command: "bun dev".into(), stop_on_settle: true, ..Default::default() });
+    assert_eq!(serde_json::to_value(&stopping).unwrap()["stopOnSettle"], true);
 
     let mut other = script("old");
     other.run_on_worktree_create = true;
@@ -72,10 +74,13 @@ fn the_editor_round_trips_a_script_and_its_shortcut() {
     let mut saved = script("test");
     saved.run_on_worktree_create = true;
     saved.run_async = Some(false);
+    saved.stop_on_settle = Some(true);
     let bindings = keybindings(json!([binding("script.test.run", "t", &["mod", "shift"]), binding("script.other.run", "o", &["mod"])]));
     let request = EditorRequest::edit(&saved, &bindings);
     assert_eq!(request.initial.keybinding, Some(Some("mod+shift+t".into())));
     assert!(request.initial.wait_for_setup);
+    assert!(request.initial.stop_on_settle);
+    assert!(FormValues::from_input(&request.initial).stop_on_settle);
     assert_eq!(keybinding_value_for_command(&bindings, None), None);
     let escape = keybindings(json!([binding("script.go.run", "escape", &["ctrl"])]));
     assert_eq!(keybinding_value_for_command(&escape, Some("script.go.run")).as_deref(), Some("ctrl+esc"));
@@ -101,6 +106,9 @@ fn the_form_validates_like_the_web_editor() {
     edit.initial.keybinding = Some(Some("mod+d".into()));
     assert_eq!(check(&edit, &form("Dev", "bun dev", "mod+d"), true, false).unwrap().keybinding, None, "an unchanged shortcut is kept");
     assert_eq!(check(&edit, &form("Dev", "bun dev", ""), true, true).unwrap().keybinding, Some(None), "a cleared shortcut is removed");
+
+    let stopping = check(&add, &FormValues { stop_on_settle: true, ..form("Dev", "bun dev", "") }, true, true).unwrap();
+    assert!(stopping.stop_on_settle);
 
     let preview = FormValues { preview_url: "  ".into(), auto_open_preview: true, ..form("Dev", "bun dev", "") };
     let saved = check(&add, &preview, true, true).unwrap();
@@ -198,7 +206,7 @@ fn t3_json_parses_leniently_and_rejects_invalid_files() {
             "$schema": "https://t3.codes/schema/t3.json",
             "defaultThreadEnvMode": "worktree",
             "scripts": [
-                { "name": " Dev ", "command": "bun dev", "previewUrl": "http://localhost:5173", "autoOpenPreview": true, },
+                { "name": " Dev ", "command": "bun dev", "previewUrl": "http://localhost:5173", "autoOpenPreview": true, "stopOnSettle": true, },
                 /* setup */ { "name": "Install", "command": "bun i // not a comment", "icon": "build", "runOnWorktreeCreate": true, "async": false },
             ],
             "unknownKey": 1,
@@ -210,13 +218,14 @@ fn t3_json_parses_leniently_and_rejects_invalid_files() {
     assert_eq!(scripts[0].name, "Dev");
     assert_eq!(scripts[1].command, "bun i // not a comment");
     let dev = scripts[0].import_input();
-    assert_eq!((dev.icon, dev.auto_open_preview, dev.keybinding.clone()), (ScriptIcon::Play, true, Some(None)));
+    assert_eq!((dev.icon, dev.auto_open_preview, dev.stop_on_settle, dev.keybinding.clone()), (ScriptIcon::Play, true, true, Some(None)));
     let install = scripts[1].import_input();
-    assert_eq!((install.icon, install.run_on_worktree_create, install.wait_for_setup), (ScriptIcon::Build, true, true));
+    assert_eq!((install.icon, install.run_on_worktree_create, install.wait_for_setup, install.stop_on_settle), (ScriptIcon::Build, true, true, false));
 
     assert_eq!(parse_project_file("{ not json"), ProjectFile::Invalid);
     assert_eq!(parse_project_file(r#"{"scripts": [{"name": "x", "command": "y", "icon": "rocket"}]}"#), ProjectFile::Invalid);
     assert_eq!(parse_project_file(r#"{"scripts": [{"name": "", "command": "y"}]}"#), ProjectFile::Invalid);
+    assert_eq!(parse_project_file(r#"{"scripts": [{"name": "x", "command": "y", "stopOnSettle": "yes"}]}"#), ProjectFile::Invalid);
     assert_eq!(parse_project_file(r#"{"defaultThreadEnvMode": "elsewhere"}"#), ProjectFile::Invalid);
     assert_eq!(parse_project_file("[]"), ProjectFile::Invalid);
     assert_eq!(project_file_from_read(&json!({"exists": false})), ProjectFile::Missing);

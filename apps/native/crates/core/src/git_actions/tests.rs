@@ -271,3 +271,67 @@ fn elapsed_time_switches_to_minutes() {
     assert_eq!(format_elapsed(0, 61_000), "1m 1s");
     assert_eq!(format_elapsed(5_000, 0), "0s");
 }
+
+fn with_changes(branch: Option<(&str, u64, u64)>, tree: (u64, u64)) -> VcsStatus {
+    let mut status = status(tree.0 + tree.1 > 0, true, 0, 0);
+    status.local.working_tree.insertions = tree.0;
+    status.local.working_tree.deletions = tree.1;
+    status.local.branch_changes = branch.map(|(base, insertions, deletions)| crate::vcs::BranchChanges { base_ref: Some(base.into()), insertions, deletions });
+    status
+}
+
+fn totals(insertions: u64, deletions: u64, base_ref: Option<&str>) -> Option<ChangesTotals> {
+    Some(ChangesTotals { insertions, deletions, base_ref: base_ref.map(str::to_owned) })
+}
+
+#[test]
+fn changes_totals_name_what_they_compare_against() {
+    let dirty = with_changes(Some(("main", 0, 0)), (5, 1));
+    assert_eq!(resolve_changes_totals(Some(&dirty), None), totals(5, 1, None), "an empty branchChanges does not hide a dirty working tree");
+    let branch = with_changes(Some(("origin/master", 20, 3)), (1, 0));
+    assert_eq!(resolve_changes_totals(Some(&branch), None), totals(20, 3, Some("origin/master")), "non-zero branchChanges win over the working tree");
+    assert_eq!(resolve_changes_totals(Some(&with_changes(None, (2, 0))), None), totals(2, 0, None), "no branchChanges falls back to the working tree");
+    assert_eq!(resolve_changes_totals(None, None), None);
+
+    let preview = |files: serde_json::Value| {
+        crate::diff::decode_diff_preview(&json!({ "sources": [{ "kind": "branch-range", "baseRef": "release", "headRef": "feature/test", "diff": "", "truncated": false, "files": files }] }), crate::diff::PreviewSourceKind::BranchRange)
+    };
+    let stats = preview(json!([{ "path": "a.ts", "additions": 4, "deletions": 1 }, { "path": "b.ts", "additions": 2, "deletions": 0 }])).expect("source");
+    let dirty = with_changes(Some(("main", 20, 3)), (0, 0));
+    assert_eq!(resolve_changes_totals(Some(&dirty), Some(&stats)), totals(6, 1, Some("release")), "the panel's branch comparison wins when it has file stats");
+    let no_stats = crate::diff::decode_diff_preview(&json!({ "sources": [{ "kind": "branch-range", "baseRef": "release", "diff": "", "truncated": false }] }), crate::diff::PreviewSourceKind::BranchRange).expect("source");
+    assert_eq!(resolve_changes_totals(Some(&dirty), Some(&no_stats)), totals(20, 3, Some("main")));
+
+    assert_eq!(totals(1, 0, None).unwrap().base_label(), "Uncommitted");
+    assert_eq!(totals(1, 0, Some("origin/main")).unwrap().base_label(), "vs origin/main");
+}
+
+#[test]
+fn menu_content_is_usable_only_when_something_can_run_or_inform() {
+    let clean = status(false, true, 0, 0);
+    let dirty = status(true, true, 0, 0);
+    let ahead = status(false, true, 1, 0);
+    let has = |st: &VcsStatus, can_write: bool, can_publish: bool, has_notice: bool| {
+        let items = build_menu_items(Some(st), false, st.local.has_primary_remote);
+        has_usable_menu_content(&items, can_write, can_publish, has_notice)
+    };
+    assert!(!has(&clean, true, false, false));
+    assert!(has(&dirty, true, false, false));
+    assert!(has(&ahead, true, false, false));
+    assert!(!has(&dirty, false, false, false));
+    assert!(has(&status(false, false, 0, 0), true, true, false));
+    assert!(has(&clean, false, false, true));
+}
+
+#[test]
+fn offered_providers_default_to_github_until_others_are_enabled() {
+    use std::collections::HashMap;
+    assert!(is_source_control_provider_offered(None, "github"));
+    assert!(!is_source_control_provider_offered(None, "gitlab"));
+    let empty = HashMap::new();
+    assert!(is_source_control_provider_offered(Some(&empty), "github"));
+    assert!(!is_source_control_provider_offered(Some(&empty), "gitlab"));
+    let custom = HashMap::from([("gitlab".into(), true), ("github".into(), false)]);
+    assert!(!is_source_control_provider_offered(Some(&custom), "github"));
+    assert!(is_source_control_provider_offered(Some(&custom), "gitlab"));
+}

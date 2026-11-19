@@ -49,8 +49,14 @@ impl Node {
 }
 
 pub fn file_tree_rows(files: &[FileDiff], collapsed_directories: &HashSet<String>) -> Vec<TreeRow> {
+    file_tree_rows_shown(files, collapsed_directories, |_| true)
+}
+
+/// `diffFileTreeEntries(renderableFiles.filter(isFileShown))`: the tree without hidden files,
+/// still indexing into the full list.
+pub fn file_tree_rows_shown(files: &[FileDiff], collapsed_directories: &HashSet<String>, shown: impl Fn(usize) -> bool) -> Vec<TreeRow> {
     let mut root = Node::default();
-    for (index, file) in files.iter().enumerate() {
+    for (index, file) in files.iter().enumerate().filter(|(index, _)| shown(*index)) {
         let segments: Vec<&str> = file.path().split('/').filter(|segment| !segment.is_empty()).collect();
         root.insert(&segments, index);
     }

@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 pub struct DiffSession {
     whitespace: HashMap<String, bool>,
     folds: HashMap<String, HashSet<String>>,
+    /// `useHideTestFiles`: one choice for every thread and scope.
+    pub hide_test_files: bool,
 }
 
 impl DiffSession {

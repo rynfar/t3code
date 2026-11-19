@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use t3_core::diff::{
     PreviewSourceKind, ToolCallDiff, ToolCallTarget, checkpoint_diff_request, decode_turn_diff,
-    hide_whitespace_changes, tool_call_diff, ReviewModel,
+    hide_whitespace_changes, is_checkpoint_diff_truncated, tool_call_diff, ReviewModel,
 };
 use t3_core::timeline::{GET_TURN_ITEM, decode_detail};
 
@@ -23,7 +23,15 @@ use crate::app_state::AppState;
 pub enum RequestKey {
     /// Only the selected Git scope is requested. `revision` bumps on refresh and when
     /// the agent may have changed the workspace.
-    Git { kind: PreviewSourceKind, environment: String, cwd: String, base_ref: Option<String>, ignore_whitespace: bool, revision: u64 },
+    Git {
+        kind: PreviewSourceKind,
+        environment: String,
+        cwd: String,
+        base_ref: Option<String>,
+        commit_sha: Option<String>,
+        ignore_whitespace: bool,
+        revision: u64,
+    },
     Turn { environment: String, thread_id: String, turn_count: u64, ignore_whitespace: bool },
     /// `orchestration.getTurnItem`; whitespace is hidden client-side, so it is not part of the key.
     ToolCall { environment: String, target: ToolCallTarget },
@@ -34,9 +42,9 @@ impl RequestKey {
     pub fn same_source(&self, other: &RequestKey) -> bool {
         match (self, other) {
             (
-                RequestKey::Git { kind, environment, cwd, base_ref, ignore_whitespace, .. },
-                RequestKey::Git { kind: k, environment: e, cwd: c, base_ref: b, ignore_whitespace: w, .. },
-            ) => kind == k && environment == e && cwd == c && base_ref == b && ignore_whitespace == w,
+                RequestKey::Git { kind, environment, cwd, base_ref, commit_sha, ignore_whitespace, .. },
+                RequestKey::Git { kind: k, environment: e, cwd: c, base_ref: b, commit_sha: s, ignore_whitespace: w, .. },
+            ) => kind == k && environment == e && cwd == c && base_ref == b && commit_sha == s && ignore_whitespace == w,
             (RequestKey::ToolCall { environment, target }, RequestKey::ToolCall { environment: e, target: t }) => {
                 environment == e && target.thread_id == t.thread_id && target.item_id == t.item_id
             }
@@ -83,7 +91,7 @@ pub fn fetch(state: &AppState, key: &RequestKey) -> Option<tokio::task::JoinHand
         RequestKey::Turn { thread_id, turn_count, ignore_whitespace, .. } => {
             let (method, payload) = checkpoint_diff_request(thread_id, *turn_count, *ignore_whitespace);
             state.request(method, payload, |value| {
-                decode_turn_diff(&value).map(|patch| Loaded::Turn(Parsed::new(&patch, false, None, None, None)))
+                decode_turn_diff(&value).map(|patch| Loaded::Turn(Parsed::new(&patch, is_checkpoint_diff_truncated(&patch), None, None, None)))
             })
         }
         RequestKey::ToolCall { target, .. } if !target.source_available(state.thread_shell(&target.thread_id), state.thread_state(&target.thread_id)) => None,
@@ -126,10 +134,10 @@ mod tests {
         assert!(!live.same_source(&other_environment));
         assert!(needs_fetch(&live, Some(&other_environment)));
 
-        let git = |revision| RequestKey::Git { kind: PreviewSourceKind::BranchRange, environment: "e".into(), cwd: "/r".into(), base_ref: None, ignore_whitespace: true, revision };
+        let git = |revision| RequestKey::Git { kind: PreviewSourceKind::BranchRange, environment: "e".into(), cwd: "/r".into(), base_ref: None, commit_sha: None, ignore_whitespace: true, revision };
         assert!(git(2).same_source(&git(1)) && needs_fetch(&git(2), Some(&git(1))));
-        let RequestKey::Git { environment, cwd, base_ref, ignore_whitespace, revision, .. } = git(1) else { unreachable!() };
-        let working = RequestKey::Git { kind: PreviewSourceKind::WorkingTree, environment, cwd, base_ref, ignore_whitespace, revision };
+        let RequestKey::Git { environment, cwd, base_ref, commit_sha, ignore_whitespace, revision, .. } = git(1) else { unreachable!() };
+        let working = RequestKey::Git { kind: PreviewSourceKind::WorkingTree, environment, cwd, base_ref, commit_sha, ignore_whitespace, revision };
         assert!(!working.same_source(&git(1)), "working-tree metadata cannot satisfy a branch preview");
     }
 }

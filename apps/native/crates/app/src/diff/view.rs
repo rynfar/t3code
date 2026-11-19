@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use t3_core::diff::{DiffRow, DiffSession, FileDiff, Layout, ParsedPatch, TreeRow, file_rows, file_tree_rows, parse_patch};
+use t3_core::diff::{DiffRow, DiffSession, FileDiff, Layout, ParsedPatch, TreeRow, file_rows, file_tree_rows_shown, parse_patch};
 
 /// One fetched patch, parsed off the UI thread.
 pub struct Parsed {
@@ -52,7 +52,8 @@ pub struct View {
     pub digits: Vec<usize>,
     keys: Vec<String>,
     folded: Vec<bool>,
-    folded_count: usize,
+    /// Files "Hide test files" leaves out: no rows, no tree entry, still indexed (`isFileShown`).
+    hidden: Vec<bool>,
     rows: Vec<Arc<Vec<DiffRow>>>,
     /// `starts[file]` is the file's first row; the last entry is the row count.
     starts: Vec<usize>,
@@ -65,9 +66,9 @@ impl View {
         let folded = session.resolve_folds(&scope_key, &keys, files_collapsed_default);
         let rows = rows_for(files, &keys, &folded, layout, None);
         let mut view = View {
-            tree: file_tree_rows(files, tree_collapsed),
+            tree: file_tree_rows_shown(files, tree_collapsed, |_| true),
             digits: files.iter().map(gutter_digits).collect(),
-            folded_count: folded.iter().filter(|folded| **folded).count(),
+            hidden: vec![false; files.len()],
             keys,
             folded,
             rows,
@@ -90,10 +91,10 @@ impl View {
             let keys = file_keys(files, review);
             let folded = session.resolve_folds(&self.scope_key, &keys, self.files_collapsed_default);
             self.rows = rows_for(files, &keys, &folded, self.layout, Some(self));
-            self.tree = file_tree_rows(files, tree_collapsed);
+            self.tree = file_tree_rows_shown(files, tree_collapsed, |_| true);
             self.digits = files.iter().map(gutter_digits).collect();
             self.keys = keys;
-            self.folded_count = folded.iter().filter(|folded| **folded).count();
+            self.hidden = vec![false; files.len()];
             self.folded = folded;
             self.parsed = parsed;
             self.recount(0);
@@ -101,6 +102,9 @@ impl View {
         }
         let mut changes = Vec::new();
         for (i, (before, file)) in old.iter().zip(files).enumerate() {
+            if self.hidden[i] {
+                continue;
+            }
             if !same_rows(before, file) {
                 let rows = Arc::new(file_rows(0, file, self.folded[i], self.layout));
                 changes.push((self.starts[i]..self.starts[i + 1], rows.len()));
@@ -156,8 +160,32 @@ impl View {
         self.folded.get(file).copied().unwrap_or(false)
     }
 
+    /// `areAllDiffFilesCollapsed(shownFileKeys, …)`.
     pub fn all_folded(&self) -> bool {
-        !self.folded.is_empty() && self.folded_count == self.folded.len()
+        let mut shown = self.folded.iter().zip(&self.hidden).filter(|(_, hidden)| !**hidden).peekable();
+        shown.peek().is_some() && shown.all(|(folded, _)| *folded)
+    }
+
+    pub fn is_hidden(&self, file: usize) -> bool {
+        self.hidden.get(file).copied().unwrap_or(false)
+    }
+
+    /// Applies "Hide test files": hidden files lose their rows and tree entries. Returns whether
+    /// anything changed, so the caller resets the list.
+    pub fn set_hidden(&mut self, hidden: Vec<bool>, tree_collapsed: &HashSet<String>) -> bool {
+        if hidden.len() != self.hidden.len() || hidden == self.hidden {
+            return false;
+        }
+        let files = self.parsed.files();
+        for (i, file) in files.iter().enumerate() {
+            if hidden[i] != self.hidden[i] {
+                self.rows[i] = if hidden[i] { Arc::new(Vec::new()) } else { Arc::new(file_rows(0, file, self.folded[i], self.layout)) };
+            }
+        }
+        self.hidden = hidden;
+        self.rebuild_tree(tree_collapsed);
+        self.recount(0);
+        true
     }
 
     /// Folds or unfolds one file: returns the row range it held and how many rows replace it.
@@ -166,25 +194,22 @@ impl View {
             return None;
         }
         let diff = self.parsed.files().get(file)?;
-        let next = Arc::new(file_rows(0, diff, folded, self.layout));
+        let next = if self.is_hidden(file) { Arc::new(Vec::new()) } else { Arc::new(file_rows(0, diff, folded, self.layout)) };
         let old = self.starts[file]..self.starts[file + 1];
         let count = next.len();
         self.rows[file] = next;
         self.folded[file] = folded;
-        if folded {
-            self.folded_count += 1;
-        } else {
-            self.folded_count -= 1;
-        }
         self.recount(file + 1);
         Some((old, count))
     }
 
+    /// `toggleAllDiffFiles(shownFileKeys, …)`: hidden files keep their folds.
     pub fn set_all_folded(&mut self, folded: bool) {
         let files = self.parsed.files();
-        self.rows = files.iter().map(|file| Arc::new(file_rows(0, file, folded, self.layout))).collect();
-        self.folded = vec![folded; files.len()];
-        self.folded_count = if folded { files.len() } else { 0 };
+        for (i, file) in files.iter().enumerate().filter(|(i, _)| !self.hidden[*i]) {
+            self.rows[i] = Arc::new(file_rows(0, file, folded, self.layout));
+            self.folded[i] = folded;
+        }
         self.recount(0);
     }
 
@@ -193,7 +218,8 @@ impl View {
     }
 
     pub fn rebuild_tree(&mut self, tree_collapsed: &HashSet<String>) {
-        self.tree = file_tree_rows(self.parsed.files(), tree_collapsed);
+        let hidden = &self.hidden;
+        self.tree = file_tree_rows_shown(self.parsed.files(), tree_collapsed, |file| !hidden[file]);
     }
 }
 
@@ -227,7 +253,7 @@ fn rows_for(files: &[FileDiff], keys: &[String], folded: &[bool], layout: Layout
     let cached: std::collections::HashMap<_, _> = previous.into_iter().flat_map(|view| view.keys.iter().enumerate().map(move |(i, key)| (key.as_str(), (view, i)))).collect();
     files.iter().enumerate().map(|(i, file)| {
         if let Some((view, old)) = cached.get(keys[i].as_str())
-            && view.layout == layout && view.folded[*old] == folded[i]
+            && view.layout == layout && view.folded[*old] == folded[i] && !view.hidden[*old]
             && same_rows(&view.parsed.files()[*old], file) {
             return view.rows[*old].clone();
         }

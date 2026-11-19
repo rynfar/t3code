@@ -92,6 +92,8 @@ pub struct GitStore {
     success_timer: Option<Task<()>>,
     tick: Option<Task<()>>,
     wake: Option<Task<()>>,
+    /// The typed message from the last failed `Commit` in `(cwd, message)`, restored on reopen.
+    failed_commit_message: Option<(String, String)>,
     _subscription: Subscription,
 }
 
@@ -161,6 +163,7 @@ impl GitStore {
             success_timer: None,
             tick: None,
             wake: None,
+            failed_commit_message: None,
             _subscription: subscription,
         };
         store.sync_target(cx);
@@ -221,6 +224,7 @@ impl GitStore {
             self.target = None;
             self.status = None;
             self.status_error = None;
+            self.failed_commit_message = None;
             cx.emit(GitEvent::Changed);
         }
         if connected {
@@ -247,6 +251,7 @@ impl GitStore {
             self.status_error = None;
             self.success = None;
             self.optimistic_branch = None;
+            self.failed_commit_message = None;
             self.refs.reset();
             self.refs_task = None;
             self.start_status_feed(cx);
@@ -313,6 +318,34 @@ impl GitStore {
     /// Whether this device may record a branch on the thread (`canUpdateThreadBranch`).
     pub fn can_operate_thread(&self) -> bool {
         vcs::can_operate_thread(self.grants.as_ref())
+    }
+
+    /// The project's checkout root (`workingTree.rootPath` of the project's status), which the
+    /// open status names only while the thread works in the project folder itself.
+    pub fn project_checkout_root(&self) -> Option<&str> {
+        self.target.as_ref().filter(|target| target.worktree_path.is_none() && target.cwd == target.project_cwd)?;
+        self.status.as_ref()?.local.working_tree.root_path.as_deref()
+    }
+
+    /// Whether this device may mutate git/source control (`AuthSourceControlWriteScope`).
+    pub fn can_write_source_control(&self) -> bool {
+        self.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::SOURCE_CONTROL_WRITE_SCOPE))
+    }
+
+    /// Whether this device may switch or create a feature branch for the current target
+    /// (`canChangeThreadBranch` in `GitActionsControl.tsx`).
+    pub fn can_change_target_branch(&self) -> bool {
+        self.can_write_source_control() && (self.target.as_ref().is_some_and(|target| target.is_draft) || self.can_operate_thread())
+    }
+
+    /// Returns and consumes a failed commit's typed message for the active checkout (`pingdotgg/t3code#35781`).
+    pub fn take_failed_commit_message(&mut self) -> Option<String> {
+        let cwd = self.target.as_ref().map(|target| target.cwd.as_str())?;
+        self.failed_commit_message.take().and_then(|(saved_cwd, msg)| (saved_cwd == cwd).then_some(msg))
+    }
+
+    pub fn clear_failed_commit_message(&mut self) {
+        self.failed_commit_message = None;
     }
 
     fn start_status_feed(&mut self, cx: &mut Context<Self>) {
@@ -410,7 +443,7 @@ impl GitStore {
 
     /// `runGitActionWithToast` after any default-branch confirmation.
     pub fn run_stacked_action(&mut self, action: StackedAction, commit_message: Option<String>, file_paths: Option<Vec<String>>, feature_branch: bool, cx: &mut Context<Self>) {
-        if self.is_running() {
+        if self.is_running() || !self.can_write_source_control() || (feature_branch && !self.can_change_target_branch()) {
             return;
         }
         let (Some(origin), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else { return };
@@ -456,7 +489,7 @@ impl GitStore {
                 });
             }
             let result: Result<RunResult, String> = net.await.unwrap_or_else(|_| Err("Source control action failed.".into()));
-            let _ = this.update(cx, |store, cx| store.finish_stacked_action(&origin, terms, result, cx));
+            let _ = this.update(cx, |store, cx| store.finish_stacked_action(&origin, terms, action, commit_message, result, cx));
         })
         .detach();
     }
@@ -466,9 +499,12 @@ impl GitStore {
         self.target.as_ref().is_some_and(|target| target.cwd == origin.cwd)
     }
 
-    fn finish_stacked_action(&mut self, origin: &Target, terms: Terminology, result: Result<RunResult, String>, cx: &mut Context<Self>) {
+    fn finish_stacked_action(&mut self, origin: &Target, terms: Terminology, action: StackedAction, commit_message: Option<String>, result: Result<RunResult, String>, cx: &mut Context<Self>) {
         match result {
             Ok(result) => {
+                if self.failed_commit_message.as_ref().is_some_and(|(cwd, _)| *cwd == origin.cwd) {
+                    self.failed_commit_message = None;
+                }
                 // `persistThreadBranchSync` for the thread the action ran for.
                 if !origin.is_draft
                     && let Some(branch) = result.created_branch()
@@ -483,6 +519,11 @@ impl GitStore {
                 self.finish(success, cx);
             }
             Err(message) => {
+                if action == StackedAction::Commit
+                    && let Some(typed) = commit_message.filter(|text| !text.trim().is_empty())
+                {
+                    self.failed_commit_message = Some((origin.cwd.clone(), typed));
+                }
                 self.finish(None, cx);
                 self.toast(Toast::new(ToastKind::Error, "Action failed").description(message), cx);
             }
@@ -491,7 +532,7 @@ impl GitStore {
 
     /// The quick action's Pull.
     pub fn pull(&mut self, cx: &mut Context<Self>) {
-        if self.is_running() {
+        if self.is_running() || !self.can_write_source_control() {
             return;
         }
         let Some(target) = self.target.clone() else { return };
@@ -515,6 +556,9 @@ impl GitStore {
 
     /// "Initialize Git" for a project folder that is not a repository yet.
     pub fn init_repo(&mut self, cx: &mut Context<Self>) {
+        if self.initializing || !self.can_write_source_control() {
+            return;
+        }
         let Some(target) = self.target.as_ref() else { return };
         let Some(task) = self.state.read(cx).request(method::VCS_INIT, vcs::init(&target.cwd), Ok) else { return };
         self.initializing = true;
@@ -606,8 +650,8 @@ impl GitStore {
         if self.branch_pending || (!origin.is_draft && !self.can_operate_thread()) {
             return;
         }
-        let selection = vcs::branch_selection_target(&origin.project_cwd, origin.worktree_path.as_deref(), item);
-        if !origin.is_draft && selection.reuse_existing_worktree {
+        let selection = vcs::branch_selection_target(&origin.project_cwd, self.project_checkout_root(), origin.worktree_path.as_deref(), item);
+        if !origin.is_draft && vcs::records_existing_worktree(&selection, self.can_change_branch()) {
             self.set_thread_branch(&origin, Some(&item.name), selection.next_worktree_path.as_deref(), cx);
             return;
         }
@@ -728,13 +772,23 @@ impl GitStore {
         self.target.as_ref().is_some_and(|target| self.terminals.script_running(&target.thread_id, script_id))
     }
 
-    /// `runProjectScript`: in the script's idle thread terminal, or a fresh one beside it.
+    /// Whether this device may run project scripts in thread terminals (`AuthTerminalOperateScope`).
+    pub fn can_run_scripts(&self) -> bool {
+        self.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::TERMINAL_OPERATE_SCOPE))
+    }
+
+    /// `runProjectScript`: in the script's idle thread terminal, or a fresh one beside it. A
+    /// `stopOnSettle` script, or a device that cannot read terminals, always opens a new one.
     pub fn run_script(&mut self, script: &ProjectScript, cx: &mut Context<Self>) {
+        if !self.can_run_scripts() {
+            return;
+        }
         let (Some(target), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else { return };
         let suffix: String = uuid_v4().chars().take(8).collect();
-        let terminal_id = self.terminals.terminal_for_run(&target.thread_id, &script.id, &suffix);
-        let open = project_scripts::open_terminal(&target.thread_id, &terminal_id, &target.project_cwd, target.worktree_path.as_deref());
-        let write = project_scripts::write_terminal(&target.thread_id, &terminal_id, &project_scripts::terminal_input(&script.command));
+        let can_reuse = self.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::TERMINAL_READ_SCOPE));
+        let launch = self.terminals.launch_for(&target.thread_id, script, can_reuse, &suffix);
+        let open = project_scripts::open_script_terminal(&target.thread_id, &launch, &target.project_cwd, target.worktree_path.as_deref(), script.stops_on_settle());
+        let write = project_scripts::write_terminal(&target.thread_id, &launch.terminal_id, &project_scripts::terminal_input(&script.command));
         let name = script.name.clone();
         let task = runtime.spawn(async move {
             client.request(method::TERMINAL_OPEN, open).await?;
@@ -753,6 +807,26 @@ impl GitStore {
 
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, String> {
     serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+/// The thread card's Add or Edit action (`ProjectScriptsControl`'s editor request), waiting for
+/// Settings → Projects to show the project; its action editor takes it from there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptEditorRequest {
+    pub project_id: String,
+    /// `None` adds an action.
+    pub script_id: Option<String>,
+}
+
+#[derive(Default)]
+pub struct PendingScriptEditor(pub Option<ScriptEditorRequest>);
+
+impl gpui::Global for PendingScriptEditor {}
+
+/// Opens the action editor on `project_id`'s actions: Add, or Edit on `script_id`.
+pub fn open_script_editor(project_id: &str, script_id: Option<&str>, cx: &mut App) {
+    cx.set_global(PendingScriptEditor(Some(ScriptEditorRequest { project_id: project_id.to_owned(), script_id: script_id.map(str::to_owned) })));
+    crate::settings::open_project(project_id, cx);
 }
 
 pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<GitStore> {

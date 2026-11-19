@@ -71,6 +71,7 @@ pub struct FilePatchState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchTicket {
     pub scope: ReviewScope,
+    pub commit_sha: Option<String>,
     pub revision: u64,
     pub file: ReviewFile,
     pub cwd: String,
@@ -80,6 +81,9 @@ pub struct PatchTicket {
 impl PatchTicket {
     pub fn request(&self) -> (&'static str, Value) {
         let (method, mut input) = diff_preview_request(&self.cwd, self.base_ref.as_deref(), self.scope.ignore_whitespace);
+        if let Some(sha) = &self.commit_sha {
+            input["commitSha"] = json!(sha);
+        }
         input["file"] = json!({"path": self.file.path, "previousPath": self.file.previous_path, "sourceKind": self.scope.kind.wire()});
         (method, input)
     }
@@ -88,6 +92,7 @@ impl PatchTicket {
 #[derive(Debug, Clone)]
 pub struct ReviewModel {
     pub scope: ReviewScope,
+    pub commit_sha: Option<String>,
     pub source: Option<Arc<DiffPreviewSource>>,
     pub incomplete: bool,
     pub repository: bool,
@@ -102,6 +107,7 @@ impl ReviewModel {
     pub fn new(scope: ReviewScope) -> Self {
         Self {
             scope,
+            commit_sha: None,
             source: None,
             incomplete: false,
             repository: true,
@@ -111,6 +117,21 @@ impl ReviewModel {
             rendered: Arc::new(ParsedPatch::Empty),
             render_version: 0,
         }
+    }
+
+    pub fn with_commit(mut self, commit_sha: Option<String>) -> Self {
+        self.commit_sha = commit_sha;
+        self
+    }
+
+    pub fn request(&self, tracked_only: bool) -> (&'static str, Value) {
+        if let Some(sha) = &self.commit_sha {
+            let (method, mut payload) = diff_preview_request(&self.scope.cwd, self.scope.base_ref.as_deref(), self.scope.ignore_whitespace);
+            payload["commitSha"] = json!(sha);
+            payload["metadataOnly"] = json!(true);
+            return (method, payload);
+        }
+        self.scope.request(tracked_only)
     }
 
     pub fn has_complete_preview(&self) -> bool {
@@ -216,6 +237,7 @@ impl ReviewModel {
                 );
                 PatchTicket {
                     scope: self.scope.clone(),
+                    commit_sha: self.source.as_ref().filter(|s| s.kind == PreviewSourceKind::Commit).and_then(|s| s.id.clone()).or_else(|| self.commit_sha.clone()),
                     revision: self.revision,
                     file,
                     cwd: self
@@ -235,6 +257,7 @@ impl ReviewModel {
 
     pub fn accept_patch(&mut self, ticket: &PatchTicket, result: Result<DiffPreviewSource, String>) -> bool {
         if ticket.scope != self.scope
+            || ticket.commit_sha != (self.source.as_ref().filter(|s| s.kind == PreviewSourceKind::Commit).and_then(|s| s.id.clone()).or_else(|| self.commit_sha.clone()))
             || ticket.revision != self.revision
             || !self.files().iter().any(|f| f.identity() == ticket.file.identity())
         {

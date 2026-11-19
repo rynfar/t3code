@@ -55,8 +55,12 @@ impl GitDialogs {
 
     /// `runGitActionWithToast`: pushing from the default branch asks first; anything else runs.
     pub fn request_action(&mut self, request: ActionRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.git.read(cx);
+        if !store.can_write_source_control() || (request.feature_branch && !store.can_change_target_branch()) {
+            return;
+        }
         let ActionRequest { action, commit_message, file_paths, feature_branch, skip_prompt } = request;
-        let status = self.git.read(cx).status.clone();
+        let status = store.status.clone();
         let branch = status.as_ref().and_then(|status| status.local.ref_name.clone());
         let is_default = !feature_branch && status.as_ref().is_some_and(|status| status.local.is_default_ref);
         let has_changes = status.as_ref().is_some_and(|status| status.local.has_working_tree_changes);
@@ -74,7 +78,8 @@ impl GitDialogs {
 
     /// `continuePendingDefaultBranchAction`.
     fn continue_pending(&mut self, feature_branch: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if feature_branch && self.feature_branch_unavailable(cx).is_some() {
+        let store = self.git.read(cx);
+        if !store.can_write_source_control() || (feature_branch && (!store.can_change_target_branch() || self.feature_branch_unavailable(cx).is_some())) {
             return;
         }
         let Some(pending) = self.pending.take() else { return };
@@ -91,17 +96,20 @@ impl GitDialogs {
     }
 
     pub fn open_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let restored = self.git.update(cx, |git, _| git.take_failed_commit_message()).unwrap_or_default();
         self.commit = Some(CommitDraft::default());
         self.message.update(cx, |input, cx| {
-            input.set_value("", window, cx);
+            input.set_value(restored, window, cx);
             input.focus(window, cx);
         });
         cx.notify();
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit = None;
         self.pending = None;
+        self.message.update(cx, |input, cx| input.set_value("", window, cx));
+        self.git.update(cx, |git, _| git.clear_failed_commit_message());
         cx.notify();
     }
 
@@ -231,12 +239,15 @@ impl GitDialogs {
             .gap(px(16.))
             .child(summary)
             .child(v_flex().gap(px(4.)).child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Commit message (optional)")).child(Textarea::new(&self.message)));
+        let store = self.git.read(cx);
+        let can_write = store.can_write_source_control();
+        let can_change_branch = store.can_change_target_branch();
         let footer = h_flex()
             .justify_end()
             .gap(px(8.))
-            .child(DialogButton::new("commit-cancel", "Cancel", false).on_click(cx.listener(|this, _, _, cx| this.close(cx))))
-            .child(DialogButton::new("commit-new-branch", "Commit on new branch", false).disabled(none_selected).on_click(cx.listener(|this, _, window, cx| this.commit(true, window, cx))))
-            .child(DialogButton::new("commit-confirm", "Commit", true).disabled(none_selected).on_click(cx.listener(|this, _, window, cx| this.commit(false, window, cx))));
+            .child(DialogButton::new("commit-cancel", "Cancel", false).on_click(cx.listener(|this, _, window, cx| this.close(window, cx))))
+            .child(DialogButton::new("commit-new-branch", "Commit on new branch", false).disabled(!can_change_branch || none_selected).on_click(cx.listener(|this, _, window, cx| this.commit(true, window, cx))))
+            .child(DialogButton::new("commit-confirm", "Commit", true).disabled(!can_write || none_selected).on_click(cx.listener(|this, _, window, cx| this.commit(false, window, cx))));
         let frame = Frame {
             id: "commit-dialog",
             max_width: 512.,
@@ -250,17 +261,20 @@ impl GitDialogs {
     }
 
     fn render_pending(&self, pending: &PendingDefault, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let terms = terminology(self.git.read(cx).status.as_ref().and_then(|status| status.provider_kind()));
+        let store = self.git.read(cx);
+        let can_write = store.can_write_source_control();
+        let can_change_branch = store.can_change_target_branch();
+        let terms = terminology(store.status.as_ref().and_then(|status| status.provider_kind()));
         let copy = git_actions::default_branch_dialog_copy(pending.action, &pending.branch, pending.includes_commit, terms);
         let unavailable = self.feature_branch_unavailable(cx);
         let footer = h_flex()
             .flex_wrap()
             .gap(px(8.))
-            .child(div().mr_auto().child(DialogButton::new("default-branch-abort", "Abort", false).on_click(cx.listener(|this, _, _, cx| this.close(cx)))))
-            .child(DialogButton::new("default-branch-continue", copy.continue_label, false).on_click(cx.listener(|this, _, window, cx| this.continue_pending(false, window, cx))))
+            .child(div().mr_auto().child(DialogButton::new("default-branch-abort", "Abort", false).on_click(cx.listener(|this, _, window, cx| this.close(window, cx)))))
+            .child(DialogButton::new("default-branch-continue", copy.continue_label, false).disabled(!can_write).on_click(cx.listener(|this, _, window, cx| this.continue_pending(false, window, cx))))
             .child(
                 DialogButton::new("default-branch-feature", "Check out feature branch & continue", true)
-                    .disabled(unavailable.is_some())
+                    .disabled(!can_change_branch || unavailable.is_some())
                     .on_click(cx.listener(|this, _, window, cx| this.continue_pending(true, window, cx))),
             );
         let frame = Frame {
@@ -318,18 +332,18 @@ impl Frame {
             .justify_center()
             .p(px(16.))
             .bg(hsla(p.dialog_backdrop))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close(cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close(window, cx)))
             .child(
                 div()
                     .id(id)
                     .track_focus(&focus)
-                    .capture_action(cx.listener(|this, _: &Escape, _, cx| {
-                        this.close(cx);
+                    .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                        this.close(window, cx);
                         cx.stop_propagation();
                     }))
-                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                         if event.keystroke.key == "escape" {
-                            this.close(cx);
+                            this.close(window, cx);
                         }
                     }))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

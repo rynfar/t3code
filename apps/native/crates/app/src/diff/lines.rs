@@ -8,13 +8,17 @@ use gpui::{
     Styled, Window, div, list, prelude::*, px,
 };
 use gpui_component::ActiveTheme;
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{h_flex, v_flex};
-use t3_core::diff::{ChangeKind, DiffLine, DiffRow, FileDiff, LineKind, RecordedContent, compact_count, separator_label};
+use t3_core::diff::{
+    ChangeKind, DiffLine, DiffRow, FileContextMenuAction, FileDiff, LineKind, RecordedContent,
+    compact_count, separator_label,
+};
 
 use super::DiffPanel;
 use crate::icons::Icon;
-use crate::right_panel::{Button, Size, Variant};
+use crate::right_panel::{Button, Size, Variant, tooltip_view};
 use crate::theme::{Palette, hsla, palette};
 
 pub const LINE_HEIGHT: f32 = 20.;
@@ -304,6 +308,9 @@ impl DiffPanel {
             _ => file.path().to_owned(),
         };
         let path_label = file.path().to_owned();
+        let copied = self.is_path_copied(file.path());
+        let context_menu = self.file_context_menu(file_ix, cx);
+        let entity = cx.entity().downgrade();
         let toggle = cx.listener(move |this, _, _, cx| this.toggle_file(file_ix, cx));
         let toggle_button = cx.listener(move |this, _, _, cx| this.toggle_file(file_ix, cx));
         let copy = cx.listener(move |this, _, _, cx| this.copy_path(file_ix, cx));
@@ -343,15 +350,42 @@ impl DiffPanel {
                     .on_click(move |event, window, cx| toggle_button(event, window, cx)),
             )
             .child(icon.svg().size(px(14.)).text_color(icon_color))
-            .child(div().min_w_0().text_ellipsis_start().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::MEDIUM).child(title))
-            .child(
+            .child({
+                let title = div().id(("diff-file-title", file_ix)).min_w_0().text_ellipsis_start().overflow_hidden().whitespace_nowrap().font_weight(FontWeight::MEDIUM).child(title);
+                // The title opens the file; the rest of the header folds it (`onClickCapture`).
+                if self.is_external() { title } else {
+                    let hover = hsla(mix_rgba(p.code_foreground, p.primary, 0.16));
+                    title.hover(move |style| style.text_color(hover)).on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.open_file(file_ix, cx);
+                    }))
+                }
+            })
+            .child(if copied {
+                div()
+                    .id(("diff-file-copy", file_ix))
+                    .size(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .child(Icon::Check.svg().size(px(12.)).text_color(hsla(p.success)))
+                    .tooltip(|window, cx| tooltip_view("Copied".into(), window, cx))
+                    .on_click(move |event, window, cx| {
+                        cx.stop_propagation();
+                        copy(event, window, cx);
+                    })
+                    .into_any_element()
+            } else {
                 Button::new(("diff-file-copy", file_ix))
                     .variant(Variant::Ghost)
                     .size(Size::IconMicro)
                     .icon(Icon::Copy)
                     .tooltip(format!("Copy {path_label}"))
-                    .on_click(move |event, window, cx| copy(event, window, cx)),
-            )
+                    .on_click(move |event, window, cx| copy(event, window, cx))
+                    .into_any_element()
+            })
             .child(div().flex_1())
             .children(patch_state.as_ref().filter(|state| state.files.is_none() && state.error.is_none()).map(|_| div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Loading diff…")))
             .children(patch_state.as_ref().filter(|state| state.error.is_some()).map(|_| {
@@ -360,8 +394,56 @@ impl DiffPanel {
             }))
             .children(patch_state.as_ref().filter(|state| state.truncated).map(|_| div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Partial diff preview")))
             .child(stat_label(u64::from(file.additions), u64::from(file.deletions), cx))
-            .into_any_element()
+            .map(|this| match context_menu {
+                Some((absolute_path, capabilities)) => this
+                    .context_menu(move |mut menu, window, cx| {
+                        let item = |label: SharedString, icon: Icon, action: FileContextMenuAction| {
+                            let entity = entity.clone();
+                            let absolute_path = absolute_path.clone();
+                            PopupMenuItem::new(label).icon(gpui_component::Icon::empty().path(icon.path())).on_click(move |_, _, cx| {
+                                if let Some(entity) = entity.upgrade() {
+                                    entity.update(cx, |panel, cx| panel.activate_file_context_menu(action.clone(), absolute_path.clone(), cx));
+                                }
+                            })
+                        };
+                        if capabilities.can_open_default {
+                            menu = menu.item(item("Open".into(), Icon::Pencil, FileContextMenuAction::Open));
+                        }
+                        if let Some(reveal_label) = capabilities.reveal_label {
+                            menu = menu.item(item(reveal_label.into(), Icon::FolderTree, FileContextMenuAction::RevealInFolder));
+                        }
+                        if !capabilities.editors.is_empty() {
+                            let editors = capabilities.editors.clone();
+                            let entity = entity.clone();
+                            let absolute_path = absolute_path.clone();
+                            menu = menu.submenu("Open with", window, cx, move |menu, _, _| {
+                                editors.iter().fold(menu, |menu, (id, label)| {
+                                    let entity = entity.clone();
+                                    let absolute_path = absolute_path.clone();
+                                    let action = FileContextMenuAction::Editor { id: id.clone(), label: label.clone() };
+                                    menu.item(PopupMenuItem::new(label.clone()).on_click(move |_, _, cx| {
+                                        if let Some(entity) = entity.upgrade() {
+                                            entity.update(cx, |panel, cx| panel.activate_file_context_menu(action.clone(), absolute_path.clone(), cx));
+                                        }
+                                    }))
+                                })
+                            });
+                        }
+                        menu
+                    })
+                    .into_any_element(),
+                None => this.into_any_element(),
+            })
     }
+}
+
+/// `color-mix(in srgb, a (1-t), b t)` over packed `0xRRGGBBAA` tokens.
+fn mix_rgba(a: u32, b: u32, t: f32) -> u32 {
+    (0..4).fold(0u32, |out, channel| {
+        let shift = 24 - channel * 8;
+        let (x, y) = (((a >> shift) & 0xff) as f32, ((b >> shift) & 0xff) as f32);
+        out | (((x + (y - x) * t).round() as u32) << shift)
+    })
 }
 
 /// The shared diff row surface, also used by the embedded typography sample.

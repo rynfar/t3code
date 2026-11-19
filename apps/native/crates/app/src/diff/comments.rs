@@ -313,6 +313,7 @@ index 1111111..2222222 100644
                 (format!("turn:{}", summary.run_id), format!("Turn {}", summary.turn_count))
             }
             DiffScope::ToolCall(target) => (format!("tool-call:{}:{}", target.thread_id, target.item_id), "Tool call".into()),
+            DiffScope::Commit { sha, .. } => (format!("commit:{sha}"), format!("Commit {}", &sha[..sha.len().min(7)])),
             DiffScope::NoTurns => return,
         };
         let Some(diff) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)) else { return };
