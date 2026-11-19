@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use t3_core::auth::AuthSessionState;
@@ -22,12 +22,14 @@ use tokio::task::JoinHandle;
 
 use crate::auth::{self, AuthError, Credentials};
 use crate::routes::{
-    CandidateRoute, ROUTE_CHECK_HEAD_START, ROUTE_CHECK_TIMEOUT, ReportedEndpoint, RouteAttemptError,
-    RouteCheck, connect_over_routes, merge_learned_routes, normalize_http_base,
+    BETTER_ROUTE_CHECK_INTERVAL, BETTER_ROUTE_COOLDOWN, CandidateRoute, ROUTE_CHECK_HEAD_START,
+    ROUTE_CHECK_TIMEOUT, ReportedEndpoint, RouteAttemptError, RouteCheck, SILENT_ROUTE_BACKOFF_MAX,
+    connect_over_routes, merge_learned_routes, normalize_http_base,
 };
 use crate::session::{OpenError, RpcError, Session, StreamHandle};
 use crate::wakeups::{
     self, ConnectionWakeup, probe_timeout_for, reaches_connection_supervisor, resets_retry_backoff,
+    should_resubscribe_after_wakeup,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,6 +497,8 @@ async fn supervise(
     config_extras: Arc<watch::Sender<ServerConfigExtras>>,
 ) {
     let mut routes = initial_candidate_routes(&credentials, alternate_routes, prepare.is_some());
+    let mut preferred_route_id: Option<String> = None;
+    let mut last_route_switch: Option<Instant> = None;
     let mut wakeup_rx = wakeups::subscribe();
     let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
     let mut attempt: u32 = 0;
@@ -521,8 +525,10 @@ async fn supervise(
             },
             None => Ok(()),
         };
+        let ordered_routes = prioritize_preferred_route(&routes, preferred_route_id.as_deref());
+        preferred_route_id = None;
         let outcome = match prepared {
-            Ok(()) => match connect_draining(&credentials, &routes, expected_environment_id.as_deref(), &mut commands, &mut wakeup_rx, &mut resume).await {
+            Ok(()) => match connect_draining(&credentials, &ordered_routes, expected_environment_id.as_deref(), &mut commands, &mut wakeup_rx, &mut resume).await {
                 ConnectOutcome::Done(result) => result,
                 ConnectOutcome::RetryNow => {
                     attempt = 0;
@@ -554,6 +560,7 @@ async fn supervise(
                     &active_route,
                     &mut routes,
                     &mut expected_environment_id,
+                    last_route_switch,
                     &mut resume,
                     &mut commands,
                     &mut wakeup_rx,
@@ -565,6 +572,18 @@ async fn supervise(
                 fetch.stop();
                 match end {
                     SessionEnd::Closed(reason) => (reason, false),
+                    SessionEnd::ReconnectImmediately => {
+                        attempt = 0;
+                        awaiting_approval = false;
+                        continue;
+                    }
+                    SessionEnd::SwitchRoute(route_id) => {
+                        preferred_route_id = Some(route_id);
+                        last_route_switch = Some(Instant::now());
+                        attempt = 0;
+                        awaiting_approval = false;
+                        continue;
+                    }
                     SessionEnd::Dropped => return,
                 }
             }
@@ -646,9 +665,25 @@ enum WaitOutcome {
     Dropped,
 }
 
+fn prioritize_preferred_route(routes: &[CandidateRoute], preferred_route_id: Option<&str>) -> Vec<CandidateRoute> {
+    let Some(preferred_id) = preferred_route_id else {
+        return routes.to_vec();
+    };
+    let mut ordered = Vec::with_capacity(routes.len());
+    if let Some(preferred) = routes.iter().find(|route| route.id == preferred_id) {
+        ordered.push(preferred.clone());
+    }
+    for route in routes {
+        if route.id != preferred_id {
+            ordered.push(route.clone());
+        }
+    }
+    ordered
+}
+
 /// Runs `prepare` while keeping track of threads opened or closed and failing dispatches.
-/// A `RetryNow` or long OS wake interrupts a stalled preparation so a dead route never holds
-/// reconnect (`pingdotgg/t3code#34623`, `pingdotgg/t3code#24932`, `wakeups.ts`).
+/// A `RetryNow` or backoff-resetting OS wake interrupts a stalled preparation so a dead route
+/// never holds reconnect (`pingdotgg/t3code#34623`, `pingdotgg/t3code#24932`, `wakeups.ts`).
 async fn prepare_draining(
     prepare: &Prepare,
     commands: &mut mpsc::UnboundedReceiver<Command>,
@@ -661,22 +696,23 @@ async fn prepare_draining(
         tokio::select! {
             prepared = &mut preparation => return PrepareOutcome::Done(prepared),
             reason = next_wakeup(wakeup_rx) => {
-                if reason == ConnectionWakeup::ApplicationActiveLong {
+                if resets_retry_backoff(reason) {
                     return PrepareOutcome::RetryNow;
                 }
             }
             command = commands.recv() => match command {
                 None => return PrepareOutcome::Dropped,
                 Some(Command::RetryNow) => return PrepareOutcome::RetryNow,
-                Some(Command::Wakeup(ConnectionWakeup::ApplicationActiveLong)) => return PrepareOutcome::RetryNow,
+                Some(Command::Wakeup(reason)) if resets_retry_backoff(reason) => return PrepareOutcome::RetryNow,
                 Some(command) => drain_command(command, resume),
             }
         }
     }
 }
 
-/// Runs multi-route `connect` while listening for handle drop, `RetryNow`, or long OS wake so a
-/// stalled ticket or dead route never blocks recovery (`pingdotgg/t3code#34623`, `#24932`, `wakeups.ts`).
+/// Runs multi-route `connect` while listening for handle drop, `RetryNow`, or backoff-resetting
+/// OS wake so a stalled ticket or dead route never blocks recovery (`pingdotgg/t3code#34623`,
+/// `#24932`, `wakeups.ts`).
 async fn connect_draining(
     credentials: &Credentials,
     routes: &[CandidateRoute],
@@ -691,14 +727,14 @@ async fn connect_draining(
         tokio::select! {
             result = &mut attempt => return ConnectOutcome::Done(result),
             reason = next_wakeup(wakeup_rx) => {
-                if reason == ConnectionWakeup::ApplicationActiveLong {
+                if resets_retry_backoff(reason) {
                     return ConnectOutcome::RetryNow;
                 }
             }
             command = commands.recv() => match command {
                 None => return ConnectOutcome::Dropped,
                 Some(Command::RetryNow) => return ConnectOutcome::RetryNow,
-                Some(Command::Wakeup(ConnectionWakeup::ApplicationActiveLong)) => return ConnectOutcome::RetryNow,
+                Some(Command::Wakeup(reason)) if resets_retry_backoff(reason) => return ConnectOutcome::RetryNow,
                 Some(command) => drain_command(command, resume),
             }
         }
@@ -848,7 +884,187 @@ async fn wait_draining(
 
 enum SessionEnd {
     Closed(String),
+    ReconnectImmediately,
+    SwitchRoute(String),
     Dropped,
+}
+
+enum WakeProbeResult {
+    Alive(ConnectionWakeup),
+    ReplaceImmediately,
+    Failed(String),
+}
+
+struct RunningWakeProbe {
+    reason: ConnectionWakeup,
+    task: JoinHandle<()>,
+    rx: oneshot::Receiver<WakeProbeResult>,
+}
+
+impl RunningWakeProbe {
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+/// Runs a wakeup liveness check off the `run_session` dispatch loop so live RPCs and streams are
+/// never stalled while probing a half-open socket (`supervisor.ts:788-899`).
+fn spawn_wake_probe(
+    session: Session,
+    http_base: String,
+    reason: ConnectionWakeup,
+    nearby: bool,
+) -> Option<RunningWakeProbe> {
+    let timeout = probe_timeout_for(reason, nearby)?;
+    let (tx, rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let tolerates_miss = reason == ConnectionWakeup::ApplicationActiveProbe;
+        let long_resume = reason == ConnectionWakeup::ApplicationActiveLong;
+        let outcome = if tolerates_miss {
+            // Foreground probe (`supervisor.ts:789-792, 857-863`): a busy host can miss one probe
+            // while still healthy, so retry once before declaring the session dead.
+            if session.probe(timeout).await || session.probe(timeout).await {
+                WakeProbeResult::Alive(reason)
+            } else {
+                WakeProbeResult::Failed("Connection did not respond to a connection health check.".into())
+            }
+        } else {
+            // Non-foreground wake (`ApplicationActive`, `ApplicationActiveLong`, `NetworkChanged`):
+            // race the WebSocket probe against an HTTP host check (`awaitSilentSocket`). If HTTP
+            // answers while the socket stays silent, replace the socket immediately.
+            let ws_probe = session.probe(timeout);
+            let http_check = async {
+                auth::fetch_descriptor_timeout(&http_base, timeout).await.is_ok()
+            };
+            tokio::pin!(ws_probe);
+            tokio::pin!(http_check);
+            let mut http_done = false;
+            loop {
+                tokio::select! {
+                    alive = &mut ws_probe => {
+                        break if alive {
+                            WakeProbeResult::Alive(reason)
+                        } else if long_resume {
+                            WakeProbeResult::ReplaceImmediately
+                        } else {
+                            WakeProbeResult::Failed("Connection did not respond after system wake.".into())
+                        };
+                    }
+                    reachable = &mut http_check, if !http_done => {
+                        http_done = true;
+                        if reachable {
+                            // Host answered HTTP; give the WebSocket a brief grace window to see a
+                            // frame before treating it as a silent socket to replace immediately.
+                            let grace = Duration::from_millis(250).min(timeout);
+                            if session.probe(grace).await {
+                                break WakeProbeResult::Alive(reason);
+                            }
+                            break WakeProbeResult::ReplaceImmediately;
+                        }
+                    }
+                }
+            }
+        };
+        let _ = tx.send(outcome);
+    });
+    Some(RunningWakeProbe { reason, task, rx })
+}
+
+async fn next_wake_probe(probe: &mut Option<RunningWakeProbe>) -> WakeProbeResult {
+    match probe.as_mut() {
+        Some(running) => match (&mut running.rx).await {
+            Ok(result) => {
+                *probe = None;
+                result
+            }
+            Err(_) => {
+                *probe = None;
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+struct RunningBetterRouteProbe {
+    task: JoinHandle<()>,
+    rx: oneshot::Receiver<Option<String>>,
+}
+
+impl RunningBetterRouteProbe {
+    fn abort(self) {
+        self.task.abort();
+    }
+}
+
+fn better_ranked_routes(routes: &[CandidateRoute], active_route: &CandidateRoute) -> Vec<CandidateRoute> {
+    let active_rank = active_route.kind().rank();
+    let mut better: Vec<CandidateRoute> = routes
+        .iter()
+        .filter(|candidate| candidate.id != active_route.id && candidate.kind().rank() < active_rank)
+        .cloned()
+        .collect();
+    better.sort_by_key(|candidate| candidate.kind().rank());
+    better
+}
+
+fn spawn_better_route_probe(
+    candidates: Vec<CandidateRoute>,
+    expected_environment_id: Option<String>,
+) -> RunningBetterRouteProbe {
+    let (tx, rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        for candidate in candidates {
+            if let Ok(descriptor) = auth::fetch_descriptor_timeout(&candidate.http_base, ROUTE_CHECK_TIMEOUT).await
+                && expected_environment_id
+                    .as_deref()
+                    .is_none_or(|wanted| descriptor.environment_id.is_empty() || descriptor.environment_id == wanted)
+            {
+                let _ = tx.send(Some(candidate.id));
+                return;
+            }
+        }
+        let _ = tx.send(None);
+    });
+    RunningBetterRouteProbe { task, rx }
+}
+
+async fn next_better_route_probe(probe: &mut Option<RunningBetterRouteProbe>) -> Option<String> {
+    match probe.as_mut() {
+        Some(running) => match (&mut running.rx).await {
+            Ok(result) => {
+                *probe = None;
+                result
+            }
+            Err(_) => {
+                *probe = None;
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+fn next_better_route_deadline(
+    active_route: &CandidateRoute,
+    routes: &[CandidateRoute],
+    last_route_switch: Option<Instant>,
+    delay: Duration,
+) -> Option<tokio::time::Instant> {
+    if better_ranked_routes(routes, active_route).is_empty() {
+        return None;
+    }
+    let cooldown_remaining = last_route_switch
+        .map(|switched| BETTER_ROUTE_COOLDOWN.saturating_sub(switched.elapsed()))
+        .unwrap_or(Duration::ZERO);
+    Some(tokio::time::Instant::now() + delay.max(cooldown_remaining))
+}
+
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 enum ThreadDelivery {
@@ -1051,6 +1267,7 @@ async fn run_session(
     active_route: &CandidateRoute,
     routes: &mut Vec<CandidateRoute>,
     expected_environment_id: &mut Option<String>,
+    last_route_switch: Option<Instant>,
     resume: &mut Resume,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     wakeup_rx: &mut tokio::sync::broadcast::Receiver<ConnectionWakeup>,
@@ -1086,6 +1303,12 @@ async fn run_session(
         forwarders.insert(thread_id.clone(), forward_thread(session, &thread_id, sequence, thread_tx.clone()));
     }
     let nearby = active_route.kind().is_nearby();
+    let mut wake_probe: Option<RunningWakeProbe> = None;
+    let mut better_route_backoff = BETTER_ROUTE_CHECK_INTERVAL;
+    let mut better_route_probe: Option<RunningBetterRouteProbe> = None;
+    let mut better_route_deadline =
+        next_better_route_deadline(active_route, routes, last_route_switch, better_route_backoff);
+
     let end = loop {
         tokio::select! {
             value = shell.receiver.recv() => match value {
@@ -1119,6 +1342,14 @@ async fn run_session(
                     match serde_json::from_value::<ServerConfigStreamEvent>(value) {
                         Ok(event) => {
                             absorb_learned_routes(active_route, routes, expected_environment_id, config_extras, &event);
+                            if better_route_probe.is_none() && better_route_deadline.is_none() {
+                                better_route_deadline = next_better_route_deadline(
+                                    active_route,
+                                    routes,
+                                    last_route_switch,
+                                    better_route_backoff,
+                                );
+                            }
                             let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await;
                         }
                         Err(error) => report(events, "server config", error.to_string()).await,
@@ -1148,11 +1379,61 @@ async fn run_session(
                     ThreadDelivery::RpcError(error) => report(events, &format!("thread {thread_id}"), error.to_string()).await,
                 }
             }
+            probe_result = next_wake_probe(&mut wake_probe) => match probe_result {
+                WakeProbeResult::Alive(reason) => {
+                    if should_resubscribe_after_wakeup(reason) {
+                        fetch.start();
+                        match session.stream(method::SUBSCRIBE_SHELL, commands::subscribe_shell(resume.shell, options)) {
+                            Ok(fresh) => shell = fresh,
+                            Err(error) => break SessionEnd::Closed(format!("Post-wake shell resubscribe failed: {error}")),
+                        }
+                        if server_config.is_none() {
+                            server_config = session
+                                .stream(method::SUBSCRIBE_SERVER_CONFIG, subscribe_server_config_payload())
+                                .ok();
+                        }
+                    }
+                }
+                WakeProbeResult::ReplaceImmediately => break SessionEnd::ReconnectImmediately,
+                WakeProbeResult::Failed(reason) => break SessionEnd::Closed(reason),
+            },
+            _ = sleep_until_opt(better_route_deadline), if better_route_probe.is_none() => {
+                better_route_deadline = None;
+                let better = better_ranked_routes(routes, active_route);
+                if !better.is_empty() {
+                    better_route_probe = Some(spawn_better_route_probe(better, expected_environment_id.clone()));
+                }
+            }
+            better_result = next_better_route_probe(&mut better_route_probe) => {
+                if let Some(better_id) = better_result {
+                    break SessionEnd::SwitchRoute(better_id);
+                }
+                better_route_backoff = (better_route_backoff * 2).min(SILENT_ROUTE_BACKOFF_MAX);
+                better_route_deadline = next_better_route_deadline(
+                    active_route,
+                    routes,
+                    last_route_switch,
+                    better_route_backoff,
+                );
+            }
             reason = next_wakeup(wakeup_rx) => {
-                if let Some(timeout) = probe_timeout_for(reason, nearby)
-                    && !session.probe(timeout).await
+                let supersede = wake_probe
+                    .as_ref()
+                    .is_none_or(|running| running.reason == ConnectionWakeup::ApplicationActiveProbe && reason != ConnectionWakeup::ApplicationActiveProbe);
+                if supersede
+                    && let Some(next_probe) = spawn_wake_probe(session.clone(), active_route.http_base.clone(), reason, nearby)
+                    && let Some(prev) = wake_probe.replace(next_probe)
                 {
-                    break SessionEnd::Closed("Connection did not respond after system wake.".into());
+                    prev.abort();
+                }
+                if better_route_probe.is_none() && !better_ranked_routes(routes, active_route).is_empty() {
+                    better_route_backoff = BETTER_ROUTE_CHECK_INTERVAL;
+                    better_route_deadline = next_better_route_deadline(
+                        active_route,
+                        routes,
+                        last_route_switch,
+                        Duration::ZERO,
+                    );
                 }
             }
             command = commands.recv() => match command {
@@ -1174,11 +1455,25 @@ async fn run_session(
                 Some(Command::RefreshSessionState) => fetch.start(),
                 Some(Command::RetryNow) => {}
                 Some(Command::Wakeup(reason)) => {
-                    if reaches_connection_supervisor(reason)
-                        && let Some(timeout) = probe_timeout_for(reason, nearby)
-                        && !session.probe(timeout).await
-                    {
-                        break SessionEnd::Closed("Connection did not respond after system wake.".into());
+                    if reaches_connection_supervisor(reason) {
+                        let supersede = wake_probe
+                            .as_ref()
+                            .is_none_or(|running| running.reason == ConnectionWakeup::ApplicationActiveProbe && reason != ConnectionWakeup::ApplicationActiveProbe);
+                        if supersede
+                            && let Some(next_probe) = spawn_wake_probe(session.clone(), active_route.http_base.clone(), reason, nearby)
+                            && let Some(prev) = wake_probe.replace(next_probe)
+                        {
+                            prev.abort();
+                        }
+                        if better_route_probe.is_none() && !better_ranked_routes(routes, active_route).is_empty() {
+                            better_route_backoff = BETTER_ROUTE_CHECK_INTERVAL;
+                            better_route_deadline = next_better_route_deadline(
+                                active_route,
+                                routes,
+                                last_route_switch,
+                                Duration::ZERO,
+                            );
+                        }
                     }
                 }
                 Some(Command::Request { method, payload, mut reply, settled }) => {
@@ -1203,6 +1498,12 @@ async fn run_session(
             reason = session.closed() => break SessionEnd::Closed(reason),
         }
     };
+    if let Some(probe) = wake_probe {
+        probe.abort();
+    }
+    if let Some(probe) = better_route_probe {
+        probe.abort();
+    }
     for (_, task) in forwarders {
         task.abort();
     }
@@ -1596,6 +1897,104 @@ mod parity_tests {
             .expect("wakeup probe failure triggers reconnect");
         assert!(second.path.contains("clientCapabilities=settingsSecretReferences"));
         let _ = second.request(method::SUBSCRIBE_SERVER_CONFIG).await;
+    }
+
+    #[tokio::test]
+    async fn wake_probe_never_blocks_live_rpcs_resubscribes_after_wake_and_probes_better_routes() {
+        let mut server = crate::test_server::FakeServer::start().await;
+        server.set_descriptor(Some(json!({
+            "environmentId": "env-wake",
+            "label": "Studio",
+            "serverVersion": "0.1.9",
+            "orchestrationProtocolVersion": 2
+        })));
+        let (client, mut events) = start(&tokio::runtime::Handle::current(), server.credentials());
+        let mut conn = tokio::time::timeout(Duration::from_secs(5), server.connection())
+            .await
+            .expect("connects");
+        let config_req = conn.request(method::SUBSCRIBE_SERVER_CONFIG).await;
+        conn.chunk(
+            &config_req,
+            json!([{
+                "type": "snapshot",
+                "config": { "environment": { "environmentId": "env-wake", "label": "Studio", "serverVersion": "0.1.9" } }
+            }]),
+        )
+        .await;
+        let _initial_shell = conn.request(method::SUBSCRIBE_SHELL).await;
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+            if matches!(ev, ClientEvent::ServerConfig(_)) {
+                break;
+            }
+        }
+
+        // 1. Trigger a foreground probe (`ApplicationActiveProbe` = 3s nearby) and immediately
+        // dispatch an RPC. Because the probe runs off the `select!` loop, the RPC reaches the
+        // server right away instead of blocking for 3s, and its reply marks the socket alive.
+        client.notify_wakeup(ConnectionWakeup::ApplicationActiveProbe);
+        let rpc_client = client.clone();
+        let rpc_task = tokio::spawn(async move { rpc_client.request("server.ping", json!({})).await });
+        let req = tokio::time::timeout(Duration::from_millis(800), conn.request("server.ping"))
+            .await
+            .expect("RPC must not be stalled by in-flight wake probe");
+        conn.send(json!({
+            "_tag": "Exit",
+            "requestId": req["id"],
+            "exit": { "_tag": "Success", "value": { "ok": true } }
+        }))
+        .await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), rpc_task)
+            .await
+            .expect("rpc joins")
+            .unwrap()
+            .expect("rpc succeeds");
+        assert_eq!(reply["ok"], true);
+
+        // 2. An `ApplicationActive` wakeup that observes live traffic triggers post-wake
+        // `SUBSCRIBE_SHELL` resubscribe (`should_resubscribe_after_wakeup`).
+        client.notify_wakeup(ConnectionWakeup::ApplicationActive);
+        let rpc_client = client.clone();
+        let rpc_task = tokio::spawn(async move { rpc_client.request("server.ping", json!({})).await });
+        let req = tokio::time::timeout(Duration::from_millis(800), conn.request("server.ping"))
+            .await
+            .expect("RPC during ApplicationActive probe");
+        conn.send(json!({
+            "_tag": "Exit",
+            "requestId": req["id"],
+            "exit": { "_tag": "Success", "value": { "ok": true } }
+        }))
+        .await;
+        let _ = rpc_task.await.unwrap().expect("rpc succeeds");
+        let _resubscribed_shell = tokio::time::timeout(Duration::from_secs(2), conn.request(method::SUBSCRIBE_SHELL))
+            .await
+            .expect("surviving ApplicationActive wake must resubscribe shell");
+
+        // 3. `prepare_draining` interrupts on `NetworkChanged` / `ApplicationActive` (not just Long).
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut wakeup_rx = wakeups::subscribe();
+        let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
+        let stalled: Prepare = Arc::new(|| Box::pin(std::future::pending()));
+        tx.send(Command::Wakeup(ConnectionWakeup::NetworkChanged)).unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            prepare_draining(&stalled, &mut rx, &mut wakeup_rx, &mut resume),
+        )
+        .await
+        .expect("NetworkChanged interrupts stalled preparation");
+        assert!(matches!(outcome, PrepareOutcome::RetryNow));
+
+        // 4. `better_ranked_routes` + `spawn_better_route_probe` discovers a higher-ranked
+        // candidate answering with the expected `environmentId`.
+        let wan_active = CandidateRoute::saved("https://remote.example.com:3773");
+        let local_better = CandidateRoute::saved(server.credentials().http_base);
+        let better = better_ranked_routes(&[wan_active.clone(), local_better.clone()], &wan_active);
+        assert_eq!(better.len(), 1);
+        assert_eq!(better[0].id, local_better.id);
+        let mut probe = Some(spawn_better_route_probe(better, Some("env-wake".into())));
+        let winner = tokio::time::timeout(Duration::from_secs(3), next_better_route_probe(&mut probe))
+            .await
+            .expect("better-route probe completes");
+        assert_eq!(winner.as_deref(), Some(local_better.id.as_str()));
     }
 }
 

@@ -468,15 +468,13 @@ impl AppState {
                 .map(|c| c.environment.environment_id.clone())
                 .filter(|id| !id.is_empty())
                 .unwrap_or_else(|| saved_id.clone());
-            let project_id = match project_key {
-                Some(wanted) => view
-                    .summary
+            let project_id = project_key.and_then(|wanted| {
+                view.summary
                     .projects
                     .iter()
                     .find(|p| p.project.id == wanted || p.project.workspace_root == wanted)
-                    .map(|p| p.project.id.clone()),
-                None => view.summary.projects.first().map(|p| p.project.id.clone()).or_else(|| Some(String::new())),
-            };
+                    .map(|p| p.project.id.clone())
+            });
             let weight = weights
                 .get(&canonical_id)
                 .or_else(|| weights.get(&saved_id))
@@ -492,7 +490,11 @@ impl AppState {
                         .map(|provider| CandidateProvider {
                             instance_id: provider.instance_id.clone(),
                             driver: provider.driver.clone(),
-                            enabled: provider.enabled,
+                            enabled: t3_core::providers::instance_enabled(
+                                &cfg.settings,
+                                project_id.as_deref(),
+                                &provider.instance_id,
+                            ),
                             installed: provider.installed,
                             status: provider.status.clone(),
                             auth_status: (!provider.auth.status.is_empty()).then(|| provider.auth.status.clone()),
@@ -521,7 +523,7 @@ impl AppState {
                 .into_iter()
                 .filter(|candidate| {
                     candidate.connected
-                        && candidate.project_id.is_some()
+                        && (project_key.is_none() || candidate.project_id.is_some())
                         && candidate.weight.is_finite()
                         && candidate.weight > 0.0
                         && referenced_thread_environment_ids.iter().all(|env_id| env_id == &candidate.environment_id)

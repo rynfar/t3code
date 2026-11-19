@@ -298,21 +298,37 @@ pub async fn fetch_host_resources(client: &ClientHandle) -> Option<HostResources
 }
 
 /// Concurrently refreshes host resources across all `candidates` `(environment_id, client, weight)`
-/// and selects the best environment (`refreshSelection` in `useLoadBalancedEnvironment.ts`).
+/// through the shared `HostResourcesCache` and selects the best environment
+/// (`refreshSelection` in `useLoadBalancedEnvironment.ts`).
 pub async fn refresh_load_balanced_selection(
     candidates: Vec<(String, ClientHandle, f64)>,
 ) -> Option<String> {
-    let futures = candidates.into_iter().map(|(environment_id, client, weight)| async move {
-        let resources = fetch_host_resources(&client).await;
-        LoadBalanceCandidate {
-            environment_id,
-            resources,
-            received_at: Some(wall_now_ms()),
-            weight,
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HostResourcesCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HostResourcesCache::default()));
+
+    let mut env_ids = Vec::with_capacity(candidates.len());
+    let mut weights = HashMap::with_capacity(candidates.len());
+    {
+        let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (environment_id, _, weight) in &candidates {
+            guard.mark_pending(environment_id);
+            env_ids.push(environment_id.clone());
+            weights.insert(environment_id.clone(), *weight);
         }
+    }
+
+    let futures = candidates.into_iter().map(|(environment_id, client, _weight)| async move {
+        let resources = fetch_host_resources(&client).await;
+        (environment_id, resources, wall_now_ms())
     });
     let resolved = futures::future::join_all(futures).await;
-    choose_load_balanced_environment(&resolved, wall_now_ms())
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (environment_id, resources, received_at_ms) in resolved {
+        guard.record(&environment_id, resources, received_at_ms);
+    }
+    guard.evaluate(&env_ids, &weights, wall_now_ms()).environment_id
 }
 
 #[cfg(test)]

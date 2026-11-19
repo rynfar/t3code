@@ -215,15 +215,23 @@ impl Workspace {
                     cx.notify();
                 }
             }),
-            // Coming back to the app retires its delivered notifications and signals connection
-            // supervisors (`wakeups.ts`: `application-focused` / `application-active-long`).
+            // Coming back to the app retires its delivered notifications, signals connection
+            // supervisors (`wakeups.ts`: `application-focused` / `application-active-long`), and
+            // relists T3 Connect account environments when signed in (`shouldRelistAccountAfterWakeup`).
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
-                    this.state.update(cx, |state, cx| state.clear_pending_notifications(cx));
                     let wakeup = match this.inactive_since.take() {
                         Some(since) => t3_client::wakeups::classify_app_resume(since.elapsed()),
                         None => t3_client::wakeups::ConnectionWakeup::ApplicationFocused,
                     };
+                    this.state.update(cx, |state, cx| {
+                        state.clear_pending_notifications(cx);
+                        if t3_client::wakeups::should_relist_account_after_wakeup(wakeup)
+                            && state.cloud.identity.is_some()
+                        {
+                            state.refresh_cloud(cx);
+                        }
+                    });
                     t3_client::wakeups::emit_wakeup(wakeup);
                 } else {
                     this.inactive_since = Some(Instant::now());
@@ -1229,6 +1237,26 @@ impl Workspace {
             let state = self.state.read(cx);
             let mut out = Vec::new();
             let mut seen_keys = HashSet::new();
+            let canonical_env_key = |saved_id: &str, saved_env_id: Option<&str>| -> String {
+                state
+                    .fleet
+                    .environments
+                    .iter()
+                    .find(|view| view.summary.owner.saved_id == saved_id)
+                    .and_then(|view| view.config.config.as_ref())
+                    .map(|cfg| cfg.environment.environment_id.as_str())
+                    .filter(|id| !id.trim().is_empty())
+                    .or_else(|| {
+                        (state.environments.active.as_deref() == Some(saved_id))
+                            .then_some(state.server_config.config.as_ref())
+                            .flatten()
+                            .map(|cfg| cfg.environment.environment_id.as_str())
+                            .filter(|id| !id.trim().is_empty())
+                    })
+                    .or_else(|| saved_env_id.filter(|id| !id.trim().is_empty()))
+                    .unwrap_or(saved_id)
+                    .to_owned()
+            };
             let mut push_stall = |env_key: String, label: &str, stall: &t3_client::status::ServerEventLoopStall| {
                 let dedup = stall.dedup_key(&env_key);
                 if !seen_keys.insert(dedup.clone()) {
@@ -1243,7 +1271,15 @@ impl Workspace {
             {
                 let env_key = state
                     .active_environment()
-                    .and_then(|e| e.environment_id.clone().or_else(|| Some(e.id.clone())))
+                    .map(|env| canonical_env_key(&env.id, env.environment_id.as_deref()))
+                    .or_else(|| {
+                        state
+                            .server_config
+                            .config
+                            .as_ref()
+                            .map(|c| c.environment.environment_id.clone())
+                            .filter(|s| !s.trim().is_empty())
+                    })
                     .unwrap_or_else(|| "local".to_owned());
                 let label = state
                     .active_environment()
@@ -1255,22 +1291,27 @@ impl Workspace {
             for env in &state.environments.environments {
                 let extras = t3_client::supervisor::server_config_extras_for(&env.http_base);
                 if let Some(stall) = extras.borrow().last_event_loop_stall.as_ref() {
-                    let env_key = env.environment_id.clone().unwrap_or_else(|| env.id.clone());
-                    push_stall(env_key, &env.label, stall);
+                    let env_key = canonical_env_key(&env.id, env.environment_id.as_deref());
+                    let label = if !env.label.trim().is_empty() {
+                        env.label.as_str()
+                    } else {
+                        state
+                            .fleet
+                            .environments
+                            .iter()
+                            .find(|view| view.summary.owner.saved_id == env.id)
+                            .and_then(|view| view.config.config.as_ref())
+                            .map(|cfg| cfg.environment.label.as_str())
+                            .unwrap_or_default()
+                    };
+                    push_stall(env_key, label, stall);
                 }
             }
             for env in &state.fleet.environments {
                 let Some(saved) = state.environments.get(&env.summary.owner.saved_id) else { continue };
                 let extras = t3_client::supervisor::server_config_extras_for(&saved.http_base);
                 if let Some(stall) = extras.borrow().last_event_loop_stall.as_ref() {
-                    let env_key = env
-                        .config
-                        .config
-                        .as_ref()
-                        .map(|c| c.environment.environment_id.clone())
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| saved.environment_id.clone())
-                        .unwrap_or_else(|| saved.id.clone());
+                    let env_key = canonical_env_key(&saved.id, saved.environment_id.as_deref());
                     let label = if !saved.label.trim().is_empty() {
                         saved.label.as_str()
                     } else {
@@ -1928,11 +1969,13 @@ mod tests {
             );
         });
 
-        // 6. Host-freeze toast (`CN-STATUS`): fires across saved/fleet environments and deduplicates by `detectedAt`.
+        // 6. Host-freeze toast (`CN-STATUS`): fires across saved/fleet environments, canonicalizes
+        // `env_key` when `saved.environment_id` is `None` while fleet has `config.environment.environment_id`,
+        // and deduplicates by `detectedAt`.
         state.update(cx, |state, _| {
             state.environments.environments.push(t3_client::store::SavedEnvironment {
                 id: "fleet-worker".into(),
-                environment_id: Some("fleet-env-1".into()),
+                environment_id: None,
                 label: "Build Box".into(),
                 http_base: "http://10.0.0.42:3773".into(),
                 access_token: Some("tok".into()),
@@ -1941,6 +1984,36 @@ mod tests {
                 ssh: None,
                 server_version: None,
             });
+            let mut cfg_state = t3_core::server_config::ServerConfigState::default();
+            let snapshot: t3_core::server_config::ServerConfigStreamEvent = serde_json::from_value(json!({
+                "version": 1,
+                "type": "snapshot",
+                "config": {
+                    "environment": { "environmentId": "fleet-env-1", "label": "Build Box", "serverVersion": "0.1.9" }
+                }
+            }))
+            .unwrap();
+            cfg_state.apply(snapshot);
+            let fleet = std::sync::Arc::make_mut(&mut state.fleet);
+            let owner = t3_core::sidebar::grouping::EnvironmentOwner {
+                saved_id: "fleet-worker".into(),
+                canonical_id: Some("fleet-env-1".into()),
+                generation: 1,
+                connection_generation: 1,
+                shell_generation: 0,
+            };
+            fleet.environments.push(std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                    owner,
+                    &t3_core::shell::ShellState::default(),
+                    &cfg_state,
+                )),
+                status: ConnectionStatus::Connected,
+                config: cfg_state,
+                grants: None,
+                settings_revision: 0,
+                keybindings_revision: 0,
+            }));
         });
         t3_client::supervisor::set_server_config_extras_for(
             "http://10.0.0.42:3773",

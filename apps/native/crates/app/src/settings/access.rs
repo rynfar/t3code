@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, canvas, div, fill, point, prelude::FluentBuilder, px, size,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::{Value, json};
 use t3_client::supervisor::{ClientHandle, ConnectionStatus, ServerConfigExtras};
@@ -112,6 +112,7 @@ struct LinkMachineForm {
     mint_failed: HashSet<String>,
     submitting: bool,
     error: Option<String>,
+    _subscriptions: Vec<Subscription>,
 }
 
 /// The create dialog's state, open in the page.
@@ -175,6 +176,9 @@ pub(crate) struct AccessPageState {
     link_state_task: Option<(String, u64, Task<()>)>,
     create: Option<CreateLink>,
     link_machine: Option<LinkMachineForm>,
+    /// Peer environment IDs already linked on the active access target (`peerLinks.list`).
+    linked_peer_ids: HashSet<String>,
+    linked_peers_task: Option<Task<()>>,
     /// Credentials of links this client created, known only in memory (`credentialsById`).
     credentials: HashMap<String, String>,
     sharing: Option<String>,
@@ -213,6 +217,8 @@ impl AccessPageState {
             link_state_task: None,
             create: None,
             link_machine: None,
+            linked_peer_ids: HashSet::new(),
+            linked_peers_task: None,
             credentials: HashMap::new(),
             sharing: None,
             newest_pairing_link_id: None,
@@ -243,6 +249,8 @@ impl AccessPageState {
         self.link_state_task = None;
         self.create = None;
         self.link_machine = None;
+        self.linked_peer_ids.clear();
+        self.linked_peers_task = None;
         self.credentials.clear();
         self.sharing = None;
         self.newest_pairing_link_id = None;
@@ -262,6 +270,7 @@ impl AccessPageState {
         self.link_state_task = None;
         self.ticker = None;
         self.target_client_task = None;
+        self.linked_peers_task = None;
     }
 }
 
@@ -1116,6 +1125,8 @@ impl SettingsView {
             .config
             .as_ref()
             .is_some_and(|cfg| cfg.settings.threads.linked_environments_enabled);
+        let target_id_for_link = target.saved_id.clone();
+        let client_for_link = target.client.clone();
         let actions = can_write.then(|| {
             h_flex()
                 .gap(r(6.))
@@ -1125,20 +1136,8 @@ impl SettingsView {
                             .icon(Icon::Link2)
                             .label("Link machine")
                             .disabled(self.access.link_machine.is_some())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                let address = cx.new(|cx| InputState::new(window, cx).placeholder("https://box.example.ts.net"));
-                                let pairing_code = cx.new(|cx| InputState::new(window, cx).placeholder("From Sharing & access there, or t3 pair"));
-                                this.access.link_machine = Some(LinkMachineForm {
-                                    choice: None,
-                                    select_open: false,
-                                    address,
-                                    pairing_code,
-                                    access: "approval-required".to_owned(),
-                                    mint_failed: HashSet::new(),
-                                    submitting: false,
-                                    error: None,
-                                });
-                                cx.notify();
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_link_machine_form(target_id_for_link.clone(), client_for_link.clone(), window, cx);
                             })),
                     )
                 })
@@ -1493,6 +1492,7 @@ impl SettingsView {
             raw_urls.push(env.http_base.as_str());
             let urls = collect_known_machine_urls(raw_urls);
             let connected = fleet_view.is_some_and(|view| view.status == ConnectionStatus::Connected);
+            let linked = self.access.linked_peer_ids.contains(&env_id);
             machines.push(LinkableMachine {
                 environment_id: env_id,
                 label: if env.label.trim().is_empty() { env.address() } else { env.label.clone() },
@@ -1500,13 +1500,14 @@ impl SettingsView {
                 urls,
                 connected,
                 connect_only: false,
-                linked: false,
+                linked,
             });
         }
         for cloud_env in &app.cloud.discovery.environments {
             if cloud_env.environment_id == host_env_id || !seen.insert(cloud_env.environment_id.clone()) {
                 continue;
             }
+            let linked = self.access.linked_peer_ids.contains(&cloud_env.environment_id);
             machines.push(LinkableMachine {
                 environment_id: cloud_env.environment_id.clone(),
                 label: cloud_env.label.clone(),
@@ -1514,10 +1515,81 @@ impl SettingsView {
                 urls: Vec::new(),
                 connected: false,
                 connect_only: true,
-                linked: false,
+                linked,
             });
         }
         machines
+    }
+
+    fn open_link_machine_form(
+        &mut self,
+        target_saved_id: String,
+        client: Option<ClientHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let address = cx.new(|cx| InputState::new(window, cx).placeholder("https://box.example.ts.net"));
+        let pairing_code = cx.new(|cx| InputState::new(window, cx).placeholder("From Sharing & access there, or t3 pair"));
+        let subscriptions = vec![
+            cx.subscribe_in(&address, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&pairing_code, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+        ];
+        self.access.link_machine = Some(LinkMachineForm {
+            choice: None,
+            select_open: false,
+            address,
+            pairing_code,
+            access: "approval-required".to_owned(),
+            mint_failed: HashSet::new(),
+            submitting: false,
+            error: None,
+            _subscriptions: subscriptions,
+        });
+        self.refresh_linked_peers(target_saved_id, client, cx);
+        cx.notify();
+    }
+
+    fn refresh_linked_peers(
+        &mut self,
+        target_saved_id: String,
+        client: Option<ClientHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = client else {
+            return;
+        };
+        let runtime = self.state.read(cx).runtime().clone();
+        let task = runtime.spawn(async move { client.request("peerLinks.list", json!({})).await });
+        self.access.linked_peers_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(Ok(value)) = task.await else {
+                return;
+            };
+            let ids: HashSet<String> = value
+                .get("links")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("environmentId").and_then(Value::as_str))
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+                .collect();
+            let _ = this.update(cx, |this, cx| {
+                if this.access.active_target.as_deref() == Some(target_saved_id.as_str())
+                    || this.access.active_target.is_none()
+                {
+                    this.access.linked_peer_ids = ids;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn submit_access_link_machine(&mut self, target: &ResolvedAccessTarget, cx: &mut Context<Self>) {
@@ -1575,6 +1647,9 @@ impl SettingsView {
             let fut = self.state.read(cx).mint_pairing_code_on(&env_id, &access);
             (env_id, fut)
         });
+        let linked_env_id = expected_id.clone();
+        let client_for_refresh = client.clone();
+        let target_saved_id_for_refresh = target_saved_id.clone();
         let runtime = self.state.read(cx).runtime().clone();
         let task = runtime.spawn(async move {
             let code = match mint_future {
@@ -1600,12 +1675,23 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|e| Err((None, e.to_string())));
             let _ = this.update(cx, |this, cx| {
-                if this.access.active_target.as_deref() != Some(target_saved_id.as_str()) {
+                if this.access.active_target.as_deref().is_some_and(|active| active != target_saved_id.as_str()) {
                     return;
                 }
                 match result {
-                    Ok(_) => {
+                    Ok(value) => {
+                        if let Some(id) = value
+                            .get("link")
+                            .and_then(|link| link.get("environmentId"))
+                            .and_then(Value::as_str)
+                            .or_else(|| value.get("environmentId").and_then(Value::as_str))
+                            .map(str::to_owned)
+                            .or(linked_env_id)
+                        {
+                            this.access.linked_peer_ids.insert(id);
+                        }
                         this.access.link_machine = None;
+                        this.refresh_linked_peers(target_saved_id_for_refresh, Some(client_for_refresh), cx);
                     }
                     Err((mint_env_id, message)) => {
                         if let Some(form) = this.access.link_machine.as_mut() {
@@ -2091,5 +2177,209 @@ mod tests {
         .unwrap();
         assert!(!revokes_connect_devices(&[], &[normal_session.clone(), current_cloud_session]));
         assert!(revokes_connect_devices(&[], &[normal_session, cloud_session]));
+    }
+
+    #[cfg(feature = "snapshot")]
+    struct AccessSettingsFrame;
+
+    #[cfg(feature = "snapshot")]
+    impl gpui::Render for AccessSettingsFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+            div().size_full().children(crate::settings::overlay(window, cx))
+        }
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn link_machine_form_tracks_peer_links_input_changes_and_submission(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        cx.executor().allow_parking();
+        let (state, mut fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "access:read", "access:write"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.environments.environments.push(t3_client::store::SavedEnvironment {
+                    id: "host-mac".into(),
+                    environment_id: Some("mac-env".into()),
+                    label: "Mac".into(),
+                    http_base: "http://127.0.0.1:3773".into(),
+                    access_token: Some("tok-host".into()),
+                    local: true,
+                    disabled: false,
+                    ssh: None,
+                    server_version: None,
+                });
+                state.environments.environments.push(t3_client::store::SavedEnvironment {
+                    id: "peer-vps".into(),
+                    environment_id: Some("vps-1".into()),
+                    label: "Build VPS".into(),
+                    http_base: "https://vps.example.ts.net".into(),
+                    access_token: Some("tok-peer".into()),
+                    local: false,
+                    disabled: false,
+                    ssh: None,
+                    server_version: None,
+                });
+                state.environments.active = Some("host-mac".into());
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": { "environmentId": "mac-env", "label": "Mac" },
+                        "settings": { "threads": { "linkedEnvironmentsEnabled": true } }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+            crate::settings::open(super::super::Section::Access, cx);
+        });
+        let window = cx.add_window(|_, _| AccessSettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let view = vcx.read(|cx| cx.global::<super::super::Host>().view.clone().expect("settings view"));
+
+        // 1. Opening `LinkMachineForm` queries `peerLinks.list` and attaches `InputEvent::Change` observers.
+        let notify_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notify_counter = notify_count.clone();
+        let _observer = vcx.update(|_, cx| {
+            cx.observe(&view, move |_, _| {
+                notify_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let target = view.resolve_access_target(cx).1.expect("target");
+                view.open_link_machine_form(target.saved_id, target.client, window, cx);
+            });
+        });
+        let (method, _, reply) = loop {
+            let req = fixture.next_request().await;
+            if req.0 == "peerLinks.list" {
+                break req;
+            }
+            let _ = req.2.send(Ok(json!({})));
+        };
+        assert_eq!(method, "peerLinks.list");
+        let (linked_tx, linked_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut linked_tx = Some(linked_tx);
+        let _linked_obs = vcx.update(|_, cx| {
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).access.linked_peer_ids.contains("vps-1")
+                    && let Some(tx) = linked_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        reply
+            .send(Ok(json!({
+                "links": [{ "environmentId": "vps-1", "label": "Build VPS" }]
+            })))
+            .unwrap();
+        linked_rx.await.unwrap();
+        drop(_linked_obs);
+        vcx.run_until_parked();
+
+        // `access_linkable_machines` marks `vps-1` as `linked: true` from `peerLinks.list`.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let target = view.resolve_access_target(cx).1.expect("target");
+                let machines = view.access_linkable_machines(&target, cx);
+                let vps = machines.iter().find(|m| m.environment_id == "vps-1").expect("vps machine");
+                assert!(vps.linked, "already-linked peer must report linked: true");
+            });
+        });
+
+        // 2. Typing into `address` and `pairing_code` fires `InputEvent::Change` -> `cx.notify()`.
+        let (address_input, code_input) = vcx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                let form = view.access.link_machine.as_mut().expect("form open");
+                form.choice = Some(ANOTHER_ADDRESS.to_owned());
+                (form.address.clone(), form.pairing_code.clone())
+            })
+        });
+        let before_type = notify_count.load(std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            address_input.update(cx, |input, cx| input.insert("https://other.example:3773", window, cx));
+            code_input.update(cx, |input, cx| input.insert("code-1234", window, cx));
+        });
+        vcx.run_until_parked();
+        assert!(
+            notify_count.load(std::sync::atomic::Ordering::SeqCst) > before_type,
+            "typing into address/pairing_code must notify SettingsView"
+        );
+
+        // 3. Submitting `"Another address…"` sends `peerLinks.link` and closes the form on success.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let target = view.resolve_access_target(cx).1.expect("target");
+                view.submit_access_link_machine(&target, cx);
+            });
+        });
+        let (link_method, payload, reply) = loop {
+            let req = fixture.next_request().await;
+            if req.0 == "peerLinks.link" {
+                break req;
+            }
+            let _ = req.2.send(Ok(json!({})));
+        };
+        assert_eq!(link_method, "peerLinks.link");
+        assert_eq!(payload["url"], "https://other.example:3773");
+        assert_eq!(payload["pairingCode"], "code-1234");
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut closed_tx = Some(closed_tx);
+        let _closed_obs = vcx.update(|_, cx| {
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).access.link_machine.is_none()
+                    && let Some(tx) = closed_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        reply.send(Ok(json!({ "link": { "environmentId": "other-env" } }))).unwrap();
+        closed_rx.await.unwrap();
+        drop(_closed_obs);
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let view_ref = view.read(cx);
+            assert!(view_ref.access.link_machine.is_none(), "successful link closes the form");
+            assert!(view_ref.access.linked_peer_ids.contains("other-env"));
+        });
+
+        // 4. `mint_pairing_code_on` returns `Unavailable` for an unconnected peer environment.
+        let mint_fut = vcx.read(|cx| state.read(cx).mint_pairing_code_on("vps-1", "approval-required"));
+        let mint_err = runtime.block_on(mint_fut).expect_err("disconnected peer cannot auto-mint");
+        assert_eq!(mint_err.reason, t3_core::pairing::PeerPairingCodeErrorReason::Unavailable);
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(_observer);
+        drop(vcx);
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }
