@@ -154,6 +154,7 @@ pub(super) fn event_card(view: &mut DetailView, event: &TimelineEvent, reply: bo
         let edit_input = view.editing_comment.as_ref().map(|e| e.input.clone());
         let saving = view.editing_comment.as_ref().is_some_and(|e| e.saving);
         edit_input.map(|input| {
+            let empty = input.read(cx).value().trim().is_empty();
             v_flex()
                 .gap(px(6.))
                 .child(Textarea::new(&input).disabled(saving))
@@ -168,7 +169,7 @@ pub(super) fn event_card(view: &mut DetailView, event: &TimelineEvent, reply: bo
                         .child(
                             Button::new("pr-edit-comment-save", Variant::Outline, Size::Xs)
                                 .label(if saving { "Saving..." } else { "Save" })
-                                .disabled(saving)
+                                .disabled(saving || empty)
                                 .on_click(cx.listener(|this, _, _, cx| this.commit_comment_edit(cx))),
                         ),
                 )

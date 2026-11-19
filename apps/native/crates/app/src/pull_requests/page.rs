@@ -18,7 +18,7 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use t3_client::store;
 use t3_core::pull_requests::assignment::{
-    AssignableProject, EnvironmentInfo, HostAvailability, project_assignment_rows, remember_hosts, reset_hosts,
+    AssignableProject, AssignedProjectColumnRow, EnvironmentInfo, HostAvailability, project_assignment_rows, remember_hosts, reset_hosts,
 };
 use t3_core::pull_requests::cache::{LIST_CACHE_KEY, PersistedListCache, PersistedStatsCache, STATS_CACHE_KEY};
 use t3_core::pull_requests::editing::patch_list_entry;
@@ -115,6 +115,11 @@ pub struct PullRequestsPage {
     /// Host availability and stacked project-assignment column state (`pullRequestProjectAssignment.logic.ts`).
     host_availability: HostAvailability,
     projects_column_open: bool,
+    /// Per-project counts preserved across project-scoped reads, keyed by `(env, unfiltered_scope_key)`.
+    project_counts_scope: Option<(String, String)>,
+    project_counts: HashMap<String, usize>,
+    project_unavailable: HashSet<String>,
+    all_projects_total: Option<usize>,
     /// Lazily loaded stack info per row key for `PullRequestStackPopover`.
     pub(super) row_stacks: HashMap<String, Result<Option<Stack>, String>>,
     row_stack_loading: HashSet<String>,
@@ -183,6 +188,10 @@ impl PullRequestsPage {
             restat: false,
             host_availability: HashMap::new(),
             projects_column_open: true,
+            project_counts_scope: None,
+            project_counts: HashMap::new(),
+            project_unavailable: HashSet::new(),
+            all_projects_total: None,
             row_stacks: HashMap::new(),
             row_stack_loading: HashSet::new(),
             intent_target: None,
@@ -214,6 +223,7 @@ impl PullRequestsPage {
     fn hydrate_from_cache(&mut self, cx: &mut Context<Self>) {
         let Some(env) = self.environment_key(cx) else { return };
         let key = self.scope_key();
+        let unfiltered_key = self.unfiltered_scope_key();
         if self.data.key.as_deref() == Some(key.as_str()) && self.data.result.is_some() {
             return;
         }
@@ -224,10 +234,57 @@ impl PullRequestsPage {
                 self.stats.insert(stat_key(&entry.project_id, entry.number), (entry.additions, entry.deletions));
             }
         }
+        let project_filter = self.prefs.project_id.clone();
+        self.record_project_counts(Some(&env), &unfiltered_key, project_filter.as_deref(), &cached);
         self.data.first_page = cached.entries.len();
         self.data.key = Some(key);
         self.data.result = Some(cached);
         self.rebuild(cx);
+    }
+
+    /// Updates per-project counts and `"All projects"` total without collapsing sibling project
+    /// counts when the list is filtered to a single `project_id`.
+    fn record_project_counts(&mut self, env: Option<&str>, unfiltered_key: &str, project_filter: Option<&str>, result: &ListResult) {
+        let scope_id = (env.unwrap_or("").to_owned(), unfiltered_key.to_owned());
+        if self.project_counts_scope.as_ref() != Some(&scope_id) {
+            self.project_counts.clear();
+            self.project_unavailable.clear();
+            self.all_projects_total = None;
+            self.project_counts_scope = Some(scope_id);
+            if project_filter.is_some()
+                && let Some(unfiltered) = env.and_then(|e| self.list_cache.get(e, unfiltered_key))
+            {
+                for entry in &unfiltered.entries {
+                    *self.project_counts.entry(entry.project_id.clone()).or_default() += 1;
+                }
+                for error in &unfiltered.errors {
+                    self.project_unavailable.insert(error.project_id.clone());
+                }
+                self.all_projects_total = Some(unfiltered.entries.len());
+            }
+        }
+        match project_filter {
+            None => {
+                self.project_counts.clear();
+                self.project_unavailable.clear();
+                for entry in &result.entries {
+                    *self.project_counts.entry(entry.project_id.clone()).or_default() += 1;
+                }
+                for error in &result.errors {
+                    self.project_unavailable.insert(error.project_id.clone());
+                }
+                self.all_projects_total = Some(result.entries.len());
+            }
+            Some(pid) => {
+                let count = result.entries.iter().filter(|entry| entry.project_id == pid).count();
+                self.project_counts.insert(pid.to_owned(), count);
+                self.project_unavailable.remove(pid);
+                if result.errors.iter().any(|error| error.project_id == pid) {
+                    self.project_unavailable.insert(pid.to_owned());
+                }
+                self.all_projects_total = Some(self.project_counts.values().sum());
+            }
+        }
     }
 
     /// Reads when the page is shown and connected, again on reopening and on reconnecting, and
@@ -401,9 +458,18 @@ impl PullRequestsPage {
         }
     }
 
-    fn scope_key(&self) -> String {
-        let scope = ListPreferences { sort: Default::default(), q: None, merge_method: None, ..self.prefs.clone() };
+    fn scope_key_for(&self, project_id: Option<&str>) -> String {
+        let mut scope = ListPreferences { sort: Default::default(), q: None, merge_method: None, ..self.prefs.clone() };
+        scope.project_id = project_id.map(str::to_owned);
         format!("{}|{}", serde_json::to_string(&scope).unwrap_or_default(), self.sent)
+    }
+
+    fn scope_key(&self) -> String {
+        self.scope_key_for(self.prefs.project_id.as_deref())
+    }
+
+    fn unfiltered_scope_key(&self) -> String {
+        self.scope_key_for(None)
     }
 
     pub(super) fn save_prefs(&mut self) {
@@ -520,6 +586,9 @@ impl PullRequestsPage {
                     self.list_cache.put(env, &key, answer.clone(), now_ms());
                     store::save_ui_state(LIST_CACHE_KEY, &self.list_cache);
                 }
+                let unfiltered_key = self.unfiltered_scope_key();
+                let project_filter = self.prefs.project_id.clone();
+                self.record_project_counts(env_key.as_deref(), &unfiltered_key, project_filter.as_deref(), &answer);
                 self.data.error = None;
                 self.data.key = Some(key);
                 self.data.result = Some(answer);
@@ -842,12 +911,10 @@ impl PullRequestsPage {
         self.state.update(cx, |state, cx| state.show_toast(toast, cx));
     }
 
-    /// Stacked project-assignment column (`pullRequestProjectAssignment.logic.ts`): deduplicates
-    /// shared repositories across environments and lets the user scope the list to any project.
-    fn render_project_assignment_column(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.projects_column_open {
-            return None;
-        }
+    /// Computes the project-assignment rows and `"All projects"` total for the active environment
+    /// (matching the server `PullRequestsPage::fetch` queries, so foreign fleet projects are never
+    /// shown with bogus `0` counts or misrouted on click).
+    pub(crate) fn assignment_rows(&self, cx: &App) -> (Vec<AssignedProjectColumnRow>, usize) {
         let state = self.state.read(cx);
         let env_id = self.environment_key(cx).unwrap_or_else(|| "local".into());
         let env_label = state
@@ -857,9 +924,9 @@ impl PullRequestsPage {
             .map(|c| c.environment.label.clone())
             .or_else(|| state.active_environment().map(|e| e.label.clone()))
             .unwrap_or_else(|| "Local".to_owned());
+        let env_ids = vec![env_id.clone()];
+        let envs = vec![EnvironmentInfo { environment_id: env_id.clone(), label: env_label }];
         let mut projects: Vec<AssignableProject> = Vec::new();
-        let mut env_ids: Vec<String> = vec![env_id.clone()];
-        let mut envs: Vec<EnvironmentInfo> = vec![EnvironmentInfo { environment_id: env_id.clone(), label: env_label }];
         if let Some(snapshot) = &state.shell.snapshot {
             for project in snapshot.projects.iter().filter(|p| p.archived_at.is_none()) {
                 let repo_key = project
@@ -878,58 +945,24 @@ impl PullRequestsPage {
                 });
             }
         }
-        for fleet_env in &state.fleet.environments {
-            let fid = fleet_env.summary.owner.saved_id.clone();
-            if env_ids.contains(&fid) {
-                continue;
-            }
-            let flabel = fleet_env
-                .config
-                .config
-                .as_ref()
-                .map(|c| c.environment.label.clone())
-                .unwrap_or_else(|| fid.clone());
-            env_ids.push(fid.clone());
-            envs.push(EnvironmentInfo { environment_id: fid.clone(), label: flabel });
-            for project in &fleet_env.summary.projects {
-                if project.project.archived_at.is_some() {
-                    continue;
-                }
-                let repo_key = project
-                    .project
-                    .repository_identity
-                    .as_ref()
-                    .and_then(|id| id.get("canonicalKey").and_then(serde_json::Value::as_str))
-                    .map(str::to_owned);
-                let host = repo_key.as_deref().and_then(|key| key.split('/').next()).map(str::to_owned);
-                projects.push(AssignableProject {
-                    id: project.project.id.clone(),
-                    environment_id: fid.clone(),
-                    title: project.project.title.clone(),
-                    workspace_root: project.project.workspace_root.clone(),
-                    repository_key: repo_key,
-                    host,
-                });
-            }
-        }
-        if projects.is_empty() {
+        let rows = project_assignment_rows(&projects, &env_ids, &envs, Some(&self.host_availability), &self.project_counts, &self.project_unavailable);
+        let total = self.all_projects_total.unwrap_or_else(|| self.data.result.as_ref().map_or(0, |r| r.entries.len()));
+        (rows, total)
+    }
+
+    /// Stacked project-assignment column (`pullRequestProjectAssignment.logic.ts`): deduplicates
+    /// shared repositories on the active environment and lets the user scope the list to any project
+    /// while preserving sibling project counts.
+    fn render_project_assignment_column(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.projects_column_open {
             return None;
         }
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        let mut unavailable: HashSet<String> = HashSet::new();
-        if let Some(result) = &self.data.result {
-            for entry in &result.entries {
-                *counts.entry(entry.project_id.clone()).or_default() += 1;
-            }
-            for error in &result.errors {
-                unavailable.insert(error.project_id.clone());
-            }
+        let (rows, total) = self.assignment_rows(cx);
+        if rows.is_empty() {
+            return None;
         }
-        let rows = project_assignment_rows(&projects, &env_ids, &envs, Some(&self.host_availability), &counts, &unavailable);
         let p = palette(cx);
         let active_project = self.prefs.project_id.clone();
-        let total = self.data.result.as_ref().map_or(0, |r| r.entries.len());
-        let multi_env = envs.len() > 1;
         Some(
             v_flex()
                 .id("pr-project-assignment-column")
@@ -984,12 +1017,8 @@ impl PullRequestsPage {
                                 .child(div().flex_1().min_w_0().truncate().font_weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL }).text_color(hsla(p.foreground)).child(row.project_title))
                                 .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(if blocked { "—".to_owned() } else { row.pr_count.to_string() })),
                         )
-                        .when(multi_env || blocked, |this| {
-                            this.child(div().truncate().text_size(px(10.)).text_color(hsla(p.muted_foreground)).child(if blocked {
-                                format!("{} · Unavailable", row.environment_label)
-                            } else {
-                                row.environment_label
-                            }))
+                        .when(blocked, |this| {
+                            this.child(div().truncate().text_size(px(10.)).text_color(hsla(p.muted_foreground)).child(format!("{} · Unavailable", row.environment_label)))
                         })
                 }))
                 .into_any_element(),
@@ -1165,6 +1194,84 @@ mod tests {
                 assert!(!host.preview.is_open());
                 assert!(host.preview.render_card(cx).is_none());
             });
+        });
+    }
+
+    #[gpui::test]
+    fn project_assignment_preserves_sibling_counts_and_excludes_foreign_fleet_projects(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| {
+                state.environments.active = Some("env-a".into());
+                state.shell.snapshot = Some(serde_json::from_value(json!({
+                    "snapshotSequence": 1,
+                    "projects": [
+                        {
+                            "id": "p1", "title": "Alpha", "workspaceRoot": "/tmp/alpha",
+                            "defaultModelSelection": null, "scripts": [],
+                            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+                        },
+                        {
+                            "id": "p2", "title": "Beta", "workspaceRoot": "/tmp/beta",
+                            "defaultModelSelection": null, "scripts": [],
+                            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+                        }
+                    ],
+                    "threads": [],
+                    "updatedAt": "2026-01-02T00:00:00Z"
+                })).unwrap());
+            });
+            state
+        });
+        let (page, cx) = cx.add_window_view(|window, cx| PullRequestsPage::new(state.clone(), window, cx));
+        let entry = |project_id: &str, project_title: &str, number: u64| -> serde_json::Value {
+            json!({
+                "provider": "github", "host": "github.com", "projectId": project_id, "projectTitle": project_title,
+                "repository": format!("acme/{project_id}"), "number": number, "title": format!("PR #{number}"),
+                "url": format!("https://github.com/acme/{project_id}/pull/{number}"), "author": { "login": "alice" },
+                "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 5, "deletions": 1,
+                "viewerReviewRequested": false, "headBranch": "feat", "baseBranch": "main",
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z"
+            })
+        };
+        let unfiltered: ListResult = decode(json!({
+            "entries": [entry("p1", "Alpha", 1), entry("p1", "Alpha", 2), entry("p2", "Beta", 3)],
+            "providers": [],
+            "errors": [],
+            "hasMore": false
+        }))
+        .unwrap();
+        let filtered_p1: ListResult = decode(json!({
+            "entries": [entry("p1", "Alpha", 1), entry("p1", "Alpha", 2)],
+            "providers": [],
+            "errors": [],
+            "hasMore": false
+        }))
+        .unwrap();
+
+        page.update(cx, |page, cx| {
+            let key = page.scope_key();
+            page.apply_list(key, false, false, Ok(unfiltered), cx);
+            let (rows, total) = page.assignment_rows(cx);
+            assert_eq!(total, 3);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.iter().find(|r| r.project_id == "p1").map(|r| r.pr_count), Some(2));
+            assert_eq!(rows.iter().find(|r| r.project_id == "p2").map(|r| r.pr_count), Some(1));
+
+            // Selecting p1 and receiving a project-scoped response must keep sibling p2's count (1)
+            // and the "All projects" total (3) intact rather than collapsing them to 0 / 2.
+            page.prefs.project_id = Some("p1".into());
+            let filtered_key = page.scope_key();
+            page.apply_list(filtered_key, false, false, Ok(filtered_p1), cx);
+            let (rows_after, total_after) = page.assignment_rows(cx);
+            assert_eq!(total_after, 3);
+            assert_eq!(rows_after.iter().find(|r| r.project_id == "p1").map(|r| r.pr_count), Some(2));
+            assert_eq!(rows_after.iter().find(|r| r.project_id == "p2").map(|r| r.pr_count), Some(1));
         });
     }
 }

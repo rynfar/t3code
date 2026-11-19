@@ -1078,11 +1078,15 @@ impl DetailView {
             let can_write = self.can_write_source_control(cx);
             self.code = Some(cx.new(|cx| CodeTab::new(state, detail_view, reference, detail.as_ref(), activity.as_ref(), can_write, cx)));
         }
-        if tab == Tab::Guide && self.guide.is_none() {
-            let state = self.state.clone();
-            let detail_view = cx.entity().downgrade();
-            let reference = self.reference.clone();
-            self.guide = Some(cx.new(|cx| GuideTab::new(state, detail_view, reference, cx)));
+        if tab == Tab::Guide {
+            if let Some(guide) = &self.guide {
+                guide.update(cx, |guide, _| guide.request_focus());
+            } else {
+                let state = self.state.clone();
+                let detail_view = cx.entity().downgrade();
+                let reference = self.reference.clone();
+                self.guide = Some(cx.new(|cx| GuideTab::new(state, detail_view, reference, cx)));
+            }
         }
         cx.notify();
     }

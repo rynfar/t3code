@@ -4,13 +4,16 @@
 //! attention callouts, sliced diff excerpts, lettered notes (A/B/C), clickable file jumps to the
 //! Code tab, review questions, and `j`/`k` stepping.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, IntoElement, KeyDownEvent, ParentElement, Render, ScrollHandle, SharedString, Styled, Task, WeakEntity, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled, Task, WeakEntity,
+    Window, div, prelude::*, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::diff::{FileDiff, LineKind};
+use t3_core::pull_requests::editing::allowed_review_verdicts;
 use t3_core::pull_requests::guide::{TourProgress, excerpt_rows, letter_stop_notes, stop_subline};
 use t3_core::pull_requests::wire::{DiffResult, ReviewGuide, ReviewGuideResult, ReviewGuideRun, ReviewGuideStop, decode};
 use t3_core::pull_requests::{PrRef, failure_message, method};
@@ -24,6 +27,7 @@ use crate::theme::{hsla, palette};
 use crate::transcript::markdown::{MarkdownStore, prose};
 
 const FAILURE_HINT: &str = "Check the review guide model in Settings → Source control.";
+const MAX_DIFF_SLICES: usize = 32;
 
 pub struct GuideTab {
     state: Entity<AppState>,
@@ -38,10 +42,54 @@ pub struct GuideTab {
     diff_files: Vec<FileDiff>,
     diff_loaded_sha: Option<String>,
     diff_error: Option<String>,
+    focus: FocusHandle,
+    needs_focus: bool,
     scroll: ScrollHandle,
     markdown: MarkdownStore,
     _fetch: Option<Task<()>>,
     _diff: Option<Task<()>>,
+}
+
+impl Focusable for GuideTab {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+fn wanted_excerpt_paths(guide: &ReviewGuide) -> HashSet<String> {
+    guide.stops.iter().flat_map(|stop| stop.excerpts.iter().map(|e| e.path.clone())).collect()
+}
+
+/// Paginates diff slices (`useGuideDiffFiles.ts:44-63`) until every excerpt path in `wanted` has
+/// arrived or `next_cursor` is exhausted (bounded by `MAX_DIFF_SLICES`).
+async fn fetch_guide_diff_slices<F, Fut>(wanted: &HashSet<String>, mut fetch_slice: F) -> Result<Vec<FileDiff>, String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<DiffResult, String>>,
+{
+    let mut files = Vec::new();
+    let mut seen_paths = HashSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_DIFF_SLICES {
+        let diff = fetch_slice(cursor.clone()).await?;
+        if let t3_core::diff::ParsedPatch::Files(parsed) = t3_core::diff::parse_patch(&diff.patch) {
+            for file in parsed {
+                if seen_paths.insert(file.path().to_owned()) {
+                    files.push(file);
+                }
+            }
+        }
+        if !wanted.is_empty() && wanted.iter().all(|path| seen_paths.contains(path)) {
+            break;
+        }
+        match diff.next_cursor {
+            Some(next) if !next.is_empty() && Some(next.as_str()) != cursor.as_deref() => {
+                cursor = Some(next);
+            }
+            _ => break,
+        }
+    }
+    Ok(files)
 }
 
 impl GuideTab {
@@ -59,6 +107,8 @@ impl GuideTab {
             diff_files: Vec::new(),
             diff_loaded_sha: None,
             diff_error: None,
+            focus: cx.focus_handle(),
+            needs_focus: true,
             scroll: ScrollHandle::new(),
             markdown: MarkdownStore::new(cx.entity_id()),
             _fetch: None,
@@ -66,6 +116,10 @@ impl GuideTab {
         };
         tab.reload(cx);
         tab
+    }
+
+    pub fn request_focus(&mut self) {
+        self.needs_focus = true;
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -79,13 +133,13 @@ impl GuideTab {
                 tab.loading = false;
                 match res {
                     Ok(result) => {
-                        let sha = result.guide.as_ref().map(|g| g.head_sha.clone());
+                        let diff_target = result.guide.as_ref().map(|g| (g.head_sha.clone(), wanted_excerpt_paths(g)));
                         tab.result = Some(result);
                         tab.error = None;
-                        if let Some(sha) = sha
+                        if let Some((sha, wanted)) = diff_target
                             && tab.diff_loaded_sha.as_deref() != Some(sha.as_str())
                         {
-                            tab.load_diff(sha, cx);
+                            tab.load_diff(sha, wanted, cx);
                         }
                     }
                     Err(err) => tab.error = Some(err),
@@ -95,18 +149,25 @@ impl GuideTab {
         }));
     }
 
-    fn load_diff(&mut self, head_sha: String, cx: &mut Context<Self>) {
+    fn load_diff(&mut self, head_sha: String, wanted: HashSet<String>, cx: &mut Context<Self>) {
         let Some(client) = self.state.read(cx).client_handle() else { return };
-        let payload = self.reference.payload();
+        let base_payload = self.reference.payload();
         let task = self.state.read(cx).runtime().spawn(async move {
-            let value = client.pull_request_diff(payload).await.map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
-            let diff: DiffResult = decode(value)?;
-            let parsed = t3_core::diff::parse_patch(&diff.patch);
-            let files = match parsed {
-                t3_core::diff::ParsedPatch::Files(files) => files,
-                _ => Vec::new(),
-            };
-            Ok::<_, String>(files)
+            fetch_guide_diff_slices(&wanted, move |cursor| {
+                let client = client.clone();
+                let mut payload = base_payload.clone();
+                if let Some(cursor) = cursor {
+                    payload["cursor"] = serde_json::json!(cursor);
+                }
+                async move {
+                    let value = client
+                        .pull_request_diff(payload)
+                        .await
+                        .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
+                    decode::<DiffResult>(value)
+                }
+            })
+            .await
         });
         self._diff = Some(cx.spawn(async move |this, cx| {
             let res = task.await.unwrap_or_else(|e| Err(e.to_string()));
@@ -137,13 +198,13 @@ impl GuideTab {
                 tab.generating = false;
                 match res {
                     Ok(result) => {
-                        let sha = result.guide.as_ref().map(|g| g.head_sha.clone());
+                        let diff_target = result.guide.as_ref().map(|g| (g.head_sha.clone(), wanted_excerpt_paths(g)));
                         tab.result = Some(result);
                         tab.error = None;
-                        if let Some(sha) = sha
+                        if let Some((sha, wanted)) = diff_target
                             && tab.diff_loaded_sha.as_deref() != Some(sha.as_str())
                         {
-                            tab.load_diff(sha, cx);
+                            tab.load_diff(sha, wanted, cx);
                         }
                     }
                     Err(err) => {
@@ -200,6 +261,15 @@ impl GuideTab {
 
     fn can_write(&self, cx: &App) -> bool {
         self.detail_view.upgrade().is_some_and(|view| view.read(cx).can_write_source_control(cx))
+    }
+
+    /// Mirrors `PullRequestDetailPanel.tsx:1918-1924`: only offer `"Finish review"` when the viewer
+    /// has write access and at least one review verdict is permitted on this pull request.
+    pub(crate) fn can_finish_review(&self, cx: &App) -> bool {
+        self.detail_view.upgrade().is_some_and(|view| {
+            let v = view.read(cx);
+            v.can_write_source_control(cx) && v.detail.as_ref().is_some_and(|detail| !allowed_review_verdicts(detail).is_empty())
+        })
     }
 
     fn open_file(&self, path: String, cx: &mut Context<Self>) {
@@ -361,8 +431,10 @@ impl GuideTab {
 
         h_flex()
             .id("pr-guide-tour")
+            .track_focus(&self.focus)
             .flex_1()
             .min_h_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.handle_key_down(event, cx)))
             .child(rail)
             .child(main)
@@ -523,6 +595,28 @@ impl GuideTab {
         });
 
         let is_last = index + 1 >= stop_count;
+        let can_finish = self.can_finish_review(cx);
+        let next_control: Option<AnyElement> = if is_last {
+            can_finish.then(|| {
+                Button::new("pr-guide-finish", Variant::Default, Size::Xs)
+                    .icon(Icon::Check)
+                    .label("Finish review")
+                    .on_click(cx.listener(|this, _, _, cx| this.finish_review(cx)))
+                    .into_any_element()
+            })
+        } else {
+            let next_label = match next_title {
+                Some(title) => format!("Next: {title}"),
+                None => "Next stop".to_owned(),
+            };
+            Some(
+                Button::new("pr-guide-next", Variant::Outline, Size::Xs)
+                    .icon(Icon::ChevronRight)
+                    .label(next_label)
+                    .on_click(cx.listener(|this, _, _, cx| this.step(1, cx)))
+                    .into_any_element(),
+            )
+        };
         let nav_footer = h_flex()
             .pt(px(12.))
             .border_t_1()
@@ -535,21 +629,7 @@ impl GuideTab {
                     .disabled(index == 0)
                     .on_click(cx.listener(|this, _, _, cx| this.step(-1, cx))),
             )
-            .child(if is_last {
-                Button::new("pr-guide-finish", Variant::Default, Size::Xs)
-                    .icon(Icon::Check)
-                    .label("Finish review")
-                    .on_click(cx.listener(|this, _, _, cx| this.finish_review(cx)))
-            } else {
-                let next_label = match next_title {
-                    Some(title) => format!("Next: {title}"),
-                    None => "Next stop".to_owned(),
-                };
-                Button::new("pr-guide-next", Variant::Outline, Size::Xs)
-                    .icon(Icon::ChevronRight)
-                    .label(next_label)
-                    .on_click(cx.listener(|this, _, _, cx| this.step(1, cx)))
-            });
+            .children(next_control);
 
         v_flex()
             .id("pr-guide-main")
@@ -594,8 +674,12 @@ impl GuideTab {
 }
 
 impl Render for GuideTab {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.markdown.begin_frame();
+        if self.needs_focus {
+            self.needs_focus = false;
+            self.focus.focus(window, cx);
+        }
         let p = palette(cx);
         let can_write = self.can_write(cx);
         let data = self.result.clone();
@@ -635,5 +719,125 @@ impl Render for GuideTab {
                 .into_any_element()
         });
         self.render_tour(guide, banner, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use t3_core::pull_requests::wire::{Detail, DiffResult, ReviewGuideResult, decode};
+
+    use super::*;
+
+    fn sample_guide_result() -> ReviewGuideResult {
+        decode(json!({
+            "guide": {
+                "headSha": "abc1234",
+                "generatedAt": "2026-01-02T02:00:00Z",
+                "stops": [
+                    {
+                        "title": "Stop one",
+                        "summary": "Core logic",
+                        "attention": null,
+                        "files": [{ "path": "src/a.rs" }],
+                        "excerpts": [{ "path": "src/a.rs", "side": "new", "start": 1, "end": 1, "caption": "a" }],
+                        "notes": [],
+                        "questions": []
+                    },
+                    {
+                        "title": "Stop two",
+                        "summary": "Second slice file",
+                        "attention": null,
+                        "files": [{ "path": "src/b.rs" }],
+                        "excerpts": [{ "path": "src/b.rs", "side": "new", "start": 1, "end": 1, "caption": "b" }],
+                        "notes": [],
+                        "questions": []
+                    }
+                ]
+            },
+            "run": null,
+            "currentHeadSha": "abc1234"
+        }))
+        .unwrap()
+    }
+
+    #[gpui::test]
+    fn guide_tab_focuses_on_open_steps_on_real_jk_keystrokes_and_gates_finish_review(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let reference = PrRef { project_id: "p1".into(), host: Some("github.com".into()), repository: "acme/app".into(), number: 42 };
+        let readonly_detail: Detail = decode(json!({
+            "provider": "github",
+            "capabilities": {
+                "actions": [], "mergeMethods": ["merge"],
+                "edit": { "changeRequest": false, "comment": false },
+                "review": { "resolve": false, "verdicts": [] },
+                "labels": false
+            },
+            "viewerPermissions": { "actions": [], "comment": false, "resolve": false, "labels": false },
+            "projectId": "p1", "projectTitle": "Repo", "workspaceRoot": "/tmp/repo", "repository": "acme/app", "number": 42,
+            "title": "PR", "body": "", "url": "https://github.com/acme/app/pull/42", "author": { "login": "alice" },
+            "viewer": "alice", "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 1, "deletions": 0, "changedFiles": 1,
+            "headBranch": "feat", "baseBranch": "main", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+            "observedAt": 100, "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+            "mergeCapabilities": { "merge": true, "squash": false, "rebase": false }
+        }))
+        .unwrap();
+        let (state, detail_view) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let detail_view = cx.new(|cx| DetailView::new(state.clone(), WeakEntity::new_invalid(), reference.clone(), None, cx));
+            detail_view.update(cx, |v, _| v.detail = Some(readonly_detail));
+            (state, detail_view)
+        });
+        let (guide, cx) = cx.add_window_view(|_window, cx| GuideTab::new(state.clone(), detail_view.downgrade(), reference.clone(), cx));
+        guide.update(cx, |guide, cx| {
+            guide.set_result_for_test(sample_guide_result(), Vec::new(), cx);
+            // Viewer with no allowed review verdicts cannot finish review.
+            assert!(!guide.can_finish_review(cx));
+        });
+        cx.run_until_parked();
+
+        // Dispatch real GPUI j/k keystrokes through the focused GuideTab window.
+        assert_eq!(guide.read_with(cx, |g, _| g.current_position()), 0);
+        cx.simulate_keystrokes("j");
+        assert_eq!(guide.read_with(cx, |g, _| g.current_position()), 1);
+        cx.simulate_keystrokes("k");
+        assert_eq!(guide.read_with(cx, |g, _| g.current_position()), 0);
+    }
+
+    #[test]
+    fn guide_diff_pagination_fetches_multiple_slices_until_all_wanted_paths_arrive() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let guide = sample_guide_result().guide.unwrap();
+        let wanted = wanted_excerpt_paths(&guide);
+        assert_eq!(wanted.len(), 2);
+
+        let mut seen_cursors: Vec<Option<String>> = Vec::new();
+        let files = runtime
+            .block_on(fetch_guide_diff_slices(&wanted, |cursor| {
+                seen_cursors.push(cursor.clone());
+                let slice = match cursor.as_deref() {
+                    None => DiffResult {
+                        patch: "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
+                        next_cursor: Some("slice-2".into()),
+                        truncated: false,
+                    },
+                    Some("slice-2") => DiffResult {
+                        patch: "diff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-old2\n+new2\n".into(),
+                        next_cursor: Some("slice-3".into()),
+                        truncated: false,
+                    },
+                    _ => panic!("should stop paginating once all wanted excerpt paths have arrived"),
+                };
+                async move { Ok(slice) }
+            }))
+            .unwrap();
+
+        assert_eq!(seen_cursors, vec![None, Some("slice-2".into())]);
+        let paths: Vec<&str> = files.iter().map(|f| f.path()).collect();
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
     }
 }

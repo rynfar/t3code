@@ -55,9 +55,15 @@ pub struct CodeTab {
     reveals: u64,
     viewed_supported: bool,
     viewed_can_write: bool,
+    inline_allowed: bool,
     range_comments: bool,
+    /// PR-head inline review threads, cleared on `DiffPanel` while viewing a single commit and
+    /// restored when returning to the full PR diff (`PullRequestCodeTab.tsx:595, 637-638`).
+    head_review_threads: Vec<t3_core::diff::InlineReviewThread>,
     _fetch: Option<Task<()>>,
     _viewed: Option<Task<()>>,
+    #[cfg(test)]
+    last_requested_cursor: Option<String>,
 }
 
 impl CodeTab {
@@ -100,9 +106,13 @@ impl CodeTab {
             reveals: 0,
             viewed_supported: false,
             viewed_can_write: false,
+            inline_allowed: false,
             range_comments: false,
+            head_review_threads: Vec::new(),
             _fetch: None,
             _viewed: None,
+            #[cfg(test)]
+            last_requested_cursor: None,
         };
         tab.sync_state(detail, activity, can_write, cx);
         tab.fetch(None, cx);
@@ -121,24 +131,40 @@ impl CodeTab {
     }
 
     pub fn sync_review_threads(&mut self, activity: &Activity, cx: &mut Context<Self>) {
-        let threads = to_inline_review_threads(activity);
-        self.panel.update(cx, |panel, cx| panel.set_review_threads(threads, cx));
+        self.head_review_threads = to_inline_review_threads(activity);
+        self.apply_commit_review_state(cx);
+    }
+
+    /// Commit-scoped diffs use commit-local coordinates, so PR-head inline review threads and
+    /// inline review comment drafting are disabled while `self.commit.is_some()` and restored when
+    /// viewing the full PR diff (`PullRequestCodeTab.tsx:595, 637-638`).
+    fn apply_commit_review_state(&self, cx: &mut Context<Self>) {
+        if self.commit.is_some() {
+            self.panel.update(cx, |panel, cx| {
+                panel.set_review_threads(Vec::new(), cx);
+                panel.set_external_comment_handler(None, cx);
+            });
+            return;
+        }
+        let threads = self.head_review_threads.clone();
+        let handler = self.inline_allowed.then(|| {
+            let this = cx.entity().downgrade();
+            Rc::new(move |comment: ReviewComment, cx: &mut gpui::App| {
+                if let Some(this) = this.upgrade() {
+                    this.update(cx, |tab, cx| tab.handle_inline_comment(comment, cx));
+                }
+            }) as Rc<dyn Fn(ReviewComment, &mut gpui::App)>
+        });
+        self.panel.update(cx, |panel, cx| {
+            panel.set_review_threads(threads, cx);
+            panel.set_external_comment_handler(handler, cx);
+        });
     }
 
     fn sync_capabilities(&mut self, detail: &Detail, can_write: bool, cx: &mut Context<Self>) {
         self.range_comments = detail.capabilities.review.range_comment == Some(true);
-        let inline_allowed = can_write && detail.capabilities.review.inline_comment && detail.viewer_permissions.comment;
-        if inline_allowed {
-            let this = cx.entity().downgrade();
-            let handler = Rc::new(move |comment: ReviewComment, cx: &mut gpui::App| {
-                if let Some(this) = this.upgrade() {
-                    this.update(cx, |tab, cx| tab.handle_inline_comment(comment, cx));
-                }
-            });
-            self.panel.update(cx, |panel, cx| panel.set_external_comment_handler(Some(handler), cx));
-        } else {
-            self.panel.update(cx, |panel, cx| panel.set_external_comment_handler(None, cx));
-        }
+        self.inline_allowed = can_write && detail.capabilities.review.inline_comment && detail.viewer_permissions.comment;
+        self.apply_commit_review_state(cx);
 
         let reference_sigils: Vec<ReferenceSigil> = detail
             .capabilities
@@ -220,6 +246,7 @@ impl CodeTab {
     pub fn set_commit(&mut self, commit: Option<String>, cx: &mut Context<Self>) {
         if self.commit != commit {
             self.commit = commit;
+            self.apply_commit_review_state(cx);
             if self.viewed_supported {
                 let can_write = self.viewed_can_write;
                 let target = self.viewed_target(can_write);
@@ -253,6 +280,10 @@ impl CodeTab {
     }
 
     fn fetch(&mut self, cursor: Option<String>, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.last_requested_cursor = cursor.clone();
+        }
         let Some(client) = self.state.read(cx).client_handle() else {
             self.error = Some(super::NOT_CONNECTED.to_owned());
             return self.show(cx);
@@ -322,23 +353,35 @@ impl CodeTab {
                 self.panel.update(cx, |panel, cx| panel.reveal_file_path(request, FileRevealTarget::file(wanted_path), cx));
             }
         }
-        let Some((digest, range)) = &self.reveal else { return };
-        let path = self.slices.iter().flat_map(|slice| slice.files().iter()).map(|file| file.path().to_owned()).find(|path| diff_path_matches(digest, path));
-        let Some(path) = path else { return };
-        let target = match range {
-            Some(range) => {
-                let side = match range.side {
-                    Side::Left => DiffSide::Deletions,
-                    Side::Right => DiffSide::Additions,
+        if let Some((digest, range)) = &self.reveal {
+            let path = self
+                .slices
+                .iter()
+                .flat_map(|slice| slice.files().iter())
+                .map(|file| file.path().to_owned())
+                .find(|path| diff_path_matches(digest, path));
+            if let Some(path) = path {
+                let target = match range {
+                    Some(range) => {
+                        let side = match range.side {
+                            Side::Left => DiffSide::Deletions,
+                            Side::Right => DiffSide::Additions,
+                        };
+                        FileRevealTarget::range(path, range.start.min(u32::MAX as u64) as u32, Some(range.end.min(u32::MAX as u64) as u32), Some(side), true)
+                    }
+                    None => FileRevealTarget::file(path),
                 };
-                FileRevealTarget::range(path, range.start.min(u32::MAX as u64) as u32, Some(range.end.min(u32::MAX as u64) as u32), Some(side), true)
+                self.reveal = None;
+                self.reveals += 1;
+                let request = self.reveals;
+                self.panel.update(cx, |panel, cx| panel.reveal_file_path(request, target, cx));
             }
-            None => FileRevealTarget::file(path),
-        };
-        self.reveal = None;
-        self.reveals += 1;
-        let request = self.reveals;
-        self.panel.update(cx, |panel, cx| panel.reveal_file_path(request, target, cx));
+        }
+        // If a pending path or anchor reveal is not in loaded slices yet, pull the next slice
+        // automatically (`PullRequestCodeTab.tsx:1518-1521, 1545-1548`).
+        if (self.reveal_path.is_some() || self.reveal.is_some()) && self.can_load_next() {
+            self.load_next(cx);
+        }
     }
 
     fn key(&self) -> String {
@@ -363,9 +406,17 @@ impl CodeTab {
     }
 
     #[cfg(test)]
-    #[cfg(test)]
     pub(crate) fn diff_panel(&self) -> &Entity<DiffPanel> {
         &self.panel
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_review_active(&self) -> (bool, usize) {
+        if self.commit.is_some() {
+            (false, 0)
+        } else {
+            (self.inline_allowed, self.head_review_threads.len())
+        }
     }
 }
 
@@ -480,5 +531,89 @@ impl Render for CodeTab {
                         }),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use t3_core::pull_requests::wire::{Activity, Detail, decode};
+
+    use super::*;
+
+    #[gpui::test]
+    fn code_tab_reveal_paginates_into_next_slice_and_commit_scope_disables_head_review_state(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let detail: Detail = decode(json!({
+            "provider": "github",
+            "capabilities": {
+                "actions": [], "mergeMethods": ["merge"],
+                "edit": { "changeRequest": false, "comment": false },
+                "review": { "resolve": true, "inlineComment": true, "rangeComment": true },
+                "labels": false
+            },
+            "viewerPermissions": { "actions": [], "comment": true, "resolve": true, "labels": false },
+            "projectId": "p1", "projectTitle": "Repo", "workspaceRoot": "/tmp/repo", "repository": "acme/app", "number": 42,
+            "title": "PR", "body": "", "url": "https://github.com/acme/app/pull/42", "author": { "login": "alice" },
+            "viewer": "alice", "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 2, "deletions": 0, "changedFiles": 2,
+            "headBranch": "feat", "baseBranch": "main", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+            "observedAt": 100, "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+            "mergeCapabilities": { "merge": true, "squash": false, "rebase": false }
+        }))
+        .unwrap();
+        let activity: Activity = decode(json!({
+            "comments": [],
+            "commentCount": 0,
+            "commentsTruncated": false,
+            "reviewThreads": [{
+                "id": "rt1", "path": "src/slice1.rs", "line": 1, "side": "right", "isResolved": false, "isOutdated": false,
+                "comments": [{ "id": "rc1", "author": { "login": "bob" }, "body": "Nit", "createdAt": "2026-01-02T01:00:00Z" }]
+            }],
+            "overviewThreads": [],
+            "commits": []
+        }))
+        .unwrap();
+        let reference = PrRef { project_id: "p1".into(), host: Some("github.com".into()), repository: "acme/app".into(), number: 42 };
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let code = cx.new(|cx| CodeTab::new(state, WeakEntity::new_invalid(), reference, Some(&detail), Some(&activity), true, cx));
+
+            // Full PR diff keeps inline comment drafting and PR-head review threads active.
+            assert_eq!(code.read(cx).commit_review_active(), (true, 1));
+
+            // Switching to a single commit disables inline drafting and clears head review threads.
+            code.update(cx, |tab, cx| tab.set_commit(Some("deadbeef".into()), cx));
+            assert_eq!(code.read(cx).commit_review_active(), (false, 0));
+
+            // Returning to full PR diff restores both.
+            code.update(cx, |tab, cx| tab.set_commit(None, cx));
+            assert_eq!(code.read(cx).commit_review_active(), (true, 1));
+
+            // Revealing a file in slice 2 triggers pagination to `next_cursor` instead of stalling.
+            code.update(cx, |tab, cx| {
+                let slice1 = Parsed::new("diff --git a/src/slice1.rs b/src/slice1.rs\n--- a/src/slice1.rs\n+++ b/src/slice1.rs\n@@ -1 +1 @@\n-a\n+b\n", false, None, None, None);
+                tab.slices = vec![slice1];
+                tab.next_cursor = Some("cursor-2".into());
+                tab.pending = false;
+                tab.error = None;
+                tab.last_requested_cursor = None;
+
+                tab.reveal_file_path("src/slice2.rs".into(), cx);
+                assert_eq!(tab.last_requested_cursor.as_deref(), Some("cursor-2"));
+                assert_eq!(tab.reveal_path.as_deref(), Some("src/slice2.rs"));
+
+                // Once slice 2 arrives, `try_reveal` resolves the pending path and bumps `reveals`.
+                let slice2 = Parsed::new("diff --git a/src/slice2.rs b/src/slice2.rs\n--- a/src/slice2.rs\n+++ b/src/slice2.rs\n@@ -1 +1 @@\n-x\n+y\n", false, None, None, None);
+                tab.slices.push(slice2);
+                tab.next_cursor = None;
+                tab.error = None;
+                tab.try_reveal(cx);
+                assert!(tab.reveal_path.is_none());
+                assert_eq!(tab.reveals, 1);
+            });
+        });
     }
 }
