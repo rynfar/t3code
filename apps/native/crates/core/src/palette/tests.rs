@@ -512,3 +512,38 @@ fn parses_rfc3339_timestamps() {
         assert_eq!(parse_iso_ms(invalid), None, "{invalid}");
     }
 }
+
+#[test]
+fn appends_in_messages_group_deduped_against_listed_threads_only_in_root_search() {
+    let threads = thread_items(&[make_thread("t1", "Alpha bug"), make_thread("t2", "Beta work")], &[]);
+    let msg_items = vec![
+        CommandPaletteItem { value: "thread:environment-local:t1".into(), title: "Alpha bug".into(), description: Some("...alpha...".into()), ..Default::default() },
+        CommandPaletteItem { value: "thread:environment-local:t2".into(), title: "Beta work".into(), description: Some("...alpha in body...".into()), ..Default::default() },
+    ];
+    let groups = search(CommandPaletteSearch {
+        query: "alpha",
+        thread_search_items: &threads,
+        thread_message_items: &msg_items,
+        ..Default::default()
+    });
+    let in_messages = groups.iter().find(|group| group.value == "threads-messages").expect("In messages group");
+    assert_eq!(in_messages.label, "In messages");
+    assert_eq!(in_messages.items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(), ["thread:environment-local:t2"]);
+
+    let actions_only = search(CommandPaletteSearch {
+        query: ">alpha",
+        thread_search_items: &threads,
+        thread_message_items: &msg_items,
+        ..Default::default()
+    });
+    assert!(actions_only.iter().all(|group| group.value != "threads-messages"));
+
+    let submenu = search(CommandPaletteSearch {
+        query: "alpha",
+        is_in_submenu: true,
+        thread_search_items: &threads,
+        thread_message_items: &msg_items,
+        ..Default::default()
+    });
+    assert!(submenu.iter().all(|group| group.value != "threads-messages"));
+}

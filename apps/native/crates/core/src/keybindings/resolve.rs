@@ -215,25 +215,28 @@ pub fn shortcut_conflict_key(shortcut: &KeybindingShortcut, mac: bool) -> String
     .join("|")
 }
 
-/// Resolves a persisted Mod+Enter against the send preference without rewriting saved shortcuts.
-fn shortcut_for_context<'a>(
-    binding: &'a ResolvedKeybindingRule,
-    context: &ShortcutMatchContext,
-) -> Cow<'a, KeybindingShortcut> {
+/// Whether a rule's plain `Mod+Enter` shifts to `Mod+Shift+Enter` while `composerRequiresModifier`
+/// is active (`shortcutForContext` in `apps/web/src/keybindings.ts`).
+pub fn shifts_with_composer_modifier(binding: &ResolvedKeybindingRule) -> bool {
     let shortcut = &binding.shortcut;
-    if context.flag("composerRequiresModifier")
-        && (binding.command == "composer.sendAlternate"
-            || binding.command == "composer.sendBackground")
+    (binding.command == "composer.sendAlternate" || binding.command == "composer.sendBackground")
         && shortcut.key == "enter"
         && shortcut.mod_key
         && !shortcut.meta_key
         && !shortcut.ctrl_key
         && !shortcut.alt_key
         && !shortcut.shift_key
-    {
-        return Cow::Owned(KeybindingShortcut { shift_key: true, ..shortcut.clone() });
+}
+
+/// Resolves a persisted Mod+Enter against the send preference without rewriting saved shortcuts.
+fn shortcut_for_context<'a>(
+    binding: &'a ResolvedKeybindingRule,
+    context: &ShortcutMatchContext,
+) -> Cow<'a, KeybindingShortcut> {
+    if context.flag("composerRequiresModifier") && shifts_with_composer_modifier(binding) {
+        return Cow::Owned(KeybindingShortcut { shift_key: true, ..binding.shortcut.clone() });
     }
-    Cow::Borrowed(shortcut)
+    Cow::Borrowed(&binding.shortcut)
 }
 
 pub fn effective_shortcuts_for_command(
@@ -440,4 +443,45 @@ pub fn gpui_predicate(node: &KeybindingWhenNode) -> String {
             format!("({} || {})", gpui_predicate(left), gpui_predicate(right))
         }
     }
+}
+
+/// Top-level workspace regions visited by `workspace.focusNext` / `workspace.focusPrevious`
+/// (`apps/web/src/lib/workspaceFocus.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkspaceFocusArea {
+    Sidebar,
+    Conversation,
+    Composer,
+    Terminal,
+    RightPanel,
+    PullRequests,
+    Home,
+}
+
+/// Cycles to the next or previous visible workspace region (`move` in `workspaceFocus.ts`).
+pub fn next_workspace_focus_area(
+    visible: &[WorkspaceFocusArea],
+    current: Option<WorkspaceFocusArea>,
+    forward: bool,
+) -> Option<WorkspaceFocusArea> {
+    if visible.is_empty() {
+        return None;
+    }
+    let idx = match current.and_then(|area| visible.iter().position(|candidate| *candidate == area)) {
+        None => {
+            if forward {
+                0
+            } else {
+                visible.len() - 1
+            }
+        }
+        Some(pos) => {
+            if forward {
+                (pos + 1) % visible.len()
+            } else {
+                (pos + visible.len() - 1) % visible.len()
+            }
+        }
+    };
+    Some(visible[idx])
 }

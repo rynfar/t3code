@@ -108,7 +108,8 @@ pub fn contents_request(cwd: &str, query: &str, options: ContentOptions) -> Opti
     })
 }
 
-/// Converts UTF-16 code-unit `matchRanges` returned by the Node server into UTF-8 byte ranges for `text`.
+/// Converts UTF-16 code-unit `matchRanges` returned by the Node server into sorted, merged,
+/// non-overlapping UTF-8 byte ranges for `text` (`normalizeRanges` in `HighlightedSearchLine.tsx`).
 pub fn utf16_byte_ranges(text: &str, match_ranges: &[MatchRange]) -> Vec<std::ops::Range<usize>> {
     if match_ranges.is_empty() {
         return Vec::new();
@@ -121,21 +122,25 @@ pub fn utf16_byte_ranges(text: &str, match_ranges: &[MatchRange]) -> Vec<std::op
     }
     utf16_to_byte.push(text.len());
     let max_u16 = utf16_to_byte.len() - 1;
-    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
-    for range in match_ranges {
-        let start_u16 = range.start.min(max_u16);
-        let end_u16 = range.end.min(max_u16);
-        if start_u16 >= end_u16 {
-            continue;
-        }
-        let start = utf16_to_byte[start_u16];
-        let end = utf16_to_byte[end_u16];
-        if start >= end {
-            continue;
-        }
+    let mut raw: Vec<std::ops::Range<usize>> = match_ranges
+        .iter()
+        .filter_map(|range| {
+            let start_u16 = range.start.min(max_u16);
+            let end_u16 = range.end.min(max_u16);
+            if start_u16 >= end_u16 {
+                return None;
+            }
+            let start = utf16_to_byte[start_u16];
+            let end = utf16_to_byte[end_u16];
+            (start < end).then_some(start..end)
+        })
+        .collect();
+    raw.sort_by_key(|range| (range.start, range.end));
+    let mut out: Vec<std::ops::Range<usize>> = Vec::with_capacity(raw.len());
+    for range in raw {
         match out.last_mut() {
-            Some(last) if last.end == start => last.end = end,
-            _ => out.push(start..end),
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => out.push(range),
         }
     }
     out
@@ -356,6 +361,11 @@ mod tests {
         assert_eq!(
             utf16_byte_ranges("🚀 fn é", &[MatchRange { start: 3, end: 5 }, MatchRange { start: 6, end: 7 }]),
             [5..7, 8..10]
+        );
+        // Unsorted and overlapping UTF-16 ranges normalize cleanly without overlapping byte runs.
+        assert_eq!(
+            utf16_byte_ranges("abcdef", &[MatchRange { start: 3, end: 5 }, MatchRange { start: 1, end: 4 }]),
+            std::slice::from_ref(&(1..5))
         );
     }
 }

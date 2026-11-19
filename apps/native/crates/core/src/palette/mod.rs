@@ -1,6 +1,6 @@
 //! Port of the ranking and grouping in `apps/web/src/components/CommandPalette.logic.ts`, with `threadSearchSubject` from `packages/client-runtime/src/state/threadSearch.ts` and the recent-threads order from `CommandPalette.tsx` (`shortcuts/commandPaletteCommands.ts` holds only key handlers).
 //!
-//! Skipped: `ITEM_ICON_CLASS`, `ADDON_ICON_CLASS`, `buildLinkedThreadActionItems`, `browseInputEndPaddingClass`, `SearchOverlayMode`, `CommandPaletteOpenIntent`, `CommandPaletteUiState`, `CommandPaletteUiAction`, `reduceCommandPaletteUiState`, `AddProjectEntry`, `resolveAddProjectEntry`, `CommandPaletteThreadContentMatch`, `CommandPaletteItemPin`, `CommandPaletteReturnContext`, `buildCommandPaletteProjectMetadata`, `buildBrowseGroups`, `filterPinnedBrowseEntries`, `getEnvironmentBrowsePlatform`, `AddProjectEnvironmentOption`, `AddProjectCloneFlow`, `remoteProjectInputPlaceholder`, `buildPaletteRemoteSourceReadiness`, `errorMessage`, `overlayModeForCommand`, `resolveCommandPaletteProject`, `newThreadNoProjectIndex`, and the `threadMessageItems` ("In messages") input of `filterCommandPaletteGroups`.
+//! Skipped: `ITEM_ICON_CLASS`, `ADDON_ICON_CLASS`, `buildLinkedThreadActionItems`, `browseInputEndPaddingClass`, `SearchOverlayMode`, `CommandPaletteOpenIntent`, `CommandPaletteUiState`, `CommandPaletteUiAction`, `reduceCommandPaletteUiState`, `AddProjectEntry`, `resolveAddProjectEntry`, `CommandPaletteThreadContentMatch`, `CommandPaletteItemPin`, `CommandPaletteReturnContext`, `buildCommandPaletteProjectMetadata`, `buildBrowseGroups`, `filterPinnedBrowseEntries`, `getEnvironmentBrowsePlatform`, `AddProjectEnvironmentOption`, `AddProjectCloneFlow`, `remoteProjectInputPlaceholder`, `buildPaletteRemoteSourceReadiness`, `errorMessage`, `overlayModeForCommand`, `resolveCommandPaletteProject`, `newThreadNoProjectIndex`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -399,6 +399,8 @@ pub struct CommandPaletteSearch<'a> {
     pub project_search_items: &'a [CommandPaletteItem],
     pub settings_search_items: &'a [CommandPaletteItem],
     pub thread_search_items: &'a [CommandPaletteItem],
+    /// Server-matched message rows (`"In messages"`), already trimmed to `PALETTE_MESSAGE_LIMIT`.
+    pub thread_message_items: &'a [CommandPaletteItem],
     pub now: i64,
 }
 
@@ -490,7 +492,7 @@ pub fn filter_command_palette_groups(input: &CommandPaletteSearch<'_>) -> Vec<Co
         |item, typos, _| score_palette_item(item, &normalized_query, input.now, typos),
     );
     let threads_match = ranked.iter().any(|entry| entry.group.value == "threads-search");
-    ranked
+    let mut groups: Vec<CommandPaletteGroup> = ranked
         .into_iter()
         .map(|RankedGroup { group, mut ranked }| {
             let limit = if group.value == "threads-search" {
@@ -516,7 +518,26 @@ pub fn filter_command_palette_groups(input: &CommandPaletteSearch<'_>) -> Vec<Co
                 items: items.collect(),
             }
         })
-        .collect()
+        .collect();
+    if !searches_everything {
+        return groups;
+    }
+    let listed: HashSet<&str> =
+        groups.iter().flat_map(|group| group.items.iter().map(|item| item.value.as_str())).collect();
+    let message_items: Vec<CommandPaletteItem> = input
+        .thread_message_items
+        .iter()
+        .filter(|item| !listed.contains(item.value.as_str()))
+        .cloned()
+        .collect();
+    if !message_items.is_empty() {
+        groups.push(CommandPaletteGroup {
+            value: "threads-messages".into(),
+            label: "In messages".into(),
+            items: message_items,
+        });
+    }
+    groups
 }
 
 /// `YYYY-MM-DDTHH:MM:SS(.fff)` with `Z` or `±HH:MM`, to epoch ms.

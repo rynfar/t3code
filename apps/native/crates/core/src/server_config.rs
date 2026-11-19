@@ -582,6 +582,9 @@ pub struct EnvironmentCapabilities {
     pub voice_transcription: Option<bool>,
     #[serde(default)]
     pub cloud_voice_transcription: Option<bool>,
+    /// Server answers `server.prepareTriage`.
+    #[serde(default)]
+    pub triage: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -845,6 +848,16 @@ pub struct RemoteOpenTarget {
     pub username: Option<String>,
 }
 
+/// `ServerConfigIssue` in `packages/contracts/src/server.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerConfigIssue {
+    pub kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub index: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
@@ -861,6 +874,9 @@ pub struct ServerConfig {
     /// `ResolvedKeybindingsConfig`, kept raw for the keymap (ledger KB-USER).
     #[serde(default)]
     pub keybindings: Value,
+    /// `ServerConfig.issues`: configuration diagnostics such as malformed or invalid `keybindings.json`.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub issues: Vec<ServerConfigIssue>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub providers: Vec<ServerProvider>,
     #[serde(default, deserialize_with = "update_settings")]
@@ -917,6 +933,14 @@ impl ServerConfig {
     pub fn provider(&self, instance_id: &str) -> Option<&ServerProvider> {
         self.providers.iter().find(|provider| provider.instance_id == instance_id)
     }
+
+    /// First `keybindings.*` configuration issue message (`KeybindingsUpdateToast.logic.ts`).
+    pub fn keybindings_issue_message(&self) -> Option<&str> {
+        self.issues
+            .iter()
+            .find(|issue| issue.kind.starts_with("keybindings."))
+            .map(|issue| issue.message.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -924,6 +948,8 @@ impl ServerConfig {
 pub struct KeybindingsPayload {
     #[serde(default)]
     pub keybindings: Value,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub issues: Vec<ServerConfigIssue>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -992,6 +1018,8 @@ pub struct ServerConfigState {
     settings_revision: u64,
     /// The same for keymaps, so a keybinding edit's reply never overwrites a newer stream.
     keybindings_revision: u64,
+    /// Counts live `keybindingsUpdated` stream events so UI toasts react only to live updates.
+    keybindings_updated_seq: u64,
 }
 
 impl ServerConfigState {
@@ -1021,7 +1049,13 @@ impl ServerConfigState {
             }
             ServerConfigStreamEvent::KeybindingsUpdated { payload } => {
                 self.keybindings_revision += 1;
-                self.update(|config| replace(&mut config.keybindings, payload.keybindings))
+                self.keybindings_updated_seq += 1;
+                self.update(|config| {
+                    let keys = replace(&mut config.keybindings, payload.keybindings);
+                    let issues = replace(&mut config.issues, payload.issues);
+                    let has_issue = config.keybindings_issue_message().is_some();
+                    keys || issues || has_issue
+                })
             }
             ServerConfigStreamEvent::ProviderStatuses { payload } => self.apply_providers(payload.providers),
             ServerConfigStreamEvent::SettingsUpdated { payload } => {
@@ -1065,15 +1099,24 @@ impl ServerConfigState {
         self.keybindings_revision
     }
 
-    /// Applies the `keybindings` a `server.upsertKeybinding` / `server.removeKeybinding` sent at
-    /// `sent_at` answered with, so an edit shows before `keybindingsUpdated` streams the same
+    pub fn keybindings_updated_seq(&self) -> u64 {
+        self.keybindings_updated_seq
+    }
+
+    /// Applies the `keybindings` (and `issues`) a `server.upsertKeybinding` / `server.removeKeybinding`
+    /// sent at `sent_at` answered with, so an edit shows before `keybindingsUpdated` streams the same
     /// set, unless a keymap streamed since. Returns true when the config changed.
     pub fn apply_keybindings_reply(&mut self, reply: &Value, sent_at: u64) -> bool {
         if sent_at != self.keybindings_revision {
             return false;
         }
+        let next_issues = reply.get("issues").cloned().and_then(decode_each::<ServerConfigIssue>);
         match reply.get("keybindings") {
-            Some(keybindings @ Value::Array(_)) => self.update(|config| replace(&mut config.keybindings, keybindings.clone())),
+            Some(keybindings @ Value::Array(_)) => self.update(|config| {
+                let keys = replace(&mut config.keybindings, keybindings.clone());
+                let issues = next_issues.is_some_and(|next| replace(&mut config.issues, next));
+                keys || issues
+            }),
             _ => false,
         }
     }
@@ -1147,3 +1190,76 @@ fn overrides_map<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<String, Proj
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod keybindings_issues_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn snapshot_with_issues(issues: Value) -> ServerConfigStreamEvent {
+        serde_json::from_value(json!({
+            "version": 1,
+            "type": "snapshot",
+            "config": {
+                "environment": { "environmentId": "e1", "label": "Mac", "serverVersion": "0.1.0", "capabilities": { "triage": true } },
+                "auth": {},
+                "cwd": "/w",
+                "keybindingsConfigPath": "/k.json",
+                "keybindings": [],
+                "issues": issues,
+                "providers": [],
+                "availableEditors": ["vscode"],
+                "observability": {},
+                "settings": {}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn decodes_keybindings_issues_from_snapshot_stream_and_reply() {
+        let mut state = ServerConfigState::default();
+        assert!(state.apply(snapshot_with_issues(json!([
+            { "kind": "other.warning", "message": "Ignored" },
+            { "kind": "keybindings.invalid-entry", "message": "Invalid entry at index 2", "index": 2 },
+            { "bad": true }
+        ]))));
+        let config = state.config.as_ref().unwrap();
+        assert_eq!(config.environment.capabilities.triage, Some(true));
+        assert_eq!(config.issues.len(), 2);
+        assert_eq!(config.keybindings_issue_message(), Some("Invalid entry at index 2"));
+        assert_eq!(state.keybindings_updated_seq(), 0);
+
+        let updated: ServerConfigStreamEvent = serde_json::from_value(json!({
+            "version": 1,
+            "type": "keybindingsUpdated",
+            "payload": {
+                "keybindings": [{ "key": "mod+k", "command": "commandPalette.toggle" }],
+                "issues": [{ "kind": "keybindings.malformed-config", "message": "Malformed JSON" }]
+            }
+        }))
+        .unwrap();
+        assert!(state.apply(updated));
+        assert_eq!(state.keybindings_updated_seq(), 1);
+        assert_eq!(state.config.as_ref().unwrap().keybindings_issue_message(), Some("Malformed JSON"));
+
+        // Reply updates issues optimistically and clears when empty.
+        let sent_at = state.keybindings_revision();
+        assert!(state.apply_keybindings_reply(&json!({ "keybindings": [], "issues": [] }), sent_at));
+        assert_eq!(state.config.as_ref().unwrap().keybindings_issue_message(), None);
+
+        // Live keybindingsUpdated clearing issues updates seq and state cleanly.
+        let cleared: ServerConfigStreamEvent = serde_json::from_value(json!({
+            "version": 1,
+            "type": "keybindingsUpdated",
+            "payload": {
+                "keybindings": [{ "key": "mod+k", "command": "commandPalette.toggle" }],
+                "issues": []
+            }
+        }))
+        .unwrap();
+        assert!(state.apply(cleared));
+        assert_eq!(state.keybindings_updated_seq(), 2);
+        assert_eq!(state.config.as_ref().unwrap().keybindings_issue_message(), None);
+    }
+}

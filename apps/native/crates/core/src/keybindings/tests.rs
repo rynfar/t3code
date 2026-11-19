@@ -730,3 +730,18 @@ fn composer_requires_modifier_shifts_send_background_as_well_as_send_alternate()
     assert_eq!(resolve(ev("enter", "meta"), defaults(), &turn_ctx, MAC), None);
     assert_eq!(resolve(ev("enter", "meta+shift"), defaults(), &turn_ctx, MAC), Some("composer.sendAlternate"));
 }
+
+#[test]
+fn workspace_focus_cycles_visible_areas_forward_and_backward() {
+    use WorkspaceFocusArea::*;
+    let areas = [Sidebar, Conversation, Composer, Terminal, RightPanel];
+    assert_eq!(next_workspace_focus_area(&[], None, true), None);
+    assert_eq!(next_workspace_focus_area(&areas, None, true), Some(Sidebar));
+    assert_eq!(next_workspace_focus_area(&areas, None, false), Some(RightPanel));
+    assert_eq!(next_workspace_focus_area(&areas, Some(Composer), true), Some(Terminal));
+    assert_eq!(next_workspace_focus_area(&areas, Some(RightPanel), true), Some(Sidebar));
+    assert_eq!(next_workspace_focus_area(&areas, Some(Sidebar), false), Some(RightPanel));
+    // When the remembered area is no longer visible, fall back to ends matching web move().
+    assert_eq!(next_workspace_focus_area(&[Sidebar, Composer], Some(Terminal), true), Some(Sidebar));
+    assert_eq!(next_workspace_focus_area(&[Sidebar, Composer], Some(Terminal), false), Some(Composer));
+}

@@ -8,14 +8,18 @@ mod files;
 mod projects;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use gpui::{
     App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled,
-    Subscription, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
+    Subscription, Task, Window, deferred, div, hsla as gpui_hsla, point, prelude::*, px,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Backspace, Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::client_settings::{AppearanceMode, ClientSettingChange, ThemePreference};
+use t3_core::composer::{SERVER_PREPARE_TRIAGE, prepare_triage_request};
+use t3_core::home::{PROJECTS_ENSURE_SCRATCH, ensure_scratch_project_id};
 use t3_core::palette::{
     CommandPaletteAllOptions, CommandPaletteGroup, CommandPaletteItem, CommandPaletteItemKind, CommandPaletteProject, CommandPaletteRow, CommandPaletteSearch,
     CommandPaletteSearchAction, CommandPaletteSearchState, CommandPaletteView, PaletteThread, build_command_palette_rows,
@@ -23,6 +27,12 @@ use t3_core::palette::{
     enumerate_command_palette_items, filter_command_palette_groups, get_command_palette_input_placeholder, get_command_palette_mode, recent_thread_items,
     reduce_command_palette_search_state,
 };
+use t3_core::project_search::SEARCH_DEBOUNCE_MS;
+use t3_core::search::{
+    MessageRankOptions, PALETTE_MESSAGE_LIMIT, ShownOrder, decode_search_matches, find_for_message_match, fold_search_query, next_shown_order,
+    rank_message_matches,
+};
+use t3_core::sidebar::older_settled::{SEARCH_THREADS, search_request, searches_messages};
 use t3_core::sidebar::time::{compact_relative_label, format_iso, parse_iso};
 
 use crate::app_state::AppState;
@@ -33,11 +43,20 @@ use crate::keymap::{
 };
 use crate::new_thread::{NewThread, NewThreadWithoutProject};
 use crate::sidebar::is_composing;
-use crate::sidebar::controller::now_ms;
+use crate::sidebar::controller::{now_ms, uuid};
 use crate::theme::{hsla, palette};
 use crate::thread_view::FindInThread;
+use crate::toast::{Toast, ToastKind};
 
 const ENVIRONMENT: &str = t3_core::sidebar::ENVIRONMENT_ID;
+const TRIAGE_CLI_COMMAND: &str = "npx t3 triage";
+
+fn grants_orchestration_operate(state: &AppState) -> bool {
+    state
+        .client_handle()
+        .and_then(|handle| handle.session_state().borrow().clone())
+        .is_none_or(|session| session.grants(ORCHESTRATION_OPERATE_SCOPE))
+}
 
 gpui::actions!(palette, [OpenAddProject]);
 
@@ -70,6 +89,7 @@ pub struct CommandPalette {
     state: Entity<AppState>,
     composer: Entity<crate::composer::Composer>,
     input: Entity<InputState>,
+    focus: FocusHandle,
     open: bool,
     mode: Mode,
     files: files::FileSearch,
@@ -82,6 +102,10 @@ pub struct CommandPalette {
     scoped_project_actions: ScopedProjectActions,
     scoped_thread_actions: HashMap<String, t3_core::sidebar::tag_filter::ThreadKey>,
     settings: Vec<CommandPaletteItem>,
+    message_items: Vec<CommandPaletteItem>,
+    message_finds: HashMap<String, t3_core::timeline::PendingThreadFind>,
+    message_order: Option<ShownOrder<String>>,
+    message_request: Option<Task<()>>,
     groups: Vec<CommandPaletteGroup>,
     highlighted: Option<String>,
     focus_return: Option<FocusHandle>,
@@ -127,6 +151,14 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
             Some("chat.newWithoutProject"),
         ));
     }
+    if state.server_config.config.as_ref().is_some_and(|config| config.environment.capabilities.triage == Some(true))
+        && grants_orchestration_operate(state)
+    {
+        items.push(CommandPaletteItem {
+            description: Some("An agent investigates a T3 Code problem and helps file an issue".to_owned()),
+            ..action("action:triage", "Triage an issue", &["triage", "bug", "issue", "report", "broken", "debug", "help", "support"], None)
+        });
+    }
     if state.selected_thread.is_some() {
         items.push(action("action:find-in-thread", "Find in current thread", &["find", "search", "thread", "messages"], Some("chat.find")));
     }
@@ -160,6 +192,15 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
         items.push(action("action:link-pull-request", "Link pull request to thread", &["link", "pull request", "pr", "attach", "stack"], None));
         let linked = state.thread_shell(&thread.id).is_some_and(|shell| !t3_core::pull_requests::link::visible_links(&shell.pull_requests).is_empty());
         items.push(CommandPaletteItem { disabled: !linked, ..action("action:open-thread-pull-requests", "Show linked pull requests", &["pull requests", "linked", "stack", "prs"], None) });
+        if state.can_share_with_guest() {
+            items.push(action("action:share-thread-with-guest", "Share with guest", &["share", "guest", "invite", "link", "teammate"], None));
+        }
+        items.push(action(
+            "action:restart-agent-session",
+            "Restart agent session",
+            &["restart", "reset", "reload", "agent", "session", "skills", "plugins", "mcp"],
+            None,
+        ));
     }
     if state.active_project_target().is_some() {
         items.push(action("action:open-file-picker", "Go to file", &["go to file", "open file", "file picker", "find file", "quick open"], Some("filePicker.toggle")));
@@ -387,10 +428,12 @@ impl CommandPalette {
                 match this.mode {
                     Mode::Command => {
                         this.search = reduce_command_palette_search_state(std::mem::take(&mut this.search), CommandPaletteSearchAction::Query(query));
+                        this.schedule_message_search(cx);
                         this.refilter(cx);
                     }
-                    Mode::Files => this.files.search(query, &this.state.clone(), cx),
-                    Mode::Content => this.content.search(query, &this.state.clone(), cx),
+                    Mode::Files if !this.input_disabled(cx) => this.files.search(query, &this.state.clone(), cx),
+                    Mode::Content if !this.input_disabled(cx) => this.content.search(query, &this.state.clone(), cx),
+                    Mode::Files | Mode::Content => {}
                     Mode::Browse => this.browse.set_query(query, &this.state.clone(), cx),
                     Mode::NewProject => this.search = reduce_command_palette_search_state(std::mem::take(&mut this.search), CommandPaletteSearchAction::Query(query)),
                 }
@@ -413,6 +456,7 @@ impl CommandPalette {
             state,
             composer,
             input,
+            focus: cx.focus_handle(),
             open: false,
             mode: Mode::Command,
             files: Default::default(),
@@ -425,6 +469,10 @@ impl CommandPalette {
             scoped_project_actions: HashMap::new(),
             scoped_thread_actions: HashMap::new(),
             settings: crate::settings::palette_items(cx),
+            message_items: Vec::new(),
+            message_finds: HashMap::new(),
+            message_order: None,
+            message_request: None,
             groups: Vec::new(),
             highlighted: None,
             focus_return: None,
@@ -463,14 +511,29 @@ impl CommandPalette {
         get_command_palette_input_placeholder(get_command_palette_mode(!self.search.views.is_empty(), false))
     }
 
+    fn input_disabled(&self, cx: &App) -> bool {
+        match self.mode {
+            Mode::Files => self.files.target.is_none() || !files::grants_filesystem_read(self.state.read(cx)),
+            Mode::Content => self.content.target.is_none() || !files::grants_filesystem_read(self.state.read(cx)),
+            _ => false,
+        }
+    }
+
+    fn clear_message_search(&mut self) {
+        self.message_request = None;
+        self.message_items.clear();
+        self.message_finds.clear();
+        self.message_order = None;
+    }
+
     fn enter_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = mode;
+        self.clear_message_search();
         let target = self.state.read(cx).active_project_target();
         let placeholder = mode.placeholder(target.as_ref().map(|target| target.project_name.as_str()));
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.set_placeholder(placeholder, window, cx);
-            input.focus(window, cx);
         });
         match mode {
             Mode::Command => {
@@ -486,6 +549,11 @@ impl CommandPalette {
                 self.browse.set_query("~/".to_owned(), &self.state.clone(), cx);
             }
             Mode::NewProject => self.search = create_command_palette_search_state(""),
+        }
+        if self.input_disabled(cx) {
+            window.focus(&self.focus, cx);
+        } else {
+            self.input.update(cx, |input, cx| input.focus(window, cx));
         }
         cx.notify();
     }
@@ -518,6 +586,7 @@ impl CommandPalette {
                     input.set_value(query, window, cx);
                     input.set_placeholder(placeholder, window, cx);
                 });
+                self.schedule_message_search(cx);
                 self.refilter(cx);
             }
             Mode::Command => self.close(window, cx),
@@ -528,7 +597,11 @@ impl CommandPalette {
     /// Enter opens the file in the right panel (`openFile`); without an open thread, in the
     /// preferred editor (or mentions it when the server has none). Cmd+Enter mentions it.
     fn open_target(&mut self, path: String, line: Option<u64>, mention: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(cwd) = self.state.read(cx).active_project_target().map(|target| target.cwd) else { return };
+        let state = self.state.read(cx);
+        if !files::grants_filesystem_read(state) {
+            return;
+        }
+        let Some(cwd) = state.active_project_target().map(|target| target.cwd) else { return };
         self.close(window, cx);
         self.state.update(cx, |state, cx| {
             if !mention && state.file_workspace().is_some() {
@@ -564,6 +637,7 @@ impl CommandPalette {
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
+        self.clear_message_search();
         if let Some(focus) = self.focus_return.take() {
             window.focus(&focus, cx);
         }
@@ -689,6 +763,108 @@ impl CommandPalette {
         }
     }
 
+    fn schedule_message_search(&mut self, cx: &mut Context<Self>) {
+        if self.mode != Mode::Command || !self.search.views.is_empty() || self.search.query.starts_with('>') {
+            self.clear_message_search();
+            return;
+        }
+        let query = self.search.query.clone();
+        if !searches_messages(&query) {
+            self.clear_message_search();
+            return;
+        }
+        let Some(payload) = search_request(&query, None, None) else {
+            self.clear_message_search();
+            return;
+        };
+        let conn_id = self.state.read(cx).connection_id();
+        let state = self.state.clone();
+        self.message_request = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
+            let current = this.read_with(cx, |palette, _| {
+                palette.open
+                    && palette.mode == Mode::Command
+                    && palette.search.views.is_empty()
+                    && palette.search.query == query
+            });
+            if !current.unwrap_or(false) {
+                return;
+            }
+            let same_conn = state.read_with(cx, |app, _| app.connection_id() == conn_id);
+            if !same_conn {
+                return;
+            }
+            let result = cx.update(|cx| state.read(cx).rpc(SEARCH_THREADS, payload)).await;
+            let _ = this.update(cx, |palette, cx| {
+                let app = state.read(cx);
+                if !palette.open
+                    || palette.mode != Mode::Command
+                    || !palette.search.views.is_empty()
+                    || palette.search.query != query
+                    || app.connection_id() != conn_id
+                {
+                    return;
+                }
+                let Ok(value) = result else {
+                    palette.message_items.clear();
+                    palette.message_finds.clear();
+                    palette.refilter(cx);
+                    return;
+                };
+                let matches = decode_search_matches(&value, ENVIRONMENT);
+                let now = now_ms();
+                let item_by_value: HashMap<&str, &CommandPaletteItem> =
+                    palette.threads.iter().map(|item| (item.value.as_str(), item)).collect();
+                let item_for_thread = |thread_id: &str| -> Option<&CommandPaletteItem> {
+                    item_by_value.get(format!("thread:{ENVIRONMENT}:{thread_id}").as_str()).copied().or_else(|| {
+                        palette
+                            .scoped_thread_actions
+                            .iter()
+                            .find(|(_, key)| key.thread_id == thread_id)
+                            .and_then(|(val, _)| item_by_value.get(val.as_str()).copied())
+                    })
+                };
+                let ranked = rank_message_matches(
+                    &matches,
+                    |hit| item_for_thread(&hit.thread_id).and_then(|item| item.thread_search.as_ref()),
+                    &fold_search_query(&query),
+                    now,
+                    MessageRankOptions { picks: true, without_title_matches: true },
+                );
+                let mut built_by_value: HashMap<String, CommandPaletteItem> = HashMap::new();
+                let mut finds: HashMap<String, t3_core::timeline::PendingThreadFind> = HashMap::new();
+                let mut keys: Vec<String> = Vec::new();
+                for hit in ranked {
+                    let Some(item) = item_for_thread(&hit.thread_id) else { continue };
+                    if built_by_value.contains_key(&item.value) {
+                        continue;
+                    }
+                    keys.push(item.value.clone());
+                    let find = find_for_message_match(&hit.snippet, hit.message_id.as_deref(), &query);
+                    finds.insert(item.value.clone(), find);
+                    built_by_value.insert(
+                        item.value.clone(),
+                        CommandPaletteItem {
+                            description: (!hit.snippet.trim().is_empty()).then(|| hit.snippet.clone()),
+                            timestamp: hit.message_created_at.clone().or_else(|| item.timestamp.clone()),
+                            ..item.clone()
+                        },
+                    );
+                }
+                let order = next_shown_order(palette.message_order.as_ref(), &query, &keys, PALETTE_MESSAGE_LIMIT);
+                palette.message_items = order
+                    .keys
+                    .iter()
+                    .take(order.shown)
+                    .filter_map(|key| built_by_value.remove(key))
+                    .collect();
+                palette.message_finds = finds;
+                palette.message_order = Some(order);
+                palette.refilter(cx);
+            });
+        }));
+    }
+
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let root_actions = self
             .root
@@ -708,6 +884,7 @@ impl CommandPalette {
             project_search_items: &self.projects,
             settings_search_items: &self.settings,
             thread_search_items: &self.threads,
+            thread_message_items: &self.message_items,
             now: now_ms(),
         });
         let rows = build_command_palette_rows(&self.groups);
@@ -776,6 +953,7 @@ impl CommandPalette {
             }
             if let CommandPaletteItemKind::Submenu(view) = &item.kind {
                 let view = view.clone();
+                self.clear_message_search();
                 self.search = reduce_command_palette_search_state(std::mem::take(&mut self.search), CommandPaletteSearchAction::Push(view));
                 let placeholder = self.command_placeholder();
                 let query = self.search.query.clone();
@@ -794,6 +972,11 @@ impl CommandPalette {
             "action:search-project-contents" => return self.enter_mode(Mode::Content, window, cx),
             _ => {}
         }
+        let from_message_group = self
+            .groups
+            .iter()
+            .any(|group| group.value == "threads-messages" && group.items.iter().any(|item| item.value == value));
+        let pending_find = from_message_group.then(|| self.message_finds.get(value).cloned()).flatten();
         let project_action = self.scoped_project_actions.get(value).cloned();
         let thread_action = self.scoped_thread_actions.get(value).cloned();
         let search_query = palette_search_query(self.mode, &self.search);
@@ -865,6 +1048,9 @@ impl CommandPalette {
                             }
                         }
                     }
+                    if let Some(find) = pending_find.clone() {
+                        state.queue_thread_find(key.clone(), find, cx);
+                    }
                     state.navigate_scoped(row.owner.clone(), crate::app_state::ScopedRouteAction::Thread(key.thread_id), cx);
                 }
             });
@@ -874,6 +1060,22 @@ impl CommandPalette {
             let action: Box<dyn gpui::Action> = match command {
                 "new-thread-in-active" => Box::new(NewThread),
                 "new-thread-without-project" => Box::new(NewThreadWithoutProject),
+                "triage" => {
+                    self.start_triage(window, cx);
+                    return;
+                }
+                "share-thread-with-guest" => {
+                    if let Some(thread_id) = self.state.read(cx).selected_thread.clone()
+                        && let Some(owner) = crate::context_menu::ThreadMenuOwner::capture(self.state.read(cx), &thread_id)
+                    {
+                        crate::guest_share::open(owner, window.window_handle(), cx);
+                    }
+                    return;
+                }
+                "restart-agent-session" => {
+                    self.restart_agent_session(cx);
+                    return;
+                }
                 "find-in-thread" => Box::new(FindInThread),
                 "copy-prompt-link" => Box::new(crate::composer::prompt_links::CopyPromptLink),
                 "copy-prompt-link-context" => Box::new(crate::composer::prompt_links::CopyPromptLinkWithContext),
@@ -968,6 +1170,15 @@ impl CommandPalette {
                         state.send_visit_with(&thread_id, visited_at, true, Some(query), cx);
                     }
                 }
+                if let Some(find) = pending_find {
+                    let key = state
+                        .active_thread_key(&thread_id)
+                        .unwrap_or_else(|| t3_core::sidebar::tag_filter::ThreadKey {
+                            environment_id: ENVIRONMENT.to_owned(),
+                            thread_id: thread_id.clone(),
+                        });
+                    state.queue_thread_find(key, find, cx);
+                }
                 state.select_thread(&thread_id, cx);
             });
         } else if let Some(rest) = value.strip_prefix("new-thread-in:") {
@@ -981,6 +1192,193 @@ impl CommandPalette {
                 self.state.update(cx, |state, cx| state.select_thread(&thread_id, cx));
             }
         }
+    }
+
+    /// `useStartTriage` (`apps/web/src/hooks/useStartTriage.ts`): prepares a triage session on the
+    /// active environment, ensures its scratch project, and opens a draft with the playbook prompt.
+    fn start_triage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (has_scratch, conn_id, origin_thread, origin_draft) = {
+            let state = self.state.read(cx);
+            (
+                state.server_config.config.as_ref().is_some_and(|c| c.scratch_workspace_root.is_some()),
+                state.connection_id(),
+                state.selected_thread.clone(),
+                state.draft_project.clone(),
+            )
+        };
+        let fail_toast = |reason: &str| {
+            Toast::new(ToastKind::Error, "Could not start triage")
+                .description(format!("{reason} Run {TRIAGE_CLI_COMMAND} in a terminal on that machine instead."))
+        };
+        if !has_scratch {
+            self.state.update(cx, |state, cx| {
+                state.show_toast(fail_toast("This machine cannot start threads without a project."), cx);
+            });
+            return;
+        }
+        let state = self.state.clone();
+        let composer = self.composer.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let prepared = cx
+                .update(|_, cx| {
+                    state.read(cx).rpc(
+                        SERVER_PREPARE_TRIAGE,
+                        prepare_triage_request(Some(std::env::consts::OS), Some(env!("CARGO_PKG_VERSION"))),
+                    )
+                })
+                .ok();
+            let prepared = match prepared {
+                Some(fut) => fut.await,
+                None => return,
+            };
+            let prompt = match prepared {
+                Ok(value) => match value.get("prompt").and_then(serde_json::Value::as_str) {
+                    Some(prompt) if !prompt.trim().is_empty() => prompt.to_owned(),
+                    _ => {
+                        let _ = cx.update(|_, cx| {
+                            if state.read(cx).connection_id() == conn_id {
+                                state.update(cx, |state, cx| state.show_toast(fail_toast("Triage did not return a prompt."), cx));
+                            }
+                        });
+                        return;
+                    }
+                },
+                Err(error) => {
+                    let msg = error.to_string();
+                    let _ = cx.update(|_, cx| {
+                        if state.read(cx).connection_id() == conn_id {
+                            state.update(cx, |state, cx| state.show_toast(fail_toast(&msg), cx));
+                        }
+                    });
+                    return;
+                }
+            };
+            let still_same_conn = cx.update(|_, cx| state.read(cx).connection_id() == conn_id).unwrap_or(false);
+            if !still_same_conn {
+                return;
+            }
+            let scratch = match cx.update(|_, cx| state.read(cx).rpc(PROJECTS_ENSURE_SCRATCH, serde_json::json!({}))).ok() {
+                Some(fut) => fut.await,
+                None => return,
+            };
+            let project_id = match scratch {
+                Ok(value) => match ensure_scratch_project_id(&value) {
+                    Some(id) => id,
+                    None => {
+                        let _ = cx.update(|_, cx| {
+                            if state.read(cx).connection_id() == conn_id {
+                                state.update(cx, |state, cx| state.show_toast(fail_toast("T3 Code could not open a new thread."), cx));
+                            }
+                        });
+                        return;
+                    }
+                },
+                Err(error) => {
+                    let msg = error.to_string();
+                    let _ = cx.update(|_, cx| {
+                        if state.read(cx).connection_id() == conn_id {
+                            state.update(cx, |state, cx| state.show_toast(fail_toast(&msg), cx));
+                        }
+                    });
+                    return;
+                }
+            };
+            let _ = cx.update(|window, cx| {
+                let unchanged = {
+                    let app = state.read(cx);
+                    app.connection_id() == conn_id && app.selected_thread == origin_thread && app.draft_project == origin_draft
+                };
+                if !unchanged {
+                    return;
+                }
+                state.update(cx, |state, cx| state.start_draft(&project_id, cx));
+                // Defer past `AppEvent::Selection` so `Composer` switches to the new scratch draft first.
+                let state_for_prompt = state.clone();
+                let composer_for_prompt = composer.clone();
+                let target_project = project_id.clone();
+                window.defer(cx, move |window, cx| {
+                    let on_target = {
+                        let app = state_for_prompt.read(cx);
+                        app.connection_id() == conn_id
+                            && app.selected_thread.is_none()
+                            && app.draft_project.as_deref() == Some(target_project.as_str())
+                    };
+                    if on_target {
+                        composer_for_prompt.update(cx, |composer, cx| {
+                            composer.replace_prompt_text(&prompt, window, cx);
+                            composer.focus(window, cx);
+                        });
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// `action:restart-agent-session` (`CommandPalette.tsx`): detaches tracked provider sessions on
+    /// the active thread, confirms with a toast, and refreshes provider catalogs for its workspace.
+    fn restart_agent_session(&mut self, cx: &mut Context<Self>) {
+        let (conn_id, commands, refresh_target) = {
+            let state = self.state.read(cx);
+            let Some(thread_id) = state.selected_thread.as_deref() else { return };
+            let commands = state
+                .thread
+                .projection
+                .as_ref()
+                .filter(|projection| projection.thread.id == thread_id)
+                .map(|projection| t3_core::workflows::detach_session_commands(&uuid(), projection))
+                .unwrap_or_default();
+            let refresh_target = state.thread_shell(thread_id).and_then(|shell| {
+                let cwd = shell
+                    .worktree_path
+                    .clone()
+                    .or_else(|| state.shell.project(&shell.project_id).map(|p| p.workspace_root.clone()))?;
+                let instance_id = if !shell.provider_instance_id.is_empty() {
+                    shell.provider_instance_id.clone()
+                } else {
+                    shell.model_selection.instance_id.clone()
+                };
+                (!instance_id.is_empty()).then_some((instance_id, cwd))
+            });
+            (state.connection_id(), commands, refresh_target)
+        };
+        let state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            if !commands.is_empty() {
+                let result = cx.update(|cx| state.read(cx).dispatch_in_order(commands)).await;
+                if let Err((_, error)) = result {
+                    cx.update(|cx| {
+                        if state.read(cx).connection_id() == conn_id {
+                            state.update(cx, |state, cx| {
+                                state.show_toast(
+                                    Toast::new(ToastKind::Error, "Could not restart agent session").description(error.to_string()),
+                                    cx,
+                                );
+                            });
+                        }
+                    });
+                    return;
+                }
+            }
+            let same_conn = cx.update(|cx| state.read(cx).connection_id() == conn_id);
+            if !same_conn {
+                return;
+            }
+            cx.update(|cx| {
+                state.update(cx, |state, cx| {
+                    state.show_toast(
+                        Toast::new(ToastKind::Success, "Agent session will restart")
+                            .description("Your next message starts a fresh session."),
+                        cx,
+                    );
+                });
+            });
+            if let Some((instance_id, cwd)) = refresh_target {
+                let payload = serde_json::json!({ "instanceId": instance_id, "cwd": cwd, "fresh": true });
+                let _ = cx.update(|cx| state.read(cx).rpc(t3_core::composer::menu::REFRESH_PROVIDERS, payload)).await;
+            }
+        })
+        .detach();
     }
 
     fn render_row(&self, row: &CommandPaletteRow, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1137,6 +1535,7 @@ impl Render for CommandPalette {
         drop(rows);
         self.groups = groups;
         let top = window.viewport_size().height * 0.1;
+        let input_disabled = self.input_disabled(cx);
         deferred(
             div()
                 .id("palette-backdrop")
@@ -1150,8 +1549,15 @@ impl Render for CommandPalette {
                 .child(
                     div()
                         .id("command-palette")
+                        .track_focus(&self.focus)
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" && this.input_disabled(cx) {
+                                this.escape(window, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
                         .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
                             if !is_composing(&this.input, window, cx) {
                                 this.move_selection(1, cx);
@@ -1255,7 +1661,7 @@ impl Render for CommandPalette {
                                                     .on_click(cx.listener(|this, _, window, cx| this.escape(window, cx))),
                                             )
                                         })
-                                        .child(div().flex_1().min_w_0().child(Input::new(&self.input).appearance(false).bordered(false)))
+                                        .child(div().flex_1().min_w_0().child(Input::new(&self.input).appearance(false).bordered(false).disabled(input_disabled)))
                                         .when(self.mode == Mode::Content && self.content.target.is_some(), |this| this.child(self.render_content_options(cx))),
                                 ),
                         )
@@ -1350,7 +1756,7 @@ mod scoped_project_tests {
         let (items, actions) = scoped_project_items(&entries);
         for (query, draft) in [("/uniquebeta", false), ("UniqueRemoteHost", false), ("Secondary", false), ("/uniquebeta", true)] {
             let category = items.iter().filter(|item| actions[&item.value].2 == draft).cloned().collect::<Vec<_>>();
-            let matches = filter_command_palette_groups(&CommandPaletteSearch { active_groups:&[],query,is_in_submenu:false,all_options:None,project_search_items:&category,settings_search_items:&[],thread_search_items:&[],now:0 });
+            let matches = filter_command_palette_groups(&CommandPaletteSearch { active_groups:&[],query,is_in_submenu:false,all_options:None,project_search_items:&category,settings_search_items:&[],thread_search_items:&[],thread_message_items:&[],now:0 });
             let matched = matches.iter().flat_map(|group| &group.items).collect::<Vec<_>>();
             assert_eq!(matched.len(), 1, "query {query}, draft {draft}");
             assert_eq!(actions[&matched[0].value].1, preferred);
@@ -1799,5 +2205,237 @@ mod visit_recency_tests {
             !fixture.take_commands().contains(&t3_core::project_search::SEARCH_ENTRIES),
             "post-debounce search must not dispatch SEARCH_ENTRIES when filesystem:read was revoked"
         );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn palette_covers_triage_guest_share_restart_agent_disabled_inputs_and_in_messages_search(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed.0.update(cx, |state, _| {
+                state.selected_thread = Some("menu-thread".to_owned());
+                if let Some(config) = state.server_config.config.as_mut() {
+                    config.environment.capabilities.triage = Some(true);
+                    config.scratch_workspace_root = Some("/tmp/scratch".to_owned());
+                    config.settings.guest_sharing_enabled = Some(true);
+                }
+            });
+            installed
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(serde_json::json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "access:write"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+
+        let window = cx.open_window(gpui::size(px(900.), px(700.)), |_, _| gpui::EmptyView);
+        let (composer, palette) = cx
+            .update_window(window.into(), |_, window, cx| {
+                let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+                let palette = cx.new(|cx| CommandPalette::new(state.clone(), composer.clone(), window, cx));
+                (composer, palette)
+            })
+            .unwrap();
+
+        cx.update_window(window.into(), |_, window, cx| {
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                let actions = &palette.root.iter().find(|group| group.value == "actions").unwrap().items;
+                assert!(actions.iter().any(|item| item.value == "action:triage"));
+                assert!(actions.iter().any(|item| item.value == "action:share-thread-with-guest"));
+                assert!(actions.iter().any(|item| item.value == "action:restart-agent-session"));
+
+                // Without `filesystem:read`, both Files and Content modes disable the search input,
+                // and `open_target` refuses to open or close the palette if permission was revoked.
+                palette.toggle_mode(Mode::Files, window, cx);
+                assert!(palette.input_disabled(cx), "Files input must be disabled without filesystem:read");
+                palette.open_target("src/lib.rs".into(), None, false, window, cx);
+                assert!(palette.open, "open_target must guard against missing filesystem:read");
+                palette.toggle_mode(Mode::Content, window, cx);
+                assert!(palette.input_disabled(cx), "Content input must be disabled without filesystem:read");
+            });
+        })
+        .unwrap();
+
+        // Granting `filesystem:read` re-enables both search inputs.
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(serde_json::json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "access:write", "filesystem:read"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Files, window, cx);
+                assert!(!palette.input_disabled(cx));
+                palette.toggle_mode(Mode::Content, window, cx);
+                assert!(!palette.input_disabled(cx));
+
+                // In-messages search in Command mode schedules `orchestration.searchThreads`.
+                palette.toggle_mode(Mode::Command, window, cx);
+                palette.search = reduce_command_palette_search_state(
+                    std::mem::take(&mut palette.search),
+                    CommandPaletteSearchAction::Query("needle".into()),
+                );
+                palette.schedule_message_search(cx);
+                palette.refilter(cx);
+            });
+        })
+        .unwrap();
+
+        cx.executor().advance_clock(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS + 10));
+        cx.run_until_parked();
+        let (method, payload, reply) = loop {
+            let (method, payload, reply) = fixture.next_request().await;
+            if method == SEARCH_THREADS {
+                break (method, payload, reply);
+            }
+            let _ = reply.send(Ok(serde_json::json!({})));
+        };
+        let (msg_tx, msg_rx) = futures::channel::oneshot::channel::<()>();
+        let msg_tx = std::cell::RefCell::new(Some(msg_tx));
+        let _msg_sub = cx.update(|cx| {
+            cx.observe(&palette, move |palette, cx| {
+                if palette.read(cx).groups.iter().any(|group| group.value == "threads-messages")
+                    && let Some(tx) = msg_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        assert_eq!(method, SEARCH_THREADS);
+        assert_eq!(payload["query"], "needle");
+        reply
+            .send(Ok(serde_json::json!({
+                "matches": [{
+                    "threadId": "sibling",
+                    "projectId": "checkout-a",
+                    "source": "message",
+                    "snippet": "found needle in transcript",
+                    "messageId": "m-42",
+                    "messageCreatedAt": "2026-04-02T00:00:00.000Z"
+                }]
+            })))
+            .unwrap();
+        msg_rx.await.unwrap();
+        drop(_msg_sub);
+        cx.run_until_parked();
+
+        cx.update_window(window.into(), |_, window, cx| {
+            palette.update(cx, |palette, cx| {
+                let in_messages = palette
+                    .groups
+                    .iter()
+                    .find(|group| group.value == "threads-messages")
+                    .expect("In messages group populated");
+                assert_eq!(in_messages.label, "In messages");
+                assert_eq!(in_messages.items.len(), 1);
+                let val = in_messages.items[0].value.clone();
+                palette.activate(&val, window, cx);
+            });
+            state.update(cx, |state, _| {
+                let find = state.take_pending_thread_find("sibling").expect("queued thread find from In messages");
+                assert_eq!(find.query, "needle");
+                assert_eq!(find.start.as_ref().map(|s| s.entry_id.as_str()), Some("m-42"));
+            });
+        })
+        .unwrap();
+
+        // Restart agent session shows confirmation toast and refreshes provider catalog.
+        cx.update_window(window.into(), |_, window, cx| {
+            state.update(cx, |state, _| state.selected_thread = Some("menu-thread".to_owned()));
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                palette.activate("action:restart-agent-session", window, cx);
+            });
+        })
+        .unwrap();
+        let (method, params, reply) = loop {
+            let (method, params, reply) = fixture.next_request().await;
+            if method == t3_core::composer::menu::REFRESH_PROVIDERS {
+                break (method, params, reply);
+            }
+            let _ = reply.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(method, t3_core::composer::menu::REFRESH_PROVIDERS);
+        assert_eq!(params["fresh"], true);
+        reply.send(Ok(serde_json::json!({}))).unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let toast = state.read(cx).toasts.latest().expect("restart confirmation toast");
+            assert_eq!(toast.title, "Agent session will restart");
+        });
+
+        // Triage action prepares triage session, ensures scratch project, and opens draft with playbook prompt.
+        cx.update_window(window.into(), |_, window, cx| {
+            palette.update(cx, |palette, cx| {
+                palette.toggle_mode(Mode::Command, window, cx);
+                palette.activate("action:triage", window, cx);
+            });
+        })
+        .unwrap();
+        let (method, _, reply) = loop {
+            let (method, params, reply) = fixture.next_request().await;
+            if method == SERVER_PREPARE_TRIAGE {
+                break (method, params, reply);
+            }
+            let _ = reply.send(Ok(serde_json::json!({})));
+        };
+        assert_eq!(method, SERVER_PREPARE_TRIAGE);
+        reply
+            .send(Ok(serde_json::json!({ "prompt": "Follow [triage-playbook.md](file:///tmp/triage-playbook.md)" })))
+            .unwrap();
+        let (method, _, reply) = loop {
+            let (method, params, reply) = fixture.next_request().await;
+            if method == PROJECTS_ENSURE_SCRATCH {
+                break (method, params, reply);
+            }
+            let _ = reply.send(Ok(serde_json::json!({})));
+        };
+        let (tx, rx) = futures::channel::oneshot::channel::<()>();
+        let tx = std::cell::RefCell::new(Some(tx));
+        let _selection_sub = cx.update(|cx| {
+            cx.subscribe(&state, move |state, event: &crate::app_state::AppEvent, cx| {
+                if *event == crate::app_state::AppEvent::Selection
+                    && state.read(cx).draft_project.as_deref() == Some("scratch-1")
+                    && let Some(tx) = tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        assert_eq!(method, PROJECTS_ENSURE_SCRATCH);
+        reply.send(Ok(serde_json::json!({ "projectId": "scratch-1" }))).unwrap();
+        rx.await.unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(state.read(cx).draft_project.as_deref(), Some("scratch-1"));
+            assert!(t3_core::composer::is_triage_prompt(&composer.read(cx).prompt_text(cx)));
+        });
+        drop(_selection_sub);
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

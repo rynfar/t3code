@@ -9,11 +9,24 @@ use t3_core::project_search::{EntriesResult, FilePickerMatch, SEARCH_DEBOUNCE_MS
 
 use super::CommandPalette;
 use crate::app_state::AppState;
+use crate::icons::Icon;
 use crate::project_files::ProjectTarget;
 use crate::theme::{hsla, palette};
 
 const ROW_HEIGHT: f32 = 32.;
 pub(super) const NO_FILE_READ_ACCESS: &str = "This connection cannot search host files.";
+
+/// File-type icon for palette file picker & content search headers (`PierreEntryIcon` mapping).
+pub(super) fn file_icon(path: &str) -> Icon {
+    let ext = path.rsplit('/').next().unwrap_or(path).rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("json" | "jsonc" | "json5" | "jsonl" | "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "toml" | "yaml" | "yml" | "lock") => Icon::FileBraces,
+        Some("rs" | "py" | "pyi" | "go" | "html" | "htm" | "xml" | "svg" | "css" | "scss" | "sh" | "bash" | "zsh" | "sql") => Icon::CodeXml,
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "tif" | "tiff" | "avif") => Icon::Image,
+        Some("md" | "mdx" | "markdown" | "mdown" | "mkd" | "txt" | "log" | "diff" | "patch") => Icon::FileText,
+        _ => Icon::File,
+    }
+}
 
 pub(super) fn grants_filesystem_read(state: &AppState) -> bool {
     state
@@ -26,6 +39,7 @@ pub(super) fn grants_filesystem_read(state: &AppState) -> bool {
 pub(super) struct FileSearch {
     pub target: Option<ProjectTarget>,
     pub matches: Vec<FilePickerMatch>,
+    query: String,
     matched_query: String,
     pending: bool,
     pub error: Option<String>,
@@ -59,6 +73,7 @@ impl FileSearch {
     }
 
     fn search_with_delay(&mut self, query: String, debounce: bool, state: &Entity<AppState>, cx: &mut Context<CommandPalette>) {
+        self.query = query.clone();
         let Some(target) = self.target.clone() else {
             self.request = None;
             self.pending = false;
@@ -170,7 +185,7 @@ impl FileSearch {
         if let Some(error) = &self.error {
             return error.clone();
         }
-        let searching = !self.matched_query.trim().is_empty();
+        let searching = !self.query.trim().is_empty();
         match (self.pending, searching) {
             (true, true) => "Searching workspace files…",
             (true, false) => "Indexing workspace files…",
@@ -186,7 +201,9 @@ impl FileSearch {
             return div().py(px(40.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("Open a project to search its files.").into_any_element();
         };
         if let Some(error) = &self.error {
-            return div().py(px(40.)).px(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.destructive)).child(error.clone()).into_any_element();
+            let can_read = grants_filesystem_read(cx.entity().read(cx).state.read(cx));
+            let color = if can_read { p.destructive } else { p.muted_foreground };
+            return div().py(px(40.)).px(px(24.)).flex().justify_center().text_sm().text_color(hsla(color)).child(error.clone()).into_any_element();
         }
         if self.matches.is_empty() {
             return div().py(px(40.)).px(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child(self.empty_message()).into_any_element();
@@ -226,6 +243,7 @@ impl FileSearch {
             .rounded(px(4.))
             .cursor_pointer()
             .when(highlighted, |this| this.bg(hsla(p.foreground).opacity(0.09)))
+            .child(file_icon(&found.path).render(px(14.), hsla(p.muted_foreground).opacity(0.8)))
             .child(div().flex_none().text_sm().text_color(hsla(if active { p.muted_foreground } else { p.foreground })).child(styled(&found.name, &found.name_match_indices)))
             .child(div().flex_1().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(styled(&found.path, &found.path_match_indices)))
             .on_mouse_move(cx.listener(move |this, _, _, cx| {
@@ -247,9 +265,20 @@ impl FileSearch {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn char_ranges_merge_adjacent_indices_by_byte() {
         assert_eq!(super::char_ranges("app.rs", &[0, 1, 4]), [0..2, 4..5]);
         assert_eq!(super::char_ranges("é/ab", &[0, 2]), [0..2, 3..4]);
+    }
+
+    #[test]
+    fn file_icon_maps_extensions_case_insensitively() {
+        assert!(matches!(file_icon("src/App.TSX"), Icon::FileBraces));
+        assert!(matches!(file_icon("crates/main.rs"), Icon::CodeXml));
+        assert!(matches!(file_icon("assets/shot.PNG"), Icon::Image));
+        assert!(matches!(file_icon("docs/notes.md"), Icon::FileText));
+        assert!(matches!(file_icon("Makefile"), Icon::File));
     }
 }

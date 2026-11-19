@@ -8,14 +8,16 @@ use std::rc::Rc;
 
 use gpui::{Action, App, DummyKeyboardMapper, Global, KeyBinding, KeyBindingContextPredicate, KeyContext, actions};
 use t3_core::keybindings::{
-    KeybindingWhenNode, ResolvedKeybindingRule, ShortcutMatchContext, decode_resolved_keybindings, default_resolved_keybindings, gpui_keystrokes,
-    gpui_predicate, merge_with_default_keybindings, shortcut_label_for_command,
+    KeybindingShortcut, KeybindingWhenNode, ResolvedKeybindingRule, ShortcutMatchContext, decode_resolved_keybindings, default_resolved_keybindings,
+    gpui_keystrokes, gpui_predicate, merge_with_default_keybindings, shifts_with_composer_modifier, shortcut_label_for_command,
 };
 
 actions!(
     t3_keys,
     [
         ToggleSidebar,
+        FocusNextWorkspaceArea,
+        FocusPreviousWorkspaceArea,
         PreviousThread,
         NextThread,
         JumpToThread1,
@@ -40,6 +42,7 @@ actions!(
         CycleAppearance,
         StopThread,
         RegenerateThreadTitle,
+        SendBackground,
         Unimplemented,
     ]
 );
@@ -50,6 +53,8 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "theme.select" => Box::new(SelectTheme),
         "appearance.cycle" => Box::new(CycleAppearance),
         "sidebar.toggle" => Box::new(ToggleSidebar),
+        "workspace.focusNext" => Box::new(FocusNextWorkspaceArea),
+        "workspace.focusPrevious" => Box::new(FocusPreviousWorkspaceArea),
         "thread.stop" => Box::new(StopThread),
         "thread.regenerateTitle" => Box::new(RegenerateThreadTitle),
         "thread.previous" => Box::new(PreviousThread),
@@ -83,6 +88,7 @@ pub fn action_for(command: &str) -> Box<dyn Action> {
         "composer.mode" => Box::new(crate::composer::OpenPermissions),
         "composer.stash" => Box::new(crate::composer::StashPrompt),
         "composer.sendAlternate" => Box::new(crate::composer::SendAlternate),
+        "composer.sendBackground" => Box::new(SendBackground),
         "composer.dictation" => Box::new(crate::voice::Dictation),
         "thread.steerQueuedMessage" => Box::new(crate::composer::SteerQueuedMessage),
         "thread.editQueuedMessage" => Box::new(crate::composer::EditQueuedMessage),
@@ -154,17 +160,40 @@ type BindingKey = (String, Option<String>, String);
 
 impl Global for Keymap {}
 
+fn and_when(base: Option<KeybindingWhenNode>, extra: KeybindingWhenNode) -> KeybindingWhenNode {
+    match base {
+        Some(left) => KeybindingWhenNode::And { left: Box::new(left), right: Box::new(extra) },
+        None => extra,
+    }
+}
+
 fn binding_keys(rules: &[ResolvedKeybindingRule]) -> Vec<BindingKey> {
     let mac = cfg!(target_os = "macos");
     let mut seen = HashSet::new();
     let mut keys = Vec::new();
-    for rule in rules {
-        let predicate = rule.when_ast.as_ref().map(|when| gpui_predicate(&rename(when)));
-        for keystroke in gpui_keystrokes(&rule.shortcut, mac) {
-            let key = (keystroke, predicate.clone(), rule.command.clone());
+    let mut push = |shortcut: &KeybindingShortcut, predicate: Option<String>, command: &str| {
+        for keystroke in gpui_keystrokes(shortcut, mac) {
+            let key = (keystroke, predicate.clone(), command.to_owned());
             if seen.insert(key.clone()) {
                 keys.push(key);
             }
+        }
+    };
+    for rule in rules {
+        let renamed = rule.when_ast.as_ref().map(rename);
+        if shifts_with_composer_modifier(rule) {
+            let modifier_flag = KeybindingWhenNode::Identifier { name: "composerRequiresModifier".to_owned() };
+            let unshifted_pred = gpui_predicate(&and_when(
+                renamed.clone(),
+                KeybindingWhenNode::Not { node: Box::new(modifier_flag.clone()) },
+            ));
+            let shifted_pred = gpui_predicate(&and_when(renamed, modifier_flag));
+            push(&rule.shortcut, Some(unshifted_pred), &rule.command);
+            let shifted = KeybindingShortcut { shift_key: true, ..rule.shortcut.clone() };
+            push(&shifted, Some(shifted_pred), &rule.command);
+        } else {
+            let predicate = renamed.as_ref().map(gpui_predicate);
+            push(&rule.shortcut, predicate, &rule.command);
         }
     }
     keys
@@ -224,12 +253,25 @@ pub fn root_context(right_panel_open: bool, turn_running: bool) -> KeyContext {
 }
 
 /// Full workspace `when` flags: right panel, running turn, open terminal/preview, and draft route.
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn root_context_with(
     right_panel_open: bool,
     turn_running: bool,
     terminal_open: bool,
     preview_open: bool,
     draft_thread_route: bool,
+) -> KeyContext {
+    root_context_full(right_panel_open, turn_running, terminal_open, preview_open, draft_thread_route, false)
+}
+
+/// Full workspace `when` flags including `composerRequiresModifier`.
+pub fn root_context_full(
+    right_panel_open: bool,
+    turn_running: bool,
+    terminal_open: bool,
+    preview_open: bool,
+    draft_thread_route: bool,
+    composer_requires_modifier: bool,
 ) -> KeyContext {
     let mut context = KeyContext::new_with_defaults();
     context.add("Workspace");
@@ -249,6 +291,9 @@ pub fn root_context_with(
     if draft_thread_route {
         context.add("draftThreadRoute");
     }
+    if composer_requires_modifier {
+        context.add("composerRequiresModifier");
+    }
     context
 }
 
@@ -264,6 +309,9 @@ mod tests {
         assert_eq!(action_for("thread.stop").as_any().type_id(), TypeId::of::<StopThread>());
         assert_eq!(action_for("thread.regenerateTitle").as_any().type_id(), TypeId::of::<RegenerateThreadTitle>());
         assert_eq!(action_for("chat.newLocal").as_any().type_id(), TypeId::of::<crate::new_thread::NewThread>());
+        assert_eq!(action_for("workspace.focusNext").as_any().type_id(), TypeId::of::<FocusNextWorkspaceArea>());
+        assert_eq!(action_for("workspace.focusPrevious").as_any().type_id(), TypeId::of::<FocusPreviousWorkspaceArea>());
+        assert_eq!(action_for("composer.sendBackground").as_any().type_id(), TypeId::of::<SendBackground>());
     }
 
     #[test]
@@ -273,5 +321,18 @@ mod tests {
         for flag in ["Workspace", "isDesktop", "rightPanelOpen", "turnRunning", "terminalOpen", "previewOpen", "draftThreadRoute"] {
             assert!(ctx.contains(flag), "missing flag {flag}");
         }
+        assert!(!ctx.contains("composerRequiresModifier"));
+        let full = root_context_full(true, true, true, true, true, true);
+        assert!(full.contains("composerRequiresModifier"));
+    }
+
+    #[test]
+    fn binding_keys_splits_mod_enter_by_composer_requires_modifier() {
+        let keys = binding_keys(default_resolved_keybindings());
+        let bg_keys: Vec<_> = keys.iter().filter(|(_, _, cmd)| cmd == "composer.sendBackground").collect();
+        let mod_enter = if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" };
+        let mod_shift_enter = if cfg!(target_os = "macos") { "cmd-shift-enter" } else { "ctrl-shift-enter" };
+        assert!(bg_keys.iter().any(|(k, pred, _)| k == mod_enter && pred.as_deref().is_some_and(|p| p.contains("!(!(!composerRequiresModifier))"))));
+        assert!(bg_keys.iter().any(|(k, pred, _)| k == mod_shift_enter && pred.as_deref().is_some_and(|p| p.contains("!(!composerRequiresModifier)"))));
     }
 }

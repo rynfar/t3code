@@ -762,3 +762,77 @@ pub fn keybinding_issue_message(payload: &Value) -> Option<String> {
         .and_then(|entry| entry.get("message").and_then(Value::as_str))
         .map(str::to_owned)
 }
+
+/// `KEYBINDINGS_TOAST_COOLDOWN_MS` (`apps/web/src/components/KeybindingsUpdateToast.logic.ts`).
+pub const KEYBINDINGS_TOAST_COOLDOWN_MS: i64 = 2_000;
+
+/// Decision returned by `KeybindingsUpdateToastController::handle`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeybindingsUpdateToastDecision {
+    Success,
+    InvalidConfiguration(String),
+}
+
+/// Deduplicates live `keybindingsUpdated` stream events within `KEYBINDINGS_TOAST_COOLDOWN_MS`
+/// (`createKeybindingsUpdateToastController` in `KeybindingsUpdateToast.logic.ts`).
+#[derive(Debug, Clone, Default)]
+pub struct KeybindingsUpdateToastController {
+    last_toast: Option<(String, i64)>,
+}
+
+impl KeybindingsUpdateToastController {
+    pub fn handle(
+        &mut self,
+        issues: &[crate::server_config::ServerConfigIssue],
+        now_ms: i64,
+    ) -> Option<KeybindingsUpdateToastDecision> {
+        let issue = issues.iter().find(|entry| entry.kind.starts_with("keybindings."));
+        let (key, decision) = match issue {
+            Some(issue) => (
+                format!("invalid:{}", issue.message),
+                KeybindingsUpdateToastDecision::InvalidConfiguration(issue.message.clone()),
+            ),
+            None => ("success".to_owned(), KeybindingsUpdateToastDecision::Success),
+        };
+        if let Some((last_key, last_at)) = &self.last_toast
+            && *last_key == key
+            && now_ms.saturating_sub(*last_at) < KEYBINDINGS_TOAST_COOLDOWN_MS
+        {
+            return None;
+        }
+        self.last_toast = Some((key, now_ms));
+        Some(decision)
+    }
+
+    pub fn reset(&mut self) {
+        self.last_toast = None;
+    }
+}
+
+#[cfg(test)]
+mod toast_controller_tests {
+    use super::*;
+    use crate::server_config::ServerConfigIssue;
+
+    fn issue(kind: &str, message: &str) -> ServerConfigIssue {
+        ServerConfigIssue { kind: kind.into(), message: message.into(), index: None }
+    }
+
+    #[test]
+    fn keybindings_update_toast_controller_deduplicates_within_cooldown() {
+        let mut ctrl = KeybindingsUpdateToastController::default();
+        let bad = [issue("other.kind", "ignored"), issue("keybindings.invalid-entry", "Bad key")];
+        assert_eq!(ctrl.handle(&bad, 1_000), Some(KeybindingsUpdateToastDecision::InvalidConfiguration("Bad key".into())));
+        assert_eq!(ctrl.handle(&bad, 2_500), None, "same invalid toast within 2s is suppressed");
+        assert_eq!(ctrl.handle(&bad, 3_000), Some(KeybindingsUpdateToastDecision::InvalidConfiguration("Bad key".into())));
+
+        let different = [issue("keybindings.malformed-config", "Malformed JSON")];
+        assert_eq!(
+            ctrl.handle(&different, 3_100),
+            Some(KeybindingsUpdateToastDecision::InvalidConfiguration("Malformed JSON".into())),
+            "a different error bypasses cooldown"
+        );
+        assert_eq!(ctrl.handle(&[], 3_200), Some(KeybindingsUpdateToastDecision::Success));
+        assert_eq!(ctrl.handle(&[], 4_000), None, "repeated success within 2s is suppressed");
+    }
+}
