@@ -414,7 +414,7 @@ fn render_pill_icon_action(
         .into_any_element()
 }
 
-fn render_waveform(level: f32, compact: bool, cx: &App) -> AnyElement {
+pub fn render_waveform(level: f32, compact: bool, cx: &App) -> AnyElement {
     let p = palette(cx);
     let bar_count = if compact { 12 } else { WAVEFORM_BAR_COUNT };
     let max_h = if compact { 14.0 } else { 16.0 };

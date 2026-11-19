@@ -2,6 +2,8 @@
 //! general rows of `ProjectDefaultsSettings.tsx`, `SnoozePresetsSettings.tsx`, and
 //! `ThreadTitleInstructionsSettings.tsx`, at environment scope. Every row is server-backed.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveTime, Timelike, TimeZone};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled,
@@ -14,10 +16,14 @@ use t3_core::composer::{runtime_mode_description, runtime_mode_label};
 use t3_core::model::ModelSelection;
 use t3_core::providers;
 use t3_core::server_config::{OptionDescriptor, RuntimeMode, ServerConfig, ThreadEnvMode};
+use t3_core::settings::providers::text_generators::{
+    LIST_TEXT_GENERATOR_MODELS, ListModelsResult, TextGeneratorModel, decode_text_generators, list_models_payload,
+};
 use t3_core::settings::snooze::{self, DurationUnit, SnoozeDay, SnoozeDraft, SnoozePreset};
 use t3_core::settings::{
     AutoSettleDaysField, DEFAULT_AUTO_SETTLE_DAYS, ENV_MODES, ResponseStreamingMode, ServerSettingChange,
-    effective_env_mode,
+    effective_env_mode, resolve_default_text_generation_selection, text_generation_options,
+    text_generation_selection_label,
 };
 use t3_core::sidebar::time::LocalTime;
 use t3_core::timeline::TimestampLocale;
@@ -56,6 +62,8 @@ pub(crate) struct ThreadsState {
     title_instructions_pending: Option<(String, u64)>,
     title_instructions_revision: u64,
     text_gen_advanced: bool,
+    pub(super) text_gen_models: HashMap<String, Vec<TextGeneratorModel>>,
+    text_gen_fetch_keys: HashMap<String, String>,
     time_inputs: Vec<(Entity<InputState>, Subscription)>,
     row_memory: Vec<SnoozeRowMemory>,
     /// The snooze editor's local copy, created from the saved options on first render.
@@ -109,6 +117,8 @@ impl ThreadsState {
             title_instructions_pending: None,
             title_instructions_revision: 0,
             text_gen_advanced: false,
+            text_gen_models: HashMap::new(),
+            text_gen_fetch_keys: HashMap::new(),
             time_inputs: Vec::new(),
             row_memory: Vec::new(),
             snooze: None,
@@ -166,7 +176,7 @@ fn format_time(time: &DateTime<Local>, format: TimestampFormat) -> String {
 }
 
 /// Renders effort/trait controls for a selected model (`TraitsPicker` in `SettingsPanels.tsx`).
-fn model_trait_controls(
+pub(super) fn model_trait_controls(
     id_prefix: &'static str,
     config: &ServerConfig,
     selection: &ModelSelection,
@@ -252,6 +262,70 @@ fn resolve(preset: &SnoozePreset, now: DateTime<Local>, format: TimestampFormat)
 impl SettingsView {
     pub(super) fn thread_settings<'a>(&self, cx: &'a App) -> Option<&'a ServerConfig> {
         self.state.read(cx).server_config.config.as_ref()
+    }
+
+    /// Ensures enabled text generators on `config` have their model lists fetched via
+    /// `server.listTextGeneratorModels` (`useTextGenerationTargets` in `textGenerators.ts`).
+    pub(super) fn sync_text_generator_models(&mut self, config: &ServerConfig, cx: &mut Context<Self>) {
+        let env_id = &config.environment.environment_id;
+        let generators = decode_text_generators(&config.settings.text_generators);
+        let active_ids: std::collections::HashSet<&String> =
+            generators.iter().filter(|(_, cfg)| cfg.enabled).map(|(id, _)| id).collect();
+        self.threads.text_gen_fetch_keys.retain(|id, _| active_ids.contains(id));
+        self.threads.text_gen_models.retain(|id, _| active_ids.contains(id));
+
+        for (id, gen_cfg) in generators {
+            if !gen_cfg.enabled {
+                continue;
+            }
+            let cache_key = format!(
+                "{env_id}\u{1f}{id}\u{1f}{}\u{1f}{}\u{1f}{}",
+                gen_cfg.kind.as_str(),
+                gen_cfg.base_url,
+                gen_cfg.api_key.encode()
+            );
+            if self.threads.text_gen_fetch_keys.get(&id).is_some_and(|existing| existing == &cache_key) {
+                continue;
+            }
+            self.threads.text_gen_fetch_keys.insert(id.clone(), cache_key.clone());
+            let payload = list_models_payload(&id, false);
+            let task = self.state.read(cx).rpc(LIST_TEXT_GENERATOR_MODELS, payload);
+            let id_owned = id.clone();
+            cx.spawn(async move |this, cx| {
+                let result = task.await.ok().and_then(|value| ListModelsResult::decode(value).ok());
+                let _ = this.update(cx, |this, cx| {
+                    if this.threads.text_gen_fetch_keys.get(&id_owned).is_some_and(|k| k == &cache_key)
+                        && let Some(decoded) = result
+                    {
+                        this.threads.text_gen_models.insert(id_owned, decoded.models);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    pub(super) fn text_gen_select_options(
+        &self,
+        config: &ServerConfig,
+        project_id: Option<&str>,
+        selections: &[Option<&ModelSelection>],
+    ) -> Vec<SelectOption> {
+        text_generation_options(config, project_id, &self.threads.text_gen_models, selections)
+            .into_iter()
+            .map(|opt| {
+                SelectOption::new(
+                    format!("{}{SELECTION_SEPARATOR}{}", opt.instance_id, opt.model_slug),
+                    opt.model_label,
+                )
+                .group(SharedString::from(opt.group_label))
+            })
+            .collect()
+    }
+
+    pub(super) fn text_gen_selection_label(&self, config: &ServerConfig, selection: &ModelSelection) -> String {
+        text_generation_selection_label(config, selection, &self.threads.text_gen_models)
     }
 
     pub(super) fn sync_input(input: &Entity<InputState>, value: &str, window: &mut Window, cx: &mut App) {
@@ -526,11 +600,12 @@ impl SettingsView {
         }
         let auto_settle = section("Auto-settle", auto_settle_rows, cx);
 
+        self.sync_text_generator_models(&config, cx);
         let saved_text_gen = t3_core::settings::text_generation_model_selection(settings);
-        let text_gen_selection = saved_text_gen
-            .clone()
-            .filter(|selection| providers::instance_enabled(settings, None, &selection.instance_id))
-            .or_else(|| selection.clone());
+        let text_gen_selection =
+            resolve_default_text_generation_selection(&config, None, &self.threads.text_gen_models);
+        let text_gen_options =
+            self.text_gen_select_options(&config, None, &[saved_text_gen.as_ref(), text_gen_selection.as_ref()]);
         let text_gen_state = self.state.clone();
         let text_gen_row = Row::new("text-generation-model", "Text generation model")
             .description("For thread titles and other generated text. Source control has its own setting.")
@@ -540,7 +615,7 @@ impl SettingsView {
                 move |_, _, cx| reset(cx)
             });
         let text_gen_row = match &text_gen_selection {
-            Some(shown) if !options.is_empty() => {
+            Some(shown) if !text_gen_options.is_empty() => {
                 let trait_pickers = model_trait_controls(
                     "text-generation-model",
                     &config,
@@ -548,15 +623,16 @@ impl SettingsView {
                     &self.state,
                     ServerSettingChange::TextGenerationModelSelection,
                 );
+                let label = self.text_gen_selection_label(&config, shown);
                 text_gen_row.control(
                     h_flex()
                         .flex_wrap()
                         .justify_end()
                         .gap(r(6.))
                         .child(
-                            Select::new("text-generation-model-select", options)
+                            Select::new("text-generation-model-select", text_gen_options)
                                 .selected(selection_value(shown))
-                                .label(selection_label(&config, shown))
+                                .label(label)
                                 .width(220.)
                                 .popup_width(260.)
                                 .show_check()
@@ -1241,6 +1317,123 @@ mod tests {
                 view.sync_title_instructions("Old style", window, cx);
                 assert_eq!(view.threads.title_instructions.read(cx).value().as_ref(), "Old style");
             });
+        });
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(view);
+        vcx.run_until_parked();
+        drop(vcx);
+        drop(fixture);
+        drop(runtime);
+    }
+
+    #[gpui::test]
+    fn text_generation_picker_filters_supports_text_generation_and_loads_text_generators(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let drive = |vcx: &mut gpui::VisualTestContext| {
+            vcx.run_until_parked();
+            runtime.block_on(async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            });
+            vcx.run_until_parked();
+        };
+        cx.executor().allow_parking();
+        let (state, mut fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.run_until_parked();
+        let server_cfg: ServerConfig = serde_json::from_value(json!({
+            "environment": { "environmentId": "fixture-env", "label": "Mac" },
+            "providers": [
+                {
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "displayName": "Codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "models": [
+                        { "slug": "gpt-5", "name": "GPT-5" },
+                        { "slug": "no-text", "name": "No Text", "supportsTextGeneration": false }
+                    ]
+                },
+                {
+                    "instanceId": "fx",
+                    "driver": "fx",
+                    "displayName": "fx",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "supportsTextGeneration": false,
+                    "models": [{ "slug": "fx-1", "name": "fx 1" }]
+                }
+            ],
+            "settings": {
+                "providerInstances": {
+                    "codex": { "driver": "codex", "enabled": true },
+                    "fx": { "driver": "fx", "enabled": true }
+                },
+                "textGenerators": {
+                    "or-fast": {
+                        "kind": "openaiCompatible",
+                        "label": "OpenRouter Fast",
+                        "baseUrl": "https://openrouter.ai/api/v1",
+                        "apiKey": "__REDACTED__",
+                        "enabled": true
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(server_cfg.clone());
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx.add_window(|_, _| EmptyFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let view = vcx.update(|window, cx| cx.new(|cx| SettingsView::new(state.clone(), Section::Threads, None, window, cx)));
+
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| view.sync_text_generator_models(&server_cfg, cx));
+        });
+        drive(&mut vcx);
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests
+            .into_iter()
+            .find(|(m, _, _)| *m == LIST_TEXT_GENERATOR_MODELS)
+            .expect("listTextGeneratorModels RPC sent");
+        assert_eq!(payload["id"], json!("or-fast"));
+        let _ = reply.send(Ok(json!({
+            "models": [{ "id": "openai/gpt-5-nano", "name": "GPT-5 Nano" }]
+        })));
+        drive(&mut vcx);
+
+        view.read_with(&vcx, |view, _| {
+            let sel = ModelSelection {
+                instance_id: "or-fast".into(),
+                model: "openai/gpt-5-nano".into(),
+                options: None,
+            };
+            let opts = view.text_gen_select_options(&server_cfg, None, &[Some(&sel)]);
+            let values: Vec<&str> = opts.iter().map(|o| o.value.as_ref()).collect();
+            assert_eq!(
+                values,
+                vec![
+                    format!("codex{SELECTION_SEPARATOR}gpt-5"),
+                    format!("or-fast{SELECTION_SEPARATOR}openai/gpt-5-nano"),
+                ]
+            );
+            assert_eq!(view.text_gen_selection_label(&server_cfg, &sel), "GPT-5 Nano");
         });
 
         state.update(&mut vcx, |state, _| state.stop_pump());

@@ -185,6 +185,42 @@ pub fn set_voice_cleanup_enabled(enabled: bool, cx: &mut App) {
     stored.save();
 }
 
+pub fn begin_pending_cloud_choice(
+    destination: VoiceTranscriptionDestination,
+    cx: &mut App,
+) -> String {
+    ensure_consent(cx);
+    let pending_id = uuid::Uuid::new_v4().to_string();
+    let stored = cx.global_mut::<StoredVoiceConsent>();
+    let id = stored.state.begin_pending_cloud_choice(pending_id, destination);
+    stored.generation.fetch_add(1, Ordering::SeqCst);
+    id
+}
+
+pub fn acknowledge_pending_cloud_choice(pending_id: &str, cx: &mut App) {
+    ensure_consent(cx);
+    let stored = cx.global_mut::<StoredVoiceConsent>();
+    let had_cleanup = stored
+        .state
+        .active_grant()
+        .is_some_and(|g| stored.state.cleanup_grant() == Some(g.id.as_str()));
+    stored.state.acknowledge_pending_cloud_choice(pending_id);
+    if had_cleanup {
+        stored
+            .state
+            .choose_transcript_cleanup(Some(pending_id.to_owned()));
+    }
+    stored.generation.fetch_add(1, Ordering::SeqCst);
+    stored.save();
+}
+
+pub fn fail_pending_cloud_choice(pending_id: &str, cx: &mut App) {
+    ensure_consent(cx);
+    let stored = cx.global_mut::<StoredVoiceConsent>();
+    stored.state.fail_pending_cloud_choice(pending_id);
+    stored.generation.fetch_add(1, Ordering::SeqCst);
+}
+
 pub fn list_voice_candidates(state: &AppState) -> Vec<VoiceEnvironmentCandidate> {
     let mut candidates = Vec::new();
     let active_env_id = state

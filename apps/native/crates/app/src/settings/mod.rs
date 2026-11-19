@@ -13,6 +13,7 @@ pub(crate) mod controls;
 mod devices;
 pub(crate) mod diagnostics;
 mod diffs_browser;
+mod environments;
 mod general;
 mod keybindings;
 mod maintenance;
@@ -36,12 +37,20 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_core::settings::search::{self, Features, SearchItem, Section};
+use t3_core::settings::search::{self, Features, SearchAvailability, SearchItem, Section};
+use t3_core::settings::{
+    ALL_PROJECTS_VALUE, ScopeCheckout, ScopeProjectGroup, SettingsScopeSearch,
+    select_checkout_axis, select_project_axis, settings_scope_checkout_choices,
+    settings_scope_checkout_label,
+};
 
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
-use controls::{Button, ButtonSize, ButtonVariant, ModalLayout, focus_ring, icon, r};
+use controls::{
+    Button, ButtonSize, ButtonVariant, ModalLayout, Select, SelectOption, focus_ring, group, icon,
+    r,
+};
 
 actions!(settings, [OpenSettings, CloseSettings, FocusSettingsSearch, FocusNextInSettings, FocusPreviousInSettings]);
 
@@ -365,9 +374,40 @@ pub fn show_project_list(cx: &mut App) {
     }
 }
 
+/// Computes `SearchAvailability` (`useAvailableSettingsSearchItems.ts`) from live app state.
+fn search_availability_for(state: &AppState) -> SearchAvailability {
+    let active_config = state.server_config.config.as_ref();
+    let has_environment = active_config.is_some();
+    let has_provider_settings_environment = active_config.is_some();
+    let has_thread_auto_settlement = active_config.is_some();
+    let has_peer_link_host = active_config.is_some()
+        || !state.environments.environments.is_empty();
+    let has_fast_worktree_checkout_environment = active_config
+        .and_then(|c| c.environment.platform.as_ref())
+        .is_some_and(|platform| platform.os == "darwin");
+    let has_text_generators_environment = active_config.is_some_and(|c| {
+        c.managed_policy
+            .as_ref()
+            .and_then(|policy| policy.pointer("/limits/providers/allowedDrivers"))
+            .is_none()
+    });
+    let has_multiple_environments = state.environments.environments.len() >= 2;
+    SearchAvailability {
+        has_environment,
+        has_provider_settings_environment,
+        has_thread_auto_settlement,
+        has_peer_link_host,
+        has_fast_worktree_checkout_environment,
+        has_text_generators_environment,
+        has_multiple_environments,
+        is_macos: cfg!(target_os = "macos"),
+    }
+}
+
 /// The settings search results the command palette lists (`CommandPalette.tsx`).
 pub fn palette_items(cx: &App) -> Vec<t3_core::palette::CommandPaletteItem> {
-    search::items(features(cx))
+    let availability = search_availability_for(cx.global::<Host>().state.read(cx));
+    search::available_items(features(cx), availability)
         .into_iter()
         .map(|item| t3_core::palette::CommandPaletteItem {
             value: format!("setting:{}", item.id),
@@ -507,6 +547,71 @@ impl Block {
     }
 }
 
+/// Collapsible settings section (`FoldedSettingsSection.tsx`): chevron toggle, title, muted
+/// summary when collapsed, optional trailing control (e.g., master switch), highlight border on
+/// search jump, and expanded divided group.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn folded_section(
+    id: &'static str,
+    title: &'static str,
+    summary: Option<String>,
+    open: bool,
+    highlighted: bool,
+    control: Option<AnyElement>,
+    on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    rows: Vec<AnyElement>,
+    cx: &App,
+) -> AnyElement {
+    let p = palette(cx);
+    let chevron = if open { Icon::ChevronDown } else { Icon::ChevronRight };
+    let header_trigger = h_flex()
+        .id(SharedString::from(format!("folded-section-toggle-{id}")))
+        .flex_1()
+        .min_w_0()
+        .gap(r(8.))
+        .items_center()
+        .cursor_pointer()
+        .on_click(on_toggle)
+        .child(icon(chevron, 14., hsla(p.muted_foreground)))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hsla(p.foreground))
+                .child(title),
+        )
+        .when_some(summary.filter(|s| !open && !s.is_empty()), |this, text| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(hsla(p.muted_foreground))
+                    .truncate()
+                    .child(text),
+            )
+        });
+    v_flex()
+        .id(SharedString::from(format!("folded-section-{id}")))
+        .rounded(r(12.))
+        .border_1()
+        .border_color(if highlighted { hsla(p.primary) } else { hsla(p.border) })
+        .bg(if highlighted { hsla(p.primary).opacity(0.05) } else { hsla(p.card) })
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .min_h(r(44.))
+                .px(r(16.))
+                .py(r(10.))
+                .gap(r(12.))
+                .items_center()
+                .justify_between()
+                .when(open, |this| this.border_b_1().border_color(hsla(p.border)))
+                .child(header_trigger)
+                .children(control),
+        )
+        .when(open, |this| this.child(group(rows, cx)))
+        .into_any_element()
+}
+
 pub struct SettingsView {
     state: Entity<AppState>,
     focus: FocusHandle,
@@ -514,6 +619,8 @@ pub struct SettingsView {
     /// The row a search jump landed on, tinted until the next navigation.
     target: Option<String>,
     scroll_to_target: bool,
+    /// Scoped settings selection (`SettingsScopeSentence.tsx`, `useScopedSettings.ts`).
+    scope: SettingsScopeSearch,
     search: Entity<InputState>,
     active_result: usize,
     scroll: ScrollHandle,
@@ -536,6 +643,8 @@ pub struct SettingsView {
     pub(crate) maintenance: maintenance::MaintenanceState,
     pub(crate) diagnostics: diagnostics::DiagnosticsState,
     pub(crate) devices: devices::DevicesState,
+    pub(crate) environments: environments::EnvironmentsState,
+    pub(crate) voice: voice::VoiceState,
     chat_ui: general::ChatState,
     about: about::AboutState,
     browser: diffs_browser::BrowserState,
@@ -592,6 +701,8 @@ impl SettingsView {
             maintenance: maintenance::MaintenanceState::new(window, cx),
             diagnostics: diagnostics::DiagnosticsState::new(window, cx),
             devices: devices::DevicesState::new(cx),
+            environments: environments::EnvironmentsState::new(),
+            voice: voice::VoiceState::new(window, cx),
             chat_ui: general::ChatState::default(),
             about: about::AboutState::new(window, cx),
             browser: diffs_browser::BrowserState::new(window, cx),
@@ -602,6 +713,7 @@ impl SettingsView {
             section,
             target: None,
             scroll_to_target: false,
+            scope: SettingsScopeSearch::default(),
             search,
             active_result: 0,
             scroll: ScrollHandle::new(),
@@ -623,6 +735,11 @@ impl SettingsView {
         if section != Section::Providers { self.providers.leave(); }
         let changed = self.section != section;
         self.section = section;
+        let target = if section == Section::Voice {
+            target.map(|id| self.resolve_voice_target(&id, cx))
+        } else {
+            target
+        };
         self.scroll_to_target = target.is_some();
         if let Some(target) = target.as_deref() {
             if matches!(target, "prompt-font" | "terminal-font") && !store::client(cx).separate_fonts() {
@@ -630,6 +747,8 @@ impl SettingsView {
             }
             self.worktrees.reveal(target);
             self.source_control.reveal(target);
+            self.environments.reveal(target);
+            self.voice.reveal(target);
         }
         self.target = target;
         if changed || self.target.is_none() {
@@ -659,6 +778,12 @@ impl SettingsView {
         if section != Section::About {
             self.about.leave();
         }
+        if section != Section::Connections {
+            self.environments.leave();
+        }
+        if section != Section::Voice {
+            self.leave_voice(cx);
+        }
         if section == Section::Diagnostics {
             if changed {
                 self.diagnostics.reset();
@@ -674,9 +799,10 @@ impl SettingsView {
     }
 
     fn search_items(&self, cx: &App) -> Vec<SearchItem> {
-        let mut items = search::items(features(cx));
+        let state = self.state.read(cx);
+        let mut items = search::available_items(features(cx), search_availability_for(state));
         let mac = cfg!(target_os = "macos");
-        if let Some(config) = self.state.read(cx).server_config.config.as_ref() {
+        if let Some(config) = state.server_config.config.as_ref() {
             for row in t3_core::settings::keybindings::rows(&config.keybindings, mac) {
                 items.push(search::keybinding_item(&row.command, &row.label, &row.shortcuts));
             }
@@ -717,7 +843,11 @@ impl SettingsView {
             dialog.update(cx,|dialog,cx|dialog.close(window,cx));
             return;
         }
-        if self.dismiss_about_overlay(window, cx) || self.dismiss_auto_settle_days(window, cx) {
+        if self.dismiss_about_overlay(window, cx)
+            || self.dismiss_auto_settle_days(window, cx)
+            || self.dismiss_environments_overlay(window, cx)
+            || self.dismiss_voice_overlay(window, cx)
+        {
             return;
         }
         if self.archive.dismiss()
@@ -737,6 +867,7 @@ impl SettingsView {
             return;
         }
         self.commit_focused_field(window, cx);
+        self.leave_voice(cx);
         finish_close(window, cx);
     }
 
@@ -749,6 +880,7 @@ impl SettingsView {
         self.commit_focused_source_control_field(window, cx);
         self.commit_focused_project_field(window, cx);
         self.commit_focused_maintenance_field(window, cx);
+        self.commit_focused_voice_field(window, cx);
     }
 
     fn on_focus_search(&mut self, _: &FocusSettingsSearch, window: &mut Window, cx: &mut Context<Self>) {
@@ -867,10 +999,13 @@ impl SettingsView {
             .chain(self.secrets.inputs())
             .chain(self.maintenance.inputs())
             .chain(self.diagnostics.inputs())
+            .chain(self.environments.inputs())
+            .chain(self.voice.inputs())
             .any(|input| input.focus_handle(cx).is_focused(window))
             || [&self.threads.title_instructions, &self.worktrees.instructions, self.scheduled.textarea(), &self.projects.actions.command]
                 .into_iter()
                 .chain(self.source_control.textareas())
+                .chain(self.voice.textareas())
                 .any(|input| input.focus_handle(cx).is_focused(window))
     }
 
@@ -1042,9 +1177,202 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// Projects belonging to the active environment, used where per-project overrides are wired
+    /// (currently Voice project dictionary).
+    fn active_env_project_groups(&self, cx: &App) -> Vec<ScopeProjectGroup> {
+        let state = self.state.read(cx);
+        let active_env_id = state
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.environment.environment_id.as_str())
+            .filter(|id| !id.is_empty());
+        let active_saved_id = state.environments.active.as_deref();
+        self.project_groups(cx)
+            .into_iter()
+            .filter(|group| !group.is_scratch)
+            .filter_map(|group| {
+                let members: Vec<ScopeCheckout> = group
+                    .members
+                    .into_iter()
+                    .filter(|member| {
+                        let owner = &member.project.owner;
+                        active_env_id.is_some_and(|id| owner.identity() == id)
+                            || active_saved_id.is_some_and(|id| owner.saved_id == id)
+                            || (active_env_id.is_none() && active_saved_id.is_none())
+                    })
+                    .map(|member| ScopeCheckout {
+                        environment_id: member.project.owner.identity(),
+                        physical_project_key: member.physical_key,
+                        workspace_root: member.project.project.workspace_root,
+                    })
+                    .collect();
+                let workspace_root = members.first()?.workspace_root.clone();
+                Some(ScopeProjectGroup {
+                    project_key: group.key,
+                    display_name: group.label,
+                    workspace_root,
+                    archived: group.archived,
+                    members,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn scope_project_id(&self, cx: &App) -> Option<String> {
+        let project_key = self.scope.project.as_deref()?;
+        let state = self.state.read(cx);
+        let active_env_id = state
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.environment.environment_id.as_str())
+            .filter(|id| !id.is_empty());
+        let active_saved_id = state.environments.active.as_deref();
+        let groups = self.project_groups(cx);
+        let group = groups.iter().find(|g| g.key == project_key)?;
+        let active_members = || {
+            group.members.iter().filter(|m| {
+                let owner = &m.project.owner;
+                active_env_id.is_some_and(|id| owner.identity() == id)
+                    || active_saved_id.is_some_and(|id| owner.saved_id == id)
+                    || (active_env_id.is_none() && active_saved_id.is_none())
+            })
+        };
+        if let Some(checkout) = self.scope.checkout.as_deref()
+            && let Some(member) = active_members().find(|m| m.physical_key == checkout)
+        {
+            return Some(member.project.project.id.clone());
+        }
+        active_members().next().map(|m| m.project.project.id.clone())
+    }
+
+    pub(super) fn scope_project_label(&self, cx: &App) -> Option<String> {
+        let project_key = self.scope.project.as_deref()?;
+        self.active_env_project_groups(cx)
+            .into_iter()
+            .find(|g| g.project_key == project_key)
+            .map(|g| g.display_name)
+    }
+
+    /// `SettingsScopeSentence.tsx`: rendered only on sections that genuinely honor `self.scope`
+    /// (`Section::Voice` project dictionary on the active environment), never over unwired global
+    /// panels where changing the banner would have no effect.
+    fn render_scope_sentence(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.section != Section::Voice {
+            return None;
+        }
+        let groups = self.active_env_project_groups(cx);
+        if groups.is_empty() {
+            return None;
+        }
+        let p = palette(cx);
+        let selected_project = self
+            .scope
+            .project
+            .as_deref()
+            .and_then(|key| groups.iter().find(|g| g.project_key == key));
+        let project_value = selected_project
+            .map(|g| g.project_key.clone())
+            .unwrap_or_else(|| ALL_PROJECTS_VALUE.to_owned());
+        let mut project_options = vec![SelectOption::new(ALL_PROJECTS_VALUE, "All projects")];
+        for g in &groups {
+            let label = if g.archived {
+                format!("{} (archived)", g.display_name)
+            } else {
+                g.display_name.clone()
+            };
+            project_options.push(SelectOption::new(g.project_key.clone(), label));
+        }
+
+        let checkouts: Vec<ScopeCheckout> = selected_project
+            .map(|g| {
+                settings_scope_checkout_choices(g, &self.scope)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let checkout_refs: Vec<&ScopeCheckout> = checkouts.iter().collect();
+        let checkout_select = (!checkouts.is_empty()).then(|| {
+            let mut opts = vec![SelectOption::new("__all__", "All checkouts")];
+            for ch in &checkouts {
+                opts.push(SelectOption::new(
+                    ch.physical_project_key.clone(),
+                    settings_scope_checkout_label(ch, &checkout_refs),
+                ));
+            }
+            let selected_checkout = self
+                .scope
+                .checkout
+                .as_deref()
+                .filter(|k| checkouts.iter().any(|c| c.physical_project_key == *k))
+                .unwrap_or("__all__")
+                .to_owned();
+            let checkouts_for_cb = checkouts.clone();
+            let weak = cx.entity().downgrade();
+            h_flex()
+                .gap(r(6.))
+                .items_center()
+                .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("in"))
+                .child(
+                    Select::new("settings-scope-checkout", opts)
+                        .selected(selected_checkout)
+                        .width(160.)
+                        .on_change(move |value, _, cx| {
+                            let chosen = checkouts_for_cb
+                                .iter()
+                                .find(|c| c.physical_project_key == value)
+                                .cloned();
+                            let _ = weak.update(cx, |this, cx| {
+                                this.scope = select_checkout_axis(&this.scope, chosen.as_ref());
+                                cx.notify();
+                            });
+                        }),
+                )
+        });
+
+        let weak_proj = cx.entity().downgrade();
+        Some(
+            h_flex()
+                .id("settings-scope-sentence")
+                .debug_selector(|| "settings-scope-sentence".to_owned())
+                .flex_wrap()
+                .gap(r(6.))
+                .items_center()
+                .px(r(12.))
+                .py(r(8.))
+                .rounded(r(10.))
+                .border_1()
+                .border_color(hsla(p.border))
+                .bg(hsla(p.card))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child("Project dictionary scope:"),
+                )
+                .child(
+                    Select::new("settings-scope-project", project_options)
+                        .selected(project_value)
+                        .width(168.)
+                        .on_change(move |value, _, cx| {
+                            let _ = weak_proj.update(cx, |this, cx| {
+                                this.scope = select_project_axis(&this.scope, &value);
+                                cx.notify();
+                            });
+                        }),
+                )
+                .children(checkout_select)
+                .into_any_element(),
+        )
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let licenses_open = self.section == Section::About && self.about.licenses_open;
+        let nav_parent = self.section.nav_parent();
+        let has_detail_parent = nav_parent != self.section;
         let section_crumb = if licenses_open {
             div()
                 .id("settings-breadcrumb-about")
@@ -1056,6 +1384,17 @@ impl SettingsView {
                     cx.notify();
                 }))
                 .child(self.section.label())
+                .into_any_element()
+        } else if has_detail_parent {
+            div()
+                .id("settings-breadcrumb-parent")
+                .cursor_pointer()
+                .text_color(hsla(p.muted_foreground))
+                .hover(|this| this.text_color(hsla(p.foreground)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.navigate(nav_parent, None, cx);
+                }))
+                .child(nav_parent.label())
                 .into_any_element()
         } else {
             div()
@@ -1082,6 +1421,10 @@ impl SettingsView {
                     .child(div().text_color(hsla(p.muted_foreground)).child("Settings"))
                     .child(div().text_color(hsla(p.icon_muted)).child("/"))
                     .child(section_crumb)
+                    .when(has_detail_parent, |this| {
+                        this.child(div().text_color(hsla(p.icon_muted)).child("/"))
+                            .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.section.label()))
+                    })
                     .when(licenses_open, |this| {
                         this.child(div().text_color(hsla(p.icon_muted)).child("/"))
                             .child(div().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Open-source licenses"))
@@ -1119,7 +1462,7 @@ impl SettingsView {
             Section::About => self.about(cx),
             Section::Archived => self.archive_page(cx),
             Section::Devices => self.devices_page(cx),
-            Section::Voice => self.voice_page(cx),
+            Section::Voice => self.voice_page(window, cx),
         }
     }
 
@@ -1133,6 +1476,9 @@ fn section_icon(section: Section) -> Icon {
         Section::General => Icon::Settings2,
         Section::Appearance => Icon::Palette,
         Section::Chat => Icon::MessageSquareText,
+        Section::Diffs => Icon::FileDiff,
+        Section::Browser => Icon::Globe,
+        Section::SnapShot => Icon::History,
         Section::Keybindings => Icon::Keyboard,
         Section::Providers => Icon::Bot,
         Section::Threads => Icon::MessagesSquare,
@@ -1149,7 +1495,6 @@ fn section_icon(section: Section) -> Icon {
         Section::Labs => Icon::FlaskConical,
         Section::About => Icon::Info,
         Section::Archived => Icon::Archive,
-        _ => Icon::Settings2,
     }
 }
 
@@ -1162,10 +1507,13 @@ impl Render for SettingsView {
             Section::Projects => self.project_list_view(cx),
             _ => None,
         };
+        let scope_sentence = self.render_scope_sentence(cx);
         if self.scroll_to_target {
             self.scroll_to_target = false;
             if let Some(index) = self.target.as_deref().and_then(|target| blocks.iter().position(|block| block.anchors.iter().any(|anchor| anchor.as_ref() == target))) {
-                self.scroll.scroll_to_item(index + usize::from(store::error(cx).is_some()));
+                let offset = usize::from(store::error(cx).is_some())
+                    + usize::from(scope_sentence.is_some());
+                self.scroll.scroll_to_item(index + offset);
             }
         }
         let p = palette(cx);
@@ -1187,8 +1535,18 @@ impl Render for SettingsView {
                     .child(div().opacity(0.8).child(error)),
             )
         });
+        let scope_banner = scope_sentence.map(|el| {
+            div().w_full().max_w(r(page_width)).px(r(24.)).child(el)
+        });
         let content = match archive_list {
-            Some(list) => v_flex().flex_1().min_h_0().items_center().when_some(error, |this, error| this.child(div().w_full().flex().justify_center().pt(r(24.)).child(error))).child(list).into_any_element(),
+            Some(list) => v_flex()
+                .flex_1()
+                .min_h_0()
+                .items_center()
+                .when_some(error, |this, error| this.child(div().w_full().flex().justify_center().pt(r(24.)).child(error)))
+                .when_some(scope_banner, |this, banner| this.child(div().w_full().flex().justify_center().pt(r(16.)).child(banner)))
+                .child(list)
+                .into_any_element(),
             None => v_flex()
                 .id("settings-content")
                 .flex_1()
@@ -1200,6 +1558,7 @@ impl Render for SettingsView {
                 .pb(r(48.))
                 .gap(r(24.))
                 .children(error)
+                .children(scope_banner)
                 .children(blocks.into_iter().map(|block| div().w_full().max_w(r(page_width)).px(r(24.)).child(block.element)))
                 .into_any_element(),
         };
@@ -1207,6 +1566,8 @@ impl Render for SettingsView {
         let action_editor = self.action_editor_overlay(window, cx);
         let secret_dialog = self.secret_dialog_overlay(window, cx);
         let background_dialog = self.background_dialog_overlay(window, cx);
+        let environments_dialog = self.environments_dialog_overlay(window, cx);
+        let voice_dialog = self.voice_dialog_overlay(window, cx);
         h_flex()
             .relative()
             .size_full()
@@ -1227,6 +1588,8 @@ impl Render for SettingsView {
             .children(action_editor)
             .children(secret_dialog)
             .children(background_dialog)
+            .children(environments_dialog)
+            .children(voice_dialog)
             .children(self.appearance_ui.import.clone())
     }
 }
@@ -1236,4 +1599,135 @@ pub(crate) fn import_theme_fixture(path:&std::path::Path,state:&Entity<AppState>
     let text=std::fs::read_to_string(path).map_err(|e|e.to_string())?;
     let theme=t3_core::themes::import(&text)?;
     appearance::import_theme(state,theme,true,cx);Ok(())
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod shell_tests {
+    use gpui::{Context, IntoElement, ParentElement, Render, Styled, Window, div};
+    use serde_json::json;
+    use t3_core::settings::search::Section;
+
+    use super::*;
+
+    struct SettingsFrame;
+    impl Render for SettingsFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().children(overlay(window, cx))
+        }
+    }
+
+    #[gpui::test]
+    fn scope_sentence_search_availability_and_detail_breadcrumb(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.executor().allow_parking();
+        let (state, fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "settings:write"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::updates::init(cx);
+            init(state.clone(), cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "env-mac",
+                            "label": "Mac Studio",
+                            "platform": { "os": "darwin", "arch": "arm64" }
+                        },
+                        "settings": {}
+                    }))
+                    .unwrap(),
+                );
+                state.environments.environments.push(
+                    serde_json::from_value(json!({
+                        "id": "env-mac",
+                        "label": "Mac Studio",
+                        "httpBase": "http://127.0.0.1:3773",
+                        "local": true,
+                        "environmentId": "env-mac"
+                    }))
+                    .unwrap(),
+                );
+                state.environments.environments.push(
+                    serde_json::from_value(json!({
+                        "id": "env-vps",
+                        "label": "Build VPS",
+                        "httpBase": "https://vps.example.ts.net",
+                        "local": false,
+                        "environmentId": "env-vps"
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(AppEvent::ServerConfig);
+                cx.emit(AppEvent::Phase);
+            });
+            open(Section::Appearance, cx);
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        // Device-only (Appearance) and unwired global panels (Threads) do not render a misleading
+        // scope banner.
+        assert!(vcx.debug_bounds("settings-scope-sentence").is_none());
+        vcx.update(|_, cx| open(Section::Threads, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("settings-scope-sentence").is_none());
+
+        // Search availability includes darwin fast-worktree-checkout, voice, text-generators, and
+        // multi-env items, and hides text-generators when managedPolicy restricts allowedDrivers.
+        vcx.update(|window, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            let items = view.read(cx).search_items(cx);
+            assert!(items.iter().any(|i| i.id == "worktree-fast-checkout"));
+            assert!(items.iter().any(|i| i.id == "voice-microphone"));
+            assert!(items.iter().any(|i| i.id == "load-balancing"));
+            assert!(items.iter().any(|i| i.id == "text-generators"));
+
+            state.update(cx, |state, cx| {
+                state.server_config.config.as_mut().unwrap().managed_policy = Some(json!({
+                    "organization": "Acme",
+                    "limits": { "providers": { "allowedDrivers": ["codex"] } }
+                }));
+                cx.emit(AppEvent::ServerConfig);
+            });
+            let restricted = view.read(cx).search_items(cx);
+            assert!(!restricted.iter().any(|i| i.id == "text-generators"));
+
+            // Navigating to Diagnostics sets nav_parent to Maintenance, and navigating to
+            // load-balancing auto-reveals its folded section.
+            view.update(cx, |v, cx| v.navigate(Section::Diagnostics, None, cx));
+            assert_eq!(view.read(cx).section.nav_parent(), Section::Maintenance);
+            view.update(cx, |v, cx| {
+                v.navigate(Section::Connections, Some("load-balancing".to_owned()), cx)
+            });
+            assert!(view.read(cx).environments.load_balancing_open);
+
+            drop(view);
+            finish_close(window, cx);
+        });
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        vcx.run_until_parked();
+        drop(vcx);
+        drop(runtime);
+    }
 }

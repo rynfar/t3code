@@ -167,6 +167,7 @@ pub struct VoiceSpeechController {
     app: Entity<AppState>,
     owner_key: String,
     offer_setup: bool,
+    cleanup_override: Option<bool>,
     draft_reader: DraftReader,
     hints_reader: HintsReader,
     project_id_reader: ProjectIdReader,
@@ -222,6 +223,7 @@ impl VoiceSpeechController {
             app: config.app,
             owner_key: config.owner_key,
             offer_setup: config.offer_setup,
+            cleanup_override: None,
             draft_reader: config.draft_reader,
             hints_reader: config.hints_reader,
             project_id_reader: config.project_id_reader,
@@ -262,6 +264,11 @@ impl VoiceSpeechController {
 
     pub fn owner_key(&self) -> &str {
         &self.owner_key
+    }
+
+    /// Overrides transcript cleanup (`cleanup: false` for the Settings model test).
+    pub fn set_cleanup_override(&mut self, allow: Option<bool>) {
+        self.cleanup_override = allow;
     }
 
     pub fn set_owner_key(&mut self, next: impl Into<String>, cx: &mut Context<Self>) {
@@ -1023,7 +1030,8 @@ impl VoiceSpeechController {
                         this.apply_effects(effects, cx);
                         return;
                     }
-                    this.machine.set_enable_post_processing(cleanup_granted);
+                    let cleanup_effective = this.cleanup_override.unwrap_or(cleanup_granted);
+                    this.machine.set_enable_post_processing(cleanup_effective);
                     this.prepared = Some(PreparedStart {
                         owner_key,
                         destination: active,
@@ -1031,11 +1039,11 @@ impl VoiceSpeechController {
                         consent_gen_ref,
                         consent_generation,
                         draft_environment_id: draft_env_id,
-                        cleanup_requested: cleanup_granted,
+                        cleanup_requested: cleanup_effective,
                         cleanup_grant_id,
                         options,
                         cleanup_options,
-                        can_post_process: cleanup_granted,
+                        can_post_process: cleanup_effective,
                     });
                     let effects = this
                         .machine
@@ -1157,7 +1165,8 @@ impl VoiceSpeechController {
                             speech_post_processing_prompt: post_prompt,
                             speech_correction_word: correction_word,
                         };
-                        this.machine.set_enable_post_processing(cleanup_granted);
+                        let cleanup_effective = this.cleanup_override.unwrap_or(cleanup_granted);
+                        this.machine.set_enable_post_processing(cleanup_effective);
                         this.prepared = Some(PreparedStart {
                             owner_key,
                             destination: active,
@@ -1165,11 +1174,11 @@ impl VoiceSpeechController {
                             consent_gen_ref,
                             consent_generation,
                             draft_environment_id: draft_env_id,
-                            cleanup_requested: cleanup_granted,
+                            cleanup_requested: cleanup_effective,
                             cleanup_grant_id,
                             options,
                             cleanup_options,
-                            can_post_process: cleanup_granted,
+                            can_post_process: cleanup_effective,
                         });
                         // `/ws/voice` uses `StreamCommand::Finish` rather than a live-start promise,
                         // so `has_live_start` is always `false` here.

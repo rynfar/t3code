@@ -42,6 +42,10 @@ pub trait AudioCaptureSession: Send {
     fn stop(&mut self) -> Result<(), String>;
 }
 
+pub trait AudioPlaybackSession: Send {
+    fn stop(&mut self);
+}
+
 pub trait AudioPlatform: Send + Sync {
     fn list_input_devices(&self) -> Vec<AudioDeviceInfo>;
     fn permission_status(&self) -> MicPermissionStatus;
@@ -52,6 +56,15 @@ pub trait AudioPlatform: Send + Sync {
         meter_only: bool,
         callbacks: AudioCaptureCallbacks,
     ) -> Result<Box<dyn AudioCaptureSession>, CaptureStartError>;
+    fn start_playback(
+        &self,
+        _pcm_samples: Vec<f32>,
+        _start_sample: usize,
+        _on_position: Arc<dyn Fn(usize) + Send + Sync>,
+        _on_ended: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Box<dyn AudioPlaybackSession>, String> {
+        Err("Audio playback is not supported on this platform.".to_owned())
+    }
     fn open_microphone_settings(&self) -> bool;
 }
 
@@ -199,6 +212,14 @@ impl MockAudioPlatform {
 }
 
 #[cfg(any(test, feature = "snapshot"))]
+struct MockPlaybackSession;
+
+#[cfg(any(test, feature = "snapshot"))]
+impl AudioPlaybackSession for MockPlaybackSession {
+    fn stop(&mut self) {}
+}
+
+#[cfg(any(test, feature = "snapshot"))]
 impl AudioPlatform for MockAudioPlatform {
     fn list_input_devices(&self) -> Vec<AudioDeviceInfo> {
         self.devices.lock().expect("devices lock").clone()
@@ -238,6 +259,20 @@ impl AudioPlatform for MockAudioPlatform {
         });
         *self.active.lock().expect("active lock") = Some(state.clone());
         Ok(Box::new(MockCaptureSession { state }))
+    }
+
+    fn start_playback(
+        &self,
+        pcm_samples: Vec<f32>,
+        start_sample: usize,
+        on_position: Arc<dyn Fn(usize) + Send + Sync>,
+        _on_ended: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Box<dyn AudioPlaybackSession>, String> {
+        if pcm_samples.is_empty() {
+            return Err("No audio was recorded. Try again.".to_owned());
+        }
+        on_position(start_sample.min(pcm_samples.len()));
+        Ok(Box::new(MockPlaybackSession))
     }
 
     fn open_microphone_settings(&self) -> bool {

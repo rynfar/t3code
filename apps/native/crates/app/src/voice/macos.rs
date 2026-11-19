@@ -15,8 +15,8 @@ use t3_core::voice_input::{
 };
 
 use super::platform::{
-    AudioCaptureCallbacks, AudioCaptureSession, AudioPlatform, CaptureStartError,
-    MicPermissionStatus, PermissionOutcome,
+    AudioCaptureCallbacks, AudioCaptureSession, AudioPlatform, AudioPlaybackSession,
+    CaptureStartError, MicPermissionStatus, PermissionOutcome,
 };
 
 #[link(name = "AudioToolbox", kind = "framework")]
@@ -108,6 +108,12 @@ type AudioQueueInputCallback = unsafe extern "C" fn(
     in_packet_descs: *const c_void,
 );
 
+type AudioQueueOutputCallback = unsafe extern "C" fn(
+    in_user_data: *mut c_void,
+    in_aq: AudioQueueRef,
+    in_buffer: *mut AudioQueueBuffer,
+);
+
 type AudioQueuePropertyListenerProc = unsafe extern "C" fn(
     in_user_data: *mut c_void,
     in_aq: AudioQueueRef,
@@ -135,6 +141,16 @@ unsafe extern "C" {
     fn AudioQueueNewInput(
         in_format: *const AudioStreamBasicDescription,
         in_callback_proc: AudioQueueInputCallback,
+        in_user_data: *mut c_void,
+        in_callback_run_loop: *const c_void,
+        in_callback_run_loop_mode: CFStringRef,
+        in_flags: u32,
+        out_aq: *mut AudioQueueRef,
+    ) -> OSStatus;
+
+    fn AudioQueueNewOutput(
+        in_format: *const AudioStreamBasicDescription,
+        in_callback_proc: AudioQueueOutputCallback,
         in_user_data: *mut c_void,
         in_callback_run_loop: *const c_void,
         in_callback_run_loop_mode: CFStringRef,
@@ -235,6 +251,18 @@ impl AudioPlatform for MacOsAudioPlatform {
             MicPermissionStatus::Granted | MicPermissionStatus::NotDetermined => {}
         }
         let session = MacOsAudioCaptureSession::start(device_id, meter_only, callbacks)?;
+        Ok(Box::new(session))
+    }
+
+    fn start_playback(
+        &self,
+        pcm_samples: Vec<f32>,
+        start_sample: usize,
+        on_position: Arc<dyn Fn(usize) + Send + Sync>,
+        on_ended: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Box<dyn AudioPlaybackSession>, String> {
+        let session =
+            MacOsAudioPlaybackSession::start(pcm_samples, start_sample, on_position, on_ended)?;
         Ok(Box::new(session))
     }
 
@@ -750,5 +778,195 @@ unsafe extern "C" fn audio_queue_property_listener(
     };
     if status == 0 && is_running == 0 && !inner.error_reported.swap(true, Ordering::SeqCst) {
         (inner.callbacks.on_error)("The microphone disconnected.".to_owned());
+    }
+}
+
+const PLAYBACK_BUFFER_FRAMES: usize = 1600;
+const PLAYBACK_BUFFER_COUNT: usize = 3;
+
+struct PlaybackInner {
+    samples: Vec<f32>,
+    cursor: Mutex<usize>,
+    stopping: AtomicBool,
+    ended_reported: AtomicBool,
+    on_position: Arc<dyn Fn(usize) + Send + Sync>,
+    on_ended: Arc<dyn Fn() + Send + Sync>,
+}
+
+struct MacOsAudioPlaybackSession {
+    queue: NonNull<c_void>,
+    inner: Arc<PlaybackInner>,
+    user_data: *mut c_void,
+    stopped: bool,
+}
+
+unsafe impl Send for MacOsAudioPlaybackSession {}
+
+impl MacOsAudioPlaybackSession {
+    fn start(
+        samples: Vec<f32>,
+        start_sample: usize,
+        on_position: Arc<dyn Fn(usize) + Send + Sync>,
+        on_ended: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, String> {
+        if samples.is_empty() {
+            return Err("No audio was recorded. Try again.".to_owned());
+        }
+        let cursor = start_sample.min(samples.len());
+        let format = AudioStreamBasicDescription {
+            sample_rate: f64::from(t3_core::voice_input::SPEECH_SAMPLE_RATE),
+            format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+            format_flags: K_AUDIO_FORMAT_FLAG_IS_FLOAT | K_AUDIO_FORMAT_FLAG_IS_PACKED,
+            bytes_per_packet: 4,
+            frames_per_packet: 1,
+            bytes_per_frame: 4,
+            channels_per_frame: 1,
+            bits_per_channel: 32,
+            reserved: 0,
+        };
+
+        let inner = Arc::new(PlaybackInner {
+            samples,
+            cursor: Mutex::new(cursor),
+            stopping: AtomicBool::new(false),
+            ended_reported: AtomicBool::new(false),
+            on_position,
+            on_ended,
+        });
+        let user_data = Arc::into_raw(inner.clone()).cast::<c_void>().cast_mut();
+
+        let mut raw_queue: AudioQueueRef = null_mut();
+        let status = unsafe {
+            AudioQueueNewOutput(
+                &format,
+                audio_queue_output_callback,
+                user_data,
+                null(),
+                null(),
+                0,
+                &mut raw_queue,
+            )
+        };
+        let Some(queue) = NonNull::new(raw_queue).filter(|_| status == 0) else {
+            unsafe { drop(Arc::from_raw(user_data.cast::<PlaybackInner>())) };
+            return Err(format!("Could not play this recording (OSStatus {status})."));
+        };
+
+        let byte_size = (PLAYBACK_BUFFER_FRAMES * std::mem::size_of::<f32>()) as u32;
+        let mut enqueued = 0usize;
+        for _ in 0..PLAYBACK_BUFFER_COUNT {
+            let mut buffer: *mut AudioQueueBuffer = null_mut();
+            let alloc_status = unsafe { AudioQueueAllocateBuffer(queue.as_ptr(), byte_size, &mut buffer) };
+            if alloc_status != 0 || buffer.is_null() {
+                unsafe {
+                    let _ = AudioQueueDispose(queue.as_ptr(), 1);
+                    drop(Arc::from_raw(user_data.cast::<PlaybackInner>()));
+                }
+                return Err(format!("Could not allocate playback buffer (OSStatus {alloc_status})."));
+            }
+            if fill_playback_buffer(&inner, queue.as_ptr(), buffer) {
+                enqueued += 1;
+            }
+        }
+
+        if enqueued == 0 {
+            unsafe {
+                let _ = AudioQueueDispose(queue.as_ptr(), 1);
+                drop(Arc::from_raw(user_data.cast::<PlaybackInner>()));
+            }
+            (inner.on_ended)();
+            return Err("No remaining audio to play.".to_owned());
+        }
+
+        let start_status = unsafe { AudioQueueStart(queue.as_ptr(), null()) };
+        if start_status != 0 {
+            unsafe {
+                let _ = AudioQueueDispose(queue.as_ptr(), 1);
+                drop(Arc::from_raw(user_data.cast::<PlaybackInner>()));
+            }
+            return Err(format!("Could not start playback (OSStatus {start_status})."));
+        }
+
+        Ok(Self { queue, inner, user_data, stopped: false })
+    }
+
+    fn teardown(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.inner.stopping.store(true, Ordering::SeqCst);
+        unsafe {
+            let _ = AudioQueueStop(self.queue.as_ptr(), 1);
+            let _ = AudioQueueDispose(self.queue.as_ptr(), 1);
+            drop(Arc::from_raw(self.user_data.cast::<PlaybackInner>()));
+        }
+    }
+}
+
+impl AudioPlaybackSession for MacOsAudioPlaybackSession {
+    fn stop(&mut self) {
+        self.teardown();
+    }
+}
+
+impl Drop for MacOsAudioPlaybackSession {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+fn fill_playback_buffer(
+    inner: &PlaybackInner,
+    queue: AudioQueueRef,
+    buffer_ptr: *mut AudioQueueBuffer,
+) -> bool {
+    if inner.stopping.load(Ordering::SeqCst) || buffer_ptr.is_null() {
+        return false;
+    }
+    let mut cursor = inner.cursor.lock().expect("playback cursor lock");
+    let remaining = inner.samples.len().saturating_sub(*cursor);
+    if remaining == 0 {
+        return false;
+    }
+    let count = remaining.min(PLAYBACK_BUFFER_FRAMES);
+    let slice = &inner.samples[*cursor..*cursor + count];
+    *cursor += count;
+    let new_pos = *cursor;
+    drop(cursor);
+
+    unsafe {
+        let buffer = &mut *buffer_ptr;
+        if buffer.audio_data.is_null() {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(slice.as_ptr(), buffer.audio_data.cast::<f32>(), count);
+        buffer.audio_data_byte_size = (count * std::mem::size_of::<f32>()) as u32;
+        let status = AudioQueueEnqueueBuffer(queue, buffer_ptr, 0, null());
+        if status != 0 {
+            return false;
+        }
+    }
+    (inner.on_position)(new_pos);
+    true
+}
+
+unsafe extern "C" fn audio_queue_output_callback(
+    in_user_data: *mut c_void,
+    in_aq: AudioQueueRef,
+    in_buffer: *mut AudioQueueBuffer,
+) {
+    if in_user_data.is_null() || in_buffer.is_null() {
+        return;
+    }
+    let inner = unsafe { &*in_user_data.cast::<PlaybackInner>() };
+    if inner.stopping.load(Ordering::SeqCst) {
+        return;
+    }
+    if !fill_playback_buffer(inner, in_aq, in_buffer)
+        && !inner.ended_reported.swap(true, Ordering::SeqCst)
+    {
+        let _ = unsafe { AudioQueueStop(in_aq, 0) };
+        (inner.on_ended)();
     }
 }
