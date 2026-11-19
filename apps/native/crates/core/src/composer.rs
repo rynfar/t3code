@@ -408,6 +408,32 @@ pub fn replace_triage_playbook_link(prompt: &str, prepared_prompt: &str) -> Stri
     next
 }
 
+/// `MANUAL_CONTINUATION_FALLBACK_TEXT` (`packages/client-runtime/src/operations/commands.ts`,
+/// `pingdotgg/t3code#38917`): older servers dispatch `command.text` verbatim when resuming; newer
+/// servers clear it when `manualContinuationOfRunId` is set.
+pub const MANUAL_CONTINUATION_FALLBACK_TEXT: &str = "Continue where you left off.";
+
+/// Ensures a `message.dispatch` command carrying `manualContinuationOfRunId` with empty text and
+/// no attachments sends `MANUAL_CONTINUATION_FALLBACK_TEXT` so older servers never dispatch blank.
+pub fn with_manual_continuation_fallback(mut command: serde_json::Value) -> serde_json::Value {
+    let is_manual = command
+        .get("manualContinuationOfRunId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    let blank_text = command
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|t| t.trim().is_empty());
+    let no_attachments = command
+        .get("attachments")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if is_manual && blank_text && no_attachments {
+        command["text"] = serde_json::json!(MANUAL_CONTINUATION_FALLBACK_TEXT);
+    }
+    command
+}
+
 /// `isClearComposerCommand` (`packages/shared/src/composerTrigger.ts`).
 pub fn is_clear_composer_command(text: &str) -> bool {
     text.trim().eq_ignore_ascii_case("/clear")

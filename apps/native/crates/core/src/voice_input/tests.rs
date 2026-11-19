@@ -825,3 +825,89 @@ fn saved_audio_choice_serde_and_presentation_helpers() {
     assert!(!is_retryable_transcription_error(state.error.as_deref()));
     assert!(is_retryable_transcription_error(Some("Could not transcribe this recording.")));
 }
+
+#[test]
+fn speech_model_recommendations_and_modifier_release_stop() {
+    // `pingdotgg/t3code#33336`: recommendations by language, speed, and accuracy.
+    let make_model = |id: &str, name: &str, langs: &[&str], en_wer: f64, ja_wer: Option<f64>, acc_s: f64, cpu_s: f64, rec: bool| {
+        let mut accuracy = std::collections::BTreeMap::new();
+        accuracy.insert("en".to_owned(), SpeechBenchmarkAccuracyEntry { grade: "A".into(), error_percent: en_wer });
+        if let Some(ja) = ja_wer {
+            accuracy.insert("ja".to_owned(), SpeechBenchmarkAccuracyEntry { grade: "A".into(), error_percent: ja });
+        }
+        EnvironmentSpeechModel {
+            id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            size: 100_000_000.0,
+            languages: langs.iter().map(|s| (*s).to_owned()).collect(),
+            accuracy: 0.9,
+            speed: 0.9,
+            benchmark: Some(SpeechBenchmark {
+                accuracy,
+                seconds_per_30s: SpeechBenchmarkTimes { accelerated: Some(acc_s), cpu: Some(Some(cpu_s)) },
+            }),
+            recommended: rec,
+            supports_streaming: true,
+            supports_language_detection: true,
+            supports_translation: false,
+            active: false,
+            state: EnvironmentSpeechModelState::Downloadable,
+            downloaded: None,
+            linked_from: None,
+        }
+    };
+    let models = vec![
+        make_model("fast-en", "Fast EN", &["en"], 7.0, None, 0.4, 1.2, false),
+        make_model("balanced-multi", "Balanced Multi", &["en", "de", "fr", "es"], 3.2, None, 0.8, 3.5, true),
+        make_model("accurate-multi", "Accurate Multi", &["en", "de", "fr", "es", "ja"], 2.1, Some(2.9), 8.0, 18.0, false),
+    ];
+
+    let recs = recommend_speech_models(&models, &["en".into()], Some(SpeechBenchmarkTier::Accelerated));
+    assert!(recs.iter().any(|(_, role)| *role == SpeechRecommendationRole::Recommended));
+    let picked_en = choose_setup_speech_model_for_tier(
+        &models,
+        "",
+        "en",
+        &[],
+        Some(SpeechBenchmarkTier::Accelerated),
+    );
+    assert_eq!(picked_en.map(|(m, _, _)| m.id.as_str()), Some("balanced-multi"));
+    // Multilingual query that includes Japanese picks a model supporting `ja`.
+    let ja_pick = choose_setup_speech_model_for_tier(
+        &models,
+        "fast-en",
+        "ja",
+        &[],
+        Some(SpeechBenchmarkTier::Accelerated),
+    );
+    assert_eq!(ja_pick.map(|(m, _, _)| m.id.as_str()), Some("accurate-multi"));
+
+    // `pingdotgg/t3code#32648`: releasing a held shortcut modifier stops held dictation.
+    let mut shortcut = DictationShortcutState::new();
+    assert_eq!(
+        shortcut.on_dictation_keydown_with_modifiers(
+            DictationKeydown {
+                phase: VoiceInputPhase::Idle,
+                available: true,
+                disabled: false,
+                repeat: false,
+                key_code: "KeyD",
+                now_ms: 1000,
+                mode: VoiceShortcutMode::Hold,
+            },
+            &["meta", "shift"],
+        ),
+        DictationShortcutAction::Start
+    );
+    // Still holding both modifiers -> no action.
+    assert_eq!(
+        shortcut.on_modifiers_changed(&["meta", "shift"], 1100),
+        DictationShortcutAction::None
+    );
+    // Releasing `meta` ends the held dictation press.
+    assert_eq!(
+        shortcut.on_modifiers_changed(&["shift"], 1200),
+        DictationShortcutAction::Stop
+    );
+}

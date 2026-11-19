@@ -98,6 +98,39 @@ pub(super) fn key(target: &Target) -> String {
     }
 }
 
+/// Reads the persisted draft prompt for `storage_key` (`backgroundThread.ts` for `pingdotgg/t3code#35761`).
+pub(super) fn read_stored_prompt(storage_key: &str, cx: &gpui::App) -> String {
+    if let Some(shared) = cx.try_global::<SharedDraftStore>()
+        && shared.loaded
+    {
+        return shared
+            .store
+            .get(storage_key)
+            .map(Draft::restored_prompt)
+            .unwrap_or_default();
+    }
+    DraftStore::from_value(store::load_ui_state(rules::STORE_NAME).as_ref())
+        .get(storage_key)
+        .map(Draft::restored_prompt)
+        .unwrap_or_default()
+}
+
+/// Commits a dictated prompt directly into a background target's stored draft (`pingdotgg/t3code#35761`).
+pub(super) fn write_stored_prompt(storage_key: &str, prompt: String, cx: &mut gpui::App) {
+    let _ = load_shared_store(cx);
+    let (changed, snapshot) = cx.update_global::<SharedDraftStore, _>(|shared, _| {
+        let mut draft = shared.store.get(storage_key).cloned().unwrap_or_default();
+        draft.prompt = prompt;
+        draft.updated_at = now_ms();
+        let changed = shared.store.set(storage_key, draft);
+        (changed, shared.store.clone())
+    });
+    if changed {
+        sync_composers_draft_store(None, &snapshot, cx);
+        save_shared_now(cx);
+    }
+}
+
 pub(super) fn target(key: &str) -> Option<Target> {
     key.strip_prefix("thread:")
         .map(|id| Target::Thread(id.to_owned()))

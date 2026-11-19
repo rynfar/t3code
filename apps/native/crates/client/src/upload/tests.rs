@@ -927,3 +927,75 @@ async fn retarget_roundtrip_restores_ready_and_in_flight_reconnect_retries_upon_
         Some("att-b3".into())
     );
 }
+
+#[tokio::test]
+async fn refresh_expired_uploads_reuploads_missing_server_asset_from_retained_bytes() {
+    let mut server = MockUploadWsServer::start().await;
+    let (client, _ev) =
+        crate::supervisor::start(&tokio::runtime::Handle::current(), server.credentials());
+    let mut conn = server.accept_ws().await;
+    wait_session(&client).await;
+
+    let (queue, _) = AttachmentUploadQueueClient::with_options(
+        tokio::runtime::Handle::current(),
+        64,
+        Duration::from_secs(5),
+    );
+    let env_id = client.environment().to_owned();
+    let target = DraftTarget {
+        draft_id: "thread:t-exp".into(),
+        file_id: "f-exp".into(),
+    };
+
+    // 1. Initial upload completes -> Ready(att-old), local bytes retained.
+    queue.start_upload(
+        "exp-job".into(),
+        target,
+        client,
+        UploadPayload {
+            request: json!({ "name": "shot.png", "mimeType": "image/png", "sizeBytes": 12 }),
+            mime_type: "image/png".into(),
+            bytes: Some(b"png-bytes-ok".to_vec()),
+            persisted_attachment_id: None,
+            current_state: None,
+        },
+    );
+    let req1 = conn.recv_request(Some(CREATE_UPLOAD_URL)).await;
+    conn.respond_exit_success(&req1, json!({ "attachmentId": "att-old", "relativeUrl": "/up/old" }))
+        .await;
+    let (_p, _b, gate1) = server.uploads.recv().await.unwrap();
+    let _ = gate1.send(200);
+    queue.await_uploads(&["exp-job".into()]).await;
+    assert_eq!(
+        queue.state("exp-job").and_then(|s| s.ready_attachment_id().map(str::to_owned)),
+        Some("att-old".into())
+    );
+
+    // 2. Server reports `att-old` missing when verifying before send (`pingdotgg/t3code#32910`).
+    let queue_clone = queue.clone();
+    let env_clone = env_id.clone();
+    let refresh_task = tokio::spawn(async move {
+        queue_clone
+            .refresh_expired_uploads(&env_clone, &["exp-job".into()])
+            .await
+    });
+    let verify_req = conn.recv_request(Some(CREATE_ASSET_URL)).await;
+    conn.respond_exit_fail(
+        &verify_req,
+        json!({ "_tag": "AssetAttachmentNotFoundError", "message": "Attachment not found" }),
+    )
+    .await;
+
+    // 3. Re-upload mints a fresh `att-fresh` and uploads retained bytes before `refresh_expired_uploads` finishes.
+    let req2 = conn.recv_request(Some(CREATE_UPLOAD_URL)).await;
+    conn.respond_exit_success(&req2, json!({ "attachmentId": "att-fresh", "relativeUrl": "/up/fresh" }))
+        .await;
+    let (_p, body2, gate2) = server.uploads.recv().await.unwrap();
+    assert_eq!(body2, b"png-bytes-ok");
+    let _ = gate2.send(200);
+    refresh_task.await.unwrap();
+    assert_eq!(
+        queue.state("exp-job").and_then(|s| s.ready_attachment_id().map(str::to_owned)),
+        Some("att-fresh".into())
+    );
+}

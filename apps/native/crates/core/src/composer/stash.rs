@@ -39,13 +39,27 @@ pub struct StashEntry {
 }
 
 impl StashEntry {
-    /// `stashEntrySnippet`.
+    /// `stashEntrySnippet` (`ComposerStashMenu.tsx`, `pingdotgg/t3code#37498`, `pingdotgg/t3code#32404`):
+    /// replaces composer context references with their readable labels before stripping citations
+    /// and truncating safely at UTF-16/scalar boundaries (never splitting a surrogate pair).
     pub fn snippet(&self) -> String {
-        let plain = crate::assistant_citations::to_plain_text(&self.prompt);
+        let with_labels = super::menu::replace_context_references(&self.prompt, |r| r.label);
+        let plain = crate::assistant_citations::to_plain_text(&with_labels);
         let trimmed = plain.split_whitespace().collect::<Vec<_>>().join(" ");
         if !trimmed.is_empty() {
-            let chars: Vec<char> = trimmed.chars().collect();
-            return if chars.len() > SNIPPET_MAX_CHARS { format!("{}…", chars[..SNIPPET_MAX_CHARS].iter().collect::<String>()) } else { trimmed };
+            let mut utf16_len = 0usize;
+            let mut end_byte = trimmed.len();
+            let mut truncated = false;
+            for (byte_idx, ch) in trimmed.char_indices() {
+                let next_units = utf16_len + ch.len_utf16();
+                if next_units > SNIPPET_MAX_CHARS {
+                    end_byte = byte_idx;
+                    truncated = true;
+                    break;
+                }
+                utf16_len = next_units;
+            }
+            return if truncated { format!("{}…", &trimmed[..end_byte]) } else { trimmed };
         }
         let images = self.attachments.iter().filter(|attachment| attachment.image).count();
         let files = self.attachments.len() - images;

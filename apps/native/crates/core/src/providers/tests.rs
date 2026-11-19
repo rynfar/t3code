@@ -309,3 +309,72 @@ fn custom_model_slugs_matching_aliases_stay_exact_and_cwd_snapshots_override_mod
     assert_eq!(format_multiple_model_label(&picks[..2], |s| s.model.clone()), "a, b");
     assert_eq!(format_multiple_model_label(&picks, |s| s.model.clone()), "a, b, 1 more");
 }
+
+#[test]
+fn fx_sub_providers_retained_models_catalog_gaps_and_dedup() {
+    // `pingdotgg/t3code#29388`: fx models group under subProviders with unavailableReason.
+    let mut fx_provider = provider(
+        "fx",
+        "fx",
+        "ready",
+        json!([
+            model("openai/gpt-5", json!({"name": "GPT-5", "subProvider": "openai"})),
+            model("anthropic/claude-4", json!({"name": "Claude 4", "subProvider": "anthropic"})),
+            model("other-model", json!({"name": "Other"}))
+        ]),
+    );
+    fx_provider["subProviders"] = json!([
+        {"name": "openai", "label": "OpenAI", "available": true},
+        {"name": "anthropic", "label": "Anthropic", "available": false, "unavailableReason": "API key missing"}
+    ]);
+    let fx: ServerProvider = serde_json::from_value(fx_provider).unwrap();
+    let opts = model_options(&ServerSettings::default(), &fx);
+    let sub_providers = fx.sub_providers.as_deref().unwrap();
+    let (ungrouped, groups) = group_models_by_sub_provider(&opts, sub_providers, |m| m.sub_provider.as_deref());
+    assert_eq!(ungrouped.len(), 1);
+    assert_eq!(ungrouped[0].slug, "other-model");
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].sub_provider.name, "openai");
+    assert!(groups[0].sub_provider.unavailable_reason.is_none());
+    assert_eq!(groups[0].models.len(), 1);
+    assert_eq!(groups[1].sub_provider.name, "anthropic");
+    assert_eq!(groups[1].sub_provider.unavailable_reason.as_deref(), Some("API key missing"));
+
+    // `pingdotgg/t3code#39114`: warning provider with `modelsRetained: true` stays selectable.
+    let mut retained_val = provider("codex", "codex", "warning", json!([model("gpt-5.4", json!({}))]));
+    retained_val["modelsRetained"] = json!(true);
+    let retained_cfg = config(json!([retained_val]), json!({}));
+    let retained_entries = entries(&retained_cfg, None);
+    assert!(!retained_entries[0].is_healthy());
+    assert!(retained_entries[0].is_ready());
+
+    // `pingdotgg/t3code#37528`: Pi & ACP preserve unavailable model selection during catalog gaps.
+    let pi_cfg = config(json!([provider("pi", "pi", "ready", json!([model("pi-a", json!({}))]))]), json!({}));
+    let pi_entries = entries(&pi_cfg, None);
+    assert!(should_preserve_unavailable_selection(
+        &pi_entries[0].provider.driver,
+        "pi-old",
+        &pi_entries[0].provider.models,
+        &[],
+    ));
+    let codex_cfg = config(json!([provider("codex", "codex", "ready", json!([model("gpt-5.4", json!({}))]))]), json!({}));
+    let codex_entries = entries(&codex_cfg, None);
+    assert!(!should_preserve_unavailable_selection(
+        &codex_entries[0].provider.driver,
+        "gpt-4",
+        &codex_entries[0].provider.models,
+        &[],
+    ));
+
+    // `pingdotgg/t3code#31590`: duplicate model slugs are deduplicated.
+    let dup: ServerProvider = serde_json::from_value(provider(
+        "opencode",
+        "opencode",
+        "ready",
+        json!([model("dup-slug", json!({"name": "First"})), model("dup-slug", json!({"name": "Second"}))]),
+    ))
+    .unwrap();
+    let deduped = model_options_for_cwd(&ServerSettings::default(), &dup, None);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].name, "First");
+}

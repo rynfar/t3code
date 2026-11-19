@@ -54,7 +54,7 @@ impl Composer {
             .chain(
                 self.staged_for(target)
                     .iter()
-                    .filter_map(|s| s.attachment.context_record()),
+                    .filter_map(|s| s.attachment.context_record_with_source(s.snapshot_source.as_ref())),
             )
             .collect()
     }

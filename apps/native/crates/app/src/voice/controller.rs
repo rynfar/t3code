@@ -17,8 +17,9 @@ use t3_core::voice_input::{
     SpeechTranscriptionOptions, VoiceControllerEffect, VoiceDraftSnapshot, VoiceErrorAction,
     VoiceInputControllerMachine, VoiceInputPhase, VoiceInputState, VoiceSelection,
     VoiceTranscriptionDestination, VoiceTranscriptionError, VoiceTranscriptionErrorCode,
-    choose_setup_speech_model, cleanup_context, f32_slice_to_le_bytes, preferred_microphone_id,
-    preferred_speech_languages, remember_microphones, resolve_speech_vocabulary,
+    choose_setup_speech_model_for_tier, cleanup_context, f32_slice_to_le_bytes,
+    preferred_microphone_id, preferred_speech_languages, remember_microphones,
+    resolve_speech_vocabulary,
 };
 
 use super::consent::{
@@ -86,6 +87,23 @@ pub type DraftReader = Rc<dyn Fn(&App) -> Option<VoiceDraftSnapshot>>;
 pub type HintsReader = Rc<dyn Fn(&App) -> Vec<String>>;
 pub type ProjectIdReader = Rc<dyn Fn(&App) -> Option<String>>;
 pub type VoiceSettingsHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+pub type StoredDraftCommit = Rc<dyn Fn(String, VoiceSelection, &mut App)>;
+
+/// Metadata for a dictation target that can outlive its currently presented thread
+/// (`VoiceInputTarget` in `apps/web/src/speech/voiceInputSession.ts`, `pingdotgg/t3code#35761`).
+#[derive(Clone)]
+pub struct BackgroundVoiceTarget {
+    pub owner_key: String,
+    pub label: Option<String>,
+    pub persistent: bool,
+    pub open: Option<VoiceSettingsHandler>,
+    pub read_stored_draft: Option<DraftReader>,
+    pub commit_stored_draft: Option<StoredDraftCommit>,
+}
+
+pub type TargetMetaReader = Rc<dyn Fn(&App) -> Option<BackgroundVoiceTarget>>;
+
+static IDLE_VOICE_STATE: VoiceInputState = VoiceInputState::idle();
 
 #[derive(Default)]
 struct ActiveVoiceSessionLock {
@@ -109,7 +127,7 @@ fn try_acquire_voice_session(
         .and_then(|(id, w)| w.upgrade().map(|e| (*id, e)));
     if let Some((active_id, active_entity)) = existing
         && active_id != entity_id
-        && active_entity.read(cx).state().is_busy()
+        && active_entity.read(cx).session_state().is_busy()
     {
         return false;
     }
@@ -173,10 +191,13 @@ pub struct VoiceSpeechController {
     project_id_reader: ProjectIdReader,
     environment_id_reader: ProjectIdReader,
     on_open_voice_settings: VoiceSettingsHandler,
+    target_meta_reader: Option<TargetMetaReader>,
+    active_target: Option<BackgroundVoiceTarget>,
 
     machine: VoiceInputControllerMachine,
     submission_gate: DictationSubmissionGate,
     setup: VoiceSetupState,
+    last_overlay_visible: bool,
     status: Option<EnvironmentSpeechStatus>,
     status_env_id: Option<String>,
     start_request_id: u64,
@@ -215,7 +236,7 @@ impl VoiceSpeechController {
         let app_sub = cx.subscribe(&config.app, |this, _, event, cx| {
             if matches!(event, AppEvent::Phase | AppEvent::ServerConfig) {
                 this.refresh_status_if_needed(cx);
-                cx.notify();
+                this.sync_overlay(cx);
             }
         });
 
@@ -229,9 +250,12 @@ impl VoiceSpeechController {
             project_id_reader: config.project_id_reader,
             environment_id_reader: config.environment_id_reader,
             on_open_voice_settings: config.on_open_voice_settings,
+            target_meta_reader: None,
+            active_target: None,
             machine: VoiceInputControllerMachine::new(true, true),
             submission_gate: DictationSubmissionGate::new(),
             setup: VoiceSetupState::default(),
+            last_overlay_visible: false,
             status: None,
             status_env_id: None,
             start_request_id: 0,
@@ -266,9 +290,71 @@ impl VoiceSpeechController {
         &self.owner_key
     }
 
+    /// Registers a metadata reader so persistent thread drafts keep recording across navigation
+    /// (`pingdotgg/t3code#35761`).
+    pub fn set_target_meta_reader(&mut self, reader: TargetMetaReader) {
+        self.target_meta_reader = Some(reader);
+    }
+
     /// Overrides transcript cleanup (`cleanup: false` for the Settings model test).
     pub fn set_cleanup_override(&mut self, allow: Option<bool>) {
         self.cleanup_override = allow;
+    }
+
+    /// True when no active recording exists or the active recording belongs to the currently
+    /// presented composer owner.
+    pub fn is_recording_owner_presented(&self) -> bool {
+        self.active_target
+            .as_ref()
+            .is_none_or(|target| target.owner_key == self.owner_key)
+    }
+
+    /// True when a persistent background recording is in progress for a different thread/draft.
+    pub fn is_busy_elsewhere(&self) -> bool {
+        self.machine.state().is_busy() && !self.is_recording_owner_presented()
+    }
+
+    /// True when the floating `GlobalVoiceInputIndicator` should display for this controller
+    /// (non-idle recording whose owner draft is currently off-screen).
+    pub fn shows_floating_indicator(&self) -> bool {
+        self.machine.state().phase != VoiceInputPhase::Idle
+            && self.active_target.is_some()
+            && !self.is_recording_owner_presented()
+    }
+
+    pub fn active_target_label(&self) -> Option<&str> {
+        self.active_target.as_ref().and_then(|t| t.label.as_deref())
+    }
+
+    pub fn can_open_active_target(&self) -> bool {
+        self.active_target.as_ref().is_some_and(|t| t.open.is_some())
+    }
+
+    pub fn active_target_open_handler(&self) -> Option<VoiceSettingsHandler> {
+        self.active_target.as_ref().and_then(|t| t.open.clone())
+    }
+
+    /// The underlying session state regardless of which thread is currently presented.
+    pub fn session_state(&self) -> &VoiceInputState {
+        self.machine.state()
+    }
+
+    /// True when the workspace overlay (`render_active_voice_setup_modal`) currently renders
+    /// either the voice setup modal or the floating `GlobalVoiceInputIndicator`.
+    fn overlay_visible(&self) -> bool {
+        self.setup.open || self.shows_floating_indicator()
+    }
+
+    /// Notifies observers of this controller and refreshes windows whenever the workspace
+    /// voice overlay is visible or just closed (since `Workspace` renders the overlay slot
+    /// without observing individual `VoiceSpeechController` entities).
+    fn sync_overlay(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        let visible = self.overlay_visible();
+        if visible || self.last_overlay_visible {
+            self.last_overlay_visible = visible;
+            cx.refresh_windows();
+        }
     }
 
     pub fn set_owner_key(&mut self, next: impl Into<String>, cx: &mut Context<Self>) {
@@ -277,8 +363,22 @@ impl VoiceSpeechController {
             return;
         }
         self.owner_key = next;
+        let keep_background = self
+            .active_target
+            .as_ref()
+            .is_some_and(|target| target.persistent)
+            && self.machine.state().phase != VoiceInputPhase::Idle;
+        if keep_background {
+            self.setup = VoiceSetupState::default();
+            self._setup_task = None;
+            self._download_poll_task = None;
+            self.submission_gate.clear();
+            self.sync_overlay(cx);
+            return;
+        }
         self.start_request_id = self.start_request_id.wrapping_add(1);
         self.setup = VoiceSetupState::default();
+        self.active_target = None;
         self._prepare_task = None;
         self._setup_task = None;
         self._download_poll_task = None;
@@ -286,10 +386,15 @@ impl VoiceSpeechController {
         self.submission_gate.clear();
         release_voice_session(cx.entity_id(), cx);
         self.apply_effects(effects, cx);
-        cx.notify();
+        self.sync_overlay(cx);
     }
 
+    /// State scoped to the currently presented owner: returns idle when a background recording
+    /// belongs to another thread (`pingdotgg/t3code#35761`).
     pub fn state(&self) -> &VoiceInputState {
+        if !self.is_recording_owner_presented() {
+            return &IDLE_VOICE_STATE;
+        }
         self.machine.state()
     }
 
@@ -298,22 +403,24 @@ impl VoiceSpeechController {
     }
 
     pub fn blocks_submission(&self) -> bool {
-        self.machine.state().blocks_submission()
+        self.is_recording_owner_presented() && self.machine.state().blocks_submission()
     }
 
     pub fn freezes_editor(&self) -> bool {
-        self.machine.state().blocks_submission()
+        self.is_recording_owner_presented() && self.machine.state().blocks_submission()
     }
 
     pub fn preparing(&self) -> bool {
-        self.machine.state().phase == VoiceInputPhase::Preparing
+        self.is_recording_owner_presented()
+            && self.machine.state().phase == VoiceInputPhase::Preparing
     }
 
     pub fn preview(&self) -> Option<&SpeechStreamText> {
-        matches!(
-            self.machine.state().phase,
-            VoiceInputPhase::Recording | VoiceInputPhase::Transcribing
-        )
+        (self.is_recording_owner_presented()
+            && matches!(
+                self.machine.state().phase,
+                VoiceInputPhase::Recording | VoiceInputPhase::Transcribing
+            ))
         .then_some(self.live_preview.as_ref())
         .flatten()
     }
@@ -357,7 +464,25 @@ impl VoiceSpeechController {
     }
 
     pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_inner(window, cx, false);
+    }
+
+    /// Retries a failed dictation for the currently active target, preserving an off-screen
+    /// background target when invoked from the floating `GlobalVoiceInputIndicator`.
+    pub fn retry_active_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_inner(window, cx, true);
+    }
+
+    fn start_inner(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        preserve_offscreen_target: bool,
+    ) {
         if self.setup.open && self.setup.downloading {
+            return;
+        }
+        if !preserve_offscreen_target && self.is_busy_elsewhere() {
             return;
         }
         if !matches!(
@@ -366,13 +491,26 @@ impl VoiceSpeechController {
         ) {
             return;
         }
+
+        // Starting dictation from the currently presented composer while an off-screen
+        // background thread holds a stale Error state must discard that off-screen target
+        // (and its retained failed audio) instead of dictating into the off-screen thread.
+        if !preserve_offscreen_target && !self.is_recording_owner_presented() {
+            self.start_request_id = self.start_request_id.wrapping_add(1);
+            self.submission_gate.clear();
+            self.setup = VoiceSetupState::default();
+            self.active_target = None;
+            let cancel_effects = self.machine.cancel();
+            self.apply_effects(cancel_effects, cx);
+        }
+
         let resolution = resolve_voice_destination(self.app.read(cx), cx);
         if resolution.active.is_none() {
             if resolution.offer_first_run_setup && self.offer_setup {
                 (self.on_open_voice_settings)(window, cx);
             } else {
                 self.machine.set_has_transcriber(false);
-                let draft = (self.draft_reader)(cx);
+                let draft = self.read_active_or_current_draft(cx);
                 let effects = self.machine.start(draft);
                 self.apply_effects(effects, cx);
             }
@@ -390,10 +528,29 @@ impl VoiceSpeechController {
 
         self.start_request_id = self.start_request_id.wrapping_add(1);
         self.setup = VoiceSetupState::default();
+        // Keep an existing off-screen retry target only when retrying from the floating
+        // indicator; otherwise snapshot the currently presented composer's metadata.
+        if !preserve_offscreen_target || self.is_recording_owner_presented() {
+            self.active_target = self
+                .target_meta_reader
+                .as_ref()
+                .and_then(|reader| reader(cx));
+        }
         self.machine.set_has_transcriber(true);
-        let draft = (self.draft_reader)(cx);
+        let draft = self.read_active_or_current_draft(cx);
         let effects = self.machine.start(draft);
         self.apply_effects(effects, cx);
+    }
+
+    fn read_active_or_current_draft(&self, cx: &App) -> Option<VoiceDraftSnapshot> {
+        if !self.is_recording_owner_presented() {
+            return self
+                .active_target
+                .as_ref()
+                .and_then(|target| target.read_stored_draft.as_ref())
+                .and_then(|reader| reader(cx));
+        }
+        (self.draft_reader)(cx)
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
@@ -405,6 +562,7 @@ impl VoiceSpeechController {
         self.start_request_id = self.start_request_id.wrapping_add(1);
         self.submission_gate.clear();
         self.setup = VoiceSetupState::default();
+        self.active_target = None;
         self._prepare_task = None;
         self._op_task = None;
         self._stream_updates_task = None;
@@ -413,7 +571,7 @@ impl VoiceSpeechController {
         release_voice_session(cx.entity_id(), cx);
         let effects = self.machine.cancel();
         self.apply_effects(effects, cx);
-        cx.notify();
+        self.sync_overlay(cx);
     }
 
     pub fn skip_post_processing(&mut self, cx: &mut Context<Self>) {
@@ -448,7 +606,7 @@ impl VoiceSpeechController {
         if !open && !self.setup.downloading {
             self._download_poll_task = None;
         }
-        cx.notify();
+        self.sync_overlay(cx);
     }
 
     pub fn setup_download(&mut self, cx: &mut Context<Self>) {
@@ -464,7 +622,7 @@ impl VoiceSpeechController {
         self.setup.error = None;
         self.setup.downloaded_bytes = Some(0);
         self.setup.total_bytes = Some(model.size as u64);
-        cx.notify();
+        self.sync_overlay(cx);
 
         let creds_for_poll = credentials.clone();
         let model_id_for_poll = model_id.clone();
@@ -486,7 +644,7 @@ impl VoiceSpeechController {
                         this.setup.downloaded_bytes = entry.downloaded.map(|d| d as u64);
                         this.setup.total_bytes = Some(entry.size as u64);
                         this.setup.model = Some(entry.clone());
-                        cx.notify();
+                        this.sync_overlay(cx);
                         entry.state == EnvironmentSpeechModelState::Installed
                     })
                     .unwrap_or(true);
@@ -541,7 +699,7 @@ impl VoiceSpeechController {
                         this.setup.error = Some(err.to_string());
                     }
                 }
-                cx.notify();
+                this.sync_overlay(cx);
             });
         }));
     }
@@ -552,7 +710,7 @@ impl VoiceSpeechController {
             (self.setup_credentials.clone(), self.setup.model.clone())
         else {
             self.setup.open = false;
-            cx.notify();
+            self.sync_overlay(cx);
             return;
         };
         let model_id = model.id;
@@ -560,7 +718,7 @@ impl VoiceSpeechController {
         self._download_poll_task = None;
         self.setup.downloading = false;
         self.setup.step = VoiceSetupStep::Confirm;
-        cx.notify();
+        self.sync_overlay(cx);
         self._setup_task = Some(cx.spawn(async move |this, cx| {
             let _ = runtime
                 .spawn(async move { VoiceClient::new(credentials)?.cancel_model_download(&model_id).await })
@@ -568,7 +726,7 @@ impl VoiceSpeechController {
             let _ = this.update(cx, |this, cx| {
                 this.setup.downloading = false;
                 this.setup.step = VoiceSetupStep::Confirm;
-                cx.notify();
+                this.sync_overlay(cx);
             });
         }));
     }
@@ -584,6 +742,7 @@ impl VoiceSpeechController {
     pub fn setup_start_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.setup.open = false;
         self.start(window, cx);
+        self.sync_overlay(cx);
     }
 
     #[cfg(feature = "snapshot")]
@@ -604,7 +763,7 @@ impl VoiceSpeechController {
             self.setup = setup;
         }
         self.machine.force_state_for_preview(state);
-        cx.notify();
+        self.sync_overlay(cx);
     }
 
     fn refresh_status_if_needed(&mut self, cx: &mut Context<Self>) {
@@ -634,7 +793,7 @@ impl VoiceSpeechController {
                 let _ = this.update(cx, |this, cx| {
                     if this.status_env_id.as_deref() == Some(env_id.as_str()) {
                         this.status = Some(status);
-                        cx.notify();
+                        this.sync_overlay(cx);
                     }
                 });
             }
@@ -660,7 +819,7 @@ impl VoiceSpeechController {
             step: VoiceSetupStep::Confirm,
             ..Default::default()
         };
-        cx.notify();
+        self.sync_overlay(cx);
 
         self.start_request_id = self.start_request_id.wrapping_add(1);
         let setup_token = self.start_request_id;
@@ -674,12 +833,21 @@ impl VoiceSpeechController {
                 }
                 match res {
                     Ok(Ok(catalog)) => {
-                        if let Some((model, language)) = choose_setup_speech_model(
-                            &catalog.models,
-                            &selected_model_id,
-                            &intent,
-                            &preferred,
-                        ) {
+                        let benchmark_tier = match &this.status {
+                            Some(EnvironmentSpeechStatus::Supported { benchmark_tier, .. }) => {
+                                Some(*benchmark_tier)
+                            }
+                            _ => None,
+                        };
+                        if let Some((model, language, _recommended)) =
+                            choose_setup_speech_model_for_tier(
+                                &catalog.models,
+                                &selected_model_id,
+                                &intent,
+                                &preferred,
+                                benchmark_tier,
+                            )
+                        {
                             this.setup = VoiceSetupState {
                                 open: true,
                                 step: if model.state == EnvironmentSpeechModelState::Downloading {
@@ -721,7 +889,7 @@ impl VoiceSpeechController {
                         };
                     }
                 }
-                cx.notify();
+                this.sync_overlay(cx);
             });
         }));
     }
@@ -774,7 +942,7 @@ impl VoiceSpeechController {
                         MicPermissionStatus::Denied | MicPermissionStatus::Restricted
                     );
                     let uri = format!("memory://voice/{}", uuid::Uuid::new_v4());
-                    let current_draft = (self.draft_reader)(cx);
+                    let current_draft = self.read_active_or_current_draft(cx);
                     let result = if denied {
                         Err(MICROPHONE_PERMISSION_ERROR.to_owned())
                     } else {
@@ -835,15 +1003,25 @@ impl VoiceSpeechController {
                 }
 
                 VoiceControllerEffect::ReadyToCommit { operation_token } => {
-                    let current = (self.draft_reader)(cx);
+                    let current = self.read_active_or_current_draft(cx);
                     let effects = self.machine.finalize_commit(operation_token, current.as_ref());
                     self.apply_effects(effects, cx);
                 }
 
                 VoiceControllerEffect::CommitDraft { text, selection } => {
-                    self.submission_gate.on_commit_draft(&text);
                     self.live_preview = None;
-                    cx.emit(VoiceControllerEvent::CommitDraft { text, selection });
+                    if !self.is_recording_owner_presented() {
+                        if let Some(commit) = self
+                            .active_target
+                            .as_ref()
+                            .and_then(|target| target.commit_stored_draft.clone())
+                        {
+                            commit(text, selection, cx);
+                        }
+                    } else {
+                        self.submission_gate.on_commit_draft(&text);
+                        cx.emit(VoiceControllerEvent::CommitDraft { text, selection });
+                    }
                 }
 
                 VoiceControllerEffect::DeleteRecording(uri) => {
@@ -882,11 +1060,14 @@ impl VoiceSpeechController {
                     if !next_state.is_busy() {
                         release_voice_session(cx.entity_id(), cx);
                     }
+                    if next_state.phase == VoiceInputPhase::Idle {
+                        self.active_target = None;
+                    }
                     cx.emit(VoiceControllerEvent::StateChanged);
                     if let Some(text) = submit_text {
                         cx.emit(VoiceControllerEvent::SubmitAfterDictation { text });
                     }
-                    cx.notify();
+                    self.sync_overlay(cx);
                 }
             }
         }
@@ -936,10 +1117,15 @@ impl VoiceSpeechController {
         let translate = settings_doc.speech_translate_to_english();
         let remove_fillers = settings_doc.speech_remove_filler_words();
         let silence_filter = settings_doc.speech_silence_filtering();
+        let streaming_enabled = settings_doc.speech_streaming();
         let post_prompt = settings_doc.speech_post_processing_prompt();
         let consent_grant_id = active.grant_id.clone();
         let cleanup_grant_id = active.cleanup_grant_id.clone();
-        let owner_key = self.owner_key.clone();
+        let owner_key = self
+            .active_target
+            .as_ref()
+            .map(|target| target.owner_key.clone())
+            .unwrap_or_else(|| self.owner_key.clone());
         let runtime = app_state.runtime().clone();
 
         if let VoiceTranscriptionDestination::Cloud { provider, model, .. } = &active.destination {
@@ -1145,13 +1331,17 @@ impl VoiceSpeechController {
                             supports_language_detection.unwrap_or(true),
                             &intent_lang,
                         );
-                        let locale = if !*supports_streaming && *supports_translation && translate {
+                        let native_streaming = *supports_streaming && streaming_enabled;
+                        let locale = if !native_streaming && *supports_translation && translate {
                             "en".to_owned()
                         } else {
                             effective_lang.clone()
                         };
-                        let can_stream =
-                            *supports_streaming || supports_buffered_streaming.unwrap_or(false);
+                        let can_stream = if *supports_streaming {
+                            native_streaming
+                        } else {
+                            supports_buffered_streaming.unwrap_or(false)
+                        };
                         let options = SpeechTranscriptionOptions {
                             speech_language: effective_lang,
                             speech_translate_to_english: translate,
@@ -1477,7 +1667,7 @@ impl VoiceSpeechController {
                     CaptureMsg::Level(level) => {
                         let _ = this.update(cx, |this, cx| {
                             this.audio_level = level;
-                            cx.notify();
+                            this.sync_overlay(cx);
                         });
                     }
                     CaptureMsg::Limit => {
@@ -1506,7 +1696,7 @@ impl VoiceSpeechController {
                         let secs = started.elapsed().as_secs();
                         if secs != this.elapsed_seconds {
                             this.elapsed_seconds = secs;
-                            cx.notify();
+                            this.sync_overlay(cx);
                         }
                         true
                     })

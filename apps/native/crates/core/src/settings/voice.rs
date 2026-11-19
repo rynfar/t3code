@@ -10,9 +10,9 @@ use crate::voice_input::{
     CLOUD_SPEECH_LANGUAGES, CloudSpeechModel, CloudSpeechProvider, EnvironmentSpeechModel,
     EnvironmentSpeechModelState, EnvironmentSpeechState, EnvironmentSpeechStatus,
     SPEECH_MAX_ALIASES_PER_WORD, SPEECH_MAX_CUSTOM_WORD_LEN_UTF16, SPEECH_MAX_CUSTOM_WORDS,
-    SpeechBenchmarkTier, SpeechCustomWordEntry, SpeechModelUnloadTimeout, VoiceShortcutMode,
-    effective_speech_language, speech_language_label, validate_cloud_speech_api_key,
-    validate_cloud_speech_model_id,
+    SpeechBenchmarkTier, SpeechCustomWordEntry, SpeechModelUnloadTimeout, SpeechRecommendationRole,
+    VoiceShortcutMode, effective_speech_language, recommend_speech_models, speech_language_label,
+    validate_cloud_speech_api_key, validate_cloud_speech_model_id,
 };
 
 pub const LOOPBACK_SECONDS: u32 = 10;
@@ -132,7 +132,7 @@ fn model_sort_order(model: &EnvironmentSpeechModel) -> u8 {
     ) {
         return 2;
     }
-    if model.recommended { 3 } else { 4 }
+    3
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,15 +142,26 @@ pub struct SpeechModelFilterOptions<'a> {
     pub downloaded_only: bool,
     pub sort: SpeechModelSort,
     pub accuracy_language: &'a str,
-    pub benchmark_tier: SpeechBenchmarkTier,
+    pub benchmark_tier: Option<SpeechBenchmarkTier>,
 }
 
-/// `filterSpeechModels` (`apps/web/src/components/settings/speechModelBrowser.ts`).
+/// `filterSpeechModels` (`apps/web/src/components/settings/speechModelBrowser.ts`, `pingdotgg/t3code#33336`).
 pub fn filter_speech_models<'a>(
     models: &'a [EnvironmentSpeechModel],
     options: &SpeechModelFilterOptions<'_>,
 ) -> Vec<&'a EnvironmentSpeechModel> {
+    let recommendations = recommend_speech_models(models, options.languages, options.benchmark_tier);
+    filter_speech_models_with_recommendations(models, options, &recommendations)
+}
+
+pub fn filter_speech_models_with_recommendations<'a>(
+    models: &'a [EnvironmentSpeechModel],
+    options: &SpeechModelFilterOptions<'_>,
+    recommendations: &[(String, SpeechRecommendationRole)],
+) -> Vec<&'a EnvironmentSpeechModel> {
     let query = options.search.trim().to_lowercase();
+    let ranks: HashMap<&str, usize> =
+        recommendations.iter().enumerate().map(|(index, (id, _))| (id.as_str(), index)).collect();
     let score = |model: &EnvironmentSpeechModel| -> f64 {
         match options.sort {
             SpeechModelSort::Size => model.size,
@@ -159,14 +170,20 @@ pub fn filter_speech_models<'a>(
                 .as_ref()
                 .and_then(|b| b.accuracy.get(options.accuracy_language))
                 .map_or(f64::INFINITY, |entry| entry.error_percent),
-            SpeechModelSort::Speed => {
-                let speed = model.benchmark.as_ref().and_then(|b| match options.benchmark_tier {
-                    SpeechBenchmarkTier::Cpu => b.seconds_per_30s.cpu.flatten(),
-                    SpeechBenchmarkTier::Accelerated => b.seconds_per_30s.accelerated,
-                });
-                speed.unwrap_or(f64::INFINITY)
+            SpeechModelSort::Speed => match options.benchmark_tier {
+                None => f64::INFINITY,
+                Some(tier) => {
+                    let speed = model.benchmark.as_ref().and_then(|b| match tier {
+                        SpeechBenchmarkTier::Cpu => b.seconds_per_30s.cpu.flatten(),
+                        SpeechBenchmarkTier::Accelerated => b.seconds_per_30s.accelerated,
+                    });
+                    speed.unwrap_or(f64::INFINITY)
+                }
+            },
+            SpeechModelSort::Recommended => {
+                let rank = ranks.get(model.id.as_str()).copied().unwrap_or(3);
+                (usize::from(model_sort_order(model)) * 4 + rank) as f64
             }
-            SpeechModelSort::Recommended => f64::from(model_sort_order(model)),
         }
     };
 
@@ -240,6 +257,7 @@ pub struct ModelAccuracySummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSpeedSummary {
+    Hidden,
     UpdateServer,
     NotBenchmarked,
     Seconds(String),
@@ -252,11 +270,11 @@ pub struct ModelBenchmarkDisplay {
     pub facts: Vec<String>,
 }
 
-/// `ModelBenchmarks` (`apps/web/src/components/settings/SpeechModelComparison.tsx`).
+/// `ModelBenchmarks` (`apps/web/src/components/settings/SpeechModelComparison.tsx`, `pingdotgg/t3code#33336`).
 pub fn model_benchmark_display(
     model: &EnvironmentSpeechModel,
     selected_languages: &[String],
-    tier: SpeechBenchmarkTier,
+    tier: Option<SpeechBenchmarkTier>,
 ) -> ModelBenchmarkDisplay {
     let data = model.benchmark.as_ref();
     let visible_languages: Vec<String> = match data {
@@ -291,14 +309,15 @@ pub fn model_benchmark_display(
         .collect();
 
     let speed = match data {
-        None => ModelSpeedSummary::NotBenchmarked,
+        None => ModelSpeedSummary::Hidden,
         Some(bench) => match tier {
-            SpeechBenchmarkTier::Cpu => match bench.seconds_per_30s.cpu {
+            None => ModelSpeedSummary::UpdateServer,
+            Some(SpeechBenchmarkTier::Cpu) => match bench.seconds_per_30s.cpu {
                 None => ModelSpeedSummary::UpdateServer,
                 Some(None) => ModelSpeedSummary::NotBenchmarked,
                 Some(Some(secs)) => ModelSpeedSummary::Seconds(format_compact_number(secs)),
             },
-            SpeechBenchmarkTier::Accelerated => match bench.seconds_per_30s.accelerated {
+            Some(SpeechBenchmarkTier::Accelerated) => match bench.seconds_per_30s.accelerated {
                 None => ModelSpeedSummary::NotBenchmarked,
                 Some(secs) => ModelSpeedSummary::Seconds(format_compact_number(secs)),
             },
@@ -495,7 +514,7 @@ pub fn voice_search_target_fallback(
             }
         }
         "speech-models" => (!has_local_prepared).then_some("voice-transcription-destination"),
-        "speech-hardware" => {
+        "speech-hardware" | "speech-streaming" => {
             (!(has_local_prepared && supported_model.is_some())).then_some("voice-transcription-destination")
         }
         "transcription-test" => {
@@ -715,7 +734,7 @@ mod tests {
                 downloaded_only: false,
                 sort: SpeechModelSort::Recommended,
                 accuracy_language: "en",
-                benchmark_tier: SpeechBenchmarkTier::Accelerated,
+                benchmark_tier: Some(SpeechBenchmarkTier::Accelerated),
             },
         );
         assert_eq!(rec.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["active", "small", "big"]);
@@ -728,7 +747,7 @@ mod tests {
                 downloaded_only: false,
                 sort: SpeechModelSort::Size,
                 accuracy_language: "en",
-                benchmark_tier: SpeechBenchmarkTier::Accelerated,
+                benchmark_tier: Some(SpeechBenchmarkTier::Accelerated),
             },
         );
         assert_eq!(by_size.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["small", "active", "big"]);
@@ -741,7 +760,7 @@ mod tests {
                 downloaded_only: false,
                 sort: SpeechModelSort::Accuracy,
                 accuracy_language: "en",
-                benchmark_tier: SpeechBenchmarkTier::Accelerated,
+                benchmark_tier: Some(SpeechBenchmarkTier::Accelerated),
             },
         );
         assert_eq!(by_acc.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["big", "active", "small"]);
@@ -754,13 +773,43 @@ mod tests {
                 downloaded_only: false,
                 sort: SpeechModelSort::Speed,
                 accuracy_language: "en",
-                benchmark_tier: SpeechBenchmarkTier::Cpu,
+                benchmark_tier: Some(SpeechBenchmarkTier::Cpu),
             },
         );
         assert_eq!(by_speed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["big"]);
 
-        let bench = model_benchmark_display(&models[2], &[], SpeechBenchmarkTier::Cpu);
+        let bench = model_benchmark_display(&models[2], &[], Some(SpeechBenchmarkTier::Cpu));
         assert_eq!(bench.speed, ModelSpeedSummary::UpdateServer);
+        let no_tier = model_benchmark_display(&models[0], &[], None);
+        assert_eq!(no_tier.speed, ModelSpeedSummary::UpdateServer);
+        let mut unbenchmarked = models[0].clone();
+        unbenchmarked.benchmark = None;
+        assert_eq!(
+            model_benchmark_display(&unbenchmarked, &[], Some(SpeechBenchmarkTier::Accelerated)).speed,
+            ModelSpeedSummary::Hidden
+        );
+
+        let mut models_with_ultra = models.clone();
+        models_with_ultra.push(sample_model(
+            "ultra",
+            "Whisper Ultra",
+            3_000_000_000.0,
+            EnvironmentSpeechModelState::Downloadable,
+            false,
+            false,
+            &["en"],
+            Some(2.0),
+            Some(9.5),
+            Some(Some(18.0)),
+        ));
+        let roles = recommend_speech_models(&models_with_ultra, &["en".into()], Some(SpeechBenchmarkTier::Accelerated));
+        assert!(roles.iter().any(|(_, role)| *role == SpeechRecommendationRole::Recommended));
+        assert!(roles.iter().any(|(_, role)| *role == SpeechRecommendationRole::Faster));
+        assert!(roles.iter().any(|(_, role)| *role == SpeechRecommendationRole::Accurate));
+        assert_eq!(
+            voice_search_target_fallback("speech-streaming", false, None, false, false, false),
+            Some("voice-transcription-destination")
+        );
     }
 
     #[test]

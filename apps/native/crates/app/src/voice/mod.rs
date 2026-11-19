@@ -18,7 +18,10 @@ pub use consent::{
 };
 #[cfg(feature = "snapshot")]
 pub use controller::{VoiceSetupState, VoiceSetupStep};
-pub use controller::{VoiceControllerEvent, VoiceSpeechConfig, VoiceSpeechController};
+pub use controller::{
+    BackgroundVoiceTarget, DraftReader, StoredDraftCommit, VoiceControllerEvent,
+    VoiceSettingsHandler, VoiceSpeechConfig, VoiceSpeechController,
+};
 #[cfg(feature = "snapshot")]
 pub use platform::{MockAudioPlatform, install_audio_platform};
 pub use platform::{
@@ -26,9 +29,9 @@ pub use platform::{
     audio_platform,
 };
 pub use shortcuts::{
-    Dictation, handle_dictation_action, handle_escape, handle_key_up, handle_setup_escape,
-    handle_window_blur, is_setup_modal_open, record_key_down, register_dictation_target,
-    unregister_dictation_target,
+    Dictation, handle_dictation_action, handle_escape, handle_key_up, handle_modifiers_changed,
+    handle_setup_escape, handle_window_blur, is_setup_modal_open, record_key_down,
+    register_dictation_target, unregister_dictation_target,
 };
 pub use ui::{
     VoiceUiSize, render_active_voice_setup_modal, render_speech_button,

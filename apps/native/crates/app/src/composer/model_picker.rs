@@ -3,6 +3,8 @@
 //! `ModelPickerContent.tsx`, `ModelListRow.tsx`, and the column and footer in
 //! `ComposerModelEffort.tsx`. Choices go to the composer as `PickerEvent`s.
 
+use std::collections::HashSet;
+
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, KeyBinding, ParentElement,
     Render, ScrollStrategy, SharedString, Styled, Subscription, UniformListScrollHandle, Window, actions, div,
@@ -123,6 +125,14 @@ enum Row {
         favorite: bool,
         selected: bool,
         disabled: Option<SharedString>,
+        unavailable: bool,
+    },
+    SubProvider {
+        instance_id: String,
+        name: SharedString,
+        unavailable_reason: Option<SharedString>,
+        expanded: bool,
+        model_count: usize,
     },
     Legacy { expanded: bool },
 }
@@ -134,6 +144,7 @@ pub struct ModelPicker {
     input: PickerInput,
     tab: Tab,
     legacy_expanded: bool,
+    expanded_sub_providers: HashSet<(String, String)>,
     rows: Vec<Row>,
     highlighted: Option<usize>,
     permissions_open: bool,
@@ -168,6 +179,7 @@ impl ModelPicker {
             input: PickerInput::default(),
             tab: Tab::Favorites,
             legacy_expanded: false,
+            expanded_sub_providers: HashSet::new(),
             rows: Vec::new(),
             highlighted: None,
             permissions_open: false,
@@ -216,6 +228,21 @@ impl ModelPicker {
         self.tab = if has_favorites && input.locked_instance.is_none() { Tab::Favorites } else { Tab::Instance(active) };
         self.input = input;
         self.legacy_expanded = false;
+        self.expanded_sub_providers.clear();
+        // The thread's active sub-provider opens expanded so its models show without a click (`pingdotgg/t3code#29388`).
+        if let Some(selection) = self.input.selection.as_ref()
+            && let Some(config) = self.state.read(cx).server_config.config.as_ref()
+            && let Some(provider) = config.provider(&selection.instance_id)
+        {
+            let models = providers::models_for_cwd(provider, self.snapshot_for(provider));
+            if let Some(sub) = models
+                .iter()
+                .find(|m| m.slug == selection.model)
+                .and_then(|m| m.sub_provider.as_ref())
+            {
+                self.expanded_sub_providers.insert((selection.instance_id.clone(), sub.clone()));
+            }
+        }
         self.permissions_open = false;
         self.search.update(cx, |search, cx| {
             search.set_value("", window, cx);
@@ -249,12 +276,66 @@ impl ModelPicker {
     }
 
     fn first_enabled(&self) -> Option<usize> {
-        self.rows.iter().position(|row| matches!(row, Row::Model { disabled: None, .. }) || matches!(row, Row::Legacy { .. }))
+        self.rows.iter().position(|row| {
+            matches!(
+                row,
+                Row::Model { disabled: None, .. }
+                    | Row::SubProvider { unavailable_reason: None, .. }
+                    | Row::Legacy { .. }
+            )
+        })
     }
 
     fn snapshot_for<'a>(&'a self, provider: &'a ServerProvider) -> Option<&'a WorkspaceSnapshot> {
         let fetched = self.input.workspace_snapshots.iter().find(|(id, _)| id == &provider.instance_id).map(|(_, snapshot)| snapshot);
         t3_core::composer::menu::workspace_snapshot(provider, fetched, self.input.cwd.as_deref())
+    }
+
+    fn unavailable_active_row(
+        &self,
+        entry: &ProviderEntry,
+        entries: &[ProviderEntry],
+        settings: &t3_core::server_config::ServerSettings,
+        models: &[&t3_core::server_config::ProviderModel],
+    ) -> Option<Row> {
+        let selected = self.input.selection.as_ref()?;
+        if !entry.enabled || selected.instance_id != entry.instance_id() {
+            return None;
+        }
+        let hidden = settings
+            .provider_model_preferences
+            .as_ref()
+            .and_then(|prefs| prefs.get(entry.instance_id()))
+            .map(|p| p.hidden_models.as_slice())
+            .unwrap_or(&[]);
+        let raw_models: Vec<t3_core::server_config::ProviderModel> =
+            models.iter().map(|m| (*m).clone()).collect();
+        if !providers::should_preserve_unavailable_selection(
+            entry.driver(),
+            &selected.model,
+            &raw_models,
+            hidden,
+        ) {
+            return None;
+        }
+        let disabled = self
+            .input
+            .locked_instance
+            .as_deref()
+            .filter(|locked| *locked != entry.instance_id())
+            .map(|_| SharedString::from(LOCKED_REASON));
+        Some(Row::Model {
+            instance_id: entry.instance_id().to_owned(),
+            slug: selected.model.clone(),
+            name: selected.model.clone().into(),
+            sub_provider: None,
+            mark: ProviderMark::of(entry, entries),
+            badge_new: false,
+            favorite: providers::is_favorite(settings, entry.instance_id(), &selected.model),
+            selected: true,
+            disabled,
+            unavailable: true,
+        })
     }
 
     fn refresh_rows(&mut self, cx: &App) {
@@ -290,13 +371,18 @@ impl ModelPicker {
                 favorite,
                 selected: is_selected,
                 disabled,
+                unavailable: false,
             }
         };
         let mut rows = Vec::new();
+        let mut seen_keys: HashSet<(String, String)> = HashSet::new();
         if !query.is_empty() {
             let mut ranked: Vec<(i64, usize, Row)> = Vec::new();
             for entry in entries.iter().filter(|entry| entry.is_ready()) {
                 for model in providers::model_options_for_cwd(&config.settings, entry.provider, self.snapshot_for(entry.provider)) {
+                    if !seen_keys.insert((entry.instance_id().to_owned(), model.slug.clone())) {
+                        continue;
+                    }
                     let favorite = providers::is_favorite(&config.settings, entry.instance_id(), &model.slug);
                     if let Some(score) = providers::search_score(model, entry, favorite, &query) {
                         ranked.push((score, ranked.len(), row(entry, model)));
@@ -313,24 +399,89 @@ impl ModelPicker {
                             continue;
                         };
                         let models = providers::models_for_cwd(entry.provider, self.snapshot_for(entry.provider));
-                        if let Some(model) = models.iter().find(|model| model.slug == favorite.model) {
+                        if let Some(model) = models.iter().find(|model| model.slug == favorite.model)
+                            && seen_keys.insert((entry.instance_id().to_owned(), model.slug.clone()))
+                        {
                             rows.push(row(entry, model));
                         }
                     }
                 }
                 Tab::Instance(instance_id) => {
-                    if let Some(entry) = entries.iter().find(|entry| entry.instance_id() == instance_id).filter(|e| e.is_ready()) {
-                        let models = providers::model_options_for_cwd(&config.settings, entry.provider, self.snapshot_for(entry.provider));
+                    if let Some(entry) = entries.iter().find(|entry| entry.instance_id() == instance_id) {
+                        let models = if entry.is_ready() {
+                            providers::model_options_for_cwd(&config.settings, entry.provider, self.snapshot_for(entry.provider))
+                        } else {
+                            Vec::new()
+                        };
+                        let unavailable_row =
+                            self.unavailable_active_row(entry, &entries, &config.settings, &models);
                         let favorite = |slug: &str| providers::is_favorite(&config.settings, entry.instance_id(), slug);
-                        let (mut current, legacy): (Vec<_>, Vec<_>) =
-                            models.into_iter().partition(|model| !model.is_legacy || favorite(&model.slug));
-                        current.sort_by_key(|model| !favorite(&model.slug));
-                        rows.extend(current.into_iter().map(|model| row(entry, model)));
-                        if !legacy.is_empty() {
-                            if self.legacy_expanded {
-                                rows.extend(legacy.into_iter().map(|model| row(entry, model)));
+                        if let Some(sub_providers) = entry
+                            .provider
+                            .sub_providers
+                            .as_deref()
+                            .filter(|subs| !subs.is_empty() && entry.is_ready())
+                        {
+                            let (ungrouped, groups) = providers::group_models_by_sub_provider(
+                                &models,
+                                sub_providers,
+                                |model| model.sub_provider.as_deref(),
+                            );
+                            let mut ungrouped_current = ungrouped;
+                            ungrouped_current.sort_by_key(|model| !favorite(&model.slug));
+                            for model in ungrouped_current {
+                                if seen_keys.insert((entry.instance_id().to_owned(), model.slug.clone())) {
+                                    rows.push(row(entry, model));
+                                }
                             }
-                            rows.push(Row::Legacy { expanded: self.legacy_expanded });
+                            for group in groups {
+                                let key = (entry.instance_id().to_owned(), group.sub_provider.name.clone());
+                                let unavailable_reason = group
+                                    .sub_provider
+                                    .unavailable_reason
+                                    .clone()
+                                    .map(SharedString::from);
+                                let expanded = unavailable_reason.is_none()
+                                    && self.expanded_sub_providers.contains(&key);
+                                rows.push(Row::SubProvider {
+                                    instance_id: entry.instance_id().to_owned(),
+                                    name: group.sub_provider.name.clone().into(),
+                                    unavailable_reason,
+                                    expanded,
+                                    model_count: group.models.len(),
+                                });
+                                if expanded {
+                                    let mut group_models = group.models;
+                                    group_models.sort_by_key(|model| !favorite(&model.slug));
+                                    for model in group_models {
+                                        if seen_keys.insert((entry.instance_id().to_owned(), model.slug.clone())) {
+                                            rows.push(row(entry, model));
+                                        }
+                                    }
+                                }
+                            }
+                        } else if entry.is_ready() {
+                            let (mut current, legacy): (Vec<_>, Vec<_>) =
+                                models.into_iter().partition(|model| !model.is_legacy || favorite(&model.slug));
+                            current.sort_by_key(|model| !favorite(&model.slug));
+                            for model in current {
+                                if seen_keys.insert((entry.instance_id().to_owned(), model.slug.clone())) {
+                                    rows.push(row(entry, model));
+                                }
+                            }
+                            if !legacy.is_empty() {
+                                if self.legacy_expanded {
+                                    for model in legacy {
+                                        if seen_keys.insert((entry.instance_id().to_owned(), model.slug.clone())) {
+                                            rows.push(row(entry, model));
+                                        }
+                                    }
+                                }
+                                rows.push(Row::Legacy { expanded: self.legacy_expanded });
+                            }
+                        }
+                        if let Some(unavailable) = unavailable_row {
+                            rows.push(unavailable);
                         }
                     }
                 }
@@ -422,6 +573,14 @@ impl ModelPicker {
                     cx.emit(PickerEvent::Model { instance_id, model: slug });
                 }
             }
+            Some(Row::SubProvider { instance_id, name, unavailable_reason: None, .. }) => {
+                let key = (instance_id, name.to_string());
+                if !self.expanded_sub_providers.remove(&key) {
+                    self.expanded_sub_providers.insert(key);
+                }
+                self.refresh_rows(cx);
+                cx.notify();
+            }
             Some(Row::Legacy { expanded }) => {
                 self.legacy_expanded = !expanded;
                 self.refresh_rows(cx);
@@ -439,7 +598,11 @@ impl ModelPicker {
         let mut index = self.highlighted.map(|i| i as isize).unwrap_or(-1);
         for _ in 0..count {
             index = (index + step).rem_euclid(count as isize);
-            if !matches!(self.rows[index as usize], Row::Model { disabled: Some(_), .. }) {
+            if !matches!(
+                self.rows[index as usize],
+                Row::Model { disabled: Some(_), .. }
+                    | Row::SubProvider { unavailable_reason: Some(_), .. }
+            ) {
                 break;
             }
         }
@@ -521,6 +684,53 @@ impl ModelPicker {
             .rounded(px(4.))
             .when(highlighted, |this| this.bg(hsla(p.foreground).opacity(0.09)));
         match &self.rows[index] {
+            Row::SubProvider { name, unavailable_reason, expanded, model_count, .. } => {
+                let available = unavailable_reason.is_none();
+                let chevron = if *expanded { Icon::ChevronDown } else { Icon::ChevronRight };
+                base.when(available, |this| {
+                    this.cursor_pointer()
+                        .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                            if this.highlighted != Some(index) {
+                                this.highlighted = Some(index);
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| this.activate(index, false, cx)))
+                })
+                .when(!available, |this| this.opacity(0.64))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hsla(p.muted_foreground))
+                .child(chevron.render(px(12.), hsla(p.muted_foreground)))
+                .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                .when_some(unavailable_reason.clone(), |this, reason| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .px(px(6.))
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(hsla(p.border))
+                            .text_size(px(10.))
+                            .text_color(hsla(p.muted_foreground))
+                            .child("Unavailable"),
+                    )
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx)
+                    })
+                })
+                .when(available && *model_count > 0, |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.))
+                            .text_color(hsla(p.muted_foreground).opacity(0.7))
+                            .child(format!("{model_count}")),
+                    )
+                })
+                .into_any_element()
+            }
             Row::Legacy { expanded } => base
                 .cursor_pointer()
                 .text_sm()
@@ -529,10 +739,10 @@ impl ModelPicker {
                 .child(if *expanded { Icon::ChevronUp } else { Icon::ChevronDown }.render(px(14.), hsla(p.muted_foreground)))
                 .on_click(cx.listener(move |this, _, _, cx| this.activate(index, false, cx)))
                 .into_any_element(),
-            Row::Model { instance_id, slug, name, sub_provider, mark, badge_new, favorite, selected, disabled } => {
+            Row::Model { instance_id, slug, name, sub_provider, mark, badge_new, favorite, selected, disabled, unavailable } => {
                 let star_id = (instance_id.clone(), slug.clone(), *favorite);
                 base.when(disabled.is_none(), |this| this.cursor_pointer())
-                    .when(disabled.is_some(), |this| this.opacity(0.64))
+                    .when(disabled.is_some() || *unavailable, |this| this.opacity(0.64))
                     .on_mouse_move(cx.listener(move |this, _, _, cx| {
                         if this.highlighted != Some(index) {
                             this.highlighted = Some(index);
@@ -549,6 +759,19 @@ impl ModelPicker {
                             .children(sub_provider.clone().map(|sub| {
                                 div().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground).opacity(0.7)).child(sub)
                             }))
+                            .when(*unavailable, |this| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .px(px(4.))
+                                        .rounded(px(4.))
+                                        .border_1()
+                                        .border_color(hsla(p.border))
+                                        .text_size(px(10.))
+                                        .text_color(hsla(p.muted_foreground))
+                                        .child("Unavailable"),
+                                )
+                            })
                             .when(*badge_new, |this| {
                                 this.child(
                                     div()

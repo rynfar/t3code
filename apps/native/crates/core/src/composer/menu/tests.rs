@@ -302,7 +302,8 @@ fn context_links_match_the_web_pattern() {
     let spans = |text: &str| -> Vec<(usize, usize, bool, String)> {
         context_references(text).into_iter().map(|r| (r.start, r.end, r.image, r.label.to_owned())).collect()
     };
-    assert_eq!(spans("a [b [c](t3-context://v1/thread/thread_1) d"), [(2, 41, false, "b [c".to_owned())]);
+    // `pingdotgg/t3code#37827`: `[` is excluded from context link labels (`[^[\]\n]`).
+    assert_eq!(spans("a [b [c](t3-context://v1/thread/thread_1) d"), [(5, 41, false, "c".to_owned())]);
     assert_eq!(
         spans("x ![shot.png](t3-context://v1/image/image_a) and [T](t3-context://v1/thread/t2)"),
         [(2, 44, true, "shot.png".to_owned()), (49, 79, false, "T".to_owned())]

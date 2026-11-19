@@ -725,6 +725,178 @@ pub fn effective_speech_language(
         .unwrap_or_else(|| "auto".to_owned())
 }
 
+/// `SpeechRecommendationRole` from `packages/shared/src/speech.ts` (`pingdotgg/t3code#33336`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeechRecommendationRole {
+    Recommended,
+    Faster,
+    Accurate,
+}
+
+impl SpeechRecommendationRole {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Recommended => "Recommended",
+            Self::Faster => "Faster",
+            Self::Accurate => "More accurate",
+        }
+    }
+
+    pub const fn tooltip(self) -> &'static str {
+        match self {
+            Self::Recommended => {
+                "Balanced accuracy and speed for your selected languages on Handy\u{2019}s reference benchmarks."
+            }
+            Self::Faster => {
+                "Quicker than Recommended on this reference tier, with useful accuracy."
+            }
+            Self::Accurate => {
+                "Higher accuracy with a longer reference processing budget for your selected languages."
+            }
+        }
+    }
+}
+
+/// Constants from `packages/shared/src/speechRecommendationPolicy.json`.
+const SPEECH_POLICY_FREE_WAIT_SECONDS: f64 = 3.0;
+const SPEECH_POLICY_WAIT_WEIGHT: f64 = 0.5;
+const SPEECH_POLICY_OVERALL_MAX_WAIT_SECONDS: f64 = 5.0;
+const SPEECH_POLICY_MAX_LANGUAGE_ERROR_PERCENT: f64 = 20.0;
+const SPEECH_POLICY_ACCURATE_MAX_WAIT_SECONDS: f64 = 10.0;
+const SPEECH_POLICY_FAST_MAX_WAIT_SECONDS: f64 = 4.0;
+
+/// Reference accuracy/speed picks (`recommendSpeechModels` in `packages/shared/src/speech.ts`).
+/// Returns `(model_id, role)` pairs in recommendation order: Recommended, Faster, Accurate.
+/// No preference or incomplete measurements yield no badges.
+pub fn recommend_speech_models(
+    models: &[EnvironmentSpeechModel],
+    languages: &[String],
+    tier: Option<SpeechBenchmarkTier>,
+) -> Vec<(String, SpeechRecommendationRole)> {
+    let mut wanted: Vec<&str> = Vec::new();
+    for lang in languages {
+        if !wanted.contains(&lang.as_str()) {
+            wanted.push(lang.as_str());
+        }
+    }
+    let Some(tier) = tier else {
+        return Vec::new();
+    };
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    struct Scored<'a> {
+        id: &'a str,
+        error: f64,
+        worst: f64,
+        wait: f64,
+        cost: f64,
+    }
+
+    let scored: Vec<Scored<'_>> = models
+        .iter()
+        .filter_map(|model| {
+            if !wanted.iter().all(|lang| model.languages.iter().any(|l| l == lang)) {
+                return None;
+            }
+            let bench = model.benchmark.as_ref()?;
+            let wait = match tier {
+                SpeechBenchmarkTier::Cpu => bench.seconds_per_30s.cpu.flatten()?,
+                SpeechBenchmarkTier::Accelerated => bench.seconds_per_30s.accelerated?,
+            };
+            if !wait.is_finite() || wait < 0.0 {
+                return None;
+            }
+            let mut measured = Vec::with_capacity(wanted.len());
+            for lang in &wanted {
+                let err = bench.accuracy.get(*lang)?.error_percent;
+                if !err.is_finite() || err < 0.0 {
+                    return None;
+                }
+                measured.push(err);
+            }
+            let log_sum: f64 = measured.iter().map(|v| v.ln()).sum();
+            let error = (log_sum / measured.len() as f64).exp();
+            let worst = measured.iter().copied().fold(0.0_f64, f64::max);
+            let cost =
+                error + SPEECH_POLICY_WAIT_WEIGHT * (wait - SPEECH_POLICY_FREE_WAIT_SECONDS).max(0.0);
+            Some(Scored { id: &model.id, error, worst, wait, cost })
+        })
+        .collect();
+
+    if scored.is_empty() {
+        return Vec::new();
+    }
+
+    let useful: Vec<&Scored<'_>> = scored
+        .iter()
+        .filter(|m| m.worst < SPEECH_POLICY_MAX_LANGUAGE_ERROR_PERCENT)
+        .collect();
+    let pool: Vec<&Scored<'_>> =
+        if !useful.is_empty() { useful.clone() } else { scored.iter().collect() };
+
+    fn lowest<'a, 'b>(
+        items: &[&'a Scored<'b>],
+        score: fn(&Scored<'_>) -> f64,
+    ) -> Option<&'a Scored<'b>> {
+        items.iter().copied().fold(None, |best, item| match best {
+            None => Some(item),
+            Some(cur) if score(item) < score(cur) => Some(item),
+            _ => best,
+        })
+    }
+
+    let within_budget: Vec<&Scored<'_>> =
+        pool.iter().copied().filter(|m| m.wait <= SPEECH_POLICY_OVERALL_MAX_WAIT_SECONDS).collect();
+    let best = if !useful.is_empty() {
+        let candidates = if !within_budget.is_empty() { &within_budget } else { &pool };
+        lowest(candidates, |m| m.cost)
+    } else {
+        lowest(&pool, |m| m.worst + m.error / 1000.0)
+    }
+    .expect("pool is non-empty");
+
+    let quicker: Vec<&Scored<'_>> = pool.iter().copied().filter(|m| m.wait < best.wait).collect();
+    let fast = if !useful.is_empty() {
+        let within_fast: Vec<&Scored<'_>> = quicker
+            .iter()
+            .copied()
+            .filter(|m| m.wait <= SPEECH_POLICY_FAST_MAX_WAIT_SECONDS)
+            .collect();
+        lowest(&within_fast, |m| m.error)
+            .or_else(|| lowest(&quicker, |m| m.wait + m.error / 1000.0))
+    } else {
+        None
+    };
+
+    let accurate = if !useful.is_empty() {
+        let more_accurate: Vec<&Scored<'_>> = pool
+            .iter()
+            .copied()
+            .filter(|m| m.error < best.error && m.wait <= SPEECH_POLICY_ACCURATE_MAX_WAIT_SECONDS)
+            .collect();
+        lowest(&more_accurate, |m| m.error)
+    } else {
+        None
+    };
+
+    let mut roles: Vec<(String, SpeechRecommendationRole)> = Vec::new();
+    for (picked, role) in [
+        (Some(best), SpeechRecommendationRole::Recommended),
+        (fast, SpeechRecommendationRole::Faster),
+        (accurate, SpeechRecommendationRole::Accurate),
+    ] {
+        if let Some(model) = picked
+            && !roles.iter().any(|(id, _)| id == model.id)
+        {
+            roles.push((model.id.to_owned(), role));
+        }
+    }
+    roles
+}
+
 /// `chooseSetupSpeechModel` from `packages/shared/src/speech.ts`.
 pub fn choose_setup_speech_model<'a>(
     models: &'a [EnvironmentSpeechModel],
@@ -732,8 +904,24 @@ pub fn choose_setup_speech_model<'a>(
     intent: &str,
     preferred: &[String],
 ) -> Option<(&'a EnvironmentSpeechModel, Option<String>)> {
+    choose_setup_speech_model_for_tier(models, selected_model_id, intent, preferred, None)
+        .map(|(model, lang, _)| (model, lang))
+}
+
+/// Benchmark-aware `chooseSetupSpeechModel` (`pingdotgg/t3code#33336`), returning
+/// `(model, language, recommended)`.
+pub fn choose_setup_speech_model_for_tier<'a>(
+    models: &'a [EnvironmentSpeechModel],
+    selected_model_id: &str,
+    intent: &str,
+    preferred: &[String],
+    benchmark_tier: Option<SpeechBenchmarkTier>,
+) -> Option<(&'a EnvironmentSpeechModel, Option<String>, bool)> {
     if intent == "auto" && preferred.is_empty() {
-        return models.iter().find(|m| m.id == selected_model_id).map(|model| (model, None));
+        return models
+            .iter()
+            .find(|m| m.id == selected_model_id)
+            .map(|model| (model, None, false));
     }
     let candidates: Vec<&str> =
         if intent == "auto" { preferred.iter().map(String::as_str).collect() } else { vec![intent] };
@@ -747,14 +935,30 @@ pub fn choose_setup_speech_model<'a>(
                     || (effective == "auto" && model.languages.iter().any(|l| l == language))
             })
             .collect();
+        let capable_owned: Vec<EnvironmentSpeechModel> =
+            capable.iter().map(|m| (*m).clone()).collect();
+        let recommended_id = recommend_speech_models(
+            &capable_owned,
+            &[language.to_owned()],
+            benchmark_tier,
+        )
+        .into_iter()
+        .next()
+        .map(|(id, _)| id);
         let chosen = capable
             .iter()
             .copied()
             .find(|m| m.id == selected_model_id)
+            .or_else(|| {
+                recommended_id
+                    .as_deref()
+                    .and_then(|rec_id| capable.iter().copied().find(|m| m.id == rec_id))
+            })
             .or_else(|| capable.iter().copied().find(|m| m.recommended))
             .or_else(|| capable.first().copied());
         if let Some(model) = chosen {
-            return Some((model, Some(language.to_owned())));
+            let is_recommended = recommended_id.as_deref() == Some(model.id.as_str());
+            return Some((model, Some(language.to_owned()), is_recommended));
         }
     }
     None

@@ -107,6 +107,17 @@ fn is_currency_symbol(c: char) -> bool {
         | 0x11FDD..=0x11FE0 | 0x1E2FF | 0x1ECB0)
 }
 
+/// Unicode's opening punctuation (`\p{Ps}`, `pingdotgg/t3code#37827`).
+fn is_opening_bracket(c: char) -> bool {
+    matches!(
+        c,
+        '(' | '[' | '{' | '༺' | '༼' | '᚛' | '‚' | '„' | '⁅' | '⁽' | '₍' | '⌈' | '⌊'
+        | '〈' | '《' | '「' | '『' | '【' | '〔' | '〖' | '〘' | '〚' | '〝'
+        | '﴾' | '︗' | '︵' | '︷' | '︹' | '︻' | '︽' | '︿' | '﹁' | '﹃' | '﹇'
+        | '﹙' | '﹛' | '﹝' | '（' | '［' | '｛' | '｟' | '｢'
+    )
+}
+
 /// `^#([\p{L}\p{N}][\p{L}\p{N}_-]*)?$` after the `#`.
 fn is_pull_request_query(query: &str) -> bool {
     let mut chars = query.chars();
@@ -114,6 +125,35 @@ fn is_pull_request_query(query: &str) -> bool {
         None => true,
         Some(first) => first.is_alphanumeric() && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
     }
+}
+
+/// `detectComposerPullRequestTrigger` (`packages/shared/src/composerTrigger.ts`, `pingdotgg/t3code#37827`):
+/// opens PR completion for `#query` at the start of a token or immediately after opening punctuation
+/// like `(`, `[`, `{`, `（`, `「`, while ignoring tokens starting with `@` or currency symbols.
+pub fn detect_pull_request_trigger(token: &str, cursor: usize) -> Option<Trigger> {
+    if token.starts_with('@') || token.chars().next().is_some_and(is_currency_symbol) {
+        return None;
+    }
+    let hash_pos = token.rfind('#')?;
+    let query = &token[hash_pos + 1..];
+    if !is_pull_request_query(query) {
+        return None;
+    }
+    let valid_before = if hash_pos == 0 {
+        true
+    } else {
+        token[..hash_pos].chars().next_back().is_some_and(is_opening_bracket)
+    };
+    if !valid_before {
+        return None;
+    }
+    let range_start = cursor.saturating_sub(query.len() + 1);
+    Some(Trigger {
+        kind: TriggerKind::PullRequest,
+        query: query.to_owned(),
+        range_start,
+        range_end: cursor,
+    })
 }
 
 /// `detectComposerTrigger`.
@@ -128,10 +168,8 @@ pub fn detect_trigger(text: &str, cursor: usize) -> Option<Trigger> {
         }
         return trigger(TriggerKind::SlashCommand, query);
     }
-    if let Some(query) = token.strip_prefix('#')
-        && is_pull_request_query(query)
-    {
-        return trigger(TriggerKind::PullRequest, query);
+    if let Some(pr_trigger) = detect_pull_request_trigger(token, cursor) {
+        return Some(pr_trigger);
     }
     if let Some(symbol) = token.chars().next().filter(|c| is_currency_symbol(*c)) {
         let query = &token[symbol.len_utf8()..];
@@ -522,6 +560,7 @@ pub enum MenuAction {
     ProviderCommand { name: String },
     Skill { name: String, source: SkillSource },
     Thread { thread_id: String, title: String },
+    LinkedThread { environment_id: String, thread_id: String, title: String },
     Environment { environment_id: String, label: String },
     Model { instance_id: String, model: String, driver: String, display_name: String },
     PullRequest(ComposerPullRequest),
@@ -777,6 +816,91 @@ pub fn thread_items(threads: &[PaletteThread], environment_id: &str, exclude: Op
         }
     })
     .collect()
+}
+
+/// `matchComposerThreadItems` across active and linked environments (`pingdotgg/t3code#37243`):
+/// up to five threads for `@`, including older settled threads on linked machines.
+pub fn thread_items_across_environments(
+    threads: &[PaletteThread],
+    active_environment_id: &str,
+    exclude_active_thread: Option<&str>,
+    environment_labels: &std::collections::HashMap<String, String>,
+    query: &str,
+    now: i64,
+) -> Vec<MenuItem> {
+    let query = fold_search_query(query);
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let candidates: Vec<(&PaletteThread, crate::search::ThreadSearchSubject)> = threads
+        .iter()
+        .filter(|thread| {
+            let is_active_env = thread.environment_id == active_environment_id
+                || thread.environment_id == crate::sidebar::ENVIRONMENT_ID;
+            let excluded = is_active_env && Some(thread.id.as_str()) == exclude_active_thread;
+            !excluded && thread.archived_at.is_none() && !thread.hidden
+        })
+        .map(|thread| (thread, thread_search_subject(thread, None, None)))
+        .collect();
+    rank_search_items(&candidates, |(_, subject), typos| {
+        score_thread_search(&query, subject, now, ThreadSearchOptions { typos, picks: false })
+    })
+    .into_iter()
+    .take(THREAD_RESULT_LIMIT)
+    .map(|ranked| {
+        let thread = ranked.item.0;
+        let is_active_env = thread.environment_id == active_environment_id
+            || thread.environment_id == crate::sidebar::ENVIRONMENT_ID;
+        if is_active_env {
+            MenuItem {
+                id: format!("thread:{active_environment_id}:{}", thread.id),
+                label: thread.title.clone(),
+                description: "Thread".to_owned(),
+                action: MenuAction::Thread { thread_id: thread.id.clone(), title: thread.title.clone() },
+            }
+        } else {
+            let env_label = environment_labels
+                .get(&thread.environment_id)
+                .map(String::as_str)
+                .filter(|s| !s.is_empty());
+            let description = match env_label {
+                Some(name) => format!("Thread on {name}"),
+                None => "Thread".to_owned(),
+            };
+            MenuItem {
+                id: format!("thread:{}:{}", thread.environment_id, thread.id),
+                label: thread.title.clone(),
+                description,
+                action: MenuAction::LinkedThread {
+                    environment_id: thread.environment_id.clone(),
+                    thread_id: thread.id.clone(),
+                    title: thread.title.clone(),
+                },
+            }
+        }
+    })
+    .collect()
+}
+
+/// `replaceComposerContextReferences` (`packages/shared/src/composerContextReferences.ts`,
+/// `pingdotgg/t3code#37498`): replaces each inline `t3-context://v1/...` link with `replacement`.
+pub fn replace_context_references<'a>(
+    text: &'a str,
+    mut replacement: impl FnMut(&ContextReference<'a>) -> &'a str,
+) -> String {
+    let refs = context_references(text);
+    if refs.is_empty() {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for reference in &refs {
+        out.push_str(&text[cursor..reference.start]);
+        out.push_str(replacement(reference));
+        cursor = reference.end;
+    }
+    out.push_str(&text[cursor..]);
+    out
 }
 
 /// Prompt text naming a provider instance and model (`formatComposerModelMention`).
@@ -1248,13 +1372,14 @@ pub fn context_references(text: &str) -> Vec<ContextReference<'_>> {
         if !rest[href_len..].starts_with(')') || !(1..=200).contains(&href.chars().count()) {
             continue;
         }
-        // The leftmost `[` the regex would start at: after the last `]` or newline, label ≤ 512.
+        // The `[` the regex `(!?)\[([^[\]\n]{0,512})\]\(` matches (`pingdotgg/t3code#37827`):
+        // labels cannot contain `[`, `]`, or `\n`, so take the nearest `[` before `close`.
         let floor = text[..close].rfind([']', '\n']).map_or(0, |at| at + 1);
         let floor = floor.max(found.last().map_or(0, |previous: &ContextReference| previous.end));
         let Some(open) = text[floor..close]
-            .match_indices('[')
-            .map(|(at, _)| floor + at)
-            .find(|open| text[open + 1..close].chars().count() <= 512)
+            .rfind('[')
+            .map(|at| floor + at)
+            .filter(|open| text[open + 1..close].chars().count() <= 512)
         else {
             continue;
         };

@@ -1110,6 +1110,7 @@ pub enum DictationShortcutAction {
 struct ActiveDictationPress {
     generation: u64,
     key_code: String,
+    modifiers: Vec<String>,
     started_at_ms: u64,
     mode: VoiceShortcutMode,
 }
@@ -1130,6 +1131,16 @@ pub struct DictationKeydown<'a> {
     pub key_code: &'a str,
     pub now_ms: u64,
     pub mode: VoiceShortcutMode,
+}
+
+fn normalize_modifier_key(key: &str) -> Option<&'static str> {
+    match key.to_ascii_lowercase().as_str() {
+        "alt" | "option" => Some("alt"),
+        "control" | "ctrl" => Some("control"),
+        "meta" | "cmd" | "command" | "super" | "platform" => Some("meta"),
+        "shift" => Some("shift"),
+        _ => None,
+    }
 }
 
 impl DictationShortcutState {
@@ -1160,6 +1171,16 @@ impl DictationShortcutState {
     }
 
     pub fn on_dictation_keydown(&mut self, event: DictationKeydown<'_>) -> DictationShortcutAction {
+        self.on_dictation_keydown_with_modifiers(event, &[])
+    }
+
+    /// Starts or stops dictation on keydown, recording active chord modifiers so releasing a
+    /// modifier stops held dictation even when macOS omits the letter keyup (`pingdotgg/t3code#32648`).
+    pub fn on_dictation_keydown_with_modifiers(
+        &mut self,
+        event: DictationKeydown<'_>,
+        modifiers: &[&str],
+    ) -> DictationShortcutAction {
         let can_start = matches!(event.phase, VoiceInputPhase::Idle | VoiceInputPhase::Error);
         if can_start && (!event.available || event.disabled) {
             return DictationShortcutAction::None;
@@ -1173,9 +1194,14 @@ impl DictationShortcutState {
         if event.phase == VoiceInputPhase::Recording {
             return DictationShortcutAction::Stop;
         }
+        let normalized_modifiers: Vec<String> = modifiers
+            .iter()
+            .filter_map(|m| normalize_modifier_key(m).map(str::to_owned))
+            .collect();
         self.pressed = Some(ActiveDictationPress {
             generation: self.generation,
             key_code: event.key_code.to_owned(),
+            modifiers: normalized_modifiers,
             started_at_ms: event.now_ms,
             mode: event.mode,
         });
@@ -1190,9 +1216,41 @@ impl DictationShortcutState {
         let Some(press) = &self.pressed else {
             return DictationShortcutAction::None;
         };
-        if let Some(code) = key_code
-            && code != press.key_code
+        if let Some(code) = key_code {
+            let matches_key = code == press.key_code;
+            let matches_modifier = normalize_modifier_key(code)
+                .is_some_and(|modifier| press.modifiers.iter().any(|m| m == modifier));
+            if !matches_key && !matches_modifier {
+                return DictationShortcutAction::None;
+            }
+        }
+        let press = self.pressed.take().expect("checked");
+        if press.generation == self.generation
+            && should_finish_dictation_on_release(press.mode, now_ms.saturating_sub(press.started_at_ms))
         {
+            DictationShortcutAction::Stop
+        } else {
+            DictationShortcutAction::None
+        }
+    }
+
+    /// Stops held dictation when any modifier that was held at shortcut press is released
+    /// (`pingdotgg/t3code#32648`, matching GPUI `ModifiersChangedEvent` on macOS).
+    pub fn on_modifiers_changed(
+        &mut self,
+        held_modifiers: &[&str],
+        now_ms: u64,
+    ) -> DictationShortcutAction {
+        let Some(press) = &self.pressed else {
+            return DictationShortcutAction::None;
+        };
+        if press.modifiers.is_empty() {
+            return DictationShortcutAction::None;
+        }
+        let held: Vec<&'static str> =
+            held_modifiers.iter().filter_map(|m| normalize_modifier_key(m)).collect();
+        let released = press.modifiers.iter().any(|m| !held.contains(&m.as_str()));
+        if !released {
             return DictationShortcutAction::None;
         }
         let press = self.pressed.take().expect("checked");

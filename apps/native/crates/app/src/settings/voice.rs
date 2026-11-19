@@ -21,10 +21,10 @@ use t3_core::settings::voice::{
     LOOPBACK_SECONDS, MicrophoneTestPhase, ModelSpeedSummary, SHORTCUT_MODES,
     SpeechModelFilterOptions, SpeechModelSort, UNLOAD_TIMEOUT_OPTIONS, add_dictionary_alias,
     add_dictionary_terms, can_add_dictionary_terms, cloud_speech_language_list,
-    filter_speech_models, format_loopback_time, model_benchmark_display, order_speech_languages,
-    parse_unload_timeout, remove_dictionary_term, resolve_speech_language_display,
-    shortcut_mode_meta, unload_timeout_label, validate_cloud_voice_config,
-    voice_search_target_fallback,
+    filter_speech_models_with_recommendations, format_loopback_time, model_benchmark_display,
+    order_speech_languages, parse_unload_timeout, remove_dictionary_term,
+    resolve_speech_language_display, shortcut_mode_meta, unload_timeout_label,
+    validate_cloud_voice_config, voice_search_target_fallback,
 };
 use t3_core::settings::{
     ServerSettingChange, resolve_default_text_generation_selection,
@@ -35,11 +35,11 @@ use t3_core::voice_input::{
     DEFAULT_SPEECH_POST_PROCESSING_PROMPT, EnvironmentSpeechModel, EnvironmentSpeechModelState,
     EnvironmentSpeechStatus, SPEECH_SAMPLE_RATE, SavedAudioChoice, SpeechAcceleration,
     SpeechBenchmarkTier, SpeechCustomWordEntry, SpeechPostProcessingPromptMode,
-    SpeechPostProcessingPromptSettings, VoiceDraftSnapshot, VoiceInputPhase, VoiceSelection,
-    VoiceShortcutMode, VoiceTranscriptionDestination, cloud_speech_disclosure, forget_microphone,
-    microphone_entry_key, microphone_order, move_microphone, preferred_microphone,
-    preferred_microphone_id, preferred_speech_languages, remember_microphones,
-    speech_language_label,
+    SpeechPostProcessingPromptSettings, SpeechRecommendationRole, VoiceDraftSnapshot,
+    VoiceInputPhase, VoiceSelection, VoiceShortcutMode, VoiceTranscriptionDestination,
+    cloud_speech_disclosure, forget_microphone, microphone_entry_key, microphone_order,
+    move_microphone, preferred_microphone, preferred_microphone_id, preferred_speech_languages,
+    recommend_speech_models, remember_microphones, speech_language_label,
 };
 
 use super::controls::{
@@ -277,7 +277,7 @@ impl VoiceState {
     }
 
     pub(super) fn reveal(&mut self, target: &str) {
-        if target == "speech-hardware" {
+        if matches!(target, "speech-hardware" | "speech-streaming") {
             self.advanced_open = true;
         }
     }
@@ -2139,6 +2139,7 @@ impl SettingsView {
                         );
                     }
                     EnvironmentSpeechStatus::Supported {
+                        supports_streaming,
                         benchmark_tier,
                         supports_model_linking,
                         acceleration,
@@ -2149,14 +2150,16 @@ impl SettingsView {
                         let browser_row = self.render_speech_model_browser(
                             &env_id,
                             &creds,
-                            benchmark_tier,
+                            Some(benchmark_tier),
                             supports_model_linking == Some(true),
                             cx,
                         );
                         transcription_rows.push(browser_row);
 
-                        // Collapsible Advanced (`speech-hardware` + `Unload model`)
-                        let adv_open = self.voice.advanced_open || self.is_target("speech-hardware");
+                        // Collapsible Advanced (`speech-streaming` + `speech-hardware` + `Unload model`)
+                        let adv_open = self.voice.advanced_open
+                            || self.is_target("speech-hardware")
+                            || self.is_target("speech-streaming");
                         transcription_rows.push(
                             div()
                                 .px(r(16.))
@@ -2171,7 +2174,9 @@ impl SettingsView {
                                         .label("Advanced")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.voice.advanced_open = !this.voice.advanced_open;
-                                            if this.is_target("speech-hardware") {
+                                            if this.is_target("speech-hardware")
+                                                || this.is_target("speech-streaming")
+                                            {
                                                 this.target = None;
                                             }
                                             cx.notify();
@@ -2181,6 +2186,30 @@ impl SettingsView {
                         );
 
                         if adv_open {
+                            let streaming_state = self.state.clone();
+                            let streaming_checked = store::client(cx).speech_streaming();
+                            transcription_rows.push(
+                                Row::new("speech-streaming", "Streaming transcription")
+                                    .description(if supports_streaming {
+                                        "Transcribe while recording. Turn off to transcribe after stopping, which may help when live transcription falls behind."
+                                    } else {
+                                        "This model doesn\u{2019}t support native streaming."
+                                    })
+                                    .highlighted(self.is_target("speech-streaming"))
+                                    .control(
+                                        Switch::new("speech-streaming-switch", streaming_checked)
+                                            .disabled(!supports_streaming)
+                                            .on_change(move |checked, _, cx| {
+                                                store::update_client(
+                                                    &streaming_state,
+                                                    ClientSettingChange::SpeechStreaming(checked),
+                                                    cx,
+                                                );
+                                            }),
+                                    )
+                                    .into_any_element(),
+                            );
+
                             let can_manage = self.can_write_settings_on(Some(&env_id), cx);
                             let controls_disabled = !can_manage
                                 || self.voice.catalog_busy
@@ -2501,6 +2530,7 @@ impl SettingsView {
                     "speech-silence-filtering",
                     "remove-filler-words",
                     "speech-models",
+                    "speech-streaming",
                     "speech-hardware",
                     "transcription-test",
                 ],
@@ -2623,7 +2653,7 @@ impl SettingsView {
         &mut self,
         env_id: &str,
         creds: &Credentials,
-        benchmark_tier: SpeechBenchmarkTier,
+        benchmark_tier: Option<SpeechBenchmarkTier>,
         supports_model_linking: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2654,20 +2684,24 @@ impl SettingsView {
             .to_owned();
         let search_query = self.voice.model_search.read(cx).value().to_string();
 
-        let sorted_models: Vec<EnvironmentSpeechModel> = filter_speech_models(
-            &self.voice.catalog_models,
-            &SpeechModelFilterOptions {
-                search: &search_query,
-                languages: &selected_langs,
-                downloaded_only: self.voice.model_downloaded_only,
-                sort: self.voice.model_sort,
-                accuracy_language: &accuracy_lang,
-                benchmark_tier,
-            },
-        )
-        .into_iter()
-        .cloned()
-        .collect();
+        let recommendations =
+            recommend_speech_models(&self.voice.catalog_models, &selected_langs, benchmark_tier);
+        let sorted_models: Vec<EnvironmentSpeechModel> =
+            filter_speech_models_with_recommendations(
+                &self.voice.catalog_models,
+                &SpeechModelFilterOptions {
+                    search: &search_query,
+                    languages: &selected_langs,
+                    downloaded_only: self.voice.model_downloaded_only,
+                    sort: self.voice.model_sort,
+                    accuracy_language: &accuracy_lang,
+                    benchmark_tier,
+                },
+                &recommendations,
+            )
+            .into_iter()
+            .cloned()
+            .collect();
         let active_model = self.voice.catalog_models.iter().find(|m| m.active).cloned();
         let mut rendered_models = sorted_models.clone();
         if let Some(active) = &active_model
@@ -2796,6 +2830,10 @@ impl SettingsView {
                 .map(|d| ((d / model.size.max(1.0)) * 100.0).clamp(0.0, 100.0))
                 .unwrap_or(0.0);
             let bench = model_benchmark_display(&model, &selected_langs, benchmark_tier);
+            let recommendation: Option<SpeechRecommendationRole> = recommendations
+                .iter()
+                .find(|(id, _)| id == &model.id)
+                .map(|(_, role)| *role);
 
             let mut badges = h_flex().flex_wrap().gap(r(6.)).items_center().child(
                 div()
@@ -2804,8 +2842,25 @@ impl SettingsView {
                     .text_color(hsla(p.foreground))
                     .child(model.name.clone()),
             );
+            if let Some(role) = recommendation {
+                let tip: SharedString = role.tooltip().into();
+                badges = badges.child(
+                    div()
+                        .id(SharedString::from(format!("voice-model-rec-{idx}")))
+                        .px(r(6.))
+                        .py(r(1.))
+                        .rounded(r(4.))
+                        .border_1()
+                        .border_color(hsla(p.border))
+                        .text_size(r(11.))
+                        .text_color(hsla(p.muted_foreground))
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                        })
+                        .child(role.label()),
+                );
+            }
             for (cond, label) in [
-                (model.recommended, "Recommended"),
                 (model.supports_streaming, "Live preview"),
                 (model.supports_translation, "Translate"),
             ] {
@@ -2832,12 +2887,18 @@ impl SettingsView {
                 };
                 bench_row = bench_row.child(div().child(text));
             }
-            let speed_text = match &bench.speed {
-                ModelSpeedSummary::UpdateServer => "Speed: update server".to_owned(),
-                ModelSpeedSummary::NotBenchmarked => "Speed: not benchmarked".to_owned(),
-                ModelSpeedSummary::Seconds(s) => format!("Speed: {s} s / 30 s"),
-            };
-            bench_row = bench_row.child(div().child(speed_text));
+            match &bench.speed {
+                ModelSpeedSummary::Hidden => {}
+                ModelSpeedSummary::UpdateServer => {
+                    bench_row = bench_row.child(div().child("Speed: update server for this benchmark"));
+                }
+                ModelSpeedSummary::NotBenchmarked => {
+                    bench_row = bench_row.child(div().child("Speed: not benchmarked"));
+                }
+                ModelSpeedSummary::Seconds(s) => {
+                    bench_row = bench_row.child(div().child(format!("Speed: {s} s / 30 s")));
+                }
+            }
             for fact in &bench.facts {
                 bench_row = bench_row.child(div().child(fact.clone()));
             }
@@ -3196,7 +3257,7 @@ impl SettingsView {
             );
         }
 
-        let tier_label = if benchmark_tier == SpeechBenchmarkTier::Cpu { "CPU" } else { "GPU" };
+        let tier_label = if benchmark_tier == Some(SpeechBenchmarkTier::Cpu) { "CPU" } else { "GPU" };
         Row::new("speech-models", "Models")
             .description(format!(
                 "Grades are error rates and speed is seconds per 30 s of audio, from Handy\u{2019}s benchmark {tier_label}."

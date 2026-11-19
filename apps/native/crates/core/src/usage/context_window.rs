@@ -130,12 +130,98 @@ fn inherited_fork_usage(projection: &ThreadProjection) -> Option<TurnTokenUsage>
     })
 }
 
+fn is_retired_provider_thread_item(
+    item: &crate::turn_item::TurnItem,
+    active_provider_thread_id: Option<&str>,
+) -> bool {
+    match (active_provider_thread_id, item.provider_thread_id.as_deref()) {
+        (Some(active_id), Some(item_thread_id)) => item_thread_id != active_id,
+        _ => false,
+    }
+}
+
+fn compaction_snapshot(
+    before_token_count: Option<u64>,
+    after_token_count: Option<u64>,
+    max_tokens: Option<f64>,
+    updated_at: String,
+) -> Option<ContextWindowSnapshot> {
+    let used = after_token_count? as f64;
+    let max = finite(max_tokens);
+    Some(ContextWindowSnapshot {
+        used_tokens: used,
+        total_processed_tokens: before_token_count.map(|count| count as f64),
+        max_tokens: max,
+        used_percentage: used_percentage(used, max),
+        compacts_automatically: Some(true),
+        auto_compact_threshold: None,
+        prompt_cache_ttl_ms: None,
+        cost: None,
+        updated_at,
+    })
+}
+
 fn build_context_window_snapshot(
     visible_turn_items: &[ProjectedTurnItem],
     live: Option<TurnTokenUsage>,
+    active_provider_thread_id: Option<&str>,
     provider_thread: Option<&Value>,
     provider_usage: Option<ContextUsage>,
 ) -> Option<ContextWindowSnapshot> {
+    // Prefer a newer completed compaction on the active provider thread over stale pre-compaction
+    // usage (`pingdotgg/t3code#39024`, `pingdotgg/t3code#28581`).
+    let latest_completed_compaction = visible_turn_items.iter().rev().find_map(|row| {
+        if is_retired_provider_thread_item(&row.item, active_provider_thread_id) {
+            return None;
+        }
+        let TurnItemKind::Compaction {
+            before_token_count,
+            after_token_count,
+            ..
+        } = &row.item.kind
+        else {
+            return None;
+        };
+        if row.item.status != "completed" || after_token_count.is_none() {
+            return None;
+        }
+        let compacted_at = row
+            .item
+            .completed_at
+            .clone()
+            .unwrap_or_else(|| row.item.updated_at.clone());
+        Some((*before_token_count, *after_token_count, compacted_at))
+    });
+
+    let provider_updated_at = provider_thread
+        .and_then(|thread| thread.get("updatedAt"))
+        .and_then(Value::as_str);
+    let usage_updated_at = live
+        .as_ref()
+        .map(|u| u.updated_at.as_str())
+        .or_else(|| provider_usage.as_ref().and(provider_updated_at));
+
+    if let Some((before_token_count, after_token_count, compacted_at)) = latest_completed_compaction
+    {
+        let compaction_newer = match (parse_iso(&compacted_at), usage_updated_at.and_then(parse_iso))
+        {
+            (_, None) => true,
+            (Some(c), Some(u)) => c > u,
+            (None, Some(_)) => false,
+        };
+        if compaction_newer {
+            let max_tokens = live
+                .as_ref()
+                .and_then(|u| u.max_tokens)
+                .or_else(|| provider_usage.as_ref().and_then(|u| u.max_tokens));
+            if let Some(snapshot) =
+                compaction_snapshot(before_token_count, after_token_count, max_tokens, compacted_at)
+            {
+                return Some(snapshot);
+            }
+        }
+    }
+
     if let Some(live) = live {
         let used = live.used_tokens.max(0.);
         return Some(ContextWindowSnapshot {
@@ -150,8 +236,7 @@ fn build_context_window_snapshot(
             updated_at: live.updated_at,
         });
     }
-    let updated_at = provider_thread.and_then(|thread| thread.get("updatedAt")).and_then(Value::as_str);
-    if let (Some(usage), Some(updated_at)) = (provider_usage, updated_at) {
+    if let (Some(usage), Some(updated_at)) = (provider_usage, provider_updated_at) {
         let max = finite(usage.max_tokens);
         return Some(ContextWindowSnapshot {
             used_tokens: usage.used_tokens,
@@ -166,32 +251,33 @@ fn build_context_window_snapshot(
         });
     }
     visible_turn_items.iter().rev().find_map(|row| {
+        if is_retired_provider_thread_item(&row.item, active_provider_thread_id) {
+            return None;
+        }
         let TurnItemKind::Compaction { before_token_count, after_token_count, .. } = &row.item.kind else { return None };
-        let used = (*after_token_count)? as f64;
-        Some(ContextWindowSnapshot {
-            used_tokens: used,
-            total_processed_tokens: before_token_count.map(|count| count as f64),
-            max_tokens: None,
-            used_percentage: None,
-            compacts_automatically: Some(true),
-            auto_compact_threshold: None,
-            prompt_cache_ttl_ms: None,
-            cost: None,
-            updated_at: row.item.started_at.clone().unwrap_or_else(|| row.item.updated_at.clone()),
-        })
+        let updated_at = row.item.started_at.clone().unwrap_or_else(|| row.item.updated_at.clone());
+        compaction_snapshot(*before_token_count, *after_token_count, None, updated_at)
     })
 }
 
-/// `deriveLatestContextWindowSnapshot` over the open thread.
+/// `deriveLatestContextWindowSnapshot` over the open thread (`pingdotgg/t3code#28581`, `pingdotgg/t3code#39024`).
 pub fn context_window_snapshot(projection: &ThreadProjection) -> Option<ContextWindowSnapshot> {
     let provider_thread = active_provider_thread(projection);
+    let active_provider_thread_id =
+        provider_thread.and_then(|thread| thread.get("id").and_then(Value::as_str));
     let provider_usage = provider_thread
         .and_then(|thread| thread.get("contextUsage"))
         .filter(|usage| !usage.is_null())
         .and_then(|usage| serde_json::from_value::<ContextUsage>(usage.clone()).ok());
-    let live = latest_turn_usage(&projection.provider_turns, None)
+    let live = latest_turn_usage(&projection.provider_turns, active_provider_thread_id)
         .or_else(|| if provider_usage.is_none() { inherited_fork_usage(projection) } else { None });
-    build_context_window_snapshot(&projection.visible_turn_items, live, provider_thread, provider_usage)
+    build_context_window_snapshot(
+        &projection.visible_turn_items,
+        live,
+        active_provider_thread_id,
+        provider_thread,
+        provider_usage,
+    )
 }
 
 /// `formatContextWindowTokens`: `999`, `1.5k`, `12k`, `1.2m`.
@@ -394,8 +480,9 @@ pub fn compact_before_send_tokens(
     {
         return None;
     }
-    let active_provider_thread_id = projection.thread.active_provider_thread_id.as_deref();
     let provider_thread = active_provider_thread(projection);
+    let active_provider_thread_id =
+        provider_thread.and_then(|thread| thread.get("id").and_then(Value::as_str));
     let provider_usage = provider_thread
         .and_then(|thread| thread.get("contextUsage"))
         .filter(|usage| !usage.is_null())
@@ -406,8 +493,13 @@ pub fn compact_before_send_tokens(
             .flatten()
     });
     let ttl_ms = live_usage.as_ref().and_then(|usage| usage.prompt_cache_ttl_ms);
-    let snapshot =
-        build_context_window_snapshot(&projection.visible_turn_items, live_usage, provider_thread, provider_usage)?;
+    let snapshot = build_context_window_snapshot(
+        &projection.visible_turn_items,
+        live_usage,
+        active_provider_thread_id,
+        provider_thread,
+        provider_usage,
+    )?;
     should_offer_resume_compaction(
         &provider.driver,
         Some(snapshot.used_tokens),
@@ -416,4 +508,111 @@ pub fn compact_before_send_tokens(
         now_ms,
     )
     .then_some(snapshot.used_tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::ThreadProjection;
+    use serde_json::json;
+
+    #[test]
+    fn retired_provider_usage_is_ignored_and_newer_compaction_beats_stale_live_usage() {
+        // `pingdotgg/t3code#28581`: retired provider turn usage does not leak into active provider thread.
+        let retired_proj: ThreadProjection = serde_json::from_value(json!({
+            "thread": {
+                "id": "t1",
+                "projectId": "p1",
+                "title": "Thread",
+                "providerInstanceId": "claudeAgent",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "claude-sonnet-4-5"},
+                "runtimeMode": "approval-required",
+                "interactionMode": "default",
+                "branch": null,
+                "worktreePath": null,
+                "lineage": {"parentThreadId": null, "relationshipToParent": null, "rootThreadId": "t1"},
+                "activeProviderThreadId": "pt-new",
+                "createdAt": "2026-11-01T00:00:00Z",
+                "updatedAt": "2026-11-01T00:00:00Z",
+                "archivedAt": null
+            },
+            "runs": [], "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+            "providerThreads": [
+                {"id": "pt-old", "status": "retired", "updatedAt": "2026-11-01T00:00:00Z", "contextUsage": {"usedTokens": 120000, "maxTokens": 200000}},
+                {"id": "pt-new", "status": "active", "updatedAt": "2026-11-01T00:00:00Z", "contextUsage": null}
+            ],
+            "providerTurns": [
+                {
+                    "id": "turn-old",
+                    "providerThreadId": "pt-old",
+                    "tokenUsage": {"usedTokens": 120000, "maxTokens": 200000, "updatedAt": "2026-11-01T00:00:00Z"}
+                }
+            ],
+            "runtimeRequests": [], "messages": [], "plans": [], "turnItems": [],
+            "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+            "visibleTurnItems": [],
+            "updatedAt": "2026-11-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(context_window_snapshot(&retired_proj).is_none());
+
+        // `pingdotgg/t3code#39024`: newer completed compaction beats stale liveUsage.
+        let compacted_proj: ThreadProjection = serde_json::from_value(json!({
+            "thread": {
+                "id": "t1",
+                "projectId": "p1",
+                "title": "Thread",
+                "providerInstanceId": "claudeAgent",
+                "modelSelection": {"instanceId": "claudeAgent", "model": "claude-sonnet-4-5"},
+                "runtimeMode": "approval-required",
+                "interactionMode": "default",
+                "branch": null,
+                "worktreePath": null,
+                "lineage": {"parentThreadId": null, "relationshipToParent": null, "rootThreadId": "t1"},
+                "activeProviderThreadId": "pt-new",
+                "createdAt": "2026-11-01T00:00:00Z",
+                "updatedAt": "2026-11-01T10:06:00Z",
+                "archivedAt": null
+            },
+            "runs": [], "attempts": [], "nodes": [], "subagents": [], "providerSessions": [],
+            "providerThreads": [
+                {"id": "pt-new", "status": "active", "updatedAt": "2026-11-01T10:00:00Z", "contextUsage": {"usedTokens": 150000, "maxTokens": 200000}}
+            ],
+            "providerTurns": [
+                {
+                    "id": "turn-new",
+                    "providerThreadId": "pt-new",
+                    "tokenUsage": {"usedTokens": 150000, "maxTokens": 200000, "updatedAt": "2026-11-01T10:00:00Z"}
+                }
+            ],
+            "runtimeRequests": [], "messages": [], "plans": [], "turnItems": [],
+            "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+            "visibleTurnItems": [
+                {
+                    "position": 0,
+                    "visibility": "local",
+                    "sourceThreadId": "t1",
+                    "sourceItemId": "compact-1",
+                    "item": {
+                        "id": "compact-1",
+                        "runId": "run-1",
+                        "providerThreadId": "pt-new",
+                        "type": "compaction",
+                        "status": "completed",
+                        "startedAt": "2026-11-01T10:05:00Z",
+                        "completedAt": "2026-11-01T10:06:00Z",
+                        "updatedAt": "2026-11-01T10:06:00Z",
+                        "beforeTokenCount": 150000,
+                        "afterTokenCount": 18000
+                    }
+                }
+            ],
+            "updatedAt": "2026-11-01T10:06:00Z"
+        }))
+        .unwrap();
+        let snap = context_window_snapshot(&compacted_proj).expect("compacted snapshot");
+        assert_eq!(snap.used_tokens, 18_000.0);
+        assert_eq!(snap.max_tokens, Some(200_000.0));
+        assert_eq!(snap.updated_at, "2026-11-01T10:06:00Z");
+    }
 }

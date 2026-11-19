@@ -29,6 +29,8 @@ use crate::theme::{hsla, palette};
 
 /// `(instance id, cwd)`.
 type SnapshotKey = (String, String);
+/// `(environment id, environment label, threads)`.
+type SearchedEnvironmentThreads = (String, String, Vec<PaletteThread>);
 
 /// A failed scan waits this long before the next try (`WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS`).
 const SNAPSHOT_RETRY_MS: i64 = 10_000;
@@ -58,6 +60,9 @@ pub(super) struct Menu {
     paths: Option<(String, String, Vec<PathEntry>)>,
     scope: Option<(String, String)>,
     path_search: Option<(String, String, Task<()>)>,
+    /// Older settled & linked-machine `orchestration.searchThreads` hits for `@<query>` (`pingdotgg/t3code#37243`).
+    searched_threads: Option<(String, Vec<SearchedEnvironmentThreads>)>,
+    thread_search: Option<(String, Task<()>)>,
     /// The latest `pullRequests.list` reply: project_id, query, entries.
     prs: Option<(String, String, Vec<ComposerPullRequest>)>,
     pr_search: Option<(String, String, Task<()>)>,
@@ -75,6 +80,124 @@ pub(super) struct Menu {
     scroll: ScrollHandle,
     /// Threads mentioned per target. A send carries those the prompt still links.
     threads: HashMap<Target, Vec<ThreadContext>>,
+}
+
+/// Converts a shell `ThreadShell` (e.g. from `orchestration.searchThreads` older settled rows)
+/// into a `PaletteThread` for `@` thread mention ranking.
+fn palette_thread_from_shell(environment_id: &str, thread: &t3_core::shell::ThreadShell) -> PaletteThread {
+    let presented = t3_core::sidebar::thread::present_thread(thread, None);
+    PaletteThread {
+        environment_id: environment_id.to_owned(),
+        id: thread.id.clone(),
+        project_id: thread.project_id.clone(),
+        title: thread.title.clone(),
+        branch: thread.branch.clone(),
+        archived_at: thread.archived_at.clone(),
+        hidden: !presented.listed,
+        created_at: thread.created_at.clone(),
+        updated_at: thread.updated_at.clone(),
+        latest_user_message_at: thread.latest_user_message_at.clone(),
+        latest_user_authored_message_at: thread.latest_user_authored_message_at.clone(),
+        ..Default::default()
+    }
+}
+
+/// Converts a fleet `ScopedThread` into a `PaletteThread` for linked-machine `@` mentions.
+fn palette_thread_from_scoped(environment_id: &str, scoped: &t3_core::sidebar::fleet::ScopedThread) -> PaletteThread {
+    let thread = &scoped.thread;
+    PaletteThread {
+        environment_id: environment_id.to_owned(),
+        id: thread.id.clone(),
+        project_id: thread.project_id.clone(),
+        title: thread.title.clone(),
+        branch: thread.branch.clone(),
+        archived_at: thread.archived.then(|| thread.updated_at.map(format_iso).unwrap_or_default()),
+        hidden: !thread.listed,
+        created_at: scoped.created_at.clone(),
+        updated_at: thread.updated_at.map(format_iso).unwrap_or_default(),
+        latest_user_message_at: thread.latest_user_message_at.map(format_iso),
+        latest_user_authored_message_at: thread.latest_user_authored_message_at.map(|at| at.map(format_iso)),
+        opens: thread.opens.clone(),
+        ..Default::default()
+    }
+}
+
+fn environment_label_for_owner(state: &AppState, owner: &t3_core::sidebar::grouping::EnvironmentOwner) -> String {
+    state
+        .environments
+        .environments
+        .iter()
+        .find(|e| {
+            e.id == owner.saved_id
+                || owner
+                    .canonical_id
+                    .as_deref()
+                    .is_some_and(|cid| e.environment_id.as_deref() == Some(cid))
+        })
+        .map(|e| e.label.clone())
+        .filter(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| owner.saved_id.clone())
+}
+
+/// Collects cached local + linked-machine threads and environment labels for `@` mentions (`pingdotgg/t3code#37243`).
+fn collect_environment_threads(
+    state: &AppState,
+    active_env_id: &str,
+    searched: Option<&[SearchedEnvironmentThreads]>,
+) -> (Vec<PaletteThread>, HashMap<String, String>) {
+    let mut threads = palette_threads(state);
+    for t in &mut threads {
+        t.environment_id = active_env_id.to_owned();
+    }
+    let mut labels = HashMap::new();
+    if let Some(label) = state
+        .server_config
+        .config
+        .as_ref()
+        .map(|c| c.environment.label.clone())
+        .filter(|l| !l.trim().is_empty())
+    {
+        labels.insert(active_env_id.to_owned(), label);
+    }
+
+    let mut seen: HashSet<(String, String)> = threads
+        .iter()
+        .map(|t| (t.environment_id.clone(), t.id.clone()))
+        .collect();
+
+    for entry in &state.fleet.environments {
+        let env_id = entry
+            .summary
+            .owner
+            .canonical_id
+            .as_deref()
+            .unwrap_or(&entry.summary.owner.saved_id)
+            .to_owned();
+        let label = environment_label_for_owner(state, &entry.summary.owner);
+        labels.entry(env_id.clone()).or_insert(label);
+        if env_id == active_env_id {
+            continue;
+        }
+        for t in &entry.summary.threads {
+            if !t.thread.deleted && seen.insert((env_id.clone(), t.thread.id.clone())) {
+                threads.push(palette_thread_from_scoped(&env_id, t));
+            }
+        }
+    }
+
+    if let Some(extra) = searched {
+        for (env_id, label, hits) in extra {
+            if !label.trim().is_empty() {
+                labels.entry(env_id.clone()).or_insert_with(|| label.clone());
+            }
+            for hit in hits {
+                if seen.insert((env_id.clone(), hit.id.clone())) {
+                    threads.push(hit.clone());
+                }
+            }
+        }
+    }
+    (threads, labels)
 }
 
 /// The sidebar's threads in the shape thread search ranks.
@@ -173,6 +296,8 @@ impl Composer {
         self.menu.scope = scope;
         self.menu.paths = None;
         self.menu.path_search = None;
+        self.menu.searched_threads = None;
+        self.menu.thread_search = None;
         self.menu.prs = None;
         self.menu.pr_search = None;
         self.menu.pr_detail = None;
@@ -218,6 +343,7 @@ impl Composer {
             self.menu.items.clear();
             self.menu.loading = false;
             self.menu.path_search = None;
+            self.menu.thread_search = None;
             self.menu.pr_search = None;
             self.menu.pr_detail_search = None;
             return;
@@ -403,18 +529,42 @@ impl Composer {
         self.menu.pr_detail_search = Some((project_id, repository, number, task));
     }
 
-    /// Threads first, then the workspace entries of the latest search for this cwd. While a
-    /// newer query loads, the previous rows stay, but picking one does nothing.
+    /// Threads first (active + linked-machine + older settled hits), then environments, models,
+    /// and workspace entries of the latest search for this cwd.
     fn path_menu(&mut self, trigger: &Trigger, cwd: Option<String>, cx: &mut Context<Self>) -> (Vec<MenuItem>, bool) {
         let query = trigger.query.trim().to_owned();
+        let environment_id = self.environment_id(cx);
         let mut items = if query.is_empty() {
+            self.menu.thread_search = None;
             Vec::new()
         } else {
-            let environment = self.environment_id(cx);
-            let threads = palette_threads(self.state.read(cx));
-            rules::thread_items(&threads, &environment, self.thread_id().as_deref(), &trigger.query, now_ms())
+            let has_searched = self
+                .menu
+                .searched_threads
+                .as_ref()
+                .is_some_and(|(q, _)| *q == query);
+            if !has_searched
+                && query.encode_utf16().count() >= 2
+                && !matches!(&self.menu.thread_search, Some((q, _)) if *q == query)
+            {
+                self.search_threads_for_menu(query.clone(), cx);
+            }
+            let searched = self
+                .menu
+                .searched_threads
+                .as_ref()
+                .filter(|(q, _)| *q == query)
+                .map(|(_, hits)| hits.as_slice());
+            let (threads, labels) = collect_environment_threads(self.state.read(cx), &environment_id, searched);
+            rules::thread_items_across_environments(
+                &threads,
+                &environment_id,
+                self.thread_id().as_deref(),
+                &labels,
+                &trigger.query,
+                now_ms(),
+            )
         };
-        let environment_id = self.environment_id(cx);
         items.extend(t3_core::composer::records::environment_items(
             self.state.read(cx).environments.environments.iter().filter_map(|e| Some((e.environment_id.as_deref()?, e.label.as_str()))),
             &environment_id, &query,
@@ -445,6 +595,136 @@ impl Composer {
             self.search_paths(cwd, query, cx);
         }
         (items, !current)
+    }
+
+    /// Queries `orchestration.searchThreads` across active and linked/fleet machines so older
+    /// settled threads surface in the `@` picker (`pingdotgg/t3code#37243`).
+    fn search_threads_for_menu(&mut self, query: String, cx: &mut Context<Self>) {
+        let searched = query.clone();
+        let scope = self.menu.scope.clone();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(rules::PATH_SEARCH_DEBOUNCE_MS))
+                .await;
+            let plan = this.update(cx, |this, cx| {
+                if this.menu.scope != scope {
+                    return None;
+                }
+                let state = this.state.read(cx);
+                let active_env_id = this.environment_id(cx);
+                let active_label = state
+                    .server_config
+                    .config
+                    .as_ref()
+                    .map(|c| c.environment.label.clone())
+                    .unwrap_or_default();
+                let runtime = state.runtime().clone();
+                let mut active_req = None;
+                if let Some(before) = state
+                    .shell
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.older_settled.as_ref())
+                    .map(|c| c.before.clone())
+                    && let Some(client) = state.client_handle()
+                {
+                    let payload = serde_json::json!({
+                        "query": t3_core::sidebar::older_settled::truncate_search_query(&searched),
+                        "olderSettledBefore": before,
+                        "titlesOnly": true,
+                    });
+                    active_req = Some((active_env_id.clone(), active_label, client, payload));
+                }
+                let mut linked_reqs = Vec::new();
+                for entry in &state.fleet.environments {
+                    let env_id = entry
+                        .summary
+                        .owner
+                        .canonical_id
+                        .as_deref()
+                        .unwrap_or(&entry.summary.owner.saved_id)
+                        .to_owned();
+                    if env_id == active_env_id {
+                        continue;
+                    }
+                    let Some(before) = entry.summary.older_settled.as_ref().map(|c| c.before.clone()) else {
+                        continue;
+                    };
+                    if !state.scoped_ready(&entry.summary.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE) {
+                        continue;
+                    }
+                    let resolve = state
+                        .connections
+                        .destination(&entry.summary.owner, t3_core::auth::ORCHESTRATION_READ_SCOPE);
+                    let payload = serde_json::json!({
+                        "query": t3_core::sidebar::older_settled::truncate_search_query(&searched),
+                        "olderSettledBefore": before,
+                        "titlesOnly": true,
+                    });
+                    let label = environment_label_for_owner(state, &entry.summary.owner);
+                    linked_reqs.push((env_id, label, resolve, payload));
+                }
+                Some((runtime, active_req, linked_reqs))
+            });
+            let Ok(Some((runtime, active_req, linked_reqs))) = plan else {
+                return;
+            };
+            let mut results: Vec<SearchedEnvironmentThreads> = Vec::new();
+            if let Some((env_id, label, client, payload)) = active_req {
+                let value = runtime
+                    .spawn(async move {
+                        client
+                            .request(t3_core::sidebar::older_settled::SEARCH_THREADS, payload)
+                            .await
+                    })
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                if let Some(read) = value.and_then(|v| serde_json::from_value::<t3_core::families::FamilyRead>(v).ok()) {
+                    let threads = read
+                        .threads
+                        .iter()
+                        .map(|t| palette_thread_from_shell(&env_id, t))
+                        .collect();
+                    results.push((env_id, label, threads));
+                }
+            }
+            for (env_id, label, resolve, payload) in linked_reqs {
+                let value = match resolve.await {
+                    Ok(target) => runtime
+                        .spawn(async move {
+                            target
+                                .client
+                                .request(t3_core::sidebar::older_settled::SEARCH_THREADS, payload)
+                                .await
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok),
+                    Err(_) => None,
+                };
+                if let Some(read) = value.and_then(|v| serde_json::from_value::<t3_core::families::FamilyRead>(v).ok()) {
+                    let threads = read
+                        .threads
+                        .iter()
+                        .map(|t| palette_thread_from_shell(&env_id, t))
+                        .collect();
+                    results.push((env_id, label, threads));
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                if this.menu.scope != scope
+                    || !matches!(&this.menu.thread_search, Some((q, _)) if *q == searched)
+                {
+                    return;
+                }
+                this.menu.thread_search = None;
+                this.menu.searched_threads = Some((searched, results));
+                this.refresh_menu(cx);
+                cx.notify();
+            });
+        });
+        self.menu.thread_search = Some((query, task));
     }
 
     fn search_paths(&mut self, cwd: String, query: String, cx: &mut Context<Self>) {
@@ -703,6 +983,19 @@ impl Composer {
                 }
                 self.draft_changed(cx);
             }
+            MenuAction::LinkedThread { environment_id, thread_id, title } => {
+                if trigger.kind != TriggerKind::Path {
+                    return;
+                }
+                let context = ThreadContext::new(&environment_id, &thread_id, &title);
+                self.replace_trigger(&text, &trigger, &format!("{} ", context.reference()), window, cx);
+                if let Some(target) = self.snapshot.target.clone() {
+                    let threads = self.menu.threads.entry(target).or_default();
+                    threads.retain(|existing| existing.context_id != context.context_id);
+                    threads.push(context);
+                }
+                self.draft_changed(cx);
+            }
             MenuAction::PullRequest(pr) => {
                 if trigger.kind != TriggerKind::PullRequest {
                     return;
@@ -765,13 +1058,27 @@ impl Composer {
     }
 
     /// The `context` a send to the current target carries: the terminal excerpts and threads
-    /// its text still links, then its attachments.
+    /// its text still links, then its attachments (preserving SnapShot `source` metadata and long
+    /// preview-annotation comments up to `COMPOSER_CONTEXT_PREVIEW_COMMENT_MAX_CHARS`).
     pub(super) fn message_context(&self, text: &str, attachments: &[t3_core::composer::attachments::Attachment]) -> Option<serde_json::Value> {
         let threads = self.snapshot.target.as_ref().and_then(|target| self.menu.threads.get(target)).map(Vec::as_slice).unwrap_or_default();
         let base = t3_core::composer::attachments::message_context_with_reviews(text, threads, self.current_terminals(), self.current_reviews(), attachments);
         let mut records = base.and_then(|value| value["records"].as_array().cloned()).unwrap_or_default();
+        // Preserve SnapShot `source` metadata on staged image records (`pingdotgg/t3code#37771`).
+        for staged in self.staged() {
+            if let Some(source) = staged.snapshot_source.as_ref() {
+                let cid = staged.attachment.context_id();
+                if let Some(rec) = records.iter_mut().find(|r| t3_core::composer::records::field(r, "contextId") == cid)
+                    && let Some(obj) = rec.as_object_mut()
+                {
+                    obj.insert("source".to_owned(), source.clone());
+                }
+            }
+        }
         if let Some(target) = &self.snapshot.target {
-            records.extend(self.records_for(target).iter().map(|r| (**r).clone()));
+            for r in self.records_for(target) {
+                records.push(t3_core::composer::records::clamp_preview_annotation_record((**r).clone()));
+            }
             if let Some(reply) = self.reply_to_for(target) {
                 records.push(reply.clone());
             }
@@ -882,7 +1189,7 @@ impl Composer {
             MenuAction::Path { kind: PathKind::Directory, .. } => Some(Icon::Folder.render(px(16.), hsla(p.muted_foreground)).into_any_element()),
             MenuAction::Path { .. } => Some(Icon::File.render(px(16.), hsla(p.muted_foreground)).into_any_element()),
             MenuAction::Environment { .. } => Some(Icon::Server.render(px(16.), muted).into_any_element()),
-            MenuAction::Thread { .. } => Some(Icon::MessagesSquare.render(px(16.), muted).into_any_element()),
+            MenuAction::Thread { .. } | MenuAction::LinkedThread { .. } => Some(Icon::MessagesSquare.render(px(16.), muted).into_any_element()),
             MenuAction::Model { instance_id, .. } => self.state.read(cx).server_config.config.as_ref().and_then(|config| {
                 let entries = provider_rules::entries(config, self.target_project());
                 let entry = entries.iter().find(|entry| entry.instance_id() == instance_id)?;

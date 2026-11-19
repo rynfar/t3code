@@ -392,7 +392,15 @@ impl Composer {
                     .into_any_element(),
             );
         }
-        let has_text = self.has_text || !self.staged().is_empty() || self.current_reply_to().is_some();
+        let preparing = self
+            .attachment_target()
+            .is_some_and(|target| self.attachments.preparations.count(&super::drafts::key(&target)) > 0);
+        let current_prompt = self.prompt(cx);
+        let has_text = self.has_text
+            || !self.staged().is_empty()
+            || preparing
+            || self.current_reply_to().is_some()
+            || self.has_context_records(&current_prompt);
         let editing_queued = self.editing_queued().is_some();
         if (can_interrupt || stop_retained) && !has_text && !editing_queued && !voice_blocks {
             return with_voice(stop_button().into_any_element());
@@ -555,6 +563,9 @@ impl Render for Composer {
         div().w_full().flex().justify_center().px(px(gutter)).pb(px(if self.fixed.is_some() { 12. } else { 16. })).pt(px(8.)).child(
             v_flex()
                 .key_context("Composer")
+                .on_modifiers_changed(cx.listener(|_, event: &gpui::ModifiersChangedEvent, _, cx| {
+                    crate::voice::handle_modifiers_changed(&event.modifiers, cx);
+                }))
                 .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                     if event.keystroke.key == "enter" {
                         this.enter_repeat = event.is_held;

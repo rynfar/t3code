@@ -481,6 +481,12 @@ pub fn resolved_draft_keys<'a>(
         .collect()
 }
 
+/// Returns whether a runtime request ended without user answers (cancelled/stopped or expired),
+/// meaning its attached files should return to the thread composer (`pingdotgg/t3code#38005`).
+pub fn is_unanswered_request_status(status: &str) -> bool {
+    matches!(status, "cancelled" | "expired")
+}
+
 #[cfg(test)]
 mod resolution_tests {
     use super::*;

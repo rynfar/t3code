@@ -328,6 +328,50 @@ impl UploadQueue {
             .collect()
     }
 
+    pub fn target_of(&self, job_key: &str) -> Option<&DraftTarget> {
+        self.jobs.get(job_key).map(|job| &job.target)
+    }
+
+    /// Marks an already-`Ready` upload as `Failed` after send-time verification reported it
+    /// missing or unreachable without local bytes to re-upload (`pingdotgg/t3code#32910`).
+    pub fn mark_verification_failed(
+        &mut self,
+        job_key: &str,
+        expected_attachment_id: &str,
+        reason: String,
+    ) -> Vec<QueueEffect> {
+        let Some(job) = self.jobs.get_mut(job_key) else {
+            return Vec::new();
+        };
+        let AttachmentUploadState::Ready(ref ready) = job.state else {
+            return Vec::new();
+        };
+        if ready.attachment_id != expected_attachment_id {
+            return Vec::new();
+        }
+        let previous = ready.clone();
+        let environment_id = previous.environment_id.clone();
+        let failed = AttachmentUploadState::Failed {
+            environment_id: environment_id.clone(),
+            attachment_id: None,
+            reason,
+            previous: Some(previous),
+        };
+        job.state = failed.clone();
+        job.phase = JobPhase::Settled;
+        vec![
+            QueueEffect::StateChanged {
+                job_key: job_key.to_owned(),
+                target: job.target.clone(),
+                state: Some(failed),
+            },
+            QueueEffect::Settled {
+                job_key: job_key.to_owned(),
+                environment_id,
+            },
+        ]
+    }
+
     /// Records a newly minted `attachment_id` from `on_minted`. Returns `false` if `job_token` is
     /// no longer active (was cancelled or superseded while minting), signalling the caller to
     /// immediately delete the freshly minted asset.
@@ -363,6 +407,32 @@ impl UploadQueue {
         persisted_attachment_id: Option<String>,
         current_state: Option<AttachmentUploadState>,
     ) -> (Option<JobToken>, Vec<QueueEffect>) {
+        self.start_with_force(
+            job_key,
+            target,
+            environment_id,
+            has_bytes,
+            persisted_attachment_id,
+            current_state,
+            false,
+        )
+    }
+
+    /// Starts or rebinds an upload; when `force` is true, bypasses an already-`Ready` upload and
+    /// skips persisted-ID verification so expired server uploads re-upload fresh bytes
+    /// (`pingdotgg/t3code#32910`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_force(
+        &mut self,
+        job_key: String,
+        target: DraftTarget,
+        environment_id: String,
+        has_bytes: bool,
+        persisted_attachment_id: Option<String>,
+        current_state: Option<AttachmentUploadState>,
+        force: bool,
+    ) -> (Option<JobToken>, Vec<QueueEffect>) {
+        let persisted_attachment_id = if force { None } else { persisted_attachment_id };
         if let Some(existing_job) = self.jobs.get_mut(&job_key)
             && matches!(existing_job.phase, JobPhase::Queued | JobPhase::Active)
             && existing_job.environment_id == environment_id
@@ -372,7 +442,11 @@ impl UploadQueue {
             return (Some(existing_job.token), Vec::new());
         }
 
-        let effective_state = current_state.or_else(|| self.jobs.get(&job_key).map(|j| j.state.clone()));
+        let effective_state = if force {
+            None
+        } else {
+            current_state.or_else(|| self.jobs.get(&job_key).map(|j| j.state.clone()))
+        };
 
         if let Some(AttachmentUploadState::Ready(ref ready)) = effective_state
             && ready.environment_id == environment_id

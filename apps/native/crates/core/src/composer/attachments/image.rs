@@ -568,9 +568,42 @@ pub fn classify_file_with_mime(name: &str, raw_mime_type: Option<&str>) -> MimeC
     }
 }
 
+/// Synchronous cyrb53 byte hash (`rememberComposerImageBytes` in `composerAttachmentFiles.ts`,
+/// `pingdotgg/t3code#37116`): distinguishes two pasted images that share identical name/size/MIME.
+pub fn composer_image_fingerprint(bytes: &[u8]) -> String {
+    let mut h1: u32 = 0xdead_beef;
+    let mut h2: u32 = 0x41c6_ce57;
+    for &byte in bytes {
+        h1 = (h1 ^ u32::from(byte)).wrapping_mul(2_654_435_761);
+        h2 = (h2 ^ u32::from(byte)).wrapping_mul(1_597_334_677);
+    }
+    h1 = (h1 ^ (h1 >> 16))
+        .wrapping_mul(2_246_822_507)
+        ^ (h2 ^ (h2 >> 13)).wrapping_mul(3_266_489_909);
+    h2 = (h2 ^ (h2 >> 16))
+        .wrapping_mul(2_246_822_507)
+        ^ (h1 ^ (h1 >> 13)).wrapping_mul(3_266_489_909);
+    let combined = u64::from(h2 & 0x001f_ffff) * 4_294_967_296 + u64::from(h1);
+    format!("bytes:{combined:x}")
+}
+
 /// `composerImageDedupKey` (`apps/web/src/components/chat/composerAttachmentFiles.ts`).
 pub fn composer_image_dedup_key(mime_type: &str, size_bytes: u64, name: &str) -> String {
     format!("{mime_type}\0{size_bytes}\0{name}")
+}
+
+/// Byte-aware `composerImageDedupKey` (`pingdotgg/t3code#37116`): includes the content hash when
+/// bytes are available so distinct images with matching metadata are both kept.
+pub fn composer_image_dedup_key_with_bytes(
+    mime_type: &str,
+    size_bytes: u64,
+    name: &str,
+    bytes: Option<&[u8]>,
+) -> String {
+    match bytes {
+        Some(data) => format!("{mime_type}\0{size_bytes}\0{name}\0{}", composer_image_fingerprint(data)),
+        None => composer_image_dedup_key(mime_type, size_bytes, name),
+    }
 }
 
 /// `fileAttachmentStagingLimit` (`apps/web/src/components/chat/composerAttachmentFiles.ts`).
@@ -637,6 +670,19 @@ pub fn attachments_to_release_on_upload_capability_loss(
 
 /// `shouldHandleComposerAttachmentPaste` (`composerAttachmentFiles.ts`).
 pub fn should_handle_attachment_paste(files: &[(&str, Option<&str>)], plain_text: &str) -> bool {
+    should_handle_attachment_paste_with_bypass(files, plain_text, false)
+}
+
+/// `shouldHandleComposerAttachmentPaste` with `bypassAutoAttachment` (`pingdotgg/t3code#38475`):
+/// Paste as Text keeps plain text even when the clipboard also carries an image.
+pub fn should_handle_attachment_paste_with_bypass(
+    files: &[(&str, Option<&str>)],
+    plain_text: &str,
+    bypass_auto_attachment: bool,
+) -> bool {
+    if bypass_auto_attachment && !plain_text.is_empty() {
+        return false;
+    }
     if files.iter().any(|(name, mime)| {
         is_dng_attachment(name, *mime)
             || is_svg_attachment(name, *mime)

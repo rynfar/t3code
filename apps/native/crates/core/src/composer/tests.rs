@@ -335,3 +335,138 @@ fn clear_compact_commands_and_plan_composer_turn() {
         PlannedComposerTurn { compact_before_send: false, turn_dispatch: ComposerDispatch::Queue }
     );
 }
+
+#[test]
+fn parity_443_composer_triggers_attachments_stash_and_resume_fallback() {
+    use super::attachments::{Attachment, AttachmentKind, Upload, image as image_rules};
+    use super::menu::{MenuAction, TriggerKind, context_references, detect_trigger, thread_items_across_environments};
+    use super::records::{
+        COMPOSER_CONTEXT_PREVIEW_COMMENT_MAX_CHARS, clamp_preview_annotation_record, snapshot_source_from_record,
+    };
+    use super::stash::StashEntry;
+    use crate::palette::PaletteThread;
+    use crate::requests::attachments::is_unanswered_request_status;
+    use serde_json::json;
+
+    // `pingdotgg/t3code#38917`: manual continuation fallback text.
+    let resumed = with_manual_continuation_fallback(json!({
+        "type": "thread.turn.start",
+        "manualContinuationOfRunId": "run-1",
+        "text": ""
+    }));
+    assert_eq!(resumed["text"], MANUAL_CONTINUATION_FALLBACK_TEXT);
+    let custom = with_manual_continuation_fallback(json!({
+        "type": "thread.turn.start",
+        "manualContinuationOfRunId": "run-1",
+        "text": "keep"
+    }));
+    assert_eq!(custom["text"], "keep");
+
+    // `pingdotgg/t3code#37827`: PR trigger after `(` / `[` and `[` disallowed inside context labels.
+    let trigger = detect_trigger("see (#123", "see (#123".len()).expect("PR trigger after (");
+    assert_eq!(trigger.kind, TriggerKind::PullRequest);
+    assert_eq!(trigger.query, "123");
+    assert!(detect_trigger("foo(#123", "foo(#123".len()).is_some());
+    assert_eq!(detect_trigger("@#123", "@#123".len()).map(|t| t.kind), Some(TriggerKind::Path));
+    let refs = context_references("[outer [inner](t3-context://v1/file/file_1)");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].label, "inner");
+
+    // `pingdotgg/t3code#37243`: linked-machine threads include machine subtitle and LinkedThread action.
+    let remote = PaletteThread {
+        environment_id: "env-remote".into(),
+        id: "t-remote".into(),
+        title: "Deploy pipeline".into(),
+        updated_at: "2026-11-18T12:00:00Z".into(),
+        ..Default::default()
+    };
+    let mut env_labels = std::collections::HashMap::new();
+    env_labels.insert("env-local".to_owned(), "MacBook".to_owned());
+    env_labels.insert("env-remote".to_owned(), "Build Box".to_owned());
+    let items = thread_items_across_environments(
+        std::slice::from_ref(&remote),
+        "env-local",
+        None,
+        &env_labels,
+        "deploy",
+        1_795_000_000_000,
+    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].description, "Thread on Build Box");
+    assert!(matches!(
+        &items[0].action,
+        MenuAction::LinkedThread { environment_id, thread_id, .. }
+            if environment_id == "env-remote" && thread_id == "t-remote"
+    ));
+
+    // `pingdotgg/t3code#37498` & `pingdotgg/t3code#32404`: stash snippet renders readable mention labels & safe emoji truncation.
+    let stashed_mention = StashEntry {
+        id: "s1".into(),
+        prompt: "Review [Deploy pipeline](t3-context://v1/thread/thread_1) now".into(),
+        created_at: 0,
+        threads: Vec::new(),
+        terminals: Vec::new(),
+        review_comments: Vec::new(),
+        context_records: Vec::new(),
+        reply_to: None,
+        attachments: Vec::new(),
+    };
+    assert_eq!(stashed_mention.snippet(), "Review Deploy pipeline now");
+    let emoji_entry = StashEntry {
+        id: "s2".into(),
+        prompt: format!("{}😀😀😀", "a".repeat(119)),
+        created_at: 0,
+        threads: Vec::new(),
+        terminals: Vec::new(),
+        review_comments: Vec::new(),
+        context_records: Vec::new(),
+        reply_to: None,
+        attachments: Vec::new(),
+    };
+    let snippet = emoji_entry.snippet();
+    assert!(snippet.ends_with('…'));
+    assert!(!snippet.contains('\u{FFFD}'));
+
+    // `pingdotgg/t3code#29834`: preview annotation comment keeps up to 8,000 chars.
+    let long_comment = "x".repeat(COMPOSER_CONTEXT_PREVIEW_COMMENT_MAX_CHARS + 50);
+    let ann = clamp_preview_annotation_record(json!({"kind": "preview-annotation", "comment": long_comment}));
+    assert_eq!(
+        ann["comment"].as_str().unwrap().chars().count(),
+        COMPOSER_CONTEXT_PREVIEW_COMMENT_MAX_CHARS
+    );
+
+    // `pingdotgg/t3code#37771`: SnapShot source metadata preserved on context record & chat attachment.
+    let att = Attachment {
+        id: "img1".into(),
+        kind: AttachmentKind::Image,
+        name: "snapshot.png".into(),
+        mime_type: "image/png".into(),
+        size_bytes: 128,
+        pasted_text: false,
+        upload: Upload::Ready { attachment_id: "srv-img1".into() },
+    };
+    let source = json!({"kind": "snapshot", "url": "http://localhost:3000"});
+    let rec = att.context_record_with_source(Some(&source)).unwrap();
+    assert_eq!(snapshot_source_from_record(&rec), Some(source.clone()));
+    let chat_att = att.chat_attachment_with_source(Some(&source)).unwrap();
+    assert_eq!(chat_att["source"], source);
+
+    // `pingdotgg/t3code#37116`: distinct images with matching metadata get distinct dedup keys.
+    let k1 = image_rules::composer_image_dedup_key_with_bytes("image/png", 4, "image.png", Some(&[1, 2, 3, 4]));
+    let k2 = image_rules::composer_image_dedup_key_with_bytes("image/png", 4, "image.png", Some(&[5, 6, 7, 8]));
+    assert_ne!(k1, k2);
+    assert_eq!(
+        k1,
+        image_rules::composer_image_dedup_key_with_bytes("image/png", 4, "image.png", Some(&[1, 2, 3, 4]))
+    );
+
+    // `pingdotgg/t3code#38475`: Paste as Text bypass skips image interception.
+    let img_files = [("shot.png", Some("image/png"))];
+    assert!(!image_rules::should_handle_attachment_paste_with_bypass(&img_files, "hello", true));
+    assert!(image_rules::should_handle_attachment_paste_with_bypass(&img_files, "hello", false));
+
+    // `pingdotgg/t3code#38005`: cancelled and expired questions return attachments.
+    assert!(is_unanswered_request_status("cancelled"));
+    assert!(is_unanswered_request_status("expired"));
+    assert!(!is_unanswered_request_status("answered"));
+}

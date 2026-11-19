@@ -71,10 +71,13 @@ pub(crate) fn shell(
         "file" => Icon::File,
         _ => Icon::CircleDashed,
     };
+    let mention_path = (kind == "mention")
+        .then(|| field(record, "path").trim().to_owned())
+        .filter(|path| !path.is_empty());
     let mut tooltip = if kind == "unresolved" {
         "This context is no longer available.".into()
-    } else if kind == "mention" {
-        field(record, "path").to_owned()
+    } else if let Some(path) = &mention_path {
+        format!("{path}\nClick to copy path")
     } else {
         String::new()
     };
@@ -178,7 +181,7 @@ pub(crate) fn shell(
     } else {
         Ink::Accent(accent(accent_kind, cx))
     };
-    let clickable = thread.is_some() || url.is_some() || has_details(record);
+    let clickable = thread.is_some() || url.is_some() || mention_path.is_some() || has_details(record);
     let mut shell = if let Some(visual) = favicon {
         chip_shell_with_icon(
             field(record, "contextId"),
@@ -204,6 +207,16 @@ pub(crate) fn shell(
             }
             if let Some(url) = &url {
                 crate::pull_requests::open_context_link(&state, url, cx);
+            }
+            if let Some(path) = &mention_path {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
+                state.update(cx, |s, cx| {
+                    s.show_toast(
+                        crate::toast::Toast::new(crate::toast::ToastKind::Success, "Copied file path")
+                            .description(path.clone()),
+                        cx,
+                    );
+                });
             }
         });
     (shell, ink)

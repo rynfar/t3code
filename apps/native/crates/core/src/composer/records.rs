@@ -10,6 +10,53 @@ use serde_json::{Value, json};
 #[cfg(test)]
 mod tests;
 
+pub const COMPOSER_CONTEXT_PREVIEW_COMMENT_MAX_CHARS: usize = 8_000;
+const CONTEXT_TRUNCATION_MARKER: &str = "\n… truncated …";
+
+/// `clampContextText` (`apps/web/src/lib/composerContextRecords.ts`, `pingdotgg/t3code#29834`):
+/// clamps text to `max_utf16` UTF-16 code units with `"\n… truncated …"` without splitting
+/// surrogate pairs so long preview annotation comments are preserved rather than dropped on send.
+pub fn clamp_context_text(value: &str, max_utf16: usize) -> String {
+    let total_units = value.encode_utf16().count();
+    if total_units <= max_utf16 {
+        return value.to_owned();
+    }
+    let marker_units = CONTEXT_TRUNCATION_MARKER.encode_utf16().count();
+    let target_units = max_utf16.saturating_sub(marker_units);
+    let mut units = 0usize;
+    let mut end_byte = 0usize;
+    for (byte_idx, ch) in value.char_indices() {
+        let next = units + ch.len_utf16();
+        if next > target_units {
+            break;
+        }
+        units = next;
+        end_byte = byte_idx + ch.len_utf8();
+    }
+    format!("{}{CONTEXT_TRUNCATION_MARKER}", &value[..end_byte])
+}
+
+/// Clamps `comment` on a `preview-annotation` record to `COMPOSER_CONTEXT_PREVIEW_COMMENT_MAX_CHARS`
+/// (`pingdotgg/t3code#29834`).
+pub fn clamp_preview_annotation_record(mut record: Value) -> Value {
+    if field(&record, "kind") == "preview-annotation"
+        && let Some(comment) = record.get("comment").and_then(Value::as_str)
+    {
+        let trimmed = comment.trim();
+        let clamped = clamp_context_text(trimmed, COMPOSER_CONTEXT_PREVIEW_COMMENT_MAX_CHARS);
+        record["comment"] = json!(clamped);
+    }
+    record
+}
+
+/// Extracts optional `SnapShotSource` metadata from an `image` context record (`pingdotgg/t3code#37771`).
+pub fn snapshot_source_from_record(record: &Value) -> Option<Value> {
+    if field(record, "kind") != "image" {
+        return None;
+    }
+    record.get("source").filter(|v| v.is_object()).cloned()
+}
+
 pub fn environment_record(environment_id: &str, label: &str) -> Value {
     json!({"version":1,"kind":"environment","contextId":kind_scoped_context_id("environment", environment_id),"label":sanitize_context_label(label,"environment"),"environmentId":environment_id})
 }
