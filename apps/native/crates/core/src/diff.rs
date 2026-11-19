@@ -8,18 +8,21 @@
 
 mod base_ref;
 mod completion;
+mod expand;
 mod file_actions;
 mod file_kind;
 mod parse;
 mod hunks;
 mod reveal;
 mod review;
+mod review_threads;
 mod rows;
 mod scope;
 mod scroll;
 mod session;
 mod tool_call;
 mod tree;
+mod viewed;
 mod whitespace;
 
 use std::sync::Arc;
@@ -40,6 +43,11 @@ pub use completion::{
     narrow_pull_request_references, nudge_completion, pull_request_completion_key,
     pull_request_completions,
 };
+pub use expand::{
+    DEFAULT_EXPAND_LINES, DIFF_FILE_CONTENTS_METHOD, DiffFileContents, ExpandDirection,
+    STALE_DIFF_FILE_ERROR, decode_diff_file_contents, diff_file_contents_request,
+    expand_file_to_line, expand_hunk_context, reproduces_patch, trailing_hidden_lines,
+};
 pub use parse::parse_patch;
 pub use file_actions::{
     FileContextMenuAction, FileContextMenuCapabilities, file_context_menu_error_title,
@@ -53,9 +61,17 @@ pub use reveal::{
     file_matches_path, find_nearest_row_for_line, find_selection_row, line_number_for_side,
 };
 pub use review::{review_boundary_near, ReviewScope, ReviewFile, ReviewModel, PatchTicket, FilePatchState};
+pub use review_threads::{
+    InlineReviewComment, InlineReviewThread, InlineReviewThreadsState, ResolvedAvatar,
+    ResolvedAvatarCluster, ReviewActor, resolve_inline_review_anchor,
+};
 pub use scroll::{ScrollRestore, ScrollRestoreAction};
 pub use session::DiffSession;
-pub use rows::{DiffRow, Layout, build_rows, file_rows, separator_label};
+pub use rows::{DiffRow, Layout, build_rows, file_rows, file_rows_with_trailing, separator_label};
+pub use viewed::{
+    FILES_VIEWED_FLUSH_DELAY_MS, FileViewedPress, FileViewedState, FilesViewedTracker,
+    SET_FILES_VIEWED_METHOD, set_files_viewed_payload, viewed_range_indices,
+};
 pub use scope::{
     BranchCommit, BranchCommits, CheckpointFile, method, DiffPreviewSource, DiffScope,
     DiffSelection, FileTotals, PreviewSourceKind, TurnDiffSummary,
@@ -149,6 +165,16 @@ impl FileDiff {
 
     pub fn line_count(&self) -> usize {
         self.hunks.line_count()
+    }
+
+    /// The old blob object ID from `index <old>..<new>`, if present and non-zero.
+    pub fn old_object_id(&self) -> Option<&str> {
+        self.hunks.old_object_id()
+    }
+
+    /// The new blob object ID from `index <old>..<new>` (Pierre's `FileDiffMetadata.newObjectId`).
+    pub fn new_object_id(&self) -> Option<&str> {
+        self.hunks.new_object_id()
     }
 }
 

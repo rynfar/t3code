@@ -19,7 +19,7 @@ use gpui::{
 };
 use gpui_component::tooltip::Tooltip;
 
-pub use drawer::{RunningTerminals, TerminalDrawer};
+pub use drawer::{RunningTerminals, TerminalDrawer, open_script_terminal};
 pub use pane::{PaneEvent, TerminalPane};
 pub use session::Target;
 pub use element::{set_typography, typography};

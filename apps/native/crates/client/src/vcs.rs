@@ -2,19 +2,92 @@
 //! `onSettled` hooks in `state/vcs.ts`, `state/git.ts`, `state/sourceControl.ts`, and the
 //! stacked-action finalizer in `state/vcsAction.ts`.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
 use t3_core::rpc::RpcFailure;
-use t3_core::vcs::{ListRefsResult, VcsBranchStatus, VcsStatusEvent, branch_fallback_subscription, branch_status_from_status_event, branch_subscription, method, refs::RefCache};
+use t3_core::vcs::{
+    ListRefsResult, VcsBranchStatus, VcsStatusEvent, branch_fallback_subscription,
+    branch_status_from_status_event, branch_subscription, method,
+    refs::{RefCache, can_use_offline_refs_cache},
+};
 use tokio::sync::watch;
 
 use crate::session::{RpcError, StreamHandle};
+use crate::store;
 use crate::supervisor::ClientHandle;
+
+const MAX_CACHED_CWDS: usize = 64;
+
+fn refs_cache_path_in(base: &std::path::Path, environment_key: &str) -> Option<PathBuf> {
+    let key: String = environment_key
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') { ch } else { '_' })
+        .take(96)
+        .collect();
+    if key.is_empty() {
+        return None;
+    }
+    Some(base.join("vcs-refs").join(format!("{key}.json")))
+}
+
+fn refs_cache_path(environment_key: &str) -> Option<PathBuf> {
+    refs_cache_path_in(&store::base()?, environment_key)
+}
+
+fn read_disk_cache_at(path: &std::path::Path) -> Option<BTreeMap<String, ListRefsResult>> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn read_disk_cache(environment_key: &str) -> Option<BTreeMap<String, ListRefsResult>> {
+    read_disk_cache_at(&refs_cache_path(environment_key)?)
+}
+
+fn write_disk_cache_at(path: &std::path::Path, cwd: &str, refs: &ListRefsResult) -> std::io::Result<()> {
+    let mut map = read_disk_cache_at(path).unwrap_or_default();
+    if !map.contains_key(cwd) && map.len() >= MAX_CACHED_CWDS {
+        map.pop_first();
+    }
+    map.insert(cwd.to_owned(), refs.clone());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let payload = serde_json::to_vec(&map).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, payload)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn write_disk_cache(environment_key: &str, cwd: &str, refs: &ListRefsResult) -> std::io::Result<()> {
+    let Some(path) = refs_cache_path(environment_key) else {
+        return Ok(());
+    };
+    write_disk_cache_at(&path, cwd, refs)
+}
+
+fn clear_disk_cache_at(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn clear_disk_cache(environment_key: &str) -> std::io::Result<()> {
+    let Some(path) = refs_cache_path(environment_key) else {
+        return Ok(());
+    };
+    clear_disk_cache_at(&path)
+}
 
 #[derive(Clone)]
 pub(crate) struct RefState {
     cache: Arc<Mutex<RefCache>>,
+    persisted_env: Arc<Mutex<Option<String>>>,
+    persistence_lock: Arc<Mutex<()>>,
     revision: watch::Sender<u64>,
 }
 
@@ -22,6 +95,8 @@ impl Default for RefState {
     fn default() -> Self {
         Self {
             cache: Arc::default(),
+            persisted_env: Arc::default(),
+            persistence_lock: Arc::default(),
             revision: watch::channel(0).0,
         }
     }
@@ -30,6 +105,17 @@ impl Default for RefState {
 impl RefState {
     fn lock(&self) -> MutexGuard<'_, RefCache> {
         self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_environment_key(&self, environment_key: &str) {
+        let mut guard = self.persisted_env.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.as_deref() != Some(environment_key) {
+            *guard = Some(environment_key.to_owned());
+        }
+    }
+
+    fn environment_key(&self) -> Option<String> {
+        self.persisted_env.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub(crate) fn on_settled(&self, method: &'static str) -> Option<OnSettled> {
@@ -44,8 +130,15 @@ pub(crate) struct OnSettled {
 
 impl Drop for OnSettled {
     fn drop(&mut self) {
+        let _persist_guard = self.state.persistence_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let env_key = self.state.environment_key();
+        let readable = match env_key.as_deref() {
+            Some(key) => clear_disk_cache(key).is_ok(),
+            None => true,
+        };
         let mut cache = self.state.lock();
         if cache.settle(self.method) {
+            cache.set_persisted_cache_readable(readable);
             self.state.revision.send_replace(cache.revision());
         }
     }
@@ -161,9 +254,33 @@ impl ClientHandle {
         self.request(method::VCS_REFRESH_BRANCH, branch_subscription(cwd)).await.map(drop).map_err(|error| error.to_string())
     }
 
+    /// Reads the persisted offline ref snapshot for `(environment_key, cwd)` when the cache is
+    /// readable (`makeCachedVcsRefsChanges` in `packages/client-runtime/src/state/vcs.ts`).
+    pub fn load_cached_refs(&self, environment_key: &str, cwd: &str) -> Option<ListRefsResult> {
+        self.refs.set_environment_key(environment_key);
+        let _persist_guard = self.refs.persistence_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.refs.lock().persisted_cache_readable() {
+            return None;
+        }
+        read_disk_cache(environment_key)?.remove(cwd)
+    }
+
     /// `None` means invalidation superseded this response; it must never reach the picker.
     pub async fn list_refs(&self, input: Value) -> Result<Option<ListRefsResult>, String> {
+        self.list_refs_with_cache(None, input).await
+    }
+
+    /// Like [`ClientHandle::list_refs`], and persists unfiltered first-page snapshots under
+    /// `environment_key` for offline startup / recovery (`commitVcsRefsRefresh`).
+    pub async fn list_refs_cached(&self, environment_key: &str, input: Value) -> Result<Option<ListRefsResult>, String> {
+        self.refs.set_environment_key(environment_key);
+        self.list_refs_with_cache(Some(environment_key), input).await
+    }
+
+    async fn list_refs_with_cache(&self, environment_key: Option<&str>, input: Value) -> Result<Option<ListRefsResult>, String> {
         let generation = *self.connection_generation().borrow();
+        let persist = environment_key.is_some() && can_use_offline_refs_cache(&input);
+        let cwd = input["cwd"].as_str().unwrap_or_default().to_owned();
         let request = self.refs.lock().begin(input);
         let result = self.request(method::VCS_LIST_REFS, request.input.clone()).await;
         if *self.connection_generation().borrow() != generation || self.refs.lock().revision() != request.revision() {
@@ -171,7 +288,28 @@ impl ClientHandle {
         }
         let value = result.map_err(|error| error.to_string())?;
         let refs = serde_json::from_value::<ListRefsResult>(value).map_err(|error| error.to_string())?;
-        Ok(self.refs.lock().commit(&request).then_some(refs))
+        let _persist_guard = self.refs.persistence_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let (committed, was_readable) = {
+            let mut cache = self.refs.lock();
+            let readable = cache.persisted_cache_readable();
+            (cache.commit(&request), readable)
+        };
+        if !committed {
+            return Ok(None);
+        }
+        if persist && let Some(env_key) = environment_key {
+            let mut readable = was_readable;
+            if !readable {
+                readable = clear_disk_cache(env_key).is_ok();
+            }
+            if write_disk_cache(env_key, &cwd, &refs).is_ok() && readable != was_readable {
+                let mut cache = self.refs.lock();
+                if cache.revision() == request.revision() {
+                    cache.set_persisted_cache_readable(readable);
+                }
+            }
+        }
+        Ok(Some(refs))
     }
 }
 
@@ -274,5 +412,23 @@ mod tests {
 
         let (item, _stream) = recv.await.unwrap();
         assert_eq!(item.unwrap().unwrap(), VcsBranchStatus { ref_name: Some("main".into()), is_repo: Some(true) });
+    }
+
+    #[test]
+    fn offline_ref_disk_cache_roundtrips_and_clears() {
+        let dir = std::env::temp_dir().join(format!("t3-vcs-refs-test-{}", uuid::Uuid::new_v4()));
+        let path = super::refs_cache_path_in(&dir, "env:local/1").expect("cache path");
+        let refs: super::ListRefsResult = serde_json::from_value(json!({
+            "refs": [{ "name": "main", "current": true }, { "name": "feat/offline" }],
+            "nextCursor": null,
+            "totalCount": 2
+        }))
+        .unwrap();
+        super::write_disk_cache_at(&path, "/repo", &refs).unwrap();
+        let loaded = super::read_disk_cache_at(&path).expect("loaded");
+        assert_eq!(loaded.get("/repo"), Some(&refs));
+        super::clear_disk_cache_at(&path).unwrap();
+        assert!(super::read_disk_cache_at(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

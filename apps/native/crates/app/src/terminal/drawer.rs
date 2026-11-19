@@ -40,6 +40,30 @@ pub struct RunningTerminals {
 
 impl gpui::Global for RunningTerminals {}
 
+/// The workspace's live terminal drawer, so `runProjectScript` (`GT-SCRIPTS`) can open and focus
+/// the script's terminal from `GitStore` or keybindings without holding a `Window`.
+struct ActiveDrawer(gpui::WeakEntity<TerminalDrawer>);
+
+impl gpui::Global for ActiveDrawer {}
+
+/// Opens and focuses `terminal_id` in `thread_id`'s terminal drawer (`useChatTerminalActions.ts`).
+pub fn open_script_terminal(thread_id: String, terminal_id: String, cx: &mut App) {
+    let Some(drawer) = cx.try_global::<ActiveDrawer>().and_then(|active| active.0.upgrade()) else {
+        return;
+    };
+    if let Some(window) = cx.active_window().or_else(|| cx.windows().into_iter().next()) {
+        let _ = window.update(cx, |_, window, cx| {
+            drawer.update(cx, |drawer, cx| drawer.open_terminal_for_thread(&thread_id, &terminal_id, window, cx));
+        });
+    } else {
+        drawer.update(cx, |drawer, cx| {
+            drawer.layouts.ensure(&thread_id, &terminal_id, true, Some(true));
+            drawer.schedule_save(cx);
+            cx.notify();
+        });
+    }
+}
+
 pub(super) type SharedMetadataCache = Rc<RefCell<(Instant, MetadataCache)>>;
 
 pub struct TerminalDrawer {
@@ -91,6 +115,8 @@ impl TerminalDrawer {
             _subscriptions: vec![subscription],
         };
         drawer.connection_changed(window, cx);
+        let weak = cx.entity().downgrade();
+        cx.set_global(ActiveDrawer(weak));
         drawer
     }
 
@@ -418,8 +444,18 @@ impl TerminalDrawer {
     /// script's (`openSetupTerminal`).
     pub fn open_terminal(&mut self, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.selected_thread(cx) else { return };
-        self.layouts.ensure(&thread_id, terminal_id, true, Some(true));
-        self.changed(window, cx);
+        self.open_terminal_for_thread(&thread_id, terminal_id, window, cx);
+    }
+
+    /// Opens `terminal_id` in `thread_id`'s drawer layout and focuses it when `thread_id` is open.
+    pub fn open_terminal_for_thread(&mut self, thread_id: &str, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.layouts.ensure(thread_id, terminal_id, true, Some(true));
+        if self.selected_thread(cx).as_deref() == Some(thread_id) {
+            self.changed(window, cx);
+        } else {
+            self.schedule_save(cx);
+            cx.notify();
+        }
     }
 
     fn open_if_closed(&mut self, cx: &App) {

@@ -5,7 +5,7 @@
 //! picker's badges and filter (`BranchPicker.tsx`), the branch permissions in
 //! `BranchToolbarBranchSelector.tsx`, and `resolveChangesTotals` (`GitActionsControl.logic.ts`).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::auth::{AuthSessionState, ORCHESTRATION_OPERATE_SCOPE, SOURCE_CONTROL_WRITE_SCOPE};
@@ -24,7 +24,11 @@ pub mod method {
     pub const VCS_CREATE_REF: &str = "vcs.createRef";
     pub const VCS_SWITCH_REF: &str = "vcs.switchRef";
     pub const VCS_INIT: &str = "vcs.init";
+    pub const VCS_REMOVE_WORKTREE: &str = "vcs.removeWorktree";
     pub const GIT_RUN_STACKED_ACTION: &str = "git.runStackedAction";
+    pub const GIT_RESOLVE_PULL_REQUEST: &str = "git.resolvePullRequest";
+    pub const GIT_PREPARE_PULL_REQUEST_THREAD: &str = "git.preparePullRequestThread";
+    pub const ORCHESTRATION_GET_WORKTREE_THREAD_IDS: &str = "orchestration.getWorktreeThreadIds";
     pub const SHELL_OPEN_IN_EDITOR: &str = "shell.openInEditor";
     pub const TERMINAL_OPEN: &str = "terminal.open";
     pub const TERMINAL_WRITE: &str = "terminal.write";
@@ -244,7 +248,7 @@ pub fn format_diff_count(count: u64) -> String {
     grouped
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VcsRef {
     pub name: String,
@@ -266,7 +270,7 @@ impl VcsRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListRefsResult {
     #[serde(default)]
@@ -365,6 +369,101 @@ pub fn create_ref(cwd: &str, ref_name: &str) -> Value {
 
 pub fn open_in_editor(cwd: &str, editor: &str) -> Value {
     json!({ "cwd": cwd, "editor": editor })
+}
+
+/// `VcsRemoveWorktreeInput`.
+pub fn remove_worktree(cwd: &str, path: &str, force: bool) -> Value {
+    json!({ "cwd": cwd, "path": path, "force": force })
+}
+
+/// `orchestration.getWorktreeThreadIds` input.
+pub fn worktree_thread_ids_request(worktree_path: &str) -> Value {
+    json!({ "worktreePath": worktree_path })
+}
+
+/// Decodes `orchestration.getWorktreeThreadIds` output.
+pub fn decode_worktree_thread_ids(value: &Value) -> Result<Vec<String>, String> {
+    let ids = value
+        .get("threadIds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Missing threadIds array.".to_owned())?;
+    Ok(ids.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+}
+
+/// `GitResolvedPullRequest` (`packages/contracts/src/git.ts`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedPullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub base_branch: String,
+    pub head_branch: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvePullRequestResult {
+    pub pull_request: ResolvedPullRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullRequestCheckoutMode {
+    Local,
+    Worktree,
+}
+
+impl PullRequestCheckoutMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PullRequestCheckoutMode::Local => "local",
+            PullRequestCheckoutMode::Worktree => "worktree",
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `GitPreparePullRequestThreadResult`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparePullRequestThreadResult {
+    pub pull_request: ResolvedPullRequest,
+    pub branch: String,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default = "default_true")]
+    pub is_on_pull_request_head: bool,
+}
+
+/// `GitPullRequestRefInput`.
+pub fn resolve_pull_request(cwd: &str, reference: &str) -> Value {
+    json!({ "cwd": cwd, "reference": reference })
+}
+
+/// `GitPreparePullRequestThreadInput`.
+pub fn prepare_pull_request_thread(cwd: &str, reference: &str, mode: PullRequestCheckoutMode, thread_id: Option<&str>) -> Value {
+    let mut payload = Map::new();
+    payload.insert("cwd".into(), json!(cwd));
+    payload.insert("reference".into(), json!(reference));
+    payload.insert("mode".into(), json!(mode.as_str()));
+    if mode == PullRequestCheckoutMode::Worktree
+        && let Some(thread_id) = thread_id
+    {
+        payload.insert("threadId".into(), json!(thread_id));
+    }
+    Value::Object(payload)
+}
+
+/// `offHeadPullRequestCheckoutToast` (`pullRequestCheckoutToast.ts`).
+pub fn off_head_checkout_toast(singular: &str) -> (&'static str, String) {
+    (
+        "Checked out, but not confirmed on the latest commit",
+        format!("This checkout could not be confirmed at the {singular}'s latest commit, so its code may differ. Local commits or uncommitted work keep a checkout where it is."),
+    )
 }
 
 /// `EDITORS` (`packages/contracts/src/editor.ts`): ids in the web's preference order.

@@ -27,12 +27,16 @@ use gpui_component::v_flex;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::composer::review::Side;
 use t3_core::diff::{
-    BranchCommits, DiffLine, DiffScope, DiffSelection, DiffSession, FileContextMenuAction,
-    FileContextMenuCapabilities, FileReveal, FileRevealTarget, Layout, ParsedPatch, RevealAction,
-    ScrollRestore, ScrollRestoreAction, TurnDiffSummary, branch_commits_request,
-    decode_branch_commits, file_context_menu_error_title, file_context_menu_open_request,
+    BranchCommits, DiffFileContents, DiffLine, DiffScope, DiffSelection, DiffSession,
+    ExpandDirection, FILES_VIEWED_FLUSH_DELAY_MS, FileContextMenuAction,
+    FileContextMenuCapabilities, FileReveal, FileRevealTarget, FileViewedState, FilesViewedTracker,
+    InlineReviewThread, InlineReviewThreadsState, Layout, ParsedPatch, PreviewSourceKind,
+    RevealAction, ScrollRestore, ScrollRestoreAction, TurnDiffSummary, branch_commits_request,
+    decode_branch_commits, decode_diff_file_contents, diff_file_contents_request,
+    expand_hunk_context, file_context_menu_error_title, file_context_menu_open_request,
     line_number_for_side, project_commit_url, resolve_file_context_menu_absolute_path,
-    turn_diff_summaries, workspace_mutation_id,
+    set_files_viewed_payload, trailing_hidden_lines, turn_diff_summaries, viewed_range_indices,
+    workspace_mutation_id,
 };
 use t3_core::right_panel::SurfaceKind;
 
@@ -106,7 +110,38 @@ pub struct DiffPanel {
     branch_commits_key: Option<(String, String, Option<String>)>,
     branch_commits_generation: u64,
     _branch_commits: Option<Task<()>>,
+    /// Per-file hydrated contents and loading/error status for hidden hunk context expansion.
+    expansions: HashMap<String, FileExpansionState>,
+    expansion_scope_key: Option<String>,
+    /// Revision-tracked PR files-viewed state (`pingdotgg/t3code#35114`).
+    viewed_target: Option<ViewedTarget>,
+    viewed_tracker: FilesViewedTracker,
+    last_viewed_file_key: Option<String>,
+    _viewed_flush: Option<Task<()>>,
+    /// Inline review conversations and resolved-avatar expansion state (`pingdotgg/t3code#34644`).
+    pub(super) review_threads: InlineReviewThreadsState,
     _subscription: Subscription,
+}
+
+#[derive(Default)]
+pub(super) struct FileExpansionState {
+    pub contents: Option<DiffFileContents>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub _task: Option<Task<()>>,
+}
+
+/// Host target for revision-tracked `pullRequests.setFilesViewed` (`pingdotgg/t3code#35114`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewedTarget {
+    pub project_id: String,
+    pub number: u64,
+    pub host: Option<String>,
+    pub repository: Option<String>,
+    /// Set when viewing a single commit diff, so `revision` is omitted from `setFilesViewed`.
+    pub commit: Option<String>,
+    pub enabled: bool,
 }
 
 type ScrollHandler = Box<dyn FnMut(&gpui::ListScrollEvent, &mut Window, &mut gpui::App)>;
@@ -206,6 +241,13 @@ impl DiffPanel {
             branch_commits_key: None,
             branch_commits_generation: 0,
             _branch_commits: None,
+            expansions: HashMap::new(),
+            expansion_scope_key: None,
+            viewed_target: None,
+            viewed_tracker: FilesViewedTracker::default(),
+            last_viewed_file_key: None,
+            _viewed_flush: None,
+            review_threads: InlineReviewThreadsState::default(),
             _subscription: subscription,
         };
         let entity = cx.entity().downgrade();
@@ -272,6 +314,8 @@ impl DiffPanel {
             self.branch_commits_generation += 1;
             self._branch_commits = None;
             self.comments = comments::Comments::default();
+            self.expansions.clear();
+            self.expansion_scope_key = None;
             self.file_reveal.reset();
             self.scroll_restore = ScrollRestore::default();
             self._grants = None;
@@ -659,6 +703,10 @@ impl DiffPanel {
         }
         if let DiffSelection::Turn { file_path: Some(path), reveal_request_id, .. } = &self.selection {
             self.file_reveal.request(&scope_key, *reveal_request_id, FileRevealTarget::file(path));
+        }
+        if self.expansion_scope_key.as_deref() != Some(scope_key.as_str()) {
+            self.expansions.clear();
+            self.expansion_scope_key = Some(scope_key.clone());
         }
         self.scroll_restore.sync_scope(&scope_key, self.file_reveal.has_pending());
         scope_key
@@ -1054,9 +1102,293 @@ impl DiffPanel {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.expansions.clear();
         self.git_revision += 1;
         self.error = None;
         self.sync(cx);
+    }
+
+    /// Whether hidden hunk context expansion is available for `file_ix` in the active scope.
+    pub(super) fn can_expand_file(&self, file_ix: usize) -> bool {
+        if self.external.is_some() {
+            return false;
+        }
+        let Some(file) = self.view.as_ref().and_then(|view| view.parsed.files().get(file_ix)) else {
+            return false;
+        };
+        if file.binary || file.hunks.is_empty() {
+            return false;
+        }
+        matches!(self.scope, DiffScope::Branch { .. } | DiffScope::Unstaged | DiffScope::Commit { .. })
+            && matches!(self.request, Some(RequestKey::Git { .. }))
+    }
+
+    pub(super) fn expansion_state(&self, file_ix: usize) -> Option<&FileExpansionState> {
+        let key = self.view.as_ref()?.key(file_ix)?;
+        self.expansions.get(key)
+    }
+
+    /// Expands hidden context lines at separator `hunk_ix` for `file_ix`, fetching
+    /// `review.getDiffFileContents` on first expansion and validating `reproduces_patch`.
+    pub fn expand_hunk(
+        &mut self,
+        file_ix: usize,
+        hunk_ix: usize,
+        direction: ExpandDirection,
+        count: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_expand_file(file_ix) {
+            return;
+        }
+        let Some((file_key, file)) = self.view.as_ref().and_then(|view| {
+            Some((view.key(file_ix)?.to_owned(), view.parsed.files().get(file_ix)?.clone()))
+        }) else {
+            return;
+        };
+        if let Some(contents) = self.expansions.get(&file_key).and_then(|state| state.contents.clone()) {
+            self.apply_hunk_expansion(file_ix, &file_key, &file, &contents, hunk_ix, direction, count, cx);
+            return;
+        }
+        if self.expansions.get(&file_key).is_some_and(|state| state.loading) {
+            return;
+        }
+        let Some(RequestKey::Git { cwd, kind, base_ref, commit_sha, .. }) = self.request.clone() else {
+            return;
+        };
+        let (resolved_base, resolved_head, source_kind) = match self.review().and_then(|r| r.source.as_ref()) {
+            Some(source) => (source.base_ref.clone(), source.head_ref.clone(), source.kind),
+            None => (
+                base_ref.clone(),
+                if kind == PreviewSourceKind::Commit { commit_sha.clone() } else { None },
+                kind,
+            ),
+        };
+        let (method, payload) = diff_file_contents_request(
+            &cwd,
+            source_kind,
+            file.change,
+            resolved_base.as_deref(),
+            resolved_head.as_deref(),
+            file.previous_path(),
+            file.path(),
+        );
+        let Some(task) = self.state.read(cx).request(method, payload, |value| decode_diff_file_contents(&value)) else {
+            return;
+        };
+        let scope_key = self.scope_key();
+        let entry = self.expansions.entry(file_key.clone()).or_default();
+        entry.loading = true;
+        entry.error = None;
+        let key_for_task = file_key.clone();
+        entry._task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|_| Err("Failed to load file contents.".into()));
+            let _ = this.update(cx, |panel, cx| {
+                if panel.scope_key() != scope_key {
+                    return;
+                }
+                let Some(current_ix) = panel
+                    .view
+                    .as_ref()
+                    .and_then(|view| (0..view.parsed.files().len()).find(|&i| view.key(i) == Some(key_for_task.as_str())))
+                else {
+                    return;
+                };
+                let Some(current_file) = panel.view.as_ref().and_then(|view| view.parsed.files().get(current_ix).cloned()) else {
+                    return;
+                };
+                match result {
+                    Ok(contents) => {
+                        if let Some(entry) = panel.expansions.get_mut(&key_for_task) {
+                            entry.loading = false;
+                            entry.error = None;
+                            entry.contents = Some(contents.clone());
+                        }
+                        panel.apply_hunk_expansion(current_ix, &key_for_task, &current_file, &contents, hunk_ix, direction, count, cx);
+                    }
+                    Err(error) => {
+                        if let Some(entry) = panel.expansions.get_mut(&key_for_task) {
+                            entry.loading = false;
+                            entry.error = Some(error.clone());
+                        }
+                        panel.state.update(cx, |state, cx| {
+                            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Unable to expand diff").description(error), cx);
+                        });
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_hunk_expansion(
+        &mut self,
+        file_ix: usize,
+        file_key: &str,
+        file: &t3_core::diff::FileDiff,
+        contents: &DiffFileContents,
+        hunk_ix: usize,
+        direction: ExpandDirection,
+        count: u32,
+        cx: &mut Context<Self>,
+    ) {
+        match expand_hunk_context(file, contents, hunk_ix, direction, count.max(1)) {
+            Ok(expanded) => {
+                let trailing = trailing_hidden_lines(&expanded, contents);
+                if let Some(view) = self.view.as_mut()
+                    && let Some((range, new_count)) = view.replace_expanded_file(file_ix, expanded, trailing)
+                {
+                    self.list.splice(range, new_count);
+                }
+                if let Some(entry) = self.expansions.get_mut(file_key) {
+                    entry.error = None;
+                }
+                cx.notify();
+            }
+            Err(error) => {
+                if let Some(entry) = self.expansions.get_mut(file_key) {
+                    entry.error = Some(error.clone());
+                    entry.contents = None;
+                }
+                self.state.update(cx, |state, cx| {
+                    state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Unable to expand diff").description(error), cx);
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Configures revision-tracked PR viewed state on this panel (`pingdotgg/t3code#35114`).
+    /// Flushes any pending debounced Viewed presses for the previous target before switching scopes.
+    #[allow(dead_code)]
+    pub fn set_viewed_target(
+        &mut self,
+        target: Option<ViewedTarget>,
+        states: HashMap<String, FileViewedState>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.viewed_target != target {
+            if let Some(prev) = self.viewed_target.take()
+                && prev.enabled
+                && let Some((_, batch)) = self.viewed_tracker.take_batch()
+            {
+                let (method, payload) = set_files_viewed_payload(
+                    &prev.project_id,
+                    prev.number,
+                    prev.host.as_deref(),
+                    prev.repository.as_deref(),
+                    batch,
+                );
+                let _ = self.state.read(cx).request(method, payload, |_| Ok(()));
+            }
+            self.viewed_target = target;
+            self.viewed_tracker = FilesViewedTracker::default();
+            self.last_viewed_file_key = None;
+            self._viewed_flush = None;
+        }
+        self.viewed_tracker.set_server_states(states);
+        cx.notify();
+    }
+
+    pub(super) fn viewed_enabled(&self) -> bool {
+        self.viewed_target.as_ref().is_some_and(|target| target.enabled)
+    }
+
+    pub(super) fn file_viewed_state(&self, path: &str) -> FileViewedState {
+        self.viewed_tracker.state_for(path)
+    }
+
+    /// Toggles Viewed for `file_ix` (or Shift-click range from the last toggled file), auto-folding
+    /// viewed files and queuing a debounced revision-tracked `pullRequests.setFilesViewed` batch.
+    pub fn toggle_file_viewed(&mut self, file_ix: usize, extend_range: bool, cx: &mut Context<Self>) {
+        let Some(target) = self.viewed_target.as_ref().filter(|t| t.enabled).cloned() else {
+            return;
+        };
+        let Some((clicked_key, next_viewed, file_keys)) = self.view.as_ref().and_then(|view| {
+            let file = view.parsed.files().get(file_ix)?;
+            let clicked_key = view.key(file_ix)?.to_owned();
+            let next_viewed = !self.viewed_tracker.is_viewed(file.path());
+            let keys: Vec<String> = (0..view.parsed.files().len())
+                .filter_map(|i| view.key(i).map(str::to_owned))
+                .collect();
+            Some((clicked_key, next_viewed, keys))
+        }) else {
+            return;
+        };
+        let indices = viewed_range_indices(
+            &file_keys,
+            &clicked_key,
+            extend_range.then_some(self.last_viewed_file_key.as_deref()).flatten(),
+        );
+        self.last_viewed_file_key = Some(clicked_key);
+        let commit_scope = target.commit.is_some();
+        for ix in indices {
+            let Some((path, revision)) = self.view.as_ref().and_then(|view| {
+                let file = view.parsed.files().get(ix)?;
+                // Commit diffs name that commit's blob, not the PR head's (`pingdotgg/t3code#35114`).
+                let rev = (!commit_scope).then(|| file.new_object_id().map(str::to_owned)).flatten();
+                Some((file.path().to_owned(), rev))
+            }) else {
+                continue;
+            };
+            self.viewed_tracker.set_viewed(&path, next_viewed, revision);
+            self.set_folded(ix, next_viewed, cx);
+        }
+        self.schedule_viewed_flush(target, cx);
+        cx.notify();
+    }
+
+    fn schedule_viewed_flush(&mut self, target: ViewedTarget, cx: &mut Context<Self>) {
+        self._viewed_flush = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(FILES_VIEWED_FLUSH_DELAY_MS)).await;
+            let request = this.update(cx, |panel, cx| {
+                if panel.viewed_target.as_ref() != Some(&target) {
+                    return None;
+                }
+                let (seq, batch) = panel.viewed_tracker.take_batch()?;
+                let (method, payload) = set_files_viewed_payload(
+                    &target.project_id,
+                    target.number,
+                    target.host.as_deref(),
+                    target.repository.as_deref(),
+                    batch,
+                );
+                Some((seq, panel.state.read(cx).rpc(method, payload)))
+            });
+            let Ok(Some((seq, rpc))) = request else { return };
+            let ok = rpc.await.is_ok();
+            let _ = this.update(cx, |panel, cx| {
+                if panel.viewed_target.as_ref() == Some(&target) {
+                    panel.viewed_tracker.finish_batch(seq, ok);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// Sets inline PR review conversations on this diff panel, folding resolved conversations into
+    /// line-level author avatars (`pingdotgg/t3code#34644`).
+    #[allow(dead_code)]
+    pub fn set_review_threads(&mut self, threads: Vec<InlineReviewThread>, cx: &mut Context<Self>) {
+        self.review_threads.set_threads(threads);
+        if let Some(view) = &self.view {
+            self.list.remeasure_items(0..view.row_count());
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_resolved_review_threads(&mut self, file_ix: usize, side: Side, line: u32, cx: &mut Context<Self>) {
+        let Some((file, layout, row_count)) = self.view.as_ref().and_then(|view| {
+            Some((view.parsed.files().get(file_ix)?.clone(), view.layout, view.row_count()))
+        }) else {
+            return;
+        };
+        if self.review_threads.toggle_resolved(&file, layout, side, line) {
+            self.list.remeasure_items(0..row_count);
+            cx.notify();
+        }
     }
 
     pub fn toggle_wrap(&mut self, cx: &mut Context<Self>) {

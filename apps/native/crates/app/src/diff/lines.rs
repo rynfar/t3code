@@ -11,9 +11,10 @@ use gpui_component::ActiveTheme;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{h_flex, v_flex};
+use t3_core::composer::review::Side;
 use t3_core::diff::{
-    ChangeKind, DiffLine, DiffRow, FileContextMenuAction, FileDiff, LineKind, RecordedContent,
-    compact_count, separator_label,
+    ChangeKind, DEFAULT_EXPAND_LINES, DiffLine, DiffRow, ExpandDirection, FileContextMenuAction,
+    FileDiff, FileViewedState, LineKind, RecordedContent, compact_count, separator_label,
 };
 
 use super::DiffPanel;
@@ -150,7 +151,7 @@ impl DiffPanel {
         };
         match row {
             DiffRow::FileHeader { file } => self.render_file_header(file, cx),
-            DiffRow::Separator { file, hidden, .. } => self.render_separator(file, hidden, cx),
+            DiffRow::Separator { file, hunk, hidden } => self.render_separator(file, hunk, hidden, cx),
             DiffRow::Line { file, hunk, line } => {
                 let Some((line, digits)) = self.line(file, hunk, line).map(|(line, digits)| (line.clone(), digits)) else { return div().into_any_element() };
                 let p = palette(cx);
@@ -225,6 +226,25 @@ impl DiffPanel {
             _ => line.new_line,
         });
         let text: Option<SharedString> = line.map(display_text);
+        let resolved_cluster = if !self.review_threads.is_empty() {
+            line.and_then(|line| {
+                let side = if line.kind == LineKind::Deletion || !new_side {
+                    Side::Deletions
+                } else {
+                    Side::Additions
+                };
+                let line_number = match side {
+                    Side::Additions => line.new_line?,
+                    Side::Deletions => line.old_line?,
+                };
+                let view = self.view.as_ref()?;
+                let diff = view.parsed.files().get(file)?;
+                let cluster = self.review_threads.resolved_cluster(diff, view.layout, side, line_number)?;
+                Some((side, line_number, cluster))
+            })
+        } else {
+            None
+        };
         div()
             .flex()
             .flex_1()
@@ -255,6 +275,57 @@ impl DiffPanel {
                     })
                     .when(self.wrap, |this| this.children(text)),
             )
+            .children(resolved_cluster.map(|(side, line_number, cluster)| {
+                let label = cluster.label.clone();
+                let expanded = cluster.expanded;
+                let border = if expanded {
+                    hsla(p.primary).opacity(0.6)
+                } else {
+                    hsla(p.border)
+                };
+                let bg = if expanded {
+                    hsla(p.primary).opacity(0.14)
+                } else {
+                    hsla(p.muted).opacity(0.85)
+                };
+                h_flex()
+                    .id(format!("diff-resolved-avatars-{file}-{new_side}-{line_number}"))
+                    .flex_none()
+                    .items_center()
+                    .self_center()
+                    .mr(px(8.))
+                    .px(px(4.))
+                    .py(px(1.))
+                    .gap(px(2.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(border)
+                    .bg(bg)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hsla(p.accent)))
+                    .tooltip(move |window, cx| tooltip_view(label.clone().into(), window, cx))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_resolved_review_threads(file, side, line_number, cx);
+                    }))
+                    .children(cluster.avatars.into_iter().enumerate().map(|(ix, avatar)| {
+                        div()
+                            .size(px(14.))
+                            .when(ix > 0, |el| el.ml(px(-4.)))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(hsla(p.background))
+                            .bg(hsla(p.secondary))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(9.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hsla(p.secondary_foreground))
+                            .child(avatar.initial)
+                    }))
+            }))
     }
 
     /// Pierre's `createNoNewlineElement`: the line's fill with an empty gutter and the note at
@@ -280,18 +351,101 @@ impl DiffPanel {
             )
     }
 
-    fn render_separator(&self, file: usize, hidden: u32, cx: &App) -> AnyElement {
+    fn render_separator(&self, file: usize, hunk: usize, hidden: u32, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let digits = self.view.as_ref().and_then(|view| view.digits.get(file)).copied().unwrap_or(3);
         let char_width = self.char_width.unwrap_or(px(7.8));
+        let expandable = self.can_expand_file(file);
+        if !expandable {
+            return h_flex()
+                .h(px(SEPARATOR_HEIGHT))
+                .w_full()
+                .bg(hsla(p.diff_hunk_separator))
+                .pl(gutter_width(digits, char_width) + px(CODE_PADDING))
+                .text_size(px(11.))
+                .text_color(hsla(p.code_foreground).opacity(0.5))
+                .child(separator_label(hidden))
+                .into_any_element();
+        }
+        let expansion = self.expansion_state(file);
+        let loading = expansion.is_some_and(|state| state.loading);
+        let error = expansion.and_then(|state| state.error.clone());
+        let hunk_count = self
+            .view
+            .as_ref()
+            .and_then(|view| view.parsed.files().get(file))
+            .map_or(0, |f| f.hunks.len());
+        let step = DEFAULT_EXPAND_LINES;
+        let can_up = hunk < hunk_count && hidden > step;
+        let can_down = hunk > 0 && hidden > step;
+        let action_btn = |id: String, label: String, direction: ExpandDirection, count: u32, tooltip: String| {
+            div()
+                .id(id)
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_color(hsla(p.code_foreground).opacity(0.75))
+                .hover(|s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+                .tooltip(move |window, cx| tooltip_view(tooltip.clone().into(), window, cx))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.expand_hunk(file, hunk, direction, count, cx);
+                }))
+                .child(label)
+        };
         h_flex()
             .h(px(SEPARATOR_HEIGHT))
             .w_full()
+            .items_center()
+            .gap(px(6.))
             .bg(hsla(p.diff_hunk_separator))
             .pl(gutter_width(digits, char_width) + px(CODE_PADDING))
+            .pr(px(12.))
             .text_size(px(11.))
-            .text_color(hsla(p.code_foreground).opacity(0.5))
-            .child(separator_label(hidden))
+            .text_color(hsla(p.code_foreground).opacity(0.6))
+            .when(loading, |row| row.child("Expanding…"))
+            .when(!loading, |row| {
+                row.when(can_down, |row| {
+                    row.child(action_btn(
+                        format!("diff-expand-down-{file}-{hunk}"),
+                        format!("↓ {step}"),
+                        ExpandDirection::Down,
+                        step,
+                        format!("Expand {step} lines down"),
+                    ))
+                })
+                .child(action_btn(
+                    format!("diff-expand-all-{file}-{hunk}"),
+                    if hidden <= step {
+                        format!("Expand {}", separator_label(hidden))
+                    } else {
+                        separator_label(hidden)
+                    },
+                    ExpandDirection::All,
+                    hidden,
+                    format!("Expand all {hidden} unmodified lines"),
+                ))
+                .when(can_up, |row| {
+                    row.child(action_btn(
+                        format!("diff-expand-up-{file}-{hunk}"),
+                        format!("↑ {step}"),
+                        ExpandDirection::Up,
+                        step,
+                        format!("Expand {step} lines up"),
+                    ))
+                })
+            })
+            .children(error.map(|msg| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_right()
+                    .text_color(hsla(p.error_foreground))
+                    .child(msg)
+            }))
             .into_any_element()
     }
 
@@ -309,6 +463,8 @@ impl DiffPanel {
         };
         let path_label = file.path().to_owned();
         let copied = self.is_path_copied(file.path());
+        let viewed_enabled = self.viewed_enabled();
+        let viewed_state = viewed_enabled.then(|| self.file_viewed_state(file.path()));
         let context_menu = self.file_context_menu(file_ix, cx);
         let entity = cx.entity().downgrade();
         let toggle = cx.listener(move |this, _, _, cx| this.toggle_file(file_ix, cx));
@@ -393,6 +549,63 @@ impl DiffPanel {
                 Button::new(("diff-file-retry", file_ix)).variant(Variant::GhostMuted).size(Size::IconMicro).icon(Icon::RefreshCw).tooltip("Retry loading diff").on_click(cx.listener(move |this, _, _, _| this.patch_command(super::source::Command::Retry(path.clone()))))
             }))
             .children(patch_state.as_ref().filter(|state| state.truncated).map(|_| div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child("Partial diff preview")))
+            .children(viewed_state.map(|state| {
+                let checked = state == FileViewedState::Viewed;
+                let stale = state == FileViewedState::Stale;
+                let label = if stale { "Changed" } else { "Viewed" };
+                let border = if checked {
+                    hsla(p.primary).opacity(0.6)
+                } else if stale {
+                    hsla(p.warning).opacity(0.6)
+                } else {
+                    hsla(p.border)
+                };
+                let bg = if checked {
+                    hsla(p.primary).opacity(0.14)
+                } else if stale {
+                    hsla(p.warning).opacity(0.14)
+                } else {
+                    hsla(p.background)
+                };
+                let fg = if checked {
+                    hsla(p.primary)
+                } else if stale {
+                    hsla(p.warning_foreground)
+                } else {
+                    hsla(p.muted_foreground)
+                };
+                let tooltip = if stale {
+                    "Changed since last viewed — click to mark viewed (Shift+click for range)"
+                } else if checked {
+                    "Viewed — click to unmark (Shift+click for range)"
+                } else {
+                    "Mark file as viewed (Shift+click for range)"
+                };
+                h_flex()
+                    .id(("diff-file-viewed", file_ix))
+                    .flex_none()
+                    .items_center()
+                    .gap(px(4.))
+                    .h(px(20.))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(border)
+                    .bg(bg)
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(fg)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+                    .tooltip(move |window, cx| tooltip_view(tooltip.into(), window, cx))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_file_viewed(file_ix, event.modifiers().shift, cx);
+                    }))
+                    .when(checked, |row| row.child(Icon::Check.svg().size(px(11.)).text_color(fg)))
+                    .child(label)
+            }))
             .child(stat_label(u64::from(file.additions), u64::from(file.deletions), cx))
             .map(|this| match context_menu {
                 Some((absolute_path, capabilities)) => this

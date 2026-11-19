@@ -19,7 +19,9 @@ use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
 use t3_core::auth::AuthSessionState;
 use t3_core::git_actions::{self, ActionProgress, Operation, ProgressEvent, RunRequest, RunResult, StackedAction, StackedActionRun, Terminology, terminology};
+use t3_core::keybindings::decode_resolved_keybindings;
 use t3_core::project_scripts::{self, ProjectScript, TerminalMetadataEvent, Terminals};
+use t3_core::settings::project_actions::{self as project_action_rules, EditorRequest, FileScript, Member, ProjectFile, ScriptsEdit};
 use t3_core::vcs::{self, PullResult, RefNameResult, VcsRef, VcsStatus, VcsStatusEvent, apply_status_event, method};
 use tokio::sync::mpsc;
 
@@ -94,6 +96,10 @@ pub struct GitStore {
     wake: Option<Task<()>>,
     /// The typed message from the last failed `Commit` in `(cwd, message)`, restored on reopen.
     failed_commit_message: Option<(String, String)>,
+    /// The open project's `t3.json`, keyed by `project_cwd` (`From t3.json` quick-imports).
+    project_file: Option<(String, ProjectFile)>,
+    project_file_task: Option<Task<()>>,
+    importing_script: bool,
     _subscription: Subscription,
 }
 
@@ -164,6 +170,9 @@ impl GitStore {
             tick: None,
             wake: None,
             failed_commit_message: None,
+            project_file: None,
+            project_file_task: None,
+            importing_script: false,
             _subscription: subscription,
         };
         store.sync_target(cx);
@@ -225,6 +234,9 @@ impl GitStore {
             self.status = None;
             self.status_error = None;
             self.failed_commit_message = None;
+            self.project_file = None;
+            self.project_file_task = None;
+            self.importing_script = false;
             cx.emit(GitEvent::Changed);
         }
         if connected {
@@ -242,10 +254,21 @@ impl GitStore {
             if connected && self.status_feed.is_none() && self.target.is_some() {
                 self.start_status_feed(cx);
             }
+            if connected {
+                self.ensure_project_file(cx);
+            }
             return;
         }
         let cwd_changed = next.as_ref().map(|t| &t.cwd) != self.target.as_ref().map(|t| &t.cwd);
+        let project_cwd_changed = next.as_ref().map(|t| &t.project_cwd) != self.target.as_ref().map(|t| &t.project_cwd);
         self.target = next;
+        if project_cwd_changed {
+            self.project_file = None;
+            self.project_file_task = None;
+            if connected {
+                self.ensure_project_file(cx);
+            }
+        }
         if cwd_changed {
             self.status = None;
             self.status_error = None;
@@ -596,12 +619,155 @@ impl GitStore {
         }));
     }
 
+    /// `ServerSettings.offeredSourceControlProviders`, when config has loaded (`GT-ACTIONS`).
+    pub fn offered_source_control_providers(&self, cx: &App) -> Option<std::collections::BTreeMap<String, bool>> {
+        self.state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .map(|config| config.settings.source_control.offered_source_control_providers.clone())
+    }
+
+    /// Opens a changed file from the commit dialog in the preferred editor
+    /// (`openChangedFileInEditor` in `GitActionsControl.tsx`).
+    pub fn open_changed_file(&self, file_path: &str, cx: &mut Context<Self>) {
+        let Some(root) = self.status.as_ref().and_then(|s| s.local.working_tree.root_path.as_deref()) else {
+            self.toast(Toast::new(ToastKind::Error, "Editor opening is unavailable."), cx);
+            return;
+        };
+        let Some(resolved) = git_actions::resolve_commit_dialog_file_path(file_path, root) else {
+            self.toast(Toast::new(ToastKind::Error, "Editor opening is unavailable."), cx);
+            return;
+        };
+        let app = self.state.read(cx);
+        let available = app.active_open_in_config().map(|c| c.available_editors.clone()).unwrap_or_default();
+        let preferred = crate::thread_details::details(cx)
+            .and_then(|d| d.read(cx).preferred_editor(&available))
+            .or_else(|| vcs::preferred_editor(None, &available));
+        let Some(editor) = preferred else {
+            self.toast(Toast::new(ToastKind::Error, "Editor opening is unavailable."), cx);
+            return;
+        };
+        let mut payload = vcs::open_in_editor(&resolved, editor);
+        payload["projectRoot"] = serde_json::json!(root);
+        let Some(task) = app.request(method::SHELL_OPEN_IN_EDITOR, payload, Ok) else { return };
+        let state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            let result = task.await.unwrap_or_else(|_| Err("Unable to open file.".into()));
+            if let Err(error) = result {
+                state.update(cx, |state, cx| {
+                    state.show_toast(Toast::new(ToastKind::Error, "Unable to open file").description(error), cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Loads `sourceControl.discovery` for `PublishRepositoryDialog`.
+    pub fn discover_publish_providers(&self, cx: &App) -> Option<tokio::task::JoinHandle<Result<Vec<git_actions::PublishProviderDiscovery>, String>>> {
+        self.state.read(cx).request(
+            git_actions::method::SOURCE_CONTROL_DISCOVERY,
+            serde_json::json!({}),
+            |value| Ok(git_actions::decode_publish_discovery(&value)),
+        )
+    }
+
+    /// Publishes the active repository (`sourceControl.publishRepository`).
+    pub fn publish_repository(
+        &self,
+        provider: &str,
+        repository: &str,
+        visibility: git_actions::PublishVisibility,
+        remote_name: &str,
+        protocol: git_actions::CloneProtocol,
+        cx: &App,
+    ) -> Option<tokio::task::JoinHandle<Result<git_actions::PublishRepositoryResult, String>>> {
+        let target = self.target.as_ref()?;
+        let payload = git_actions::publish_repository_input(&target.cwd, provider, repository, visibility, remote_name, protocol);
+        self.state
+            .read(cx)
+            .request(git_actions::method::SOURCE_CONTROL_PUBLISH_REPOSITORY, payload, decode::<git_actions::PublishRepositoryResult>)
+    }
+
+    /// Resolves a pull/merge request reference (`git.resolvePullRequest`).
+    pub fn resolve_pull_request(&self, reference: &str, cx: &App) -> Option<tokio::task::JoinHandle<Result<vcs::ResolvePullRequestResult, String>>> {
+        let target = self.target.as_ref()?;
+        self.state
+            .read(cx)
+            .request(method::GIT_RESOLVE_PULL_REQUEST, vcs::resolve_pull_request(&target.project_cwd, reference), decode::<vcs::ResolvePullRequestResult>)
+    }
+
+    /// Prepares a local or worktree checkout for a pull/merge request (`git.preparePullRequestThread`).
+    /// Drafts only allow `Local` checkout here because attaching a new worktree to a draft lives
+    /// under `PR-DETAIL`'s `usePullRequestDraftThread` flow (`composer/`).
+    pub fn prepare_pull_request_thread(
+        &self,
+        reference: &str,
+        mode: vcs::PullRequestCheckoutMode,
+        cx: &App,
+    ) -> Option<(Target, tokio::task::JoinHandle<Result<vcs::PreparePullRequestThreadResult, String>>)> {
+        let target = self.target.clone()?;
+        if target.is_draft && mode == vcs::PullRequestCheckoutMode::Worktree {
+            return None;
+        }
+        let thread_id = (!target.is_draft).then_some(target.thread_id.as_str());
+        let payload = vcs::prepare_pull_request_thread(&target.project_cwd, reference, mode, thread_id);
+        let task = self
+            .state
+            .read(cx)
+            .request(method::GIT_PREPARE_PULL_REQUEST_THREAD, payload, decode::<vcs::PreparePullRequestThreadResult>)?;
+        Some((target, task))
+    }
+
+    /// Applies the prepared PR checkout to the active thread/checkout (`handlePreparedPullRequestThread`).
+    pub fn apply_prepared_pull_request(&mut self, origin: &Target, result: &vcs::PreparePullRequestThreadResult, cx: &mut Context<Self>) {
+        if origin.is_draft && result.worktree_path.is_some() {
+            return;
+        }
+        if !origin.is_draft {
+            self.set_thread_branch(origin, Some(&result.branch), result.worktree_path.as_deref(), cx);
+        }
+        if self.shows(origin) {
+            self.optimistic_branch = Some(Some(result.branch.clone()));
+            self.refresh_status(false, cx);
+            let query = self.refs.query.clone();
+            self.load_refs(&query, false, cx);
+        }
+        let terms = terminology(self.status.as_ref().and_then(VcsStatus::provider_kind));
+        if !result.is_on_pull_request_head {
+            let (title, description) = vcs::off_head_checkout_toast(terms.singular);
+            self.toast(Toast::new(ToastKind::Info, title).description(description), cx);
+        } else {
+            self.toast(
+                Toast::new(ToastKind::Success, format!("Checked out {} #{}", terms.short_label, result.pull_request.number))
+                    .description(result.branch.clone()),
+                cx,
+            );
+        }
+        cx.emit(GitEvent::Changed);
+    }
+
+    /// Opens the URL in the system browser (used by `PublishRepositoryDialog`'s summary step).
+    pub fn open_external_url(&self, url: &str, cx: &mut App) {
+        cx.open_url(url);
+    }
+
     /// Loads the first page for `query`, or the next page of the current listing.
+    /// Seeds unfiltered initial opens from the persisted offline ref snapshot while live refs load.
     pub fn load_refs(&mut self, query: &str, next_page: bool, cx: &mut Context<Self>) {
         let (Some(target), Some((client, runtime))) = (self.target.clone(), self.client(cx)) else {
             return;
         };
+        let env_key = self.state.read(cx).environment().map(str::to_owned);
         let query = vcs::sanitize_new_ref_name(query);
+        if !next_page
+            && query.is_empty()
+            && let Some(env_key) = env_key.as_deref()
+            && let Some(snapshot) = client.load_cached_refs(env_key, &target.cwd)
+        {
+            self.refs.seed_offline_snapshot(&query, snapshot);
+        }
         let Some(request) = self.refs.begin(&query, next_page) else {
             return;
         };
@@ -616,7 +782,11 @@ impl GitStore {
             let mut pages = Vec::with_capacity(cursors.len());
             for cursor in cursors {
                 let payload = vcs::list_refs(&cwd, Some(&query), cursor, vcs::REF_PAGE_LIMIT);
-                match client.list_refs(payload).await? {
+                let answer = match env_key.as_deref() {
+                    Some(key) => client.list_refs_cached(key, payload).await?,
+                    None => client.list_refs(payload).await?,
+                };
+                match answer {
                     Some(page) => pages.push(page),
                     None => return Ok(None),
                 }
@@ -777,8 +947,115 @@ impl GitStore {
         self.grants.as_ref().is_some_and(|grants| grants.grants(t3_core::auth::TERMINAL_OPERATE_SCOPE))
     }
 
+    /// Whether this device may edit server settings / project actions (`AuthSettingsWriteScope`).
+    pub fn can_write_settings(&self) -> bool {
+        self.grants.as_ref().is_some_and(|grants| grants.grants("settings:write"))
+    }
+
+    /// Scripts declared by the open project's `t3.json`, once read.
+    pub fn file_scripts(&self) -> &[FileScript] {
+        let Some(target) = self.target.as_ref() else { return &[] };
+        self.project_file
+            .as_ref()
+            .filter(|(cwd, _)| *cwd == target.project_cwd)
+            .map(|(_, file)| file.scripts())
+            .unwrap_or(&[])
+    }
+
+    /// Reads the open project's `t3.json` once per `(connection, project_cwd)` (`useT3ProjectFileState`).
+    fn ensure_project_file(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.as_ref() else { return };
+        if target.project_cwd.is_empty() {
+            return;
+        }
+        if self.project_file.as_ref().is_some_and(|(cwd, _)| *cwd == target.project_cwd) || self.project_file_task.is_some() {
+            return;
+        }
+        let cwd = target.project_cwd.clone();
+        let connection = self.connection;
+        let payload = t3_core::workspace::project_file_request(&cwd);
+        let Some(task) = self.state.read(cx).request(t3_core::files::READ_FILE, payload, |value| Ok(project_action_rules::project_file_from_read(&value))) else {
+            return;
+        };
+        self.project_file_task = Some(cx.spawn(async move |this, cx| {
+            let file = task.await.ok().and_then(Result::ok).unwrap_or(ProjectFile::Missing);
+            let _ = this.update(cx, |store, cx| {
+                store.project_file_task = None;
+                if store.connection != connection || store.target.as_ref().is_none_or(|t| t.project_cwd != cwd) {
+                    return;
+                }
+                store.project_file = Some((cwd, file));
+                cx.emit(GitEvent::Changed);
+            });
+        }));
+    }
+
+    /// Quick-imports a script from `t3.json` straight from the thread details card
+    /// (`importFileScript` in `ProjectScriptsControl.tsx`), falling back to the settings editor
+    /// prefilled with the error if saving fails.
+    pub fn import_file_script(&mut self, project_id: &str, file_script: FileScript, cx: &mut Context<Self>) {
+        if self.importing_script || !self.can_write_settings() {
+            return;
+        }
+        let Some((client, runtime)) = self.client(cx) else { return };
+        let app = self.state.read(cx);
+        let Some(config) = app.server_config.config.as_ref() else { return };
+        let Some(project) = app.shell.project(project_id) else { return };
+        let to_member = |project: &t3_core::shell::ProjectShell| Member {
+            id: project.id.clone(),
+            scripts: project.scripts.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect(),
+        };
+        let projects: Vec<Member> = app
+            .shell
+            .snapshot
+            .as_ref()
+            .map(|s| s.projects.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(to_member)
+            .collect();
+        let member = to_member(project);
+        let members = [member];
+        let mut input = file_script.import_input();
+        if !self.can_write_settings() {
+            input.keybinding = None;
+        }
+        let id = project_action_rules::submit_id(&config.settings, &projects, &members, None, &input.name, now_ms().max(0) as u64);
+        let keybindings = decode_resolved_keybindings(&config.keybindings);
+        let edit = ScriptsEdit::Save { id, input: input.clone(), is_new: true };
+        let writes = project_action_rules::plan_writes(&config.settings, &keybindings, &projects, &members, &edit);
+        let project_id = project_id.to_owned();
+        let connection = self.connection;
+        self.importing_script = true;
+        cx.emit(GitEvent::Changed);
+        let task = runtime.spawn(async move {
+            for write in writes {
+                client.request(write.method(), write.payload().clone()).await?;
+            }
+            Ok::<(), RpcError>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await.map_err(|_| RpcError::Closed).and_then(|res| res);
+            let _ = this.update(cx, |store, cx| {
+                store.importing_script = false;
+                if let Err(error) = result
+                    && store.connection == connection
+                {
+                    let message = error.to_string();
+                    let request = EditorRequest { script_id: None, initial: input, error: Some(message.clone()) };
+                    open_script_editor_request(&project_id, request, cx);
+                    store.toast(Toast::new(ToastKind::Error, "Failed to import action.").description(message), cx);
+                }
+                cx.emit(GitEvent::Changed);
+            });
+        })
+        .detach();
+    }
+
     /// `runProjectScript`: in the script's idle thread terminal, or a fresh one beside it. A
     /// `stopOnSettle` script, or a device that cannot read terminals, always opens a new one.
+    /// Opens and focuses the script's terminal drawer, and launches `previewUrl` when
+    /// `autoOpenPreview` is enabled (`useChatTerminalActions.ts`).
     pub fn run_script(&mut self, script: &ProjectScript, cx: &mut Context<Self>) {
         if !self.can_run_scripts() {
             return;
@@ -790,15 +1067,43 @@ impl GitStore {
         let open = project_scripts::open_script_terminal(&target.thread_id, &launch, &target.project_cwd, target.worktree_path.as_deref(), script.stops_on_settle());
         let write = project_scripts::write_terminal(&target.thread_id, &launch.terminal_id, &project_scripts::terminal_input(&script.command));
         let name = script.name.clone();
+        let auto_preview_url = (script.auto_open_preview == Some(true))
+            .then(|| script.preview_url.as_deref().map(str::trim).filter(|url| !url.is_empty()).map(str::to_owned))
+            .flatten();
+        let drawer_thread = target.thread_id.clone();
+        let drawer_terminal = launch.terminal_id.clone();
+        cx.defer(move |cx| {
+            crate::terminal::open_script_terminal(drawer_thread, drawer_terminal, cx);
+        });
+        let connection = self.connection;
+        let preview_thread = target.thread_id.clone();
         let task = runtime.spawn(async move {
             client.request(method::TERMINAL_OPEN, open).await?;
             client.request(method::TERMINAL_WRITE, write).await
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(Err(error)) | Err(error) = task.await.map_err(|_| RpcError::Closed) {
-                let _ = this.update(cx, |store, cx| {
-                    store.toast(Toast::new(ToastKind::Error, format!("Failed to run script \"{name}\".")).description(error.to_string()), cx);
-                });
+            match task.await.map_err(|_| RpcError::Closed).and_then(|res| res) {
+                Ok(_) => {
+                    if let Some(raw_url) = auto_preview_url {
+                        let _ = this.update(cx, |store, cx| {
+                            if store.connection != connection {
+                                return;
+                            }
+                            let env_http_base = store.state.read(cx).active_environment().map(|env| env.http_base.clone());
+                            let url = t3_core::thread_details::resolve_discovered_server_url(&raw_url, env_http_base.as_deref());
+                            if let Some(previews) = crate::preview::previews(cx)
+                                && previews.read(cx).availability() == crate::preview::Availability::Available
+                            {
+                                previews.update(cx, |previews, cx| previews.open_session(preview_thread, Some(url), cx));
+                            }
+                        });
+                    }
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |store, cx| {
+                        store.toast(Toast::new(ToastKind::Error, format!("Failed to run script \"{name}\".")).description(error.to_string()), cx);
+                    });
+                }
             }
         })
         .detach();
@@ -816,6 +1121,8 @@ pub struct ScriptEditorRequest {
     pub project_id: String,
     /// `None` adds an action.
     pub script_id: Option<String>,
+    /// Prefilled editor form (e.g. after a failed `From t3.json` quick-import).
+    pub request: Option<EditorRequest>,
 }
 
 #[derive(Default)]
@@ -825,10 +1132,77 @@ impl gpui::Global for PendingScriptEditor {}
 
 /// Opens the action editor on `project_id`'s actions: Add, or Edit on `script_id`.
 pub fn open_script_editor(project_id: &str, script_id: Option<&str>, cx: &mut App) {
-    cx.set_global(PendingScriptEditor(Some(ScriptEditorRequest { project_id: project_id.to_owned(), script_id: script_id.map(str::to_owned) })));
+    cx.set_global(PendingScriptEditor(Some(ScriptEditorRequest { project_id: project_id.to_owned(), script_id: script_id.map(str::to_owned), request: None })));
+    crate::settings::open_project(project_id, cx);
+}
+
+/// Opens the action editor prefilled with `request` (e.g. a failed quick-import).
+pub fn open_script_editor_request(project_id: &str, request: EditorRequest, cx: &mut App) {
+    cx.set_global(PendingScriptEditor(Some(ScriptEditorRequest { project_id: project_id.to_owned(), script_id: None, request: Some(request) })));
     crate::settings::open_project(project_id, cx);
 }
 
 pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<GitStore> {
     cx.new(|cx| GitStore::new(state, cx))
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn draft_pr_checkout_blocks_worktree_mode_and_ignores_worktree_results(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        let store = cx.update(|cx| cx.new(|cx| GitStore::new(state.clone(), cx)));
+        let draft_target = Target {
+            thread_id: "draft:proj-1".into(),
+            project_id: "proj-1".into(),
+            is_draft: true,
+            cwd: "/repo".into(),
+            project_cwd: "/repo".into(),
+            worktree_path: None,
+            branch: Some("main".into()),
+        };
+
+        store.update(cx, |store, cx| {
+            store.target = Some(draft_target.clone());
+            assert!(
+                store.prepare_pull_request_thread("#42", vcs::PullRequestCheckoutMode::Worktree, cx).is_none(),
+                "Worktree PR checkout must be refused on drafts"
+            );
+            assert!(
+                store.prepare_pull_request_thread("#42", vcs::PullRequestCheckoutMode::Local, cx).is_some(),
+                "Local PR checkout remains allowed on drafts"
+            );
+
+            // Defensive guard: a worktree result on a draft must never corrupt optimistic_branch.
+            let orphan_result = vcs::PreparePullRequestThreadResult {
+                pull_request: vcs::ResolvedPullRequest {
+                    number: 42,
+                    title: "Test PR".into(),
+                    url: "https://github.com/org/repo/pull/42".into(),
+                    base_branch: "main".into(),
+                    head_branch: "feat/pr-42".into(),
+                    state: "open".into(),
+                },
+                branch: "feat/pr-42".into(),
+                worktree_path: Some("/repo-wt/pr-42".into()),
+                is_on_pull_request_head: true,
+            };
+            store.apply_prepared_pull_request(&draft_target, &orphan_result, cx);
+            assert_eq!(store.optimistic_branch, None);
+
+            // Local result on a draft updates optimistic_branch cleanly.
+            let local_result = vcs::PreparePullRequestThreadResult {
+                worktree_path: None,
+                ..orphan_result
+            };
+            store.apply_prepared_pull_request(&draft_target, &local_result, cx);
+            assert_eq!(store.optimistic_branch, Some(Some("feat/pr-42".into())));
+        });
+    }
 }

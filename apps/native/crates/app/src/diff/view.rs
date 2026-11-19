@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use t3_core::diff::{DiffRow, DiffSession, FileDiff, Layout, ParsedPatch, TreeRow, file_rows, file_tree_rows_shown, parse_patch};
+use t3_core::diff::{DiffRow, DiffSession, FileDiff, Layout, ParsedPatch, TreeRow, file_rows_with_trailing, file_tree_rows_shown, parse_patch};
 
 /// One fetched patch, parsed off the UI thread.
 pub struct Parsed {
@@ -54,6 +54,8 @@ pub struct View {
     folded: Vec<bool>,
     /// Files "Hide test files" leaves out: no rows, no tree entry, still indexed (`isFileShown`).
     hidden: Vec<bool>,
+    /// Unchanged lines below the last hunk, known once full file contents hydrate for expansion.
+    trailing_hidden: Vec<u32>,
     rows: Vec<Arc<Vec<DiffRow>>>,
     /// `starts[file]` is the file's first row; the last entry is the row count.
     starts: Vec<usize>,
@@ -64,11 +66,13 @@ impl View {
         let files = parsed.files();
         let keys = file_keys(files, review);
         let folded = session.resolve_folds(&scope_key, &keys, files_collapsed_default);
-        let rows = rows_for(files, &keys, &folded, layout, None);
+        let trailing_hidden = vec![0; files.len()];
+        let rows = rows_for(files, &keys, &folded, &trailing_hidden, layout, None);
         let mut view = View {
             tree: file_tree_rows_shown(files, tree_collapsed, |_| true),
             digits: files.iter().map(gutter_digits).collect(),
             hidden: vec![false; files.len()],
+            trailing_hidden,
             keys,
             folded,
             rows,
@@ -90,11 +94,24 @@ impl View {
         if !same_order {
             let keys = file_keys(files, review);
             let folded = session.resolve_folds(&self.scope_key, &keys, self.files_collapsed_default);
-            self.rows = rows_for(files, &keys, &folded, self.layout, Some(self));
+            let cached: std::collections::HashMap<&str, usize> =
+                self.keys.iter().enumerate().map(|(i, key)| (key.as_str(), i)).collect();
+            let trailing_hidden: Vec<u32> = files
+                .iter()
+                .enumerate()
+                .map(|(i, file)| {
+                    cached
+                        .get(keys[i].as_str())
+                        .filter(|&&old_ix| same_rows(&old[old_ix], file))
+                        .map_or(0, |&old_ix| self.trailing_hidden[old_ix])
+                })
+                .collect();
+            self.rows = rows_for(files, &keys, &folded, &trailing_hidden, self.layout, Some(self));
             self.tree = file_tree_rows_shown(files, tree_collapsed, |_| true);
             self.digits = files.iter().map(gutter_digits).collect();
             self.keys = keys;
             self.hidden = vec![false; files.len()];
+            self.trailing_hidden = trailing_hidden;
             self.folded = folded;
             self.parsed = parsed;
             self.recount(0);
@@ -103,10 +120,14 @@ impl View {
         let mut changes = Vec::new();
         for (i, (before, file)) in old.iter().zip(files).enumerate() {
             if self.hidden[i] {
+                if !same_rows(before, file) {
+                    self.trailing_hidden[i] = 0;
+                }
                 continue;
             }
             if !same_rows(before, file) {
-                let rows = Arc::new(file_rows(0, file, self.folded[i], self.layout));
+                self.trailing_hidden[i] = 0;
+                let rows = Arc::new(file_rows_with_trailing(0, file, self.folded[i], self.layout, 0));
                 changes.push((self.starts[i]..self.starts[i + 1], rows.len()));
                 self.rows[i] = rows;
                 self.digits[i] = gutter_digits(file);
@@ -179,7 +200,11 @@ impl View {
         let files = self.parsed.files();
         for (i, file) in files.iter().enumerate() {
             if hidden[i] != self.hidden[i] {
-                self.rows[i] = if hidden[i] { Arc::new(Vec::new()) } else { Arc::new(file_rows(0, file, self.folded[i], self.layout)) };
+                self.rows[i] = if hidden[i] {
+                    Arc::new(Vec::new())
+                } else {
+                    Arc::new(file_rows_with_trailing(0, file, self.folded[i], self.layout, self.trailing_hidden[i]))
+                };
             }
         }
         self.hidden = hidden;
@@ -194,7 +219,12 @@ impl View {
             return None;
         }
         let diff = self.parsed.files().get(file)?;
-        let next = if self.is_hidden(file) { Arc::new(Vec::new()) } else { Arc::new(file_rows(0, diff, folded, self.layout)) };
+        let trailing = self.trailing_hidden.get(file).copied().unwrap_or(0);
+        let next = if self.is_hidden(file) {
+            Arc::new(Vec::new())
+        } else {
+            Arc::new(file_rows_with_trailing(0, diff, folded, self.layout, trailing))
+        };
         let old = self.starts[file]..self.starts[file + 1];
         let count = next.len();
         self.rows[file] = next;
@@ -207,7 +237,8 @@ impl View {
     pub fn set_all_folded(&mut self, folded: bool) {
         let files = self.parsed.files();
         for (i, file) in files.iter().enumerate().filter(|(i, _)| !self.hidden[*i]) {
-            self.rows[i] = Arc::new(file_rows(0, file, folded, self.layout));
+            let trailing = self.trailing_hidden.get(i).copied().unwrap_or(0);
+            self.rows[i] = Arc::new(file_rows_with_trailing(0, file, folded, self.layout, trailing));
             self.folded[i] = folded;
         }
         self.recount(0);
@@ -215,6 +246,38 @@ impl View {
 
     pub fn folded_keys(&self) -> HashSet<String> {
         self.keys.iter().zip(&self.folded).filter(|(_, folded)| **folded).map(|(key, _)| key.clone()).collect()
+    }
+
+    /// Replaces one file's parsed hunks after hidden context expansion, returning the row range
+    /// to splice in the virtualized list.
+    pub fn replace_expanded_file(&mut self, file: usize, expanded: FileDiff, trailing_hidden: u32) -> Option<(Range<usize>, usize)> {
+        let ParsedPatch::Files(mut files) = self.parsed.patch.clone() else {
+            return None;
+        };
+        if file >= files.len() {
+            return None;
+        }
+        files[file] = expanded;
+        let next_parsed = Parsed::from_patch(
+            ParsedPatch::Files(files),
+            self.parsed.truncated,
+            self.parsed.totals,
+            self.parsed.base_ref.clone(),
+            self.parsed.head_ref.clone(),
+        );
+        self.trailing_hidden[file] = trailing_hidden;
+        let next_rows = if self.is_hidden(file) {
+            Arc::new(Vec::new())
+        } else {
+            Arc::new(file_rows_with_trailing(0, &next_parsed.files()[file], self.folded[file], self.layout, trailing_hidden))
+        };
+        let old = self.starts[file]..self.starts[file + 1];
+        let count = next_rows.len();
+        self.digits[file] = gutter_digits(&next_parsed.files()[file]);
+        self.rows[file] = next_rows;
+        self.parsed = next_parsed;
+        self.recount(file + 1);
+        Some((old, count))
     }
 
     pub fn rebuild_tree(&mut self, tree_collapsed: &HashSet<String>) {
@@ -249,15 +312,23 @@ fn file_keys(files: &[FileDiff], review: bool) -> Vec<String> {
     }).collect()
 }
 
-fn rows_for(files: &[FileDiff], keys: &[String], folded: &[bool], layout: Layout, previous: Option<&View>) -> Vec<Arc<Vec<DiffRow>>> {
+fn rows_for(
+    files: &[FileDiff],
+    keys: &[String],
+    folded: &[bool],
+    trailing_hidden: &[u32],
+    layout: Layout,
+    previous: Option<&View>,
+) -> Vec<Arc<Vec<DiffRow>>> {
     let cached: std::collections::HashMap<_, _> = previous.into_iter().flat_map(|view| view.keys.iter().enumerate().map(move |(i, key)| (key.as_str(), (view, i)))).collect();
     files.iter().enumerate().map(|(i, file)| {
         if let Some((view, old)) = cached.get(keys[i].as_str())
             && view.layout == layout && view.folded[*old] == folded[i] && !view.hidden[*old]
+            && view.trailing_hidden[*old] == trailing_hidden[i]
             && same_rows(&view.parsed.files()[*old], file) {
             return view.rows[*old].clone();
         }
-        Arc::new(file_rows(0, file, folded[i], layout))
+        Arc::new(file_rows_with_trailing(0, file, folded[i], layout, trailing_hidden[i]))
     }).collect()
 }
 
@@ -329,7 +400,55 @@ mod tests {
         assert_eq!(unmeasured.offset_for_item(140), gpui::px(2800.), "width invalidation must not leave later headers at zero distance");
         assert_eq!(unmeasured.logical_scroll_top().item_ix, 140);
         assert!(!seed_height_estimates(&unmeasured, gpui::px(800.), &mut width), "unchanged width does not remeasure the list again");
-
     }
 
+    #[test]
+    fn trailing_hidden_separator_survives_fold_collapse_all_hide_and_reorder_update() {
+        let ParsedPatch::Files(mut files) = parse_patch(
+            "--- a/src/app.rs\n+++ b/src/app.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n",
+        ) else {
+            panic!("files");
+        };
+        let file = files.remove(0);
+        let parsed = Parsed::from_patch(ParsedPatch::Files(vec![file.clone()]), false, None, None, None);
+        let session = DiffSession::default();
+        let mut view = View::new(parsed, "scope".into(), Layout::Stacked, &session, false, &HashSet::new(), true);
+        view.replace_expanded_file(0, file.clone(), 7).expect("expanded");
+        let has_trailing = |view: &View, file_ix: usize| {
+            view.file_rows_slice(file_ix)
+                .is_some_and(|rows| rows.last() == Some(&DiffRow::Separator { file: 0, hunk: 1, hidden: 7 }))
+        };
+        assert!(has_trailing(&view, 0));
+
+        // Fold and unfold single file (e.g. marking/unmarking Viewed).
+        view.set_folded(0, true);
+        view.set_folded(0, false);
+        assert!(has_trailing(&view, 0), "set_folded must keep trailing_hidden");
+
+        // Collapse all / expand all.
+        view.set_all_folded(true);
+        view.set_all_folded(false);
+        assert!(has_trailing(&view, 0), "set_all_folded must keep trailing_hidden");
+
+        // Hide test files / show again.
+        assert!(view.set_hidden(vec![true], &HashSet::new()));
+        assert!(view.set_hidden(vec![false], &HashSet::new()));
+        assert!(has_trailing(&view, 0), "set_hidden must keep trailing_hidden");
+
+        // Reorder / insertion update with same file hunks preserves trailing_hidden by key.
+        let ParsedPatch::Files(mut extra) = parse_patch(
+            "--- a/src/other.rs\n+++ b/src/other.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        ) else {
+            panic!("files");
+        };
+        let reordered = Parsed::from_patch(
+            ParsedPatch::Files(vec![extra.remove(0), view.parsed.files()[0].clone()]),
+            false,
+            None,
+            None,
+            None,
+        );
+        view.update(reordered, &session, &HashSet::new(), true);
+        assert!(has_trailing(&view, 1), "update preserving file hunks must keep trailing_hidden");
+    }
 }

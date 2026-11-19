@@ -7,13 +7,18 @@
 //! `client-runtime/src/state/vcsAction.ts`, and each source control definition's change request
 //! terms (`packages/source-control-*/src/shared/definition.ts`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::diff::DiffPreviewSource;
 use crate::vcs::{VcsStatus, changes_totals};
+
+pub mod method {
+    pub const SOURCE_CONTROL_DISCOVERY: &str = "sourceControl.discovery";
+    pub const SOURCE_CONTROL_PUBLISH_REPOSITORY: &str = "sourceControl.publishRepository";
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +114,11 @@ pub const DEFAULT_SOURCE_CONTROL_PROVIDER: &str = "github";
 /// `isSourceControlProviderOffered`: only the default host is offered until the user turns
 /// others on (`ServerSettings.offeredSourceControlProviders`).
 pub fn is_source_control_provider_offered(offered: Option<&HashMap<String, bool>>, kind: &str) -> bool {
+    offered.and_then(|map| map.get(kind).copied()).unwrap_or(kind == DEFAULT_SOURCE_CONTROL_PROVIDER)
+}
+
+/// Same rule as [`is_source_control_provider_offered`] over `ServerSettings.source_control.offered_source_control_providers`.
+pub fn is_provider_offered(offered: Option<&BTreeMap<String, bool>>, kind: &str) -> bool {
     offered.and_then(|map| map.get(kind).copied()).unwrap_or(kind == DEFAULT_SOURCE_CONTROL_PROVIDER)
 }
 
@@ -599,5 +609,373 @@ pub const SUCCESS_VISIBLE_MS: u64 = 10_000;
 pub const COMMIT_DIALOG_TITLE: &str = "Commit changes";
 pub const COMMIT_DIALOG_DESCRIPTION: &str = "Review and confirm your commit. Leave the message blank to auto-generate one.";
 
+/// Static metadata for a publishable source control provider (`PUBLISH_PROVIDER_OPTIONS` in
+/// `GitActionsControl.tsx`, derived from `packages/source-control-*/src/shared/definition.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishProviderOption {
+    pub kind: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub path_placeholder: &'static str,
+    /// `None` uses the signed-in host (falling back to `"your server"`), as Forgejo does.
+    pub fixed_host: Option<&'static str>,
+}
+
+impl PublishProviderOption {
+    pub fn publish_host(&self, signed_in_host: Option<&str>) -> String {
+        match self.fixed_host {
+            Some(host) => host.to_owned(),
+            None => signed_in_host.map(str::trim).filter(|h| !h.is_empty()).unwrap_or("your server").to_owned(),
+        }
+    }
+}
+
+pub const PUBLISH_PROVIDER_OPTIONS: &[PublishProviderOption] = &[
+    PublishProviderOption {
+        kind: "github",
+        label: "GitHub",
+        description: "github.com",
+        path_placeholder: "owner/repo",
+        fixed_host: Some("github.com"),
+    },
+    PublishProviderOption {
+        kind: "gitlab",
+        label: "GitLab",
+        description: "gitlab.com",
+        path_placeholder: "group/project",
+        fixed_host: Some("gitlab.com"),
+    },
+    PublishProviderOption {
+        kind: "azure-devops",
+        label: "Azure DevOps",
+        description: "dev.azure.com",
+        path_placeholder: "project/repository",
+        fixed_host: Some("dev.azure.com"),
+    },
+    PublishProviderOption {
+        kind: "bitbucket",
+        label: "Bitbucket",
+        description: "bitbucket.org",
+        path_placeholder: "workspace/repository",
+        fixed_host: Some("bitbucket.org"),
+    },
+    PublishProviderOption {
+        kind: "forgejo",
+        label: "Forgejo / Gitea",
+        description: "Your signed-in server",
+        path_placeholder: "owner/repo",
+        fixed_host: None,
+    },
+    PublishProviderOption {
+        kind: "gitcafe",
+        label: "GitCafe",
+        description: "git.cafe",
+        path_placeholder: "owner/repo",
+        fixed_host: Some("git.cafe"),
+    },
+    PublishProviderOption {
+        kind: "cursor-origin",
+        label: "Cursor Origin",
+        description: "origin.cursor.com",
+        path_placeholder: "owner/repo",
+        fixed_host: Some("origin.cursor.com"),
+    },
+];
+
+pub fn publish_provider_option(kind: &str) -> &'static PublishProviderOption {
+    PUBLISH_PROVIDER_OPTIONS.iter().find(|option| option.kind == kind).unwrap_or(&PUBLISH_PROVIDER_OPTIONS[0])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishProviderDiscovery {
+    pub kind: String,
+    pub label: String,
+    pub available: bool,
+    pub install_hint: String,
+    pub auth_status: String,
+    pub auth_account: Option<String>,
+    pub auth_host: Option<String>,
+    pub auth_detail: Option<String>,
+}
+
+fn decode_effect_option_str(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let inner = match value.get("_tag").and_then(Value::as_str) {
+        Some("Some") => value.get("value")?,
+        Some(_) => return None,
+        None => value,
+    };
+    inner.as_str().map(str::trim).filter(|text| !text.is_empty()).map(str::to_owned)
+}
+
+/// Decodes `sourceControlProviders` from `sourceControl.discovery`.
+pub fn decode_publish_discovery(value: &Value) -> Vec<PublishProviderDiscovery> {
+    let Some(items) = value.get("sourceControlProviders").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let kind = item.get("kind")?.as_str()?.trim();
+            if kind.is_empty() {
+                return None;
+            }
+            let auth = item.get("auth");
+            Some(PublishProviderDiscovery {
+                kind: kind.to_owned(),
+                label: item.get("label").and_then(Value::as_str).unwrap_or(kind).to_owned(),
+                available: item.get("status").and_then(Value::as_str) == Some("available"),
+                install_hint: item.get("installHint").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                auth_status: auth.and_then(|a| a.get("status")).and_then(Value::as_str).unwrap_or("unknown").to_owned(),
+                auth_account: decode_effect_option_str(auth.and_then(|a| a.get("account"))),
+                auth_host: decode_effect_option_str(auth.and_then(|a| a.get("host"))),
+                auth_detail: decode_effect_option_str(auth.and_then(|a| a.get("detail"))),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishProviderReadiness {
+    pub ready: bool,
+    pub hint: Option<String>,
+}
+
+/// `getPublishProviderReadiness` in `GitActionsControl.tsx`.
+pub fn publish_provider_readiness(provider: &str, discovered: &[PublishProviderDiscovery]) -> PublishProviderReadiness {
+    let Some(item) = discovered.iter().find(|entry| entry.kind == provider) else {
+        return PublishProviderReadiness {
+            ready: false,
+            hint: Some("Provider status unavailable. Open Settings -> Source control and rescan.".into()),
+        };
+    };
+    if !item.available {
+        return PublishProviderReadiness { ready: false, hint: Some(item.install_hint.clone()).filter(|h| !h.is_empty()) };
+    }
+    if item.auth_status == "unauthenticated" {
+        return PublishProviderReadiness {
+            ready: false,
+            hint: Some(
+                item.auth_detail
+                    .clone()
+                    .unwrap_or_else(|| format!("{} is not authenticated. Open Settings -> Source control for setup guidance.", item.label)),
+            ),
+        };
+    }
+    PublishProviderReadiness { ready: true, hint: None }
+}
+
+/// Offered providers sorted ready-first, then alphabetically by label (`sortedPublishProviderOptions`).
+pub fn offered_publish_providers(
+    offered: Option<&BTreeMap<String, bool>>,
+    discovered: &[PublishProviderDiscovery],
+) -> Vec<(&'static PublishProviderOption, PublishProviderReadiness)> {
+    let mut list: Vec<_> = PUBLISH_PROVIDER_OPTIONS
+        .iter()
+        .filter(|option| is_provider_offered(offered, option.kind))
+        .map(|option| (option, publish_provider_readiness(option.kind, discovered)))
+        .collect();
+    list.sort_by(|(left, left_ready), (right, right_ready)| {
+        right_ready.ready.cmp(&left_ready.ready).then_with(|| left.label.cmp(right.label))
+    });
+    list
+}
+
+/// `publishProvider` selection rule in `PublishRepositoryDialog`: an offered & ready user choice
+/// wins, else the first ready offered provider, else the offered selection, else GitHub.
+pub fn resolve_publish_provider(
+    selected: Option<&str>,
+    offered: Option<&BTreeMap<String, bool>>,
+    discovered: &[PublishProviderDiscovery],
+) -> &'static PublishProviderOption {
+    let offered_list = offered_publish_providers(offered, discovered);
+    let offered_selection = selected.filter(|kind| is_provider_offered(offered, kind));
+    if let Some(kind) = offered_selection
+        && publish_provider_readiness(kind, discovered).ready
+    {
+        return publish_provider_option(kind);
+    }
+    if let Some((first_ready, _)) = offered_list.iter().find(|(_, readiness)| readiness.ready) {
+        return first_ready;
+    }
+    if let Some(kind) = offered_selection {
+        return publish_provider_option(kind);
+    }
+    publish_provider_option(DEFAULT_SOURCE_CONTROL_PROVIDER)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PublishVisibility {
+    #[default]
+    Private,
+    Public,
+}
+
+impl PublishVisibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PublishVisibility::Private => "private",
+            PublishVisibility::Public => "public",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CloneProtocol {
+    #[default]
+    Ssh,
+    Https,
+}
+
+impl CloneProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloneProtocol::Ssh => "ssh",
+            CloneProtocol::Https => "https",
+        }
+    }
+}
+
+/// Validates `<owner>/<repo>` (`publishRepositoryOwner` & `publishRepositoryName` in `GitActionsControl.tsx`).
+pub fn valid_publish_repository(repository: &str) -> bool {
+    let trimmed = repository.trim();
+    let Some((owner, name)) = trimmed.split_once('/') else {
+        return false;
+    };
+    !owner.trim().is_empty() && !name.trim().is_empty()
+}
+
+/// `SourceControlPublishRepositoryInput`.
+pub fn publish_repository_input(
+    cwd: &str,
+    provider: &str,
+    repository: &str,
+    visibility: PublishVisibility,
+    remote_name: &str,
+    protocol: CloneProtocol,
+) -> Value {
+    let remote = remote_name.trim();
+    json!({
+        "cwd": cwd,
+        "provider": provider,
+        "repository": repository.trim(),
+        "visibility": visibility.as_str(),
+        "remoteName": if remote.is_empty() { "origin" } else { remote },
+        "protocol": protocol.as_str(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedRepositoryInfo {
+    pub name_with_owner: String,
+    pub url: String,
+}
+
+/// `SourceControlPublishRepositoryResult`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishRepositoryResult {
+    pub repository: PublishedRepositoryInfo,
+    pub remote_name: String,
+    #[serde(default)]
+    pub remote_url: String,
+    pub branch: String,
+    /// `"pushed"` or `"remote_added"`.
+    pub status: String,
+}
+
+/// Resolves a changed file from the commit dialog against `workingTree.rootPath`
+/// (`openChangedFileInEditor` → `resolvePathLinkTarget`).
+pub fn resolve_commit_dialog_file_path(file_path: &str, working_tree_root: &str) -> Option<String> {
+    let file = file_path.trim();
+    let root = working_tree_root.trim();
+    if file.is_empty() || root.is_empty() {
+        return None;
+    }
+    if file.starts_with('/') || file.starts_with("\\\\") || (file.len() >= 3 && file.as_bytes()[1] == b':' && matches!(file.as_bytes()[2], b'/' | b'\\')) {
+        return Some(file.to_owned());
+    }
+    let sep = if root.contains('\\') && !root.contains('/') { '\\' } else { '/' };
+    let trimmed_root = root.trim_end_matches(['/', '\\']);
+    let trimmed_file = file.trim_start_matches(['/', '\\']);
+    if trimmed_file.is_empty() {
+        return None;
+    }
+    Some(format!("{trimmed_root}{sep}{trimmed_file}"))
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+
+    fn discovered(kind: &str, available: bool, auth_status: &str, account: Option<&str>, host: Option<&str>) -> PublishProviderDiscovery {
+        PublishProviderDiscovery {
+            kind: kind.into(),
+            label: publish_provider_option(kind).label.into(),
+            available,
+            install_hint: format!("Install {kind}"),
+            auth_status: auth_status.into(),
+            auth_account: account.map(str::to_owned),
+            auth_host: host.map(str::to_owned),
+            auth_detail: None,
+        }
+    }
+
+    #[test]
+    fn offered_providers_default_to_github_only_and_sort_ready_first() {
+        let items = vec![
+            discovered("github", true, "unauthenticated", None, None),
+            discovered("gitlab", true, "authenticated", Some("alice"), None),
+        ];
+        let default_offered = offered_publish_providers(None, &items);
+        assert_eq!(default_offered.len(), 1);
+        assert_eq!(default_offered[0].0.kind, "github");
+        assert!(!default_offered[0].1.ready);
+
+        let map = BTreeMap::from([("github".to_owned(), true), ("gitlab".to_owned(), true)]);
+        let both = offered_publish_providers(Some(&map), &items);
+        assert_eq!(both.iter().map(|(o, _)| o.kind).collect::<Vec<_>>(), vec!["gitlab", "github"]);
+        assert_eq!(resolve_publish_provider(None, Some(&map), &items).kind, "gitlab");
+        assert_eq!(resolve_publish_provider(Some("gitlab"), Some(&BTreeMap::from([("gitlab".to_owned(), false)])), &items).kind, "github");
+    }
+
+    #[test]
+    fn decode_publish_discovery_reads_effect_options_and_forgejo_host() {
+        let payload = json!({
+            "sourceControlProviders": [{
+                "kind": "forgejo",
+                "label": "Forgejo / Gitea",
+                "status": "available",
+                "installHint": "Install tea",
+                "auth": {
+                    "status": "authenticated",
+                    "account": { "_tag": "Some", "value": "bob" },
+                    "host": { "_tag": "Some", "value": "git.example.test" },
+                    "detail": { "_tag": "None" }
+                }
+            }]
+        });
+        let items = decode_publish_discovery(&payload);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].auth_account.as_deref(), Some("bob"));
+        assert_eq!(items[0].auth_host.as_deref(), Some("git.example.test"));
+        assert_eq!(publish_provider_option("forgejo").publish_host(items[0].auth_host.as_deref()), "git.example.test");
+        assert_eq!(publish_provider_option("forgejo").publish_host(None), "your server");
+    }
+
+    #[test]
+    fn valid_publish_repository_and_commit_dialog_file_path() {
+        assert!(valid_publish_repository("alice/demo"));
+        assert!(valid_publish_repository("group/sub/project"));
+        assert!(!valid_publish_repository("alice/"));
+        assert!(!valid_publish_repository("/demo"));
+        assert!(!valid_publish_repository("nodivider"));
+        assert_eq!(resolve_commit_dialog_file_path("src/main.rs", "/repo"), Some("/repo/src/main.rs".into()));
+        assert_eq!(resolve_commit_dialog_file_path("src/main.rs", "/repo/"), Some("/repo/src/main.rs".into()));
+        assert_eq!(resolve_commit_dialog_file_path("/abs/file.rs", "/repo"), Some("/abs/file.rs".into()));
+    }
+}

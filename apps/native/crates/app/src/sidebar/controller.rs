@@ -211,6 +211,13 @@ pub(super) struct Deletion {
     pub doomed: Arc<std::collections::HashSet<String>>,
 }
 
+#[derive(Clone)]
+struct WorktreeCleanupPlan {
+    project_root: String,
+    worktree_path: String,
+    display_path: String,
+}
+
 struct PendingDeletion {
     token: u64,
     target: DeleteTarget,
@@ -1487,22 +1494,232 @@ impl AppState {
         let Some(thread) = self.thread_shell(thread_id) else {
             return then(self, false, cx);
         };
-        let thread = t3_core::sidebar::thread::present_thread(thread, None);
         let id = thread_id.to_owned();
+        if let Some(candidate) = self.orphaned_worktree_candidate(thread, &deletion.doomed) {
+            let check_server = self
+                .server_config
+                .config
+                .as_ref()
+                .is_some_and(|config| config.shell_thread_families);
+            if check_server
+                && let Some(request) = self.request(
+                    t3_core::vcs::method::ORCHESTRATION_GET_WORKTREE_THREAD_IDS,
+                    t3_core::vcs::worktree_thread_ids_request(&candidate.worktree_path),
+                    |value| t3_core::vcs::decode_worktree_thread_ids(&value),
+                )
+            {
+                let connection = self.connection_id();
+                cx.spawn(async move |this, cx| {
+                    let occupants = request.await.ok().and_then(Result::ok);
+                    let _ = this.update(cx, |state, cx| {
+                        if state.connection_id() != connection || !deletion.target.same_scope(&state.delete_target()) {
+                            return then(state, false, cx);
+                        }
+                        let still_orphaned = occupants.is_some_and(|ids| {
+                            !t3_core::vcs::worktree_cleanup::has_other_worktree_occupants(&ids, &id, &deletion.doomed)
+                        });
+                        if still_orphaned {
+                            state.prompt_worktree_cleanup_and_delete(id, deletion, candidate, failure_title, cx, then);
+                        } else {
+                            state.stop_and_delete_thread(id, deletion, None, failure_title, cx, then);
+                        }
+                    });
+                })
+                .detach();
+                return;
+            }
+            self.prompt_worktree_cleanup_and_delete(id, deletion, candidate, failure_title, cx, then);
+            return;
+        }
+        self.stop_and_delete_thread(id, deletion, None, failure_title, cx, then);
+    }
+
+    fn orphaned_worktree_candidate(
+        &self,
+        thread: &t3_core::shell::ThreadShell,
+        doomed: &std::collections::HashSet<String>,
+    ) -> Option<WorktreeCleanupPlan> {
+        let project = self.shell.project(&thread.project_id)?;
+        if self.is_scratch_project(&thread.project_id) || project.workspace_root.is_empty() {
+            return None;
+        }
+        let automatic = self
+            .server_config
+            .config
+            .as_ref()
+            .is_some_and(|config| t3_core::vcs::worktree_cleanup::automatic_worktree_cleanup_on_delete(&config.settings, &thread.project_id));
+        if automatic {
+            return None;
+        }
+        let can_write_sc = self.client_handle().is_some_and(|client| {
+            client
+                .session_state()
+                .borrow()
+                .as_ref()
+                .is_some_and(|session| session.grants(t3_core::auth::SOURCE_CONTROL_WRITE_SCOPE))
+        });
+        if !can_write_sc {
+            return None;
+        }
+        let surviving: Vec<(&str, Option<&str>)> = self
+            .shell
+            .snapshot
+            .as_ref()
+            .map(|s| s.threads.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry.id == thread.id || !doomed.contains(&entry.id))
+            .map(|entry| (entry.id.as_str(), entry.worktree_path.as_deref()))
+            .collect();
+        let orphaned = t3_core::vcs::worktree_cleanup::orphaned_worktree_path(&surviving, &thread.id)?;
+        Some(WorktreeCleanupPlan {
+            project_root: project.workspace_root.clone(),
+            display_path: t3_core::vcs::worktree_cleanup::format_worktree_path_for_display(orphaned),
+            worktree_path: orphaned.to_owned(),
+        })
+    }
+
+    fn prompt_worktree_cleanup_and_delete(
+        &mut self,
+        id: String,
+        deletion: Deletion,
+        plan: WorktreeCleanupPlan,
+        failure_title: &'static str,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
+    ) {
+        let app = cx.entity().downgrade();
+        let message = t3_core::vcs::worktree_cleanup::worktree_delete_prompt_body(&plan.display_path);
+        let (title, description) = crate::dialog::resolve_confirm_dialog_copy(&message);
+        let then_cell = std::rc::Rc::new(std::cell::RefCell::new(Some(then)));
+        let confirm_then = then_cell.clone();
+        let cancel_then = then_cell.clone();
+        let fallback_then = then_cell;
+        let confirm_id = id.clone();
+        let cancel_id = id.clone();
+        let confirm_deletion = deletion.clone();
+        let cancel_deletion = deletion.clone();
+        let confirm_plan = plan.clone();
+        cx.defer(move |cx| {
+            let shown = crate::dialog::ask_available_cancellable(
+                title,
+                description,
+                "Delete worktree",
+                move |state, cx| {
+                    if let Some(then) = confirm_then.borrow_mut().take() {
+                        state.stop_and_delete_thread(confirm_id, confirm_deletion, Some(confirm_plan), failure_title, cx, then);
+                    }
+                },
+                move |state, cx| {
+                    if let Some(then) = cancel_then.borrow_mut().take() {
+                        state.stop_and_delete_thread(cancel_id, cancel_deletion, None, failure_title, cx, then);
+                    }
+                },
+                cx,
+            );
+            if !shown && let Some(app) = app.upgrade() {
+                app.update(cx, |state, cx| {
+                    if let Some(then) = fallback_then.borrow_mut().take() {
+                        state.stop_and_delete_thread(id, deletion, None, failure_title, cx, then);
+                    }
+                });
+            }
+        });
+    }
+
+    fn stop_and_delete_thread(
+        &mut self,
+        id: String,
+        deletion: Deletion,
+        cleanup: Option<WorktreeCleanupPlan>,
+        failure_title: &'static str,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
+    ) {
+        if !deletion.target.same_scope(&self.delete_target()) {
+            return then(self, false, cx);
+        }
+        let Some(thread) = self.thread_shell(&id) else {
+            return then(self, false, cx);
+        };
+        let thread = t3_core::sidebar::thread::present_thread(thread, None);
         if thread.runtime.is_some() {
             self.dispatch_then(
-                t3_core::commands::stop_thread(&uuid(), thread_id),
+                t3_core::commands::stop_thread(&uuid(), &id),
                 None,
                 cx,
                 move |state, _, cx| {
                     if deletion.target.same_scope(&state.delete_target()) {
-                        state.delete_stopped_thread(id, deletion, failure_title, cx, then);
+                        state.delete_stopped_thread(id, deletion, cleanup, failure_title, cx, then);
                     }
                 },
             );
         } else {
-            self.delete_stopped_thread(id, deletion, failure_title, cx, then);
+            self.delete_stopped_thread(id, deletion, cleanup, failure_title, cx, then);
         }
+    }
+
+    fn cleanup_deleted_thread_worktree(&mut self, plan: WorktreeCleanupPlan, cx: &mut Context<Self>) {
+        let can_write_sc = self.client_handle().is_some_and(|client| {
+            client
+                .session_state()
+                .borrow()
+                .as_ref()
+                .is_some_and(|session| session.grants(t3_core::auth::SOURCE_CONTROL_WRITE_SCOPE))
+        });
+        if !can_write_sc {
+            self.show_toast(
+                Toast::new(ToastKind::Error, "Failed to delete worktree")
+                    .description(format!("Could not remove {}. This connection can no longer remove worktrees.", plan.display_path)),
+                cx,
+            );
+            return;
+        }
+        let Some(remove_task) = self.request(
+            t3_core::vcs::method::VCS_REMOVE_WORKTREE,
+            t3_core::vcs::remove_worktree(&plan.project_root, &plan.worktree_path, true),
+            Ok,
+        ) else {
+            return;
+        };
+        let connection = self.connection_id();
+        cx.spawn(async move |this, cx| {
+            let remove_result = remove_task.await.unwrap_or_else(|_| Err("An error occurred.".into()));
+            let refresh_task = this.update(cx, |state, cx| {
+                if state.connection_id() != connection {
+                    return None;
+                }
+                match remove_result {
+                    Ok(_) => state.request(
+                        t3_core::vcs::method::VCS_REFRESH_STATUS,
+                        t3_core::vcs::refresh_status(&plan.project_root, false),
+                        Ok,
+                    ),
+                    Err(message) => {
+                        state.show_toast(
+                            Toast::new(ToastKind::Error, "Failed to delete worktree")
+                                .description(format!("Could not remove {}. {message}", plan.display_path)),
+                            cx,
+                        );
+                        None
+                    }
+                }
+            });
+            if let Ok(Some(refresh_task)) = refresh_task {
+                let refresh_result = refresh_task.await.unwrap_or_else(|_| Err("An error occurred.".into()));
+                if let Err(message) = refresh_result {
+                    let _ = this.update(cx, |state, cx| {
+                        if state.connection_id() == connection {
+                            state.show_toast(
+                                Toast::new(ToastKind::Error, "Worktree deleted, but Git status refresh failed").description(message),
+                                cx,
+                            );
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn hold_pending_thread_deletion(&self) -> bool {
@@ -1601,6 +1818,7 @@ impl AppState {
         &mut self,
         id: String,
         deletion: Deletion,
+        cleanup: Option<WorktreeCleanupPlan>,
         failure_title: &'static str,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
@@ -1626,20 +1844,22 @@ impl AppState {
                         state.finish_deletion(reply, false, cx);
                         return;
                     }
-                    state.dispatch_delete_stopped(id, reply, extra, failure_title, cx, then);
+                    state.dispatch_delete_stopped(id, reply, extra, cleanup, failure_title, cx, then);
                 });
             })
             .detach();
             return;
         }
-        self.dispatch_delete_stopped(id, reply, Vec::new(), failure_title, cx, then);
+        self.dispatch_delete_stopped(id, reply, Vec::new(), cleanup, failure_title, cx, then);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_delete_stopped(
         &mut self,
         id: String,
         reply: DeletionReply,
         extra_side_chats: Vec<String>,
+        cleanup: Option<WorktreeCleanupPlan>,
         failure_title: &'static str,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut AppState, bool, &mut Context<Self>) + 'static,
@@ -1664,6 +1884,9 @@ impl AppState {
                         Some(next) => state.select_thread(&next, cx),
                         None => state.clear_selection(cx),
                     }
+                }
+                if ok && let Some(plan) = cleanup {
+                    state.cleanup_deleted_thread_worktree(plan, cx);
                 }
                 then(state, ok, cx);
             },

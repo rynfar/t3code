@@ -36,6 +36,8 @@ fn parses_a_modified_file_with_line_numbers_and_stats() {
     assert_eq!(files.len(), 1);
     let file = &files[0];
     assert_eq!(file.path(), "src/main.rs");
+    assert_eq!(file.old_object_id(), Some("3b18e51"));
+    assert_eq!(file.new_object_id(), Some("a2c4f1e"));
     assert_eq!(file.change, ChangeKind::Modified);
     assert_eq!((file.additions, file.deletions), (3, 2));
     assert_eq!(file.hunks.len(), 2);

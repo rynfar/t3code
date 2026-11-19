@@ -74,13 +74,25 @@ pub fn build_rows(files: &[FileDiff], collapsed: &HashSet<String>, layout: Layou
 
 /// One file's rows: its header, then (unless collapsed) separators and lines.
 pub fn file_rows(file_index: usize, file: &FileDiff, collapsed: bool, layout: Layout) -> Vec<DiffRow> {
+    file_rows_with_trailing(file_index, file, collapsed, layout, 0)
+}
+
+/// Like [`file_rows`], appending a trailing separator when `trailing_hidden > 0` (once full file
+/// contents are known for hidden hunk context expansion).
+pub fn file_rows_with_trailing(
+    file_index: usize,
+    file: &FileDiff,
+    collapsed: bool,
+    layout: Layout,
+    trailing_hidden: u32,
+) -> Vec<DiffRow> {
     if collapsed {
         return vec![DiffRow::FileHeader { file: file_index }];
     }
     if file.binary {
         return vec![DiffRow::FileHeader { file: file_index }, DiffRow::Notice { file: file_index }];
     }
-    let mut rows = Vec::with_capacity(1 + file.hunks.len() + file.line_count());
+    let mut rows = Vec::with_capacity(2 + file.hunks.len() + file.line_count());
     rows.push(DiffRow::FileHeader { file: file_index });
     let mut previous_end: Option<u32> = None;
     for (hunk_index, hunk) in file.hunks.iter().enumerate() {
@@ -101,6 +113,9 @@ pub fn file_rows(file_index: usize, file: &FileDiff, collapsed: bool, layout: La
             Layout::Split => push_split(&mut rows, file_index, hunk_index, hunk),
         }
     }
+    if trailing_hidden > 0 && !file.hunks.is_empty() {
+        rows.push(DiffRow::Separator { file: file_index, hunk: file.hunks.len(), hidden: trailing_hidden });
+    }
     rows
 }
 
@@ -108,13 +123,21 @@ pub fn file_rows(file_index: usize, file: &FileDiff, collapsed: bool, layout: La
 fn hunk_end(hunk: &Hunk) -> u32 {
     if hunk.new_count == 0 && hunk.new_start == 0 {
         hunk.old_start + hunk.old_count
+    } else if hunk.new_count == 0 {
+        hunk.new_start + 1
     } else {
         hunk.new_start + hunk.new_count
     }
 }
 
 fn hidden_before(hunk: &Hunk, previous_end: Option<u32>) -> u32 {
-    let start = if hunk.new_count == 0 && hunk.new_start == 0 { hunk.old_start } else { hunk.new_start };
+    let start = if hunk.new_count == 0 && hunk.new_start == 0 {
+        hunk.old_start
+    } else if hunk.new_count == 0 {
+        hunk.new_start + 1
+    } else {
+        hunk.new_start
+    };
     match previous_end {
         Some(end) => start.saturating_sub(end),
         None => start.saturating_sub(1),

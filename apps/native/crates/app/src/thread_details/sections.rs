@@ -193,25 +193,61 @@ fn script_menu_item(details: &Entity<Details>, menu: gpui::WeakEntity<gpui_compo
 }
 
 /// `ProjectScriptsControl` in panel mode: runs the preferred script; the chevron lists them all
-/// with their shortcuts, an edit button each, and Add project script. With no scripts the row
-/// adds one. A terminal glyph marks scripts still running.
+/// with their shortcuts, an edit button each, quick-imports from `t3.json`, and Add project script.
+/// With no scripts or importable `t3.json` entries, the row adds one. A terminal glyph marks
+/// scripts still running.
 fn scripts_row(ctx: &Ctx, cx: &App) -> Option<AnyElement> {
     let (project_id, scripts) = project_scripts(ctx.state.read(cx))?;
-    if scripts.is_empty() {
+    let git = ctx.git.read(cx);
+    let importable: Vec<t3_core::settings::project_actions::FileScript> =
+        t3_core::settings::project_actions::importable(git.file_scripts(), &scripts).into_iter().cloned().collect();
+    if scripts.is_empty() && importable.is_empty() {
         let row = Row::new("details-add-script", ADD_PROJECT_SCRIPT).icon(Icon::Plus).tooltip(ADD_PROJECT_SCRIPT).on_click(move |_, _, cx| git::open_script_editor(&project_id, None, cx));
         return Some(row.into_any_element());
     }
-    let git = ctx.git.read(cx);
     let can_run = git.can_run_scripts();
+    let can_import = git.can_write_settings();
     let primary = run_button_script(ctx.details.read(cx), &project_id, &scripts).cloned();
     let running: Vec<bool> = scripts.iter().map(|script| git.script_running(&script.id)).collect();
     let menu = {
-        let (details, project_id, scripts, running) = (ctx.details.clone(), project_id.clone(), scripts.clone(), running.clone());
+        let (details, git_entity, project_id, scripts, running, importable) =
+            (ctx.details.clone(), ctx.git.clone(), project_id.clone(), scripts.clone(), running.clone(), importable.clone());
         MenuTrigger::new("details-scripts-menu", "Script actions").dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, cx| {
             let handle = cx.entity().downgrade();
-            let menu = scripts.iter().zip(running.iter().copied()).fold(menu.min_w(px(ROW_WIDTH)), |menu, (script, running)| {
+            let mut menu = scripts.iter().zip(running.iter().copied()).fold(menu.min_w(px(ROW_WIDTH)), |menu, (script, running)| {
                 menu.item(script_menu_item(&details, handle.clone(), &project_id, script, running, can_run))
             });
+            if !importable.is_empty() {
+                if !scripts.is_empty() {
+                    menu = menu.separator();
+                }
+                menu = menu.item(
+                    PopupMenuItem::element(|_, cx| {
+                        div().text_xs().font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(palette(cx).muted_foreground)).child("From t3.json")
+                    })
+                    .disabled(true),
+                );
+                for file_script in &importable {
+                    let name = file_script.name.clone();
+                    let icon = script_icon(file_script.icon.unwrap_or_default());
+                    let git_entity = git_entity.clone();
+                    let project_id = project_id.clone();
+                    let pick = file_script.clone();
+                    let item = PopupMenuItem::element(move |_, cx| {
+                        h_flex()
+                            .w_full()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                            .child(Icon::Download.sized(px(14.)).text_color(hsla(palette(cx).muted_foreground)))
+                    })
+                    .icon(menu_icon(icon))
+                    .disabled(!can_import)
+                    .on_click(move |_, _, cx| {
+                        git_entity.update(cx, |git, cx| git.import_file_script(&project_id, pick.clone(), cx));
+                    });
+                    menu = menu.item(item);
+                }
+            }
             let project_id = project_id.clone();
             menu.item(PopupMenuItem::new(ADD_PROJECT_SCRIPT).icon(menu_icon(Icon::Plus)).on_click(move |_, _, cx| git::open_script_editor(&project_id, None, cx)))
         })
@@ -1152,7 +1188,7 @@ mod tests {
         });
         assert_eq!(
             pending,
-            Some(git::ScriptEditorRequest { project_id: "proj-plain".into(), script_id: Some("dev".into()) }),
+            Some(git::ScriptEditorRequest { project_id: "proj-plain".into(), script_id: Some("dev".into()), request: None }),
             "Edit button inside a disabled script menu item must remain clickable when !terminal:operate"
         );
     }

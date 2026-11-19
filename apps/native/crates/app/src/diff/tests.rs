@@ -1,14 +1,16 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Entity, IntoElement as _, VisualTestContext, point, px, size};
 use t3_core::composer::review::{CommentDictationState, Selection, Side};
 use t3_core::diff::{
-    CompletionOptions, CompletionScope, CompletionSupport, FileRevealTarget, MentionCandidate,
-    ReferenceCandidate, ReferenceKind, ReferenceSigil, ReferenceState,
+    CompletionOptions, CompletionScope, CompletionSupport, DiffFileContents, ExpandDirection,
+    FileRevealTarget, FileViewedState, InlineReviewComment, InlineReviewThread, MentionCandidate,
+    ReferenceCandidate, ReferenceKind, ReferenceSigil, ReferenceState, ReviewActor,
 };
 
-use super::{DiffPanel, External, Parsed};
+use super::{DiffPanel, External, Parsed, ViewedTarget};
 use crate::app_state::AppState;
 
 const SAMPLE_PATCH: &str = "\
@@ -302,4 +304,185 @@ fn comment_completion_and_dictation_hooks_work_end_to_end(cx: &mut gpui::TestApp
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].text, "Ask @alice about #42".into());
     assert_eq!(captured[0].file_path, "src/alpha.rs");
+}
+
+#[gpui::test]
+fn hunk_expansion_viewed_tracking_and_resolved_review_avatars_work_in_diff_panel(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (_runtime, panel, mut cx) = setup_panel(cx);
+    let patch_text = "\
+diff --git a/src/a.rs b/src/a.rs
+index 1111111..aaaaaaa 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -5,3 +5,3 @@
+ line 5
+-line 6 old
++line 6 new
+ line 7
+diff --git a/src/b.rs b/src/b.rs
+index 3333333..bbbbbbb 100644
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1,2 +1,2 @@
+-old b
++new b
+ keep b
+";
+    let parsed = Parsed::new(patch_text, false, None, None, None);
+
+    panel.update(&mut cx, |panel, cx| {
+        panel.show_external(
+            External { key: "pr:77".into(), parsed: Some(parsed), pending: false, error: None },
+            cx,
+        );
+        panel.set_folded(0, false, cx);
+        panel.set_folded(1, false, cx);
+        panel.set_viewed_target(
+            Some(ViewedTarget {
+                project_id: "proj-1".into(),
+                number: 77,
+                host: Some("github.com".into()),
+                repository: Some("org/repo".into()),
+                commit: None,
+                enabled: true,
+            }),
+            HashMap::from([("src/a.rs".into(), FileViewedState::Stale)]),
+            cx,
+        );
+        panel.set_review_threads(
+            vec![InlineReviewThread {
+                id: "rt-1".into(),
+                path: "src/a.rs".into(),
+                side: Side::Additions,
+                line: 6,
+                is_resolved: true,
+                comments: vec![InlineReviewComment {
+                    id: "c-1".into(),
+                    author: Some(ReviewActor { login: "alice".into(), avatar_url: None }),
+                    body: "Looks good now.".into(),
+                    created_at: None,
+                }],
+            }],
+            cx,
+        );
+    });
+
+    // Draw once with stale viewed badge & folded resolved avatar cluster.
+    cx.draw(point(px(0.), px(0.)), size(px(800.), px(320.)), |_, _| panel.clone().into_any_element());
+
+    panel.update(&mut cx, |panel, cx| {
+        // 1. Hunk expansion splices context above hunk 0 and reveals trailing hidden lines.
+        let before_rows = panel.view.as_ref().unwrap().row_count();
+        let file = panel.view.as_ref().unwrap().parsed.files()[0].clone();
+        let file_key = panel.view.as_ref().unwrap().key(0).unwrap().to_owned();
+        let old_content = (1..=10)
+            .map(|i| if i == 6 { "line 6 old".into() } else { format!("line {i}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_content = (1..=10)
+            .map(|i| if i == 6 { "line 6 new".into() } else { format!("line {i}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        panel.apply_hunk_expansion(
+            0,
+            &file_key,
+            &file,
+            &DiffFileContents {
+                old_contents: old_content,
+                new_contents: new_content,
+            },
+            0,
+            ExpandDirection::Up,
+            2,
+            cx,
+        );
+        let after_rows = panel.view.as_ref().unwrap().row_count();
+        assert!(after_rows > before_rows, "expected expanded context rows ({before_rows} -> {after_rows})");
+
+        // 2. Resolved review avatar toggles inline conversation visibility cleanly.
+        let diff = &panel.view.as_ref().unwrap().parsed.files()[0];
+        let layout = panel.view.as_ref().unwrap().layout;
+        assert!(panel.review_threads.visible_threads(diff, layout, Side::Additions, 6).is_empty());
+        panel.toggle_resolved_review_threads(0, Side::Additions, 6, cx);
+        let diff = &panel.view.as_ref().unwrap().parsed.files()[0];
+        assert_eq!(panel.review_threads.visible_threads(diff, layout, Side::Additions, 6).len(), 1);
+
+        // 3. Revision-tracked Viewed toggle marks viewed, auto-folds, and captures new_object_id.
+        assert_eq!(panel.file_viewed_state("src/a.rs"), FileViewedState::Stale);
+        panel.toggle_file_viewed(0, false, cx);
+        assert_eq!(panel.file_viewed_state("src/a.rs"), FileViewedState::Viewed);
+        assert!(panel.is_collapsed(0));
+        let (_, batch) = panel.viewed_tracker.take_batch().expect("queued batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0]["path"], "src/a.rs");
+        assert_eq!(batch[0]["viewed"], true);
+        assert_eq!(batch[0]["revision"], "aaaaaaa");
+
+        // Shift-click range from 0..=1 marks both files viewed and collapses file 1 too.
+        panel.toggle_file_viewed(1, true, cx);
+        assert_eq!(panel.file_viewed_state("src/b.rs"), FileViewedState::Viewed);
+        assert!(panel.is_collapsed(1));
+    });
+
+    // Re-draw after expansion, avatar toggle, and viewed fold to confirm no layout panics.
+    cx.draw(point(px(0.), px(0.)), size(px(800.), px(320.)), |_, _| panel.clone().into_any_element());
+}
+
+#[cfg(feature = "snapshot")]
+#[gpui::test]
+fn switching_viewed_target_flushes_pending_debounced_presses_before_reset(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, mut fixture) = cx.update(|cx| {
+        crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+    });
+    let (panel, vcx) = cx.add_window_view(|_, cx| DiffPanel::detached(state.clone(), cx));
+    let parsed = Parsed::new(SAMPLE_PATCH, false, None, None, None);
+
+    panel.update(vcx, |panel, cx| {
+        panel.show_external(
+            External { key: "pr:77".into(), parsed: Some(parsed), pending: false, error: None },
+            cx,
+        );
+        panel.set_viewed_target(
+            Some(ViewedTarget {
+                project_id: "proj-1".into(),
+                number: 77,
+                host: Some("github.com".into()),
+                repository: Some("org/repo".into()),
+                commit: None,
+                enabled: true,
+            }),
+            HashMap::new(),
+            cx,
+        );
+        panel.toggle_file_viewed(0, false, cx);
+        // Switch PR scope immediately within the debounce window — must flush PR #77's press.
+        panel.set_viewed_target(
+            Some(ViewedTarget {
+                project_id: "proj-1".into(),
+                number: 78,
+                host: Some("github.com".into()),
+                repository: Some("org/repo".into()),
+                commit: None,
+                enabled: true,
+            }),
+            HashMap::new(),
+            cx,
+        );
+    });
+
+    vcx.run_until_parked();
+    let (method, payload, reply) = runtime.block_on(fixture.next_request());
+    assert_eq!(method, t3_core::diff::SET_FILES_VIEWED_METHOD);
+    assert_eq!(payload["projectId"], "proj-1");
+    assert_eq!(payload["number"], 77);
+    assert_eq!(payload["files"][0]["path"], "src/alpha.rs");
+    assert_eq!(payload["files"][0]["viewed"], true);
+    assert_eq!(payload["files"][0]["revision"], "2222222");
+    let _ = reply.send(Ok(serde_json::json!({})));
 }

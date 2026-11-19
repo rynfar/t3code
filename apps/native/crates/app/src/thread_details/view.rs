@@ -109,7 +109,7 @@ impl DetailsView {
     ) -> Self {
         let DetailsViewPeers { composer, thread } = peers;
         let git = details.read(cx).git.clone();
-        let picker = cx.new(|cx| BranchPicker::new(git.clone(), window, cx));
+        let picker = cx.new(|cx| BranchPicker::new(git.clone(), window, cx).with_dialogs(dialogs.clone()));
         let find_open = state.read(cx).selected_thread.is_some() && thread.read(cx).is_find_open();
         let draft_provider = composer.read(cx).resolved_provider_instance(cx);
         let subscriptions = vec![
