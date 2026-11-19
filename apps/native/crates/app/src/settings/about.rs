@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, AppContext, Bounds, ClipboardItem, Context, Entity, Focusable, FontWeight,
@@ -133,9 +133,12 @@ enum LicensesStatus {
     Failed(String),
 }
 
+const MOBILE_POPOVER_REOPEN_GUARD: Duration = Duration::from_millis(250);
+
 pub(crate) struct AboutState {
     copied_version: bool,
     mobile_popover: Option<MobileStore>,
+    mobile_popover_dismissed: Option<(MobileStore, Instant)>,
     qr_cache: RefCell<Option<(MobileStore, Rc<QrMatrix>)>>,
     pub(super) licenses_open: bool,
     licenses_status: LicensesStatus,
@@ -161,6 +164,7 @@ impl AboutState {
         AboutState {
             copied_version: false,
             mobile_popover: None,
+            mobile_popover_dismissed: None,
             qr_cache: RefCell::new(None),
             licenses_open: false,
             licenses_status: LicensesStatus::Idle,
@@ -175,6 +179,7 @@ impl AboutState {
 
     pub(super) fn leave(&mut self) {
         self.mobile_popover = None;
+        self.mobile_popover_dismissed = None;
         self.licenses_open = false;
         self.licenses_search_open = false;
         self.licenses_expanded = None;
@@ -453,8 +458,10 @@ impl SettingsView {
                                 .bg(hsla(p.popover))
                                 .shadow(crate::composer::controls::floating_shadow(dark))
                                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                    this.about.mobile_popover = None;
-                                    cx.notify();
+                                    if let Some(prev) = this.about.mobile_popover.take() {
+                                        this.about.mobile_popover_dismissed = Some((prev, Instant::now()));
+                                        cx.notify();
+                                    }
                                 }))
                                 .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(store_name))
                                 .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Scan with your phone camera."))
@@ -470,12 +477,22 @@ impl SettingsView {
             });
             div()
                 .relative()
+                .debug_selector(move || format!("mobile-app-{}", store.id()))
                 .child(
                     Button::new(SharedString::from(format!("mobile-app-{}", store.id())), ButtonVariant::Outline, ButtonSize::Sm)
                         .icon(Icon::Smartphone)
                         .label(store.label())
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.about.mobile_popover = if this.about.mobile_popover == Some(store) { None } else { Some(store) };
+                            let just_dismissed_same = this
+                                .about
+                                .mobile_popover_dismissed
+                                .take()
+                                .is_some_and(|(prev, at)| prev == store && at.elapsed() < MOBILE_POPOVER_REOPEN_GUARD);
+                            this.about.mobile_popover = if just_dismissed_same || this.about.mobile_popover == Some(store) {
+                                None
+                            } else {
+                                Some(store)
+                            };
                             cx.notify();
                         })),
                 )
@@ -778,6 +795,31 @@ mod tests {
         let view = vcx.read(|cx| cx.global::<crate::settings::Host>().view.clone().expect("settings view open"));
         assert!(vcx.debug_bounds("about-version-copy").is_some());
         assert!(vcx.debug_bounds("about-support-link").is_some());
+
+        // Clicking an open Mobile app QR trigger closes it instead of immediately reopening on mouse-up.
+        let ios_center = vcx.debug_bounds("mobile-app-ios").expect("iOS button bounds").center();
+        let android_center = vcx.debug_bounds("mobile-app-android").expect("Android button bounds").center();
+        vcx.simulate_click(ios_center, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        view.read_with(&vcx, |view, _| assert_eq!(view.about.mobile_popover, Some(MobileStore::Ios)));
+        vcx.simulate_click(ios_center, Default::default());
+        vcx.run_until_parked();
+        view.read_with(&vcx, |view, _| assert_eq!(view.about.mobile_popover, None));
+
+        // Clicking the other store button while one is open switches directly to the other store.
+        vcx.simulate_click(ios_center, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.simulate_click(android_center, Default::default());
+        vcx.run_until_parked();
+        view.read_with(&vcx, |view, _| assert_eq!(view.about.mobile_popover, Some(MobileStore::Android)));
 
         // Escape dismisses mobile QR popover first, then licenses subview, without closing Settings.
         vcx.update(|window, cx| {

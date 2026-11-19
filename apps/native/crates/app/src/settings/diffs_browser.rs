@@ -6,7 +6,7 @@ use gpui::{
     App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Styled, Subscription,
     Window, div,
 };
-use gpui_component::{Sizable, h_flex};
+use gpui_component::{ActiveTheme, Sizable, h_flex};
 use gpui_component::input::{Input, InputEvent, InputState};
 use t3_core::client_settings::{
     BrowserLinkTarget, BrowserSearchEngine, ClientSettingChange, DiffColorScheme, valid_search_template,
@@ -154,26 +154,24 @@ impl SettingsView {
                 .description("Choose colors for additions and deletions, including change counts.")
                 .highlighted(self.is_target("diff-color-scheme"))
                 .reset(doc.diff_color_scheme() != DiffColorScheme::default(), reset(&state, ClientSettingChange::DiffColorScheme(DiffColorScheme::default())))
-                .control(
-                    select(&state, "diff-colors-select", DiffColorScheme::ALL, doc.diff_color_scheme(), DiffColorScheme::as_str, DiffColorScheme::label, ClientSettingChange::DiffColorScheme)
-                        .render_icon(|value, cx| {
+                .control({
+                    let active_scheme = doc.diff_color_scheme();
+                    select(&state, "diff-colors-select", DiffColorScheme::ALL, active_scheme, DiffColorScheme::as_str, DiffColorScheme::label, ClientSettingChange::DiffColorScheme)
+                        .render_icon(move |value, cx| {
                             let p = palette(cx);
-                            let (first, second) = if value == "blue-orange" {
-                                (hsla(p.diff_addition), hsla(p.diff_deletion))
-                            } else {
-                                (hsla(p.diff_deletion), hsla(p.diff_addition))
-                            };
+                            let dark = cx.theme().mode.is_dark();
+                            let (first, second) = diff_swatch_colors(value, active_scheme, dark, &p);
                             Some(
                                 h_flex()
                                     .gap(r(4.))
-                                    .child(div().size(r(8.)).rounded_full().bg(first))
-                                    .child(div().size(r(8.)).rounded_full().bg(second))
+                                    .child(div().size(r(8.)).rounded_full().bg(hsla(first)))
+                                    .child(div().size(r(8.)).rounded_full().bg(hsla(second)))
                                     .into_any_element(),
                             )
                         })
-                        .label(if doc.diff_color_scheme() == DiffColorScheme::RedGreen { "Red & green" } else { "Blue & orange" })
-                        .popup_width(208.),
-                ).into_any_element(),
+                        .label(if active_scheme == DiffColorScheme::RedGreen { "Red & green" } else { "Blue & orange" })
+                        .popup_width(208.)
+                }).into_any_element(),
         ], cx);
         let pr_links_state = state.clone();
         let prs = section("Pull requests", vec![
@@ -399,5 +397,46 @@ impl SettingsView {
                 cx,
             ),
         )]
+    }
+}
+
+/// Resolves each diff color scheme option's own swatch pair `(first, second)` without letting
+/// the currently active scheme overwrite the inactive option's dots in the dropdown popup.
+fn diff_swatch_colors(option_value: &str, active_scheme: DiffColorScheme, dark: bool, p: &crate::theme::Palette) -> (u32, u32) {
+    if option_value == "blue-orange" {
+        (p.blue_orange_diff_addition, p.blue_orange_diff_deletion)
+    } else if active_scheme == DiffColorScheme::RedGreen {
+        (p.diff_deletion, p.diff_addition)
+    } else {
+        let base = crate::theme::BUILT_IN_THEMES
+            .iter()
+            .find_map(|theme| if dark { theme.dark } else { theme.light })
+            .unwrap_or(*p);
+        (base.diff_deletion, base.diff_addition)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_swatch_colors_distinguish_both_options_regardless_of_active_scheme() {
+        let base = crate::theme::BUILT_IN_THEMES[0].dark.expect("default dark palette");
+        let mut blue_active = base;
+        blue_active.diff_addition = base.blue_orange_diff_addition;
+        blue_active.diff_deletion = base.blue_orange_diff_deletion;
+
+        let rg_when_rg = diff_swatch_colors("red-green", DiffColorScheme::RedGreen, true, &base);
+        let bo_when_rg = diff_swatch_colors("blue-orange", DiffColorScheme::RedGreen, true, &base);
+        assert_eq!(rg_when_rg, (base.diff_deletion, base.diff_addition));
+        assert_eq!(bo_when_rg, (base.blue_orange_diff_addition, base.blue_orange_diff_deletion));
+        assert_ne!(rg_when_rg, bo_when_rg);
+
+        let rg_when_bo = diff_swatch_colors("red-green", DiffColorScheme::BlueOrange, true, &blue_active);
+        let bo_when_bo = diff_swatch_colors("blue-orange", DiffColorScheme::BlueOrange, true, &blue_active);
+        assert_eq!(rg_when_bo, (base.diff_deletion, base.diff_addition));
+        assert_eq!(bo_when_bo, (base.blue_orange_diff_addition, base.blue_orange_diff_deletion));
+        assert_ne!(rg_when_bo, bo_when_bo);
     }
 }

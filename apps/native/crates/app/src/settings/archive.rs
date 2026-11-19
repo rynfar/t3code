@@ -12,7 +12,8 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::{self, method};
-use t3_core::settings::archive::{self as model, ArchiveEntry, ArchiveGroup, GET_ARCHIVED_SHELL_SNAPSHOT};
+use t3_core::settings::archive::{self as model, ArchiveEntry, ArchiveGroup, ArchiveVisibility, GET_ARCHIVED_SHELL_SNAPSHOT};
+use t3_core::sidebar::tag_filter::ThreadKey;
 use serde_json::json;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, icon, r, section};
@@ -94,13 +95,6 @@ impl SettingsView {
         self.archive.action_error = None;
         self.archive.status = Status::Loading;
         self.archive.sync_entries();
-        let hidden_tags = self
-            .state
-            .read(cx)
-            .server_config
-            .config
-            .as_ref()
-            .and_then(|config| config.settings.hidden_tags());
         let task = self.state.read(cx).rpc(GET_ARCHIVED_SHELL_SNAPSHOT, json!({}));
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -109,7 +103,38 @@ impl SettingsView {
                     return;
                 }
                 this.archive.status = match result {
-                    Ok(snapshot) => Status::Loaded(model::groups_filtered(&snapshot, hidden_tags.as_deref())),
+                    Ok(snapshot) => {
+                        let state = this.state.read(cx);
+                        let env_id = state
+                            .server_config
+                            .config
+                            .as_ref()
+                            .map(|config| config.environment.environment_id.as_str())
+                            .unwrap_or("");
+                        let hidden_tags = state.server_config.config.as_ref().and_then(|config| config.settings.hidden_tags());
+                        let hiding_anywhere = state.hiding_thread_tags() || !state.sidebar.hidden_thread_ids.is_empty();
+                        let already_hidden: HashSet<ThreadKey> =
+                            state.sidebar.hidden_thread_ids.iter().map(|id| ThreadKey::new(env_id, id)).collect();
+                        let loaded_elsewhere: HashSet<ThreadKey> = if hiding_anywhere {
+                            state
+                                .shell
+                                .snapshot
+                                .iter()
+                                .flat_map(|snap| snap.threads.iter())
+                                .map(|thread| ThreadKey::new(env_id, &thread.id))
+                                .collect()
+                        } else {
+                            HashSet::new()
+                        };
+                        let visibility = ArchiveVisibility {
+                            environment_id: env_id,
+                            hidden_tags: hidden_tags.as_deref(),
+                            already_hidden: &already_hidden,
+                            loaded_elsewhere: &loaded_elsewhere,
+                            hiding_anywhere,
+                        };
+                        Status::Loaded(model::groups_filtered(&snapshot, Some(&visibility)))
+                    }
                     Err(_) => Status::Failed,
                 };
                 this.archive.entries.clear();
@@ -464,7 +489,8 @@ mod tests {
                         created_at: "2026-11-18T00:00:00Z".into(),
                         archived_at: Some("2026-11-18T00:00:00Z".into()),
                         tags: vec![],
-                        parent_thread_id: None,
+                        lineage: None,
+                        delegated_from: None,
                     }],
                 }]);
                 view.archive.sync_entries();

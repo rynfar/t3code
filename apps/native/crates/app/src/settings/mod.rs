@@ -1052,7 +1052,7 @@ impl SettingsView {
                 .text_color(hsla(p.muted_foreground))
                 .hover(|this| this.text_color(hsla(p.foreground)))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.about.licenses_open = false;
+                    this.about.leave();
                     cx.notify();
                 }))
                 .child(self.section.label())

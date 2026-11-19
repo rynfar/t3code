@@ -52,6 +52,9 @@ pub(crate) struct ThreadsState {
     pub(crate) auto_settle_days: Entity<InputState>,
     auto_settle_field: AutoSettleDaysField,
     pub(crate) title_instructions: Entity<TextareaState>,
+    title_instructions_saved: Option<String>,
+    title_instructions_pending: Option<(String, u64)>,
+    title_instructions_revision: u64,
     text_gen_advanced: bool,
     time_inputs: Vec<(Entity<InputState>, Subscription)>,
     row_memory: Vec<SnoozeRowMemory>,
@@ -102,6 +105,9 @@ impl ThreadsState {
             auto_settle_days,
             auto_settle_field: AutoSettleDaysField::new(DEFAULT_AUTO_SETTLE_DAYS),
             title_instructions,
+            title_instructions_saved: None,
+            title_instructions_pending: None,
+            title_instructions_revision: 0,
             text_gen_advanced: false,
             time_inputs: Vec::new(),
             row_memory: Vec::new(),
@@ -269,12 +275,7 @@ impl SettingsView {
 
         Self::sync_input(&self.threads.base_directory, &threads.add_project_base_directory, window, cx);
         self.sync_auto_settle_days(threads.sidebar_auto_settle_after_days, window, cx);
-        if !self.threads.title_instructions.focus_handle(cx).is_focused(window)
-            && self.threads.title_instructions.read(cx).value().as_ref() != threads.thread_title_instructions.as_str()
-        {
-            let value = threads.thread_title_instructions.clone();
-            self.threads.title_instructions.update(cx, |input, cx| input.set_value(value, window, cx));
-        }
+        self.sync_title_instructions(&threads.thread_title_instructions, window, cx);
 
         let ghq_state = self.state.clone();
         let new_projects = section(
@@ -532,7 +533,7 @@ impl SettingsView {
             .or_else(|| selection.clone());
         let text_gen_state = self.state.clone();
         let text_gen_row = Row::new("text-generation-model", "Text generation model")
-            .description("For thread titles and other generated text. Source control has its own setting. Text generators from Providers also appear here.")
+            .description("For thread titles and other generated text. Source control has its own setting.")
             .highlighted(self.is_target("text-generation-model"))
             .reset(saved_text_gen.is_some(), {
                 let reset = update(ServerSettingChange::TextGenerationModelSelection(None));
@@ -603,13 +604,20 @@ impl SettingsView {
         if text_gen_advanced {
             let streaming = threads.response_streaming_mode;
             let streaming_state = self.state.clone();
+            let reset_instructions_view = cx.entity().downgrade();
             text_gen_rows.push(
                 Row::new("thread-title-instructions", "Thread title instructions")
                     .description("Appended to the prompt for new and regenerated thread titles.")
                     .highlighted(self.is_target("thread-title-instructions"))
                     .reset(!threads.thread_title_instructions.is_empty(), {
                         let reset = update(ServerSettingChange::ThreadTitleInstructions(String::new()));
-                        move |_, _, cx| reset(cx)
+                        move |_, _, cx| {
+                            let _ = reset_instructions_view.update(cx, |view, _| {
+                                view.threads.title_instructions_pending = None;
+                                view.threads.title_instructions_saved = None;
+                            });
+                            reset(cx);
+                        }
                     })
                     .below(
                         div()
@@ -676,12 +684,53 @@ impl SettingsView {
         }
     }
 
+    /// Keeps `title_instructions` in step with the server without clobbering an in-flight blur
+    /// commit before the `ServerConfig` echo arrives.
+    fn sync_title_instructions(&mut self, saved: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.threads.title_instructions_pending.as_ref().is_some_and(|(pending, _)| pending == saved) {
+            self.threads.title_instructions_pending = None;
+            self.threads.title_instructions_saved = Some(saved.to_owned());
+        }
+        if self.threads.title_instructions_pending.is_some() {
+            return;
+        }
+        if self.threads.title_instructions_saved.as_deref() != Some(saved)
+            && !self.threads.title_instructions.focus_handle(cx).is_focused(window)
+        {
+            self.threads.title_instructions_saved = Some(saved.to_owned());
+            if self.threads.title_instructions.read(cx).value().as_ref() != saved {
+                let value = saved.to_owned();
+                self.threads.title_instructions.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
+        }
+    }
+
     fn commit_title_instructions(&mut self, cx: &mut Context<Self>) {
         let value = self.threads.title_instructions.read(cx).value().trim().to_owned();
         let saved = self.thread_settings(cx).map(|config| config.settings.threads.thread_title_instructions.clone());
-        if saved.as_deref() != Some(value.as_str()) {
-            store::update_server(&self.state, ServerSettingChange::ThreadTitleInstructions(value), cx);
+        let target = self
+            .threads
+            .title_instructions_pending
+            .as_ref()
+            .map(|(pending, _)| pending.as_str())
+            .or(saved.as_deref());
+        if target == Some(value.as_str()) {
+            return;
         }
+        self.threads.title_instructions_revision += 1;
+        let revision = self.threads.title_instructions_revision;
+        self.threads.title_instructions_pending = Some((value.clone(), revision));
+        let view = cx.entity().downgrade();
+        let on_failed = Box::new(move |cx: &mut App| {
+            let _ = view.update(cx, |this, cx| {
+                if this.threads.title_instructions_pending.as_ref().is_some_and(|(_, rev)| *rev == revision) {
+                    this.threads.title_instructions_pending = None;
+                    this.threads.title_instructions_saved = None;
+                    cx.notify();
+                }
+            });
+        });
+        store::update_server_with(&self.state, ServerSettingChange::ThreadTitleInstructions(value), Some(on_failed), cx);
     }
 
     fn sync_auto_settle_days(&mut self, saved: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1163,6 +1212,35 @@ mod tests {
         view.read_with(&vcx, |view, cx| {
             assert_eq!(view.threads.auto_settle_field.draft, "7");
             assert_eq!(view.threads.auto_settle_days.read(cx).value().as_ref(), "7");
+        });
+
+        // Thread title instructions blur commit must not be overwritten before the server echo lands,
+        // and must roll back to the saved server value when the save fails.
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.sync_title_instructions("Old style", window, cx);
+                assert_eq!(view.threads.title_instructions.read(cx).value().as_ref(), "Old style");
+                view.threads.title_instructions.update(cx, |input, cx| input.set_value("Use conventional style", window, cx));
+                view.commit_title_instructions(cx);
+                // Simulated unfocused re-render before ServerConfig echo arrives:
+                view.sync_title_instructions("Old style", window, cx);
+                assert_eq!(view.threads.title_instructions.read(cx).value().as_ref(), "Use conventional style");
+            });
+        });
+        drive(&mut vcx);
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests
+            .into_iter()
+            .find(|(m, _, _)| *m == "server.updateSettings")
+            .expect("title instructions save sent");
+        assert_eq!(payload["patch"]["threadTitleInstructions"], json!("Use conventional style"));
+        let _ = reply.send(Err(t3_client::session::RpcError::Closed));
+        drive(&mut vcx);
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.sync_title_instructions("Old style", window, cx);
+                assert_eq!(view.threads.title_instructions.read(cx).value().as_ref(), "Old style");
+            });
         });
 
         state.update(&mut vcx, |state, _| state.stop_pump());
