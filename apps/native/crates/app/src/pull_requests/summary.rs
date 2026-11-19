@@ -1,20 +1,25 @@
-//! The Summary tab (`PullRequestSummaryTab.tsx`): reviewers and labels with the label picker
-//! (`PullRequestLabelPicker.tsx`), the description as markdown whose task checkboxes save back
-//! to the host (`saveDescription`), media read through the pull request's own repository
-//! (`sourceControlMediaRepository`), and the collapsible Checks section.
+//! The Summary tab (`PullRequestSummaryTab.tsx`): reviewers with the reviewer picker
+//! (`PullRequestReviewerPicker.tsx`), labels with the label picker (`PullRequestLabelPicker.tsx`),
+//! the description as markdown with an inline text editor and task checkboxes that save back to
+//! the host (`saveDescription`), maintainer edits toggle, reactions (`PullRequestReactionBar`),
+//! media read through the pull request's own repository (`sourceControlMediaRepository`), the
+//! collapsible Checks section, and comments with the new-comment composer.
 
 use std::sync::Arc;
 
 use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
+use gpui_component::input::Textarea;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 use t3_core::pull_requests::detail::{EventKind, check_status_label, describe_checks, ordered_checks};
+use t3_core::pull_requests::editing::can_edit_maintainer_edits;
 use t3_core::pull_requests::list::label_color;
 use t3_core::pull_requests::tasks::{Segment, task_segments};
 use t3_core::pull_requests::wire::Detail;
 
 use super::controls::{BadgeKind, Button, Size, Variant, avatar, badge, check_glyph};
 use super::detail::DetailView;
+use super::interactions;
 use crate::icons::Icon;
 use crate::right_panel::tooltip_view;
 use crate::theme::{hsla, palette};
@@ -23,24 +28,76 @@ use crate::transcript::markdown::prose;
 /// The indent of one level of list nesting in a split description.
 const NEST: f32 = 20.;
 
-pub fn render(view: &mut DetailView, _window: &mut Window, cx: &mut Context<DetailView>) -> AnyElement {
+pub fn render(view: &mut DetailView, window: &mut Window, cx: &mut Context<DetailView>) -> AnyElement {
     let Some(detail) = view.detail.clone() else { return div().into_any_element() };
     let p = palette(cx);
     let open = view.checks_open;
     if detail.capabilities.labels == Some(true) && view.label_candidates.is_none() {
         view.load_label_candidates(cx);
     }
-    let description = description(view, &detail, cx);
-    let comments = comments_section(view, cx);
+    let can_edit_desc = view.can_edit_description(cx);
+    let editing_desc = view.description_editing;
+    let desc_heading = h_flex()
+        .justify_between()
+        .pr(px(16.))
+        .child(section_heading("Description", None, cx))
+        .when(can_edit_desc && !editing_desc, |this| {
+            this.child(
+                Button::new("pr-desc-edit", Variant::GhostMuted, Size::Xs)
+                    .icon(Icon::Pencil)
+                    .label("Edit")
+                    .on_click(cx.listener(|this, _, window, cx| this.start_description_edit(window, cx))),
+            )
+        });
+    let description = description(view, &detail, window, cx);
+    let pr_reactions = view.activity.as_ref().and_then(|activity| {
+        let can_react = view.can_write_source_control(cx) && detail.capabilities.reactions == Some(true);
+        interactions::reaction_bar(view, None, &activity.reactions, can_react, cx)
+    });
+    let maintainer_edits = (can_edit_maintainer_edits(&detail) && view.can_write_source_control(cx)).then(|| {
+        let enabled = detail.maintainer_can_modify == Some(true);
+        let saving = view.maintainer_edits_saving;
+        h_flex()
+            .gap(px(8.))
+            .px(px(16.))
+            .pb(px(8.))
+            .text_xs()
+            .text_color(hsla(p.muted_foreground))
+            .child(
+                Button::new("pr-maintainer-edits", Variant::Ghost, Size::Xs)
+                    .icon(if enabled { Icon::Check } else { Icon::Square })
+                    .label("Allow edits by maintainers")
+                    .disabled(saving)
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_maintainer_edits(!enabled, cx))),
+            )
+    });
+    let comments = comments_section(view, &detail, window, cx);
+    let reviewers_row = reviewers(view, &detail, window, cx);
     v_flex()
         .id("pr-summary")
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
         .track_scroll(&view.summary_scroll)
-        .child(v_flex().gap(px(8.)).px(px(16.)).pt(px(10.)).pb(px(4.)).child(reviewers(&detail, cx)).when(!detail.labels.is_empty() || detail.capabilities.labels == Some(true), |this| this.child(labels(view, &detail, cx))))
-        .child(section_heading("Description", None, cx))
-        .child(div().px(px(16.)).pb(px(16.)).child(description))
+        .child(
+            v_flex()
+                .gap(px(8.))
+                .px(px(16.))
+                .pt(px(10.))
+                .pb(px(4.))
+                .child(reviewers_row)
+                .when(!detail.labels.is_empty() || detail.capabilities.labels == Some(true), |this| this.child(labels(view, &detail, cx))),
+        )
+        .child(desc_heading)
+        .child(
+            v_flex()
+                .px(px(16.))
+                .pb(px(12.))
+                .gap(px(8.))
+                .child(description)
+                .children(pr_reactions),
+        )
+        .children(maintainer_edits)
         .child(section_heading("Checks", Some(open), cx).id("pr-checks-toggle").cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
             this.checks_open = !this.checks_open;
             cx.notify();
@@ -51,9 +108,31 @@ pub fn render(view: &mut DetailView, _window: &mut Window, cx: &mut Context<Deta
         .into_any_element()
 }
 
-/// The description: one piece of markdown, or, where the viewer may edit it and it has tasks,
-/// split so each checkbox writes its marker back.
-fn description(view: &mut DetailView, detail: &Detail, cx: &mut Context<DetailView>) -> AnyElement {
+/// The description: inline editor while editing, else markdown (with writable task checkboxes).
+fn description(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: &mut Context<DetailView>) -> AnyElement {
+    if view.description_editing {
+        let input = view.ensure_description_input(window, cx);
+        let saving = view.description_saves > 0;
+        return v_flex()
+            .gap(px(8.))
+            .child(Textarea::new(&input).disabled(saving))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(Button::new("pr-desc-cancel", Variant::Ghost, Size::Xs).label("Cancel").disabled(saving).on_click(cx.listener(|this, _, _, cx| {
+                        this.description_editing = false;
+                        cx.notify();
+                    })))
+                    .child(
+                        Button::new("pr-desc-save", Variant::Outline, Size::Xs)
+                            .label(if saving { "Saving..." } else { "Save" })
+                            .disabled(saving)
+                            .on_click(cx.listener(|this, _, _, cx| this.commit_description_edit(cx))),
+                    ),
+            )
+            .into_any_element();
+    }
     let body = view.description().unwrap_or_default();
     let segments = if view.can_edit_description(cx) { task_segments(&body) } else { None };
     let scope = view.media_scope(detail, cx);
@@ -121,36 +200,37 @@ fn section_heading(title: impl Into<SharedString>, open: Option<bool>, cx: &App)
 fn meta_row(icon: Icon, label: &'static str, value: impl IntoElement, cx: &App) -> impl IntoElement {
     let p = palette(cx);
     h_flex()
+        .items_start()
         .min_h(px(24.))
         .gap(px(8.))
         .text_xs()
-        .child(h_flex().w(px(96.)).flex_none().gap(px(6.)).text_color(hsla(p.muted_foreground)).child(icon.sized(px(14.))).child(label))
+        .child(h_flex().w(px(96.)).flex_none().gap(px(6.)).pt(px(2.)).text_color(hsla(p.muted_foreground)).child(icon.sized(px(14.))).child(label))
         .child(div().flex_1().min_w_0().text_color(hsla(p.foreground)).child(value))
 }
 
-fn reviewers(detail: &Detail, cx: &App) -> impl IntoElement {
+fn reviewers(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: &mut Context<DetailView>) -> AnyElement {
     let p = palette(cx);
-    let value = if detail.reviewers.is_empty() {
-        div().text_color(hsla(p.muted_foreground)).child("None").into_any_element()
-    } else {
-        h_flex()
-            .flex_wrap()
-            .gap(px(6.))
-            .children(detail.reviewers.iter().map(|reviewer| {
-                let named = match &reviewer.name {
-                    Some(name) if *name != reviewer.login => format!("{name} (@{})", reviewer.login),
-                    _ => reviewer.login.clone(),
-                };
-                h_flex()
-                    .id(SharedString::from(format!("pr-reviewer-{}", reviewer.login)))
-                    .gap(px(4.))
-                    .child(avatar(&reviewer.login, 16., cx))
-                    .child(reviewer.login.clone())
-                    .tooltip(move |window, cx| tooltip_view(named.clone().into(), window, cx))
-            }))
-            .into_any_element()
-    };
-    meta_row(Icon::Users, "Reviewers", value, cx)
+    let picker = interactions::reviewer_picker(view, detail, window, cx);
+    let value = h_flex()
+        .flex_wrap()
+        .items_start()
+        .gap(px(6.))
+        .when(detail.reviewers.is_empty(), |this| this.child(div().pt(px(2.)).text_color(hsla(p.muted_foreground)).child("None")))
+        .children(detail.reviewers.iter().map(|reviewer| {
+            let named = match &reviewer.name {
+                Some(name) if *name != reviewer.login => format!("{name} (@{})", reviewer.login),
+                _ => reviewer.login.clone(),
+            };
+            h_flex()
+                .id(SharedString::from(format!("pr-reviewer-{}", reviewer.login)))
+                .gap(px(4.))
+                .pt(px(2.))
+                .child(avatar(&reviewer.login, 16., cx))
+                .child(reviewer.login.clone())
+                .tooltip(move |window, cx| tooltip_view(named.clone().into(), window, cx))
+        }))
+        .children(picker);
+    meta_row(Icon::Users, "Reviewers", value, cx).into_any_element()
 }
 
 fn labels(view: &DetailView, detail: &Detail, cx: &mut Context<DetailView>) -> impl IntoElement {
@@ -250,10 +330,8 @@ fn checks(detail: &Detail, cx: &mut Context<DetailView>) -> impl IntoElement {
     }))
 }
 
-/// Conversation comments and review/overview threads on Summary, so threads without a diff line
-/// (such as GitLab overview threads) can be resolved and added to chat from Summary as well as
-/// Timeline (`PullRequestSummaryTab.tsx`, `pingdotgg/t3code#30575`, `pingdotgg/t3code#30579`).
-fn comments_section(view: &mut DetailView, cx: &mut Context<DetailView>) -> AnyElement {
+/// Conversation comments and review/overview threads on Summary, plus the comment composer.
+fn comments_section(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: &mut Context<DetailView>) -> AnyElement {
     let p = palette(cx);
     let Some(activity) = view.activity.as_ref() else {
         let heading = section_heading("Comments", None, cx);
@@ -270,9 +348,10 @@ fn comments_section(view: &mut DetailView, cx: &mut Context<DetailView>) -> AnyE
     let body = if items.is_empty() {
         div().px(px(16.)).pb(px(16.)).text_xs().text_color(hsla(p.muted_foreground)).child("No comments yet.").into_any_element()
     } else {
-        let cards: Vec<AnyElement> = items.iter().map(|event| super::timeline::event_card(view, event, false, cx)).collect();
+        let cards: Vec<AnyElement> = items.iter().map(|event| super::timeline::event_card(view, event, false, window, cx)).collect();
         v_flex().px(px(16.)).pb(px(16.)).gap(px(12.)).children(cards).into_any_element()
     };
+    let composer = interactions::comment_form(view, detail, window, cx);
     v_flex()
         .child(heading)
         .children(truncated.map(|loaded_count| {
@@ -290,5 +369,6 @@ fn comments_section(view: &mut DetailView, cx: &mut Context<DetailView>) -> AnyE
                 .child(format!("This conversation is only partially loaded. {loaded} loaded; open it on the host to read the rest."))
         }))
         .child(body)
+        .children(composer)
         .into_any_element()
 }

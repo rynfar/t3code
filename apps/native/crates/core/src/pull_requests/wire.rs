@@ -60,6 +60,187 @@ literals!(CheckStatus {
     Cancelled = "cancelled",
 });
 literals!(CommentKind { IssueComment = "issue-comment", ReviewComment = "review-comment", Review = "review" });
+literals!(ReactionContent {
+    ThumbsUp = "thumbs-up",
+    ThumbsDown = "thumbs-down",
+    Laugh = "laugh",
+    Hooray = "hooray",
+    Confused = "confused",
+    Heart = "heart",
+    Rocket = "rocket",
+    Eyes = "eyes",
+});
+literals!(ReviewVerdict { Comment = "comment", Approve = "approve", RequestChanges = "request-changes" });
+literals!(ReviewerKind { User = "user", Team = "team" });
+literals!(ViewedFilesStore { Host = "host", Environment = "environment" });
+literals!(FileViewedState { Unviewed = "unviewed", Viewed = "viewed", Dismissed = "dismissed" });
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reaction {
+    pub content: ReactionContent,
+    pub count: u64,
+    #[serde(default)]
+    pub actors: Vec<String>,
+    #[serde(default)]
+    pub viewer_has_reacted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewerCandidate {
+    pub id: String,
+    pub kind: ReviewerKind,
+    #[serde(default)]
+    pub is_requested: bool,
+    #[serde(default)]
+    pub is_bot: Option<bool>,
+    pub login: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerCandidates {
+    #[serde(default, deserialize_with = "lenient")]
+    pub candidates: Vec<ReviewerCandidate>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preview {
+    pub project_id: String,
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    #[serde(default)]
+    pub author: Option<Actor>,
+    pub state: PrState,
+    #[serde(default)]
+    pub is_draft: bool,
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<serde_json::Number>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileViewed {
+    pub path: String,
+    pub state: FileViewedState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilesViewedResult {
+    #[serde(default, deserialize_with = "lenient")]
+    pub files: Vec<FileViewed>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadCommentsPage {
+    #[serde(default, deserialize_with = "lenient")]
+    pub comments: Vec<ThreadComment>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub hidden_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewGuideAttention {
+    pub kind: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewGuideExcerpt {
+    pub path: String,
+    pub side: String,
+    pub start: u32,
+    pub end: u32,
+    #[serde(default)]
+    pub caption: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewGuideNote {
+    pub path: String,
+    pub line: u32,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewGuideFile {
+    pub path: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewGuideStop {
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub attention: Option<ReviewGuideAttention>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub excerpts: Vec<ReviewGuideExcerpt>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub files: Vec<ReviewGuideFile>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub notes: Vec<ReviewGuideNote>,
+    #[serde(default)]
+    pub questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewGuide {
+    pub head_sha: String,
+    pub generated_at: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub stops: Vec<ReviewGuideStop>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag")]
+pub enum ReviewGuideRun {
+    #[serde(rename_all = "camelCase")]
+    Running { head_sha: String, started_at: String },
+    #[serde(rename_all = "camelCase")]
+    Failed { head_sha: String, failed_at: String, detail: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewGuideResult {
+    #[serde(default)]
+    pub guide: Option<ReviewGuide>,
+    #[serde(default)]
+    pub run: Option<ReviewGuideRun>,
+    #[serde(default)]
+    pub current_head_sha: Option<String>,
+}
 
 /// Decodes an array element by element, dropping elements that do not decode.
 pub fn lenient<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -102,7 +283,7 @@ pub struct Check {
     pub required: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackMembership {
     pub number: u64,
     pub position: u64,
@@ -111,7 +292,7 @@ pub struct StackMembership {
 }
 
 /// `PullRequestListEntry`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListEntry {
     #[serde(default)]
@@ -145,7 +326,7 @@ pub struct ListEntry {
     pub checks_state: Option<ChecksState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSummary {
     pub host: String,
@@ -154,12 +335,14 @@ pub struct ProviderSummary {
     #[serde(default)]
     pub actions: Option<Vec<Action>>,
     pub project_count: u64,
+    #[serde(default)]
+    pub project_ids: Option<Vec<String>>,
     pub configured: bool,
     #[serde(default)]
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectError {
     pub project_id: String,
@@ -168,7 +351,7 @@ pub struct ProjectError {
 }
 
 /// `PullRequestListResult`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListResult {
     #[serde(default)]
@@ -185,7 +368,7 @@ pub struct ListResult {
     pub next_cursors: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffStat {
     pub project_id: String,
@@ -195,7 +378,7 @@ pub struct DiffStat {
     pub deletions: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListStats {
     #[serde(default, deserialize_with = "lenient")]
     pub stats: Vec<DiffStat>,
@@ -223,11 +406,32 @@ pub struct EditCapabilities {
     pub maintainer_edits: Option<bool>,
 }
 
-/// The part of `PullRequestReviewCapabilities` the native client reads.
+/// `PullRequestReviewCapabilities`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReviewCapabilities {
     #[serde(default)]
+    pub inline_comment: bool,
+    #[serde(default)]
+    pub range_comment: Option<bool>,
+    #[serde(default)]
+    pub reply: bool,
+    #[serde(default)]
     pub resolve: bool,
+    #[serde(default, deserialize_with = "lenient")]
+    pub verdicts: Vec<ReviewVerdict>,
+}
+
+/// `PullRequestReviewerCapabilities`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewerCapabilities {
+    #[serde(default)]
+    pub request: bool,
+    #[serde(default)]
+    pub list_candidates: bool,
+    #[serde(default)]
+    pub search_candidates: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -242,6 +446,10 @@ pub struct Capabilities {
     #[serde(default)]
     pub merge_methods: Vec<MergeMethod>,
     #[serde(default)]
+    pub reactions: Option<bool>,
+    #[serde(default)]
+    pub viewed_files: Option<ViewedFilesStore>,
+    #[serde(default)]
     pub labels: Option<bool>,
     #[serde(default)]
     pub stacks: Option<bool>,
@@ -251,6 +459,12 @@ pub struct Capabilities {
     pub edit: Option<EditCapabilities>,
     #[serde(default)]
     pub review: ReviewCapabilities,
+    #[serde(default)]
+    pub reviewers: ReviewerCapabilities,
+    #[serde(default)]
+    pub mentions: Option<bool>,
+    #[serde(default)]
+    pub reference_sigils: Option<Vec<String>>,
 }
 
 /// Unreported host permissions are granted.
@@ -263,10 +477,16 @@ pub struct ViewerPermissions {
     pub comment: bool,
     #[serde(default)]
     pub resolve: bool,
+    #[serde(default, deserialize_with = "lenient")]
+    pub verdicts: Vec<ReviewVerdict>,
+    #[serde(default)]
+    pub request_reviewers: bool,
     #[serde(default)]
     pub labels: Option<bool>,
     #[serde(default)]
     pub edit_change_request: Option<bool>,
+    #[serde(default)]
+    pub maintainer_edits: Option<bool>,
 }
 
 /// `PullRequestMergeQueueRemoval`: the host's merge queue letting go of a pull request without
@@ -506,11 +726,17 @@ pub struct Comment {
     pub body: String,
     pub created_at: String,
     #[serde(default)]
+    pub edited_at: Option<String>,
+    #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
     pub review_state: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub can_edit: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -522,10 +748,16 @@ pub struct ThreadComment {
     pub body: String,
     pub created_at: String,
     #[serde(default)]
+    pub edited_at: Option<String>,
+    #[serde(default)]
     pub url: Option<String>,
     /// The review that posted the comment, so a link to a review with no text finds its comments.
     #[serde(default)]
     pub review_url: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub can_edit: Option<bool>,
 }
 
 /// `PullRequestReviewThread`, or an overview thread (`PullRequestOverviewThread`) on the change
@@ -580,6 +812,8 @@ pub struct Activity {
     pub comment_count: u64,
     #[serde(default)]
     pub comments_truncated: bool,
+    #[serde(default)]
+    pub review_threads_truncated: Option<bool>,
     #[serde(default, deserialize_with = "lenient")]
     pub review_threads: Vec<ReviewThread>,
     /// Apart from `review_threads` on the wire so clients that require a path still decode.
@@ -587,6 +821,8 @@ pub struct Activity {
     pub overview_threads: Vec<ReviewThread>,
     #[serde(default, deserialize_with = "lenient")]
     pub commits: Vec<Commit>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub reactions: Vec<Reaction>,
 }
 
 /// `PullRequestDiffResult`, from `POST /api/pull-requests/diff`.

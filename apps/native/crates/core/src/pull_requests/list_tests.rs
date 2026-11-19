@@ -153,6 +153,7 @@ fn shown_groups_keep_host_matches_only_when_answered() {
         searches_on_host: true,
         actions: None,
         project_count: 1,
+        project_ids: None,
         configured: true,
         detail: None,
     }];
@@ -205,6 +206,7 @@ fn quick_actions_follow_state_and_host() {
         searches_on_host: false,
         actions: Some(vec![Action::Close]),
         project_count: 1,
+        project_ids: None,
         configured: true,
         detail: None,
     }];

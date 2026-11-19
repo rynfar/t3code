@@ -60,6 +60,21 @@ fn grants_orchestration_operate(state: &AppState) -> bool {
 
 gpui::actions!(palette, [OpenAddProject]);
 
+/// Linked-thread search intent opened from a PR's "Linked from N threads" control
+/// (`openCommandPalette({ query, linkedThreads })` in `PullRequestThreadLinks.tsx`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedThreadSearch {
+    pub query: String,
+    pub threads: Vec<t3_core::pull_requests::link::LinkedThread>,
+}
+
+/// Global handoff so `pull_requests` can open `CommandPalette` into linked-thread search via
+/// `ToggleCommandPalette` without coupling to `workspace.rs`.
+#[derive(Default)]
+pub struct PendingLinkedThreadSearch(pub Option<LinkedThreadSearch>);
+
+impl gpui::Global for PendingLinkedThreadSearch {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Command,
@@ -106,6 +121,7 @@ pub struct CommandPalette {
     message_finds: HashMap<String, t3_core::timeline::PendingThreadFind>,
     message_order: Option<ShownOrder<String>>,
     message_request: Option<Task<()>>,
+    linked_thread_search: Option<LinkedThreadSearch>,
     groups: Vec<CommandPaletteGroup>,
     highlighted: Option<String>,
     focus_return: Option<FocusHandle>,
@@ -406,6 +422,7 @@ fn scoped_project_thread_items(
 }
 
 fn palette_threads(
+    state: Option<&AppState>,
     model: &t3_core::sidebar::SidebarModel,
     history: &t3_core::sidebar::visits::OpenHistory,
     environment: Option<&t3_core::sidebar::visits::OpenEnvironment>,
@@ -413,22 +430,29 @@ fn palette_threads(
     model
         .threads
         .iter()
-        .map(|thread| PaletteThread {
-            environment_id: ENVIRONMENT.to_owned(),
-            id: thread.id.clone(),
-            project_id: thread.project_id.clone(),
-            title: thread.title.clone(),
-            branch: thread.branch.clone(),
-            created_at: thread.created_at.map(format_iso).unwrap_or_default(),
-            updated_at: thread.updated_at.map(format_iso).unwrap_or_default(),
-            latest_user_message_at: thread.latest_user_message_at.map(format_iso),
-            latest_user_authored_message_at: thread
-                .latest_user_authored_message_at
-                .map(|at| at.map(format_iso)),
-            opens: thread.opens.clone(),
-            local_opened_at: environment
-                .and_then(|environment| history.local_opened_at(environment, &thread.id)),
-            ..Default::default()
+        .map(|thread| {
+            let pull_requests = state
+                .and_then(|state| state.thread_shell(&thread.id))
+                .map(|shell| t3_core::search::search_pull_requests(&shell.pull_requests))
+                .unwrap_or_default();
+            PaletteThread {
+                environment_id: ENVIRONMENT.to_owned(),
+                id: thread.id.clone(),
+                project_id: thread.project_id.clone(),
+                title: thread.title.clone(),
+                branch: thread.branch.clone(),
+                created_at: thread.created_at.map(format_iso).unwrap_or_default(),
+                updated_at: thread.updated_at.map(format_iso).unwrap_or_default(),
+                latest_user_message_at: thread.latest_user_message_at.map(format_iso),
+                latest_user_authored_message_at: thread
+                    .latest_user_authored_message_at
+                    .map(|at| at.map(format_iso)),
+                pull_requests,
+                opens: thread.opens.clone(),
+                local_opened_at: environment
+                    .and_then(|environment| history.local_opened_at(environment, &thread.id)),
+                ..Default::default()
+            }
         })
         .collect()
 }
@@ -491,6 +515,7 @@ impl CommandPalette {
             message_finds: HashMap::new(),
             message_order: None,
             message_request: None,
+            linked_thread_search: None,
             groups: Vec::new(),
             highlighted: None,
             focus_return: None,
@@ -500,7 +525,32 @@ impl CommandPalette {
     }
 
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = cx.try_global::<PendingLinkedThreadSearch>().and_then(|pending| pending.0.clone()) {
+            cx.set_global(PendingLinkedThreadSearch(None));
+            return self.open_linked_thread_search(pending, window, cx);
+        }
         self.toggle_mode(Mode::Command, window, cx);
+    }
+
+    /// Opens the command palette seeded with a PR's linked threads and URL query (`PR-LINK`).
+    pub(crate) fn open_linked_thread_search(&mut self, search: LinkedThreadSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.open {
+            self.focus_return = window.focused(cx);
+        }
+        self.open = true;
+        self.linked_thread_search = Some(search.clone());
+        self.mode = Mode::Command;
+        self.clear_message_search();
+        self.rebuild(cx);
+        self.search = create_command_palette_search_state(&search.query);
+        let placeholder = Mode::Command.placeholder(None);
+        self.input.update(cx, |input, cx| {
+            input.set_value(search.query.clone(), window, cx);
+            input.set_placeholder(placeholder, window, cx);
+            input.focus(window, cx);
+        });
+        self.refilter(cx);
+        cx.notify();
     }
 
     /// `ToggleMode`: the same mode again closes the palette; another one switches to it.
@@ -556,7 +606,11 @@ impl CommandPalette {
         match mode {
             Mode::Command => {
                 self.rebuild(cx);
-                self.search = create_command_palette_search_state("");
+                let restored_query = self.linked_thread_search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+                if !restored_query.is_empty() {
+                    self.input.update(cx, |input, cx| input.set_value(restored_query.clone(), window, cx));
+                }
+                self.search = create_command_palette_search_state(&restored_query);
                 self.refilter(cx);
             }
             Mode::Files => self.files.start(target, &self.state.clone(), cx),
@@ -655,6 +709,7 @@ impl CommandPalette {
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
+        self.linked_thread_search = None;
         self.clear_message_search();
         if let Some(focus) = self.focus_return.take() {
             window.focus(&focus, cx);
@@ -667,7 +722,7 @@ impl CommandPalette {
         let state = self.state.read(cx);
         let model = state.sidebar.model.clone();
         let titles: HashMap<String, String> = model.project_names.iter().map(|(id, name)| (format!("{ENVIRONMENT}:{id}"), name.clone())).collect();
-        let threads = palette_threads(&model, &state.open_history, environment.as_ref());
+        let threads = palette_threads(Some(state), &model, &state.open_history, environment.as_ref());
         let active = state.selected_thread.as_deref().map(|id| (ENVIRONMENT, id));
         let items = build_thread_action_items(&threads, active, &titles, |_| None);
         let active_value = active.map(|(env, id)| format!("thread:{env}:{id}"));
@@ -773,10 +828,25 @@ impl CommandPalette {
             for row in &state.sidebar.fleet.threads {
                 let value = format!("scoped-thread:{}", self.scoped_thread_actions.len());
                 self.scoped_thread_actions.insert(value.clone(), row.key.clone());
-                self.threads.push(CommandPaletteItem { value, title:row.thread.title.clone(),
-                    description:state.sidebar.fleet.project_names.get(&row.project).cloned(),
-                    search_terms:vec![row.thread.title.clone(),row.thread.branch.clone().unwrap_or_default(),state.scoped_environment(&row.owner.saved_id).and_then(|entry| entry.config.config.as_ref()).map(|config| config.environment.label.clone()).unwrap_or_default()],
-                    ..Default::default() });
+                let mut search_terms = vec![
+                    row.thread.title.clone(),
+                    row.thread.branch.clone().unwrap_or_default(),
+                    state
+                        .scoped_environment(&row.owner.saved_id)
+                        .and_then(|entry| entry.config.config.as_ref())
+                        .map(|config| config.environment.label.clone())
+                        .unwrap_or_default(),
+                ];
+                if let Some(shell) = state.thread_shell(&row.key.thread_id) {
+                    search_terms.extend(t3_core::pull_requests::link::thread_pull_request_search_terms(&shell.pull_requests));
+                }
+                self.threads.push(CommandPaletteItem {
+                    value,
+                    title: row.thread.title.clone(),
+                    description: state.sidebar.fleet.project_names.get(&row.project).cloned(),
+                    search_terms,
+                    ..Default::default()
+                });
             }
         }
     }
@@ -905,6 +975,64 @@ impl CommandPalette {
             thread_message_items: &self.message_items,
             now: now_ms(),
         });
+        if self.search.views.is_empty()
+            && let Some(linked) = &self.linked_thread_search
+            && self.search.query == linked.query
+        {
+            let state = self.state.read(cx);
+            let loaded_ids: std::collections::HashSet<&str> = state
+                .shell
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.threads.iter().map(|t| t.id.as_str()).collect())
+                .unwrap_or_default();
+            let hiding_anywhere = state.hiding_thread_tags() || !state.sidebar.hidden_thread_ids.is_empty();
+            let visible = t3_core::pull_requests::link::visible_linked_threads(
+                &linked.threads,
+                &loaded_ids,
+                &state.sidebar.hidden_thread_ids,
+                hiding_anywhere,
+            );
+            let existing_ids: std::collections::HashSet<String> = self
+                .groups
+                .iter()
+                .flat_map(|group| &group.items)
+                .filter_map(|item| item.value.strip_prefix("thread:").and_then(|rest| rest.split_once(':').map(|(_, id)| id.to_owned())))
+                .collect();
+            let items: Vec<CommandPaletteItem> = visible
+                .into_iter()
+                .filter(|thread| !existing_ids.contains(&thread.id))
+                .map(|thread| {
+                    let project_name = state
+                        .sidebar
+                        .model
+                        .project_names
+                        .get(&thread.project_id)
+                        .cloned()
+                        .or_else(|| state.shell.project(&thread.project_id).map(|project| project.title.clone()));
+                    let mut description = project_name.unwrap_or_default();
+                    if thread.archived_at.is_some() {
+                        description = if description.is_empty() { "Archived".to_owned() } else { format!("{description} · Archived") };
+                    }
+                    CommandPaletteItem {
+                        value: format!("linked-thread:{}", thread.id),
+                        title: if thread.title.trim().is_empty() { "Untitled thread".to_owned() } else { thread.title.clone() },
+                        description: (!description.is_empty()).then_some(description),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            if !items.is_empty() {
+                self.groups.insert(
+                    0,
+                    CommandPaletteGroup {
+                        value: "linked-threads".into(),
+                        label: "Linked threads".into(),
+                        items,
+                    },
+                );
+            }
+        }
         let rows = build_command_palette_rows(&self.groups);
         self.highlighted = rows.item_values.first().map(|value| (*value).to_owned());
         cx.notify();
@@ -1218,6 +1346,12 @@ impl CommandPalette {
                         });
                     state.queue_thread_find(key, find, cx);
                 }
+                state.select_thread(&thread_id, cx);
+            });
+        } else if let Some(thread_id) = value.strip_prefix("linked-thread:") {
+            let thread_id = thread_id.to_owned();
+            self.state.update(cx, |state, cx| {
+                state.set_pull_requests_open(false, cx);
                 state.select_thread(&thread_id, cx);
             });
         } else if let Some(rest) = value.strip_prefix("new-thread-in:") {
@@ -1913,7 +2047,7 @@ mod visit_recency_tests {
         let rank = |history: &OpenHistory,
                     environment: &t3_core::sidebar::visits::OpenEnvironment| {
             let items = build_thread_action_items(
-                &palette_threads(&model, history, Some(environment)),
+                &palette_threads(None, &model, history, Some(environment)),
                 None,
                 &HashMap::new(),
                 |_| None,
@@ -1938,7 +2072,7 @@ mod visit_recency_tests {
         assert_eq!(rank(&history, &bound), ["thread:local:a", "thread:local:b"]);
         let other = history.environment(Some("other"), Some("other")).unwrap();
         assert!(
-            palette_threads(&model, &history, Some(&other))
+            palette_threads(None, &model, &history, Some(&other))
                 .iter()
                 .all(|thread| thread.local_opened_at.is_none())
         );
@@ -1946,10 +2080,69 @@ mod visit_recency_tests {
             .environment(Some("saved"), Some("replacement"))
             .unwrap();
         assert!(
-            palette_threads(&model, &history, Some(&replacement))
+            palette_threads(None, &model, &history, Some(&replacement))
                 .iter()
                 .all(|thread| thread.local_opened_at.is_none())
         );
+    }
+
+    #[gpui::test]
+    fn palette_threads_indexes_linked_pull_requests_for_search(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| {
+                state.shell.snapshot = Some(serde_json::from_value(serde_json::json!({
+                    "snapshotSequence": 1,
+                    "projects": [{
+                        "id": "p1",
+                        "title": "Repo",
+                        "workspaceRoot": "/tmp/repo",
+                        "defaultModelSelection": null,
+                        "scripts": [],
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    }],
+                    "threads": [{
+                        "id": "t1", "projectId": "p1", "title": "Fix cache race", "providerInstanceId": "replay",
+                        "modelSelection": { "instanceId": "replay", "model": "replay" },
+                        "runtimeMode": "full-access", "interactionMode": "default",
+                        "branch": "fix/cache", "lineage": { "rootThreadId": "t1" }, "status": "idle",
+                        "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+                        "pullRequests": [{
+                            "host": "github.com",
+                            "repository": "acme/app",
+                            "number": 88,
+                            "url": "https://github.com/acme/app/pull/88",
+                            "source": "manual",
+                            "linkedAt": "2026-01-02T00:00:00Z",
+                            "snapshot": {
+                                "state": "open",
+                                "title": "Avoid cache overwrite",
+                                "headBranch": "fix/cache",
+                                "baseBranch": "main",
+                                "isDraft": false
+                            }
+                        }]
+                    }],
+                    "updatedAt": "2026-01-02T00:00:00Z"
+                })).unwrap());
+            });
+            let shell_thread = state.read(cx).thread_shell("t1").unwrap().clone();
+            let mut model = t3_core::sidebar::SidebarModel::default();
+            model.threads.push(t3_core::sidebar::thread::present_thread(&shell_thread, None));
+            let history = OpenHistory::default();
+            let threads = palette_threads(Some(state.read(cx)), &model, &history, None);
+            assert_eq!(threads.len(), 1);
+            assert_eq!(threads[0].pull_requests.len(), 1);
+            assert_eq!(threads[0].pull_requests[0].number, 88);
+            assert_eq!(threads[0].pull_requests[0].title.as_deref(), Some("Avoid cache overwrite"));
+            assert!(threads[0].pull_requests[0].references.iter().any(|r| r.contains("acme/app/pull/88")));
+        });
     }
 
     #[cfg(feature = "snapshot")]

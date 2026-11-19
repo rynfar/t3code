@@ -2,22 +2,31 @@
 //! slices (`nextCursor`) as the reader nears the end of what is loaded, each slice parsed once on
 //! the network runtime (`sliceParses`) and the parses joined there for the diff panel. A link
 //! naming a file's diff, by the host's digest of its path, reveals that file and its lines once
-//! a loaded slice holds it (`useCodeViewFileReveal`).
+//! a loaded slice holds it (`useCodeViewFileReveal`). Wires `DiffPanel::set_review_threads`
+//! (`pingdotgg/t3code#34644`), `DiffPanel::set_viewed_target` (`pingdotgg/t3code#35114`),
+//! `DiffPanel::set_external_comment_handler` (inline PR review drafts), and
+//! `DiffPanel::set_completion_scope` (PR `@mention` / `#ref` completion).
 
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::{Context, Entity, IntoElement, ParentElement, Render, Styled, Task, Window, div, prelude::*, px};
+use gpui::{Context, Entity, IntoElement, ParentElement, Render, Styled, Task, WeakEntity, Window, div, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
 use serde_json::json;
-use t3_core::composer::review::Side as DiffSide;
-use t3_core::diff::{FileDiff, FileRevealTarget, ParsedPatch};
+use t3_core::composer::review::{ReviewComment, Side as DiffSide};
+use t3_core::diff::{CompletionScope, CompletionSupport, FileDiff, FileRevealTarget, ParsedPatch, ReferenceSigil};
 use t3_core::pull_requests::anchor::{Range, Side, diff_path_matches};
-use t3_core::pull_requests::wire::{DiffResult, decode};
-use t3_core::pull_requests::{PrRef, failure_message};
+use t3_core::pull_requests::review::{files_viewed_map, pending_comment_from_diff, to_inline_review_threads};
+use t3_core::pull_requests::wire::{Activity, Detail, DiffResult, FilesViewedResult, decode};
+use t3_core::pull_requests::{PrRef, failure_message, method};
 
 use super::controls::{Button, Size, Variant};
+use super::detail::DetailView;
+use super::{read, settle};
 use crate::app_state::AppState;
-use crate::diff::{DiffPanel, External, Parsed};
+use crate::diff::{DiffPanel, External, Parsed, ViewedTarget};
+use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
 /// The sentinel's `rootMargin`: the next slice is read once the end is this close.
@@ -25,6 +34,7 @@ const NEAR_END: f32 = 240.;
 
 pub struct CodeTab {
     state: Entity<AppState>,
+    detail_view: WeakEntity<DetailView>,
     reference: PrRef,
     panel: Entity<DiffPanel>,
     /// Each slice's own parse, in order.
@@ -40,12 +50,26 @@ pub struct CodeTab {
     commit: Option<String>,
     /// A linked file's digest and lines, until a loaded slice has the file.
     reveal: Option<(String, Option<Range>)>,
+    /// A direct path reveal (from GuideTab file jump), until a loaded slice holds the file.
+    reveal_path: Option<String>,
     reveals: u64,
+    viewed_supported: bool,
+    viewed_can_write: bool,
+    range_comments: bool,
     _fetch: Option<Task<()>>,
+    _viewed: Option<Task<()>>,
 }
 
 impl CodeTab {
-    pub fn new(state: Entity<AppState>, reference: PrRef, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        detail_view: WeakEntity<DetailView>,
+        reference: PrRef,
+        detail: Option<&Detail>,
+        activity: Option<&Activity>,
+        can_write: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let panel = cx.new(|cx| DiffPanel::detached(state.clone(), cx));
         let this = cx.entity().downgrade();
         let rows = panel.downgrade();
@@ -59,14 +83,149 @@ impl CodeTab {
                 }
             });
         });
-        let mut tab = CodeTab { state, reference, panel, slices: Vec::new(), next_cursor: None, pending: false, error: None, generation: 0, near_end_check: false, commit: None, reveal: None, reveals: 0, _fetch: None };
+        let mut tab = CodeTab {
+            state,
+            detail_view,
+            reference,
+            panel,
+            slices: Vec::new(),
+            next_cursor: None,
+            pending: false,
+            error: None,
+            generation: 0,
+            near_end_check: false,
+            commit: None,
+            reveal: None,
+            reveal_path: None,
+            reveals: 0,
+            viewed_supported: false,
+            viewed_can_write: false,
+            range_comments: false,
+            _fetch: None,
+            _viewed: None,
+        };
+        tab.sync_state(detail, activity, can_write, cx);
         tab.fetch(None, cx);
         tab
+    }
+
+    /// Synchronizes host capabilities (inline commenting, completion scope, viewed files) and
+    /// inline review conversations (`DiffPanel::set_review_threads`) from `DetailView`.
+    pub fn sync_state(&mut self, detail: Option<&Detail>, activity: Option<&Activity>, can_write: bool, cx: &mut Context<Self>) {
+        if let Some(activity) = activity {
+            self.sync_review_threads(activity, cx);
+        }
+        if let Some(detail) = detail {
+            self.sync_capabilities(detail, can_write, cx);
+        }
+    }
+
+    pub fn sync_review_threads(&mut self, activity: &Activity, cx: &mut Context<Self>) {
+        let threads = to_inline_review_threads(activity);
+        self.panel.update(cx, |panel, cx| panel.set_review_threads(threads, cx));
+    }
+
+    fn sync_capabilities(&mut self, detail: &Detail, can_write: bool, cx: &mut Context<Self>) {
+        self.range_comments = detail.capabilities.review.range_comment == Some(true);
+        let inline_allowed = can_write && detail.capabilities.review.inline_comment && detail.viewer_permissions.comment;
+        if inline_allowed {
+            let this = cx.entity().downgrade();
+            let handler = Rc::new(move |comment: ReviewComment, cx: &mut gpui::App| {
+                if let Some(this) = this.upgrade() {
+                    this.update(cx, |tab, cx| tab.handle_inline_comment(comment, cx));
+                }
+            });
+            self.panel.update(cx, |panel, cx| panel.set_external_comment_handler(Some(handler), cx));
+        } else {
+            self.panel.update(cx, |panel, cx| panel.set_external_comment_handler(None, cx));
+        }
+
+        let reference_sigils: Vec<ReferenceSigil> = detail
+            .capabilities
+            .reference_sigils
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|sigil| match sigil.as_str() {
+                "#" => Some(ReferenceSigil::Hash),
+                "!" => Some(ReferenceSigil::Bang),
+                _ => None,
+            })
+            .collect();
+        let support = CompletionSupport {
+            mentions: detail.capabilities.mentions == Some(true),
+            reference_sigils,
+        };
+        let scope = support.is_enabled().then(|| CompletionScope {
+            scope_key: self.reference.key(),
+            project_id: self.reference.project_id.clone(),
+            support,
+        });
+        self.panel.update(cx, |panel, cx| panel.set_completion_scope(scope, cx));
+
+        let viewed_now = detail.capabilities.viewed_files.is_some();
+        let target = viewed_now.then(|| self.viewed_target(can_write));
+        if viewed_now != self.viewed_supported || (viewed_now && can_write != self.viewed_can_write) {
+            self.viewed_supported = viewed_now;
+            self.viewed_can_write = can_write;
+            if viewed_now {
+                self.panel.update(cx, |panel, cx| panel.set_viewed_target(target, HashMap::new(), cx));
+                self.fetch_files_viewed(can_write, cx);
+            } else {
+                self.panel.update(cx, |panel, cx| panel.set_viewed_target(None, HashMap::new(), cx));
+            }
+        }
+    }
+
+    fn viewed_target(&self, enabled: bool) -> ViewedTarget {
+        ViewedTarget {
+            project_id: self.reference.project_id.clone(),
+            number: self.reference.number,
+            host: self.reference.host.clone(),
+            repository: Some(self.reference.repository.clone()),
+            commit: self.commit.clone(),
+            enabled,
+        }
+    }
+
+    fn fetch_files_viewed(&mut self, can_write: bool, cx: &mut Context<Self>) {
+        if !self.viewed_supported {
+            return;
+        }
+        let target = self.viewed_target(can_write);
+        let task = read(self.state.read(cx), method::FILES_VIEWED, self.reference.payload(), decode::<FilesViewedResult>);
+        self._viewed = Some(cx.spawn(async move |this, cx| {
+            let Ok(result) = settle(task).await else { return };
+            let states = files_viewed_map(&result);
+            let _ = this.update(cx, |tab, cx| {
+                tab.panel.update(cx, |panel, cx| panel.set_viewed_target(Some(target), states, cx));
+            });
+        }));
+    }
+
+    fn handle_inline_comment(&mut self, comment: ReviewComment, cx: &mut Context<Self>) {
+        let file = self
+            .slices
+            .iter()
+            .flat_map(|slice| slice.files().iter())
+            .find(|file| file.path() == comment.file_path);
+        let Some(pending) = pending_comment_from_diff(&comment, file, self.range_comments) else {
+            return;
+        };
+        if let Some(detail_view) = self.detail_view.upgrade() {
+            detail_view.update(cx, |view, cx| view.add_pending_review_comment(pending, cx));
+        }
     }
 
     pub fn set_commit(&mut self, commit: Option<String>, cx: &mut Context<Self>) {
         if self.commit != commit {
             self.commit = commit;
+            if self.viewed_supported {
+                let can_write = self.viewed_can_write;
+                let target = self.viewed_target(can_write);
+                self.panel.update(cx, |panel, cx| panel.set_viewed_target(Some(target), HashMap::new(), cx));
+                self.fetch_files_viewed(can_write, cx);
+            }
             self.reload(cx);
         }
     }
@@ -76,6 +235,9 @@ impl CodeTab {
         self.slices.clear();
         self.next_cursor = None;
         self.fetch(None, cx);
+        if self.viewed_supported {
+            self.fetch_files_viewed(self.viewed_can_write, cx);
+        }
     }
 
     /// `canLoadNextSlice`: never after a failure, which would retry without end.
@@ -144,7 +306,22 @@ impl CodeTab {
         self.try_reveal(cx);
     }
 
+    /// Reveals a file directly by repo-relative path (used by `GuideTab` file jumps).
+    pub fn reveal_file_path(&mut self, path: String, cx: &mut Context<Self>) {
+        self.reveal_path = Some(path);
+        self.try_reveal(cx);
+    }
+
     fn try_reveal(&mut self, cx: &mut Context<Self>) {
+        if let Some(wanted_path) = self.reveal_path.clone() {
+            let found = self.slices.iter().flat_map(|slice| slice.files().iter()).any(|file| file.path() == wanted_path);
+            if found {
+                self.reveal_path = None;
+                self.reveals += 1;
+                let request = self.reveals;
+                self.panel.update(cx, |panel, cx| panel.reveal_file_path(request, FileRevealTarget::file(wanted_path), cx));
+            }
+        }
         let Some((digest, range)) = &self.reveal else { return };
         let path = self.slices.iter().flat_map(|slice| slice.files().iter()).map(|file| file.path().to_owned()).find(|path| diff_path_matches(digest, path));
         let Some(path) = path else { return };
@@ -183,6 +360,12 @@ impl CodeTab {
         let external = External { key: self.key(), parsed: None, pending: self.pending, error: self.error.clone() };
         self.panel.update(cx, |panel, cx| panel.show_external(external, cx));
         cx.notify();
+    }
+
+    #[cfg(test)]
+    #[cfg(test)]
+    pub(crate) fn diff_panel(&self) -> &Entity<DiffPanel> {
+        &self.panel
     }
 }
 
@@ -228,6 +411,7 @@ impl Render for CodeTab {
         let failed = self.error.is_some();
         let first = self.slices.is_empty();
         let partial = (!first && self.pending) || failed;
+        let pending_count = self.detail_view.upgrade().map_or(0, |view| view.read(cx).pending_review_comment_count());
         let commit_banner = self.commit.as_deref().map(|sha| {
             let short = t3_core::pull_requests::detail::short_sha(sha).to_owned();
             h_flex()
@@ -244,10 +428,36 @@ impl Render for CodeTab {
                 .child(format!("Showing commit {short}"))
                 .child(Button::new("pr-code-all-commits", Variant::Ghost, Size::Xs).label("Show full diff").on_click(cx.listener(|this, _, _, cx| this.set_commit(None, cx))))
         });
+        let review_banner = (pending_count > 0).then(|| {
+            let detail_view = self.detail_view.clone();
+            h_flex()
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .px(px(16.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(hsla(p.border))
+                .bg(hsla(p.muted).opacity(0.6))
+                .text_xs()
+                .text_color(hsla(p.foreground))
+                .child(h_flex().gap(px(6.)).child(Icon::MessageSquare.sized(px(13.)).text_color(hsla(p.primary))).child(format!("{pending_count} pending review {}", if pending_count == 1 { "comment" } else { "comments" })))
+                .child(
+                    Button::new("pr-code-finish-review", Variant::Default, Size::Xs)
+                        .label("Finish review")
+                        .on_click(move |_, _, cx| {
+                            if let Some(view) = detail_view.upgrade() {
+                                view.update(cx, |view, cx| view.open_review_form(cx));
+                            }
+                        }),
+                )
+        });
         v_flex()
             .size_full()
             .min_h_0()
             .children(commit_banner)
+            .children(review_banner)
             .pt(px(12.))
             .child(div().flex_1().min_h_0().child(self.panel.clone()))
             .when(partial, |this| {

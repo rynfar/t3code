@@ -1,6 +1,9 @@
 //! The pull requests page (`PullRequestsPage.tsx`, `PullRequestsColumn.tsx`): one list read per
-//! scope with a debounced host search, line counts read after the rows, grouped and sorted rows
-//! in a virtualized list, and the selected pull request's detail beside it. While open it follows
+//! scope with a debounced host search, persisted cold-start list and diff-stat caches
+//! (`pullRequestStatsPersistence.ts`), hover-intent detail prefetch (`usePullRequestIntentPrefetch.ts`),
+//! link hover preview cards (`PullRequestLinkPreview.tsx`), stacked project-assignment column
+//! (`pullRequestProjectAssignment.logic.ts`), grouped and sorted rows in a virtualized list, and
+//! the selected pull request's detail beside it. While open it follows
 //! `pullRequests.subscribeRefreshes`, re-reading the list and the open detail on each new epoch
 //! (`refreshTrigger` in `client-runtime/src/state/pullRequests.ts`).
 
@@ -9,32 +12,42 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, ListAlignment, ListState, Modifiers,
-    ParentElement, Render, Styled, Subscription, Task, Window, WindowControlArea, div, list, prelude::*, px, relative,
+    ParentElement, Render, SharedString, Styled, Subscription, Task, Window, WindowControlArea, div, list, prelude::*, px, relative,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use t3_client::store;
+use t3_core::pull_requests::assignment::{
+    AssignableProject, EnvironmentInfo, HostAvailability, project_assignment_rows, remember_hosts, reset_hosts,
+};
+use t3_core::pull_requests::cache::{LIST_CACHE_KEY, PersistedListCache, PersistedStatsCache, STATS_CACHE_KEY};
+use t3_core::pull_requests::editing::patch_list_entry;
 use t3_core::pull_requests::list::{Group, Shown, entry_key, needs_stats, shown_groups};
 use t3_core::pull_requests::query::parse_query;
-use t3_core::pull_requests::editing::patch_list_entry;
-use t3_core::pull_requests::wire::{Action, FilterOptions, ListResult, ListStats, MergeMethod, PrState, Summary, decode};
+use t3_core::pull_requests::wire::{Action, Activity, Detail, FilterOptions, ListResult, ListStats, MergeMethod, PrState, Stack, Summary, decode};
 use t3_core::pull_requests::{
-    ListPreferences, MAX_PAGE_SIZE, PAGE_SIZE, PREFERENCES_KEY, PrRef, SEARCH_DEBOUNCE_MS, action_done_label, action_failed_label, action_input, list_accepts, list_input, method, project_default_merge_method,
-    stats_inputs,
+    ListPreferences, MAX_PAGE_SIZE, PAGE_SIZE, PREFERENCES_KEY, PrRef, SEARCH_DEBOUNCE_MS, action_done_label, action_failed_label, action_input, list_accepts, list_input, method,
+    project_default_merge_method, stats_inputs,
 };
 
 use super::controls::{Button, Size, Variant};
-use super::detail::DetailView;
+use super::detail::{DetailView, has_held_detail, prefetch_into_held};
 use super::mutations::{self, MergePicks, Mutations};
+use super::preview::{LinkPreviewController, PreviewTarget};
 use super::thread_panel::PendingSelection;
 use super::{read, settle};
 use crate::app_state::{AppEvent, AppState};
+use crate::icons::Icon;
+use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
 pub(super) const ROW_HEIGHT: f32 = 56.;
 /// A bound on remembered line counts.
 const MAX_HELD_STATS: usize = 4000;
+/// `INTENT_DELAY_MS` (`usePullRequestIntentPrefetch.ts`).
+pub(super) const INTENT_PREFETCH_DELAY: Duration = Duration::from_millis(150);
+const PROJECT_COLUMN_WIDTH: f32 = 200.;
 
 /// `pullRequestDiffStatKey`, in one environment.
 fn stat_key(project_id: &str, number: u64) -> String {
@@ -91,11 +104,26 @@ pub struct PullRequestsPage {
     detail: Option<Entity<DetailView>>,
     pub(super) shift: bool,
     pub(super) options: FilterOptions,
+    /// Persisted cold-start caches (`pullRequestStatsPersistence.ts` + list scope cache).
+    list_cache: PersistedListCache,
+    stats_cache: PersistedStatsCache,
     /// Line counts by `pullRequestDiffStatKey`, kept across reads (GitHub listings omit them).
     stats: HashMap<String, (u64, u64)>,
     requested: HashSet<String>,
     /// A refresh epoch passed, so counts `listStats` measured are read again.
     restat: bool,
+    /// Host availability and stacked project-assignment column state (`pullRequestProjectAssignment.logic.ts`).
+    host_availability: HostAvailability,
+    projects_column_open: bool,
+    /// Lazily loaded stack info per row key for `PullRequestStackPopover`.
+    pub(super) row_stacks: HashMap<String, Result<Option<Stack>, String>>,
+    row_stack_loading: HashSet<String>,
+    /// Hover-intent prefetch (`usePullRequestIntentPrefetch.ts`).
+    intent_target: Option<PrRef>,
+    _intent_timer: Option<Task<()>>,
+    _intent_fetch: Option<Task<()>>,
+    /// Link hover preview card (`PullRequestLinkPreview.tsx`).
+    pub(super) preview: LinkPreviewController,
     focus: FocusHandle,
     connected: bool,
     open: bool,
@@ -117,6 +145,8 @@ impl Focusable for PullRequestsPage {
 impl PullRequestsPage {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let prefs: ListPreferences = store::load_ui_state(PREFERENCES_KEY).and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
+        let list_cache = PersistedListCache::from_value(store::load_ui_state(LIST_CACHE_KEY));
+        let stats_cache = PersistedStatsCache::from_value(store::load_ui_state(STATS_CACHE_KEY));
         let typed = prefs.q.clone().unwrap_or_default();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search pull requests, or label:bug").default_value(typed.clone()));
         let subscriptions = vec![
@@ -126,7 +156,7 @@ impl PullRequestsPage {
                 _ => {}
             }),
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
-                if matches!(event, AppEvent::Phase | AppEvent::Selection) {
+                if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Shell) {
                     this.sync(cx);
                 }
             }),
@@ -146,9 +176,19 @@ impl PullRequestsPage {
             detail: None,
             shift: false,
             options: FilterOptions::default(),
+            list_cache,
+            stats_cache,
             stats: HashMap::new(),
             requested: HashSet::new(),
             restat: false,
+            host_availability: HashMap::new(),
+            projects_column_open: true,
+            row_stacks: HashMap::new(),
+            row_stack_loading: HashSet::new(),
+            intent_target: None,
+            _intent_timer: None,
+            _intent_fetch: None,
+            preview: LinkPreviewController::default(),
             focus: cx.focus_handle(),
             connected: false,
             open: false,
@@ -159,8 +199,35 @@ impl PullRequestsPage {
             _options: None,
             _subscriptions: subscriptions,
         };
+        page.hydrate_from_cache(cx);
         page.sync(cx);
         page
+    }
+
+    fn environment_key(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        state.environment().or(state.environments.active.as_deref()).map(str::to_owned)
+    }
+
+    /// Hydrates cold-start list rows and diff stats from the persisted cache so the page paints
+    /// immediately before the network read finishes (`pullRequestStatsPersistence.ts`).
+    fn hydrate_from_cache(&mut self, cx: &mut Context<Self>) {
+        let Some(env) = self.environment_key(cx) else { return };
+        let key = self.scope_key();
+        if self.data.key.as_deref() == Some(key.as_str()) && self.data.result.is_some() {
+            return;
+        }
+        let Some(mut cached) = self.list_cache.get(&env, &key).cloned() else { return };
+        self.stats_cache.hydrate_list(&env, &mut cached);
+        for entry in &cached.entries {
+            if !needs_stats(entry) {
+                self.stats.insert(stat_key(&entry.project_id, entry.number), (entry.additions, entry.deletions));
+            }
+        }
+        self.data.first_page = cached.entries.len();
+        self.data.key = Some(key);
+        self.data.result = Some(cached);
+        self.rebuild(cx);
     }
 
     /// Reads when the page is shown and connected, again on reopening and on reconnecting, and
@@ -182,8 +249,13 @@ impl PullRequestsPage {
         if !(open && connected) {
             self.refreshes = None;
             self.epoch = None;
+            self.cancel_intent();
+            self.preview.clear();
         } else if self.refreshes.is_none() {
             self.follow_refreshes(cx);
+        }
+        if open && self.data.result.is_none() {
+            self.hydrate_from_cache(cx);
         }
         if open && connected && (returned || self.data.key.is_none()) {
             self.refetch(cx);
@@ -193,6 +265,80 @@ impl PullRequestsPage {
             }
         }
         cx.notify();
+    }
+
+    /// Hover-intent prefetch (`usePullRequestIntentPrefetch.ts`): after 150ms resting on a listed
+    /// row that is not already selected or held in `DetailView`'s `Held` cache, prefetches
+    /// `pullRequests.detail` (`allowStale: false`) + `pullRequests.activity` into `Held`.
+    pub(super) fn hover_row(&mut self, target: Option<(PrRef, PreviewTarget)>, cx: &mut Context<Self>) {
+        let Some((reference, preview_target)) = target else {
+            self.cancel_intent();
+            self.preview.hover(&self.state.clone(), None, |page: &mut Self| &mut page.preview, cx);
+            return;
+        };
+        let state_entity = self.state.clone();
+        self.preview.hover(&state_entity, Some(preview_target), |page: &mut Self| &mut page.preview, cx);
+        if self.selected.as_ref() == Some(&reference) || has_held_detail(self.state.read(cx), &reference, cx) {
+            self.cancel_intent();
+            return;
+        }
+        if self.intent_target.as_ref() == Some(&reference) {
+            return;
+        }
+        self.cancel_intent();
+        self.intent_target = Some(reference.clone());
+        self._intent_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(INTENT_PREFETCH_DELAY).await;
+            let _ = this.update(cx, |page, cx| page.run_intent_prefetch(reference, cx));
+        }));
+    }
+
+    fn cancel_intent(&mut self) {
+        self.intent_target = None;
+        self._intent_timer = None;
+        self._intent_fetch = None;
+    }
+
+    fn is_listed(&self, reference: &PrRef) -> bool {
+        self.data.result.as_ref().is_some_and(|result| result.entries.iter().any(|entry| PrRef::of(entry) == *reference))
+    }
+
+    fn run_intent_prefetch(&mut self, reference: PrRef, cx: &mut Context<Self>) {
+        if self.intent_target.as_ref() != Some(&reference) || !self.is_listed(&reference) {
+            return;
+        }
+        let mut payload = reference.payload();
+        payload["allowStale"] = serde_json::json!(false);
+        let detail_task = read(self.state.read(cx), method::DETAIL, payload, decode::<Detail>);
+        let activity_task = read(self.state.read(cx), method::ACTIVITY, reference.payload(), decode::<Activity>);
+        self._intent_fetch = Some(cx.spawn(async move |this, cx| {
+            let (detail, activity) = (settle(detail_task).await.ok(), settle(activity_task).await.ok());
+            let _ = this.update(cx, |page, cx| {
+                if page.is_listed(&reference) {
+                    let state = page.state.clone();
+                    prefetch_into_held(&state, &reference, detail.as_ref(), activity.as_ref(), cx);
+                }
+            });
+        }));
+    }
+
+    /// Lazily loads `pullRequests.stack` for a stacked row's `PullRequestStackPopover`.
+    pub(super) fn ensure_row_stack(&mut self, reference: PrRef, force: bool, cx: &mut Context<Self>) {
+        let key = reference.key();
+        if !force && (self.row_stacks.contains_key(&key) || self.row_stack_loading.contains(&key)) {
+            return;
+        }
+        self.row_stack_loading.insert(key.clone());
+        let task = read(self.state.read(cx), method::STACK, reference.payload(), decode::<Option<Stack>>);
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |page, cx| {
+                page.row_stack_loading.remove(&key);
+                page.row_stacks.insert(key, res);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn follow_refreshes(&mut self, cx: &mut Context<Self>) {
@@ -264,13 +410,14 @@ impl PullRequestsPage {
         store::save_ui_state(PREFERENCES_KEY, &self.prefs);
     }
 
-    /// A scope change: persist, re-read from the first page.
+    /// A scope change: persist, hydrate from cache if present, re-read from the first page.
     pub(super) fn update_prefs(&mut self, change: impl FnOnce(&mut ListPreferences), cx: &mut Context<Self>) {
         let before = self.scope_key();
         change(&mut self.prefs);
         self.save_prefs();
         if self.scope_key() != before {
             self.data.page_size = PAGE_SIZE;
+            self.hydrate_from_cache(cx);
             self.refetch(cx);
         } else {
             self.rebuild(cx);
@@ -303,6 +450,7 @@ impl PullRequestsPage {
         if query != self.sent {
             self.sent = query;
             self.data.page_size = PAGE_SIZE;
+            self.hydrate_from_cache(cx);
             self.refetch(cx);
         }
     }
@@ -340,6 +488,7 @@ impl PullRequestsPage {
         self.data.loading_more = false;
         match result {
             Ok(mut answer) => {
+                let env_key = self.environment_key(cx);
                 let first_page = answer.entries.len();
                 if appending && let Some(previous) = self.data.result.take() {
                     let seen: HashSet<String> = previous.entries.iter().map(entry_key).collect();
@@ -357,15 +506,26 @@ impl PullRequestsPage {
                 if !appending {
                     self.data.first_page = first_page;
                 }
+                if let Some(env) = &env_key {
+                    self.stats_cache.hydrate_list(env, &mut answer);
+                    self.host_availability = remember_hosts(&self.host_availability, &[(env.as_str(), &answer.providers, now_ms())]);
+                }
                 for entry in answer.entries.iter_mut().filter(|entry| needs_stats(entry)) {
                     if let Some((additions, deletions)) = self.stats.get(&stat_key(&entry.project_id, entry.number)) {
                         entry.additions = *additions;
                         entry.deletions = *deletions;
                     }
                 }
+                if let Some(env) = &env_key {
+                    self.list_cache.put(env, &key, answer.clone(), now_ms());
+                    store::save_ui_state(LIST_CACHE_KEY, &self.list_cache);
+                }
                 self.data.error = None;
                 self.data.key = Some(key);
                 self.data.result = Some(answer);
+                if self.intent_target.as_ref().is_some_and(|target| !self.is_listed(target)) {
+                    self.cancel_intent();
+                }
                 self.fetch_stats(cx);
                 #[cfg(feature = "snapshot")]
                 self.select_for_snapshot(cx);
@@ -408,6 +568,10 @@ impl PullRequestsPage {
         cx.spawn(async move |this, cx| {
             let Ok(stats) = settle(task).await else { return };
             let _ = this.update(cx, |this, cx| {
+                if let Some(env) = this.environment_key(cx) {
+                    this.stats_cache.record(&env, &stats, now_ms());
+                    store::save_ui_state(STATS_CACHE_KEY, &this.stats_cache);
+                }
                 let mut answered = HashSet::new();
                 for stat in stats.stats {
                     let key = stat_key(&stat.project_id, stat.number);
@@ -464,12 +628,21 @@ impl PullRequestsPage {
         self.data.result.as_ref().is_some_and(|result| result.truncated && (!result.next_cursors.is_empty() || self.data.page_size < MAX_PAGE_SIZE))
     }
 
-    /// "Check again": the host is asked afresh (`pullRequests.invalidate`), then the list re-read.
+    /// "Check again": the host is asked afresh (`pullRequests.invalidate`), caches and host
+    /// availability reset, then the list re-read.
     pub(super) fn refresh_from_host(&mut self, cx: &mut Context<Self>) {
         let task = read(self.state.read(cx), method::INVALIDATE, t3_core::pull_requests::invalidate_input(None), |_| Ok(()));
         self.data.pending = true;
         self.stats.clear();
         self.requested.clear();
+        self.row_stacks.clear();
+        self.host_availability = reset_hosts(&self.host_availability);
+        if let Some(env) = self.environment_key(cx) {
+            self.list_cache.clear_environment(&env);
+            self.stats_cache.clear_environment(&env);
+            store::save_ui_state(LIST_CACHE_KEY, &self.list_cache);
+            store::save_ui_state(STATS_CACHE_KEY, &self.stats_cache);
+        }
         cx.notify();
         self._list = Some(cx.spawn(async move |this, cx| {
             let _ = settle(task).await;
@@ -530,6 +703,8 @@ impl PullRequestsPage {
         if self.selected.as_ref() == Some(&reference) {
             return;
         }
+        self.cancel_intent();
+        self.preview.clear();
         let entry = self.data.result.as_ref().and_then(|result| result.entries.iter().find(|entry| PrRef::of(entry) == reference)).cloned();
         let state = self.state.clone();
         let page = cx.entity().downgrade();
@@ -595,8 +770,6 @@ impl PullRequestsPage {
     }
 
     /// A list row's quick action (`PullRequestSpeedActions`): runs immediately, no confirmation.
-    /// A merge is only requested, since some hosts accept one before it lands, so the row waits
-    /// for the host to say it merged.
     pub(super) fn quick_action(&mut self, index: usize, action: Action, cx: &mut Context<Self>) {
         let Some(entry) = self.data.result.as_ref().and_then(|result| result.entries.get(index)).cloned() else { return };
         let reference = PrRef::of(&entry);
@@ -619,7 +792,6 @@ impl PullRequestsPage {
                     Err(error) => Toast::new(ToastKind::Error, action_failed_label(action, term)).description(error.clone()),
                 };
                 match &result {
-                    // The host's reply says whether a merge landed or was only accepted.
                     Ok(Some(reply)) => {
                         this.acted(&reference, action, Some(reply), cx);
                         if this.selected.as_ref() == Some(&reference)
@@ -670,6 +842,160 @@ impl PullRequestsPage {
         self.state.update(cx, |state, cx| state.show_toast(toast, cx));
     }
 
+    /// Stacked project-assignment column (`pullRequestProjectAssignment.logic.ts`): deduplicates
+    /// shared repositories across environments and lets the user scope the list to any project.
+    fn render_project_assignment_column(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.projects_column_open {
+            return None;
+        }
+        let state = self.state.read(cx);
+        let env_id = self.environment_key(cx).unwrap_or_else(|| "local".into());
+        let env_label = state
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.environment.label.clone())
+            .or_else(|| state.active_environment().map(|e| e.label.clone()))
+            .unwrap_or_else(|| "Local".to_owned());
+        let mut projects: Vec<AssignableProject> = Vec::new();
+        let mut env_ids: Vec<String> = vec![env_id.clone()];
+        let mut envs: Vec<EnvironmentInfo> = vec![EnvironmentInfo { environment_id: env_id.clone(), label: env_label }];
+        if let Some(snapshot) = &state.shell.snapshot {
+            for project in snapshot.projects.iter().filter(|p| p.archived_at.is_none()) {
+                let repo_key = project
+                    .repository_identity
+                    .as_ref()
+                    .and_then(|id| id.get("canonicalKey").and_then(serde_json::Value::as_str))
+                    .map(str::to_owned);
+                let host = repo_key.as_deref().and_then(|key| key.split('/').next()).map(str::to_owned);
+                projects.push(AssignableProject {
+                    id: project.id.clone(),
+                    environment_id: env_id.clone(),
+                    title: project.title.clone(),
+                    workspace_root: project.workspace_root.clone(),
+                    repository_key: repo_key,
+                    host,
+                });
+            }
+        }
+        for fleet_env in &state.fleet.environments {
+            let fid = fleet_env.summary.owner.saved_id.clone();
+            if env_ids.contains(&fid) {
+                continue;
+            }
+            let flabel = fleet_env
+                .config
+                .config
+                .as_ref()
+                .map(|c| c.environment.label.clone())
+                .unwrap_or_else(|| fid.clone());
+            env_ids.push(fid.clone());
+            envs.push(EnvironmentInfo { environment_id: fid.clone(), label: flabel });
+            for project in &fleet_env.summary.projects {
+                if project.project.archived_at.is_some() {
+                    continue;
+                }
+                let repo_key = project
+                    .project
+                    .repository_identity
+                    .as_ref()
+                    .and_then(|id| id.get("canonicalKey").and_then(serde_json::Value::as_str))
+                    .map(str::to_owned);
+                let host = repo_key.as_deref().and_then(|key| key.split('/').next()).map(str::to_owned);
+                projects.push(AssignableProject {
+                    id: project.project.id.clone(),
+                    environment_id: fid.clone(),
+                    title: project.project.title.clone(),
+                    workspace_root: project.project.workspace_root.clone(),
+                    repository_key: repo_key,
+                    host,
+                });
+            }
+        }
+        if projects.is_empty() {
+            return None;
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut unavailable: HashSet<String> = HashSet::new();
+        if let Some(result) = &self.data.result {
+            for entry in &result.entries {
+                *counts.entry(entry.project_id.clone()).or_default() += 1;
+            }
+            for error in &result.errors {
+                unavailable.insert(error.project_id.clone());
+            }
+        }
+        let rows = project_assignment_rows(&projects, &env_ids, &envs, Some(&self.host_availability), &counts, &unavailable);
+        let p = palette(cx);
+        let active_project = self.prefs.project_id.clone();
+        let total = self.data.result.as_ref().map_or(0, |r| r.entries.len());
+        let multi_env = envs.len() > 1;
+        Some(
+            v_flex()
+                .id("pr-project-assignment-column")
+                .flex_none()
+                .w(px(PROJECT_COLUMN_WIDTH))
+                .h_full()
+                .border_r_1()
+                .border_color(hsla(p.border))
+                .p(px(8.))
+                .gap(px(2.))
+                .overflow_y_scroll()
+                .child(div().px(px(8.)).py(px(6.)).text_size(px(11.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child("Projects"))
+                .child(
+                    h_flex()
+                        .id("pr-assign-all")
+                        .gap(px(6.))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_xs()
+                        .when(active_project.is_none(), |this| this.bg(hsla(p.accent)).font_weight(FontWeight::MEDIUM))
+                        .when(active_project.is_some(), |this| this.hover(|s| s.bg(hsla(p.accent).opacity(0.6))))
+                        .on_click(cx.listener(|this, _, _, cx| this.update_prefs(|p| p.project_id = None, cx)))
+                        .child(div().flex_1().truncate().text_color(hsla(p.foreground)).child("All projects"))
+                        .child(div().text_color(hsla(p.muted_foreground)).child(total.to_string())),
+                )
+                .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                    let selected = active_project.as_deref() == Some(row.project_id.as_str());
+                    let pid = row.project_id.clone();
+                    let blocked = row.unavailable;
+                    v_flex()
+                        .id(SharedString::from(format!("pr-assign-proj-{ix}")))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(6.))
+                        .when(!blocked, |this| this.cursor_pointer())
+                        .when(selected, |this| this.bg(hsla(p.accent)))
+                        .when(!selected && !blocked, |this| this.hover(|s| s.bg(hsla(p.accent).opacity(0.6))))
+                        .when(blocked, |this| this.opacity(0.55))
+                        .when(!blocked, |this| {
+                            this.on_click(cx.listener(move |this, _, _, cx| {
+                                let pid = pid.clone();
+                                this.update_prefs(move |prefs| prefs.project_id = Some(pid), cx);
+                            }))
+                        })
+                        .child(
+                            h_flex()
+                                .gap(px(6.))
+                                .min_w_0()
+                                .text_xs()
+                                .child(div().flex_1().min_w_0().truncate().font_weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL }).text_color(hsla(p.foreground)).child(row.project_title))
+                                .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(if blocked { "—".to_owned() } else { row.pr_count.to_string() })),
+                        )
+                        .when(multi_env || blocked, |this| {
+                            this.child(div().truncate().text_size(px(10.)).text_color(hsla(p.muted_foreground)).child(if blocked {
+                                format!("{} · Unavailable", row.environment_label)
+                            } else {
+                                row.environment_label
+                            }))
+                        })
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let collapsed = crate::workspace::sidebar_inline_width(self.state.read(cx), f32::from(window.viewport_size().width)) == 0.;
@@ -682,7 +1008,16 @@ impl PullRequestsPage {
             .gap(px(12.))
             .border_b_1()
             .border_color(hsla(p.border))
-            .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Pull requests"))
+            .child(div().flex_1().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Pull requests"))
+            .child(
+                Button::new("pr-toggle-projects-col", Variant::GhostMuted, Size::Xs)
+                    .icon(Icon::PanelLeft)
+                    .tooltip(if self.projects_column_open { "Hide project assignment column" } else { "Show project assignment column" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.projects_column_open = !this.projects_column_open;
+                        cx.notify();
+                    })),
+            )
     }
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -710,6 +1045,8 @@ impl Render for PullRequestsPage {
         let error_with_rows = self.data.error.clone().filter(|_| self.shown_count() > 0);
         let detail = self.detail.clone();
         let detail_width = (f32::from(window.viewport_size().width) / 2.).max(DETAIL_MIN_WIDTH);
+        let projects_col = self.render_project_assignment_column(cx);
+        let preview_card = self.preview.render_card(cx);
         h_flex()
             .id("pull-requests-page")
             .track_focus(&self.focus)
@@ -721,27 +1058,42 @@ impl Render for PullRequestsPage {
                     .flex_1()
                     .min_w_0()
                     .h_full()
+                    .relative()
                     .child(self.render_header(window, cx))
-                    .child(super::toolbar::render(self, window, cx))
-                    .children(error_with_rows.map(|error| {
-                        let retry = cx.listener(|this, _, _, cx| this.refetch(cx));
+                    .child(
                         h_flex()
-                            .flex_none()
-                            .mx(px(20.))
-                            .mb(px(8.))
-                            .px(px(12.))
-                            .py(px(8.))
-                            .gap(px(12.))
-                            .justify_between()
-                            .rounded(px(8.))
-                            .border_1()
-                            .border_color(hsla(p.warning).opacity(0.3))
-                            .bg(hsla(p.warning_surface))
-                            .text_xs()
-                            .child(format!("{error} Showing the last pull requests loaded."))
-                            .child(Button::new("pr-list-retry", Variant::Outline, Size::Xs).label("Retry").on_click(retry))
-                    }))
-                    .child(div().flex_1().min_h_0().flex().flex_col().px(px(8.)).child(self.render_body(window, cx))),
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .children(projects_col)
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .min_h_0()
+                                    .child(super::toolbar::render(self, window, cx))
+                                    .children(error_with_rows.map(|error| {
+                                        let retry = cx.listener(|this, _, _, cx| this.refetch(cx));
+                                        h_flex()
+                                            .flex_none()
+                                            .mx(px(20.))
+                                            .mb(px(8.))
+                                            .px(px(12.))
+                                            .py(px(8.))
+                                            .gap(px(12.))
+                                            .justify_between()
+                                            .rounded(px(8.))
+                                            .border_1()
+                                            .border_color(hsla(p.warning).opacity(0.3))
+                                            .bg(hsla(p.warning_surface))
+                                            .text_xs()
+                                            .child(format!("{error} Showing the last pull requests loaded."))
+                                            .child(Button::new("pr-list-retry", Variant::Outline, Size::Xs).label("Retry").on_click(retry))
+                                    }))
+                                    .child(div().flex_1().min_h_0().flex().flex_col().px(px(8.)).child(self.render_body(window, cx))),
+                            ),
+                    )
+                    .children(preview_card.map(|card| div().absolute().right(px(16.)).bottom(px(16.)).child(card))),
             )
             .children(detail.map(|detail| {
                 div()
@@ -753,5 +1105,66 @@ impl Render for PullRequestsPage {
                     .border_color(hsla(p.border))
                     .child(detail)
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use t3_core::pull_requests::wire::{Detail, ListEntry, decode};
+
+    use super::*;
+
+    #[gpui::test]
+    fn hover_prefetch_seeds_held_and_preview_controller_renders_fallback_card(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let entry: ListEntry = decode(json!({
+            "provider": "github", "host": "github.com", "projectId": "p1", "projectTitle": "Repo",
+            "repository": "acme/app", "number": 7, "title": "Improve cold start cache",
+            "url": "https://github.com/acme/app/pull/7", "author": { "login": "alice" },
+            "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 10, "deletions": 2, "viewerReviewRequested": false, "headBranch": "feat/cache", "baseBranch": "main",
+            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z"
+        }))
+        .unwrap();
+        let detail: Detail = decode(json!({
+            "provider": "github",
+            "capabilities": { "actions": [], "mergeMethods": ["merge"], "edit": { "changeRequest": false, "comment": false }, "review": { "resolve": false }, "labels": false },
+            "viewerPermissions": { "actions": [], "comment": false, "resolve": false, "labels": false },
+            "projectId": "p1", "projectTitle": "Repo", "workspaceRoot": "/tmp/repo", "repository": "acme/app", "number": 7,
+            "title": "Improve cold start cache", "body": "", "url": "https://github.com/acme/app/pull/7", "author": { "login": "alice" },
+            "viewer": "alice", "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 10, "deletions": 2, "changedFiles": 1,
+            "headBranch": "feat/cache", "baseBranch": "main", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+            "observedAt": 100, "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+            "mergeCapabilities": { "merge": true, "squash": false, "rebase": false }
+        }))
+        .unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| state.environments.active = Some("env-a".into()));
+
+            let reference = PrRef::of(&entry);
+            assert!(!has_held_detail(state.read(cx), &reference, cx));
+            prefetch_into_held(&state, &reference, Some(&detail), None, cx);
+            assert!(has_held_detail(state.read(cx), &reference, cx));
+
+            // LinkPreviewController renders immediately from fallback summary and clears cleanly.
+            struct Host {
+                preview: LinkPreviewController,
+            }
+            let host = cx.new(|_| Host { preview: LinkPreviewController::default() });
+            host.update(cx, |host, cx| {
+                assert!(!host.preview.is_open());
+                host.preview.open_now(&state, PreviewTarget::from_entry(&entry), |h| &mut h.preview, cx);
+                assert!(host.preview.is_open());
+                assert_eq!(host.preview.active_url(), Some("https://github.com/acme/app/pull/7"));
+                assert!(host.preview.render_card(cx).is_some());
+                host.preview.clear();
+                assert!(!host.preview.is_open());
+                assert!(host.preview.render_card(cx).is_none());
+            });
+        });
     }
 }

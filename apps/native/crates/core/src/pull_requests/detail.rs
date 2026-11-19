@@ -283,9 +283,12 @@ fn instant(iso: &str) -> i64 {
 pub struct TimelineEvent {
     pub id: String,
     pub at: String,
+    pub edited_at: Option<String>,
     pub kind: EventKind,
+    pub comment_kind: Option<CommentKind>,
     pub title: String,
     pub body: Option<String>,
+    pub raw_body: Option<String>,
     pub markdown: bool,
     pub url: Option<String>,
     pub actor: Option<Actor>,
@@ -293,6 +296,8 @@ pub struct TimelineEvent {
     pub deletions: Option<u64>,
     pub path: Option<String>,
     pub outcome: Option<ReviewOutcome>,
+    pub reactions: Vec<super::wire::Reaction>,
+    pub can_edit: Option<bool>,
     pub thread: Option<TimelineThread>,
 }
 
@@ -317,6 +322,7 @@ pub struct TimelineThread {
     pub is_outdated: bool,
     pub replies: Vec<TimelineEvent>,
     pub more_replies: u64,
+    pub next_comments_cursor: Option<String>,
 }
 
 fn comment_event(comment: &Comment) -> TimelineEvent {
@@ -324,9 +330,12 @@ fn comment_event(comment: &Comment) -> TimelineEvent {
     TimelineEvent {
         id: comment.id.clone(),
         at: comment.created_at.clone(),
+        edited_at: comment.edited_at.clone(),
         kind: if review { EventKind::Review } else { EventKind::Comment },
+        comment_kind: Some(comment.kind),
         title: if review { "reviewed".into() } else { "commented".into() },
         body: visible_body(&comment.body),
+        raw_body: Some(comment.body.clone()),
         markdown: true,
         url: comment.url.clone(),
         actor: comment.author.clone(),
@@ -334,6 +343,8 @@ fn comment_event(comment: &Comment) -> TimelineEvent {
         deletions: None,
         path: comment.path.clone(),
         outcome: review_outcome(comment.review_state.as_deref()),
+        reactions: comment.reactions.clone(),
+        can_edit: comment.can_edit,
         thread: None,
     }
 }
@@ -345,9 +356,12 @@ fn thread_comment(thread: &ReviewThread, comment: &super::wire::ThreadComment) -
         author: comment.author.clone(),
         body: comment.body.clone(),
         created_at: comment.created_at.clone(),
+        edited_at: comment.edited_at.clone(),
         url: comment.url.clone(),
         path: thread.path.clone(),
         review_state: None,
+        reactions: comment.reactions.clone(),
+        can_edit: comment.can_edit,
     }
 }
 
@@ -376,6 +390,7 @@ fn conversation_events(activity: &Activity) -> Vec<TimelineEvent> {
             is_outdated: thread.is_outdated,
             replies: replies.iter().map(comment_event).collect(),
             more_replies: more,
+            next_comments_cursor: thread.next_comments_cursor.clone(),
         });
         threads.push(event);
     }
@@ -397,9 +412,12 @@ pub fn build_timeline(detail: &Detail, activity: &Activity, term: &str) -> Vec<T
     let plain = |id: &str, at: &str, kind: EventKind, title: String, actor: Option<Actor>| TimelineEvent {
         id: id.to_owned(),
         at: at.to_owned(),
+        edited_at: None,
         kind,
+        comment_kind: None,
         title,
         body: None,
+        raw_body: None,
         markdown: false,
         url: None,
         actor,
@@ -407,6 +425,8 @@ pub fn build_timeline(detail: &Detail, activity: &Activity, term: &str) -> Vec<T
         deletions: None,
         path: None,
         outcome: None,
+        reactions: Vec::new(),
+        can_edit: None,
         thread: None,
     };
     let capitalized = capitalize(term);
@@ -454,6 +474,64 @@ pub fn host_label(provider: &str) -> &'static str {
         "forgejo" => "Forgejo",
         "gitcafe" => "GitCafe",
         _ => "source control",
+    }
+}
+
+/// The subject a pull request link preview names (`pullRequestLinkSubject` in `pullRequestDetail.logic.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkSubject {
+    Commit(super::wire::Commit),
+    Comment {
+        author: Option<Actor>,
+        created_at: String,
+        review_state: Option<String>,
+        excerpt: Option<String>,
+    },
+}
+
+/// Resolves a pull request URL pointing to a commit or timeline comment/review against `activity`.
+pub fn link_subject(url: &str, activity: &Activity) -> Option<LinkSubject> {
+    if let Some(oid) = super::anchor::link_commit(url) {
+        let commit = activity.commits.iter().find(|candidate| candidate.oid.eq_ignore_ascii_case(&oid))?;
+        return Some(LinkSubject::Commit(commit.clone()));
+    }
+    let super::anchor::Anchor::Timeline(anchor) = super::anchor::parse_anchor(url)? else {
+        return None;
+    };
+    let resolved = super::anchor::resolve_review_anchor(&anchor, &activity.comments, &activity.review_threads);
+    if let Some(comment) = activity.comments.iter().find(|candidate| super::anchor::anchor_matches_url(&resolved, candidate.url.as_deref())) {
+        return Some(LinkSubject::Comment {
+            author: comment.author.clone(),
+            created_at: comment.created_at.clone(),
+            review_state: comment.review_state.clone(),
+            excerpt: markdown_excerpt(&comment.body),
+        });
+    }
+    let thread_comment = activity
+        .review_threads
+        .iter()
+        .chain(&activity.overview_threads)
+        .flat_map(|thread| &thread.comments)
+        .find(|candidate| super::anchor::anchor_matches_url(&resolved, candidate.url.as_deref()))?;
+    Some(LinkSubject::Comment {
+        author: thread_comment.author.clone(),
+        created_at: thread_comment.created_at.clone(),
+        review_state: None,
+        excerpt: markdown_excerpt(&thread_comment.body),
+    })
+}
+
+fn markdown_excerpt(body: &str) -> Option<String> {
+    let visible = visible_body(body)?;
+    let collapsed = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = collapsed.chars().collect();
+    if chars.len() > 220 {
+        Some(format!("{}…", chars[..220].iter().collect::<String>()))
+    } else {
+        Some(collapsed)
     }
 }
 

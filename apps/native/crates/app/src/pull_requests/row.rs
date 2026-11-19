@@ -50,18 +50,57 @@ fn group_header(page: &PullRequestsPage, index: usize, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn entry_row(page: &PullRequestsPage, index: usize, window: &mut Window, cx: &mut Context<PullRequestsPage>) -> AnyElement {
+fn entry_row(page: &mut PullRequestsPage, index: usize, window: &mut Window, cx: &mut Context<PullRequestsPage>) -> AnyElement {
     let Some(result) = page.data.result.as_ref() else { return div().into_any_element() };
-    let Some(entry) = result.entries.get(index) else { return div().into_any_element() };
+    let Some(entry) = result.entries.get(index).cloned() else { return div().into_any_element() };
     let p = palette(cx);
-    let reference = PrRef::of(entry);
-    let key = entry_key(entry);
+    let reference = PrRef::of(&entry);
+    let key = entry_key(&entry);
     let selected = page.selected.as_ref() == Some(&reference);
     let acting = super::mutations::pending(&reference, cx).is_some();
-    let actions = quick_actions(entry.state, entry.is_draft, &host_actions(&result.providers, entry));
+    let actions = quick_actions(entry.state, entry.is_draft, &host_actions(&result.providers, &entry));
     let show_actions = !actions.is_empty() && (page.shift || acting);
-    let elsewhere = matched_elsewhere(entry, &parse_query(&page.typed).text);
-    let select = cx.listener(move |this, _: &ClickEvent, _, cx| this.select(reference.clone(), cx));
+    let elsewhere = matched_elsewhere(&entry, &parse_query(&page.typed).text);
+    let select_ref = reference.clone();
+    let select = cx.listener(move |this, _: &ClickEvent, _, cx| this.select(select_ref.clone(), cx));
+    let hover_ref = reference.clone();
+    let preview_target = super::preview::PreviewTarget::from_entry(&entry);
+    let on_hover = cx.listener(move |this, hovered: &bool, _, cx| {
+        if *hovered {
+            this.hover_row(Some((hover_ref.clone(), preview_target.clone())), cx);
+        } else {
+            this.hover_row(None, cx);
+        }
+    });
+    let stack_popover = entry.stack.as_ref().and_then(|membership| {
+        let stack_key = reference.key();
+        if !page.row_stacks.contains_key(&stack_key) {
+            page.ensure_row_stack(reference.clone(), false, cx);
+        }
+        let stack = page.row_stacks.get(&stack_key);
+        let entity = cx.entity().downgrade();
+        let entity_retry = entity.clone();
+        let base_ref = reference.clone();
+        let retry_ref = reference.clone();
+        super::interactions::stack_popover(
+            Some(membership),
+            stack,
+            entry.number,
+            move |number, cx| {
+                if let Some(entity) = entity.upgrade() {
+                    let target = PrRef { number, ..base_ref.clone() };
+                    entity.update(cx, |page, cx| page.select(target, cx));
+                }
+            },
+            move |cx| {
+                if let Some(entity) = entity_retry.upgrade() {
+                    entity.update(cx, |page, cx| page.ensure_row_stack(retry_ref.clone(), true, cx));
+                }
+            },
+            SharedString::from(format!("pr-row-stack-{key}")),
+            cx,
+        )
+    });
     let id = SharedString::from(format!("pr-row-{key}"));
     let row = focusable(div().id(id.clone()), id.into(), true, window, cx)
         .flex()
@@ -72,8 +111,9 @@ fn entry_row(page: &PullRequestsPage, index: usize, window: &mut Window, cx: &mu
         .px(px(12.))
         .py(px(10.))
         .cursor_pointer()
-        .child(row_glyph(entry, cx))
-        .child(lines(entry, elsewhere, cx))
+        .on_hover(on_hover)
+        .child(row_glyph(&entry, cx))
+        .child(lines(&entry, elsewhere, stack_popover, cx))
         .on_click(select);
     h_flex()
         .h(px(super::page::ROW_HEIGHT))
@@ -81,7 +121,7 @@ fn entry_row(page: &PullRequestsPage, index: usize, window: &mut Window, cx: &mu
         .when(selected, |this| this.bg(hsla(p.accent)))
         .when(!selected, |this| this.hover(|style| style.bg(hsla(p.accent).opacity(0.6))))
         .child(row)
-        .when(show_actions, |this| this.child(speed_actions(entry, index, &actions, acting, cx)))
+        .when(show_actions, |this| this.child(speed_actions(&entry, index, &actions, acting, cx)))
         .into_any_element()
 }
 
@@ -105,7 +145,7 @@ fn row_glyph(entry: &ListEntry, cx: &App) -> impl IntoElement {
         .tooltip(move |window, cx| tooltip_view(label.clone().into(), window, cx))
 }
 
-fn lines(entry: &ListEntry, elsewhere: bool, cx: &App) -> impl IntoElement {
+fn lines(entry: &ListEntry, elsewhere: bool, stack_popover: Option<AnyElement>, cx: &App) -> impl IntoElement {
     let p = palette(cx);
     let key = entry_key(entry);
     let mono = cx.theme().mono_font_family.clone();
@@ -126,6 +166,7 @@ fn lines(entry: &ListEntry, elsewhere: bool, cx: &App) -> impl IntoElement {
                 .gap(px(6.))
                 .child(div().flex_none().font_family(mono).text_xs().text_color(hsla(p.muted_foreground)).child(format!("#{}", entry.number)))
                 .child(div().min_w_0().truncate().text_sm().text_color(hsla(p.foreground)).child(entry.title.clone()))
+                .children(stack_popover)
                 .children(entry.checks_state.map(|state| {
                     let (icon, color) = checks_glyph(state, cx);
                     glyph(SharedString::from(format!("pr-checks-{key}")), icon, color, 14., t3_core::pull_requests::detail::checks_state_label(state))

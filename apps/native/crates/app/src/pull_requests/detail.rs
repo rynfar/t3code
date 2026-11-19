@@ -7,34 +7,50 @@
 //! an action's reply without a re-read, writes the description's task checkboxes back, resolves
 //! conversation threads, edits labels, and goes where a link's fragment points.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Global, IntoElement, ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Task, WeakEntity, Window, div,
+    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Global, IntoElement, ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Task, WeakEntity, Window, div,
     prelude::*, px,
 };
+use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
+use t3_core::commands::method::DISPATCH_COMMAND;
 use t3_core::pull_requests::detail::{MergeGate, PrimaryControl, StateKind, change_request_term, host_label, merge_gate, merge_method_label, primary_control, resolve_merge_method};
 use t3_core::pull_requests::anchor::{Anchor, LinkedTab, anchor_matches_url, link_commit, parse_anchor, resolve_review_anchor};
 use t3_core::pull_requests::chat_context::{ChatSubject, build_comment_context, build_pull_request_context};
 use t3_core::pull_requests::detail::EventKind;
-use t3_core::pull_requests::link::{LINKED_THREADS, LINKED_THREADS_POLL_SECONDS, LinkedThread, LinkedThreads, SUBSCRIBE_LINKED_THREAD_REFRESHES, linked_threads_input, linked_threads_label};
-use t3_core::pull_requests::editing::{
-    self, DescriptionDraft, SOURCE_CONTROL_WRITE_SCOPE, apply_label_change, can_edit_change_request, description_draft_in_force, label_change_input, patch_detail, settle_description_save,
-    start_description_save, thread_resolution_input, update_body_input,
+use t3_core::pull_requests::link::{
+    LINKED_THREADS, LINKED_THREADS_POLL_SECONDS, LinkableThread, LinkedThread, LinkedThreads, SUBSCRIBE_LINKED_THREAD_REFRESHES, is_linked_to_url, link_command, linked_threads_input,
+    linked_threads_label, parse_change_request_url, unlink_command, visible_linked_threads,
 };
+use t3_core::pull_requests::editing::{
+    self, DescriptionDraft, SOURCE_CONTROL_WRITE_SCOPE, allowed_review_verdicts, apply_label_change, can_edit_change_request, description_draft_in_force, label_change_input, patch_detail,
+    settle_description_save, start_description_save, thread_resolution_input, update_body_input, update_maintainer_edits_input, update_title_input,
+};
+use t3_core::pull_requests::reactions::set_reaction_input;
+use t3_core::pull_requests::review::{
+    PendingReviewComment, ReviewDraft, post_comment_input, reply_to_thread_input, review_verdict_sent_label, submit_review_input, thread_comments_input, update_comment_input,
+};
+use t3_core::pull_requests::reviewers::{host_reviewer_query, request_reviewers_input, reviewer_candidates_input};
 use t3_core::pull_requests::tasks::set_task_checked;
-use t3_core::pull_requests::wire::{Action, Activity, Detail, LabelCandidates, ListEntry, MergeMethod, PrState, Stack, Summary, decode};
+use t3_core::pull_requests::wire::{
+    Action, Activity, CommentKind, Detail, LabelCandidates, ListEntry, MergeMethod, PrState, ReactionContent, ReviewVerdict, ReviewerCandidate, ReviewerCandidates, Stack, Summary,
+    ThreadCommentsPage, decode,
+};
 use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, invalidate_input, method, stack_merge};
 
 use super::code::CodeTab;
 use super::controls::{BadgeKind, Button, Size, Variant, badge, diff_stat, state_glyph};
+use super::guide::GuideTab;
+use super::interactions;
 use super::mutations::{self, MergePicks, Mutations};
 use super::page::{PullRequestsPage, Refreshes};
 use super::{read, settle};
-use crate::app_state::{AppEvent, AppState};
+use crate::app_state::{AppEvent, AppState, uuid_v4};
 use crate::icons::Icon;
 use crate::right_panel::{segment, segmented};
 use crate::theme::{hsla, palette};
@@ -89,12 +105,42 @@ fn hold(key: HeldKey, detail: Option<&Detail>, activity: Option<&Activity>, cx: 
     }
 }
 
+/// Seeds `Held` from a hover-intent prefetch (`usePullRequestIntentPrefetch`), scoped to the
+/// active environment so clicking the row paints immediately.
+pub(super) fn prefetch_into_held(state: &Entity<AppState>, reference: &PrRef, detail: Option<&Detail>, activity: Option<&Activity>, cx: &mut App) {
+    let key = HeldKey::of(state.read(cx), reference);
+    if let Some(key) = key {
+        hold(key, detail, activity, cx);
+    }
+}
+
+pub(super) fn has_held_detail(state: &AppState, reference: &PrRef, cx: &App) -> bool {
+    HeldKey::of(state, reference).is_some_and(|key| held(&key, cx).0.is_some())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
     Summary,
+    Guide,
     Timeline,
     Code,
 }
+
+pub(super) struct CommentEditState {
+    pub comment_id: String,
+    pub kind: CommentKind,
+    pub input: Entity<TextareaState>,
+    pub saving: bool,
+}
+
+#[derive(Default)]
+struct PendingReactionOverlay {
+    signature: String,
+    values: HashMap<ReactionContent, bool>,
+}
+
+pub(super) type CloseHandler = Rc<dyn Fn(&mut App)>;
+pub(super) type SelectPrHandler = Rc<dyn Fn(PrRef, &mut App)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Confirm {
@@ -112,6 +158,8 @@ struct Armed {
 pub struct DetailView {
     pub(super) state: Entity<AppState>,
     page: WeakEntity<PullRequestsPage>,
+    on_close: Option<CloseHandler>,
+    on_select_pr: Option<SelectPrHandler>,
     pub(super) reference: PrRef,
     entry: Option<ListEntry>,
     pub(super) detail: Option<Detail>,
@@ -122,17 +170,62 @@ pub struct DetailView {
     tab: Tab,
     /// This pull request's own merge method pick (`mergeMethodSelection`).
     merge_method: Option<MergeMethod>,
-    /// `pullRequests.stack` where the host runs stack actions; `None` until it first answers.
+    /// `pullRequests.stack` where the host runs stack actions or the PR belongs to a stack.
     stack: Option<Result<Option<Stack>, String>>,
     stack_pending: bool,
     refreshing: bool,
     armed: Option<Armed>,
-    /// A description written from here, shown until a host reading after its saves.
+    /// Inline title editor (`PullRequestTitleEditor`).
+    title_editing: bool,
+    title_saving: bool,
+    title_input: Option<Entity<InputState>>,
+    _title_sub: Option<Subscription>,
+    /// Inline description editor & task-checkbox draft.
+    pub(super) description_editing: bool,
+    description_input: Option<Entity<TextareaState>>,
     description_draft: Option<DescriptionDraft>,
-    description_saves: u32,
+    pub(super) description_saves: u32,
+    pub(super) maintainer_edits_saving: bool,
     /// `pullRequests.labelCandidates`, read once the label picker can show.
     pub(super) label_candidates: Option<Result<LabelCandidates, String>>,
     pub(super) label_pending: bool,
+    /// `PullRequestReviewerPicker` state.
+    pub(super) reviewer_picker_open: bool,
+    pub(super) reviewer_candidates: Option<Result<ReviewerCandidates, String>>,
+    pub(super) reviewer_query: String,
+    pub(super) reviewer_debounced_query: String,
+    pub(super) reviewer_search_result: Option<Result<ReviewerCandidates, String>>,
+    pub(super) reviewer_search_pending: bool,
+    pub(super) reviewer_request_pending: Option<String>,
+    reviewer_search_input: Option<Entity<InputState>>,
+    _reviewer_sub: Option<Subscription>,
+    _reviewer_debounce: Option<Task<()>>,
+    _reviewers: Option<Task<()>>,
+    _reviewer_search: Option<Task<()>>,
+    /// Review submission form & inline pending review comments (`PullRequestReviewForm`).
+    pub(super) review_form_open: bool,
+    pub(super) review_draft: ReviewDraft,
+    pub(super) review_submitting: bool,
+    review_summary_input: Option<Entity<TextareaState>>,
+    /// Top-level comment composer (`PullRequestCommentForm`).
+    comment_input: Option<Entity<TextareaState>>,
+    pub(super) comment_submitting: bool,
+    pub(super) comment_close_armed: bool,
+    _comment_disarm: Option<Task<()>>,
+    /// Inline comment editing (`PullRequestCommentBody`).
+    pub(super) editing_comment: Option<CommentEditState>,
+    /// Inline thread reply composer (`pullRequests.replyToThread`).
+    pub(super) replying_thread: Option<String>,
+    reply_input: Option<Entity<TextareaState>>,
+    pub(super) reply_submitting: bool,
+    pub(super) loading_more_replies: HashSet<String>,
+    /// Optimistic reactions overlay keyed by subject_id (or `"__pr__"` for the PR description).
+    pending_reactions: HashMap<String, PendingReactionOverlay>,
+    /// Inline thread-link picker (`PullRequestThreadLinks`).
+    pub(super) thread_picker_open: bool,
+    pub(super) thread_link_pending: bool,
+    thread_picker_input: Option<Entity<InputState>>,
+    _thread_picker_sub: Option<Subscription>,
     /// Threads whose resolution is being written.
     pub(super) resolving: HashSet<String>,
     /// Where a link points, still to reach once its tab holds what it names.
@@ -150,6 +243,7 @@ pub struct DetailView {
     pub(super) markdown: MarkdownStore,
     pub(super) timeline: Vec<t3_core::pull_requests::detail::TimelineEvent>,
     pub(super) timeline_list: gpui::ListState,
+    guide: Option<Entity<GuideTab>>,
     code: Option<Entity<CodeTab>>,
     _detail: Option<Task<()>>,
     _activity: Option<Task<()>>,
@@ -163,6 +257,30 @@ pub struct DetailView {
 
 impl DetailView {
     pub fn new(state: Entity<AppState>, page: WeakEntity<PullRequestsPage>, reference: PrRef, entry: Option<ListEntry>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_hooks(state, page, None, None, reference, entry, cx)
+    }
+
+    /// Creates a `DetailView` embedded inside another surface (such as `ThreadPullRequestsPanel`).
+    pub(super) fn new_embedded(
+        state: Entity<AppState>,
+        reference: PrRef,
+        entry: Option<ListEntry>,
+        on_close: CloseHandler,
+        on_select_pr: SelectPrHandler,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_hooks(state, WeakEntity::new_invalid(), Some(on_close), Some(on_select_pr), reference, entry, cx)
+    }
+
+    fn new_with_hooks(
+        state: Entity<AppState>,
+        page: WeakEntity<PullRequestsPage>,
+        on_close: Option<CloseHandler>,
+        on_select_pr: Option<SelectPrHandler>,
+        reference: PrRef,
+        entry: Option<ListEntry>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let subscriptions = vec![
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
                 if matches!(event, AppEvent::Selection | AppEvent::Phase) {
@@ -181,6 +299,8 @@ impl DetailView {
         let mut view = DetailView {
             state,
             page,
+            on_close,
+            on_select_pr,
             reference,
             entry,
             detail,
@@ -194,10 +314,47 @@ impl DetailView {
             stack_pending: false,
             refreshing: false,
             armed: None,
+            title_editing: false,
+            title_saving: false,
+            title_input: None,
+            _title_sub: None,
+            description_editing: false,
+            description_input: None,
             description_draft: None,
             description_saves: 0,
+            maintainer_edits_saving: false,
             label_candidates: None,
             label_pending: false,
+            reviewer_picker_open: false,
+            reviewer_candidates: None,
+            reviewer_query: String::new(),
+            reviewer_debounced_query: String::new(),
+            reviewer_search_result: None,
+            reviewer_search_pending: false,
+            reviewer_request_pending: None,
+            reviewer_search_input: None,
+            _reviewer_sub: None,
+            _reviewer_debounce: None,
+            _reviewers: None,
+            _reviewer_search: None,
+            review_form_open: false,
+            review_draft: ReviewDraft::default(),
+            review_submitting: false,
+            review_summary_input: None,
+            comment_input: None,
+            comment_submitting: false,
+            comment_close_armed: false,
+            _comment_disarm: None,
+            editing_comment: None,
+            replying_thread: None,
+            reply_input: None,
+            reply_submitting: false,
+            loading_more_replies: HashSet::new(),
+            pending_reactions: HashMap::new(),
+            thread_picker_open: false,
+            thread_link_pending: false,
+            thread_picker_input: None,
+            _thread_picker_sub: None,
             resolving: HashSet::new(),
             reveal: None,
             summary_scroll: ScrollHandle::new(),
@@ -210,6 +367,7 @@ impl DetailView {
             markdown: MarkdownStore::new(cx.entity_id()),
             timeline: Vec::new(),
             timeline_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(600.)),
+            guide: None,
             code: None,
             _detail: None,
             _activity: None,
@@ -313,29 +471,48 @@ impl DetailView {
         }));
     }
 
-    /// The header's "Linked from N threads" (`PullRequestThreadLinks`'s count): each thread
-    /// opens from its menu.
-    fn render_linked_threads(&self) -> Option<AnyElement> {
-        let threads = self.linked_threads.clone().filter(|threads| !threads.is_empty())?;
-        let label = linked_threads_label(threads.len());
-        let state = self.state.clone();
+    /// Linked threads filtered through the environment's hidden-tag filter (`visibleLinkedThreads`).
+    pub(crate) fn visible_linked_threads(&self, cx: &App) -> Vec<LinkedThread> {
+        let Some(rows) = &self.linked_threads else { return Vec::new() };
+        let state = self.state.read(cx);
+        let loaded_ids: HashSet<&str> = state
+            .shell
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.threads.iter().map(|t| t.id.as_str()).collect())
+            .unwrap_or_default();
+        let hiding_anywhere = state.hiding_thread_tags() || !state.sidebar.hidden_thread_ids.is_empty();
+        visible_linked_threads(rows, &loaded_ids, &state.sidebar.hidden_thread_ids, hiding_anywhere)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// The header's "Linked from N threads" (`PullRequestThreadLinks`'s count): clicking opens
+    /// the command palette pre-seeded with the PR URL and visible linked threads.
+    fn render_linked_threads(&self, cx: &App) -> Option<AnyElement> {
+        let threads = self.visible_linked_threads(cx);
+        if threads.is_empty() {
+            return None;
+        }
+        let label = format!("{}. Search in the command palette.", linked_threads_label(threads.len()));
+        let url = self
+            .detail
+            .as_ref()
+            .map(|d| d.url.clone())
+            .or_else(|| self.entry.as_ref().map(|e| e.url.clone()))
+            .unwrap_or_else(|| format!("#{}", self.reference.number));
         Some(
             Button::new("pr-linked-threads", Variant::GhostMuted, Size::Xs)
                 .icon(Icon::MessageSquare)
                 .label(threads.len().to_string())
                 .tooltip(label)
-                .dropdown_menu(move |mut menu, _, _| {
-                    for thread in &threads {
-                        let (id, state) = (thread.id.clone(), state.clone());
-                        let title = if thread.title.trim().is_empty() { "Untitled thread".to_owned() } else { thread.title.clone() };
-                        menu = menu.item(PopupMenuItem::new(title).on_click(move |_, _, cx| {
-                            state.update(cx, |state, cx| {
-                                state.set_pull_requests_open(false, cx);
-                                state.select_thread(&id, cx);
-                            });
-                        }));
-                    }
-                    menu
+                .on_click(move |_, window, cx| {
+                    cx.set_global(crate::palette::PendingLinkedThreadSearch(Some(crate::palette::LinkedThreadSearch {
+                        query: url.clone(),
+                        threads: threads.clone(),
+                    })));
+                    window.dispatch_action(Box::new(crate::keymap::ToggleCommandPalette), cx);
                 })
                 .into_any_element(),
         )
@@ -382,6 +559,12 @@ impl DetailView {
                         if first_detail && this.entry.is_none() {
                             this.read_linked_threads(cx);
                         }
+                        if let Some(code) = this.code.clone() {
+                            let detail = this.detail.clone();
+                            let activity = this.activity.clone();
+                            let can_write = this.can_write_source_control(cx);
+                            code.update(cx, |code, cx| code.sync_state(detail.as_ref(), activity.as_ref(), can_write, cx));
+                        }
                     }
                     Err(error) => this.error = Some(error),
                 }
@@ -398,6 +581,12 @@ impl DetailView {
                         this.activity = Some(activity);
                         this.activity_error = None;
                         this.hold(cx);
+                        if let Some(code) = this.code.clone() {
+                            let detail = this.detail.clone();
+                            let activity = this.activity.clone();
+                            let can_write = this.can_write_source_control(cx);
+                            code.update(cx, |code, cx| code.sync_state(detail.as_ref(), activity.as_ref(), can_write, cx));
+                        }
                     }
                     Err(error) => this.activity_error = Some(error),
                 }
@@ -408,6 +597,9 @@ impl DetailView {
         }));
         if let Some(code) = &self.code {
             code.update(cx, |code, cx| code.reload(cx));
+        }
+        if let Some(guide) = &self.guide {
+            guide.update(cx, |guide, cx| guide.reload(cx));
         }
     }
 
@@ -429,10 +621,10 @@ impl DetailView {
         .detach();
     }
 
-    /// Stack membership, read only where the host runs stack actions. The last answer stands
-    /// while it is re-read; the merge itself checks again before it runs.
+    /// Stack membership, read whenever the host supports stacks (for `PullRequestStackPopover`
+    /// and stack-scoped merges). The last answer stands while re-read.
     fn refresh_stack(&mut self, cx: &mut Context<Self>) {
-        let supported = self.detail.as_ref().is_some_and(|detail| detail.capabilities.stacks == Some(true) && detail.capabilities.stack_actions == Some(true));
+        let supported = self.detail.as_ref().is_some_and(|detail| detail.capabilities.stacks == Some(true)) || self.entry.as_ref().is_some_and(|entry| entry.stack.is_some());
         if !supported {
             self._stack = None;
             return;
@@ -878,10 +1070,763 @@ impl DetailView {
         self.tab = tab;
         if tab == Tab::Code && self.code.is_none() {
             let state = self.state.clone();
+            let detail_view = cx.entity().downgrade();
             let reference = self.reference.clone();
-            self.code = Some(cx.new(|cx| CodeTab::new(state, reference, cx)));
+            let detail = self.detail.clone();
+            let activity = self.activity.clone();
+            let can_write = self.can_write_source_control(cx);
+            self.code = Some(cx.new(|cx| CodeTab::new(state, detail_view, reference, detail.as_ref(), activity.as_ref(), can_write, cx)));
+        }
+        if tab == Tab::Guide && self.guide.is_none() {
+            let state = self.state.clone();
+            let detail_view = cx.entity().downgrade();
+            let reference = self.reference.clone();
+            self.guide = Some(cx.new(|cx| GuideTab::new(state, detail_view, reference, cx)));
         }
         cx.notify();
+    }
+
+    /// Jumps from the Guide tab straight to `path` in the Code tab (`onOpenFile`).
+    pub(super) fn open_code_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.set_tab(Tab::Code, cx);
+        if let Some(code) = &self.code {
+            code.update(cx, |code, cx| code.reveal_file_path(path, cx));
+        }
+    }
+
+    /// Navigates to another PR in the same stack (`PullRequestStackPopover`).
+    pub(super) fn select_stack_layer(&mut self, number: u64, cx: &mut Context<Self>) {
+        if number == self.reference.number {
+            return;
+        }
+        let target = PrRef { number, ..self.reference.clone() };
+        if let Some(handler) = &self.on_select_pr {
+            handler(target, cx);
+        } else if let Some(page) = self.page.upgrade() {
+            page.update(cx, |page, cx| page.select(target, cx));
+        }
+    }
+
+    fn close_self(&mut self, cx: &mut Context<Self>) {
+        if let Some(handler) = &self.on_close {
+            handler(cx);
+        } else if let Some(page) = self.page.upgrade() {
+            page.update(cx, |page, cx| page.close_detail(cx));
+        }
+    }
+
+    // --- Title & Description editors (`PullRequestTitleEditor`, `PullRequestSummaryTab`) ---
+
+    fn start_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.detail.as_ref().map(|d| d.title.clone()) else { return };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.save_title(cx);
+            }
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.title_input = Some(input);
+        self._title_sub = Some(sub);
+        self.title_editing = true;
+        cx.notify();
+    }
+
+    fn save_title(&mut self, cx: &mut Context<Self>) {
+        if self.title_saving || !self.can_write_source_control(cx) {
+            return;
+        }
+        let Some(input) = &self.title_input else { return };
+        let next = input.read(cx).value().trim().to_owned();
+        if next.is_empty() || self.detail.as_ref().is_some_and(|d| d.title == next) {
+            self.title_editing = false;
+            cx.notify();
+            return;
+        }
+        self.title_saving = true;
+        let task = mutations::write(self.state.read(cx), editing::method::UPDATE, update_title_input(&self.reference, &next), cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.title_saving = false;
+                match res {
+                    Ok(()) => {
+                        if let Some(detail) = this.detail.as_mut() {
+                            detail.title = next;
+                        }
+                        this.title_editing = false;
+                        this.hold(cx);
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        let desc = if err.trim().is_empty() { "The host refused the new title.".to_owned() } else { err };
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "The title could not be saved").description(desc), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn start_description_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let body = self.description().unwrap_or_default();
+        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(4, 14).default_value(body).placeholder("Describe this change..."));
+        self.description_input = Some(input);
+        self.description_editing = true;
+        cx.notify();
+    }
+
+    pub(super) fn ensure_description_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextareaState> {
+        if let Some(input) = &self.description_input {
+            return input.clone();
+        }
+        let body = self.description().unwrap_or_default();
+        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(4, 14).default_value(body).placeholder("Describe this change..."));
+        self.description_input = Some(input.clone());
+        input
+    }
+
+    pub(super) fn commit_description_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = &self.description_input else { return };
+        let body = input.read(cx).value().to_string();
+        self.description_editing = false;
+        self.save_description(body, cx);
+    }
+
+    pub(super) fn toggle_maintainer_edits(&mut self, allow: bool, cx: &mut Context<Self>) {
+        if self.maintainer_edits_saving || !self.can_write_source_control(cx) {
+            return;
+        }
+        self.maintainer_edits_saving = true;
+        let task = mutations::write(self.state.read(cx), editing::method::UPDATE, update_maintainer_edits_input(&self.reference, allow), cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.maintainer_edits_saving = false;
+                match res {
+                    Ok(()) => {
+                        if let Some(detail) = this.detail.as_mut() {
+                            detail.maintainer_can_modify = Some(allow);
+                        }
+                        this.hold(cx);
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not update maintainer edits").description(err), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // --- Reviewer picker (`PullRequestReviewerPicker`) ---
+
+    pub(super) fn toggle_reviewer_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reviewer_picker_open = !self.reviewer_picker_open;
+        if self.reviewer_picker_open {
+            self.load_reviewer_candidates(cx);
+            let input = self.ensure_reviewer_search_input(window, cx);
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    pub(super) fn ensure_reviewer_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some(input) = &self.reviewer_search_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search people with access"));
+        let sub = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                let query = input.read(cx).value().to_string();
+                this.reviewer_query = query.clone();
+                this._reviewer_debounce = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(250)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.reviewer_debounced_query = query.trim().to_owned();
+                        this.maybe_search_reviewers(cx);
+                        cx.notify();
+                    });
+                }));
+                cx.notify();
+            }
+        });
+        self.reviewer_search_input = Some(input.clone());
+        self._reviewer_sub = Some(sub);
+        input
+    }
+
+    fn load_reviewer_candidates(&mut self, cx: &mut Context<Self>) {
+        if self._reviewers.is_some() {
+            return;
+        }
+        let task = read(self.state.read(cx), method::REVIEWER_CANDIDATES, reviewer_candidates_input(&self.reference, None), decode::<ReviewerCandidates>);
+        self._reviewers = Some(cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                if res.is_err() {
+                    this._reviewers = None;
+                }
+                this.reviewer_candidates = Some(res);
+                this.maybe_search_reviewers(cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    pub(super) fn retry_reviewer_candidates(&mut self, cx: &mut Context<Self>) {
+        self._reviewers = None;
+        self.reviewer_candidates = None;
+        self.load_reviewer_candidates(cx);
+        cx.notify();
+    }
+
+    fn maybe_search_reviewers(&mut self, cx: &mut Context<Self>) {
+        let searchable = self.detail.as_ref().and_then(|d| d.capabilities.reviewers.search_candidates) == Some(true);
+        let loaded = self.reviewer_candidates.as_ref().and_then(|r| r.as_ref().ok());
+        let Some(host_q) = host_reviewer_query(loaded, searchable, &self.reviewer_debounced_query).map(str::to_owned) else {
+            self.reviewer_search_pending = false;
+            return;
+        };
+        self.reviewer_search_pending = true;
+        let task = read(self.state.read(cx), method::REVIEWER_CANDIDATES, reviewer_candidates_input(&self.reference, Some(&host_q)), decode::<ReviewerCandidates>);
+        self._reviewer_search = Some(cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.reviewer_debounced_query != host_q {
+                    return;
+                }
+                this.reviewer_search_pending = false;
+                this.reviewer_search_result = Some(res);
+                cx.notify();
+            });
+        }));
+    }
+
+    pub(super) fn toggle_reviewer(&mut self, candidate: ReviewerCandidate, cx: &mut Context<Self>) {
+        if self.reviewer_request_pending.is_some() || !self.can_write_source_control(cx) {
+            return;
+        }
+        let next_requested = !candidate.is_requested;
+        self.reviewer_request_pending = Some(candidate.id.clone());
+        let payload = request_reviewers_input(&self.reference, &candidate.id, candidate.kind, next_requested);
+        let task = mutations::write(self.state.read(cx), method::REQUEST_REVIEWERS, payload, cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.reviewer_request_pending = None;
+                match res {
+                    Ok(()) => {
+                        if let Some(Ok(list)) = this.reviewer_candidates.as_mut() {
+                            for item in list.candidates.iter_mut().filter(|c| c.id == candidate.id && c.kind == candidate.kind) {
+                                item.is_requested = next_requested;
+                            }
+                        }
+                        if let Some(Ok(list)) = this.reviewer_search_result.as_mut() {
+                            for item in list.candidates.iter_mut().filter(|c| c.id == candidate.id && c.kind == candidate.kind) {
+                                item.is_requested = next_requested;
+                            }
+                        }
+                        if let Some(detail) = this.detail.as_mut() {
+                            if next_requested {
+                                if !detail.reviewers.iter().any(|r| r.login.eq_ignore_ascii_case(&candidate.login)) {
+                                    detail.reviewers.push(t3_core::pull_requests::wire::Actor {
+                                        is_bot: candidate.is_bot,
+                                        login: candidate.login.clone(),
+                                        name: candidate.name.clone(),
+                                        avatar_url: candidate.avatar_url.clone(),
+                                    });
+                                }
+                            } else {
+                                detail.reviewers.retain(|r| !r.login.eq_ignore_ascii_case(&candidate.login));
+                            }
+                        }
+                        this.hold(cx);
+                        let title = if next_requested {
+                            format!("Review requested from {}", candidate.login)
+                        } else {
+                            format!("Review request to {} taken back", candidate.login)
+                        };
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Success, title), cx));
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        let title = if next_requested {
+                            format!("Could not ask {} for a review", candidate.login)
+                        } else {
+                            format!("Could not take back the review request to {}", candidate.login)
+                        };
+                        let desc = if err.trim().is_empty() {
+                            "The host refused it. Check that you have write access on this repository, and that they still have access to it.".to_owned()
+                        } else {
+                            err
+                        };
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, title).description(desc), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // --- Review submission & inline comments (`PullRequestReviewForm`) ---
+
+    pub(super) fn pending_review_comment_count(&self) -> usize {
+        self.review_draft.comments.len()
+    }
+
+    pub(super) fn add_pending_review_comment(&mut self, comment: PendingReviewComment, cx: &mut Context<Self>) {
+        self.review_draft.add_comment(comment);
+        cx.notify();
+    }
+
+    pub(super) fn remove_pending_review_comment(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.review_draft.remove_comment(id);
+        cx.notify();
+    }
+
+    pub(super) fn open_review_form(&mut self, cx: &mut Context<Self>) {
+        self.review_form_open = true;
+        cx.notify();
+    }
+
+    pub(super) fn ensure_review_summary_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextareaState> {
+        if let Some(input) = &self.review_summary_input {
+            return input.clone();
+        }
+        let initial = self.review_draft.summary.clone();
+        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 8).default_value(initial).placeholder("Summarize your review (optional)"));
+        self.review_summary_input = Some(input.clone());
+        input
+    }
+
+    pub(super) fn submit_review(&mut self, verdict: ReviewVerdict, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review_submitting || !self.can_write_source_control(cx) {
+            return;
+        }
+        let body = self.review_summary_input.as_ref().map(|i| i.read(cx).value().to_string()).unwrap_or_default();
+        self.review_draft.summary = body.clone();
+        let submitted_comments = self.review_draft.comments.clone();
+        let submitted_ids: Vec<String> = submitted_comments.iter().map(|c| c.id.clone()).collect();
+        let payload = submit_review_input(&self.reference, verdict, &body, &submitted_comments);
+        let task = mutations::write(self.state.read(cx), method::SUBMIT_REVIEW, payload, cx);
+        let term = self.term();
+        self.review_submitting = true;
+        let window_handle = window.window_handle();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.review_submitting = false;
+                match res {
+                    Ok(()) => {
+                        this.review_draft.finish_submission(&submitted_ids, &body);
+                        if this.review_draft.summary.is_empty()
+                            && let Some(input) = this.review_summary_input.clone()
+                        {
+                            let _ = cx.update_window(window_handle, |_, window, cx| {
+                                input.update(cx, |input, cx| input.set_value("", window, cx));
+                            });
+                        }
+                        this.review_form_open = false;
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Success, review_verdict_sent_label(verdict, term)), cx));
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        let desc = if err.trim().is_empty() { "The host refused the review. Your draft is still here to try again.".to_owned() } else { err };
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "The review could not be submitted").description(desc), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // --- Comments, replies, comment edits, load-more replies ---
+
+    pub(super) fn ensure_comment_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextareaState> {
+        if let Some(input) = &self.comment_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 8).placeholder("Leave a comment"));
+        self.comment_input = Some(input.clone());
+        input
+    }
+
+    pub(super) fn submit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_submitting || !self.can_write_source_control(cx) {
+            return;
+        }
+        let Some(input) = self.comment_input.clone() else { return };
+        let trimmed = input.read(cx).value().trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.comment_submitting = true;
+        let task = mutations::write(self.state.read(cx), method::COMMENT, post_comment_input(&self.reference, &trimmed), cx);
+        let window_handle = window.window_handle();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.comment_submitting = false;
+                match res {
+                    Ok(()) => {
+                        let _ = cx.update_window(window_handle, |_, window, cx| {
+                            input.update(cx, |input, cx| input.set_value("", window, cx));
+                        });
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not post the comment").description(err), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn submit_comment_with_action(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if action == Action::Close && !self.comment_close_armed {
+            self.comment_close_armed = true;
+            self._comment_disarm = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(CONFIRM_WINDOW).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.comment_close_armed = false;
+                    cx.notify();
+                });
+            }));
+            cx.notify();
+            return;
+        }
+        self.comment_close_armed = false;
+        self._comment_disarm = None;
+        if self.comment_submitting || !self.can_write_source_control(cx) {
+            return;
+        }
+        let Some(input) = self.comment_input.clone() else { return };
+        let trimmed = input.read(cx).value().trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.comment_submitting = true;
+        let comment_task = mutations::write(self.state.read(cx), method::COMMENT, post_comment_input(&self.reference, &trimmed), cx);
+        let action_task = mutations::run_action(self.state.read(cx), action_input(&self.reference, action, None), cx);
+        let term = self.term();
+        let window_handle = window.window_handle();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let comment_res = settle(comment_task).await;
+            let action_res = if comment_res.is_ok() { settle(action_task).await } else { Ok(None) };
+            let _ = this.update(cx, |this, cx| {
+                this.comment_submitting = false;
+                if let Err(err) = comment_res {
+                    this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not post the comment").description(err), cx));
+                    cx.notify();
+                    return;
+                }
+                let _ = cx.update_window(window_handle, |_, window, cx| {
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                });
+                match action_res {
+                    Ok(reply) => {
+                        let reference = this.reference.clone();
+                        this.apply_reply(reply.as_ref(), cx);
+                        if let Some(page) = this.page.upgrade() {
+                            page.update(cx, |page, cx| page.acted(&reference, action, reply.as_ref(), cx));
+                        }
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, action_failed_label(action, term)).description(err), cx));
+                        this.refresh(cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn start_comment_edit(&mut self, comment_id: String, kind: CommentKind, body: String, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 10).default_value(body));
+        self.editing_comment = Some(CommentEditState { comment_id, kind, input, saving: false });
+        cx.notify();
+    }
+
+    pub(super) fn commit_comment_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.can_write_source_control(cx) {
+            return;
+        }
+        let Some(edit) = self.editing_comment.as_mut() else { return };
+        if edit.saving {
+            return;
+        }
+        let body = edit.input.read(cx).value().trim().to_owned();
+        if body.is_empty() {
+            return;
+        }
+        edit.saving = true;
+        let (comment_id, kind) = (edit.comment_id.clone(), edit.kind);
+        let task = mutations::write(self.state.read(cx), method::UPDATE_COMMENT, update_comment_input(&self.reference, &comment_id, kind, &body), cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                match res {
+                    Ok(()) => {
+                        this.editing_comment = None;
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        if let Some(edit) = this.editing_comment.as_mut() {
+                            edit.saving = false;
+                        }
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "The comment could not be saved").description(err), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn start_thread_reply(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.replying_thread = Some(thread_id);
+        let input = self.ensure_reply_input(window, cx);
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    pub(super) fn ensure_reply_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextareaState> {
+        if let Some(input) = &self.reply_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8).placeholder("Write a reply..."));
+        self.reply_input = Some(input.clone());
+        input
+    }
+
+    pub(super) fn submit_thread_reply(&mut self, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reply_submitting || !self.can_write_source_control(cx) {
+            return;
+        }
+        let Some(input) = self.reply_input.clone() else { return };
+        let body = input.read(cx).value().trim().to_owned();
+        if body.is_empty() {
+            return;
+        }
+        self.reply_submitting = true;
+        let task = mutations::write(self.state.read(cx), method::REPLY_TO_THREAD, reply_to_thread_input(&self.reference, &thread_id, &body), cx);
+        let window_handle = window.window_handle();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.reply_submitting = false;
+                match res {
+                    Ok(()) => {
+                        let _ = cx.update_window(window_handle, |_, window, cx| {
+                            input.update(cx, |input, cx| input.set_value("", window, cx));
+                        });
+                        this.replying_thread = None;
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not post the reply").description(err), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn load_more_thread_replies(&mut self, thread_id: String, cursor: String, cx: &mut Context<Self>) {
+        if !self.loading_more_replies.insert(thread_id.clone()) {
+            return;
+        }
+        let task = read(self.state.read(cx), method::THREAD_COMMENTS, thread_comments_input(&self.reference, &thread_id, &cursor), decode::<ThreadCommentsPage>);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.loading_more_replies.remove(&thread_id);
+                if let Ok(page) = res
+                    && let Some(activity) = this.activity.as_mut()
+                {
+                    for thread in activity.review_threads.iter_mut().chain(&mut activity.overview_threads) {
+                        if thread.id != thread_id {
+                            continue;
+                        }
+                        for comment in page.comments {
+                            if !thread.comments.iter().any(|existing| existing.id == comment.id) {
+                                thread.comments.push(comment);
+                            }
+                        }
+                        thread.next_comments_cursor = page.next_cursor;
+                        break;
+                    }
+                    this.hold(cx);
+                    this.rebuild_timeline();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // --- Reactions (`PullRequestReactionBar`) ---
+
+    pub(super) fn pending_reactions_for(&self, subject_key: &str, signature: &str) -> HashMap<ReactionContent, bool> {
+        self.pending_reactions
+            .get(subject_key)
+            .filter(|overlay| overlay.signature == signature)
+            .map(|overlay| overlay.values.clone())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn toggle_reaction(&mut self, subject_id: Option<String>, content: ReactionContent, reacted: bool, signature: String, cx: &mut Context<Self>) {
+        if !self.can_write_source_control(cx) {
+            return;
+        }
+        let subject_key = subject_id.clone().unwrap_or_else(|| "__pr__".to_owned());
+        let entry = self.pending_reactions.entry(subject_key.clone()).or_default();
+        if entry.signature != signature {
+            entry.signature = signature.clone();
+            entry.values.clear();
+        }
+        entry.values.insert(content, reacted);
+        let payload = set_reaction_input(&self.reference, subject_id.as_deref(), content, reacted);
+        let task = mutations::write(self.state.read(cx), method::SET_REACTION, payload, cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                match res {
+                    Ok(()) => this.refresh(cx),
+                    Err(_) => {
+                        if let Some(overlay) = this.pending_reactions.get_mut(&subject_key) {
+                            overlay.values.remove(&content);
+                        }
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "The reaction could not be saved"), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    // --- Inline thread-link picker (`PullRequestThreadLinks`) ---
+
+    fn pr_url(&self) -> Option<String> {
+        self.detail.as_ref().map(|d| d.url.clone()).or_else(|| self.entry.as_ref().map(|e| e.url.clone()))
+    }
+
+    fn is_linked_to_active_thread(&self, cx: &App) -> Option<(String, bool)> {
+        let url = self.pr_url()?;
+        let state = self.state.read(cx);
+        let thread_id = state.selected_thread.clone()?;
+        let shell = state.thread_shell(&thread_id)?;
+        Some((thread_id, is_linked_to_url(&shell.pull_requests, &url)))
+    }
+
+    pub(super) fn open_thread_picker(&mut self, cx: &mut Context<Self>) {
+        self.thread_picker_open = true;
+        cx.notify();
+    }
+
+    pub(super) fn ensure_thread_picker_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some(input) = &self.thread_picker_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads or projects..."));
+        let sub = cx.subscribe_in(&input, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.thread_picker_input = Some(input.clone());
+        self._thread_picker_sub = Some(sub);
+        input
+    }
+
+    pub(super) fn linkable_threads(&self, cx: &App) -> Vec<LinkableThread> {
+        let url = self.pr_url().unwrap_or_default();
+        let state = self.state.read(cx);
+        let Some(snapshot) = &state.shell.snapshot else { return Vec::new() };
+        let project_names: HashMap<&str, &str> = snapshot.projects.iter().map(|p| (p.id.as_str(), p.title.as_str())).collect();
+        snapshot
+            .threads
+            .iter()
+            .map(|thread| LinkableThread {
+                id: thread.id.clone(),
+                project_id: thread.project_id.clone(),
+                project_title: project_names.get(thread.project_id.as_str()).copied().unwrap_or("").to_owned(),
+                title: thread.title.clone(),
+                updated_at: thread.updated_at.clone(),
+                archived: thread.archived_at.is_some(),
+                hidden: state.sidebar.hidden_thread_ids.contains(&thread.id),
+                already_linked: is_linked_to_url(&thread.pull_requests, &url),
+            })
+            .collect()
+    }
+
+    pub(super) fn link_to_thread(&mut self, thread_id: String, remove: bool, cx: &mut Context<Self>) {
+        if self.thread_link_pending {
+            return;
+        }
+        let Some(url) = self.pr_url() else { return };
+        let Some(link) = parse_change_request_url(&url) else { return };
+        let command = if remove {
+            let thread_link = t3_core::pull_requests::link::ThreadLink {
+                host: link.host,
+                repository: link.repository,
+                number: link.number,
+                url: link.url,
+                source: "manual".into(),
+                linked_at: String::new(),
+                snapshot: None,
+                stack: None,
+                watch: None,
+            };
+            unlink_command(&uuid_v4(), &thread_id, &thread_link)
+        } else {
+            link_command(&uuid_v4(), &thread_id, &link)
+        };
+        self.thread_link_pending = true;
+        let task = self.state.read(cx).rpc(DISPATCH_COMMAND, command);
+        let term = self.term();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.thread_link_pending = false;
+                match res {
+                    Ok(_) => {
+                        this.thread_picker_open = false;
+                        this.read_linked_threads(cx);
+                    }
+                    Err(err) => {
+                        let title = if remove { format!("Could not unlink the {term}") } else { format!("Could not link the {term}") };
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, title).description(err.to_string()), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn render_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -895,6 +1840,63 @@ impl DetailView {
             let author = d.author.as_ref().map_or("ghost".to_owned(), |a| a.login.clone());
             (format!("{author} wants to merge into {} from {}", d.base_branch, d.head_branch), d.additions, d.deletions, d.changed_files)
         });
+        let can_edit_title = self.can_edit_description(cx);
+        let title_row: AnyElement = if self.title_editing && let Some(input) = &self.title_input {
+            let saving = self.title_saving;
+            let empty = input.read(cx).value().trim().is_empty();
+            v_flex()
+                .gap(px(6.))
+                .child(Input::new(input).disabled(saving))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(Button::new("pr-title-cancel", Variant::Ghost, Size::Xs).label("Cancel").disabled(saving).on_click(cx.listener(|this, _, _, cx| {
+                            this.title_editing = false;
+                            cx.notify();
+                        })))
+                        .child(
+                            Button::new("pr-title-save", Variant::Outline, Size::Xs)
+                                .label(if saving { "Saving..." } else { "Save" })
+                                .disabled(saving || empty)
+                                .on_click(cx.listener(|this, _, _, cx| this.save_title(cx))),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .gap(px(6.))
+                .min_w_0()
+                .child(div().flex_1().min_w_0().truncate().text_base().line_height(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(title))
+                .when(can_edit_title, |this| {
+                    this.child(
+                        Button::new("pr-title-edit", Variant::GhostMuted, Size::Xs)
+                            .icon(Icon::Pencil)
+                            .tooltip("Edit title")
+                            .on_click(cx.listener(|this, _, window, cx| this.start_title_edit(window, cx))),
+                    )
+                })
+                .into_any_element()
+        };
+        let entity = cx.entity().downgrade();
+        let entity_retry = entity.clone();
+        let stack_pill = interactions::stack_popover(
+            self.entry.as_ref().and_then(|e| e.stack.as_ref()),
+            self.stack.as_ref(),
+            self.reference.number,
+            move |number, cx| {
+                if let Some(entity) = entity.upgrade() {
+                    entity.update(cx, |view, cx| view.select_stack_layer(number, cx));
+                }
+            },
+            move |cx| {
+                if let Some(entity) = entity_retry.upgrade() {
+                    entity.update(cx, |view, cx| view.retry_stack(cx));
+                }
+            },
+            SharedString::from("pr-detail-stack-popover"),
+            cx,
+        );
         v_flex()
             .flex_none()
             .gap(px(8.))
@@ -915,19 +1917,16 @@ impl DetailView {
                             .text_color(hsla(p.muted_foreground))
                             .child(format!("{} #{}", self.reference.repository, self.reference.number)),
                     )
+                    .children(stack_pill)
                     .child(self.render_actions(window, cx))
                     .child(
                         Button::new("pr-detail-close", Variant::Ghost, Size::IconSm)
                             .icon(Icon::X)
                             .tooltip("Close")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(page) = this.page.upgrade() {
-                                    page.update(cx, |page, cx| page.close_detail(cx));
-                                }
-                            })),
+                            .on_click(cx.listener(|this, _, _, cx| this.close_self(cx))),
                     ),
             )
-            .child(div().text_base().line_height(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(title))
+            .child(title_row)
             .child(
                 h_flex()
                     .gap(px(8.))
@@ -944,7 +1943,7 @@ impl DetailView {
                             .child(diff_stat(additions, deletions, cx))
                             .child(div().flex_none().child(format!("{files} {}", if files == 1 { "file" } else { "files" })))
                     }))
-                    .children(self.render_linked_threads())
+                    .children(self.render_linked_threads(cx))
                     .children(url.map(|url| {
                         Button::new("pr-open-host", Variant::GhostMuted, Size::IconSm).icon(Icon::ExternalLink).tooltip("Open on the host").on_click(move |_, _, cx| cx.open_url(&url))
                     })),
@@ -960,12 +1959,13 @@ impl DetailView {
         h_flex().gap(px(8.)).child(
             segmented("pr-detail-tabs", cx)
                 .child(option("pr-tab-summary", Icon::MessageSquare, Tab::Summary, "Summary", window, cx).child(tab_label("Summary")))
+                .child(option("pr-tab-guide", Icon::FileText, Tab::Guide, "Guide", window, cx).child(tab_label("Guide")))
                 .child(option("pr-tab-timeline", Icon::GitCommit, Tab::Timeline, "Timeline", window, cx).child(tab_label("Timeline")))
                 .child(option("pr-tab-code", Icon::FileDiff, Tab::Code, "Code", window, cx).child(tab_label("Code"))),
         )
     }
 
-    /// The primary control, the stack merge, the armed menu confirmation and the actions menu.
+    /// The primary control, the review trigger, the stack merge, the armed menu confirmation and the actions menu.
     /// An armed control that is no longer shown disarms, as the web's does on unmount.
     fn render_actions(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
@@ -981,6 +1981,17 @@ impl DetailView {
             if view.armed_on(id).is_some() { button.on_mouse_down_out(cx.listener(|this, _, _, cx| this.disarm(cx))) } else { button }
         };
         let blocked = gate.blocked.filter(|_| !gate.single && !gate.stack_owns);
+        let review_button = (self.can_write_source_control(cx) && !allowed_review_verdicts(&detail).is_empty()).then(|| {
+            let count = self.review_draft.comments.len();
+            let label = if count > 0 { format!("Review ({count})") } else { "Review".to_owned() };
+            Button::new("pr-open-review", if self.review_form_open || count > 0 { Variant::Outline } else { Variant::Ghost }, Size::Xs)
+                .icon(Icon::MessageSquare)
+                .label(label)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.review_form_open = !this.review_form_open;
+                    cx.notify();
+                }))
+        });
         let primary: Option<AnyElement> = match primary_control(&detail, gate.stack_owns) {
             Some(PrimaryControl::Resolve) => Some(badge(format!("Conflicts with {}", detail.base_branch), BadgeKind::Outline, true, cx).text_color(hsla(p.destructive)).into_any_element()),
             Some(PrimaryControl::Ready) => Some(
@@ -1080,7 +2091,7 @@ impl DetailView {
             self._escape = None;
         }
         let menu = self.actions_menu(&detail, gate, cx);
-        h_flex().flex_none().gap(px(4.)).children(retry_stack).children(workflows).children(stack).children(primary).children(inline).child(menu).into_any_element()
+        h_flex().flex_none().gap(px(4.)).children(retry_stack).children(workflows).children(review_button).children(stack).children(primary).children(inline).child(menu).into_any_element()
     }
 
     fn actions_menu(&self, detail: &Detail, gate: MergeGate, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1090,6 +2101,8 @@ impl DetailView {
         let selected = self.selected_merge_method(cx);
         let refreshing = self.refreshing;
         let term = self.term();
+        let active_link_state = self.is_linked_to_active_thread(cx);
+        let thread_link_pending = self.thread_link_pending;
         let act = move |entity: &WeakEntity<DetailView>, run: ViewAction| {
             let entity = entity.clone();
             move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut gpui::App| {
@@ -1126,6 +2139,15 @@ impl DetailView {
                     }
                 }
             }
+            menu = menu.separator();
+            if let Some((thread_id, linked_here)) = active_link_state.clone() {
+                let label = if linked_here { "Unlink from this thread" } else { "Link to this thread" };
+                menu = menu.item(PopupMenuItem::new(label).disabled(thread_link_pending).on_click(act(
+                    &entity,
+                    Box::new(move |view, cx| view.link_to_thread(thread_id.clone(), linked_here, cx)),
+                )));
+            }
+            menu = menu.item(PopupMenuItem::new("Link to thread...").disabled(thread_link_pending).on_click(act(&entity, Box::new(|view, cx| view.open_thread_picker(cx)))));
             let url = detail.url.clone();
             let link = detail.url.clone();
             let number = format!("#{}", detail.number);
@@ -1149,12 +2171,17 @@ impl DetailView {
         if let Some(page) = self.page.upgrade() {
             let what = what.to_owned();
             page.update(cx, |page, cx| page.copy(text, &what, cx));
+        } else {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            let toast = Toast::new(ToastKind::Success, format!("{what} copied")).description(text);
+            self.state.update(cx, |state, cx| state.show_toast(toast, cx));
         }
     }
 
     fn render_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.tab {
             Tab::Summary => super::summary::render(self, window, cx),
+            Tab::Guide => self.guide.clone().map_or_else(|| div().into_any_element(), |guide| div().flex_1().min_h_0().flex().flex_col().child(guide).into_any_element()),
             Tab::Timeline => super::timeline::render(self, window, cx),
             Tab::Code => self.code.clone().map_or_else(|| div().into_any_element(), |code| div().flex_1().min_h_0().flex().flex_col().child(code).into_any_element()),
         }
@@ -1169,6 +2196,8 @@ impl Render for DetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         self.markdown.begin_frame();
+        let review_panel = self.detail.clone().and_then(|detail| interactions::review_form_panel(self, &detail, window, cx));
+        let thread_picker = interactions::thread_link_picker_modal(self, window, cx);
         let body = match (&self.detail, &self.error) {
             (None, Some(error)) => v_flex()
                 .flex_1()
@@ -1198,7 +2227,9 @@ impl Render for DetailView {
             .min_h_0()
             .bg(hsla(p.background))
             .child(self.render_header(window, cx))
+            .children(review_panel)
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            .children(thread_picker)
             .child(self.viewer.clone())
     }
 }
@@ -1366,6 +2397,216 @@ mod tests {
             let view = view.read(cx);
             assert!(matches!(view.label_candidates, Some(Err(_))));
             assert!(view._labels.is_none(), "error must clear `_labels` so retry is not locked out");
+        });
+    }
+
+    #[gpui::test]
+    fn guide_tab_tour_code_tab_hooks_and_inline_review_draft_work_together(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let detail: Detail = decode(json!({
+            "provider": "github",
+            "capabilities": {
+                "actions": ["merge", "close"],
+                "mergeMethods": ["merge"],
+                "edit": { "changeRequest": true, "comment": true },
+                "review": { "resolve": true, "inlineComment": true, "rangeComment": true, "verdicts": ["approve", "comment", "request-changes"] },
+                "reviewers": { "request": true, "remove": true, "searchCandidates": true },
+                "labels": true,
+                "viewedFiles": "host"
+            },
+            "viewerPermissions": { "actions": ["merge", "close"], "comment": true, "resolve": true, "labels": true, "requestReviewers": true },
+            "projectId": "p1", "projectTitle": "Local Fork", "workspaceRoot": "/tmp/fork-checkout", "repository": "upstream/repo", "number": 42,
+            "title": "PR Title", "body": "- [ ] Ship it", "url": "https://github.com/upstream/repo/pull/42", "author": { "login": "alice" },
+            "viewer": "alice", "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 5, "deletions": 2, "changedFiles": 1,
+            "headBranch": "feat", "baseBranch": "main", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+            "observedAt": 100, "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+            "mergeCapabilities": { "merge": true, "squash": false, "rebase": false }
+        }))
+        .unwrap();
+        let activity: Activity = decode(json!({
+            "comments": [],
+            "commentCount": 0,
+            "commentsTruncated": false,
+            "reviewThreads": [{
+                "id": "rt1",
+                "path": "src/lib.rs",
+                "line": 10,
+                "side": "right",
+                "isResolved": false,
+                "isOutdated": false,
+                "comments": [{
+                    "id": "rc1",
+                    "author": { "login": "bob" },
+                    "body": "Check bounds here",
+                    "createdAt": "2026-01-02T01:00:00Z"
+                }]
+            }],
+            "overviewThreads": [],
+            "commits": []
+        }))
+        .unwrap();
+        let guide_result: t3_core::pull_requests::wire::ReviewGuideResult = decode(json!({
+            "guide": {
+                "headSha": "abc1234",
+                "generatedAt": "2026-01-02T02:00:00Z",
+                "summary": "Overview of changes",
+                "stops": [
+                    {
+                        "title": "First stop",
+                        "summary": "Core logic",
+                        "attention": { "kind": "close-read", "note": "Check edge cases" },
+                        "files": [{ "path": "src/lib.rs", "note": "Main entry" }],
+                        "excerpts": [],
+                        "notes": [],
+                        "questions": ["Is bounds check needed?"]
+                    },
+                    {
+                        "title": "Second stop",
+                        "summary": "Tests",
+                        "attention": null,
+                        "files": [{ "path": "src/lib.rs" }],
+                        "excerpts": [],
+                        "notes": [],
+                        "questions": []
+                    }
+                ]
+            },
+            "run": null,
+            "currentHeadSha": "abc1234"
+        }))
+        .unwrap();
+        let reference = sample_ref();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| state.environments.active = Some("env-a".into()));
+            let key = HeldKey::of(state.read(cx), &reference).unwrap();
+            hold(key, Some(&detail), Some(&activity), cx);
+            let view = cx.new(|cx| DetailView::new(state, WeakEntity::new_invalid(), reference, None, cx));
+
+            // Guide tab tour stepping + jump to Code tab file.
+            view.update(cx, |view, cx| view.set_tab(Tab::Guide, cx));
+            let guide = view.read(cx).guide.clone().expect("GuideTab created");
+            guide.update(cx, |guide, cx| guide.set_result_for_test(guide_result, Vec::new(), cx));
+            assert_eq!(guide.read(cx).current_position(), 0);
+            guide.update(cx, |guide, cx| guide.step(1, cx));
+            assert_eq!(guide.read(cx).current_position(), 1);
+            guide.update(cx, |guide, cx| guide.step(-1, cx));
+            assert_eq!(guide.read(cx).current_position(), 0);
+
+            // Jumping to a file opens the Code tab and mounts DiffPanel with viewed-files & review-thread hooks.
+            view.update(cx, |view, cx| view.open_code_file("src/lib.rs".into(), cx));
+            assert_eq!(view.read(cx).tab, Tab::Code);
+            let code = view.read(cx).code.clone().expect("CodeTab created");
+            let _ = code.read(cx).diff_panel();
+
+            // Inline comment from DiffPanel lands in DetailView's pending review draft and opens the review panel.
+            view.update(cx, |view, cx| {
+                view.add_pending_review_comment(
+                    PendingReviewComment {
+                        id: "pending-1".into(),
+                        path: "src/lib.rs".into(),
+                        old_path: None,
+                        position: t3_core::pull_requests::review::ReviewPosition::Added { new_line: 10 },
+                        start_position: None,
+                        range_label: "L10".into(),
+                        body: "Please handle empty input".into(),
+                    },
+                    cx,
+                );
+            });
+            assert_eq!(view.read(cx).pending_review_comment_count(), 1);
+            view.update(cx, |view, cx| view.open_review_form(cx));
+            assert!(view.read(cx).review_form_open);
+        });
+    }
+
+    #[gpui::test]
+    fn hidden_tag_filtering_hides_tagged_linked_threads_and_embedded_hooks_fire(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let reference = sample_ref();
+        let closed = Rc::new(std::cell::Cell::new(false));
+        let selected_layer = Rc::new(std::cell::Cell::new(0u64));
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| {
+                state.shell.snapshot = Some(serde_json::from_value(json!({
+                    "snapshotSequence": 1,
+                    "projects": [{
+                        "id": "p1",
+                        "title": "Repo",
+                        "workspaceRoot": "/tmp/repo",
+                        "defaultModelSelection": null,
+                        "scripts": [],
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z"
+                    }],
+                    "threads": [
+                        {
+                            "id": "t-visible", "projectId": "p1", "title": "Visible thread", "providerInstanceId": "replay",
+                            "modelSelection": { "instanceId": "replay", "model": "replay" },
+                            "runtimeMode": "full-access", "interactionMode": "default",
+                            "lineage": { "rootThreadId": "t-visible" }, "status": "idle",
+                            "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+                            "tags": [], "pullRequests": []
+                        },
+                        {
+                            "id": "t-hidden", "projectId": "p1", "title": "Hidden thread", "providerInstanceId": "replay",
+                            "modelSelection": { "instanceId": "replay", "model": "replay" },
+                            "runtimeMode": "full-access", "interactionMode": "default",
+                            "lineage": { "rootThreadId": "t-hidden" }, "status": "idle",
+                            "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+                            "tags": ["archived"], "pullRequests": []
+                        }
+                    ],
+                    "updatedAt": "2026-01-02T00:00:00Z"
+                })).unwrap());
+                state.sidebar.hidden_thread_ids.insert("t-hidden".into());
+            });
+            let closed_cb = closed.clone();
+            let selected_cb = selected_layer.clone();
+            let view = cx.new(|cx| {
+                DetailView::new_embedded(
+                    state,
+                    reference,
+                    None,
+                    Rc::new(move |_| closed_cb.set(true)),
+                    Rc::new(move |pr, _| selected_cb.set(pr.number)),
+                    cx,
+                )
+            });
+            view.update(cx, |view, cx| {
+                view.linked_threads = Some(vec![
+                    LinkedThread {
+                        id: "t-visible".into(),
+                        project_id: "p1".into(),
+                        title: "Visible thread".into(),
+                        archived_at: None,
+                    },
+                    LinkedThread {
+                        id: "t-hidden".into(),
+                        project_id: "p1".into(),
+                        title: "Hidden thread".into(),
+                        archived_at: None,
+                    },
+                ]);
+                let visible = view.visible_linked_threads(cx);
+                assert_eq!(visible.len(), 1);
+                assert_eq!(visible[0].id, "t-visible");
+                view.select_stack_layer(99, cx);
+                view.close_self(cx);
+            });
+            assert_eq!(selected_layer.get(), 99);
+            assert!(closed.get());
         });
     }
 }

@@ -122,15 +122,19 @@ fn timeline_threads_comments_and_puts_merges_over_closes() {
         author: None,
         body: "b".into(),
         created_at: at.into(),
+        edited_at: None,
         url: None,
         path: None,
         review_state: None,
+        reactions: Vec::new(),
+        can_edit: None,
     };
-    let reply = |id: &str, at: &str| ThreadComment { id: id.into(), author: None, body: "r".into(), created_at: at.into(), url: None, review_url: None };
+    let reply = |id: &str, at: &str| ThreadComment { id: id.into(), author: None, body: "r".into(), created_at: at.into(), edited_at: None, url: None, review_url: None, reactions: Vec::new(), can_edit: None };
     let activity = Activity {
         comments: vec![comment("c1", "2026-01-02T00:00:00Z"), comment("c3", "2026-01-04T00:00:00Z")],
         comment_count: 2,
         comments_truncated: false,
+        review_threads_truncated: None,
         review_threads: vec![ReviewThread {
             id: "t".into(),
             path: Some("src/a.rs".into()),
@@ -163,6 +167,7 @@ fn timeline_threads_comments_and_puts_merges_over_closes() {
             deletions: None,
             authors: Vec::new(),
         }],
+        reactions: Vec::new(),
     };
     let events = build_timeline(&pr, &activity, "pull request");
     let ids: Vec<&str> = events.iter().map(|event| event.id.as_str()).collect();
