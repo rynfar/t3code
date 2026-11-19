@@ -916,7 +916,7 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| {
             let view = cx.new(|cx| SettingsView::new(state.clone(), search::Section::Projects, None, window, cx));
             view.update(cx, |view, cx| {
-                view.select_project_id("proj-first", cx);
+                view.select_project_id(None, "proj-first", cx);
                 let targets = view.project_targets(cx);
                 assert_eq!(targets.len(), 2, "both scoped projects must share one group");
                 assert_eq!(targets[0].project.id, "proj-first");

@@ -394,6 +394,7 @@ impl AppState {
         self.composer_restores.clear();
         self.server_config = ServerConfigState::default();
         crate::theme::set_environment_themes(&[], cx);
+        self.sync_shortcut_keybindings(cx);
         self.draft_project = None;
         self.branch_draft = None;
         self.pull_requests_open = false;
@@ -486,6 +487,7 @@ impl AppState {
         self.uploads.notify_connection_transition(&env_id, false, connected);
         cx.emit(AppEvent::Phase);
         self.sync_server_config(cx);
+        self.sync_shortcut_keybindings(cx);
         self.sync_shell_views(true, true, self.shell.synchronized, cx);
         self.finish_notification_route(cx);
         let scoped_navigation = self.pending_scoped_route.is_some();
@@ -508,10 +510,45 @@ impl AppState {
         }
         self.sync_scoped_omitted_rows(cx);
         self.ensure_scoped_favicons(cx);
+        self.sync_shortcut_keybindings(cx);
         self.rebuild_sidebar(cx);
         self.finish_scoped_route(cx);
         cx.emit(AppEvent::Shell);
         cx.emit(AppEvent::ServerConfig);
+    }
+
+    /// Installs the authoritative shortcut keybindings (`createShortcutKeybindingsAtom` in
+    /// `apps/web/src/state/server.ts`): primary config stays authoritative while loading (resetting
+    /// stale overrides to defaults when `None`), and without a primary, falls back to the first
+    /// connected environment with config or resets to defaults when none remain.
+    pub(crate) fn sync_shortcut_keybindings(&self, cx: &mut gpui::App) {
+        let empty = serde_json::Value::Array(Vec::new());
+        let resolved = t3_core::server_config::resolve_shortcut_keybindings(
+            self.environments.active.is_some(),
+            self.server_config.config.as_ref(),
+            self.fleet
+                .environments
+                .iter()
+                .filter(|entry| entry.status == ConnectionStatus::Connected)
+                .filter_map(|entry| entry.config.config.as_ref()),
+        );
+        crate::keymap::install(resolved.unwrap_or(&empty), cx);
+    }
+
+    /// Whether the active environment's current session grants `scope`, or `None` when session
+    /// grants have not arrived yet.
+    pub(crate) fn active_session_grants(&self, scope: &str) -> Option<bool> {
+        self.client
+            .as_ref()
+            .and_then(|client| client.session_state().borrow().clone())
+            .or_else(|| {
+                self.environments
+                    .active
+                    .as_deref()
+                    .and_then(|id| self.scoped_environment(id))
+                    .and_then(|entry| entry.grants.clone())
+            })
+            .map(|session| session.grants(scope))
     }
 
     fn refresh_grouping_cache(&mut self) {
@@ -521,6 +558,29 @@ impl AppState {
 
     pub(crate) fn active_thread_key(&self, id: &str) -> Option<t3_core::sidebar::tag_filter::ThreadKey> {
         Some(t3_core::sidebar::tag_filter::ThreadKey::new(self.environments.active.as_deref()?, id))
+    }
+
+    /// Invalidates cached project favicon requests so re-picking an image path or resetting to
+    /// Automatic fetches fresh bytes from the server (`refreshProjectFaviconUrl` in `state/assets.ts`).
+    pub(crate) fn invalidate_project_favicons(
+        &mut self,
+        members: &[t3_core::sidebar::grouping::ScopedProject],
+        cx: &mut Context<Self>,
+    ) {
+        let mut invalidated_active = false;
+        let active_id = self.environments.active.as_deref();
+        for member in members {
+            self.sidebar.owner_favicons.remove(&member.owner);
+            if active_id == Some(member.owner.saved_id.as_str()) {
+                invalidated_active = true;
+            }
+        }
+        if invalidated_active {
+            self.sidebar.favicons = Default::default();
+            self.ensure_favicons(cx);
+        }
+        self.ensure_scoped_favicons(cx);
+        cx.emit(AppEvent::SidebarSelection);
     }
 
     pub(crate) fn scoped_environment(&self, saved: &str) -> Option<&t3_client::environments::EnvironmentView> {
@@ -590,7 +650,9 @@ impl AppState {
             },
             ScopedRouteAction::Draft(id) => self.start_draft(&id, cx),
             ScopedRouteAction::Branch(id) => self.start_branch_draft(&id, cx),
-            ScopedRouteAction::ProjectSettings(id) => crate::settings::open_project(&id, cx),
+            ScopedRouteAction::ProjectSettings(id) => {
+                crate::settings::open_scoped_project(Some(&route.owner.saved_id), &id, cx)
+            }
             ScopedRouteAction::Project { group, action } => self.finish_scoped_project_action(&group, action, cx),
         }
     }
@@ -1638,5 +1700,145 @@ mod stream_and_stop_tests {
             assert_eq!(p.turn_items[0].status, "interrupted");
             assert_eq!(p.visible_turn_items[0].item.status, "interrupted");
         });
+    }
+
+    #[gpui::test]
+    async fn shortcut_keybindings_reset_to_defaults_when_primary_config_missing_or_fallback_disconnects(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, _active_fx) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(
+                cx,
+                runtime.handle().clone(),
+            );
+            crate::keymap::init(cx);
+            installed
+        });
+        let (connections, _output) =
+            t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |s, _| {
+            s.stop_pump();
+            s.connections = connections;
+        });
+
+        let custom_binding = serde_json::json!([{
+            "command": "sidebar.toggle",
+            "shortcut": { "key": "j", "metaKey": false, "ctrlKey": false, "shiftKey": false, "altKey": true, "modKey": true }
+        }]);
+        let make_cfg = |env_id: &str, keybindings: serde_json::Value| {
+            let mut cfg = ServerConfigState::default();
+            cfg.apply(
+                serde_json::from_value(serde_json::json!({
+                    "type": "snapshot",
+                    "config": {
+                        "environment": { "environmentId": env_id, "label": env_id },
+                        "keybindings": keybindings,
+                        "settings": {}
+                    }
+                }))
+                .unwrap(),
+            );
+            cfg
+        };
+        let default_label = cx.update(|cx| crate::keymap::label("sidebar.toggle", cx));
+        let grants: t3_core::auth::AuthSessionState = serde_json::from_value(serde_json::json!({
+            "authenticated": true,
+            "permissions": ["orchestration:read"]
+        }))
+        .unwrap();
+        let (client_primary, _fx_p) = t3_client::supervisor::ClientFixture::handle(grants.clone());
+        let (client_loading, _fx_l) = t3_client::supervisor::ClientFixture::handle(grants.clone());
+        let (client_fb, _fx_fb) = t3_client::supervisor::ClientFixture::handle(grants);
+
+        // 1. Active primary with custom keybinding installs it.
+        state.update(cx, |s, cx| {
+            s.environments.active = Some("primary".into());
+            s.install_active_environment(
+                client_primary,
+                ShellState::default(),
+                make_cfg("primary", custom_binding.clone()),
+                ConnectionStatus::Connected,
+                cx,
+            );
+        });
+        let custom_label = cx.update(|cx| crate::keymap::label("sidebar.toggle", cx));
+        assert_ne!(custom_label, default_label, "primary custom keybinding should be installed");
+
+        // 2. Switching to a primary whose config is still None resets keybindings back to defaults
+        // rather than leaving the previous environment's custom binding active.
+        state.update(cx, |s, cx| {
+            s.environments.active = Some("loading".into());
+            s.install_active_environment(
+                client_loading,
+                ShellState::default(),
+                ServerConfigState::default(),
+                ConnectionStatus::Connecting,
+                cx,
+            );
+        });
+        assert_eq!(
+            cx.update(|cx| crate::keymap::label("sidebar.toggle", cx)),
+            default_label,
+            "loading primary without config must clear stale custom keybindings"
+        );
+
+        // 3. With no active primary, a connected fallback environment supplies its custom binding.
+        let mut view = state.read_with(cx, |s, _| s.connections.view());
+        let install_fb = state.update(cx, |s, _| {
+            s.connections.install_fixture(
+                "fallback",
+                client_fb.clone(),
+                ShellState::default(),
+                make_cfg("fallback", custom_binding),
+                ConnectionStatus::Connected,
+            )
+        });
+        let _ev_fb = runtime.spawn(install_fb).await.unwrap();
+        let fleet_connected = view.borrow_and_update().clone();
+        state.update(cx, |s, cx| {
+            s.environments.active = None;
+            s.server_config = ServerConfigState::default();
+            s.apply_fleet_view(fleet_connected, cx);
+        });
+        assert_eq!(
+            cx.update(|cx| crate::keymap::label("sidebar.toggle", cx)),
+            custom_label,
+            "connected fallback should supply custom keybinding when primary is None"
+        );
+
+        // 4. Disconnecting the last fallback resets keybindings back to defaults.
+        let install_disconnected = state.update(cx, |s, _| {
+            s.connections.install_fixture(
+                "fallback",
+                client_fb,
+                ShellState::default(),
+                ServerConfigState::default(),
+                ConnectionStatus::Connecting,
+            )
+        });
+        let _ev_fb2 = runtime.spawn(install_disconnected).await.unwrap();
+        let fleet_disconnected = view.borrow_and_update().clone();
+        state.update(cx, |s, cx| {
+            s.apply_fleet_view(fleet_disconnected, cx);
+        });
+        assert_eq!(
+            cx.update(|cx| crate::keymap::label("sidebar.toggle", cx)),
+            default_label,
+            "disconnecting last fallback must reset keybindings back to defaults"
+        );
+
+        state.update(cx, |s, _| s.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
+        cx.run_until_parked();
     }
 }

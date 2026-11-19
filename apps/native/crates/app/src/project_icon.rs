@@ -1,12 +1,15 @@
 //! Shared `web/src/components/ProjectFavicon.tsx` / `ProjectMonogram.tsx` presentation.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, FontWeight, Hsla, Image, IntoElement, ObjectFit, ParentElement, Pixels, SharedString, Styled, StyledImage, div, img, prelude::*};
+use gpui::{AnyElement, App, FontWeight, Hsla, Image, ImageFormat, IntoElement, ObjectFit, ParentElement, Pixels, SharedString, Styled, StyledImage, div, img, prelude::*};
 use t3_core::client_settings::typography::FontRole;
 use t3_core::settings::projects::{
     ProjectIcon,
     icon::{Presentation, Source, monogram_width},
+    lucide,
 };
 
 use crate::{
@@ -118,10 +121,52 @@ fn render_source(source: Option<Source<'_>>, size: Pixels, muted: Hsla, p: Palet
                 .into_any_element()
         }
         Some(Source::Icon(ProjectIcon::Lucide { name, color })) => {
-            Icon::project_named(name).unwrap_or(Icon::FolderCode).render(size, ink(color)).into_any_element()
+            let color = ink(color);
+            if let Some(icon) = Icon::project_named(name) {
+                icon.render(size, color).into_any_element()
+            } else if let Some(image) = dynamic_lucide_image(name, color) {
+                img(image)
+                    .flex_none()
+                    .size(size)
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element()
+            } else {
+                Icon::FolderCode.render(size, color).into_any_element()
+            }
         }
         _ => Icon::FolderCode.render(size, muted).into_any_element(),
     }
+}
+
+const MAX_DYNAMIC_LUCIDE_CACHE: usize = 512;
+
+thread_local! {
+    static DYNAMIC_LUCIDE_CACHE: RefCell<HashMap<(&'static str, u32), Arc<Image>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn dynamic_lucide_image(name: &str, color: Hsla) -> Option<Arc<Image>> {
+    let canonical = lucide::resolve_canonical(name)?;
+    let rgba = color.to_rgb();
+    let r = (rgba.r.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (rgba.g.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (rgba.b.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let a = (rgba.a.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let key = (canonical, u32::from_be_bytes([r, g, b, a]));
+    DYNAMIC_LUCIDE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(existing) = cache.get(&key) {
+            return Some(existing.clone());
+        }
+        let hex = format!("#{r:02x}{g:02x}{b:02x}");
+        let bytes = lucide::render_svg(canonical, &hex, rgba.a)?;
+        let image = Arc::new(Image::from_bytes(ImageFormat::Svg, bytes));
+        if cache.len() >= MAX_DYNAMIC_LUCIDE_CACHE {
+            cache.clear();
+        }
+        cache.insert(key, image.clone());
+        Some(image)
+    })
 }
 
 pub(crate) fn color_token(color: &str, p: Palette) -> Hsla {
@@ -165,4 +210,46 @@ pub(crate) fn preview(icon: &ProjectIcon, size: Pixels, cx: &App) -> AnyElement 
         false,
         crate::theme::font_family(FontRole::Code, cx),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_lucide_image_renders_popular_icons_aliases_and_caches_by_key() {
+        let color = gpui::hsla(0.55, 0.7, 0.5, 1.0);
+        for name in [
+            "code-2",
+            "globe-2",
+            "database",
+            "cloud-cog",
+            "layers-3",
+            "book-open",
+            "gamepad-2",
+            "music",
+            "shopping-bag",
+            "workflow",
+            "a-arrow-down",
+        ] {
+            let image = dynamic_lucide_image(name, color)
+                .unwrap_or_else(|| panic!("expected SVG image for Lucide icon {name}"));
+            assert_eq!(image.format(), ImageFormat::Svg);
+            let svg = std::str::from_utf8(image.bytes()).expect("valid utf8 svg");
+            assert!(svg.starts_with("<svg ") && svg.contains("stroke-width=\"1.75\""));
+        }
+
+        // Alias and canonical name resolve to the same cached Arc<Image>.
+        let alias = dynamic_lucide_image("code-2", color).expect("code-2");
+        let canonical = dynamic_lucide_image("code-xml", color).expect("code-xml");
+        assert!(Arc::ptr_eq(&alias, &canonical));
+
+        // Different color creates a distinct cached SVG.
+        let other_color = gpui::hsla(0.0, 0.8, 0.5, 1.0);
+        let red = dynamic_lucide_image("code-xml", other_color).expect("code-xml red");
+        assert!(!Arc::ptr_eq(&canonical, &red));
+
+        // Unknown future icon name returns None so render_source falls back to FolderCode.
+        assert!(dynamic_lucide_image("nonexistent-icon-xyz", color).is_none());
+    }
 }

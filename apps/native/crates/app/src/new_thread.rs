@@ -16,6 +16,7 @@ use gpui::{
     ScrollHandle, SharedString, Styled, Subscription, TextRun, Window, actions, anchored, canvas, deferred, div, point, prelude::*, px,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
@@ -747,9 +748,40 @@ impl DraftHero {
             .into_any_element()
     }
 
+    fn open_project_settings_for_draft(&self, cx: &mut App) -> bool {
+        let app = self.state.read(cx);
+        let Some(project_id) = app.draft_project.as_deref() else {
+            return false;
+        };
+        if app.is_scratch_project(project_id) || app.shell.project(project_id).is_none() {
+            return false;
+        }
+        let env_id = app.environments.active.clone();
+        let project_id = project_id.to_owned();
+        crate::settings::open_scoped_project(env_id.as_deref(), &project_id, cx);
+        true
+    }
+
+    fn open_project_settings_for_entry(&mut self, entry: &HeroPickerEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_picker(Some(window), false, cx);
+        let env_id = entry
+            .owner
+            .as_ref()
+            .map(|owner| owner.saved_id.clone())
+            .or_else(|| self.state.read(cx).environments.active.clone());
+        crate::settings::open_scoped_project(env_id.as_deref(), &entry.project_id, cx);
+    }
+
     /// The project picker trigger (`InlineButton tone="picker"`), or dotted "Add a project" trigger
     /// when there are no non-scratch projects (`canChooseProject == false`).
-    fn picker_trigger(&self, label: SharedString, tooltip: Option<String>, can_choose: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn picker_trigger(
+        &self,
+        label: SharedString,
+        tooltip: Option<String>,
+        can_choose: bool,
+        settings_target: Option<(Option<String>, String)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let p = palette(cx);
         if !can_choose {
             return div()
@@ -767,7 +799,7 @@ impl DraftHero {
                 .into_any_element();
         }
         let bounds_cell = self.trigger_bounds.clone();
-        h_flex()
+        let trigger = h_flex()
             .id("draft-project")
             .relative()
             .min_w_0()
@@ -782,8 +814,23 @@ impl DraftHero {
             .child(canvas(move |bounds, _, _| bounds_cell.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
             .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                 this.open_picker(event.position(), window, cx);
-            }))
-            .into_any_element()
+            }));
+        match settings_target {
+            Some(_) => {
+                let hero = cx.entity().downgrade();
+                trigger
+                    .context_menu(move |menu, _, _| {
+                        let hero = hero.clone();
+                        menu.item(PopupMenuItem::new("Project settings").on_click(move |_, _, cx| {
+                            let _ = hero.update(cx, |hero, cx| {
+                                hero.open_project_settings_for_draft(cx);
+                            });
+                        }))
+                    })
+                    .into_any_element()
+            }
+            None => trigger.into_any_element(),
+        }
     }
 
     fn render_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -891,6 +938,8 @@ impl DraftHero {
                             .into_any_element()
                     });
                     let select = (*entry).clone();
+                    let menu_entry = select.clone();
+                    let hero_view = cx.entity().downgrade();
                     list_rows.push(
                         div()
                             .id(row_id)
@@ -919,6 +968,15 @@ impl DraftHero {
                             .children(pin_el)
                             .children(badge_el)
                             .on_click(cx.listener(move |this, _, window, cx| this.select_entry(select.clone(), window, cx)))
+                            .context_menu(move |menu, _, _| {
+                                let menu_entry = menu_entry.clone();
+                                let hero_view = hero_view.clone();
+                                menu.item(PopupMenuItem::new("Project settings").on_click(move |_, window, cx| {
+                                    let _ = hero_view.update(cx, |this, cx| {
+                                        this.open_project_settings_for_entry(&menu_entry, window, cx);
+                                    });
+                                }))
+                            })
                             .into_any_element(),
                     );
                 }
@@ -1098,12 +1156,19 @@ impl Render for DraftHero {
                 .children(self.render_popup(cx));
         }
 
+        let active_env = app.environments.active.clone();
         let headline = match &project {
-            Some((_, title)) if !scratch_draft => {
+            Some((project_id, title)) if !scratch_draft => {
                 let measured_container = self.heading_width.get();
                 let inline_width = inline_heading_width(title, window, cx);
                 let fits_inline = viewport_width >= HERO_LARGE_BREAKPOINT && measured_container > 0. && inline_width <= measured_container;
-                let trigger = self.picker_trigger(title.clone().into(), Some(title.clone()), can_choose, cx);
+                let trigger = self.picker_trigger(
+                    title.clone().into(),
+                    Some(title.clone()),
+                    can_choose,
+                    Some((active_env.clone(), project_id.clone())),
+                    cx,
+                );
                 div()
                     .relative()
                     .w_full()
@@ -1156,6 +1221,7 @@ impl Render for DraftHero {
                     if can_choose { "Choose a project" } else { "Add a project" }.into(),
                     None,
                     can_choose,
+                    None,
                     cx,
                 );
                 h_flex()
@@ -1176,7 +1242,7 @@ impl Render for DraftHero {
         let below = if !scratch_available {
             None
         } else if scratch_draft {
-            Some(self.picker_trigger("No project".into(), None, can_choose, cx))
+            Some(self.picker_trigger("No project".into(), None, can_choose, None, cx))
         } else {
             Some(
                 div()
@@ -1856,6 +1922,203 @@ mod tests {
             vcx.read(|cx| state.read(cx).environments.active.clone()).as_deref(),
             Some("remote-1")
         );
+
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn draft_hero_project_settings_entry_opens_active_and_non_active_env_projects(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(
+                cx,
+                runtime.handle().clone(),
+            );
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        let (connections, _output) =
+            t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+        });
+
+        let grants: t3_core::auth::AuthSessionState = serde_json::from_value(serde_json::json!({
+            "authenticated": true,
+            "permissions": ["settings:write", "orchestration:operate"]
+        }))
+        .unwrap();
+        let (local_client, _local_fx) = t3_client::supervisor::ClientFixture::handle(grants.clone());
+        let (remote_client, _remote_fx) = t3_client::supervisor::ClientFixture::handle(grants);
+
+        let make_shell = |projects: Vec<t3_core::shell::ProjectShell>| {
+            let mut shell = t3_core::shell::ShellState::default();
+            shell.synchronized = true;
+            shell.generation = 1;
+            shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                projects,
+                ..Default::default()
+            });
+            shell
+        };
+        let make_proj = |id: &str, title: &str, root: &str| t3_core::shell::ProjectShell {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            has_custom_title: None,
+            workspace_root: root.to_owned(),
+            repository_identity: None,
+            default_model_selection: None,
+            pinned_at: None,
+            archived_at: None,
+            favicon_path: None,
+            project_icon: None,
+            scripts: Vec::new(),
+            created_at: "2026-04-01T00:00:00.000Z".to_owned(),
+            updated_at: "2026-04-01T00:00:00.000Z".to_owned(),
+        };
+        let make_cfg = |env_id: &str, label: &str, scratch: Option<&str>| {
+            let mut cfg = t3_core::server_config::ServerConfigState::default();
+            cfg.config = Some(
+                serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": env_id, "label": label, "platform": { "os": "linux", "arch": "x64", "machine": "linux" }, "homeDir": "/home/me", "capabilities": {}, "serverVersion": "1.2.3" },
+                    "scratchWorkspaceRoot": scratch,
+                    "auth": { "policy": "remote-reachable" }
+                }))
+                .unwrap(),
+            );
+            cfg
+        };
+
+        // Both environments intentionally share the same project ID "p-same" on distinct roots so
+        // scoped selection proves we pick the exact environment's group rather than colliding.
+        let local_shell = make_shell(vec![
+            make_proj("scratch-local", "Scratch", "/Users/me/.t3/userdata/scratch"),
+            make_proj("p-same", "Local Alpha", "/Users/me/alpha"),
+        ]);
+        let remote_shell = make_shell(vec![make_proj("p-same", "Remote Beta", "/home/me/beta")]);
+        let local_cfg = make_cfg("env-local", "MacBook", Some("/Users/me/.t3/userdata/scratch"));
+        let remote_cfg = make_cfg("env-remote", "Build Box", None);
+
+        let mut view = state.read_with(cx, |s, _| s.connections.view());
+        let i_local = state.update(cx, |s, _| {
+            s.connections.install_fixture(
+                "local",
+                local_client.clone(),
+                local_shell.clone(),
+                local_cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _local_ev = runtime.spawn(i_local).await.unwrap();
+        let i_remote = state.update(cx, |s, _| {
+            s.connections.install_fixture(
+                "remote-1",
+                remote_client.clone(),
+                remote_shell.clone(),
+                remote_cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _remote_ev = runtime.spawn(i_remote).await.unwrap();
+        let fleet = view.borrow_and_update().clone();
+
+        cx.update(|cx| {
+            state.update(cx, |s, cx| {
+                s.environments.environments = vec![
+                    t3_client::store::SavedEnvironment {
+                        id: "local".into(),
+                        environment_id: Some("env-local".into()),
+                        label: "MacBook".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:3773".into(),
+                        access_token: Some("tok-local".into()),
+                        server_version: Some("1.2.3".into()),
+                        local: true,
+                        ssh: None,
+                    },
+                    t3_client::store::SavedEnvironment {
+                        id: "remote-1".into(),
+                        environment_id: Some("env-remote".into()),
+                        label: "Build Box".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:3774".into(),
+                        access_token: Some("tok-remote".into()),
+                        server_version: Some("1.2.3".into()),
+                        local: false,
+                        ssh: None,
+                    },
+                ];
+                s.environments.active = Some("local".into());
+                s.install_active_environment(
+                    local_client,
+                    local_shell,
+                    local_cfg,
+                    t3_client::supervisor::ConnectionStatus::Connected,
+                    cx,
+                );
+                s.apply_fleet_view(fleet, cx);
+                s.start_draft("scratch-local", cx);
+            });
+        });
+
+        let (harness, vcx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let hero = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
+            let unfocus = cx.focus_handle();
+            window.focus(&unfocus, cx);
+            HeroHarness { hero, composer, render_hero: false, unfocus }
+        });
+        let hero = harness.read_with(vcx, |h, _| h.hero.clone());
+
+        // 1. Scratch draft has no project settings entry.
+        vcx.update(|_, cx| {
+            assert!(!hero.update(cx, |hero, cx| hero.open_project_settings_for_draft(cx)));
+        });
+
+        // 2. Non-scratch active draft opens Settings -> Projects on the active env's project.
+        vcx.update(|window, cx| {
+            state.update(cx, |s, cx| s.start_draft("p-same", cx));
+            assert!(hero.update(cx, |hero, cx| hero.open_project_settings_for_draft(cx)));
+            let (_, targets) = crate::settings::project_selection_for_test(window, cx)
+                .expect("active draft project opened in Settings -> Projects");
+            assert_eq!(targets, vec![("local".to_owned(), "p-same".to_owned())]);
+        });
+
+        // 3. Non-active environment picker row opens Settings -> Projects on the remote env's
+        // project without switching environments, even when projectId collides with local.
+        vcx.update(|window, cx| {
+            let (entries, _) = hero.read(cx).entries(cx);
+            let remote_entry = entries
+                .into_iter()
+                .find(|entry| entry.label == "Remote Beta")
+                .expect("non-active env project present in draft hero picker");
+            assert_eq!(
+                remote_entry.owner.as_ref().map(|o| o.saved_id.as_str()),
+                Some("remote-1")
+            );
+            hero.update(cx, |hero, cx| hero.open_project_settings_for_entry(&remote_entry, window, cx));
+            let (_, targets) = crate::settings::project_selection_for_test(window, cx)
+                .expect("non-active env project opened in Settings -> Projects");
+            assert_eq!(targets, vec![("remote-1".to_owned(), "p-same".to_owned())]);
+            assert_eq!(state.read(cx).environments.active.as_deref(), Some("local"));
+        });
 
         let _ = vcx;
         state.update(cx, |state, _| state.stop_pump());
