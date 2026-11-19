@@ -145,6 +145,49 @@ pub fn supports_shared_settings_sync(connected: bool, has_server_config: bool) -
     connected && has_server_config
 }
 
+/// `requiredScopesForServerSettingsPatch` (`packages/contracts/src/settings.ts:1990-2019`):
+/// determines the exact auth scopes a `server.updateSettings` payload requires.
+pub fn required_scopes_for_server_settings_payload(payload: &Value) -> Vec<&'static str> {
+    let mut changes_settings = false;
+    let mut changes_providers = payload
+        .get("providerInstanceMutation")
+        .is_some_and(|v| !v.is_null());
+    let mut changes_access = false;
+
+    if let Some(patch) = payload.get("patch").and_then(Value::as_object) {
+        for (key, value) in patch {
+            match key.as_str() {
+                "requireConnectDeviceApproval" => changes_access = true,
+                "providers" | "providerInstances" | "usageLimitSources" | "textGenerators" => {
+                    changes_providers = true;
+                }
+                "secretProviders" => {
+                    changes_providers = true;
+                    if value
+                        .as_object()
+                        .is_some_and(|entries| entries.values().any(Value::is_null))
+                    {
+                        changes_settings = true;
+                    }
+                }
+                _ => changes_settings = true,
+            }
+        }
+    }
+
+    let mut scopes = Vec::new();
+    if changes_settings || (!changes_providers && !changes_access) {
+        scopes.push("settings:write");
+    }
+    if changes_providers {
+        scopes.push("providers:manage");
+    }
+    if changes_access {
+        scopes.push("access:write");
+    }
+    scopes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +331,32 @@ mod tests {
         assert!(!supports_shared_settings_sync(true, false));
         assert!(!supports_shared_settings_sync(false, true));
         assert!(!supports_shared_settings_sync(false, false));
+    }
+
+    #[test]
+    fn required_scopes_match_contracts_settings_patch_rules() {
+        assert_eq!(
+            required_scopes_for_server_settings_payload(&json!({ "patch": { "sidebarAutoSettleOnMerge": false } })),
+            vec!["settings:write"]
+        );
+        assert_eq!(
+            required_scopes_for_server_settings_payload(&json!({ "patch": { "usageLimitSources": [] } })),
+            vec!["providers:manage"]
+        );
+        assert_eq!(
+            required_scopes_for_server_settings_payload(&json!({ "patch": { "requireConnectDeviceApproval": true } })),
+            vec!["access:write"]
+        );
+        assert_eq!(
+            required_scopes_for_server_settings_payload(&json!({ "patch": { "secretProviders": { "op": null } } })),
+            vec!["settings:write", "providers:manage"]
+        );
+        assert_eq!(
+            required_scopes_for_server_settings_payload(&json!({
+                "patch": {},
+                "providerInstanceMutation": { "kind": "remove", "instanceId": "codex-2" }
+            })),
+            vec!["providers:manage"]
+        );
     }
 }

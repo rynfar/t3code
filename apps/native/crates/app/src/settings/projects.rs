@@ -778,6 +778,90 @@ impl SettingsView {
         self.save_project_override("defaultModelSelection", json!(selection), cx);
     }
 
+    fn apply_project_model_trait(
+        &self,
+        config: &ServerConfig,
+        selection: &t3_core::model::ModelSelection,
+        option_id: &str,
+        value: &str,
+        cx: &mut App,
+    ) -> bool {
+        use t3_core::traits::{self, OptionValue};
+        let Some(provider) = config.provider(&selection.instance_id) else {
+            return false;
+        };
+        let model = provider.models.iter().find(|candidate| candidate.slug == selection.model);
+        let explicit = traits::selections(selection.options.as_ref());
+        let resolved = traits::composer_options(&provider.driver, model, false, &explicit);
+        let Some(next_selections) =
+            traits::with_value(&resolved.descriptors, option_id, OptionValue::Str(value.to_owned()))
+        else {
+            return false;
+        };
+        let next = traits::model_selection(&selection.instance_id, &selection.model, &next_selections);
+        self.set_project_model(next, cx);
+        true
+    }
+
+    fn project_model_trait_controls(
+        config: &ServerConfig,
+        selection: &t3_core::model::ModelSelection,
+        view: gpui::WeakEntity<Self>,
+    ) -> Vec<AnyElement> {
+        use t3_core::server_config::OptionDescriptor;
+        use t3_core::traits;
+        let Some(provider) = config.provider(&selection.instance_id) else {
+            return Vec::new();
+        };
+        let model = provider.models.iter().find(|candidate| candidate.slug == selection.model);
+        let explicit = traits::selections(selection.options.as_ref());
+        let resolved = traits::composer_options(&provider.driver, model, false, &explicit);
+        let mut controls = Vec::new();
+        for descriptor in &resolved.descriptors {
+            let OptionDescriptor::Select(select) = descriptor else {
+                continue;
+            };
+            let options: Vec<SelectOption> = traits::selectable_choices(select)
+                .map(|choice| {
+                    let mut option = SelectOption::new(choice.id.clone(), choice.label.clone());
+                    if let Some(description) = &choice.description {
+                        option = option.description(description.clone());
+                    }
+                    option
+                })
+                .collect();
+            if options.is_empty() {
+                continue;
+            }
+            let selected = select
+                .current_value
+                .clone()
+                .or_else(|| options.first().map(|option| option.value.to_string()))
+                .unwrap_or_default();
+            let option_id = select.id.clone();
+            let base_selection = selection.clone();
+            let view = view.clone();
+            controls.push(
+                Select::new(SharedString::from(format!("project-default-model-trait-{}", select.id)), options)
+                    .selected(selected)
+                    .width(124.)
+                    .popup_width(180.)
+                    .show_check()
+                    .on_change(move |value, _, cx| {
+                        let option_id = option_id.clone();
+                        let base_selection = base_selection.clone();
+                        let _ = view.update(cx, |this, cx| {
+                            let Some(shown) = this.shown_project(cx) else { return };
+                            let Some(config) = this.project_config(&shown.targets[0], cx).cloned() else { return };
+                            this.apply_project_model_trait(&config, &base_selection, &option_id, value.as_ref(), cx);
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+        controls
+    }
+
     fn clear_project_override(&self, key: &'static str, cx: &mut App) {
         store::update_projects(&self.state, self.project_targets(cx), OverrideEdit::Clear { keys: vec![key.to_owned()] }, |_, _| {}, cx);
     }
@@ -844,13 +928,7 @@ impl SettingsView {
                     },
                 );
                 let traits = if !mixed_model && unavailable.is_none() {
-                    super::threads::model_trait_controls(
-                        "project-default-model",
-                        config,
-                        selection,
-                        cx.entity().downgrade(),
-                        t3_core::settings::ServerSettingChange::DefaultModelSelection,
-                    )
+                    Self::project_model_trait_controls(config, selection, cx.entity().downgrade())
                 } else {
                     Vec::new()
                 };
@@ -1135,6 +1213,169 @@ mod tests {
             assert!(shown_scoped.has_other_members);
             assert_eq!(danger_copy(shown_scoped.has_other_members, shown_scoped.members.len()).button, "Remove checkout");
         });
+
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
+        cx.run_until_parked();
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn scratch_project_model_trait_saves_project_override_instead_of_global_default(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, _active_fx) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(
+                cx,
+                runtime.handle().clone(),
+            );
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        let (connections, _output) =
+            t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+        });
+
+        let grants: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["settings:write", "orchestration:operate"]
+        }))
+        .unwrap();
+        let (client_a, mut fx_a) = t3_client::supervisor::ClientFixture::handle(grants);
+        let mut shell = t3_core::shell::ShellState::default();
+        shell.synchronized = true;
+        shell.generation = 1;
+        shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+            projects: vec![t3_core::shell::ProjectShell {
+                id: "scratch-proj".into(),
+                title: "Scratch".into(),
+                has_custom_title: None,
+                workspace_root: "/Users/me/.t3/userdata/scratch".into(),
+                repository_identity: None,
+                default_model_selection: None,
+                pinned_at: None,
+                archived_at: None,
+                favicon_path: None,
+                project_icon: None,
+                scripts: Vec::new(),
+                created_at: "2026-04-01T00:00:00.000Z".into(),
+                updated_at: "2026-04-01T00:00:00.000Z".into(),
+            }],
+            ..Default::default()
+        });
+        let mut cfg = t3_core::server_config::ServerConfigState::default();
+        cfg.apply(
+            serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": { "environmentId": "env-a", "label": "MacBook" },
+                    "scratchWorkspaceRoot": "/Users/me/.t3/userdata/scratch",
+                    "providers": [{
+                        "instanceId": "codex",
+                        "driver": "codex",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "auth": { "status": "authenticated" },
+                        "availability": "available",
+                        "models": [{
+                            "slug": "gpt-5.4",
+                            "name": "GPT-5.4",
+                            "capabilities": {
+                                "optionDescriptors": [{
+                                    "type": "select",
+                                    "id": "reasoningEffort",
+                                    "label": "Reasoning",
+                                    "options": [
+                                        { "id": "medium", "label": "Medium", "isDefault": true },
+                                        { "id": "high", "label": "High" }
+                                    ]
+                                }]
+                            }
+                        }]
+                    }],
+                    "settings": {}
+                }
+            }))
+            .unwrap(),
+        );
+        let mut view = state.read_with(cx, |s, _| s.connections.view());
+        let ia = state.update(cx, |s, _| {
+            s.connections.install_fixture(
+                "env-a",
+                client_a.clone(),
+                shell.clone(),
+                cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _ea = runtime.spawn(ia).await.unwrap();
+        let fleet = view.borrow_and_update().clone();
+        state.update(cx, |s, cx| {
+            s.environments.active = Some("env-a".into());
+            s.install_active_environment(
+                client_a,
+                shell,
+                cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+                cx,
+            );
+            s.apply_fleet_view(fleet, cx);
+        });
+
+        let (_, vcx) = cx.add_window_view(|_, _| gpui::Empty);
+        let selection = t3_core::model::ModelSelection {
+            instance_id: "codex".into(),
+            model: "gpt-5.4".into(),
+            options: None,
+        };
+        vcx.update(|window, cx| {
+            crate::settings::open_scoped_project(Some("env-a"), "scratch-proj", cx);
+            let settings_view = crate::settings::settings_view_for_test(window, cx).expect("settings view");
+            let server_cfg = cfg.config.as_ref().unwrap();
+            let applied = settings_view.update(cx, |view, cx| {
+                view.apply_project_model_trait(
+                    server_cfg,
+                    &selection,
+                    "reasoningEffort",
+                    "high",
+                    cx,
+                )
+            });
+            assert!(applied, "trait edit should apply for scratch project");
+        });
+
+        let (rpc, payload, reply) = loop {
+            let req = fx_a.next_request().await;
+            if req.0 == method::SERVER_UPDATE_SETTINGS {
+                break req;
+            }
+            let _ = req.2.send(Ok(json!({})));
+        };
+        assert_eq!(rpc, method::SERVER_UPDATE_SETTINGS);
+        assert!(
+            payload["patch"].get("defaultModelSelection").is_none(),
+            "scratch project trait edit must NOT mutate global defaultModelSelection: {payload}"
+        );
+        let override_sel = &payload["patch"]["projectSettingsOverrides"]["scratch-proj"]["defaultModelSelection"];
+        assert_eq!(override_sel["instanceId"], "codex");
+        assert_eq!(override_sel["model"], "gpt-5.4");
+        assert_eq!(override_sel["options"], json!([{ "id": "reasoningEffort", "value": "high" }]));
+        reply.send(Ok(payload["patch"].clone())).unwrap();
 
         let _ = vcx;
         state.update(cx, |state, _| state.stop_pump());

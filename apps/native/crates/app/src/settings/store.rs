@@ -274,10 +274,12 @@ fn send_active_with_shared_fanout(
 ) {
     use t3_client::supervisor::ConnectionStatus;
     use t3_core::settings::shared::{
-        filter_shared_server_patch, split_shared_server_patch, supports_shared_settings_sync,
+        filter_shared_server_patch, required_scopes_for_server_settings_payload,
+        split_shared_server_patch, supports_shared_settings_sync,
     };
 
-    const SCOPE: &str = "settings:write";
+    const SHARED_SCOPE: &str = "settings:write";
+    let required_scopes = required_scopes_for_server_settings_payload(&payload);
 
     let patch_obj = payload.get("patch").and_then(serde_json::Value::as_object);
     let has_extra_top_keys = payload
@@ -286,7 +288,7 @@ fn send_active_with_shared_fanout(
 
     let split = patch_obj.map(split_shared_server_patch).unwrap_or_default();
 
-    let (active_label, active_sent_at, active_owner_rev, source_settings, secondary_targets) = {
+    let (active_label, active_denied, active_sent_at, active_owner_rev, source_settings, secondary_targets, denied_secondary) = {
         let app_state = state.read(cx);
         let active_saved = app_state.environments.active.clone();
         let active_label = app_state
@@ -296,6 +298,9 @@ fn send_active_with_shared_fanout(
             .map(|config| config.environment.label.clone())
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| "the environment".to_owned());
+        let active_denied = required_scopes
+            .iter()
+            .any(|scope| app_state.active_session_grants(scope) == Some(false));
         let active_sent_at = app_state.server_config.settings_revision();
         let source_settings = app_state.server_config.config.as_ref().map(|c| c.settings.clone());
         let active_owner_rev = active_saved
@@ -304,7 +309,8 @@ fn send_active_with_shared_fanout(
             .map(|entry| (entry.summary.owner.clone(), entry.settings_revision));
 
         let mut secondary = Vec::new();
-        if !split.shared_patch.is_empty() {
+        let mut denied_secondary = Vec::new();
+        if !active_denied && !split.shared_patch.is_empty() {
             for entry in &app_state.fleet.environments {
                 if active_saved.as_deref() == Some(entry.summary.owner.saved_id.as_str()) {
                     continue;
@@ -313,13 +319,6 @@ fn send_active_with_shared_fanout(
                     entry.status == ConnectionStatus::Connected,
                     entry.config.config.is_some(),
                 ) {
-                    continue;
-                }
-                if entry
-                    .grants
-                    .as_ref()
-                    .is_some_and(|session| !session.grants(SCOPE))
-                {
                     continue;
                 }
                 let target_settings = entry.config.config.as_ref().map(|c| &c.settings);
@@ -339,7 +338,18 @@ fn send_active_with_shared_fanout(
                     .map(|c| c.environment.label.clone())
                     .filter(|l| !l.is_empty())
                     .unwrap_or_else(|| entry.summary.owner.saved_id.clone());
-                let lookup = app_state.connections.destination(&entry.summary.owner, SCOPE);
+                if entry
+                    .grants
+                    .as_ref()
+                    .is_some_and(|session| !session.grants(SHARED_SCOPE))
+                {
+                    denied_secondary.push((
+                        label,
+                        "This connection lacks permission to change these settings.".to_owned(),
+                    ));
+                    continue;
+                }
+                let lookup = app_state.connections.destination(&entry.summary.owner, SHARED_SCOPE);
                 secondary.push((
                     entry.summary.owner.clone(),
                     label,
@@ -349,8 +359,25 @@ fn send_active_with_shared_fanout(
                 ));
             }
         }
-        (active_label, active_sent_at, active_owner_rev, source_settings, secondary)
+        (
+            active_label,
+            active_denied,
+            active_sent_at,
+            active_owner_rev,
+            source_settings,
+            secondary,
+            denied_secondary,
+        )
     };
+
+    if active_denied {
+        let message = format!("This connection lacks permission to change settings on {active_label}.");
+        show_error(message.clone(), cx);
+        if let Some(on_done) = on_done {
+            on_done(Some(message), cx);
+        }
+        return send_next(cx);
+    }
 
     // Build the active environment's payload (preserving non-patch keys and filtering shared keys
     // with `target_is_source = true` when settings are absent).
@@ -384,7 +411,7 @@ fn send_active_with_shared_fanout(
 
     cx.spawn(async move |cx| {
         let mut saved_labels: Vec<String> = Vec::new();
-        let mut failed: Vec<(String, String)> = Vec::new();
+        let mut failed: Vec<(String, String)> = denied_secondary;
 
         if let Some(task) = active_task {
             match task.await {
@@ -442,7 +469,7 @@ fn send_active_with_shared_fanout(
                     .session_state()
                     .borrow()
                     .as_ref()
-                    .is_some_and(|session| !session.grants(SCOPE))
+                    .is_some_and(|session| !session.grants(SHARED_SCOPE))
                 {
                     return Err("This connection lacks permission to change these settings.".to_owned());
                 }
@@ -565,7 +592,8 @@ fn send_scoped_environments(
     on_done: Option<OnDone>,
     cx: &mut App,
 ) {
-    const SCOPE: &str = "settings:write";
+    use t3_core::settings::shared::required_scopes_for_server_settings_payload;
+
     if owners.is_empty() {
         let message = "Reconnect to save this setting.".to_owned();
         show_error(message.clone(), cx);
@@ -574,28 +602,33 @@ fn send_scoped_environments(
         }
         return send_next(cx);
     }
-    let lookups: Vec<(t3_core::sidebar::grouping::EnvironmentOwner, String, _)> = {
+    let lookups: Vec<(t3_core::sidebar::grouping::EnvironmentOwner, String, Vec<&'static str>, _)> = {
         let app = state.read(cx);
         let view = app.connections.view();
         let view = view.borrow();
         owners
             .into_iter()
             .map(|owner| {
-                let label = view
-                    .environment(&owner.saved_id)
+                let entry = view.environment(&owner.saved_id);
+                let label = entry
                     .and_then(|e| e.config.config.as_ref())
                     .map(|c| c.environment.label.clone())
                     .filter(|l| !l.is_empty())
                     .unwrap_or_else(|| owner.saved_id.clone());
-                let lookup = app.connections.destination(&owner, SCOPE);
-                (owner, label, lookup)
+                let scopes = change
+                    .payload_for(entry.and_then(|e| e.config.config.as_ref()).map(|c| &c.settings))
+                    .map(|payload| required_scopes_for_server_settings_payload(&payload))
+                    .unwrap_or_else(|| vec!["settings:write"]);
+                let primary_scope = scopes.first().copied().unwrap_or("settings:write");
+                let lookup = app.connections.destination(&owner, primary_scope);
+                (owner, label, scopes, lookup)
             })
             .collect()
     };
     cx.spawn(async move |cx| {
         let mut saved_labels: Vec<String> = Vec::new();
         let mut failed: Vec<(String, String)> = Vec::new();
-        for (_owner, label, lookup) in lookups {
+        for (_owner, label, scopes, lookup) in lookups {
             let destination = match lookup.await {
                 Ok(dest) => dest,
                 Err(error) => {
@@ -616,15 +649,6 @@ fn send_scoped_environments(
                 if !destination.is_current(&view) {
                     return Err("Environment connection changed.".to_owned());
                 }
-                if !destination
-                    .client
-                    .session_state()
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|session| session.grants(SCOPE))
-                {
-                    return Err("This connection lacks permission to change these settings.".to_owned());
-                }
                 let entry = view
                     .environment(&destination.owner.saved_id)
                     .ok_or_else(|| "Environment is no longer available.".to_owned())?;
@@ -636,6 +660,21 @@ fn send_scoped_environments(
                 let payload = change
                     .payload_for(Some(&config.settings))
                     .ok_or_else(|| "Reconnect to save this setting.".to_owned())?;
+                let payload_scopes = required_scopes_for_server_settings_payload(&payload);
+                if !destination
+                    .client
+                    .session_state()
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| {
+                        scopes
+                            .iter()
+                            .chain(&payload_scopes)
+                            .all(|scope| session.grants(scope))
+                    })
+                {
+                    return Err("This connection lacks permission to change these settings.".to_owned());
+                }
                 Ok((payload, entry.settings_revision, app.runtime().clone()))
             });
             let (payload, settings_revision, runtime) = match prepared {
@@ -1432,7 +1471,7 @@ mod tests {
     ) {
         cx.executor().allow_parking();
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (state, mut active_fixture) =
+        let (state, _default_fixture) =
             cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
 
         let make_shell = || {
@@ -1492,7 +1531,7 @@ mod tests {
             "permissions": ["settings:write"]
         }))
         .unwrap();
-        let (client_active_fleet, _unused_active_fleet_fixture) = ClientFixture::handle(session);
+        let (client_active, mut active_fixture) = ClientFixture::handle(session);
         let session_b = serde_json::from_value(json!({
             "authenticated": true,
             "permissions": ["settings:write"]
@@ -1529,7 +1568,7 @@ mod tests {
 
         let i_a = state.update(cx, |s, _| {
             s.connections
-                .install_fixture("env-active", client_active_fleet, active_shell.clone(), active_cfg.clone(), ConnectionStatus::Connected)
+                .install_fixture("env-active", client_active.clone(), active_shell.clone(), active_cfg.clone(), ConnectionStatus::Connected)
         });
         let i_b = state.update(cx, |s, _| {
             s.connections
@@ -1546,8 +1585,13 @@ mod tests {
 
         state.update(cx, |s, cx| {
             s.environments.active = Some("env-active".into());
-            s.server_config = active_cfg;
-            cx.emit(AppEvent::ServerConfig);
+            s.install_active_environment(
+                client_active,
+                active_shell,
+                active_cfg,
+                ConnectionStatus::Connected,
+                cx,
+            );
         });
 
         let reply_merged = |codex_enabled: bool, patch: &serde_json::Value| {
@@ -1669,6 +1713,97 @@ mod tests {
         assert!(err.contains("Could not save on Build VPS"), "got: {err}");
         assert!(err.contains("Saved on Mac Studio, Claude Box"), "got: {err}");
 
+        // 5. Connected secondary environment lacking settings:write receives NO RPC and is reported
+        // as denied while permitted environments still save.
+        let readonly_session: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["orchestration:read"]
+        }))
+        .unwrap();
+        let (client_ro, mut fixture_ro) = ClientFixture::handle(readonly_session.clone());
+        let cfg_ro = make_cfg(
+            "env-ro",
+            "ReadOnly VPS",
+            json!({ "sidebarAutoSettleOnMerge": true }),
+        );
+        let (ready4_tx, ready4_rx) = tokio::sync::oneshot::channel();
+        let mut ready4_tx = Some(ready4_tx);
+        let _sub4 = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell
+                    && state.fleet.environments.len() == 4
+                    && let Some(tx) = ready4_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        let i_ro = state.update(cx, |s, _| {
+            s.connections.install_fixture("env-ro", client_ro, make_shell(), cfg_ro, ConnectionStatus::Connected)
+        });
+        let _ev_ro = runtime.spawn(i_ro).await.unwrap();
+        ready4_rx.await.unwrap();
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        cx.update(|cx| {
+            update_server_then(
+                &state,
+                ServerSettingChange::AutoResumeLimitedThreads(false),
+                move |err, _| {
+                    let _ = done_tx.send(err);
+                },
+                cx,
+            );
+        });
+        let (_, payload_a, reply_a) = active_fixture.next_request().await;
+        reply_a.send(Ok(reply_merged(true, &payload_a["patch"]))).unwrap();
+        let (_, payload_b, reply_b) = fixture_b.next_request().await;
+        reply_b.send(Ok(reply_merged(true, &payload_b["patch"]))).unwrap();
+        let (_, payload_c, reply_c) = fixture_c.next_request().await;
+        reply_c.send(Ok(reply_merged(false, &payload_c["patch"]))).unwrap();
+
+        let err = done_rx.await.unwrap().expect("denied secondary environment must be reported");
+        assert!(err.contains("Could not save on ReadOnly VPS"), "got: {err}");
+        assert!(err.contains("lacks permission"), "got: {err}");
+        assert!(err.contains("Saved on Mac Studio, Build VPS, Claude Box"), "got: {err}");
+        assert!(
+            fixture_ro.take_commands().is_empty(),
+            "denied secondary environment must not receive RPC"
+        );
+
+        // 6. Read-only active environment lacking settings:write sends ZERO RPCs to active or
+        // secondary environments and reports permission denial upfront.
+        let (readonly_active_client, mut readonly_active_fixture) = ClientFixture::handle(readonly_session);
+        let ro_active_cfg = state.read_with(cx, |s, _| s.server_config.clone());
+        state.update(cx, |s, cx| {
+            s.install_active_environment(
+                readonly_active_client,
+                make_shell(),
+                ro_active_cfg,
+                ConnectionStatus::Connected,
+                cx,
+            );
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        cx.update(|cx| {
+            update_server_then(
+                &state,
+                ServerSettingChange::AutoSettleOnMerge(true),
+                move |err, _| {
+                    let _ = done_tx.send(err);
+                },
+                cx,
+            );
+        });
+        let err = done_rx.await.unwrap().expect("read-only active env must reject upfront");
+        assert!(err.contains("lacks permission to change settings on Mac Studio"), "got: {err}");
+        assert!(readonly_active_fixture.take_commands().is_empty());
+        assert!(active_fixture.take_commands().is_empty());
+        assert!(fixture_b.take_commands().is_empty());
+        assert!(fixture_c.take_commands().is_empty());
+        assert!(fixture_ro.take_commands().is_empty());
+
+        drop(_ev_ro);
         drop(_ev_a);
         drop(_ev_b);
         drop(_ev_c);
