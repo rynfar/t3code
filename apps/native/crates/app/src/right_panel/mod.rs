@@ -161,9 +161,7 @@ impl RightPanelView {
     pub fn toggle_add_surface_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.add_menu_open {
             self.close_add_surface_menu(cx);
-        } else if self.add_menu_dismissed.take().is_some_and(|at| at.elapsed() < REOPEN_GUARD) {
-            return;
-        } else {
+        } else if !self.add_menu_dismissed.take().is_some_and(|at| at.elapsed() < REOPEN_GUARD) {
             self.open_add_surface_menu(window, cx);
         }
     }
@@ -393,7 +391,6 @@ impl Render for RightPanelView {
         let view = cx.entity();
         let add_menu = self.add_menu_open.then(|| {
             let entries = tabs::add_menu_entries(self.state.read(cx), cx);
-            let close_view = view.clone();
             let dismiss_view = view.clone();
             let key_view = view.clone();
             tabs::render_add_menu(
@@ -401,11 +398,14 @@ impl Render for RightPanelView {
                 &entries,
                 self.add_menu_highlighted,
                 &self.add_menu_focus,
-                move |cx| {
-                    close_view.update(cx, |this, cx| this.close_add_surface_menu(cx));
-                },
-                move |cx| {
-                    dismiss_view.update(cx, |this, cx| this.dismiss_add_surface_menu_outside(cx));
+                move |outside, cx| {
+                    dismiss_view.update(cx, |this, cx| {
+                        if outside {
+                            this.dismiss_add_surface_menu_outside(cx);
+                        } else {
+                            this.close_add_surface_menu(cx);
+                        }
+                    });
                 },
                 move |event, window, cx| {
                     key_view.update(cx, |this, cx| this.handle_add_menu_key_down(event, window, cx));

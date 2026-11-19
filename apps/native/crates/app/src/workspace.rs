@@ -954,11 +954,12 @@ impl Workspace {
     }
 
     fn has_blocking_overlay(&self, window: &mut Window, cx: &mut gpui::App) -> bool {
+        // Note: `updates::overlay(cx)` returns the persistent `UpdateDialog` entity whenever
+        // `UpdateControl` is mounted (even while closed), so it cannot be checked with `.is_some()`.
         self.menu.read(cx).is_open()
             || self.dialog.read(cx).is_open()
             || self.snooze.read(cx).is_open()
             || self.palette.read(cx).is_open()
-            || crate::updates::overlay(cx).is_some()
             || crate::voice::is_setup_modal_open(cx)
             || self.welcome.read(cx).is_open()
             || crate::settings::overlay(window, cx).is_some()
@@ -1209,6 +1210,7 @@ mod tests {
         // 2. `composer.sendAndNewThread` sends to `menu-thread` and switches to a fresh draft ONLY after RPC succeeds.
         cx.update_window(window.into(), |_, window, cx| {
             workspace.update(cx, |ws, cx| {
+                assert!(ws.composer_visible(window, cx), "composer must be visible when no overlay is open");
                 ws.composer.update(cx, |composer, cx| composer.set_prompt("Ship the follow-up", window, cx));
                 ws.send_and_new_thread(window, cx);
             });

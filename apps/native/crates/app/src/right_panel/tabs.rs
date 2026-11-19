@@ -193,16 +193,16 @@ pub(super) fn render_add_menu(
     entries: &[AddMenuEntry],
     highlighted: usize,
     focus: &gpui::FocusHandle,
-    on_close: impl Fn(&mut App) + Clone + 'static,
-    on_dismiss_outside: impl Fn(&mut App) + 'static,
+    on_dismiss: impl Fn(bool, &mut App) + Clone + 'static,
     on_key_down: impl Fn(&gpui::KeyDownEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
     let p = palette(cx);
+    let dismiss_out = on_dismiss.clone();
     let rows = entries.iter().enumerate().map(|(index, entry)| {
         let state = state.clone();
         let open = entry.open;
-        let close = on_close.clone();
+        let dismiss = on_dismiss.clone();
         let active = index == highlighted && entry.unavailable.is_none();
         h_flex()
             .id(("right-panel-add-item", index))
@@ -219,7 +219,7 @@ pub(super) fn render_add_menu(
                 this.cursor_pointer()
                     .hover(|style| style.bg(hsla(p.accent)))
                     .on_click(move |_, _, cx| {
-                        close(cx);
+                        dismiss(false, cx);
                         state.update(cx, open);
                     })
             })
@@ -236,7 +236,7 @@ pub(super) fn render_add_menu(
         .occlude()
         .w(px(216.))
         .p(px(4.))
-        .on_mouse_down_out(move |_, _, cx| on_dismiss_outside(cx))
+        .on_mouse_down_out(move |_, _, cx| dismiss_out(true, cx))
         .on_key_down(move |event, window, cx| on_key_down(event, window, cx))
         .child(v_flex().gap(px(2.)).children(rows));
     gpui::deferred(
