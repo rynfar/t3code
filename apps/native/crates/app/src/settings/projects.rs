@@ -1358,6 +1358,7 @@ mod tests {
             });
             assert!(applied, "trait edit should apply for scratch project");
         });
+        let _ = vcx;
 
         let (rpc, payload, reply) = loop {
             let req = fx_a.next_request().await;
@@ -1375,9 +1376,28 @@ mod tests {
         assert_eq!(override_sel["instanceId"], "codex");
         assert_eq!(override_sel["model"], "gpt-5.4");
         assert_eq!(override_sel["options"], json!([{ "id": "reasoningEffort", "value": "high" }]));
+        let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+        let mut applied_tx = Some(applied_tx);
+        let _applied_sub = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if *event == crate::app_state::AppEvent::ServerConfig
+                    && state
+                        .server_config
+                        .config
+                        .as_ref()
+                        .is_some_and(|c| c.settings.project_settings_overrides.contains_key("scratch-proj"))
+                    && let Some(tx) = applied_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
         reply.send(Ok(payload["patch"].clone())).unwrap();
+        applied_rx.await.unwrap();
+        drop(_applied_sub);
+        cx.run_until_parked();
+        assert!(cx.update(|cx| store::error(cx).is_none()));
 
-        let _ = vcx;
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
             cx.shutdown();
