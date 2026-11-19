@@ -31,7 +31,9 @@ pub mod method {
     pub const CLOSE: &str = "device.close";
     pub const DETAIL: &str = "device.detail";
     pub const ACTION: &str = "device.action";
+    pub const TEST_HOST: &str = "device.testHost";
     pub const EAS_ACCOUNT: &str = "device.easAccount";
+    pub const SIMLOCK_IDENTITY: &str = "device.simlockIdentity";
 }
 
 /// `LOCAL_DEVICE_HOST_ID`: this machine, reserved for it.
@@ -108,6 +110,76 @@ pub struct PlatformAvailability {
     pub reason: Option<String>,
 }
 
+/// `DeviceToolVersion`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolVersion {
+    pub required_version: String,
+    #[serde(default)]
+    pub installed_versions: Vec<String>,
+    #[serde(default)]
+    pub running_version: Option<String>,
+}
+
+impl ToolVersion {
+    /// The version shown on the trigger button: running, else required if installed, else highest
+    /// numeric installed version (`DeviceToolVersions.tsx`).
+    pub fn display_version(&self) -> Option<&str> {
+        if let Some(running) = self.running_version.as_deref() {
+            return Some(running);
+        }
+        if self.installed_versions.iter().any(|v| v == &self.required_version) {
+            return Some(self.required_version.as_str());
+        }
+        self.installed_versions.iter().max_by(|a, b| cmp_numeric_version(a, b)).map(String::as_str)
+    }
+
+    pub fn needs_update(&self) -> bool {
+        self.running_version.as_deref().is_some_and(|v| v != self.required_version)
+            || !self.installed_versions.iter().any(|v| v == &self.required_version)
+    }
+}
+
+/// Numeric-aware version comparison matching JS `localeCompare(..., { numeric: true })` so
+/// `"10.0.0" > "9.0.0"` and `"1.10.2" > "1.2.9"`.
+fn cmp_numeric_version(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut ab, mut bb) = (a.as_bytes(), b.as_bytes());
+    while !ab.is_empty() && !bb.is_empty() {
+        if ab[0].is_ascii_digit() && bb[0].is_ascii_digit() {
+            let an = ab.iter().take_while(|c| c.is_ascii_digit()).count();
+            let bn = bb.iter().take_while(|c| c.is_ascii_digit()).count();
+            let (ad, bd) = (&ab[..an], &bb[..bn]);
+            let (at, bt) = (
+                ad.iter().position(|c| *c != b'0').map_or(&b""[..], |i| &ad[i..]),
+                bd.iter().position(|c| *c != b'0').map_or(&b""[..], |i| &bd[i..]),
+            );
+            let ord = at.len().cmp(&bt.len()).then_with(|| at.cmp(bt)).then_with(|| ad.len().cmp(&bd.len()));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ab = &ab[an..];
+            bb = &bb[bn..];
+        } else {
+            let ord = ab[0].to_ascii_lowercase().cmp(&bb[0].to_ascii_lowercase()).then_with(|| ab[0].cmp(&bb[0]));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ab = &ab[1..];
+            bb = &bb[1..];
+        }
+    }
+    ab.len().cmp(&bb.len())
+}
+
+/// `DeviceToolVersions`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolVersions {
+    pub hub: ToolVersion,
+    pub agent: ToolVersion,
+}
+
 /// `DeviceHostSummary`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +189,10 @@ pub struct Host {
     pub kind: HostKind,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub platforms: Vec<PlatformAvailability>,
+    #[serde(default)]
+    pub tools: Option<ToolVersions>,
+    #[serde(default)]
+    pub tool_inspection_error: Option<String>,
     #[serde(default)]
     pub agent_device_installed: bool,
 }
@@ -182,6 +258,8 @@ pub struct ServiceState {
     pub onboarding_completed: bool,
     pub agent_access_enabled: bool,
     pub supports_host_retry: bool,
+    pub supports_tool_update: bool,
+    pub supports_tool_inspection: bool,
     /// The server reads `easDeviceHosts`; older ones ignore them, so clients offer them only then.
     pub supports_eas_hosts: bool,
     /// The server reads `simlockDeviceHosts`.
@@ -214,6 +292,10 @@ struct Wire {
     #[serde(default)]
     supports_host_retry: bool,
     #[serde(default)]
+    supports_tool_update: bool,
+    #[serde(default)]
+    supports_tool_inspection: bool,
+    #[serde(default)]
     supports_eas_hosts: bool,
     #[serde(default)]
     supports_simlock_hosts: bool,
@@ -245,6 +327,8 @@ impl ServiceState {
             onboarding_completed: false,
             agent_access_enabled: false,
             supports_host_retry: false,
+            supports_tool_update: false,
+            supports_tool_inspection: false,
             supports_eas_hosts: false,
             supports_simlock_hosts: false,
             revision: 0,
@@ -267,6 +351,8 @@ impl ServiceState {
             onboarding_completed: wire.onboarding_completed,
             agent_access_enabled: wire.agent_access_enabled,
             supports_host_retry: wire.supports_host_retry,
+            supports_tool_update: wire.supports_tool_update,
+            supports_tool_inspection: wire.supports_tool_inspection,
             supports_eas_hosts: wire.supports_eas_hosts,
             supports_simlock_hosts: wire.supports_simlock_hosts,
             revision: wire.revision,
@@ -738,6 +824,14 @@ impl HubAccess {
         };
         self.with_query(format!("{base}{}", Self::vendor(serve_sim)), path_and_query)
     }
+}
+
+pub fn update_tool_payload(tool: &str) -> Value {
+    json!({ "updateTool": tool })
+}
+
+pub fn inspect_only_payload() -> Value {
+    json!({ "inspectOnly": true })
 }
 
 /// `encodeURIComponent`, for device ids in tab ids and hub paths.

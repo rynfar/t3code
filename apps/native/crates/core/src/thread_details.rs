@@ -999,6 +999,7 @@ mod tests {
             schedule_raw: json!({ "type": "fixed_time", "timeOfDay": "09:00", "weekdays": [1, 2, 3, 4, 5] }),
             project_id: "p1".into(),
             thread_id: Some("t1".into()),
+            thread_mode: None,
             workspace_strategy: json!({}),
             model_selection: list[0].model_selection.clone(),
             runtime_mode: "full-access".into(),

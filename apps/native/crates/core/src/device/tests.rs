@@ -470,3 +470,89 @@ fn eas_token_editor_blocks_check_and_save_on_an_invalid_reference_until_cleared(
     let account = hosts::EasAccount::decode(json!({ "signedInAs": "ana", "credentialSource": "eas-login", "apps": [{ "id": "a1", "fullName": "@ana/app" }] })).unwrap();
     assert_eq!((account.credential_source_label(), account.apps[0].full_name.as_str()), ("the server's eas login", "@ana/app"));
 }
+
+#[test]
+fn ssh_simlock_and_tool_versions_decode_validate_and_patch() {
+    let decoded = state(json!({
+        "supportsToolUpdate": true,
+        "supportsToolInspection": true,
+        "hosts": [{
+            "id": "local",
+            "label": "This machine",
+            "kind": "local",
+            "platforms": [],
+            "agentDeviceInstalled": true,
+            "tools": {
+                "hub": { "requiredVersion": "0.5.0", "installedVersions": ["0.4.0"], "runningVersion": "0.4.0" },
+                "agent": { "requiredVersion": "1.2.0", "installedVersions": ["1.2.0"], "runningVersion": null }
+            }
+        }]
+    }));
+    assert!(decoded.supports_tool_update && decoded.supports_tool_inspection);
+    let tools = decoded.host("local").unwrap().tools.as_ref().unwrap();
+    assert_eq!(tools.hub.display_version(), Some("0.4.0"));
+    assert!(tools.hub.needs_update());
+    assert_eq!(tools.agent.display_version(), Some("1.2.0"));
+    assert!(!tools.agent.needs_update());
+    let numeric = ToolVersion {
+        required_version: "11.0.0".into(),
+        installed_versions: vec!["9.0.0".into(), "10.0.0".into(), "2.1.0".into()],
+        running_version: None,
+    };
+    assert_eq!(numeric.display_version(), Some("10.0.0"));
+    assert_eq!(update_tool_payload("hub"), json!({ "updateTool": "hub" }));
+    assert_eq!(inspect_only_payload(), json!({ "inspectOnly": true }));
+
+    // SSH hosts
+    let ssh_list = hosts::decode_ssh_hosts(&json!([
+        { "id": "mac", "label": "Mac mini", "target": "dev@mac.local", "port": 2222, "identityFile": "~/.ssh/id_ed25519" }
+    ]))
+    .unwrap();
+    assert_eq!(ssh_list.len(), 1);
+    assert_eq!(ssh_list[0].port, Some(2222));
+    assert!(hosts::SshHostConfig { target: "-oBad".into(), ..ssh_list[0].clone() }.validate().is_err());
+    let defaulted_label = hosts::SshHostConfig { label: "  ".into(), ..ssh_list[0].clone() }.validate().unwrap();
+    assert_eq!(defaulted_label.label, "dev@mac.local");
+    let updated_ssh = hosts::update_ssh_hosts(&ssh_list, &defaulted_label, false);
+    assert_eq!(updated_ssh.len(), 1);
+    assert_eq!(hosts::update_ssh_hosts(&ssh_list, &defaulted_label, true).len(), 0);
+
+    // Simlock hosts & token editor
+    let simlock_list = hosts::decode_simlock_hosts(&json!([
+        {
+            "kind": "simlock",
+            "id": "pool-1",
+            "label": "Office pool",
+            "gatewayUrl": "https://simlock.corp.ts.net:4700",
+            "agentToken": { "provider": "op", "reference": "op://Dev/Simlock/token" },
+            "maxLeases": 4,
+            "maxLeaseMinutes": 90
+        }
+    ]))
+    .unwrap();
+    assert_eq!(simlock_list.len(), 1);
+    assert_eq!(simlock_list[0].lease_limits(), "Up to 4 leases at once, each up to 90 min");
+    let mut sim_ed = hosts::SimlockTokenEditor::new(&simlock_list[0], false);
+    assert!(!sim_ed.configured());
+    assert_eq!(sim_ed.problem(&simlock_list[0]), None);
+    assert_eq!(
+        sim_ed.check_payload("pool-1", "https://simlock.corp.ts.net:4700/"),
+        json!({ "gatewayUrl": "https://simlock.corp.ts.net:4700", "hostId": "pool-1" })
+    );
+    sim_ed.set_validity(false);
+    assert_eq!(sim_ed.problem(&simlock_list[0]), Some(hosts::REFERENCE_PROBLEM));
+    sim_ed.clear();
+    assert_eq!(
+        sim_ed.check_payload("pool-1", "https://simlock.corp.ts.net:4700"),
+        json!({ "gatewayUrl": "https://simlock.corp.ts.net:4700", "agentToken": "" })
+    );
+    let bad_gw = hosts::SimlockHostConfig { gateway_url: "ftp://bad".into(), ..simlock_list[0].clone() };
+    assert_eq!(sim_ed.problem(&bad_gw), Some(hosts::SIMLOCK_GATEWAY_PROBLEM));
+    let ident = hosts::SimlockIdentity::decode(json!({
+        "gatewayUrl": "https://simlock.corp.ts.net:4700",
+        "signedInAs": "ci-agent",
+        "tokenSource": "env"
+    }))
+    .unwrap();
+    assert_eq!(ident.token_source_label(), "AGENT_DEVICE_DAEMON_AUTH_TOKEN on the server");
+}

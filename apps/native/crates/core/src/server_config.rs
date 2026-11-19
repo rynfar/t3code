@@ -560,6 +560,9 @@ pub struct EnvironmentCapabilities {
     pub secret_source_check: Option<bool>,
     #[serde(default)]
     pub one_time_schedules: Option<bool>,
+    /// Server accepts `threadMode` (`new_thread` | `continue` | `fresh_session`) on scheduled tasks.
+    #[serde(default)]
+    pub scheduled_task_thread_modes: Option<bool>,
     /// The server hosts headless Chromium tabs streamed over `/api/preview-stream`.
     #[serde(default)]
     pub server_browser: Option<bool>,
@@ -763,6 +766,8 @@ pub struct ServerSettings {
     pub usage_limit_sources: Value,
     #[serde(default)]
     pub text_generators: Value,
+    #[serde(default)]
+    pub device_hosts: Value,
     #[serde(default)]
     pub eas_device_hosts: Value,
     #[serde(default)]

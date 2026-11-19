@@ -3,16 +3,25 @@
 //! `SourceControlDiscoveryResult` (`contracts/src/sourceControl.ts`), whose `Option` fields arrive
 //! as `{"_tag":"Some","value":…}` or `{"_tag":"None"}`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::{ServerSettingChange, lenient_or};
+use crate::device::hosts::SecretValue;
 use crate::model::ModelSelection;
 use crate::pull_requests::wire::MergeMethod;
 use crate::server_config::ServerSettings;
 
 /// `server.discoverSourceControl`, payload `{}`.
 pub const DISCOVER: &str = "server.discoverSourceControl";
+/// `sourceControl.signInStart`, payload `{ provider, host }`.
+pub const SIGN_IN_START: &str = "sourceControl.signInStart";
+/// `sourceControl.signInWait`, payload `{ provider, host }`.
+pub const SIGN_IN_WAIT: &str = "sourceControl.signInWait";
+/// `sourceControl.signInCancel`, payload `{ provider, host }`.
+pub const SIGN_IN_CANCEL: &str = "sourceControl.signInCancel";
 
 /// The merge method select: `last` saves null.
 pub const MERGE_METHODS: [(&str, &str); 5] = [
@@ -72,9 +81,9 @@ impl WritingMode {
 
     pub fn description(self) -> &'static str {
         match self {
-            WritingMode::RepoConventions => "In each project, matches recent change descriptions and change request titles.",
-            WritingMode::ConventionalCommits => "Use Conventional Commit prefixes and keep change request text concise.",
-            WritingMode::Custom => "Use your instructions for change descriptions and change requests in every project.",
+            WritingMode::RepoConventions => "Commit messages and pull request titles and descriptions match each project's history.",
+            WritingMode::ConventionalCommits => "Conventional Commit prefixes, with short pull request titles and descriptions.",
+            WritingMode::Custom => "Use your instructions for commit messages and pull request titles and descriptions in every project.",
         }
     }
 }
@@ -108,6 +117,8 @@ pub struct SourceControlSettings {
     pub default_auto_pull: bool,
     #[serde(deserialize_with = "lenient_or")]
     pub remove_agent_credits_on_merge: bool,
+    #[serde(deserialize_with = "offered_providers")]
+    pub offered_source_control_providers: BTreeMap<String, bool>,
     #[serde(deserialize_with = "writing_style")]
     pub source_control_writing_style: WritingStyle,
     #[serde(deserialize_with = "lenient_or")]
@@ -118,6 +129,13 @@ pub struct SourceControlSettings {
     pub review_guide_model_selection: Option<ModelSelection>,
     #[serde(deserialize_with = "trimmed")]
     pub review_guide_instructions: String,
+}
+
+impl SourceControlSettings {
+    /// `isSourceControlProviderOffered`: true unless explicitly disabled for `kind`.
+    pub fn is_provider_offered(&self, kind: &str) -> bool {
+        self.offered_source_control_providers.get(kind).copied().unwrap_or(true)
+    }
 }
 
 /// The writer model in use: its own selection, else the text generation model, which
@@ -134,6 +152,16 @@ pub enum SourceControlChange {
     AutoPull(bool),
     RemoveAgentCredits(bool),
     MergeMethod(Option<MergeMethod>),
+    OfferProvider { kind: String, offered: bool },
+    /// Saves or removes one host token while sending the full `tokens` map so other hosts'
+    /// redacted tokens or secret references are preserved (`pingdotgg/t3code#29554`).
+    SaveHostToken { kind: String, existing: BTreeMap<String, SecretValue>, host: String, token: SecretValue },
+    /// Signs out of one app host while sending the full `signIns` map so other hosts' sessions stay.
+    SignOutApp { kind: String, existing: BTreeMap<String, String>, host: String },
+    /// Saves the per-host enable / pinned account choices under `sourceControlHosts.<kind>.hosts`.
+    SaveHostAccounts { kind: String, hosts: BTreeMap<String, HostAccountChoice> },
+    /// Saves generic host fields (Bitbucket / GitCafe) under `sourceControlHosts.<kind>`.
+    SaveHostFields { kind: String, fields: Map<String, Value> },
     /// The mode, with the instructions on screen when the custom field is showing.
     WritingMode { mode: WritingMode, custom_instructions: Option<String> },
     CustomInstructions(String),
@@ -151,6 +179,38 @@ impl SourceControlChange {
             SourceControlChange::AutoPull(on) => json!({ "defaultAutoPull": on }),
             SourceControlChange::RemoveAgentCredits(on) => json!({ "removeAgentCreditsOnMerge": on }),
             SourceControlChange::MergeMethod(method) => json!({ "pullRequestMergeMethod": method.map(MergeMethod::as_str) }),
+            SourceControlChange::OfferProvider { kind, offered } => json!({ "offeredSourceControlProviders": { kind: offered } }),
+            SourceControlChange::SaveHostToken { kind, existing, host, token } => {
+                let mut tokens = Map::new();
+                for (saved_host, value) in existing {
+                    tokens.insert(saved_host.clone(), value.encode());
+                }
+                tokens.insert(host.trim().to_ascii_lowercase(), token.encode());
+                json!({ "sourceControlHosts": { kind: { "tokens": Value::Object(tokens) } } })
+            }
+            SourceControlChange::SignOutApp { kind, existing, host } => {
+                let mut sign_ins = Map::new();
+                for (saved_host, value) in existing {
+                    sign_ins.insert(saved_host.clone(), Value::String(value.clone()));
+                }
+                sign_ins.insert(host.trim().to_ascii_lowercase(), Value::String(String::new()));
+                json!({ "sourceControlHosts": { kind: { "signIns": Value::Object(sign_ins) } } })
+            }
+            SourceControlChange::SaveHostAccounts { kind, hosts } => {
+                let mut encoded = Map::new();
+                for (host, choice) in hosts {
+                    let mut entry = Map::new();
+                    entry.insert("enabled".to_owned(), Value::Bool(choice.enabled));
+                    if let Some(account) = &choice.account {
+                        entry.insert("account".to_owned(), Value::String(account.clone()));
+                    }
+                    encoded.insert(host.clone(), Value::Object(entry));
+                }
+                json!({ "sourceControlHosts": { kind: { "hosts": Value::Object(encoded) } } })
+            }
+            SourceControlChange::SaveHostFields { kind, fields } => {
+                json!({ "sourceControlHosts": { kind: Value::Object(fields.clone()) } })
+            }
             SourceControlChange::WritingMode { mode, custom_instructions } => {
                 let mut style = json!({ "mode": mode.as_str() });
                 if let Some(text) = custom_instructions {
@@ -173,6 +233,13 @@ impl SourceControlChange {
     pub fn into_server(self) -> ServerSettingChange {
         ServerSettingChange::Prepared(json!({ "patch": self.patch() }))
     }
+}
+
+fn offered_providers<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, bool>, D::Error> {
+    let Value::Object(map) = Value::deserialize(d)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(map.into_iter().filter_map(|(k, v)| v.as_bool().map(|b| (k, b))).collect())
 }
 
 fn trimmed<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -204,10 +271,21 @@ pub enum AuthStatus {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredAccount {
+    pub host: String,
+    pub account: String,
+    pub authenticated: bool,
+    pub active: bool,
+    pub detail: Option<String>,
+    pub environment_variable: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderAuth {
     pub status: AuthStatus,
     pub account: Option<String>,
     pub detail: Option<String>,
+    pub accounts: Vec<DiscoveredAccount>,
     /// Some discovered account is signed in, though every host may be turned off.
     pub any_account_authenticated: bool,
 }
@@ -222,6 +300,7 @@ pub struct DiscoveryItem {
     pub version: Option<String>,
     pub install_hint: String,
     pub implemented: bool,
+    pub app_sign_in: bool,
     pub auth: Option<ProviderAuth>,
 }
 
@@ -256,7 +335,29 @@ fn option_string(value: Option<&Value>) -> Option<String> {
     inner.as_str().map(str::to_owned).filter(|text| !text.is_empty())
 }
 
+fn decode_discovered_account(value: &Value) -> Option<DiscoveredAccount> {
+    let host = value.get("host")?.as_str()?.trim();
+    let account = value.get("account")?.as_str()?.trim();
+    if host.is_empty() || account.is_empty() {
+        return None;
+    }
+    Some(DiscoveredAccount {
+        host: host.to_owned(),
+        account: account.to_owned(),
+        authenticated: value.get("authenticated").and_then(Value::as_bool).unwrap_or(false),
+        active: value.get("active").and_then(Value::as_bool).unwrap_or(false),
+        detail: option_string(value.get("detail")),
+        environment_variable: option_string(value.get("environmentVariable")),
+    })
+}
+
 fn decode_auth(value: &Value) -> ProviderAuth {
+    let accounts: Vec<DiscoveredAccount> = value
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(decode_discovered_account).collect())
+        .unwrap_or_default();
+    let any_account_authenticated = accounts.iter().any(|account| account.authenticated);
     ProviderAuth {
         status: match value.get("status").and_then(Value::as_str) {
             Some("authenticated") => AuthStatus::Authenticated,
@@ -265,10 +366,8 @@ fn decode_auth(value: &Value) -> ProviderAuth {
         },
         account: option_string(value.get("account")),
         detail: option_string(value.get("detail")),
-        any_account_authenticated: value
-            .get("accounts")
-            .and_then(Value::as_array)
-            .is_some_and(|accounts| accounts.iter().any(|account| account.get("authenticated").and_then(Value::as_bool) == Some(true))),
+        accounts,
+        any_account_authenticated,
     }
 }
 
@@ -282,6 +381,7 @@ fn decode_item(value: &Value, provider: bool) -> Option<DiscoveryItem> {
         version: option_string(value.get("version")),
         install_hint: text("installHint").unwrap_or_default(),
         implemented: value.get("implemented").and_then(Value::as_bool).unwrap_or(provider),
+        app_sign_in: value.get("appSignIn").and_then(Value::as_bool).unwrap_or(false),
         auth: provider.then(|| value.get("auth").map(decode_auth).unwrap_or_default()),
     })
 }
@@ -351,6 +451,281 @@ impl DiscoveryItem {
             AuthStatus::Unknown => format!("Could not verify {}. {}", self.label, auth.detail.as_deref().unwrap_or(&self.install_hint)),
         }
     }
+}
+
+/// `SourceControlSignInPrompt`: returned by `sourceControl.signInStart`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInPrompt {
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_at: i64,
+}
+
+pub fn decode_sign_in_prompt(value: &Value) -> Result<SignInPrompt, String> {
+    let user_code = value.get("userCode").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).ok_or("Missing sign-in userCode")?;
+    let verification_uri = value
+        .get("verificationUri")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("Missing sign-in verificationUri")?;
+    let expires_at = value.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
+    Ok(SignInPrompt {
+        user_code: user_code.to_owned(),
+        verification_uri: verification_uri.to_owned(),
+        expires_at,
+    })
+}
+
+/// `SourceControlAppSignIn` from `packages/source-control-github/src/shared/definition.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppSignInDef {
+    pub app_name: &'static str,
+    pub host: &'static str,
+    pub install_url: &'static str,
+    pub revoke_url: &'static str,
+}
+
+/// `SourceControlHostCredentials`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCredentialsDef {
+    pub cli_name: &'static str,
+    pub cli_label: &'static str,
+    pub login_command: &'static str,
+    pub token_env_var: &'static str,
+    pub token_access: &'static str,
+    pub new_token_path: &'static str,
+    pub app_sign_in: Option<AppSignInDef>,
+}
+
+impl HostCredentialsDef {
+    pub fn new_token_url(&self, host: &str) -> String {
+        format!("https://{}{}", host.trim(), self.new_token_path)
+    }
+}
+
+/// One generic setting field on a host without CLI credentials (Bitbucket, GitCafe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostFieldDef {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub placeholder: &'static str,
+    pub secret: bool,
+}
+
+/// Built-in host settings definitions matching `packages/source-control-*/src/shared/definition.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostDefinition {
+    pub kind: &'static str,
+    pub label: &'static str,
+    pub public_host: Option<&'static str>,
+    pub credentials: Option<HostCredentialsDef>,
+    pub fields: &'static [HostFieldDef],
+}
+
+const GITHUB_DEF: HostDefinition = HostDefinition {
+    kind: "github",
+    label: "GitHub",
+    public_host: Some("github.com"),
+    credentials: Some(HostCredentialsDef {
+        cli_name: "gh",
+        cli_label: "GitHub CLI",
+        login_command: "gh auth login",
+        token_env_var: "GH_TOKEN",
+        token_access: "read and write access to pull requests and contents",
+        new_token_path: "/settings/personal-access-tokens/new",
+        app_sign_in: Some(AppSignInDef {
+            app_name: "T3 Code for GitHub",
+            host: "github.com",
+            install_url: "https://github.com/apps/t3-code-for-github/installations/new",
+            revoke_url: "https://github.com/settings/apps/authorizations",
+        }),
+    }),
+    fields: &[],
+};
+
+const BITBUCKET_FIELDS: [HostFieldDef; 3] = [
+    HostFieldDef {
+        key: "accessToken",
+        label: "Access token",
+        description: "Repository, project, or workspace access token used as a Bearer token. Preferred over email + API token when both are set.",
+        placeholder: "ATCTT3xFfGN0...",
+        secret: true,
+    },
+    HostFieldDef {
+        key: "email",
+        label: "Atlassian email",
+        description: "Account email for Basic authentication with an Atlassian API token.",
+        placeholder: "you@example.com",
+        secret: false,
+    },
+    HostFieldDef {
+        key: "apiToken",
+        label: "API token",
+        description: "Scoped Atlassian API token with Bitbucket pull request scopes, paired with your Atlassian email.",
+        placeholder: "ATATT3xFfGF0...",
+        secret: true,
+    },
+];
+
+const BITBUCKET_DEF: HostDefinition = HostDefinition {
+    kind: "bitbucket",
+    label: "Bitbucket",
+    public_host: Some("bitbucket.org"),
+    credentials: None,
+    fields: &BITBUCKET_FIELDS,
+};
+
+const GITCAFE_FIELDS: [HostFieldDef; 1] = [HostFieldDef {
+    key: "token",
+    label: "API token",
+    description: "Personal access token for GitCafe pull request operations.",
+    placeholder: "gc_...",
+    secret: true,
+}];
+
+const GITCAFE_DEF: HostDefinition = HostDefinition {
+    kind: "gitcafe",
+    label: "GitCafe",
+    public_host: Some("gitcafe.net"),
+    credentials: None,
+    fields: &GITCAFE_FIELDS,
+};
+
+pub fn host_definition(kind: &str) -> Option<&'static HostDefinition> {
+    match kind {
+        "github" => Some(&GITHUB_DEF),
+        "bitbucket" => Some(&BITBUCKET_DEF),
+        "gitcafe" => Some(&GITCAFE_DEF),
+        _ => None,
+    }
+}
+
+/// One host entry under `sourceControlHosts.<kind>.hosts.<host>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAccountChoice {
+    pub enabled: bool,
+    pub account: Option<String>,
+}
+
+/// Decoded credential settings for a CLI-backed host (`readHostCredentialSettings`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostCredentialSettings {
+    pub tokens: BTreeMap<String, SecretValue>,
+    pub sign_ins: BTreeMap<String, String>,
+    pub hosts: BTreeMap<String, HostAccountChoice>,
+}
+
+pub fn has_secret_value(value: Option<&SecretValue>) -> bool {
+    value.is_some_and(|v| !v.is_empty())
+}
+
+pub fn read_host_credential_settings(source_control_hosts: &Value, kind: &str) -> HostCredentialSettings {
+    let Some(entry) = source_control_hosts.get(kind).and_then(Value::as_object) else {
+        return HostCredentialSettings::default();
+    };
+    let mut out = HostCredentialSettings::default();
+    if let Some(tokens) = entry.get("tokens").and_then(Value::as_object) {
+        for (host, val) in tokens {
+            let normalized = host.trim().to_ascii_lowercase();
+            if !normalized.is_empty()
+                && let Some(secret) = SecretValue::decode(val)
+            {
+                out.tokens.insert(normalized, secret);
+            }
+        }
+    }
+    if let Some(sign_ins) = entry.get("signIns").and_then(Value::as_object) {
+        for (host, val) in sign_ins {
+            let normalized = host.trim().to_ascii_lowercase();
+            if !normalized.is_empty()
+                && let Some(token) = val.as_str()
+            {
+                out.sign_ins.insert(normalized, token.to_owned());
+            }
+        }
+    }
+    if let Some(hosts) = entry.get("hosts").and_then(Value::as_object) {
+        for (host, val) in hosts {
+            let Some(obj) = val.as_object() else { continue };
+            let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            let account = obj.get("account").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+            out.hosts.insert(host.clone(), HostAccountChoice { enabled, account });
+        }
+    }
+    out
+}
+
+/// Decoded generic fields under `sourceControlHosts.<kind>` (Bitbucket, GitCafe).
+pub fn read_host_fields(source_control_hosts: &Value, kind: &str) -> BTreeMap<String, SecretValue> {
+    let Some(entry) = source_control_hosts.get(kind).and_then(Value::as_object) else {
+        return BTreeMap::new();
+    };
+    entry
+        .iter()
+        .filter_map(|(key, value)| SecretValue::decode(value).map(|secret| (key.clone(), secret)))
+        .collect()
+}
+
+/// `HostAccountGroup` (`SourceControlAccountSettings.logic.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAccountGroup {
+    pub host: String,
+    pub active_account: Option<String>,
+    pub selectable: Vec<String>,
+    pub broken: Vec<DiscoveredAccount>,
+    pub environment_variable: Option<String>,
+}
+
+/// `groupHostAccounts`: preserves host discovery order, separates env-var accounts, selectable
+/// authenticated accounts, and broken accounts.
+pub fn group_host_accounts(accounts: &[DiscoveredAccount]) -> Vec<HostAccountGroup> {
+    let mut hosts = Vec::new();
+    for entry in accounts {
+        if !hosts.iter().any(|existing: &String| existing == &entry.host) {
+            hosts.push(entry.host.clone());
+        }
+    }
+    hosts
+        .into_iter()
+        .map(|host| {
+            let entries: Vec<&DiscoveredAccount> = accounts.iter().filter(|entry| entry.host == host).collect();
+            let stored: Vec<&DiscoveredAccount> = entries.iter().copied().filter(|entry| entry.environment_variable.is_none()).collect();
+            let selectable_entries: Vec<&DiscoveredAccount> = stored.iter().copied().filter(|entry| entry.authenticated).collect();
+            let active_account = selectable_entries
+                .iter()
+                .find(|entry| entry.active)
+                .or_else(|| selectable_entries.first())
+                .map(|entry| entry.account.clone());
+            let selectable = selectable_entries.iter().map(|entry| entry.account.clone()).collect();
+            let broken = stored.into_iter().filter(|entry| !entry.authenticated).cloned().collect();
+            let environment_variable = entries.into_iter().find_map(|entry| entry.environment_variable.clone());
+            HostAccountGroup { host, active_account, selectable, broken, environment_variable }
+        })
+        .collect()
+}
+
+/// `nextHostAccountChoices`: updates one host's enable / pinned account choice, omitting the host
+/// entry when it returns to default (`enabled: true`, `account: None`).
+pub fn next_host_account_choices(
+    current: &BTreeMap<String, HostAccountChoice>,
+    host: &str,
+    enabled: Option<bool>,
+    account: Option<Option<String>>,
+) -> BTreeMap<String, HostAccountChoice> {
+    let previous = current.get(host);
+    let next_enabled = enabled.unwrap_or_else(|| previous.is_none_or(|choice| choice.enabled));
+    let next_account = match account {
+        Some(next) => next.filter(|s| !s.trim().is_empty()),
+        None => previous.and_then(|choice| choice.account.clone()),
+    };
+    let mut next = current.clone();
+    next.remove(host);
+    if !next_enabled || next_account.is_some() {
+        next.insert(host.to_owned(), HostAccountChoice { enabled: next_enabled, account: next_account });
+    }
+    next
 }
 
 #[cfg(test)]

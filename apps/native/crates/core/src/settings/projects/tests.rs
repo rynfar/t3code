@@ -121,6 +121,41 @@ fn removal_confirmations_follow_plan_project_removal() {
     assert_eq!(danger_copy(true, 3).title, "Remove checkout");
 }
 
+#[test]
+fn removal_counts_only_listed_lineage_threads_not_side_chats_or_subagents() {
+    use crate::shell::Lineage;
+    let listed = Lineage { parent_thread_id: None, relationship_to_parent: None, root_thread_id: "t1".into(), side_chat: None };
+    let fork = Lineage { parent_thread_id: Some("t1".into()), relationship_to_parent: Some("fork".into()), root_thread_id: "t1".into(), side_chat: None };
+    let side_chat = Lineage { parent_thread_id: Some("t1".into()), relationship_to_parent: Some("side_chat".into()), root_thread_id: "t1".into(), side_chat: Some(true) };
+    let subagent = Lineage { parent_thread_id: Some("t1".into()), relationship_to_parent: Some("subagent".into()), root_thread_id: "t1".into(), side_chat: None };
+    let threads = [
+        ("p1", &listed),
+        ("p1", &fork),
+        ("p1", &side_chat),
+        ("p1", &subagent),
+        ("other", &listed),
+    ];
+    assert_eq!(count_listed_removal_threads(threads, "p1", 0), 2);
+    assert_eq!(count_listed_removal_threads(threads, "p1", 3), 5);
+    assert_eq!(count_listed_removal_threads([("p1", &side_chat), ("p1", &subagent)], "p1", 0), 0);
+
+    let payload = ProjectUpdate::favicon_file("assets/logo.png".into()).payload("c4", "p1");
+    assert_eq!(payload["faviconPath"], "assets/logo.png");
+    assert_eq!(payload["projectIcon"], Value::Null);
+    assert_eq!(
+        favicon_search_request("/repo", "logo"),
+        json!({"cwd": "/repo", "query": "logo", "limit": 200, "imageOnly": true})
+    );
+    assert_eq!(
+        decode_favicon_entries(&json!({"entries": [
+            {"path": "assets/logo.png", "kind": "file"},
+            {"path": "assets", "kind": "directory"},
+            {"path": "icon.svg", "kind": "file"}
+        ]})),
+        vec!["assets/logo.png", "icon.svg"]
+    );
+}
+
 fn members(ids: &[&str]) -> Vec<Member> {
     ids.iter().map(|id| Member { id: (*id).to_owned(), scripts: Vec::new() }).collect()
 }

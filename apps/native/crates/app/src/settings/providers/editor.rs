@@ -339,12 +339,41 @@ impl SettingsView {
             let mut options = vec![SelectOption::new("", "Provider default")];
             options.extend(view.methods.iter().map(|method| SelectOption::new(method.id.clone(), method.name.clone())));
             let current = self.providers.method_id.clone();
-            let label = view.methods.iter().find(|method| method.id == current.as_ref()).map_or("Provider default".to_owned(), |method| method.name.clone());
+            let chosen_method = view.methods.iter().find(|method| method.id == current.as_ref());
+            let label = chosen_method.map_or("Provider default".to_owned(), |method| method.name.clone());
             let pick = cx.listener(|this, value: &SharedString, _, cx| {
                 this.providers.method_id = value.clone();
                 cx.notify();
             });
-            controls = controls.child(Select::new("provider-auth-method", options).selected(current).label(label).width(176.).on_change(move |value, window, cx| pick(&value, window, cx)));
+            controls = controls.child(Select::new("provider-auth-method", options).selected(current.clone()).label(label).width(176.).on_change(move |value, window, cx| pick(&value, window, cx)));
+            if let Some(method) = chosen_method.filter(|m| m.is_removable()) {
+                let rm_instance = instance_id.clone();
+                let rm_method = method.id.clone();
+                let rm_name = method.name.clone();
+                controls = controls.child(
+                    Button::new("provider-auth-remove-method", ButtonVariant::GhostMuted, ButtonSize::IconSm)
+                        .icon(Icon::Trash2)
+                        .tooltip(format!("Remove saved account ({rm_name})"))
+                        .disabled(view.disabled)
+                        .on_click(cx.listener(move |_this, _, _, cx| {
+                            let view = cx.entity().downgrade();
+                            let id = rm_instance.clone();
+                            let mid = rm_method.clone();
+                            crate::dialog::ask(
+                                format!("Remove saved account \"{rm_name}\"?"),
+                                "This removes the saved sign-in method on the server.",
+                                "Remove",
+                                move |_, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.providers.method_id = SharedString::default();
+                                        this.auth_command(auth::AUTH_REMOVE_METHOD, auth::remove_method_payload(&id, &mid), cx);
+                                    });
+                                },
+                                cx,
+                            );
+                        })),
+                );
+            }
         }
         if view.url.is_some() {
             let open_id = instance_id.clone();
@@ -1030,5 +1059,39 @@ impl SettingsView {
             }
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use t3_core::settings::providers::auth::AuthMethod;
+
+    #[test]
+    fn auth_method_removal_gates_on_can_remove_not_account_email() {
+        let default_completed: AuthMethod = serde_json::from_value(json!({
+            "id": "chatgpt-default",
+            "name": "ChatGPT",
+            "accountEmail": "user@example.com"
+        }))
+        .unwrap();
+        assert!(!default_completed.is_removable());
+
+        let explicit_false: AuthMethod = serde_json::from_value(json!({
+            "id": "chatgpt-primary",
+            "name": "ChatGPT",
+            "accountEmail": "user@example.com",
+            "canRemove": false
+        }))
+        .unwrap();
+        assert!(!explicit_false.is_removable());
+
+        let removable_incomplete: AuthMethod = serde_json::from_value(json!({
+            "id": "chatgpt-profile:pending",
+            "name": "Incomplete connection",
+            "canRemove": true
+        }))
+        .unwrap();
+        assert!(removable_incomplete.is_removable());
     }
 }
