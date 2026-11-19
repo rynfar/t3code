@@ -6,9 +6,12 @@
 mod code;
 pub(crate) mod controls;
 mod detail;
+mod guide;
+mod interactions;
 mod link_dialog;
 mod mutations;
 mod page;
+mod preview;
 mod row;
 mod summary;
 mod thread_panel;

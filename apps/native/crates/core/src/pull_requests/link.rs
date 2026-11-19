@@ -335,6 +335,98 @@ pub fn linked_threads_label(count: usize) -> String {
     if count == 0 { "Linked threads".to_owned() } else { format!("Linked from {count} {}", if count == 1 { "thread" } else { "threads" }) }
 }
 
+/// Ports `visibleLinkedThreads` (`packages/client-runtime/src/state/threadTagFilter.ts`):
+/// loaded threads use the parent-aware hidden set; unloaded rows carry no lineage, so while
+/// any environment hides tags they stay out.
+pub fn visible_linked_threads<'a>(
+    rows: &'a [LinkedThread],
+    loaded_thread_ids: &std::collections::HashSet<&str>,
+    hidden_thread_ids: &std::collections::HashSet<String>,
+    hiding_anywhere: bool,
+) -> Vec<&'a LinkedThread> {
+    if !hiding_anywhere && hidden_thread_ids.is_empty() {
+        return rows.iter().collect();
+    }
+    rows.iter()
+        .filter(|row| {
+            if loaded_thread_ids.contains(row.id.as_str()) {
+                !hidden_thread_ids.contains(&row.id)
+            } else {
+                !hiding_anywhere
+            }
+        })
+        .collect()
+}
+
+/// Whether `links` already contains the change request named by `url` (ignoring dismissed stack links).
+pub fn is_linked_to_url(links: &[ThreadLink], url: &str) -> bool {
+    let Some(target) = parse_change_request_url(url) else { return false };
+    visible_links(links).into_iter().any(|link| {
+        link.host.trim().eq_ignore_ascii_case(&target.host)
+            && link.repository.trim().eq_ignore_ascii_case(&target.repository)
+            && link.number == target.number
+    })
+}
+
+/// One thread candidate for the inline thread-link picker (`PullRequestThreadLinks.tsx` `ThreadPicker`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkableThread {
+    pub id: String,
+    pub project_id: String,
+    pub project_title: String,
+    pub title: String,
+    pub updated_at: String,
+    pub archived: bool,
+    pub hidden: bool,
+    pub already_linked: bool,
+}
+
+/// Filters and sorts threads for `ThreadPicker`: non-archived, non-hidden, matching `query`
+/// against title or project name, newest `updated_at` first.
+pub fn filter_linkable_threads<'a>(threads: &'a [LinkableThread], query: &str) -> Vec<&'a LinkableThread> {
+    let needle = query.trim().to_lowercase();
+    let mut matched: Vec<&LinkableThread> = threads
+        .iter()
+        .filter(|thread| {
+            !thread.archived
+                && !thread.hidden
+                && (needle.is_empty()
+                    || format!("{} {}", thread.title, thread.project_title).to_lowercase().contains(&needle))
+        })
+        .collect();
+    matched.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    matched
+}
+
+/// `threadPullRequestSearchTerms`: URL, `#number`, `repo#number`, and title terms for command palette search.
+pub fn thread_pull_request_search_terms(links: &[ThreadLink]) -> Vec<String> {
+    let mut terms = Vec::new();
+    for link in visible_links(links) {
+        terms.push(link.url.clone());
+        terms.push(format!("#{}", link.number));
+        terms.push(format!("{}#{}", link.repository, link.number));
+        if let Some(snapshot) = &link.snapshot
+            && !snapshot.title.trim().is_empty()
+        {
+            terms.push(snapshot.title.clone());
+        }
+    }
+    terms
+}
+
+/// `thread.pull-request.watch` command payload (`ThreadPullRequestsPanel.tsx`).
+pub fn watch_command(command_id: &str, thread_id: &str, link: &ThreadLink, watching: bool) -> Value {
+    json!({
+        "type": "thread.pull-request.watch",
+        "commandId": command_id,
+        "threadId": thread_id,
+        "host": link.host.trim().to_lowercase(),
+        "repository": link.repository.trim().to_lowercase(),
+        "number": link.number,
+        "watching": watching,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +519,37 @@ mod tests {
         assert_eq!(visible, vec![3, 1]);
         let unlink = unlink_command("c", "t", &row.links[0]);
         assert_eq!(unlink["type"], "thread.pull-request.unlink");
+    }
+
+    #[test]
+    fn visible_linked_threads_filters_hidden_and_unloaded_when_hiding_tags() {
+        let rows = vec![
+            LinkedThread { id: "visible".into(), project_id: "p".into(), title: "Visible".into(), archived_at: None },
+            LinkedThread { id: "hidden".into(), project_id: "p".into(), title: "Hidden".into(), archived_at: None },
+            LinkedThread { id: "unloaded".into(), project_id: "p".into(), title: "Old".into(), archived_at: None },
+        ];
+        let loaded = std::collections::HashSet::from(["visible", "hidden"]);
+        let hidden = std::collections::HashSet::from(["hidden".to_owned()]);
+        // No hiding active: all rows pass.
+        let all: Vec<&str> = visible_linked_threads(&rows, &loaded, &std::collections::HashSet::new(), false).iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(all, vec!["visible", "hidden", "unloaded"]);
+        // Hiding active: hidden loaded thread and unloaded thread without lineage are both filtered out.
+        let filtered: Vec<&str> = visible_linked_threads(&rows, &loaded, &hidden, true).iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(filtered, vec!["visible"]);
+        // Hiding off, explicit hidden set: only hidden loaded thread is dropped; unloaded stays.
+        let explicit: Vec<&str> = visible_linked_threads(&rows, &loaded, &hidden, false).iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(explicit, vec!["visible", "unloaded"]);
+    }
+
+    #[test]
+    fn filter_linkable_threads_excludes_archived_and_hidden_and_sorts_newest_first() {
+        let candidates = vec![
+            LinkableThread { id: "t1".into(), project_id: "p".into(), project_title: "Web".into(), title: "Old fix".into(), updated_at: "2026-01-01T00:00:00Z".into(), archived: false, hidden: false, already_linked: false },
+            LinkableThread { id: "t2".into(), project_id: "p".into(), project_title: "Web".into(), title: "New fix".into(), updated_at: "2026-01-05T00:00:00Z".into(), archived: false, hidden: false, already_linked: true },
+            LinkableThread { id: "t3".into(), project_id: "p".into(), project_title: "Web".into(), title: "Archived fix".into(), updated_at: "2026-01-09T00:00:00Z".into(), archived: true, hidden: false, already_linked: false },
+            LinkableThread { id: "t4".into(), project_id: "p".into(), project_title: "Web".into(), title: "Hidden fix".into(), updated_at: "2026-01-09T00:00:00Z".into(), archived: false, hidden: true, already_linked: false },
+        ];
+        let matched: Vec<&str> = filter_linkable_threads(&candidates, "fix").iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(matched, vec!["t2", "t1"]);
     }
 }

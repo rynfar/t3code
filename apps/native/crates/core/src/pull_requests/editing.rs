@@ -38,6 +38,65 @@ pub fn can_edit_change_request(detail: &Detail) -> bool {
     same_login(detail.viewer.as_deref(), detail.author.as_ref().map(|author| author.login.as_str())) || detail.viewer_permissions.actions.contains(&super::wire::Action::Merge)
 }
 
+/// `canEditPullRequestMaintainerEdits`.
+pub fn can_edit_maintainer_edits(detail: &Detail) -> bool {
+    detail.state == PrState::Open
+        && detail.capabilities.edit.as_ref().and_then(|edit| edit.maintainer_edits) == Some(true)
+        && detail.viewer_permissions.maintainer_edits == Some(true)
+        && detail.maintainer_can_modify.is_some()
+}
+
+/// `canEditPullRequestComment`: hosts do not support rewriting review summaries through comment mutations.
+pub fn can_edit_comment(detail: &Detail, kind: super::wire::CommentKind, can_edit: Option<bool>, author: Option<&super::wire::Actor>) -> bool {
+    if detail.capabilities.edit.as_ref().is_none_or(|edit| !edit.comment) {
+        return false;
+    }
+    if !matches!(kind, super::wire::CommentKind::IssueComment | super::wire::CommentKind::ReviewComment) {
+        return false;
+    }
+    if let Some(allowed) = can_edit {
+        return allowed;
+    }
+    same_login(detail.viewer.as_deref(), author.map(|actor| actor.login.as_str()))
+}
+
+pub fn can_comment(detail: &Detail) -> bool {
+    detail.capabilities.comment && detail.viewer_permissions.comment
+}
+
+pub fn can_reply(detail: &Detail) -> bool {
+    detail.capabilities.review.reply && detail.viewer_permissions.comment
+}
+
+pub fn can_request_reviewers(detail: &Detail) -> bool {
+    detail.capabilities.reviewers.request && detail.capabilities.reviewers.list_candidates
+}
+
+pub fn allowed_review_verdicts(detail: &Detail) -> Vec<super::wire::ReviewVerdict> {
+    detail
+        .capabilities
+        .review
+        .verdicts
+        .iter()
+        .copied()
+        .filter(|verdict| *verdict != super::wire::ReviewVerdict::Unknown && detail.viewer_permissions.verdicts.contains(verdict))
+        .collect()
+}
+
+/// `PullRequestUpdateInput` writing the title.
+pub fn update_title_input(reference: &PrRef, title: &str) -> Value {
+    let mut input = reference.payload();
+    input["title"] = json!(title);
+    input
+}
+
+/// `PullRequestUpdateInput` toggling `maintainerCanModify`.
+pub fn update_maintainer_edits_input(reference: &PrRef, allow: bool) -> Value {
+    let mut input = reference.payload();
+    input["maintainerCanModify"] = json!(allow);
+    input
+}
+
 /// `PullRequestResolveThreadButton`'s gate: the host resolves threads, the viewer may, and the
 /// thread does not narrow that (`canResolvePullRequestThread`).
 pub fn can_resolve_thread(detail: &Detail, thread_can_resolve: Option<bool>) -> bool {

@@ -276,8 +276,8 @@ mod tests {
             is_resolved: false,
             is_outdated: false,
             comments: vec![
-                ThreadComment { id: "c1".into(), author: Some(actor("alice")), body: "<!-- bot -->\nCheck this bound".into(), created_at: "2026-01-01T00:00:00Z".into(), url: None, review_url: None },
-                ThreadComment { id: "c2".into(), author: None, body: "Agreed".into(), created_at: "2026-01-01T01:00:00Z".into(), url: None, review_url: None },
+                ThreadComment { id: "c1".into(), author: Some(actor("alice")), body: "<!-- bot -->\nCheck this bound".into(), created_at: "2026-01-01T00:00:00Z".into(), edited_at: None, url: None, review_url: None, reactions: Vec::new(), can_edit: None },
+                ThreadComment { id: "c2".into(), author: None, body: "Agreed".into(), created_at: "2026-01-01T01:00:00Z".into(), edited_at: None, url: None, review_url: None, reactions: Vec::new(), can_edit: None },
             ],
             comment_count: None,
             next_comments_cursor: None,
@@ -297,9 +297,12 @@ mod tests {
             author: Some(actor("bob")),
             body: "Ship it!".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
+            edited_at: None,
             url: None,
             path: None,
             review_state: None,
+            reactions: Vec::new(),
+            can_edit: None,
         };
         let comment_chip = build_comment_context(&detail, ChatSubject::Comment(&comment)).unwrap();
         assert_eq!(comment_chip.id, "pr-comment:https://github.com/acme/app/pull/42:comment:ic1");

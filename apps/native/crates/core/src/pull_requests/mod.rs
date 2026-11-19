@@ -5,13 +5,19 @@
 //! `client-runtime/src/pullRequestLinkInput.ts` and `changeRequestLinks.ts`.
 
 pub mod anchor;
+pub mod assignment;
+pub mod cache;
 pub mod chat_context;
 pub mod detail;
 pub mod editing;
+pub mod guide;
 pub mod link;
-pub mod target;
 pub mod list;
 pub mod query;
+pub mod reactions;
+pub mod review;
+pub mod reviewers;
+pub mod target;
 pub mod tasks;
 pub mod thread_badge;
 pub mod wire;
@@ -28,9 +34,22 @@ pub mod method {
     pub const LIST_STATS: &str = "pullRequests.listStats";
     pub const FILTER_OPTIONS: &str = "pullRequests.filterOptions";
     pub const DETAIL: &str = "pullRequests.detail";
+    pub const PREVIEW: &str = "pullRequests.preview";
     pub const CHECKS: &str = "pullRequests.checks";
     pub const ACTIVITY: &str = "pullRequests.activity";
+    pub const REVIEW_GUIDE: &str = "pullRequests.reviewGuide";
+    pub const GENERATE_REVIEW_GUIDE: &str = "pullRequests.generateReviewGuide";
+    pub const THREAD_COMMENTS: &str = "pullRequests.threadComments";
+    pub const FILES_VIEWED: &str = "pullRequests.filesViewed";
+    pub const SET_FILES_VIEWED: &str = "pullRequests.setFilesViewed";
     pub const RUN_ACTION: &str = "pullRequests.runAction";
+    pub const COMMENT: &str = "pullRequests.comment";
+    pub const UPDATE_COMMENT: &str = "pullRequests.updateComment";
+    pub const SUBMIT_REVIEW: &str = "pullRequests.submitReview";
+    pub const REPLY_TO_THREAD: &str = "pullRequests.replyToThread";
+    pub const SET_REACTION: &str = "pullRequests.setReaction";
+    pub const REVIEWER_CANDIDATES: &str = "pullRequests.reviewerCandidates";
+    pub const REQUEST_REVIEWERS: &str = "pullRequests.requestReviewers";
     pub const INVALIDATE: &str = "pullRequests.invalidate";
     pub const STACK: &str = "pullRequests.stack";
     pub const SUBSCRIBE_REFRESHES: &str = "pullRequests.subscribeRefreshes";
