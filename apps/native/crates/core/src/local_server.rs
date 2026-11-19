@@ -13,6 +13,97 @@ use crate::pairing::parse_pairing_link;
 pub const PAIR_LABEL: &str = "T3 Code Native";
 /// The token is redeemed right away; a short life keeps an unused one harmless.
 pub const PAIR_TTL: &str = "2m";
+/// `SERVER_EXIT_CODE_MANAGED_POLICY` (`packages/contracts/src/desktopBootstrap.ts`, `pingdotgg/t3code#30319`):
+/// the server refused to start under this machine's managed policy, so diagnostics blame the
+/// policy rather than pointing at another release.
+pub const SERVER_EXIT_CODE_MANAGED_POLICY: i32 = 77;
+/// `SERVER_EXIT_CODE_STATE_DIR_OWNED`: a supervisor must not restart a server refused by the
+/// state-directory owner.
+pub const SERVER_EXIT_CODE_STATE_DIR_OWNED: i32 = 78;
+
+/// Copy shown when exit 77 stops local startup (`DesktopStartupRecovery.ts`, `pingdotgg/t3code#30319`).
+pub const MANAGED_POLICY_STARTUP_MESSAGE: &str =
+    "Your organization's managed policy stopped T3 Code from starting. Send the details below to your IT administrator.";
+
+/// Classification of a local server or CLI process exit (`DesktopBackendManager.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupExitKind {
+    ManagedPolicy { detail: String },
+    StateDirOwned,
+    Other { exit_code: Option<i32>, detail: String },
+}
+
+/// Classifies an unsuccessful local T3 process exit.
+pub fn classify_server_exit(exit_code: Option<i32>, stderr: &str, stdout: &str) -> StartupExitKind {
+    match exit_code {
+        Some(SERVER_EXIT_CODE_MANAGED_POLICY) => StartupExitKind::ManagedPolicy {
+            detail: managed_policy_diagnostic(stderr, stdout),
+        },
+        Some(SERVER_EXIT_CODE_STATE_DIR_OWNED) => StartupExitKind::StateDirOwned,
+        other => StartupExitKind::Other {
+            exit_code: other,
+            detail: cli_failure_summary(stderr, stdout),
+        },
+    }
+}
+
+/// Whether an automatic restart loop should be suppressed for `exit_code`.
+/// Exit 78 (state dir owned by another process) and exit 77 (managed policy refusal)
+/// cannot be cured by restarting the same process in a tight loop.
+pub fn should_suppress_restart(exit_code: Option<i32>) -> bool {
+    matches!(exit_code, Some(SERVER_EXIT_CODE_MANAGED_POLICY | SERVER_EXIT_CODE_STATE_DIR_OWNED))
+}
+
+/// User-facing diagnostic for a managed-policy exit 77 refusal, combining the policy message
+/// with the underlying error line when present.
+pub fn managed_policy_diagnostic(stderr: &str, stdout: &str) -> String {
+    let summary = cli_failure_summary(stderr, stdout);
+    if summary.is_empty() || summary == "it exited without a message." {
+        MANAGED_POLICY_STARTUP_MESSAGE.to_owned()
+    } else if summary.contains("managed policy") {
+        format!("{MANAGED_POLICY_STARTUP_MESSAGE} ({summary})")
+    } else {
+        format!("{MANAGED_POLICY_STARTUP_MESSAGE} Details: {summary}")
+    }
+}
+
+/// Recovery offer when the local backend fails to start (`StartupRecoveryOffer` in
+/// `apps/desktop/src/app/DesktopStartupRecovery.ts`, `pingdotgg/t3code#30319`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupRecoveryOffer {
+    Update { version: String },
+    ManagedPolicy,
+    Reinstall { version: String },
+    Releases,
+}
+
+/// Resolves what recovery action to show on local startup failure. A managed-policy refusal
+/// (`exit 77`) never points at an older release or the releases page; only a newer update can help.
+pub fn resolve_startup_recovery_offer(
+    available_update: Option<&str>,
+    last_started_version: Option<&str>,
+    managed_policy: bool,
+) -> StartupRecoveryOffer {
+    if let Some(version) = available_update.map(str::trim).filter(|v| !v.is_empty()) {
+        return StartupRecoveryOffer::Update { version: version.to_owned() };
+    }
+    if managed_policy {
+        return StartupRecoveryOffer::ManagedPolicy;
+    }
+    if let Some(version) = last_started_version.map(str::trim).filter(|v| !v.is_empty()) {
+        return StartupRecoveryOffer::Reinstall { version: version.to_owned() };
+    }
+    StartupRecoveryOffer::Releases
+}
+
+pub fn describe_startup_recovery_offer(offer: &StartupRecoveryOffer) -> String {
+    match offer {
+        StartupRecoveryOffer::Update { version } => format!("Update to T3 Code v{version} to continue."),
+        StartupRecoveryOffer::ManagedPolicy => MANAGED_POLICY_STARTUP_MESSAGE.to_owned(),
+        StartupRecoveryOffer::Reinstall { version } => format!("Reinstall T3 Code v{version} from the releases page."),
+        StartupRecoveryOffer::Releases => "Get a different version from the releases page.".to_owned(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -250,5 +341,45 @@ mod tests {
         assert_eq!(cli_failure_summary("\nERROR\n  Unexpected positional argument: \"pair\"\n", ""), "Unexpected positional argument: \"pair\"");
         assert_eq!(cli_failure_summary("\n", "Error: boom\n    at x (y.js:1)"), "boom");
         assert_eq!(cli_failure_summary("", ""), "it exited without a message.");
+    }
+
+    #[test]
+    fn exit_77_managed_policy_refusal_suppresses_restart_and_never_points_at_another_release() {
+        assert!(should_suppress_restart(Some(SERVER_EXIT_CODE_MANAGED_POLICY)));
+        assert!(should_suppress_restart(Some(SERVER_EXIT_CODE_STATE_DIR_OWNED)));
+        assert!(!should_suppress_restart(Some(1)));
+        assert!(!should_suppress_restart(None));
+
+        let kind = classify_server_exit(
+            Some(SERVER_EXIT_CODE_MANAGED_POLICY),
+            "ManagedPolicyFileError: T3 Code cannot use the managed policy at /etc/t3/policy.json: invalid JSON.",
+            "",
+        );
+        match kind {
+            StartupExitKind::ManagedPolicy { detail } => {
+                assert!(detail.contains(MANAGED_POLICY_STARTUP_MESSAGE));
+                assert!(detail.contains("invalid JSON"));
+            }
+            other => panic!("expected ManagedPolicy, got {other:?}"),
+        }
+        assert_eq!(classify_server_exit(Some(SERVER_EXIT_CODE_STATE_DIR_OWNED), "", ""), StartupExitKind::StateDirOwned);
+
+        // Managed policy refusal never offers reinstall or releases page, unless a newer update exists.
+        assert_eq!(
+            resolve_startup_recovery_offer(None, Some("0.1.7"), true),
+            StartupRecoveryOffer::ManagedPolicy
+        );
+        assert_eq!(
+            resolve_startup_recovery_offer(Some("0.1.8"), Some("0.1.7"), true),
+            StartupRecoveryOffer::Update { version: "0.1.8".into() }
+        );
+        assert_eq!(
+            resolve_startup_recovery_offer(None, Some("0.1.7"), false),
+            StartupRecoveryOffer::Reinstall { version: "0.1.7".into() }
+        );
+        assert_eq!(
+            describe_startup_recovery_offer(&StartupRecoveryOffer::ManagedPolicy),
+            MANAGED_POLICY_STARTUP_MESSAGE
+        );
     }
 }

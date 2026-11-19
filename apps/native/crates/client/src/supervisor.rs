@@ -6,7 +6,7 @@
 //! before every attempt, as the web's connection resolver authorizes each one.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -29,12 +29,29 @@ pub enum ConnectionStatus {
     Connected,
     /// Waiting to try again; `reason` is the last failure.
     Reconnecting { reason: String, attempt: u32 },
+    /// Waiting for someone on the host to approve this T3 Connect device (`pingdotgg/t3code#36419`).
+    AwaitingApproval { reason: String, attempt: u32 },
     /// The server speaks another orchestration protocol. Nothing retries until `retry_now`.
     Unsupported { reason: String, server_outdated: bool },
     NeedsPairing { reason: String },
     /// Preparing the route failed in a way retrying cannot fix, such as a cancelled SSH password
     /// prompt. Nothing retries until `retry_now`.
     Blocked { reason: String },
+}
+
+/// Extra fields read from raw `subscribeServerConfig` frames without modifying `t3-core`'s
+/// `ServerConfig` schema: Connect device approval toggle (`#36419`), auth policy & direct
+/// endpoints (`#35543` Tailscale Serve), socket thread pagination (`#33306`), and recent
+/// host event-loop stall (`hostFreeze.ts`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ServerConfigExtras {
+    pub require_connect_device_approval: Option<bool>,
+    pub auth_policy: Option<String>,
+    pub direct_endpoints: Vec<String>,
+    pub thread_snapshot_pagination: bool,
+    pub last_event_loop_stall: Option<crate::status::ServerEventLoopStall>,
+    /// Accurate `subscribeServerConfig`-scoped clock sample `(server_time_ms, requested_at_ms, received_at_ms)` (`#36420`).
+    pub clock_sample: Option<(Option<i64>, i64, i64)>,
 }
 
 /// Why preparing a route failed.
@@ -88,6 +105,28 @@ enum Command {
     Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>>, settled: Option<crate::vcs::OnSettled> },
 }
 
+/// Keyed by environment `http_base` (just like `t3_core::clock` keys by environment id), so
+/// `ClientHandle` keeps its exact struct layout while any caller can observe live extras.
+fn extras_sender(http_base: &str) -> Arc<watch::Sender<ServerConfigExtras>> {
+    static EXTRAS: OnceLock<RwLock<HashMap<String, Arc<watch::Sender<ServerConfigExtras>>>>> = OnceLock::new();
+    let map = EXTRAS.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(read) = map.read()
+        && let Some(tx) = read.get(http_base)
+    {
+        return tx.clone();
+    }
+    let mut write = map.write().unwrap_or_else(|p| p.into_inner());
+    write
+        .entry(http_base.to_owned())
+        .or_insert_with(|| Arc::new(watch::channel(ServerConfigExtras::default()).0))
+        .clone()
+}
+
+/// Live extras decoded from `subscribeServerConfig` for `http_base`.
+pub fn server_config_extras_for(http_base: &str) -> watch::Receiver<ServerConfigExtras> {
+    extras_sender(http_base).subscribe()
+}
+
 #[derive(Clone)]
 pub struct ClientHandle {
     pub(crate) refs: crate::vcs::RefState,
@@ -100,6 +139,18 @@ pub struct ClientHandle {
 impl ClientHandle {
     pub fn credentials(&self) -> &Credentials {
         &self.credentials
+    }
+
+    /// Live extras decoded from `subscribeServerConfig` snapshots and settings updates.
+    pub fn server_config_extras(&self) -> watch::Receiver<ServerConfigExtras> {
+        extras_sender(&self.credentials.http_base).subscribe()
+    }
+
+    /// Optimistically updates `requireConnectDeviceApproval` after `server.updateSettings` succeeds.
+    pub fn set_require_connect_device_approval(&self, require: bool) {
+        extras_sender(&self.credentials.http_base).send_modify(|extras| {
+            extras.require_connect_device_approval = Some(require);
+        });
     }
 }
 
@@ -254,6 +305,12 @@ impl ClientHandle {
         crate::pull_requests::fetch_diff(&self.credentials, payload).await
     }
 
+    /// An authenticated `GET` endpoint with this device's credential (`auth::get_access`). Run it
+    /// on the network runtime.
+    pub async fn get_access(&self, path: &str) -> Result<Value, String> {
+        auth::get_access(&self.credentials, path).await
+    }
+
     /// An access endpoint `POST` with this device's credential (`auth::post_access`). Run it on the
     /// network runtime.
     pub async fn post_access(&self, path: &str, body: Option<Value>) -> Result<Value, String> {
@@ -329,11 +386,18 @@ pub fn start_prepared(runtime: &tokio::runtime::Handle, credentials: Credentials
     let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
     let (grants, session_state) = watch::channel(None);
     let (generations, connection_generation) = watch::channel(0);
-    let handle = ClientHandle { refs: Default::default(), commands, credentials: Arc::new(credentials.clone()), session_state, connection_generation };
+    let config_extras_tx = extras_sender(&credentials.http_base);
+    let handle = ClientHandle {
+        refs: Default::default(),
+        commands,
+        credentials: Arc::new(credentials.clone()),
+        session_state,
+        connection_generation,
+    };
     runtime.spawn(async move {
         tokio::select! {
             _ = events.closed() => {},
-            _ = supervise(credentials, prepare, command_rx, events.clone(), grants, generations) => {},
+            _ = supervise(credentials, prepare, command_rx, events.clone(), grants, generations, config_extras_tx) => {},
         }
     });
     (handle, event_rx)
@@ -353,26 +417,43 @@ async fn supervise(
     events: Events,
     grants: watch::Sender<Option<AuthSessionState>>,
     generations: watch::Sender<u64>,
+    config_extras: Arc<watch::Sender<ServerConfigExtras>>,
 ) {
     let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
     let mut attempt: u32 = 0;
     let mut last_failure = String::new();
+    let mut awaiting_approval = false;
     loop {
         // An attempt after a failure still reads as reconnecting, with the reason it failed.
         let _ = events.send(ClientEvent::Status(if attempt == 0 {
             ConnectionStatus::Connecting
+        } else if awaiting_approval {
+            ConnectionStatus::AwaitingApproval { reason: last_failure.clone(), attempt }
         } else {
             ConnectionStatus::Reconnecting { reason: last_failure.clone(), attempt }
         })).await;
         let prepared = match &prepare {
             Some(prepare) => match prepare_draining(prepare, &mut commands, &mut resume).await {
-                Some(prepared) => prepared,
-                None => return,
+                PrepareOutcome::Done(prepared) => prepared,
+                PrepareOutcome::RetryNow => {
+                    attempt = 0;
+                    awaiting_approval = false;
+                    continue;
+                }
+                PrepareOutcome::Dropped => return,
             },
             None => Ok(()),
         };
         let outcome = match prepared {
-            Ok(()) => connect(&credentials).await,
+            Ok(()) => match connect_draining(&credentials, &mut commands, &mut resume).await {
+                ConnectOutcome::Done(result) => result,
+                ConnectOutcome::RetryNow => {
+                    attempt = 0;
+                    awaiting_approval = false;
+                    continue;
+                }
+                ConnectOutcome::Dropped => return,
+            },
             Err(PrepareError::Moved(http_base)) => {
                 let _ = events.send(ClientEvent::Moved { http_base }).await;
                 return;
@@ -380,17 +461,17 @@ async fn supervise(
             Err(PrepareError::Transient(reason)) => Err(ConnectError::Transient(reason)),
             Err(PrepareError::Blocked(reason)) => Err(ConnectError::Blocked(reason)),
         };
-        let reason = match outcome {
+        let (reason, is_approval) = match outcome {
             Ok(session) => {
                 generations.send_modify(|generation| *generation += 1);
                 attempt = 0;
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected)).await;
                 let mut fetch = SessionStateFetch::new(&credentials, &grants);
                 fetch.start();
-                let end = run_session(&session, &mut resume, &mut commands, &events, &mut fetch).await;
+                let end = run_session(&session, &mut resume, &mut commands, &events, &mut fetch, &config_extras).await;
                 fetch.stop();
                 match end {
-                    SessionEnd::Closed(reason) => reason,
+                    SessionEnd::Closed(reason) => (reason, false),
                     SessionEnd::Dropped => return,
                 }
             }
@@ -398,53 +479,109 @@ async fn supervise(
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::NeedsPairing { reason })).await;
                 return;
             }
+            Err(ConnectError::ApprovalPending(reason)) => (reason, true),
             Err(ConnectError::Unsupported { reason, server_outdated }) => {
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Unsupported { reason: reason.clone(), server_outdated })).await;
-                if !wait_draining(None, &mut commands, &mut resume).await {
-                    return;
+                match wait_draining(None, &mut commands, &mut resume).await {
+                    WaitOutcome::Elapsed | WaitOutcome::RetryNow => {
+                        attempt += 1;
+                        last_failure = reason;
+                        awaiting_approval = false;
+                        continue;
+                    }
+                    WaitOutcome::Dropped => return,
                 }
-                attempt += 1;
-                last_failure = reason;
-                continue;
             }
             Err(ConnectError::Blocked(reason)) => {
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Blocked { reason: reason.clone() })).await;
-                if !wait_draining(None, &mut commands, &mut resume).await {
-                    return;
+                match wait_draining(None, &mut commands, &mut resume).await {
+                    WaitOutcome::Elapsed | WaitOutcome::RetryNow => {
+                        attempt += 1;
+                        last_failure = reason;
+                        awaiting_approval = false;
+                        continue;
+                    }
+                    WaitOutcome::Dropped => return,
                 }
-                attempt += 1;
-                last_failure = reason;
-                continue;
             }
-            Err(ConnectError::Transient(reason)) => reason,
+            Err(ConnectError::Transient(reason)) => (reason, false),
         };
         attempt += 1;
         last_failure = reason.clone();
-        let _ = events.send(ClientEvent::Status(ConnectionStatus::Reconnecting { reason, attempt })).await;
+        awaiting_approval = is_approval;
+        let _ = events.send(ClientEvent::Status(if is_approval {
+            ConnectionStatus::AwaitingApproval { reason, attempt }
+        } else {
+            ConnectionStatus::Reconnecting { reason, attempt }
+        })).await;
         let delay = Duration::from_millis((500u64 << attempt.min(5)).min(15_000));
-        if !wait_draining(Some(delay), &mut commands, &mut resume).await {
-            return;
+        match wait_draining(Some(delay), &mut commands, &mut resume).await {
+            WaitOutcome::Elapsed => {}
+            WaitOutcome::RetryNow => {
+                // `pingdotgg/t3code#24932`: reset backoff on explicit retry while keeping the
+                // reconnecting status reason visible on the next attempt.
+                attempt = 1;
+            }
+            WaitOutcome::Dropped => return,
         }
     }
 }
 
 enum ConnectError {
     Unauthorized(String),
+    ApprovalPending(String),
     Unsupported { reason: String, server_outdated: bool },
     Blocked(String),
     Transient(String),
 }
 
-/// Runs `prepare` while keeping track of threads opened or closed and failing dispatches. `None`
-/// when the handle was dropped, which also drops the preparation.
-async fn prepare_draining(prepare: &Prepare, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> Option<Result<(), PrepareError>> {
+enum PrepareOutcome {
+    Done(Result<(), PrepareError>),
+    RetryNow,
+    Dropped,
+}
+
+enum ConnectOutcome {
+    Done(Result<Session, ConnectError>),
+    RetryNow,
+    Dropped,
+}
+
+enum WaitOutcome {
+    Elapsed,
+    RetryNow,
+    Dropped,
+}
+
+/// Runs `prepare` while keeping track of threads opened or closed and failing dispatches.
+/// A `RetryNow` interrupts a stalled preparation so a dead route never holds reconnect
+/// (`pingdotgg/t3code#34623`, `pingdotgg/t3code#24932`).
+async fn prepare_draining(prepare: &Prepare, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> PrepareOutcome {
     let preparation = prepare();
     tokio::pin!(preparation);
     loop {
         tokio::select! {
-            prepared = &mut preparation => return Some(prepared),
+            prepared = &mut preparation => return PrepareOutcome::Done(prepared),
             command = commands.recv() => match command {
-                None => return None,
+                None => return PrepareOutcome::Dropped,
+                Some(Command::RetryNow) => return PrepareOutcome::RetryNow,
+                Some(command) => drain_command(command, resume),
+            }
+        }
+    }
+}
+
+/// Runs `connect` while listening for handle drop or `RetryNow` so a stalled ticket or dead route
+/// never blocks a user-requested retry (`pingdotgg/t3code#34623`, `pingdotgg/t3code#24932`).
+async fn connect_draining(credentials: &Credentials, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> ConnectOutcome {
+    let attempt = connect(credentials);
+    tokio::pin!(attempt);
+    loop {
+        tokio::select! {
+            result = &mut attempt => return ConnectOutcome::Done(result),
+            command = commands.recv() => match command {
+                None => return ConnectOutcome::Dropped,
+                Some(Command::RetryNow) => return ConnectOutcome::RetryNow,
                 Some(command) => drain_command(command, resume),
             }
         }
@@ -484,6 +621,7 @@ async fn connect(credentials: &Credentials) -> Result<Session, ConnectError> {
     }
     let ticket = auth::issue_rpc_ticket(credentials).await.map_err(|error| match error {
         AuthError::Unauthorized | AuthError::Rejected(_) => ConnectError::Unauthorized(error.to_string()),
+        AuthError::ConnectApprovalPending { message, .. } => ConnectError::ApprovalPending(message),
         other => ConnectError::Transient(other.to_string()),
     })?;
     Session::connect(&auth::socket_url(credentials, &ticket)).await.map_err(|error| match error {
@@ -499,7 +637,7 @@ async fn connect(credentials: &Credentials) -> Result<Session, ConnectError> {
 
 /// While waiting to reconnect (until `retry_now` when `delay` is `None`), keep track of threads
 /// opened or closed and fail dispatches.
-async fn wait_draining(delay: Option<Duration>, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> bool {
+async fn wait_draining(delay: Option<Duration>, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> WaitOutcome {
     let sleep = async {
         match delay {
             Some(delay) => tokio::time::sleep(delay).await,
@@ -509,10 +647,10 @@ async fn wait_draining(delay: Option<Duration>, commands: &mut mpsc::UnboundedRe
     tokio::pin!(sleep);
     loop {
         tokio::select! {
-            _ = &mut sleep => return true,
+            _ = &mut sleep => return WaitOutcome::Elapsed,
             command = commands.recv() => match command {
-                None => return false,
-                Some(Command::RetryNow) => return true,
+                None => return WaitOutcome::Dropped,
+                Some(Command::RetryNow) => return WaitOutcome::RetryNow,
                 Some(command) => drain_command(command, resume),
             }
         }
@@ -532,15 +670,168 @@ enum ThreadDelivery {
 
 type ThreadFrame = (String, ThreadDelivery);
 
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Opts into `providerStatusDeltas` (`pingdotgg/t3code#35072`) alongside `commands::subscribe_server_config`.
+fn subscribe_server_config_payload() -> Value {
+    let mut payload = commands::subscribe_server_config();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("providerStatusDeltas".to_owned(), Value::Bool(true));
+    }
+    payload
+}
+
+/// Tracks the last seen raw provider JSON list per session so `providerStatusDeltas` events
+/// (`pingdotgg/t3code#35072`) can reconstruct omitted `models`, `slashCommands`, and `skills`
+/// before decoding `ServerConfigStreamEvent::ProviderStatuses`.
+#[derive(Default)]
+struct ServerConfigPreprocessor {
+    held_providers: HashMap<String, Value>,
+    clock_recorded: bool,
+}
+
+impl ServerConfigPreprocessor {
+    /// Inspects raw `subscribeServerConfig` JSON, updates `config_extras`, records host clock on
+    /// the first snapshot (`pingdotgg/t3code#36420`), and expands `providerStatusDeltas` into
+    /// `providerStatuses` (`pingdotgg/t3code#35072`).
+    fn preprocess(
+        &mut self,
+        mut value: Value,
+        config_requested_at_ms: i64,
+        config_extras: &watch::Sender<ServerConfigExtras>,
+    ) -> Value {
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "snapshot" => {
+                if let Some(config) = value.get("config") {
+                    if let Some(providers) = config.get("providers").and_then(Value::as_array) {
+                        self.record_providers(providers);
+                    }
+                    let mut clock_sample = config_extras.borrow().clock_sample;
+                    if !self.clock_recorded {
+                        let received_at_ms = wall_now_ms();
+                        let server_time_ms = config
+                            .get("serverTime")
+                            .and_then(Value::as_str)
+                            .and_then(t3_core::sidebar::time::parse_iso);
+                        if let Some(env_id) = config
+                            .pointer("/environment/environmentId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                        {
+                            t3_core::clock::record_server_clock(env_id, server_time_ms, config_requested_at_ms, received_at_ms);
+                        }
+                        clock_sample = Some((server_time_ms, config_requested_at_ms, received_at_ms));
+                        self.clock_recorded = true;
+                    }
+                    let mut extras = extract_server_config_extras(config);
+                    extras.clock_sample = clock_sample;
+                    config_extras.send_replace(extras);
+                }
+            }
+            "settingsUpdated" => {
+                if let Some(require) = value.pointer("/payload/settings/requireConnectDeviceApproval").and_then(Value::as_bool) {
+                    config_extras.send_modify(|extras| extras.require_connect_device_approval = Some(require));
+                }
+            }
+            "providerStatuses" => {
+                if let Some(providers) = value.pointer("/payload/providers").and_then(Value::as_array) {
+                    self.record_providers(providers);
+                }
+            }
+            "providerStatusDeltas" => {
+                if let Some(deltas) = value.pointer("/payload/providers").and_then(Value::as_array) {
+                    let rebuilt = apply_provider_status_deltas(&self.held_providers, deltas);
+                    self.record_providers(&rebuilt);
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("type".to_owned(), Value::String("providerStatuses".to_owned()));
+                        obj.insert("payload".to_owned(), serde_json::json!({ "providers": rebuilt }));
+                    }
+                }
+            }
+            _ => {}
+        }
+        value
+    }
+
+    fn record_providers(&mut self, providers: &[Value]) {
+        self.held_providers.clear();
+        for provider in providers {
+            if let Some(id) = provider.get("instanceId").and_then(Value::as_str) {
+                self.held_providers.insert(id.to_owned(), provider.clone());
+            }
+        }
+    }
+}
+
+/// `applyServerProviderDeltas` (`packages/contracts/src/server.ts`, `pingdotgg/t3code#35072`):
+/// merges each delta with the previously held `models`, `slashCommands`, and `skills` when omitted.
+fn apply_provider_status_deltas(held: &HashMap<String, Value>, deltas: &[Value]) -> Vec<Value> {
+    deltas
+        .iter()
+        .filter_map(|delta| {
+            let mut next = delta.as_object()?.clone();
+            let id = next.get("instanceId")?.as_str()?;
+            let base = held.get(id).and_then(Value::as_object);
+            for field in ["models", "slashCommands", "skills"] {
+                if !next.contains_key(field) {
+                    let inherited = base.and_then(|base| base.get(field)).cloned()?;
+                    next.insert(field.to_owned(), inherited);
+                }
+            }
+            Some(Value::Object(next))
+        })
+        .collect()
+}
+
+fn extract_server_config_extras(config: &Value) -> ServerConfigExtras {
+    let require_connect_device_approval = config
+        .pointer("/settings/requireConnectDeviceApproval")
+        .and_then(Value::as_bool);
+    let auth_policy = config.pointer("/auth/policy").and_then(Value::as_str).map(str::to_owned);
+    let direct_endpoints = config
+        .get("directEndpoints")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("url").and_then(Value::as_str).or_else(|| item.as_str()))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let thread_snapshot_pagination = config.get("threadSnapshotPagination").and_then(Value::as_bool).unwrap_or(false);
+    let last_event_loop_stall = config
+        .get("lastEventLoopStall")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    ServerConfigExtras {
+        require_connect_device_approval,
+        auth_policy,
+        direct_endpoints,
+        thread_snapshot_pagination,
+        last_event_loop_stall,
+        clock_sample: None,
+    }
+}
+
 async fn run_session(
     session: &Session,
     resume: &mut Resume,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     events: &Events,
     fetch: &mut SessionStateFetch<'_>,
+    config_extras: &watch::Sender<ServerConfigExtras>,
 ) -> SessionEnd {
-    let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, commands::subscribe_server_config()).ok();
-    let options = initial_shell_options(&mut server_config, events).await;
+    let config_requested_at_ms = wall_now_ms();
+    let mut preprocessor = ServerConfigPreprocessor::default();
+    let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, subscribe_server_config_payload()).ok();
+    let options = initial_shell_options(&mut server_config, events, &mut preprocessor, config_requested_at_ms, config_extras).await;
     // Deltas never restore rows trimmed under other options (nor trim them), so the shell starts
     // over from an authoritative snapshot, as `shell.ts` does for every new session.
     if resume.shell_options.replace(options) != Some(options) {
@@ -557,21 +848,38 @@ async fn run_session(
     let end = loop {
         tokio::select! {
             value = shell.receiver.recv() => match value {
-                Some(Ok(value)) => match serde_json::from_value::<ShellStreamItem>(value) {
-                    Ok(item) => {
-                        resume.shell = shell_sequence(&item).or(resume.shell);
-                        let _ = events.send(ClientEvent::Shell(item)).await;
+                Some(Ok(value)) => {
+                    // `snapshot-required`: server cannot replay from `resume.shell`; clear cursor
+                    // and resubscribe for a fresh snapshot on the same live socket.
+                    if value.get("kind").and_then(Value::as_str) == Some("snapshot-required") {
+                        resume.shell = None;
+                        match session.stream(method::SUBSCRIBE_SHELL, commands::subscribe_shell(None, options)) {
+                            Ok(fresh) => {
+                                shell = fresh;
+                                continue;
+                            }
+                            Err(error) => break SessionEnd::Closed(format!("Shell reload failed: {error}")),
+                        }
                     }
-                    Err(error) => report(events, "shell", error.to_string()).await,
-                },
+                    match serde_json::from_value::<ShellStreamItem>(value) {
+                        Ok(item) => {
+                            resume.shell = shell_sequence(&item).or(resume.shell);
+                            let _ = events.send(ClientEvent::Shell(item)).await;
+                        }
+                        Err(error) => report(events, "shell", error.to_string()).await,
+                    }
+                }
                 Some(Err(error)) => break SessionEnd::Closed(format!("Shell subscription failed: {error}")),
                 None => break SessionEnd::Closed("Shell subscription ended.".into()),
             },
             value = next_config(&mut server_config) => match value {
-                Some(Ok(value)) => match serde_json::from_value::<ServerConfigStreamEvent>(value) {
-                    Ok(event) => { let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await; }
-                    Err(error) => report(events, "server config", error.to_string()).await,
-                },
+                Some(Ok(value)) => {
+                    let value = preprocessor.preprocess(value, config_requested_at_ms, config_extras);
+                    match serde_json::from_value::<ServerConfigStreamEvent>(value) {
+                        Ok(event) => { let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await; }
+                        Err(error) => report(events, "server config", error.to_string()).await,
+                    }
+                }
                 // The rest of the session works without it; the next session subscribes again.
                 Some(Err(error)) => {
                     server_config = None;
@@ -647,25 +955,34 @@ const CONFIG_WAIT: Duration = Duration::from_secs(10);
 
 /// `shell.ts` builds the shell input from `session.initialConfig`: the first config snapshot,
 /// forwarded like any other. Without one the shell asks for every row, as a config failure does.
-async fn initial_shell_options(stream: &mut Option<StreamHandle>, events: &Events) -> ShellOptions {
+async fn initial_shell_options(
+    stream: &mut Option<StreamHandle>,
+    events: &Events,
+    preprocessor: &mut ServerConfigPreprocessor,
+    config_requested_at_ms: i64,
+    config_extras: &watch::Sender<ServerConfigExtras>,
+) -> ShellOptions {
     let wait = async {
         loop {
             match next_config(stream).await {
-                Some(Ok(value)) => match serde_json::from_value::<ServerConfigStreamEvent>(value) {
-                    Ok(event) => {
-                        let options = match &event {
-                            ServerConfigStreamEvent::Snapshot { config } => {
-                                Some(ShellOptions::for_server(config.shell_thread_families, config.shell_older_settled))
+                Some(Ok(value)) => {
+                    let value = preprocessor.preprocess(value, config_requested_at_ms, config_extras);
+                    match serde_json::from_value::<ServerConfigStreamEvent>(value) {
+                        Ok(event) => {
+                            let options = match &event {
+                                ServerConfigStreamEvent::Snapshot { config } => {
+                                    Some(ShellOptions::for_server(config.shell_thread_families, config.shell_older_settled))
+                                }
+                                _ => None,
+                            };
+                            let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await;
+                            if let Some(options) = options {
+                                return options;
                             }
-                            _ => None,
-                        };
-                        let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await;
-                        if let Some(options) = options {
-                            return options;
                         }
+                        Err(error) => report(events, "server config", error.to_string()).await,
                     }
-                    Err(error) => report(events, "server config", error.to_string()).await,
-                },
+                }
                 Some(Err(error)) => {
                     report(events, "server config", error.to_string()).await;
                     return ShellOptions::default();
@@ -864,4 +1181,94 @@ async fn report(events: &Events, context: &str, message: String) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn provider_status_deltas_reconstruct_omitted_lists_and_extract_extras() {
+        let (extras_tx, extras_rx) = watch::channel(ServerConfigExtras::default());
+        let mut pre = ServerConfigPreprocessor::default();
+        let snapshot = json!({
+            "type": "snapshot",
+            "config": {
+                "environment": { "environmentId": "env-delta", "label": "Studio", "serverVersion": "0.1.9" },
+                "auth": { "policy": "loopback-browser" },
+                "directEndpoints": [{ "url": "https://studio.ts.net:3773" }],
+                "threadSnapshotPagination": true,
+                "lastEventLoopStall": { "durationMs": 6200, "loadAverage": 12.0, "cpuCount": 8 },
+                "settings": { "requireConnectDeviceApproval": true },
+                "providers": [{
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "models": [{ "slug": "gpt-5", "name": "GPT-5" }],
+                    "slashCommands": [{ "name": "help" }],
+                    "skills": []
+                }]
+            }
+        });
+        let processed = pre.preprocess(snapshot, 1000, &extras_tx);
+        let parsed: ServerConfigStreamEvent = serde_json::from_value(processed).unwrap();
+        assert!(matches!(parsed, ServerConfigStreamEvent::Snapshot { .. }));
+        let extras = extras_rx.borrow().clone();
+        assert_eq!(extras.require_connect_device_approval, Some(true));
+        assert_eq!(extras.auth_policy.as_deref(), Some("loopback-browser"));
+        assert_eq!(extras.direct_endpoints, vec!["https://studio.ts.net:3773"]);
+        assert!(extras.thread_snapshot_pagination);
+        assert!(extras.last_event_loop_stall.is_some());
+        assert!(extras.clock_sample.is_some());
+
+        // Delta omits models, slashCommands, skills -> reconstructed from prior snapshot!
+        let delta = json!({
+            "type": "providerStatusDeltas",
+            "payload": {
+                "providers": [{
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "warning"
+                }]
+            }
+        });
+        let rewritten = pre.preprocess(delta, 1000, &extras_tx);
+        assert_eq!(rewritten["type"], "providerStatuses");
+        let event: ServerConfigStreamEvent = serde_json::from_value(rewritten).unwrap();
+        match event {
+            ServerConfigStreamEvent::ProviderStatuses { payload } => {
+                assert_eq!(payload.providers.len(), 1);
+                assert_eq!(payload.providers[0].status, "warning");
+                assert_eq!(payload.providers[0].models.len(), 1);
+                assert_eq!(payload.providers[0].models[0].slug, "gpt-5");
+                assert_eq!(payload.providers[0].slash_commands.len(), 1);
+            }
+            other => panic!("expected ProviderStatuses, got {other:?}"),
+        }
+
+        // settingsUpdated toggles requireConnectDeviceApproval live.
+        let updated = json!({
+            "type": "settingsUpdated",
+            "payload": { "settings": { "requireConnectDeviceApproval": false } }
+        });
+        pre.preprocess(updated, 1000, &extras_tx);
+        assert_eq!(extras_rx.borrow().require_connect_device_approval, Some(false));
+    }
+
+    #[tokio::test]
+    async fn retry_now_interrupts_stalled_preparation_immediately() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
+        let prepare: Prepare = Arc::new(|| Box::pin(std::future::pending()));
+        tx.send(Command::RetryNow).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_millis(200), prepare_draining(&prepare, &mut rx, &mut resume))
+            .await
+            .expect("retry_now must interrupt stalled prepare immediately");
+        assert!(matches!(outcome, PrepareOutcome::RetryNow));
+    }
+}
 

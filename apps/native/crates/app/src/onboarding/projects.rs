@@ -1,5 +1,5 @@
 //! `WelcomeWizard.tsx` ImportStep and `useProjectScans.ts`, for the connected environment.
-use super::{Step, WelcomeWizard, key_stop, step_title};
+use super::{Step, WelcomeWizard, key_stop, section_heading};
 use crate::provider_icon::{ProviderIcon, ProviderMark};
 use crate::{
     icons::Icon,
@@ -94,7 +94,10 @@ impl Projects {
 
 impl WelcomeWizard {
     fn projects_current(&self, cx: &Context<Self>) -> bool {
-        self.open && self.step == Step::Projects && self.projects.connection.is_some() && self.projects.connection == self.state.read(cx).connection_id() && self.projects.environment == self.project_environment(cx).unwrap_or_default()
+        self.open
+            && self.projects.connection.is_some()
+            && self.projects.connection == self.state.read(cx).connection_id()
+            && self.projects.environment == self.project_environment(cx).unwrap_or_default()
     }
     fn project_environment(&self, cx: &Context<Self>) -> Option<String> {
         let app = self.state.read(cx);
@@ -609,9 +612,10 @@ impl WelcomeWizard {
             self.projects.error.clone().filter(|e| e != model::PERMISSION_MESSAGE)
         };
         v_flex()
-            .child(step_title(
+            .gap(r(8.))
+            .child(section_heading(
                 if pending { "Your projects" } else { "Import your projects" },
-                "Import projects and conversations from Claude Code and Codex on your selected computers.",
+                "Import projects and conversations from Claude Code and Codex.",
                 cx,
             ))
             .when(pending, |d| d.child(div().py(r(24.)).text_sm().text_color(hsla(p.muted_foreground)).child("Looking for projects from Claude Code and Codex…")))

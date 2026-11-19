@@ -5,16 +5,20 @@
 //! T3 Connect rows mirror `components/cloud/CloudEnvironmentConnectList.tsx`.
 //! The SSH host suggestions list inline under the field rather than in a popup.
 
+use std::collections::{HashMap, HashSet};
+
 use gpui::{
-    App, Context, Div, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div, prelude::*, px,
-    uniform_list,
+    App, ClipboardItem, Context, Div, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div,
+    prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{h_flex, v_flex};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::local::LocalServer;
 use t3_client::ssh::{DiscoveredSshHost, SshTarget};
-use t3_client::status::DotTone;
+use t3_client::status::{DotTone, HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
 use t3_client::store::SavedEnvironment;
+use t3_core::compatibility::resolve_version_mismatch;
+use t3_core::pairing::session_has_legacy_permissions;
 use t3_core::ssh::{filter_hosts, format_target, parse_manual_target};
 
 use crate::app_state::{AppEvent, AppState};
@@ -37,6 +41,7 @@ const HOST_LIST_MAX_HEIGHT: f32 = 288.;
 pub struct ConnectView {
     state: Entity<AppState>,
     link: Entity<InputState>,
+    code: Entity<InputState>,
     mode: AddMode,
     ssh_host: Entity<InputState>,
     ssh_username: Entity<InputState>,
@@ -45,6 +50,11 @@ pub struct ConnectView {
     ssh_matches: Vec<DiscoveredSshHost>,
     /// The saved environment whose Remove awaits confirmation.
     confirm_remove: Option<String>,
+    /// Saved environment IDs whose connection diagnosis panel is expanded (`CN-STATUS`).
+    expanded_diagnosis: HashSet<String>,
+    /// Cached dismissal state per environment ID for the legacy-permission update notice (`CN-REPAIR`).
+    /// Loaded from UI state at most once per key so `render()` never hits disk every frame.
+    dismissed_permission_notice: HashMap<String, bool>,
     /// A pasted link is pairing; the field clears once it succeeds.
     submitted: bool,
     /// An SSH host is being added; the fields clear once it succeeds.
@@ -122,12 +132,18 @@ fn card(cx: &App) -> Div {
 
 impl ConnectView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let link = cx.new(|cx| InputState::new(window, cx).placeholder("https://your-server:3773/pair#token=…"));
+        let link = cx.new(|cx| InputState::new(window, cx).placeholder("https://your-server:3773/pair#token=… or host:3773"));
+        let code = cx.new(|cx| InputState::new(window, cx).placeholder("Optional pairing code"));
         let ssh_host = cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts or type devbox"));
         let ssh_username = cx.new(|cx| InputState::new(window, cx).placeholder("root"));
         let ssh_port = cx.new(|cx| InputState::new(window, cx).placeholder("22"));
         let mut subscriptions = vec![
             cx.subscribe_in(&link, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.add(cx);
+                }
+            }),
+            cx.subscribe_in(&code, window, |this, _, event: &InputEvent, _, cx| {
                 if let InputEvent::PressEnter { .. } = event {
                     this.add(cx);
                 }
@@ -144,6 +160,7 @@ impl ConnectView {
                     this.submitted = false;
                     if !failed {
                         this.link.update(cx, |input, cx| input.set_value("", window, cx));
+                        this.code.update(cx, |input, cx| input.set_value("", window, cx));
                     }
                 }
                 if this.ssh_submitted && !pairing {
@@ -168,12 +185,15 @@ impl ConnectView {
         ConnectView {
             state,
             link,
+            code,
             mode: AddMode::Link,
             ssh_host,
             ssh_username,
             ssh_port,
             ssh_matches: Vec::new(),
             confirm_remove: None,
+            expanded_diagnosis: HashSet::new(),
+            dismissed_permission_notice: HashMap::new(),
             submitted: false,
             ssh_submitted: false,
             _subscriptions: subscriptions,
@@ -182,7 +202,9 @@ impl ConnectView {
 
     fn add(&mut self, cx: &mut Context<Self>) {
         let link = self.link.read(cx).value().to_string();
-        self.state.update(cx, |state, cx| state.pair_link(&link, cx));
+        let code = self.code.read(cx).value().to_string();
+        let code = (!code.trim().is_empty()).then_some(code);
+        self.state.update(cx, |state, cx| state.pair_link_with_code(&link, code.as_deref(), cx));
         self.submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Link);
     }
 
@@ -197,13 +219,14 @@ impl ConnectView {
         self.ssh_submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Ssh);
     }
 
-    /// A suggested host connects at once, as `ssh -G` resolves it.
-    fn add_ssh_host(&mut self, alias: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// A suggested host connects at once, preserving discovered `hostname`, `username`, and `port`
+    /// (e.g. `[host]:port` from `known_hosts`, `AddEnvironmentDialog.tsx:301`).
+    fn add_ssh_host(&mut self, target: SshTarget, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.read(cx).connect.pairing.is_some() {
             return;
         }
-        self.ssh_host.update(cx, |input, cx| input.set_value(alias.clone(), window, cx));
-        let target = SshTarget { alias: alias.clone(), hostname: alias, username: None, port: None };
+        let alias = target.alias.clone();
+        self.ssh_host.update(cx, |input, cx| input.set_value(alias, window, cx));
         self.state.update(cx, |state, cx| state.add_ssh(target, cx));
         self.ssh_submitted = self.state.read(cx).connect.pairing == Some(PairingSource::Ssh);
     }
@@ -472,10 +495,68 @@ impl ConnectView {
             .into_any_element()
     }
 
+    /// Legacy-permission re-pair notice (`PermissionUpdateNotice.ts`, `CN-REPAIR`).
+    fn render_legacy_permissions(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let state = self.state.read(cx);
+        let env = state.active_environment()?;
+        let env_key = env.environment_id.as_deref().unwrap_or(env.id.as_str()).to_owned();
+        let ui_key = format!("permission-update-dismissed-{env_key}");
+        let dismissed = *self.dismissed_permission_notice.entry(env_key.clone()).or_insert_with(|| {
+            t3_client::store::load_ui_state(&ui_key).and_then(|v| v.as_bool()) == Some(true)
+        });
+        if dismissed {
+            return None;
+        }
+        let session = state
+            .fleet
+            .environment(&env.id)
+            .and_then(|view| view.grants.as_ref())
+            .cloned()
+            .or_else(|| state.client_handle().and_then(|client| client.session_state().borrow().clone()))?;
+        if !session_has_legacy_permissions(&session) {
+            return None;
+        }
+        let p = palette(cx);
+        let label = env.label.clone();
+        let dismiss_env = env_key;
+        let dismiss_key = ui_key;
+        Some(
+            v_flex()
+                .px(px(14.))
+                .py(px(12.))
+                .gap(px(6.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(hsla(p.warning).opacity(0.35))
+                .bg(hsla(p.warning).opacity(0.08))
+                .text_sm()
+                .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(format!("Permissions have changed for {label}")))
+                .child(
+                    div()
+                        .text_xs()
+                        .line_height(px(18.))
+                        .text_color(hsla(p.muted_foreground))
+                        .child("This connection still uses the old permissions, so some actions may no longer be available. Pair again using a new link with the permissions you need."),
+                )
+                .child(
+                    h_flex().gap(px(8.)).pt(px(2.)).child(
+                        Button::new("connect-legacy-perms-dismiss", ButtonVariant::GhostMuted, ButtonSize::Compact)
+                            .label("Dismiss")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.dismissed_permission_notice.insert(dismiss_env.clone(), true);
+                                t3_client::store::save_ui_state(&dismiss_key, &serde_json::Value::Bool(true));
+                                cx.notify();
+                            })),
+                    ),
+                ),
+        )
+    }
+
     fn render_saved_row(&self, environment: &SavedEnvironment, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let active = state.environments.active.as_deref() == Some(environment.id.as_str()) && state.client_handle().is_some();
-        let (tone, status, error_tone) = match state.environment_statuses.get(&environment.id) {
+        let status_opt = state.environment_statuses.get(&environment.id).cloned();
+        let (tone, status, error_tone) = match &status_opt {
             _ if environment.access_token.is_none() => (Some(DotTone::Destructive), "Needs pairing again".to_owned(), true),
             Some(status) => {
                 let (text, error) = status.summary();
@@ -483,6 +564,14 @@ impl ConnectView {
             }
             _ => (None, "Not connected".to_owned(), false),
         };
+        let diagnosis = status_opt.as_ref().and_then(|s| diagnose(s, &environment.label));
+        let expanded = self.expanded_diagnosis.contains(&environment.id);
+        let freeze = active
+            .then(|| state.client_handle())
+            .flatten()
+            .and_then(|client| client.server_config_extras().borrow().last_event_loop_stall.clone())
+            .and_then(|stall| host_freeze_notice(&environment.label, Some(&stall)));
+        let version_skew = resolve_version_mismatch(environment.server_version.as_deref(), env!("CARGO_PKG_VERSION"));
         let busy = state.connect.pairing.is_some();
         let confirming = self.confirm_remove.as_deref() == Some(environment.id.as_str());
         let p = palette(cx);
@@ -502,10 +591,22 @@ impl ConnectView {
                     },
                 )))
         } else {
-            let (connect, remove) = (id.clone(), id.clone());
+            let (connect, remove, diag_id) = (id.clone(), id.clone(), id.clone());
             let action = if active { None } else if environment.access_token.is_some() { Some("Connect") } else { Some("Pair again") };
             h_flex()
                 .gap_1()
+                .when(diagnosis.is_some(), |this| {
+                    this.child(
+                        Button::new(SharedString::from(format!("details-{diag_id}")), ButtonVariant::GhostMuted, ButtonSize::Compact)
+                            .label(if expanded { "Hide details" } else { "Details" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.expanded_diagnosis.remove(&diag_id) {
+                                    this.expanded_diagnosis.insert(diag_id.clone());
+                                }
+                                cx.notify();
+                            })),
+                    )
+                })
                 .children(action.map(|action| {
                     Button::new(SharedString::from(format!("connect-{connect}")), ButtonVariant::Outline, ButtonSize::Compact).label(action).disabled(busy).on_click(cx.listener(
                         move |this, _, _, cx| this.state.update(cx, |state, cx| state.connect_environment(&connect, cx)),
@@ -518,26 +619,110 @@ impl ConnectView {
                     }),
                 ))
         };
-        h_flex()
+        let diag_panel = diagnosis.filter(|_| expanded).map(|diag| {
+            let retry_id = id.clone();
+            let copy_text = connection_diagnosis_text(&environment.label, &diag);
+            let can_retry = status_opt.as_ref().is_some_and(|s| s.can_retry());
+            v_flex()
+                .mt(px(8.))
+                .pt(px(8.))
+                .border_t_1()
+                .border_color(hsla(p.border).opacity(0.5))
+                .gap(px(8.))
+                .text_xs()
+                .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.destructive_foreground)).child(diag.headline.clone()))
+                .child(v_flex().gap(px(2.)).children(diag.hops.iter().map(|hop| {
+                    let color = match hop.result {
+                        HopResult::Failed => hsla(p.destructive_foreground),
+                        HopResult::Ok => hsla(p.foreground),
+                        HopResult::Unchecked => hsla(p.muted_foreground),
+                    };
+                    let note = hop.result.note();
+                    let line = if note.is_empty() {
+                        format!("{} {}", hop.result.mark(), hop.label)
+                    } else {
+                        format!("{} {} ({note})", hop.result.mark(), hop.label)
+                    };
+                    div().text_color(color).child(line)
+                })))
+                .when(!diag.steps.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .gap(px(2.))
+                            .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("What to try"))
+                            .children(diag.steps.iter().map(|step| div().text_color(hsla(p.muted_foreground)).child(format!("• {step}")))),
+                    )
+                })
+                .when(!diag.facts.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .gap(px(2.))
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .children(diag.facts.iter().map(|(k, v)| {
+                                div().text_color(hsla(p.muted_foreground)).child(format!("{k}: {v}"))
+                            })),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .gap(px(6.))
+                        .when(can_retry, |this| {
+                            this.child(
+                                Button::new(SharedString::from(format!("diag-retry-{retry_id}")), ButtonVariant::Outline, ButtonSize::Compact)
+                                    .label("Retry now")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.state.read(cx).retry_environment(&retry_id);
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new(SharedString::from(format!("diag-copy-{id}")), ButtonVariant::Outline, ButtonSize::Compact)
+                                .icon(Icon::Copy)
+                                .label("Copy diagnostics")
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                }),
+                        ),
+                )
+        });
+        v_flex()
             .px(px(16.))
             .py(px(10.))
-            .gap(px(10.))
-            .child(status_dot(tone, cx))
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(environment.label.clone()))
+                h_flex()
+                    .gap(px(10.))
+                    .child(status_dot(tone, cx))
                     .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .line_height(px(18.))
-                            .text_color(if error_tone { hsla(p.destructive_foreground) } else { hsla(p.muted_foreground) })
-                            .child(format!("{} · {status}", environment.address())),
-                    ),
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(environment.label.clone()))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .line_height(px(18.))
+                                    .text_color(if error_tone { hsla(p.destructive_foreground) } else { hsla(p.muted_foreground) })
+                                    .child(format!("{} · {status}", environment.address())),
+                            )
+                            .children(freeze.map(|notice| {
+                                div()
+                                    .text_xs()
+                                    .line_height(px(18.))
+                                    .text_color(hsla(p.warning_foreground))
+                                    .child(format!("{} — {}", notice.title, notice.description))
+                            }))
+                            .children(version_skew.map(|skew| {
+                                div()
+                                    .text_xs()
+                                    .line_height(px(18.))
+                                    .text_color(hsla(p.muted_foreground))
+                                    .child(format!("Server v{} (client v{}) · {}", skew.server_version, skew.client_version, skew.hint))
+                            })),
+                    )
+                    .child(actions),
             )
-            .child(actions)
+            .children(diag_panel)
     }
 
     fn render_saved(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -608,13 +793,15 @@ impl ConnectView {
         v_flex()
             .gap(px(8.))
             .child(muted(
-                "On the machine running T3 Code, open Settings → Sharing & access and create a pairing link, or run `t3 pair` there. Paste the full pairing URL here.",
+                "On the machine running T3 Code, open Settings → Sharing & access and create a pairing link, or run `t3 pair` there. Paste the pairing URL, or enter a host and code.",
                 cx,
             ))
+            .child(field("Pairing link or host", Input::new(&self.link).disabled(state.connect.pairing.is_some()), cx))
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.link)))
+                    .items_end()
+                    .child(div().flex_1().min_w_0().child(field("Pairing code (if not in URL)", Input::new(&self.code).disabled(state.connect.pairing.is_some()), cx)))
                     .child(
                         Button::new("connect-add", if primary { ButtonVariant::Default } else { ButtonVariant::Outline }, ButtonSize::Default)
                             .label(if busy { "Adding…" } else { "Add environment" })
@@ -629,8 +816,8 @@ impl ConnectView {
         let Some(host) = self.ssh_matches.get(index) else { return div().h(px(HOST_ROW_HEIGHT)).into_any_element() };
         let p = palette(cx);
         let busy = self.state.read(cx).connect.pairing.is_some();
-        let address = format_target(&host.target());
-        let alias = host.alias.clone();
+        let target = host.target();
+        let address = format_target(&target);
         h_flex()
             .id(SharedString::from(format!("ssh-host-{index}")))
             .w_full()
@@ -650,7 +837,7 @@ impl ConnectView {
                     .text_color(hsla(p.muted_foreground))
                     .when(address != host.alias, |this| this.child(address)),
             )
-            .when(!busy, |this| this.on_click(cx.listener(move |this, _, window, cx| this.add_ssh_host(alias.clone(), window, cx))))
+            .when(!busy, |this| this.on_click(cx.listener(move |this, _, window, cx| this.add_ssh_host(target.clone(), window, cx))))
             .into_any_element()
     }
 
@@ -756,6 +943,7 @@ impl Render for ConnectView {
                         .gap(px(20.))
                         .child(self.render_header(switching, cx))
                         .children(self.render_rejected(cx))
+                        .children(self.render_legacy_permissions(cx))
                         .child(self.render_cloud(cx))
                         .child(self.render_local(cx))
                         .children(self.render_saved(cx))

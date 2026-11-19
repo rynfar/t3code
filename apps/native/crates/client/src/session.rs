@@ -23,6 +23,44 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Thread subscriptions ask for bounded snapshots, but older servers and other streams can still
 /// send whole projections.
 const MAX_MESSAGE_BYTES: usize = 256 << 20;
+/// `PART_PREFIX` (`packages/shared/src/socketFrameParts.ts`, `pingdotgg/t3code#23758`):
+/// no JSON message starts with ASCII Record Separator; it prefixes every part of a split frame
+/// except the last.
+pub(crate) const FRAME_PART_PREFIX: char = '\u{001e}';
+
+/// Reassembles application-level socket frame parts (`joinSocketFrameParts` in
+/// `packages/shared/src/socketFrameParts.ts`). Each incoming part updates socket liveness so a
+/// large `ServerConfig` on a slow link never triggers the 15-second idle timeout.
+#[derive(Default)]
+pub(crate) struct FramePartJoiner {
+    pending: String,
+}
+
+impl FramePartJoiner {
+    /// Consumes one WebSocket text frame. Returns `Ok(None)` when holding an intermediate part,
+    /// `Ok(Some(whole))` when a complete JSON frame is ready to decode, or `Err` if the assembled
+    /// message exceeds `MAX_MESSAGE_BYTES`.
+    pub(crate) fn push(&mut self, frame: String) -> Result<Option<String>, &'static str> {
+        if let Some(piece) = frame.strip_prefix(FRAME_PART_PREFIX) {
+            if self.pending.len().saturating_add(piece.len()) > MAX_MESSAGE_BYTES {
+                self.pending.clear();
+                return Err("Server frame exceeded maximum message size.");
+            }
+            self.pending.push_str(piece);
+            return Ok(None);
+        }
+        if self.pending.is_empty() {
+            return Ok(Some(frame));
+        }
+        if self.pending.len().saturating_add(frame.len()) > MAX_MESSAGE_BYTES {
+            self.pending.clear();
+            return Err("Server frame exceeded maximum message size.");
+        }
+        let mut whole = std::mem::take(&mut self.pending);
+        whole.push_str(&frame);
+        Ok(Some(whole))
+    }
+}
 
 /// `client-runtime/src/rpc/protocol.ts`: pings every 5 seconds, and 15 seconds without any frame
 /// drops the socket. The stream queue bounds what a slow consumer buffers before acks stop.
@@ -162,6 +200,7 @@ impl Session {
         tokio::spawn(async move {
             let mut last_frame = Instant::now();
             let mut ping = tokio::time::interval(timing.ping_interval);
+            let mut frame_parts = FramePartJoiner::default();
             let reason = loop {
                 tokio::select! {
                     frame = stream.next() => {
@@ -174,6 +213,11 @@ impl Session {
                             Some(Err(error)) => break describe_ws_error(error).into(),
                         };
                         last_frame = Instant::now();
+                        let text = match frame_parts.push(text) {
+                            Ok(Some(whole)) => whole,
+                            Ok(None) => continue,
+                            Err(error) => break error.into(),
+                        };
                         match decode_server_frame(&text) {
                             Ok(messages) => {
                                 if let Some(end) = messages.into_iter().find_map(|m| route(m, &task_pending)) {
@@ -368,3 +412,72 @@ fn describe_ws_error(error: tokio_tungstenite::tungstenite::Error) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod frame_parts_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn frame_part_joiner_reassembles_split_frames_and_passes_whole_frames_through() {
+        let mut joiner = FramePartJoiner::default();
+        assert_eq!(joiner.push(r#"{"_tag":"Pong"}"#.into()).unwrap().as_deref(), Some(r#"{"_tag":"Pong"}"#));
+        assert_eq!(joiner.push(format!("{FRAME_PART_PREFIX}{{\"_tag\":")).unwrap(), None);
+        assert_eq!(joiner.push(format!("{FRAME_PART_PREFIX}\"Exit\",")).unwrap(), None);
+        assert_eq!(
+            joiner.push(r#""requestId":"1"}"#.into()).unwrap().as_deref(),
+            Some(r#"{"_tag":"Exit","requestId":"1"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_link_multipart_frame_keeps_session_alive_past_ping_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["_tag"] == "Request" {
+                    let id = value["id"].clone();
+                    let full = serde_json::json!([{
+                        "_tag": "Exit",
+                        "requestId": id,
+                        "exit": { "_tag": "Success", "value": { "big": "x".repeat(256) } }
+                    }])
+                    .to_string();
+                    let chunk_size = full.len() / 4;
+                    let pieces = [
+                        format!("{FRAME_PART_PREFIX}{}", &full[..chunk_size]),
+                        format!("{FRAME_PART_PREFIX}{}", &full[chunk_size..chunk_size * 2]),
+                        format!("{FRAME_PART_PREFIX}{}", &full[chunk_size * 2..chunk_size * 3]),
+                        full[chunk_size * 3..].to_owned(),
+                    ];
+                    // Total delivery (~160ms) exceeds ping_timeout (100ms), while each part arrives
+                    // within the timeout (40ms < 100ms), proving slow-link liveness (`#23758`).
+                    for piece in pieces {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        ws.send(Message::Text(piece)).await.unwrap();
+                    }
+                    // Keep the socket open until the client finishes and drops the session.
+                    let _ = ws.next().await;
+                    break;
+                }
+            }
+        });
+        let session = Session::connect_with(
+            &format!("ws://{addr}/ws?frameParts=1"),
+            Timing {
+                ping_interval: Duration::from_millis(30),
+                ping_timeout: Duration::from_millis(100),
+                stream_queue: 16,
+            },
+        )
+        .await
+        .unwrap();
+        let reply = session.request("server.getConfig", serde_json::json!({})).await.unwrap();
+        assert_eq!(reply["big"].as_str().map(str::len), Some(256));
+        server.await.unwrap();
+    }
+}

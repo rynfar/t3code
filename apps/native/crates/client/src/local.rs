@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use t3_core::compatibility::{ProtocolMismatch, protocol_mismatch};
 use t3_core::local_server::{
-    CliVersionRefusal, ServerRuntimeState, check_cli_version, cli_candidates, cli_failure_summary, pair_args, parse_pair_output, parse_runtime_state,
-    runtime_state_paths, t3_home,
+    CliVersionRefusal, SERVER_EXIT_CODE_MANAGED_POLICY, ServerRuntimeState, StartupExitKind, check_cli_version, classify_server_exit, cli_candidates,
+    cli_failure_summary, managed_policy_diagnostic, pair_args, parse_pair_output, parse_runtime_state, runtime_state_paths, t3_home,
 };
 use t3_core::pairing::PairingLink;
 use t3_core::server_config::EnvironmentDescriptor;
@@ -56,6 +56,10 @@ pub enum LocalPairError {
     NotRunning,
     #[error("{0}")]
     Incompatible(String),
+    /// Managed policy exit 77 (`pingdotgg/t3code#30319`): never misreport as a version mismatch
+    /// or point at another release.
+    #[error("{0}")]
+    ManagedPolicy(String),
     #[error("Could not find the t3 command. Open the T3 Code desktop app once to install it, or paste a pairing link below.")]
     CliMissing,
     #[error(transparent)]
@@ -160,10 +164,15 @@ pub async fn pair(server: &LocalServer) -> Result<Paired, LocalPairError> {
 }
 
 /// `t3 pair` migrates the database it opens, so it only runs when `t3 --version` is exactly the
-/// version the running server recorded.
+/// version the running server recorded. Managed-policy exit 77 is reported directly without
+/// blaming the release version (`pingdotgg/t3code#30319`).
 async fn check_version(cli: &Path, server: &LocalServer) -> Result<(), LocalPairError> {
     let output = run_cli(cli, &["--version".to_owned()], &server.home, VERSION_TIMEOUT).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(SERVER_EXIT_CODE_MANAGED_POLICY) {
+        return Err(LocalPairError::ManagedPolicy(managed_policy_diagnostic(&stderr, &stdout)));
+    }
     check_cli_version(&stdout, server.state.server_version.as_deref()).map_err(|refusal| {
         tracing::warn!(cli = %cli.display(), %refusal, "not running t3 pair");
         LocalPairError::from(refusal)
@@ -175,9 +184,45 @@ async fn run_pair(cli: &Path, home: &Path) -> Result<String, LocalPairError> {
     let output = run_cli(cli, &pair_args(home, &default_home), home, PAIR_TIMEOUT).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
-        return Err(LocalPairError::CliFailed(cli_failure_summary(&String::from_utf8_lossy(&output.stderr), &stdout)));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return match classify_server_exit(output.status.code(), &stderr, &stdout) {
+            StartupExitKind::ManagedPolicy { detail } => Err(LocalPairError::ManagedPolicy(detail)),
+            StartupExitKind::StateDirOwned => {
+                Err(LocalPairError::CliFailed("Another T3 Code process already owns this state directory.".to_owned()))
+            }
+            StartupExitKind::Other { .. } => Err(LocalPairError::CliFailed(cli_failure_summary(&stderr, &stdout))),
+        };
     }
     parse_pair_output(&stdout).map(|output| output.token).ok_or(LocalPairError::NoToken)
+}
+
+/// Detects the local `t3` CLI installation & PATH status (`pingdotgg/t3code#33150`, `pingdotgg/t3code#33153`).
+pub fn cli_command_status() -> Option<t3_core::onboarding::CliCommandStatus> {
+    let home = home()?;
+    let bin_dir = home.join("bin");
+    let installed = is_executable(&bin_dir.join("t3"));
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let entries: Vec<(&str, bool)> = path_var
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| (dir, is_executable(&Path::new(dir).join("t3"))))
+        .collect();
+    let user_home = user_home().map(|p| p.to_string_lossy().into_owned());
+    let shell = std::env::var("SHELL").ok();
+    let config_home = std::env::var("XDG_CONFIG_HOME").ok();
+    let zdotdir = std::env::var("ZDOTDIR").ok();
+    Some(t3_core::onboarding::detect_cli_command_status(
+        &bin_dir,
+        installed,
+        &entries,
+        &t3_core::onboarding::ShellEnv {
+            platform: std::env::consts::OS,
+            home: user_home.as_deref(),
+            shell: shell.as_deref(),
+            config_home: config_home.as_deref(),
+            zdotdir: zdotdir.as_deref(),
+        },
+    ))
 }
 
 /// Runs the CLI from the user's home (from a linked worktree it would pair with that worktree's
@@ -417,6 +462,42 @@ wait
         let events = cli.grandchild().await;
         drop(task);
         SpawningCli::exits(events).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn managed_policy_exit_77_reports_policy_refusal_instead_of_version_mismatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("exit77");
+        let script = dir.join("fake-t3-policy");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'ManagedPolicyFileError: T3 Code cannot use the managed policy at /etc/t3/policy.json: invalid JSON.' >&2\nexit 77\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let server = LocalServer {
+            home: dir.clone(),
+            state: serde_json::from_value(serde_json::json!({
+                "version": 1, "pid": std::process::id(), "port": 3773,
+                "origin": "http://127.0.0.1:3773", "serverVersion": "0.1.7"
+            }))
+            .unwrap(),
+            descriptor: EnvironmentDescriptor::default(),
+        };
+        let err = check_version(&script, &server).await.unwrap_err();
+        assert!(
+            matches!(err, LocalPairError::ManagedPolicy(ref msg) if msg.contains("managed policy") && msg.contains("IT administrator")),
+            "expected ManagedPolicy, got {err:?}"
+        );
+        let pair_err = run_pair(&script, &dir).await.unwrap_err();
+        assert!(
+            matches!(pair_err, LocalPairError::ManagedPolicy(ref msg) if msg.contains("managed policy")),
+            "expected ManagedPolicy from run_pair, got {pair_err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

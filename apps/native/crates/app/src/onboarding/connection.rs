@@ -12,9 +12,11 @@ use t3_client::local::LocalServer;
 use t3_client::status::ConnectionPhase;
 use t3_client::store::SavedEnvironment;
 use t3_client::supervisor::ConnectionStatus;
-use t3_core::onboarding::{PRIVACY_POLICY_URL, privacy_notice};
+use t3_core::onboarding::{
+    INSTALL_T3_COMMAND_NPX, INSTALL_T3_COMMAND_UNIX, PRIVACY_POLICY_URL, privacy_notice,
+};
 
-use super::{Step, WelcomeWizard, key_stop, row_card, step_title};
+use super::{WelcomeWizard, key_stop, row_card, section_heading};
 use crate::app_state::{AppState, Phase};
 use crate::composer::controls::radio;
 use crate::connect::{discovery_message, local_details, pairing_error};
@@ -309,51 +311,154 @@ impl WelcomeWizard {
     }
 
     pub(super) fn render_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let p = palette(cx);
         let app = self.state.read(cx);
         let busy = app.connect.pairing.is_some();
-        let ready = app.phase == Phase::Online(ConnectionStatus::Connected) && !busy;
+        let connected = app.phase == Phase::Online(ConnectionStatus::Connected);
         let (discovering, local_found) = (app.connect.discovering, app.connect.local_server.is_some());
         let computers = self.computers(app);
-        let policy = app.server_config.config.as_ref().and_then(|config| config.managed_policy.clone());
         // `expandPairingInitially`: open while there is nothing else to connect to. A pairing-link
         // failure (pasted, or a saved computer that needs a new link) keeps the form and its error open.
         let link_failed = pairing_error(&app.connect, PairingSource::Link).is_some();
         let pairing_open = link_failed || self.pairing_open.unwrap_or(computers.is_empty() && !discovering);
         let rows: Vec<AnyElement> = computers.into_iter().map(|computer| self.render_computer(computer, busy, window, cx)).collect();
+        let (heading, subtitle) = if connected {
+            ("Computers", "Switch computers or pair another machine with T3 Code.")
+        } else {
+            ("Connect your computers", "Choose a computer to set up. Agents and projects appear below once connected.")
+        };
+        v_flex()
+            .gap(r(10.))
+            .child(section_heading(heading, subtitle, cx))
+            .when(!rows.is_empty(), |this| this.child(v_flex().gap(r(8.)).children(rows)))
+            .child(
+                v_flex()
+                    .gap(r(8.))
+                    .when(!local_found, |this| this.child(self.render_discovery(discovering, cx)))
+                    .child(self.render_add_computer(pairing_open, busy, window, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// CLI `t3` command install & PATH prompt (`CliPathSetup` / `InstallT3Commands`,
+    /// `pingdotgg/t3code#33150`, `pingdotgg/t3code#33153`).
+    pub(super) fn render_cli_setup(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let status = self.cli_status.clone()?;
+        let p = palette(cx);
+        let mut body = v_flex()
+            .gap(r(8.))
+            .child(section_heading("Command line", "Run T3 Code from any terminal using the `t3` command.", cx));
+
+        if let Some(shadowed) = &status.shadowed_by {
+            body = body.child(
+                row_card(cx).px(r(12.)).py(r(10.)).child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(p.warning_foreground))
+                        .child(format!("Another t3 at {shadowed} runs first in a new terminal. Remove it to use T3 Code's.")),
+                ),
+            );
+        } else if status.installed_path.is_some() {
+            if status.on_path || self.cli_path_added {
+                let text = if self.cli_path_added {
+                    match &status.profile_file {
+                        Some(profile) => format!("Added to {profile}. Open a new terminal to use `t3`."),
+                        None => "Added to your shell profile. Open a new terminal to use `t3`.".to_owned(),
+                    }
+                } else {
+                    status.description()
+                };
+                body = body.child(
+                    row_card(cx)
+                        .gap(r(8.))
+                        .px(r(12.))
+                        .py(r(10.))
+                        .child(Icon::Check.render(px(14.), hsla(p.success_foreground)))
+                        .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(text)),
+                );
+            } else if let (Some(profile), Some(export_line)) = (status.profile_file.clone(), status.path_line.clone()) {
+                let command = status.path_setup_command().unwrap_or_else(|| export_line.clone());
+                let saving = self.cli_path_saving;
+                body = body.child(
+                    v_flex()
+                        .gap(r(8.))
+                        .child(
+                            row_card(cx)
+                                .gap(r(12.))
+                                .px(r(12.))
+                                .py(r(10.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(hsla(p.muted_foreground))
+                                        .child(format!("Use `t3` from any terminal. Adds one line to {profile}.")),
+                                )
+                                .child(
+                                    Button::new("welcome-cli-add-path", ButtonVariant::Outline, ButtonSize::Compact)
+                                        .label(if saving { "Adding\u{2026}" } else { "Add to PATH" })
+                                        .disabled(saving)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.add_cli_to_path(profile.clone(), export_line.clone(), cx);
+                                        })),
+                                ),
+                        )
+                        .child(self.command_block("welcome-copy-cli-path", &command, cx))
+                        .children(self.cli_path_error.clone().map(|error| {
+                            div().text_xs().text_color(hsla(p.destructive_foreground)).child(error)
+                        })),
+                );
+            } else {
+                body = body.child(
+                    row_card(cx).px(r(12.)).py(r(10.)).child(
+                        div().text_xs().text_color(hsla(p.muted_foreground)).child(status.description()),
+                    ),
+                );
+            }
+        } else {
+            body = body
+                .child(self.command_block("welcome-copy-cli-install", INSTALL_T3_COMMAND_UNIX, cx))
+                .child(self.command_block("welcome-copy-cli-npx", INSTALL_T3_COMMAND_NPX, cx));
+        }
+
+        Some(body.into_any_element())
+    }
+
+    /// Footer with the privacy policy link and the primary "Start coding" CTA (`WelcomePage.tsx`).
+    pub(super) fn render_welcome_footer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
+        let app = self.state.read(cx);
+        let connected = app.phase == Phase::Online(ConnectionStatus::Connected) && app.connect.pairing.is_none();
+        let policy = app.server_config.config.as_ref().and_then(|config| config.managed_policy.clone());
         let notice = privacy_notice(policy.as_ref());
         let link = "privacy policy";
         let text = format!("{notice} {link}.");
         let link_range = notice.len() + 1..notice.len() + 1 + link.len();
         let privacy = InteractiveText::new(
             "welcome-privacy",
-            StyledText::new(text).with_highlights([(link_range.clone(), gpui::HighlightStyle { underline: Some(UnderlineStyle { thickness: px(1.), ..Default::default() }), ..Default::default() })]),
+            StyledText::new(text).with_highlights([(
+                link_range.clone(),
+                gpui::HighlightStyle {
+                    underline: Some(UnderlineStyle { thickness: px(1.), ..Default::default() }),
+                    ..Default::default()
+                },
+            )]),
         )
         .on_click(vec![link_range], |_, _, cx| cx.open_url(PRIVACY_POLICY_URL));
-        v_flex()
-            .child(step_title("Connect your computers", "Choose a computer to set up. We’ll check its agents next.", cx))
-            .when(!rows.is_empty(), |this| this.child(v_flex().mt(r(20.)).gap(r(8.)).children(rows)))
+        h_flex()
+            .pt(r(12.))
+            .border_t_1()
+            .border_color(hsla(p.border).opacity(0.4))
+            .items_end()
+            .justify_between()
+            .gap(r(24.))
+            .child(div().flex_1().min_w_0().text_xs().line_height(r(19.5)).text_color(hsla(p.muted_foreground)).child(privacy))
             .child(
-                v_flex()
-                    .mt(r(16.))
-                    .gap(r(8.))
-                    .when(!local_found, |this| this.child(self.render_discovery(discovering, cx)))
-                    .child(self.render_add_computer(pairing_open, busy, window, cx)),
-            )
-            .child(
-                h_flex()
-                    .mt(r(24.))
-                    .items_end()
-                    .justify_between()
-                    .gap(r(24.))
-                    .child(div().flex_1().min_w_0().text_xs().line_height(r(19.5)).text_color(hsla(p.muted_foreground)).child(privacy))
-                    .child(
-                        Button::new("welcome-continue", ButtonVariant::Default, ButtonSize::Default)
-                            .label("Continue")
-                            .trailing(Icon::ArrowRight)
-                            .disabled(!ready)
-                            .on_click(cx.listener(|this, _, _, cx| this.go_to(Step::Agents, cx))),
-                    ),
+                Button::new("welcome-continue", ButtonVariant::Default, ButtonSize::Default)
+                    .label("Start coding")
+                    .trailing(Icon::ArrowRight)
+                    .disabled(!connected)
+                    .on_click(cx.listener(|this, _, _, cx| this.finish(cx))),
             )
             .into_any_element()
     }

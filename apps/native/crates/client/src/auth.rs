@@ -14,6 +14,8 @@ const BOOTSTRAP_TOKEN_TYPE: &str = "urn:t3:params:oauth:token-type:environment-b
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 /// `WELL_KNOWN_ENVIRONMENT_PATH`: the unauthenticated descriptor every server answers.
 const DESCRIPTOR_PATH: &str = "/.well-known/t3/environment";
+/// `SOCKET_FRAME_PARTS_QUERY_PARAM` (`packages/shared/src/socketFrameParts.ts`, `pingdotgg/t3code#23758`).
+pub const SOCKET_FRAME_PARTS_QUERY_PARAM: &str = "frameParts";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
@@ -27,6 +29,10 @@ pub enum AuthError {
     Rejected(String),
     #[error("This device is no longer authorized. Pair again.")]
     Unauthorized,
+    /// HTTP 403 `EnvironmentConnectApprovalPendingError` (`pingdotgg/t3code#36419`):
+    /// waiting for someone on the host to approve this device; credentials remain valid and retry.
+    #[error("{message}")]
+    ConnectApprovalPending { message: String, trace_id: Option<String> },
     #[error("Could not reach {host}: {source}")]
     Unreachable { host: String, source: reqwest::Error },
     #[error("Unexpected response from {host} ({status}): {body}")]
@@ -151,6 +157,21 @@ async fn post_ticket(credentials: &Credentials, path: &str) -> Result<String, Au
         .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
     let status = response.status();
     if status.as_u16() == 401 || status.as_u16() == 403 {
+        if status.as_u16() == 403 {
+            let body = response.text().await.unwrap_or_default();
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body)
+                && t3_core::connect::is_connect_approval_pending_error(&value)
+            {
+                let message = value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or("This device is waiting for approval on the host.")
+                    .to_owned();
+                let trace_id = value.get("traceId").and_then(serde_json::Value::as_str).map(str::to_owned);
+                return Err(AuthError::ConnectApprovalPending { message, trace_id });
+            }
+        }
         return Err(AuthError::Unauthorized);
     }
     if !status.is_success() {
@@ -181,6 +202,24 @@ pub async fn fetch_session_state(credentials: &Credentials) -> Result<AuthSessio
     response.json().await.map_err(|source| AuthError::Unreachable { host, source })
 }
 
+/// An authenticated `GET` to an environment HTTP endpoint (such as `/api/connect/link-state`).
+pub async fn get_access(credentials: &Credentials, path: &str) -> Result<serde_json::Value, String> {
+    let response = http()
+        .get(format!("{}{path}", credentials.http_base))
+        .bearer_auth(&credentials.access_token)
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach {}: {error}", credentials.http_base))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let message = value.get("message").and_then(serde_json::Value::as_str).filter(|message| !message.is_empty());
+        return Err(message.map_or_else(|| format!("The server answered {}.", status.as_u16()), str::to_owned));
+    }
+    Ok(value)
+}
+
 /// An authenticated `POST` to an access endpoint (`/api/auth/pairing-token`,
 /// `/api/auth/clients/revoke`, …). A failure carries the server's `message` when it sends one.
 pub async fn post_access(credentials: &Credentials, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
@@ -209,7 +248,8 @@ pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
         .append_pair("clientAppVersion", env!("CARGO_PKG_VERSION"))
         .append_pair("clientDeviceType", "desktop")
         .append_pair("clientOs", client_os())
-        .append_pair("connectionMethod", "direct");
+        .append_pair("connectionMethod", "direct")
+        .append_pair(SOCKET_FRAME_PARTS_QUERY_PARAM, "1");
     url.to_string()
 }
 
@@ -220,5 +260,18 @@ fn client_os() -> &'static str {
         "Windows"
     } else {
         "Linux"
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn socket_url_opts_into_frame_parts() {
+        let creds = Credentials { http_base: "https://studio.ts.net:3773".into(), access_token: "tok".into() };
+        let url = socket_url(&creds, "tkt");
+        assert!(url.contains("frameParts=1"), "{url}");
+        assert!(url.contains("wsTicket=tkt"), "{url}");
     }
 }

@@ -53,15 +53,26 @@ pub const ARCHIVE_LAUNCH_TIMEOUT_MS: u64 = 900_000;
 /// How long a new tunnel has to answer HTTP.
 pub const TUNNEL_READY_TIMEOUT_MS: u64 = 20_000;
 pub const READY_PROBE_TIMEOUT_MS: u64 = 1_000;
-/// A reused tunnel must answer this quickly, or it is replaced.
-pub const TUNNEL_REUSE_TIMEOUT_MS: u64 = 2_000;
+/// Probes through an SSH port forward pay several link round trips (~4s at 1s RTT; `pingdotgg/t3code#35418`).
+pub const TUNNEL_READY_PROBE_TIMEOUT_MS: u64 = 5_000;
+/// A reused tunnel gets the same probe budget so a slow reconnect does not tear down a healthy forward
+/// (`pingdotgg/t3code#35874`).
+pub const TUNNEL_REUSE_TIMEOUT_MS: u64 = TUNNEL_READY_PROBE_TIMEOUT_MS;
 pub const TUNNEL_SHUTDOWN_TIMEOUT_MS: u64 = 2_000;
+/// `REMOTE_LAUNCH_LOCK_WAIT_SECONDS` (`packages/ssh/src/tunnel.ts`, `pingdotgg/t3code#32587`).
+pub const REMOTE_LAUNCH_LOCK_WAIT_SECONDS: u64 = 82;
 pub const TUNNEL_STDERR_TAIL_CHARS: usize = 16_384;
 const MAX_ERROR_OUTPUT_LENGTH: usize = 4_000;
 /// `DEFAULT_SSH_PASSWORD_PROMPT_TIMEOUT_MS`.
 pub const PASSWORD_PROMPT_TIMEOUT_MS: u64 = 3 * 60 * 1000;
 /// Prompts for one operation before its auth failure stands.
 pub const MAX_PASSWORD_PROMPTS: u32 = 2;
+
+/// Validates a launcher ID before passing it into the remote SSH shell command
+/// (`pingdotgg/t3code#36351`): must be exactly 32 lowercase hex characters.
+pub fn is_valid_launcher_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// `parseSshResolveOutput`: the first `hostname`, `user` and `port` lines of `ssh -G`.
 pub fn parse_ssh_resolve_output(alias: &str, stdout: &str) -> SshTarget {

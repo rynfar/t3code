@@ -779,6 +779,26 @@ pub(crate) fn clear_cloud_token(base: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(base.join("cloud-oauth.json")) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), result => result }
 }
 
+/// Stable 32-hex launcher ID for this T3 Code Native installation so renamed SSH connections keep
+/// managing the remote server this app started (`pingdotgg/t3code#36351`).
+pub fn ssh_launcher_id() -> Option<String> {
+    let dir = base()?;
+    ssh_launcher_id_in(&dir)
+}
+
+fn ssh_launcher_id_in(dir: &Path) -> Option<String> {
+    let path = dir.join("ssh-launcher-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if t3_core::ssh::is_valid_launcher_id(trimmed) {
+            return Some(trimmed.to_owned());
+        }
+    }
+    let generated = uuid::Uuid::new_v4().simple().to_string();
+    let _ = write_private(dir, "ssh-launcher-id", &generated);
+    Some(generated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,6 +1112,16 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("panels.json")).ok().as_deref(), Some("{\"a\":2}"));
         let leftovers = std::fs::read_dir(&dir).map(|entries| entries.count()).unwrap_or(0);
         assert_eq!(leftovers, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_launcher_id_is_stable_32_hex_across_reads() {
+        let dir = std::env::temp_dir().join(format!("t3-launcher-id-test-{}", uuid::Uuid::new_v4()));
+        let first = ssh_launcher_id_in(&dir).expect("generates launcher id");
+        assert!(t3_core::ssh::is_valid_launcher_id(&first), "{first}");
+        let second = ssh_launcher_id_in(&dir).expect("reuses launcher id");
+        assert_eq!(first, second);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

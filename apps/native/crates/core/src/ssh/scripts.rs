@@ -111,9 +111,12 @@ exec "$T3_RUNTIME_DIR/t3" "$@""#;
 
 /// Starts the T3 server on the remote, or reuses the one this app started or any server already
 /// running on the default home, and prints `{"remotePort":…,"serverKind":…}`. `$1` is the state
-/// key. A changed runner (a new version) replaces this app's own running server.
+/// key; optional `$2` is the 32-hex launcher ID so renamed SSH connections keep managing their
+/// remote server (`pingdotgg/t3code#36351`). Concurrent launches on one remote home serialize on
+/// `.launch.lock` so they share one server (`pingdotgg/t3code#32587`).
 const LAUNCH_SCRIPT: &str = r#"set -eu
 STATE_KEY="$1"
+LAUNCHER_ID=@@T3_LAUNCHER_ID@@
 STATE_DIR="$HOME/.t3/ssh-launch/$STATE_KEY"
 DEFAULT_SERVER_HOME="$HOME/.t3"
 DEFAULT_RUNTIME_FILE="$DEFAULT_SERVER_HOME/userdata/server-runtime.json"
@@ -124,24 +127,66 @@ LOG_FILE="$STATE_DIR/server.log"
 STARTED_FILE="$STATE_DIR/started"
 RUNNER_FILE="$STATE_DIR/run-t3.sh"
 RUNNER_NEXT="$STATE_DIR/run-t3.next.$$"
+LAUNCH_LOCK="$DEFAULT_SERVER_HOME/ssh-launch/.launch.lock"
+LAUNCH_BREAK_LOCK="$LAUNCH_LOCK.break"
 mkdir -p "$STATE_DIR"
-cleanup_runner_next() {
+cleanup_launch() {
   rm -f "$RUNNER_NEXT"
+  for OWNED_LOCK in "$LAUNCH_LOCK" "$LAUNCH_BREAK_LOCK"; do
+    if [ "$(cat "$OWNED_LOCK" 2>/dev/null || true)" = "$$" ]; then
+      rm -f "$OWNED_LOCK"
+    fi
+  done
 }
-trap cleanup_runner_next EXIT
+trap cleanup_launch EXIT
+trap 'exit 1' HUP INT PIPE TERM
 cat >"$RUNNER_NEXT" <<'SH'
 @@T3_RUNNER_SCRIPT@@
 SH
+chmod 700 "$RUNNER_NEXT"
+# The archive ships the helpers below inside the executable; the remote
+# needs no Node at all. Resolving the runner once here also downloads the
+# archive before acquiring the home launch lock.
+"$RUNNER_NEXT" --version >/dev/null
+discard_stale_launch_lock() {
+  (set -C; printf '%s\n' "$$" >"$LAUNCH_BREAK_LOCK") 2>/dev/null || return 1
+  if [ "$(cat "$LAUNCH_LOCK" 2>/dev/null || true)" = "$1" ]; then
+    rm -f "$LAUNCH_LOCK"
+  fi
+  rm -f "$LAUNCH_BREAK_LOCK"
+}
+LAUNCH_LOCK_WAITED=0
+LAUNCH_LOCK_UNOWNED=0
+while ! (set -C; printf '%s\n' "$$" >"$LAUNCH_LOCK") 2>/dev/null; do
+  LAUNCH_LOCK_OWNER="$(cat "$LAUNCH_LOCK" 2>/dev/null || true)"
+  if [ -n "$LAUNCH_LOCK_OWNER" ]; then
+    LAUNCH_LOCK_UNOWNED=0
+    if ! kill -0 "$LAUNCH_LOCK_OWNER" 2>/dev/null; then
+      discard_stale_launch_lock "$LAUNCH_LOCK_OWNER" || true
+      continue
+    fi
+  else
+    LAUNCH_LOCK_UNOWNED=$((LAUNCH_LOCK_UNOWNED + 1))
+    if [ "$LAUNCH_LOCK_UNOWNED" -ge 5 ]; then
+      discard_stale_launch_lock "" || true
+      continue
+    fi
+  fi
+  if [ "$LAUNCH_LOCK_WAITED" -ge 82 ]; then
+    printf 'Another SSH launch has held %s for too long.\n' "$LAUNCH_LOCK" >&2
+    exit 1
+  fi
+  sleep 1
+  LAUNCH_LOCK_WAITED=$((LAUNCH_LOCK_WAITED + 1))
+done
 RUNNER_CHANGED=0
 if [ ! -f "$RUNNER_FILE" ] || ! cmp -s "$RUNNER_NEXT" "$RUNNER_FILE"; then
   RUNNER_CHANGED=1
 fi
 mv "$RUNNER_NEXT" "$RUNNER_FILE"
-chmod 700 "$RUNNER_FILE"
-# The archive ships the helpers below inside the executable; the remote
-# needs no Node at all. Resolving the runner once here also downloads the
-# archive before the port and readiness probes rely on it.
-"$RUNNER_FILE" --version >/dev/null
+if [ -n "$LAUNCHER_ID" ]; then
+  printf '%s\n' "$LAUNCHER_ID" >"$STATE_DIR/launcher"
+fi
 pick_port() {
   "$RUNNER_FILE" __ssh-helper pick-port "$PORT_FILE" "3773" "200"
 }
@@ -181,46 +226,78 @@ resolve_default_runtime_port() {
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
 REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
-DEFAULT_RUNTIME_INFO="$(resolve_default_runtime_port 2>/dev/null || true)"
-DEFAULT_RUNTIME_PID=""
-DEFAULT_REMOTE_PORT=""
 ADOPTED_PID=""
-if [ -n "$DEFAULT_RUNTIME_INFO" ]; then
-  DEFAULT_RUNTIME_PID="${DEFAULT_RUNTIME_INFO%% *}"
-  DEFAULT_REMOTE_PORT="${DEFAULT_RUNTIME_INFO#* }"
-fi
-# The managed server runs on the default home, so it writes the default
-# runtime file too. When that file names the PID this launcher recorded as
-# managed, it describes our own server and its real port, not one to adopt.
-if [ -n "$DEFAULT_REMOTE_PORT" ] && [ "$REMOTE_MANAGED" = "managed" ] && [ "$DEFAULT_RUNTIME_PID" = "$REMOTE_PID" ]; then
-  REMOTE_PORT="$DEFAULT_REMOTE_PORT"
-  printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
-elif [ -n "$DEFAULT_REMOTE_PORT" ]; then
-  REMOTE_PORT="$DEFAULT_REMOTE_PORT"
-  if wait_ready "2000"; then
-    ADOPTED_PID="$DEFAULT_RUNTIME_PID"
-    if [ "$REMOTE_MANAGED" = "managed" ]; then
-      if owns_server "$REMOTE_PID"; then
-        kill "$REMOTE_PID" 2>/dev/null || true
-        wait_for_pid_exit "$REMOTE_PID"
-      fi
-      REMOTE_PID=""
-      REMOTE_PORT="$DEFAULT_REMOTE_PORT"
-      REMOTE_MANAGED="external"
-      rm -f "$PID_FILE" "$STARTED_FILE"
-      printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
-      printf 'external\n' >"$MANAGED_FILE"
-    else
-      printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
-      printf 'external\n' >"$MANAGED_FILE"
-      REMOTE_PID=""
-      REMOTE_MANAGED="external"
-    fi
-  else
-    REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-    REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
-    REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
+adopt_default_server() {
+  DEFAULT_RUNTIME_INFO="$(resolve_default_runtime_port 2>/dev/null || true)"
+  DEFAULT_RUNTIME_PID=""
+  DEFAULT_REMOTE_PORT=""
+  if [ -n "$DEFAULT_RUNTIME_INFO" ]; then
+    DEFAULT_RUNTIME_PID="${DEFAULT_RUNTIME_INFO%% *}"
+    DEFAULT_REMOTE_PORT="${DEFAULT_RUNTIME_INFO#* }"
   fi
+  # The managed server runs on the default home, so it writes the default
+  # runtime file too. When that file names the PID this launcher recorded as
+  # managed, it describes our own server and its real port, not one to adopt.
+  if [ -n "$DEFAULT_REMOTE_PORT" ] && [ "$REMOTE_MANAGED" = "managed" ] && [ "$DEFAULT_RUNTIME_PID" = "$REMOTE_PID" ]; then
+    REMOTE_PORT="$DEFAULT_REMOTE_PORT"
+    printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
+    return 1
+  elif [ -n "$DEFAULT_REMOTE_PORT" ]; then
+    REMOTE_PORT="$DEFAULT_REMOTE_PORT"
+    if wait_ready "2000"; then
+      ADOPTED_PID="$DEFAULT_RUNTIME_PID"
+      if [ "$REMOTE_MANAGED" = "managed" ]; then
+        if owns_server "$REMOTE_PID"; then
+          kill "$REMOTE_PID" 2>/dev/null || true
+          wait_for_pid_exit "$REMOTE_PID"
+        fi
+        REMOTE_PID=""
+        REMOTE_PORT="$DEFAULT_REMOTE_PORT"
+        REMOTE_MANAGED="external"
+        rm -f "$PID_FILE" "$STARTED_FILE"
+        printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
+        printf 'external\n' >"$MANAGED_FILE"
+      else
+        printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
+        printf 'external\n' >"$MANAGED_FILE"
+        REMOTE_PID=""
+        REMOTE_MANAGED="external"
+      fi
+      return 0
+    else
+      REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+      REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
+      REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
+    fi
+  fi
+  return 1
+}
+# Editing a connection's alias, host, user or port changes its key, so the
+# adopted server may be one this app started under another key. Ownership then
+# moves here, leaving one managed record so updates keep replacing it.
+if adopt_default_server && [ -n "$ADOPTED_PID" ] && [ -n "$LAUNCHER_ID" ]; then
+  for SIBLING_DIR in "$DEFAULT_SERVER_HOME"/ssh-launch/*; do
+    [ "$SIBLING_DIR" != "$STATE_DIR" ] && [ "$(cat "$SIBLING_DIR/managed" 2>/dev/null || true)" = "managed" ] || continue
+    [ "$(cat "$SIBLING_DIR/pid" 2>/dev/null || true)" = "$ADOPTED_PID" ] && server_running "$ADOPTED_PID" || continue
+    [ "$(cat "$SIBLING_DIR/launcher" 2>/dev/null || true)" = "$LAUNCHER_ID" ] || break
+    REMOTE_PID="$ADOPTED_PID"
+    REMOTE_MANAGED="managed"
+    SIBLING_STARTED="$(cat "$SIBLING_DIR/started" 2>/dev/null || true)"
+    printf '%s\n' "$REMOTE_PID" >"$PID_FILE"
+    if [ -n "$SIBLING_STARTED" ]; then
+      printf '%s\n' "$SIBLING_STARTED" >"$STARTED_FILE"
+    else
+      printf '%s\n' "$(process_started "$REMOTE_PID")" >"$STARTED_FILE"
+    fi
+    printf 'managed\n' >"$MANAGED_FILE"
+    printf 'external\n' >"$SIBLING_DIR/managed"
+    rm -f "$SIBLING_DIR/pid" "$SIBLING_DIR/started"
+    RUNNER_CHANGED=1
+    if cmp -s "$RUNNER_FILE" "$SIBLING_DIR/run-t3.sh"; then
+      RUNNER_CHANGED=0
+    fi
+    break
+  done
 fi
 if [ "$REMOTE_MANAGED" = "external" ]; then
   # A server adopted above has just answered. While it is still alive, probing
@@ -262,6 +339,9 @@ if [ -z "$REMOTE_PORT" ]; then
   printf '%s\n' "$(process_started "$REMOTE_PID")" >"$STARTED_FILE"
   printf '%s\n' "$REMOTE_PORT" >"$PORT_FILE"
   printf 'managed\n' >"$MANAGED_FILE"
+  if [ -z "$LAUNCHER_ID" ]; then
+    rm -f "$STATE_DIR/launcher"
+  fi
   if ! wait_ready "60000"; then
     printf 'Remote T3 server did not become ready on 127.0.0.1:%s.\n' "$REMOTE_PORT" >&2
     if [ -s "$LOG_FILE" ]; then
@@ -276,6 +356,17 @@ if [ -z "$REMOTE_PORT" ]; then
     rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE" "$STARTED_FILE"
     exit 1
   fi
+  # Wait briefly for server-runtime.json so a concurrent launch under another
+  # alias adopts this server instead of spawning a duplicate.
+  RECORD_WAIT=0
+  while [ "$RECORD_WAIT" -lt 20 ]; do
+    RECORDED_INFO="$(resolve_default_runtime_port 2>/dev/null || true)"
+    if [ "${RECORDED_INFO%% *}" = "$REMOTE_PID" ]; then
+      break
+    fi
+    sleep 0.5
+    RECORD_WAIT=$((RECORD_WAIT + 1))
+  done
 fi
 printf '{"remotePort":%s,"serverKind":"%s"}\n' "$REMOTE_PORT" "${REMOTE_MANAGED:-managed}"
 "#;
@@ -336,7 +427,15 @@ pub fn runner_script(version: &str) -> Result<String, String> {
 
 /// The launch script, run as `sh -l -s -- <state key>`.
 pub fn launch_script(version: &str) -> Result<String, String> {
-    Ok(LAUNCH_SCRIPT.replace("@@T3_RUNNER_SCRIPT@@", &runner_script(version)?))
+    launch_script_with_launcher(version, None)
+}
+
+/// The launch script with an optional validated 32-hex launcher ID (`pingdotgg/t3code#36351`).
+pub fn launch_script_with_launcher(version: &str, launcher_id: Option<&str>) -> Result<String, String> {
+    let launcher = launcher_id.filter(|id| super::is_valid_launcher_id(id)).unwrap_or("");
+    Ok(LAUNCH_SCRIPT
+        .replace("@@T3_RUNNER_SCRIPT@@", &runner_script(version)?)
+        .replace("@@T3_LAUNCHER_ID@@", &single_quote(launcher)))
 }
 
 pub fn pairing_script(state_key: &str, version: &str) -> Result<String, String> {
@@ -365,6 +464,11 @@ mod tests {
     fn launch_and_pairing_embed_the_runner_and_the_state_key() {
         let launch = launch_script("0.1.7").unwrap();
         assert!(launch.contains("cat >\"$RUNNER_NEXT\" <<'SH'\n#!/bin/sh\n") && launch.contains("exec \"$T3_RUNTIME_DIR/t3\" \"$@\"\nSH\n"));
+        assert!(launch.contains("LAUNCH_LOCK=\"$DEFAULT_SERVER_HOME/ssh-launch/.launch.lock\""));
+        assert!(launch.contains("LAUNCHER_ID=''"));
+        let with_id = launch_script_with_launcher("0.1.7", Some("0123456789abcdef0123456789abcdef")).unwrap();
+        assert!(with_id.contains("LAUNCHER_ID='0123456789abcdef0123456789abcdef'"));
+        assert!(launch.contains("SIBLING_DIR"));
         assert!(!launch.contains("@@"));
         let pairing = pairing_script("native-326264c4f08c8a0c", "0.1.7").unwrap();
         assert!(pairing.contains("STATE_DIR=\"$HOME/.t3/ssh-launch/native-326264c4f08c8a0c\"") && !pairing.contains("@@"));

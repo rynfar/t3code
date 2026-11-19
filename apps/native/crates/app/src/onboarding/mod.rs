@@ -87,9 +87,6 @@ fn key_stop(
         })
 }
 
-/// `ONBOARDING_STAGES` up to which is not ported yet.
-const STAGES: [&str; 3] = ["Connect", "Agents", "Projects"];
-
 /// The wizard opened or closed; the workspace swaps what it shows.
 pub struct Visibility;
 
@@ -113,6 +110,7 @@ struct AgentSetup {
     driver: &'static str,
     terminal: Entity<agent_terminal::AgentInstallTerminal>,
     _closed: Subscription,
+    _finished: Option<Subscription>,
 }
 
 pub struct WelcomeWizard {
@@ -132,6 +130,16 @@ pub struct WelcomeWizard {
     /// A pasted link is pairing; the field clears once it succeeds.
     submitted: bool,
     setup: Option<AgentSetup>,
+    /// Whether the "More agents" disclosure is expanded on the single Welcome page (`#33209`).
+    more_agents_open: bool,
+    /// Local `t3` CLI installation / PATH status (`#33150`, `#33153`).
+    cli_status: Option<t3_core::onboarding::CliCommandStatus>,
+    cli_path_added: bool,
+    cli_path_saving: bool,
+    cli_path_error: Option<String>,
+    cli_path_task: Option<Task<()>>,
+    /// Connection ID for which the open Welcome page has already initialized provider refresh + project scan.
+    connected_for_welcome: Option<u64>,
     terminal_access: bool,
     terminal_grants: Option<(u64, Task<()>)>,
     copied: Option<(String, Task<()>)>,
@@ -169,6 +177,13 @@ impl WelcomeWizard {
             pairing_help_open: false,
             submitted: false,
             setup: None,
+            more_agents_open: false,
+            cli_status: t3_client::local::cli_command_status(),
+            cli_path_added: false,
+            cli_path_saving: false,
+            cli_path_error: None,
+            cli_path_task: None,
+            connected_for_welcome: None,
             terminal_access: false,
             terminal_grants: None,
             copied: None,
@@ -214,8 +229,16 @@ impl WelcomeWizard {
         if event == AppEvent::Phase {
             self.chatgpt.clear();self.created_chatgpt=None;self.chatgpt_subscriptions.clear();
             self.watch_terminal_grants(cx);
-            let app = self.state.read(cx);
-            let (pairing, failed, unpaired) = (app.connect.pairing.is_some(), app.connect.error.is_some(), app.phase == Phase::Unpaired);
+            let (pairing, failed, unpaired, connected, connection_id) = {
+                let app = self.state.read(cx);
+                (
+                    app.connect.pairing.is_some(),
+                    app.connect.error.is_some(),
+                    app.phase == Phase::Unpaired,
+                    app.phase == Phase::Online(ConnectionStatus::Connected),
+                    app.connection_id(),
+                )
+            };
             if self.submitted && !pairing {
                 self.submitted = false;
                 if !failed {
@@ -225,6 +248,13 @@ impl WelcomeWizard {
             }
             if unpaired && self.step != Step::Connection {
                 self.step = Step::Connection;
+            }
+            if !connected {
+                self.connected_for_welcome = None;
+            } else if self.open && self.connected_for_welcome != connection_id {
+                self.connected_for_welcome = connection_id;
+                self.refresh_providers(cx);
+                self.enter_projects(cx);
             }
         }
         if matches!(event, AppEvent::Phase | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Selection) {
@@ -323,6 +353,18 @@ impl WelcomeWizard {
         self.step = step;
         self.focus_pending = true;
         self.welcome = None;
+        self.cli_status = t3_client::local::cli_command_status();
+        let (connected, connection_id) = {
+            let app = self.state.read(cx);
+            (app.phase == Phase::Online(ConnectionStatus::Connected), app.connection_id())
+        };
+        if connected {
+            self.connected_for_welcome = connection_id;
+            self.refresh_providers(cx);
+            self.enter_projects(cx);
+        } else {
+            self.connected_for_welcome = None;
+        }
         cx.emit(Visibility);
         cx.notify();
     }
@@ -339,6 +381,8 @@ impl WelcomeWizard {
         if !crate::chatgpt_setup::fixture_active(cx) {t3_client::store::save_ui_state("welcome-resume", &serde_json::Value::Null);}
         self.cancel_projects();
         self.open = false;
+        self.connected_for_welcome = None;
+        self.cli_path_task = None;
         self.setup = None;
         self.complete(cx);
         cx.emit(Visibility);
@@ -371,6 +415,68 @@ impl WelcomeWizard {
         }
         self.state.update(cx, |state, cx| state.pair_link(&link, cx));
         self.submitted = self.state.read(cx).connect.pairing.is_some();
+    }
+
+    /// Appends the `t3` PATH line to the user's shell profile on a background thread
+    /// (`DesktopCliCommand.ts` `addToPath`, `pingdotgg/t3code#33153`), checking for an exact
+    /// line match, surfacing write failures, and refreshing `cli_status`.
+    fn add_cli_to_path(&mut self, profile: String, export_line: String, cx: &mut Context<Self>) {
+        if self.cli_path_saving {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            self.cli_path_error = Some("Could not locate your home directory.".to_owned());
+            cx.notify();
+            return;
+        };
+        self.cli_path_saving = true;
+        self.cli_path_error = None;
+        let path = profile
+            .strip_prefix("~/")
+            .map_or_else(|| std::path::PathBuf::from(&profile), |rest| home.join(rest));
+        let task = cx.spawn(async move |this, cx| {
+            let result: Result<Option<t3_core::onboarding::CliCommandStatus>, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let existing = match std::fs::read_to_string(&path) {
+                        Ok(content) => content,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                        Err(error) => return Err(format!("Could not read {}: {error}", path.display())),
+                    };
+                    if !t3_core::onboarding::profile_contains_line(&existing, &export_line) {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+                        }
+                        let prefix = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+                        let next = format!("{existing}{prefix}{export_line}\n");
+                        std::fs::write(&path, next)
+                            .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+                    }
+                    Ok(t3_client::local::cli_command_status())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.cli_path_saving = false;
+                this.cli_path_task = None;
+                match result {
+                    Ok(status) => {
+                        this.cli_path_added = true;
+                        this.cli_path_error = None;
+                        if status.is_some() {
+                            this.cli_status = status;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to update shell profile PATH");
+                        this.cli_path_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.cli_path_task = Some(task);
+        cx.notify();
     }
 
     fn copy(&mut self, command: &str, cx: &mut Context<Self>) {
@@ -412,92 +518,18 @@ impl WelcomeWizard {
             )
     }
 
-    /// `WizardSteps`: done steps take you back; the current and later ones are inert.
-    fn render_steps(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let p = palette(cx);
-        let dark = cx.theme().is_dark();
-        let ink = hsla(p.foreground);
-        let current = match self.step {
-            Step::Connection => 0,
-            Step::Agents => 1,
-            Step::Projects => 2,
-        };
-        h_flex()
-            .w_full()
-            .gap(r(4.))
-            .p(r(4.))
-            .rounded(r(12.))
-            .border_1()
-            .border_color(ink.opacity(0.05))
-            .bg(if dark { ink.opacity(0.04) } else { hsla(p.background) })
-            .children(STAGES.iter().enumerate().map(|(index, label)| {
-                let (done, here) = (index < current, index == current);
-                let (badge_fill, badge_text, badge_ring) = if done {
-                    (hsla(p.primary), hsla(p.primary_foreground), hsla(p.primary))
-                } else if here {
-                    (hsla(p.primary).opacity(0.1), hsla(p.primary), hsla(p.primary).opacity(0.3))
-                } else {
-                    (if dark { ink.opacity(0.05) } else { hsla(p.card) }, hsla(p.muted_foreground), ink.opacity(0.1))
-                };
-                let badge = div()
-                    .size(r(20.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(badge_ring)
-                    .bg(badge_fill)
-                    .text_color(badge_text)
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .map(|this| if done { this.child(Icon::Check.render(px(16.), badge_text)) } else { this.child((index + 1).to_string()) });
-                let id = ElementId::from(("welcome-step", index));
-                let tab = h_flex()
-                    .id(id.clone())
-                    .flex_1()
-                    .min_w_0()
-                    .gap(r(8.))
-                    .px(r(10.))
-                    .py(r(8.))
-                    .rounded(r(8.))
-                    .border_1()
-                    .border_color(if here { ink.opacity(0.05) } else { gpui::transparent_black() })
-                    .when(here, |this| {
-                        this.bg(hsla(p.card)).when(!dark, |this| {
-                            this.shadow(vec![BoxShadow { color: gpui::black().opacity(0.05), offset: point(px(0.), px(1.)), blur_radius: px(2.), spread_radius: px(0.), inset: false }])
-                        })
-                    })
-                    .child(badge)
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(if here { hsla(p.foreground) } else { hsla(p.muted_foreground) })
-                            .child(*label),
-                    );
-                if done {
-                    let back = cx.listener(move |this, _: &(), _, cx| this.go_to(if index == 0 { Step::Connection } else { Step::Agents }, cx));
-                    key_stop(tab, &id, back, window, cx).hover(move |style| style.bg(hsla(p.card)))
-                } else {
-                    tab
-                }
-            }))
-    }
 }
 
-/// `StepShell`'s title and description.
-fn step_title(title: &'static str, description: &'static str, cx: &App) -> impl IntoElement {
+/// Section heading inside the single Welcome page (`WelcomePage.tsx`, `pingdotgg/t3code#33209`).
+fn section_heading(title: &str, description: &str, cx: &App) -> impl IntoElement {
     let p = palette(cx);
     v_flex()
-        .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(title))
-        .child(div().mt(r(10.)).text_sm().line_height(r(22.75)).text_color(hsla(p.muted_foreground)).child(description))
+        .gap(r(2.))
+        .child(div().text_base().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(title.to_owned()))
+        .child(div().text_xs().line_height(r(18.)).text_color(hsla(p.muted_foreground)).child(description.to_owned()))
 }
 
-/// The bordered row the wizard lists computers and agents in (`rounded-lg border bg-background`).
+/// The bordered row the welcome page lists computers and agents in (`rounded-lg border bg-background`).
 fn row_card(cx: &App) -> gpui::Div {
     let p = palette(cx);
     h_flex().items_center().rounded(r(8.)).border_1().border_color(hsla(p.border)).bg(hsla(p.background))
@@ -515,15 +547,27 @@ impl Render for WelcomeWizard {
         let dark = cx.theme().is_dark();
         let ink = hsla(p.foreground);
         let viewport = window.viewport_size();
-        let body: AnyElement = match self.step {
-            Step::Connection => self.render_connection(window, cx),
-            Step::Agents => self.render_agents(window, cx),
-            Step::Projects => self.render_projects(window, cx),
-        };
+        let connected = self.state.read(cx).phase == Phase::Online(ConnectionStatus::Connected);
+
+        // Single scrollable Welcome page (`WelcomePage.tsx`, `pingdotgg/t3code#33209`):
+        // replaces the 3-step stepper with unified sections on one page.
+        let mut sections: Vec<AnyElement> = Vec::new();
+        if connected {
+            sections.push(self.render_agents(window, cx));
+            sections.push(self.render_projects(window, cx));
+            sections.push(self.render_connection(window, cx));
+        } else {
+            sections.push(self.render_connection(window, cx));
+        }
+        if let Some(cli) = self.render_cli_setup(cx) {
+            sections.push(cli);
+        }
+        sections.push(self.render_welcome_footer(cx));
+
         let header = v_flex()
-            .gap(r(8.))
+            .gap(r(4.))
             .p(r(24.))
-            .pb(r(12.))
+            .pb(r(16.))
             .child(
                 h_flex()
                     .items_baseline()
@@ -532,15 +576,21 @@ impl Render for WelcomeWizard {
                     .child(div().font_weight(FontWeight::BOLD).text_color(ink).child("T3"))
                     .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child("Code")),
             )
-            .child(self.render_steps(window, cx));
-        let panel = div()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(hsla(p.muted_foreground))
+                    .child("Set up your agents, import projects, and configure the command line in one place."),
+            );
+        let panel = v_flex()
+            .gap(r(24.))
             .px(r(24.))
             .py(r(20.))
             .border_t_1()
             .border_color(ink.opacity(0.05))
             .rounded_b(r(15.))
             .bg(if dark { ink.opacity(0.02) } else { hsla(p.background).opacity(0.8) })
-            .child(body);
+            .children(sections);
         let dialog = v_flex()
             .id("welcome-wizard")
             .key_context(CONTEXT)
@@ -636,6 +686,7 @@ pub fn terminal_fixture(fixture: TerminalFixture, window: &mut Window, cx: &mut 
             driver: "codex",
             terminal,
             _closed: closed,
+            _finished: None,
         });
         cx.notify();
         Ok(())

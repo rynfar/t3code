@@ -658,14 +658,24 @@ async fn run(
                             if let t3_core::server_config::ServerConfigStreamEvent::Snapshot { config: snapshot } = &**event
                                 && !entry.clock_recorded
                             {
-                                let received_at_ms = wall_now_ms();
-                                let server_time_ms = snapshot.server_time.0.as_deref().and_then(t3_core::sidebar::time::parse_iso);
-                                t3_core::clock::record_server_clock(&id, server_time_ms, entry.clock_requested_at_ms, received_at_ms);
+                                // Prefer the exact `subscribeServerConfig`-scoped sample recorded
+                                // by `supervisor.rs` (`pingdotgg/t3code#36420`) so SSH tunnel/askpass
+                                // setup time never pollutes the clock offset.
+                                let (server_time_ms, requested_at_ms, received_at_ms) = entry
+                                    .client
+                                    .server_config_extras()
+                                    .borrow()
+                                    .clock_sample
+                                    .unwrap_or_else(|| {
+                                        let server_time_ms = snapshot.server_time.0.as_deref().and_then(t3_core::sidebar::time::parse_iso);
+                                        (server_time_ms, entry.clock_requested_at_ms, wall_now_ms())
+                                    });
+                                t3_core::clock::record_server_clock(&id, server_time_ms, requested_at_ms, received_at_ms);
                                 if !snapshot.environment.environment_id.is_empty() && snapshot.environment.environment_id != id {
                                     t3_core::clock::record_server_clock(
                                         &snapshot.environment.environment_id,
                                         server_time_ms,
-                                        entry.clock_requested_at_ms,
+                                        requested_at_ms,
                                         received_at_ms,
                                     );
                                 }
@@ -680,7 +690,12 @@ async fn run(
                                 entry.shell.synchronized = false;
                                 entry.clock_recorded = false;
                             }
-                            if matches!(status, ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. }) {
+                            if matches!(
+                                status,
+                                ConnectionStatus::Connecting
+                                    | ConnectionStatus::Reconnecting { .. }
+                                    | ConnectionStatus::AwaitingApproval { .. }
+                            ) {
                                 entry.clock_requested_at_ms = wall_now_ms();
                             }
                             let _ = output.send(EnvironmentEvent::Status { id: id.clone(), generation: epoch, status: status.clone() }).await;
