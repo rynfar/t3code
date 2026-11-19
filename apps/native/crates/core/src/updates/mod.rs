@@ -522,37 +522,6 @@ pub fn channel_switch_block_reason(
     None
 }
 
-/// Connection and database migration state for one locally hosted backend (`localSwitchBlockReason`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostedServerState {
-    pub connected: bool,
-    pub database_migration: Option<u64>,
-}
-
-/// `localSwitchBlockReason` (`updateEverything.logic.ts`, `pingdotgg/t3code#32048`):
-/// reinstalling this app restarts every server it hosts, so each database must allow the switch.
-/// With Local environment off this app runs no server, so its reinstall restarts none.
-pub fn local_switch_block_reason(
-    app_version: &str,
-    release: &ChannelSwitchRelease,
-    hosted: &[HostedServerState],
-    backend_count: usize,
-    local_environment_enabled: bool,
-) -> Option<String> {
-    if !local_environment_enabled || is_on_track(app_version, release.channel) {
-        return None;
-    }
-    if hosted.is_empty()
-        || hosted.len() < backend_count
-        || hosted.iter().any(|server| !server.connected)
-    {
-        return Some("its server is not connected, so its database cannot be checked".into());
-    }
-    hosted
-        .iter()
-        .find_map(|server| channel_switch_block_reason(app_version, release, server.database_migration))
-}
-
 fn track_switch_move(config: &ServerConfig, same_track: bool) -> Result<&str, String> {
     if channel(&config.environment.server_version) == "preview" {
         return Err("runs a preview build".into());

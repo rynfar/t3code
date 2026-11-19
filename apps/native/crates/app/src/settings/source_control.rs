@@ -125,7 +125,7 @@ pub(crate) struct SourceControlState {
     scanning: bool,
     /// Standalone issue trackers (`issueTrackers.list`, `pingdotgg/t3code#19274`).
     trackers: Option<Result<IssueTrackerConnectionList, String>>,
-    trackers_for: Option<u64>,
+    trackers_for: Option<(Option<String>, Option<u64>)>,
     trackers_loading: bool,
     trackers_expanded: HashSet<String>,
     tracker_drafts: HashMap<String, IssueTrackerDraft>,
@@ -342,31 +342,42 @@ impl SettingsView {
     }
 
     /// `issueTrackerEnvironment.connections` (`issueTrackers.list`, `pingdotgg/t3code#19274`).
+    fn issue_tracker_scope_key(&self, cx: &App) -> Option<(Option<String>, Option<u64>)> {
+        let app = self.state.read(cx);
+        let owner = self.scoped_primary_owner(cx).map(|o| o.saved_id);
+        let connection = app.connection_id();
+        if owner.is_none() && connection.is_none() {
+            return None;
+        }
+        Some((owner, connection))
+    }
+
     fn load_issue_trackers(&mut self, force: bool, cx: &mut Context<Self>) {
-        let connection = self.state.read(cx).connection_id();
-        if self.source_control.trackers_for != connection {
+        let scope_key = self.issue_tracker_scope_key(cx);
+        if self.source_control.trackers_for != scope_key {
             self.source_control.trackers = None;
             self.source_control.tracker_drafts.clear();
             self.source_control.binding_pending.clear();
+            self.source_control.trackers_loading = false;
         }
         if self.source_control.trackers_loading
-            || (!force && connection.is_some() && self.source_control.trackers_for == connection)
+            || (!force && scope_key.is_some() && self.source_control.trackers_for == scope_key)
         {
             return;
         }
-        let Some(task) = self.state.read(cx).request(
-            issue_method::TRACKERS_LIST,
-            json!({}),
-            |value| serde_json::from_value::<IssueTrackerConnectionList>(value).map_err(|e| e.to_string()),
-        ) else {
+        if scope_key.is_none() {
             return;
-        };
+        }
+        let task = self.scoped_rpc("orchestration:read", issue_method::TRACKERS_LIST, json!({}), cx);
         self.source_control.trackers_loading = true;
-        self.source_control.trackers_for = connection;
+        self.source_control.trackers_for = scope_key.clone();
         cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let result = match task.await {
+                Ok(value) => serde_json::from_value::<IssueTrackerConnectionList>(value).map_err(|e| e.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
             let _ = this.update(cx, |this, cx| {
-                if this.state.read(cx).connection_id() != connection {
+                if this.issue_tracker_scope_key(cx) != scope_key {
                     return;
                 }
                 this.source_control.trackers_loading = false;
@@ -378,9 +389,23 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn connect_issue_tracker(&mut self, tracker: IssueTrackerKind, token: Option<String>, cx: &mut Context<Self>) {
+    fn can_edit_issue_trackers(&self, cx: &App) -> bool {
+        !self.is_project_scope(cx)
+            && self.scoped_session(cx).is_none_or(|session| session.grants(SETTINGS_WRITE_SCOPE))
+    }
+
+    fn connect_issue_tracker(
+        &mut self,
+        tracker: IssueTrackerKind,
+        token: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_edit_issue_trackers(cx) {
+            return;
+        }
         let key = tracker.as_str().to_owned();
-        let connection = self.state.read(cx).connection_id();
+        let scope_key = self.issue_tracker_scope_key(cx);
         let Some(draft) = self.source_control.tracker_drafts.get_mut(&key) else {
             return;
         };
@@ -390,22 +415,16 @@ impl SettingsView {
         draft.busy = true;
         draft.failure = None;
         let payload = serde_json::to_value(IssueTrackerConnectInput { tracker, token }).unwrap_or_default();
-        let Some(task) = self.state.read(cx).request(
-            issue_method::TRACKERS_CONNECT,
-            payload,
-            |value| serde_json::from_value::<IssueTrackerConnection>(value).map_err(|e| e.to_string()),
-        ) else {
-            if let Some(draft) = self.source_control.tracker_drafts.get_mut(&key) {
-                draft.busy = false;
-                draft.failure = Some("Not connected to server.".into());
-            }
-            cx.notify();
-            return;
-        };
+        let task = self.scoped_rpc(SETTINGS_WRITE_SCOPE, issue_method::TRACKERS_CONNECT, payload, cx);
+        let window_handle = window.window_handle();
         cx.spawn(async move |this, cx| {
-            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let result = match task.await {
+                Ok(value) => serde_json::from_value::<IssueTrackerConnection>(value).map_err(|e| e.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let succeeded = result.is_ok();
             let _ = this.update(cx, |this, cx| {
-                if this.state.read(cx).connection_id() != connection {
+                if this.issue_tracker_scope_key(cx) != scope_key {
                     return;
                 }
                 if let Some(draft) = this.source_control.tracker_drafts.get_mut(&key) {
@@ -422,6 +441,17 @@ impl SettingsView {
                 this.load_issue_trackers(true, cx);
                 cx.notify();
             });
+            if succeeded {
+                let _ = cx.update_window(window_handle, |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.issue_tracker_scope_key(cx) == scope_key
+                            && let Some(draft) = this.source_control.tracker_drafts.get(&key)
+                        {
+                            draft.input.update(cx, |input, cx| input.set_value("", window, cx));
+                        }
+                    });
+                });
+            }
         })
         .detach();
         cx.notify();
@@ -434,10 +464,13 @@ impl SettingsView {
         scope: String,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_edit_issue_trackers(cx) {
+            return;
+        }
         if self.source_control.binding_pending.contains(&project_id) {
             return;
         }
-        let connection = self.state.read(cx).connection_id();
+        let scope_key = self.issue_tracker_scope_key(cx);
         self.source_control.binding_pending.insert(project_id.clone());
         let binding = (scope != UNBOUND_SCOPE).then_some(IssueTrackerProjectBinding { tracker, scope });
         let payload = serde_json::to_value(IssueTrackerBindProjectInput {
@@ -445,16 +478,15 @@ impl SettingsView {
             binding,
         })
         .unwrap_or_default();
-        let Some(task) = self.state.read(cx).request(issue_method::TRACKERS_BIND_PROJECT, payload, |_| Ok(())) else {
-            self.source_control.binding_pending.remove(&project_id);
-            cx.notify();
-            return;
-        };
+        let task = self.scoped_rpc(SETTINGS_WRITE_SCOPE, issue_method::TRACKERS_BIND_PROJECT, payload, cx);
         cx.spawn(async move |this, cx| {
-            let _ = task.await;
+            let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.source_control.binding_pending.remove(&project_id);
-                if this.state.read(cx).connection_id() == connection {
+                if let Err(error) = result {
+                    store::show_error(format!("Could not update issue tracker binding: {error}"), cx);
+                }
+                if this.issue_tracker_scope_key(cx) == scope_key {
                     this.load_issue_trackers(true, cx);
                 }
                 cx.notify();
@@ -473,7 +505,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Option<Block> {
         let p = palette(cx);
-        let can_edit = self.may(SETTINGS_WRITE_SCOPE, cx) && !self.is_project_scope(cx);
+        let can_edit = self.can_edit_issue_trackers(cx);
         let list = match &self.source_control.trackers {
             None if self.source_control.trackers_loading => {
                 let loading = vec![
@@ -503,17 +535,37 @@ impl SettingsView {
 
         let projects: Vec<(String, String)> = {
             let app = self.state.read(cx);
-            app.shell
-                .snapshot
-                .as_ref()
-                .map(|snap| {
-                    snap.projects
-                        .iter()
-                        .filter(|project| project.archived_at.is_none() && !app.is_scratch_project(&project.id))
-                        .map(|project| (project.id.clone(), project.title.clone()))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let scoped_owner = self.scoped_primary_owner(cx);
+            let active_id = app.environments.active.as_deref();
+            if let Some(owner) = scoped_owner
+                && active_id != Some(owner.saved_id.as_str())
+            {
+                app.fleet
+                    .environments
+                    .iter()
+                    .find(|env| env.summary.owner == owner)
+                    .map(|env| {
+                        env.summary
+                            .projects
+                            .iter()
+                            .filter(|project| project.project.archived_at.is_none() && !project.is_scratch)
+                            .map(|project| (project.project.id.clone(), project.project.title.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                app.shell
+                    .snapshot
+                    .as_ref()
+                    .map(|snap| {
+                        snap.projects
+                            .iter()
+                            .filter(|project| project.archived_at.is_none() && !app.is_scratch_project(&project.id))
+                            .map(|project| (project.id.clone(), project.title.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
         };
 
         let mut rows: Vec<AnyElement> = Vec::with_capacity(list.trackers.len());
@@ -528,11 +580,14 @@ impl SettingsView {
                 let input = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder));
                 let tracker_for_enter = tracker.tracker.clone();
                 let key_for_enter = key.clone();
-                let subscription = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| match event {
+                let subscription = cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, window, cx| match event {
                     InputEvent::PressEnter { .. } => {
+                        if !this.can_edit_issue_trackers(cx) {
+                            return;
+                        }
                         let next = input.read(cx).value().trim().to_owned();
                         if !next.is_empty() {
-                            this.connect_issue_tracker(tracker_for_enter.clone(), Some(next), cx);
+                            this.connect_issue_tracker(tracker_for_enter.clone(), Some(next), window, cx);
                         }
                     }
                     InputEvent::Change => {
@@ -679,8 +734,8 @@ impl SettingsView {
                         )
                         .label("Save")
                         .disabled(disabled || draft_text.is_empty())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.connect_issue_tracker(save_tracker.clone(), Some(save_text.clone()), cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.connect_issue_tracker(save_tracker.clone(), Some(save_text.clone()), window, cx);
                         })),
                     )
                     .when(tracker.connected, |this| {
@@ -693,8 +748,8 @@ impl SettingsView {
                             .icon(Icon::X)
                             .tooltip(format!("Disconnect {}", tracker.display_name))
                             .disabled(disabled)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.connect_issue_tracker(disconnect_tracker.clone(), None, cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.connect_issue_tracker(disconnect_tracker.clone(), None, window, cx);
                             })),
                         )
                     });

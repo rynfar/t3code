@@ -48,13 +48,6 @@ pub fn is_scratch_project(workspace_root: &str, scratch_root: Option<&str>) -> b
     scratch_root.is_some_and(|root| find_project_by_path(&[workspace_root], root, |path| path).is_some())
 }
 
-/// `isScratchProject` with an already-known `isScratch` marker (`pingdotgg/t3code#30597`):
-/// preserves scratch classification even while the machine is disconnected and exposes no
-/// available scratch root.
-pub fn is_scratch_project_flagged(is_scratch: bool, workspace_root: &str, scratch_root: Option<&str>) -> bool {
-    is_scratch || is_scratch_project(workspace_root, scratch_root)
-}
-
 /// The project `projects.ensureScratch` answered with.
 pub fn ensure_scratch_project_id(reply: &Value) -> Option<String> {
     reply.get("projectId").and_then(Value::as_str).map(str::to_owned)

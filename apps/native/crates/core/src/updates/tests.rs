@@ -617,33 +617,3 @@ fn does_not_offer_nightly_build_to_stable_desktop_app() {
     assert_eq!(plan.rows.len(), 1);
     assert_eq!(plan.rows[0].skipped.as_deref(), Some("on the stable channel"));
 }
-
-#[test]
-fn local_switch_block_reason_allows_switch_when_local_environment_is_off() {
-    let stable = ChannelSwitchRelease {
-        channel: UpdateTrack::Latest,
-        version: "0.1.4".into(),
-        database_migration: Some(70),
-    };
-    let nightly = "0.1.4-nightly.20261027.3796";
-    let windows = HostedServerState { connected: true, database_migration: Some(69) };
-
-    assert_eq!(local_switch_block_reason(nightly, &stable, &[windows], 1, true), None);
-    assert!(
-        local_switch_block_reason(
-            nightly,
-            &stable,
-            &[windows, HostedServerState { connected: true, database_migration: Some(72) }],
-            2,
-            true,
-        )
-        .unwrap()
-        .contains("does not support yet")
-    );
-    assert_eq!(
-        local_switch_block_reason(nightly, &stable, &[], 0, true).as_deref(),
-        Some("its server is not connected, so its database cannot be checked")
-    );
-    // Local environment off -> no locally hosted server is restarted (`pingdotgg/t3code#32048`).
-    assert_eq!(local_switch_block_reason(nightly, &stable, &[], 0, false), None);
-}

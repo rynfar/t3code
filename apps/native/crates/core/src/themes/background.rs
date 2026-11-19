@@ -87,6 +87,7 @@ pub struct ThemeBackgroundTracker {
     applied_theme_id: Option<String>,
     shown_key: Option<BackgroundKey>,
     generation: u64,
+    loaded: bool,
     in_flight: bool,
     retries: usize,
 }
@@ -105,15 +106,18 @@ impl ThemeBackgroundTracker {
     }
 
     /// Evaluates whether the background image should be fetched, cleared, or left alone.
+    /// When `connected` is false, pending loads are deferred without latching `shown_key` so
+    /// reconnecting immediately starts the fetch (`pingdotgg/t3code#37843`).
     pub fn apply(
         &mut self,
         environment_id: Option<&str>,
         theme_id: Option<&str>,
         custom: &[ThemeDefinition],
         environment: &[ThemeDefinition],
+        connected: bool,
     ) -> BackgroundAction {
         self.applied_theme_id = theme_id.map(str::to_owned);
-        self.evaluate(environment_id, custom, environment)
+        self.evaluate(environment_id, custom, environment, connected)
     }
 
     /// Re-evaluates using the last `applied_theme_id` (used when connectivity returns or
@@ -123,8 +127,9 @@ impl ThemeBackgroundTracker {
         environment_id: Option<&str>,
         custom: &[ThemeDefinition],
         environment: &[ThemeDefinition],
+        connected: bool,
     ) -> BackgroundAction {
-        self.evaluate(environment_id, custom, environment)
+        self.evaluate(environment_id, custom, environment, connected)
     }
 
     fn evaluate(
@@ -132,6 +137,7 @@ impl ThemeBackgroundTracker {
         environment_id: Option<&str>,
         custom: &[ThemeDefinition],
         environment: &[ThemeDefinition],
+        connected: bool,
     ) -> BackgroundAction {
         let theme_id = self.applied_theme_id.as_deref();
         let revision = background_revision(theme_id, custom, environment);
@@ -143,22 +149,41 @@ impl ThemeBackgroundTracker {
             }),
             _ => None,
         };
-        if key == self.shown_key {
+        let Some(key) = key else {
+            if self.shown_key.is_none() && !self.loaded && !self.in_flight {
+                return BackgroundAction::NoChange;
+            }
+            self.shown_key = None;
+            self.loaded = false;
+            self.in_flight = false;
+            self.retries = 0;
+            self.generation = self.generation.wrapping_add(1);
+            return BackgroundAction::Clear;
+        };
+        if !connected {
+            if self.shown_key.as_ref() == Some(&key) && self.loaded {
+                // Keep an already-loaded wallpaper painted across temporary disconnects.
+                return BackgroundAction::NoChange;
+            }
+            if self.shown_key.is_some() || self.loaded || self.in_flight {
+                self.shown_key = None;
+                self.loaded = false;
+                self.in_flight = false;
+                self.retries = 0;
+                self.generation = self.generation.wrapping_add(1);
+                return BackgroundAction::Clear;
+            }
             return BackgroundAction::NoChange;
         }
-        self.shown_key = key.clone();
-        self.generation = self.generation.wrapping_add(1);
-        self.retries = 0;
-        match key {
-            Some(key) => {
-                self.in_flight = true;
-                BackgroundAction::Fetch { generation: self.generation, key }
-            }
-            None => {
-                self.in_flight = false;
-                BackgroundAction::Clear
-            }
+        if self.shown_key.as_ref() == Some(&key) && (self.loaded || self.in_flight) {
+            return BackgroundAction::NoChange;
         }
+        self.shown_key = Some(key.clone());
+        self.generation = self.generation.wrapping_add(1);
+        self.loaded = false;
+        self.in_flight = true;
+        self.retries = 0;
+        BackgroundAction::Fetch { generation: self.generation, key }
     }
 
     /// Marks `generation` as successfully loaded. Returns `true` if still current.
@@ -166,6 +191,7 @@ impl ThemeBackgroundTracker {
         if generation != self.generation || !self.in_flight {
             return false;
         }
+        self.loaded = true;
         self.in_flight = false;
         self.retries = 0;
         true
@@ -180,6 +206,7 @@ impl ThemeBackgroundTracker {
             self.retries += 1;
             return RetryDecision::RetryAfterMs(delay_ms);
         }
+        self.loaded = false;
         self.in_flight = false;
         self.shown_key = None;
         RetryDecision::Exhausted
@@ -189,6 +216,7 @@ impl ThemeBackgroundTracker {
         self.applied_theme_id = None;
         self.shown_key = None;
         self.generation = self.generation.wrapping_add(1);
+        self.loaded = false;
         self.in_flight = false;
         self.retries = 0;
     }
@@ -233,7 +261,7 @@ mod tests {
         let env = vec![published("nightfall", Some("rev-1"))];
         let mut tracker = ThemeBackgroundTracker::new();
 
-        let first = tracker.apply(Some("host"), Some("nightfall"), &[], &env);
+        let first = tracker.apply(Some("host"), Some("nightfall"), &[], &env, true);
         let gen1 = match first {
             BackgroundAction::Fetch { generation, ref key } => {
                 assert_eq!(key.environment_id, "host");
@@ -252,14 +280,45 @@ mod tests {
         assert!(tracker.shown_key().is_none());
 
         // Connectivity returns -> reapply retries once, and after success further online events are no-ops.
-        let retry = tracker.reapply(Some("host"), &[], &env);
+        let retry = tracker.reapply(Some("host"), &[], &env, true);
         let gen2 = match retry {
             BackgroundAction::Fetch { generation, .. } => generation,
             other => panic!("expected Fetch on reconnect, got {other:?}"),
         };
         assert_ne!(gen1, gen2);
         assert!(tracker.on_loaded(gen2));
-        assert_eq!(tracker.reapply(Some("host"), &[], &env), BackgroundAction::NoChange);
+        assert_eq!(tracker.reapply(Some("host"), &[], &env, true), BackgroundAction::NoChange);
+    }
+
+    #[test]
+    fn offline_startup_does_not_wedge_and_fetches_once_connected() {
+        let env = vec![published("nightfall", Some("rev-1")), published("dawn", Some("rev-2"))];
+        let mut tracker = ThemeBackgroundTracker::new();
+
+        // Startup while offline must not latch `shown_key`.
+        assert_eq!(tracker.apply(Some("host"), Some("nightfall"), &[], &env, false), BackgroundAction::NoChange);
+        assert!(tracker.shown_key().is_none());
+
+        // Connecting triggers the fetch immediately.
+        let gen1 = match tracker.apply(Some("host"), Some("nightfall"), &[], &env, true) {
+            BackgroundAction::Fetch { generation, key } => {
+                assert_eq!(key.theme_id, "nightfall");
+                generation
+            }
+            other => panic!("expected Fetch on connect, got {other:?}"),
+        };
+        assert!(tracker.on_loaded(gen1));
+
+        // Temporary disconnect keeps the loaded wallpaper; switching theme while offline clears it.
+        assert_eq!(tracker.apply(Some("host"), Some("nightfall"), &[], &env, false), BackgroundAction::NoChange);
+        assert_eq!(tracker.apply(Some("host"), Some("dawn"), &[], &env, false), BackgroundAction::Clear);
+        assert!(tracker.shown_key().is_none());
+
+        // Reconnecting fetches the newly selected theme.
+        assert!(matches!(
+            tracker.apply(Some("host"), Some("dawn"), &[], &env, true),
+            BackgroundAction::Fetch { key, .. } if key.theme_id == "dawn"
+        ));
     }
 
     #[test]
@@ -269,18 +328,18 @@ mod tests {
         let mut tracker = ThemeBackgroundTracker::new();
 
         assert_eq!(background_revision(Some("nightfall"), &custom, &env), None);
-        assert_eq!(tracker.apply(Some("host"), Some("nightfall"), &custom, &env), BackgroundAction::NoChange);
+        assert_eq!(tracker.apply(Some("host"), Some("nightfall"), &custom, &env, true), BackgroundAction::NoChange);
 
         // If published was shown first, saving a custom theme with the same id clears it.
-        let _ = tracker.apply(Some("host"), Some("nightfall"), &[], &env);
-        assert_eq!(tracker.apply(Some("host"), Some("nightfall"), &custom, &env), BackgroundAction::Clear);
+        let _ = tracker.apply(Some("host"), Some("nightfall"), &[], &env, true);
+        assert_eq!(tracker.apply(Some("host"), Some("nightfall"), &custom, &env, true), BackgroundAction::Clear);
     }
 
     #[test]
     fn reapply_keeps_applied_theme_id_during_live_editor_preview() {
         let env = vec![published("nightfall", Some("rev-1"))];
         let mut tracker = ThemeBackgroundTracker::new();
-        let gen1 = match tracker.apply(Some("host"), Some("nightfall"), &[], &env) {
+        let gen1 = match tracker.apply(Some("host"), Some("nightfall"), &[], &env, true) {
             BackgroundAction::Fetch { generation, .. } => generation,
             other => panic!("expected Fetch, got {other:?}"),
         };
@@ -290,7 +349,7 @@ mod tests {
         // Even if the UI root is temporarily showing a draft preview id, reapply tracks `applied_theme_id`.
         assert_eq!(tracker.applied_theme_id(), Some("nightfall"));
         assert!(matches!(
-            tracker.reapply(Some("host"), &[], &env),
+            tracker.reapply(Some("host"), &[], &env, true),
             BackgroundAction::Fetch { key, .. } if key.theme_id == "nightfall"
         ));
     }

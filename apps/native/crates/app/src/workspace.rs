@@ -1765,28 +1765,13 @@ impl Workspace {
 
         let (environment_id, client, runtime) = {
             let state = self.state.read(cx);
-            let local_id = state.local_saved_environment().map(|env| env.id.clone());
-            let env_id = local_id
-                .as_deref()
-                .and_then(|id| {
-                    if state.environments.active.as_deref() == Some(id) {
-                        state.server_config.config.as_ref().map(|c| c.environment.environment_id.clone())
-                    } else {
-                        state
-                            .fleet
-                            .environment(id)
-                            .and_then(|entry| entry.config.config.as_ref())
-                            .map(|c| c.environment.environment_id.clone())
-                    }
-                })
-                .or_else(|| {
-                    state
-                        .server_config
-                        .config
-                        .as_ref()
-                        .map(|c| c.environment.environment_id.clone())
-                })
-                .filter(|id| !id.is_empty());
+            let env_id = state
+                .server_config
+                .config
+                .as_ref()
+                .map(|c| c.environment.environment_id.clone())
+                .filter(|id| !id.is_empty())
+                .or_else(|| state.environments.active.clone());
             (env_id, state.client_handle(), state.runtime().clone())
         };
         let theme_id = crate::theme::active_theme_id(cx);
@@ -1798,6 +1783,7 @@ impl Workspace {
             theme_id.as_deref(),
             &custom,
             &environment,
+            client.is_some(),
         );
         match action {
             BackgroundAction::NoChange => {}
@@ -1809,7 +1795,6 @@ impl Workspace {
                 // Clear previous wallpaper immediately so it never shows under the next theme while loading.
                 crate::theme::set_background_image(None, cx);
                 let Some(client) = client else {
-                    let _ = self.theme_background.on_failed(generation);
                     self.theme_background_task = None;
                     return;
                 };
