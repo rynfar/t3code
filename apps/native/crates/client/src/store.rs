@@ -779,6 +779,20 @@ pub(crate) fn clear_cloud_token(base: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(base.join("cloud-oauth.json")) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), result => result }
 }
 
+/// Saved alternate/learned routes keyed by saved environment ID (`CN-SESSION`).
+pub fn load_alternate_routes() -> std::collections::HashMap<String, Vec<crate::routes::CandidateRoute>> {
+    load_ui_state("environment-routes")
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+/// Persists alternate/learned routes keyed by saved environment ID.
+pub fn save_alternate_routes(
+    routes: &std::collections::HashMap<String, Vec<crate::routes::CandidateRoute>>,
+) {
+    save_ui_state("environment-routes", routes);
+}
+
 /// Stable 32-hex launcher ID for this T3 Code Native installation so renamed SSH connections keep
 /// managing the remote server this app started (`pingdotgg/t3code#36351`).
 pub fn ssh_launcher_id() -> Option<String> {

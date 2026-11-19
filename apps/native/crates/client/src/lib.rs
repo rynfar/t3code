@@ -33,6 +33,9 @@ pub mod vcs;
 pub mod voice;
 
 pub mod environments;
+pub mod load_balancing;
 pub mod open_vsx;
+pub mod routes;
+pub mod wakeups;
 
 pub mod acp_registry;

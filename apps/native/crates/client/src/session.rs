@@ -122,6 +122,8 @@ pub struct Session {
     next_id: Arc<AtomicU64>,
     closed: watch::Receiver<Option<String>>,
     stream_queue: usize,
+    inbound_frames: Arc<AtomicU64>,
+    frame_notify: Arc<tokio::sync::Notify>,
 }
 
 pub struct StreamHandle {
@@ -193,10 +195,14 @@ impl Session {
         let (outbound, mut outbound_rx) = mpsc::unbounded_channel::<ClientMessage>();
         let pending: PendingMap = Arc::new(Mutex::new(Some(HashMap::new())));
         let (closed_tx, closed) = watch::channel(None);
+        let inbound_frames = Arc::new(AtomicU64::new(0));
+        let frame_notify = Arc::new(tokio::sync::Notify::new());
 
         // Acks go through a weak handle so the task does not keep its own session alive: when
         // every `Session` and `StreamHandle` is gone, `outbound_rx` closes and the socket shuts.
         let task_pending = pending.clone();
+        let task_frames = inbound_frames.clone();
+        let task_notify = frame_notify.clone();
         tokio::spawn(async move {
             let mut last_frame = Instant::now();
             let mut ping = tokio::time::interval(timing.ping_interval);
@@ -209,10 +215,17 @@ impl Session {
                             Some(Ok(Message::Text(text))) => text,
                             Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
                             Some(Ok(Message::Close(_))) => break "Server closed the connection.".into(),
-                            Some(Ok(_)) => { last_frame = Instant::now(); continue }
+                            Some(Ok(_)) => {
+                                last_frame = Instant::now();
+                                task_frames.fetch_add(1, Ordering::Release);
+                                task_notify.notify_waiters();
+                                continue;
+                            }
                             Some(Err(error)) => break describe_ws_error(error).into(),
                         };
                         last_frame = Instant::now();
+                        task_frames.fetch_add(1, Ordering::Release);
+                        task_notify.notify_waiters();
                         let text = match frame_parts.push(text) {
                             Ok(Some(whole)) => whole,
                             Ok(None) => continue,
@@ -259,7 +272,46 @@ impl Session {
             let _ = closed_tx.send(Some(reason.message));
         });
 
-        Ok(Session { outbound, pending, next_id: Arc::new(AtomicU64::new(1)), closed, stream_queue: timing.stream_queue })
+        Ok(Session {
+            outbound,
+            pending,
+            next_id: Arc::new(AtomicU64::new(1)),
+            closed,
+            stream_queue: timing.stream_queue,
+            inbound_frames,
+            frame_notify,
+        })
+    }
+
+    /// Count of inbound WebSocket frames received so far (`RpcSession.inboundFrames`).
+    pub fn inbound_frames(&self) -> u64 {
+        self.inbound_frames.load(Ordering::Acquire)
+    }
+
+    /// Sends a heartbeat ping and waits up to `timeout` for any inbound frame or `Pong`.
+    /// Returns `true` if the socket is alive, `false` if it timed out or closed.
+    pub async fn probe(&self, timeout: Duration) -> bool {
+        let before = self.inbound_frames.load(Ordering::Acquire);
+        if self.outbound.send(ClientMessage::Ping).is_err() {
+            return false;
+        }
+        let wait = async {
+            loop {
+                let notified = self.frame_notify.notified();
+                if self.inbound_frames.load(Ordering::Acquire) > before {
+                    return true;
+                }
+                tokio::select! {
+                    _ = notified => {
+                        if self.inbound_frames.load(Ordering::Acquire) > before {
+                            return true;
+                        }
+                    }
+                    _ = self.closed() => return false,
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.unwrap_or(false)
     }
 
     fn start(&self, tag: &str, payload: Value, entry: Pending) -> Result<RequestId, RpcError> {

@@ -6,15 +6,23 @@
 //! removing or disconnecting an SSH environment closes its tunnel and stops the remote server
 //! this app started; the SSH password prompts queue here for `ssh_prompt.rs`.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use gpui::Context;
 use t3_client::auth::{self, Credentials, Paired};
+use t3_client::load_balancing::{
+    CandidateProvider, DEFAULT_LOAD_BALANCING_WEIGHT, DraftEnvironmentCandidate,
+    attachments_block_auto_routing_warning, eligible_load_balancing_candidates,
+    load_balancing_send_warning, refresh_load_balanced_selection,
+};
 use t3_client::local::{self, LocalServer};
+use t3_client::routes::CandidateRoute;
 use t3_client::ssh::{DiscoveredSshHost, PasswordRequest, SshPairing, SshTarget};
 use t3_client::store::{self, SavedEnvironment};
-use t3_client::supervisor::Prepare;
-use t3_core::pairing::parse_pairing_link;
+use t3_client::supervisor::{ConnectionStatus, Prepare};
+use t3_core::pairing::{PairingCredentialResult, PeerPairingCodeError, parse_pairing_link};
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::toast::{Toast, ToastKind};
@@ -268,11 +276,19 @@ impl AppState {
 
     /// Starts the client for a saved environment with a credential. An SSH environment connects
     /// through its tunnel on this session's port, which the supervisor readies before each attempt.
+    /// Direct environments pass any persisted alternate routes for multi-route candidate fallback.
     pub(crate) fn start_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(environment) = self.environments.get(id).cloned() else { return };
         let Some(access_token) = environment.access_token.clone() else { return };
         let Some(target) = environment.ssh.clone() else {
-            return self.connections.watch(id, Credentials { http_base: environment.http_base, access_token }, None);
+            let alternate_routes = store::load_alternate_routes().remove(id).unwrap_or_default();
+            return self.connections.watch_with_routes(
+                id,
+                Credentials { http_base: environment.http_base, access_token },
+                alternate_routes,
+                environment.environment_id,
+                None,
+            );
         };
         let port = match self.ssh.session_port(&target) {
             Ok(port) => port,
@@ -282,12 +298,345 @@ impl AppState {
         if self.environments.relocate(id, &http_base) {
             self.persist_environments();
         }
-        let (ssh, expected, address) = (self.ssh.clone(), environment.environment_id, http_base.clone());
+        let (ssh, expected, address) = (self.ssh.clone(), environment.environment_id.clone(), http_base.clone());
         let prepare: Prepare = Arc::new(move || {
             let (ssh, target, expected, address) = (ssh.clone(), target.clone(), expected.clone(), address.clone());
             Box::pin(async move { ssh.prepare(&target, expected.as_deref(), &address).await })
         });
-        self.connections.watch(id, Credentials { http_base, access_token }, Some(prepare));
+        self.connections.watch_with_routes(
+            id,
+            Credentials { http_base, access_token },
+            Vec::new(),
+            environment.environment_id,
+            Some(prepare),
+        );
+    }
+
+    /// Persists alternate/learned direct routes for a saved environment (`CN-SESSION`).
+    pub fn record_environment_alternate_routes(&self, id: &str, routes: Vec<CandidateRoute>) {
+        let mut all = store::load_alternate_routes();
+        if routes.is_empty() {
+            if all.remove(id).is_some() {
+                store::save_alternate_routes(&all);
+            }
+            return;
+        }
+        if all.get(id) == Some(&routes) {
+            return;
+        }
+        all.insert(id.to_owned(), routes);
+        store::save_alternate_routes(&all);
+    }
+
+    /// Merges server-advertised direct endpoints into the persisted route table for each saved
+    /// environment so subsequent startups can fall back across learned routes (`CN-SESSION`).
+    pub fn sync_learned_environment_routes(&self) {
+        for env in &self.environments.environments {
+            if env.ssh.is_some() {
+                continue;
+            }
+            let reported = t3_client::supervisor::server_config_extras_for(&env.http_base)
+                .borrow()
+                .direct_endpoint_entries
+                .clone();
+            if reported.is_empty() {
+                continue;
+            }
+            let existing = store::load_alternate_routes().remove(&env.id).unwrap_or_default();
+            let primary = CandidateRoute::saved(env.http_base.clone());
+            let mut current = vec![primary.clone()];
+            current.extend(existing);
+            let env_id = env.environment_id.as_deref().unwrap_or(&env.id);
+            if let Some(updated) = t3_client::routes::merge_learned_routes(env_id, &current, &primary.id, &reported, true) {
+                let alternates = updated
+                    .into_iter()
+                    .filter(|candidate| candidate.http_base.trim_end_matches('/') != env.http_base.trim_end_matches('/'))
+                    .collect();
+                self.record_environment_alternate_routes(&env.id, alternates);
+            }
+        }
+    }
+
+    /// Resolves connected credentials for `environment_id` (matching canonical `environmentId` or
+    /// saved ID) if this device's session is connected and authorized to create pairing codes.
+    fn peer_pairing_credentials(&self, environment_id: &str) -> Result<Credentials, PeerPairingCodeError> {
+        for view in &self.fleet.environments {
+            let canonical = view
+                .config
+                .config
+                .as_ref()
+                .map(|cfg| cfg.environment.environment_id.as_str())
+                .filter(|id| !id.is_empty());
+            if view.summary.owner.saved_id != environment_id && canonical != Some(environment_id) {
+                continue;
+            }
+            if view.status != ConnectionStatus::Connected {
+                return Err(PeerPairingCodeError::unavailable(Some("The environment is not connected.".to_owned())));
+            }
+            if view.grants.as_ref().is_some_and(|grants| !grants.grants("access:write")) {
+                return Err(PeerPairingCodeError::not_allowed(None));
+            }
+            return self
+                .environments
+                .get(&view.summary.owner.saved_id)
+                .and_then(SavedEnvironment::credentials)
+                .ok_or_else(|| PeerPairingCodeError::unavailable(Some("Missing credentials.".to_owned())));
+        }
+        if let Some(active) = self.active_environment() {
+            let matches_active = active.id == environment_id
+                || active.environment_id.as_deref() == Some(environment_id)
+                || self
+                    .server_config
+                    .config
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.environment.environment_id == environment_id);
+            if matches_active {
+                if !matches!(self.phase, Phase::Online(ConnectionStatus::Connected)) {
+                    return Err(PeerPairingCodeError::unavailable(Some("The environment is not connected.".to_owned())));
+                }
+                if self
+                    .client_handle()
+                    .and_then(|c| c.session_state().borrow().clone())
+                    .is_some_and(|grants| !grants.grants("access:write"))
+                {
+                    return Err(PeerPairingCodeError::not_allowed(None));
+                }
+                return active
+                    .credentials()
+                    .ok_or_else(|| PeerPairingCodeError::unavailable(Some("Missing credentials.".to_owned())));
+            }
+        }
+        Err(PeerPairingCodeError::unavailable(Some("The environment is not connected.".to_owned())))
+    }
+
+    /// `mintPairingCodeOn` (`apps/web/src/state/peerPairingCode.ts`):
+    /// mints a fresh one-use pairing code on `environment_id` using this client's session there.
+    pub fn mint_pairing_code_on(
+        &self,
+        environment_id: &str,
+        access: &str,
+    ) -> impl Future<Output = Result<String, PeerPairingCodeError>> + Send + 'static + use<> {
+        let resolved = self.peer_pairing_credentials(environment_id);
+        let access = access.to_owned();
+        let runtime = self.runtime().clone();
+        async move {
+            let credentials = resolved?;
+            runtime
+                .spawn(async move { auth::mint_peer_pairing_code(&credentials, &access).await })
+                .await
+                .map_err(|error| PeerPairingCodeError::unavailable(Some(error.to_string())))?
+        }
+    }
+
+    /// `mintMcpApprovalCodeOn` (`apps/web/src/state/peerPairingCode.ts`):
+    /// mints a fresh one-use code on `environment_id` that approves one app's sign-in at `access`.
+    #[allow(dead_code)]
+    pub fn mint_mcp_approval_code_on(
+        &self,
+        environment_id: &str,
+        access: &str,
+    ) -> impl Future<Output = Result<PairingCredentialResult, PeerPairingCodeError>> + Send + 'static + use<> {
+        let resolved = self.peer_pairing_credentials(environment_id);
+        let access = access.to_owned();
+        let runtime = self.runtime().clone();
+        async move {
+            let credentials = resolved?;
+            runtime
+                .spawn(async move { auth::mint_mcp_approval_code(&credentials, &access).await })
+                .await
+                .map_err(|error| PeerPairingCodeError::unavailable(Some(error.to_string())))?
+        }
+    }
+
+    /// Collects connected fleet environments eligible for automatic load balancing
+    /// (`useDraftEnvironmentRouting.ts`).
+    pub fn load_balancing_candidates_for(
+        &self,
+        selected_provider_driver: Option<&str>,
+        active_provider_instance_id: Option<&str>,
+        referenced_thread_environment_ids: &[String],
+        weights: &HashMap<String, f64>,
+        project_key: Option<&str>,
+    ) -> Vec<DraftEnvironmentCandidate> {
+        let mut raw = Vec::new();
+        for view in &self.fleet.environments {
+            let saved_id = view.summary.owner.saved_id.clone();
+            let canonical_id = view
+                .config
+                .config
+                .as_ref()
+                .map(|c| c.environment.environment_id.clone())
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| saved_id.clone());
+            let project_id = project_key.and_then(|wanted| {
+                view.summary
+                    .projects
+                    .iter()
+                    .find(|p| p.project.id == wanted || p.project.workspace_root == wanted)
+                    .map(|p| p.project.id.clone())
+            });
+            let weight = weights
+                .get(&canonical_id)
+                .or_else(|| weights.get(&saved_id))
+                .copied()
+                .unwrap_or(DEFAULT_LOAD_BALANCING_WEIGHT);
+            let providers = view
+                .config
+                .config
+                .as_ref()
+                .map(|cfg| {
+                    cfg.providers
+                        .iter()
+                        .map(|provider| CandidateProvider {
+                            instance_id: provider.instance_id.clone(),
+                            driver: provider.driver.clone(),
+                            enabled: t3_core::providers::instance_enabled(
+                                &cfg.settings,
+                                project_id.as_deref(),
+                                &provider.instance_id,
+                            ),
+                            installed: provider.installed,
+                            status: provider.status.clone(),
+                            auth_status: (!provider.auth.status.is_empty()).then(|| provider.auth.status.clone()),
+                            availability: provider.availability.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            raw.push(DraftEnvironmentCandidate {
+                saved_id,
+                environment_id: canonical_id,
+                project_id,
+                connected: view.status == ConnectionStatus::Connected,
+                weight,
+                providers,
+            });
+        }
+        match selected_provider_driver {
+            Some(driver) if !driver.trim().is_empty() => eligible_load_balancing_candidates(
+                &raw,
+                referenced_thread_environment_ids,
+                driver,
+                active_provider_instance_id,
+            ),
+            _ => raw
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.connected
+                        && (project_key.is_none() || candidate.project_id.is_some())
+                        && candidate.weight.is_finite()
+                        && candidate.weight > 0.0
+                        && referenced_thread_environment_ids.iter().all(|env_id| env_id == &candidate.environment_id)
+                })
+                .collect(),
+        }
+    }
+
+    /// Evaluates host resources across eligible connected environments and routes the draft (or
+    /// active environment) to the least-loaded machine (`useLoadBalancedEnvironment.ts` +
+    /// `useDraftEnvironmentRouting.ts`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_draft_load_balanced(
+        &mut self,
+        selected_provider_driver: Option<String>,
+        active_provider_instance_id: Option<String>,
+        has_attachments: bool,
+        referenced_thread_environment_ids: Vec<String>,
+        weights: HashMap<String, f64>,
+        project_key: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if has_attachments {
+            let warn = attachments_block_auto_routing_warning();
+            self.show_toast(
+                Toast::new(ToastKind::Warning, warn.title)
+                    .description(warn.description)
+                    .key("load-balancing-attachments"),
+                cx,
+            );
+            return;
+        }
+        let candidates = self.load_balancing_candidates_for(
+            selected_provider_driver.as_deref(),
+            active_provider_instance_id.as_deref(),
+            &referenced_thread_environment_ids,
+            &weights,
+            project_key.as_deref(),
+        );
+        if candidates.is_empty() {
+            let warn = load_balancing_send_warning(false, &referenced_thread_environment_ids, &[]);
+            self.show_toast(Toast::new(ToastKind::Warning, warn.title).description(warn.description), cx);
+            return;
+        }
+        let candidate_env_ids: Vec<String> = candidates.iter().map(|c| c.environment_id.clone()).collect();
+        let active_id = self.environments.active.clone();
+        let active_client = self.client_handle();
+        let lookups: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                let immediate = (active_id.as_deref() == Some(candidate.saved_id.as_str()))
+                    .then(|| active_client.clone())
+                    .flatten();
+                let lookup = immediate.is_none().then(|| self.connections.client(&candidate.saved_id));
+                (
+                    candidate.saved_id.clone(),
+                    candidate.environment_id.clone(),
+                    candidate.project_id.clone(),
+                    candidate.weight,
+                    immediate,
+                    lookup,
+                )
+            })
+            .collect();
+        let runtime = self.runtime().clone();
+        let task = runtime.spawn(async move {
+            let mut query_inputs = Vec::new();
+            let mut meta = Vec::new();
+            for (saved_id, env_id, project_id, weight, immediate, lookup) in lookups {
+                let client = match immediate {
+                    Some(handle) => Some(handle),
+                    None => match lookup {
+                        Some(fut) => fut.await,
+                        None => None,
+                    },
+                };
+                if let Some(handle) = client {
+                    query_inputs.push((env_id.clone(), handle, weight));
+                }
+                meta.push((saved_id, env_id, project_id));
+            }
+            let winner_env_id = refresh_load_balanced_selection(query_inputs).await;
+            winner_env_id.and_then(|wanted| meta.into_iter().find(|(_, env_id, _)| env_id == &wanted))
+        });
+        cx.spawn(async move |this, cx| {
+            let winner = task.await.ok().flatten();
+            let _ = this.update(cx, |state, cx| {
+                if let Some((saved_id, _env_id, project_id)) = winner {
+                    let label = state
+                        .environments
+                        .get(&saved_id)
+                        .map(|e| e.label.clone())
+                        .unwrap_or_else(|| saved_id.clone());
+                    if state.environments.active.as_deref() != Some(saved_id.as_str()) {
+                        state.connect_environment(&saved_id, cx);
+                    }
+                    if let Some(pid) = project_id.filter(|p| !p.is_empty()) {
+                        state.start_draft(&pid, cx);
+                    }
+                    state.show_toast(
+                        Toast::new(ToastKind::Info, format!("Auto balance selected {label}")),
+                        cx,
+                    );
+                } else {
+                    let warn = load_balancing_send_warning(false, &referenced_thread_environment_ids, &candidate_env_ids);
+                    state.show_toast(
+                        Toast::new(ToastKind::Warning, warn.title).description(warn.description),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     /// The SSH tunnel had to move to another local port, and its client stopped. Reconnects

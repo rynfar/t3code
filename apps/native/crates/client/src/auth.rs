@@ -4,9 +4,16 @@
 
 use serde::{Deserialize, Serialize};
 use t3_core::auth::AuthSessionState;
-pub use t3_core::compatibility::ORCHESTRATION_PROTOCOL_VERSION;
-use t3_core::compatibility::protocol_mismatch;
-use t3_core::pairing::{PairingLink, websocket_base};
+pub use t3_core::compatibility::{
+    CLIENT_CAPABILITIES_QUERY_PARAM, ORCHESTRATION_PROTOCOL_QUERY_PARAM, ORCHESTRATION_PROTOCOL_VERSION,
+    SETTINGS_SECRET_REFERENCES_CAPABILITY,
+};
+use t3_core::compatibility::{append_orchestration_protocol, protocol_mismatch};
+use t3_core::pairing::{
+    MINT_PAIRING_CODE_TIMEOUT_MS, PairingCredentialResult, PairingLink, PeerPairingCodeError,
+    decode_pairing_credential_result, mcp_approval_code_request_body, peer_pairing_code_request_body,
+    websocket_base,
+};
 use t3_core::server_config::EnvironmentDescriptor;
 
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -68,10 +75,18 @@ fn http() -> reqwest::Client {
 
 /// `GET /.well-known/t3/environment`: who the server is and which protocol it speaks.
 pub async fn fetch_descriptor(http_base: &str) -> Result<EnvironmentDescriptor, AuthError> {
+    fetch_descriptor_timeout(http_base, std::time::Duration::from_secs(5)).await
+}
+
+/// `GET /.well-known/t3/environment` with an explicit timeout (used by multi-route probing).
+pub async fn fetch_descriptor_timeout(
+    http_base: &str,
+    timeout: std::time::Duration,
+) -> Result<EnvironmentDescriptor, AuthError> {
     let host = http_base.to_owned();
     let response = http()
-        .get(format!("{http_base}{DESCRIPTOR_PATH}"))
-        .timeout(std::time::Duration::from_secs(5))
+        .get(format!("{}{DESCRIPTOR_PATH}", http_base.trim_end_matches('/')))
+        .timeout(timeout)
         .send()
         .await
         .map_err(|source| AuthError::Unreachable { host: host.clone(), source })?;
@@ -239,18 +254,77 @@ pub async fn post_access(credentials: &Credentials, path: &str, body: Option<ser
     Ok(value)
 }
 
+/// Classifies an HTTP failure from `POST /api/auth/pairing-token` into `PeerPairingCodeError`
+/// (`packages/client-runtime/src/state/peerPairingCode.ts`).
+pub fn classify_peer_pairing_code_http_error(status: u16, body: &serde_json::Value) -> PeerPairingCodeError {
+    let tag = body.get("_tag").and_then(serde_json::Value::as_str);
+    let detail = body
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .map(str::to_owned);
+    if status == 403
+        || matches!(tag, Some("EnvironmentScopeRequiredError" | "EnvironmentOperationForbiddenError"))
+    {
+        PeerPairingCodeError::not_allowed(detail)
+    } else {
+        PeerPairingCodeError::unavailable(detail.or_else(|| Some(format!("HTTP {status}"))))
+    }
+}
+
+async fn post_pairing_credential(
+    credentials: &Credentials,
+    body: serde_json::Value,
+) -> Result<PairingCredentialResult, PeerPairingCodeError> {
+    let response = http()
+        .post(format!("{}/api/auth/pairing-token", credentials.http_base.trim_end_matches('/')))
+        .bearer_auth(&credentials.access_token)
+        .timeout(std::time::Duration::from_millis(MINT_PAIRING_CODE_TIMEOUT_MS))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| PeerPairingCodeError::unavailable(Some(error.to_string())))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        return Err(classify_peer_pairing_code_http_error(status.as_u16(), &value));
+    }
+    decode_pairing_credential_result(&value)
+        .ok_or_else(|| PeerPairingCodeError::unavailable(Some("Missing pairing credential in server response.".to_owned())))
+}
+
+/// `createPeerPairingCodeCommand` (`packages/client-runtime/src/state/peerPairingCode.ts`):
+/// mints a fresh one-use pairing code on `credentials` for peer linking at `access`.
+pub async fn mint_peer_pairing_code(
+    credentials: &Credentials,
+    access: &str,
+) -> Result<String, PeerPairingCodeError> {
+    post_pairing_credential(credentials, peer_pairing_code_request_body(access))
+        .await
+        .map(|minted| minted.credential)
+}
+
+/// `createMcpApprovalCodeCommand` (`packages/client-runtime/src/state/peerPairingCode.ts`):
+/// mints a fresh one-use approval code on `credentials` for an app sign-in at `access`.
+pub async fn mint_mcp_approval_code(
+    credentials: &Credentials,
+    access: &str,
+) -> Result<PairingCredentialResult, PeerPairingCodeError> {
+    post_pairing_credential(credentials, mcp_approval_code_request_body(access)).await
+}
+
 pub fn socket_url(credentials: &Credentials, ticket: &str) -> String {
     let mut url = url::Url::parse(&websocket_base(&credentials.http_base)).expect("valid ws base");
     url.query_pairs_mut()
         .append_pair("wsTicket", ticket)
-        .append_pair("orchestrationProtocol", &ORCHESTRATION_PROTOCOL_VERSION.to_string())
         .append_pair("clientSurface", "desktop")
         .append_pair("clientAppVersion", env!("CARGO_PKG_VERSION"))
         .append_pair("clientDeviceType", "desktop")
         .append_pair("clientOs", client_os())
         .append_pair("connectionMethod", "direct")
         .append_pair(SOCKET_FRAME_PARTS_QUERY_PARAM, "1");
-    url.to_string()
+    append_orchestration_protocol(url.as_str()).expect("valid ws url")
 }
 
 fn client_os() -> &'static str {
@@ -268,10 +342,23 @@ mod auth_tests {
     use super::*;
 
     #[test]
-    fn socket_url_opts_into_frame_parts() {
+    fn socket_url_opts_into_frame_parts_and_secret_references_capability() {
         let creds = Credentials { http_base: "https://studio.ts.net:3773".into(), access_token: "tok".into() };
         let url = socket_url(&creds, "tkt");
         assert!(url.contains("frameParts=1"), "{url}");
         assert!(url.contains("wsTicket=tkt"), "{url}");
+        assert!(url.contains("orchestrationProtocol=2"), "{url}");
+        assert!(url.contains("clientCapabilities=settingsSecretReferences"), "{url}");
+    }
+
+    #[test]
+    fn peer_pairing_code_error_classification_matches_web() {
+        let forbidden = classify_peer_pairing_code_http_error(
+            403,
+            &serde_json::json!({ "_tag": "EnvironmentScopeRequiredError", "message": "Missing access:write" }),
+        );
+        assert_eq!(forbidden.reason, t3_core::pairing::PeerPairingCodeErrorReason::NotAllowed);
+        let unavailable = classify_peer_pairing_code_http_error(503, &serde_json::json!({}));
+        assert_eq!(unavailable.reason, t3_core::pairing::PeerPairingCodeErrorReason::Unavailable);
     }
 }

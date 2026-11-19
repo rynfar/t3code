@@ -29,11 +29,30 @@ pub enum DotTone {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerEventLoopStall {
+    #[serde(default)]
+    pub detected_at: Option<String>,
     pub duration_ms: f64,
     #[serde(default)]
     pub load_average: Option<f64>,
     #[serde(default)]
     pub cpu_count: u32,
+}
+
+impl ServerEventLoopStall {
+    /// Stable deduplication key matching `HostFreezeToastCoordinator.ts` (`${environmentId}:${stall.detectedAt}`),
+    /// with a structural fallback for older servers omitting `detectedAt`.
+    pub fn dedup_key(&self, environment_id: &str) -> String {
+        if let Some(detected_at) = self.detected_at.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            format!("{environment_id}:{detected_at}")
+        } else {
+            format!(
+                "{environment_id}:{}:{:?}:{}",
+                self.duration_ms.to_bits(),
+                self.load_average.map(f64::to_bits),
+                self.cpu_count
+            )
+        }
+    }
 }
 
 /// `HostFreezeNotice` (`packages/client-runtime/src/connection/hostFreeze.ts`).
@@ -342,17 +361,20 @@ mod tests {
     #[test]
     fn host_freeze_notice_explains_cpu_overload_or_busy_host() {
         assert_eq!(host_freeze_notice("Studio", None), None);
-        let overloaded = host_freeze_notice(
-            "Studio",
-            Some(&ServerEventLoopStall { duration_ms: 12_400.0, load_average: Some(18.2), cpu_count: 8 }),
-        )
-        .expect("notice");
+        let stall = ServerEventLoopStall {
+            detected_at: Some("2026-11-19T01:02:03.000Z".into()),
+            duration_ms: 12_400.0,
+            load_average: Some(18.2),
+            cpu_count: 8,
+        };
+        assert_eq!(stall.dedup_key("env-1"), "env-1:2026-11-19T01:02:03.000Z");
+        let overloaded = host_freeze_notice("Studio", Some(&stall)).expect("notice");
         assert_eq!(overloaded.title, "Studio froze for 12s");
         assert_eq!(overloaded.description, "Its CPU is overloaded (load 18 on 8 cores).");
 
         let busy = host_freeze_notice(
             "Studio",
-            Some(&ServerEventLoopStall { duration_ms: 4_800.0, load_average: Some(2.0), cpu_count: 8 }),
+            Some(&ServerEventLoopStall { detected_at: None, duration_ms: 4_800.0, load_average: Some(2.0), cpu_count: 8 }),
         )
         .expect("notice");
         assert_eq!(busy.title, "Studio froze for 5s");

@@ -583,7 +583,7 @@ const out = (line: string) => process.stdout.write(`${line}\n`);
 const err = (line: string) => process.stderr.write(`${line}\n`);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function makeGit(repoRoot: string) {
+export function makeGit(repoRoot: string) {
   return (args: string[]) =>
     NodeChildProcess.execFileSync("git", ["-C", repoRoot, ...args], {
       encoding: "utf8",
@@ -639,13 +639,65 @@ async function listIssues(
   return JSON.parse(json);
 }
 
-interface MergeResult {
+const MERGE_MAX_BUFFER = 1 << 28;
+const MERGE_DETAIL_LIMIT = 4_000;
+
+export interface MergeResult {
   status: "merged" | "skipped" | "conflict" | "failed";
   detail: string;
   conflicts?: string[];
+  exitStatus?: number | null;
+  signal?: NodeJS.Signals | null;
+  error?: string;
 }
 
-function mergeUpstream(git: ReturnType<typeof makeGit>, repoRoot: string, to: string): MergeResult {
+export interface MergeUpstreamOptions {
+  /** Override spawnSync maxBuffer (primarily for tests reproducing oversized output). */
+  maxBuffer?: number;
+  /** Override git merge flags after `merge` (defaults to `["--no-edit", "--no-stat"]`). */
+  mergeFlags?: string[];
+}
+
+function boundDetail(text: string, limit = MERGE_DETAIL_LIMIT): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= limit) return trimmed;
+  const suffix = "… (truncated)";
+  return `${trimmed.slice(0, Math.max(0, limit - suffix.length)).trimEnd()}${suffix}`;
+}
+
+function firstLine(text: string): string {
+  const line = text
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .find((entry) => entry.length > 0);
+  return line ? boundDetail(line) : "";
+}
+
+function formatSpawnError(error: Error | undefined): string | undefined {
+  if (!error) return undefined;
+  const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
+  return code && !error.message.includes(code) ? `${code}: ${error.message}` : error.message;
+}
+
+function isAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
+  return (
+    NodeChildProcess.spawnSync("git", [
+      "-C",
+      repoRoot,
+      "merge-base",
+      "--is-ancestor",
+      ancestor,
+      descendant,
+    ]).status === 0
+  );
+}
+
+export function mergeUpstream(
+  git: ReturnType<typeof makeGit>,
+  repoRoot: string,
+  to: string,
+  options: MergeUpstreamOptions = {},
+): MergeResult {
   const branch = git(["branch", "--show-current"]).trim();
   if (branch !== "native")
     return { status: "skipped", detail: `current branch is "${branch}", not native` };
@@ -658,26 +710,100 @@ function mergeUpstream(git: ReturnType<typeof makeGit>, repoRoot: string, to: st
       detail: "origin/main moved during this run; rerun to digest the new range",
     };
   }
+  const beforeHead = revParse(git, "HEAD");
+  const mergeFlags = options.mergeFlags ?? ["--no-edit", "--no-stat"];
   const merge = NodeChildProcess.spawnSync(
     "git",
-    ["-C", repoRoot, "merge", "--no-edit", "origin/main"],
+    ["-C", repoRoot, "merge", ...mergeFlags, "origin/main"],
     {
       encoding: "utf8",
+      maxBuffer: options.maxBuffer ?? MERGE_MAX_BUFFER,
     },
   );
-  if (merge.status === 0)
-    return { status: "merged", detail: merge.stdout.trim().split("\n")[0] ?? "merged" };
+  const errorText = formatSpawnError(merge.error);
+  const diagnostics: Pick<MergeResult, "exitStatus" | "signal" | "error"> = {
+    ...(merge.status !== 0 ? { exitStatus: merge.status } : {}),
+    ...(merge.signal !== null ? { signal: merge.signal } : {}),
+    ...(errorText !== undefined ? { error: errorText } : {}),
+  };
+
+  if (merge.status === 0 && !merge.error && !merge.signal) {
+    return { status: "merged", detail: firstLine(merge.stdout || "") || "merged" };
+  }
+
   const conflicts = git(["diff", "--name-only", "--diff-filter=U"])
     .trim()
     .split("\n")
     .filter(Boolean);
-  const inProgress =
+  let inProgress =
     NodeChildProcess.spawnSync("git", ["-C", repoRoot, "rev-parse", "-q", "--verify", "MERGE_HEAD"])
       .status === 0;
+  const dirtyTracked = git(["status", "--porcelain", "--untracked-files=no"]).trim();
+
+  if (conflicts.length === 0 && dirtyTracked.length === 0) {
+    const afterHead = revParse(git, "HEAD");
+    const parents = git(["rev-list", "--parents", "-n", "1", "HEAD"]).trim().split(/\s+/).slice(1);
+    const committedMerge = parents.length === 2 && parents[0] === beforeHead && parents[1] === to;
+    const fastForward =
+      afterHead !== beforeHead && afterHead === to && isAncestor(repoRoot, beforeHead, to);
+    const alreadyUpToDate = afterHead === beforeHead && isAncestor(repoRoot, to, beforeHead);
+    // If git was killed while printing diffstat after committing HEAD, clear leftover MERGE_HEAD
+    // metadata with `merge --quit` (which never touches HEAD, index, or worktree).
+    if (inProgress && committedMerge) {
+      NodeChildProcess.spawnSync("git", ["-C", repoRoot, "merge", "--quit"]);
+      inProgress =
+        NodeChildProcess.spawnSync("git", [
+          "-C",
+          repoRoot,
+          "rev-parse",
+          "-q",
+          "--verify",
+          "MERGE_HEAD",
+        ]).status === 0;
+    }
+    if (!inProgress && (committedMerge || fastForward || alreadyUpToDate)) {
+      const summary =
+        firstLine(merge.stdout || "") ||
+        (committedMerge
+          ? `merged ${to.slice(0, 10)} into ${beforeHead.slice(0, 10)} as ${afterHead.slice(0, 10)}`
+          : fastForward
+            ? `fast-forwarded to ${afterHead.slice(0, 10)}`
+            : "Already up to date.");
+      const suffix = [
+        errorText ? `child error=${errorText}` : "",
+        merge.signal ? `signal=${merge.signal}` : "",
+        merge.status !== null && merge.status !== 0 ? `exit=${merge.status}` : "",
+      ]
+        .filter(Boolean)
+        .join(", ");
+      return {
+        status: "merged",
+        detail: suffix ? `${summary} (${suffix})` : summary,
+        ...diagnostics,
+      };
+    }
+  }
+
   if (inProgress) NodeChildProcess.spawnSync("git", ["-C", repoRoot, "merge", "--abort"]);
-  if (conflicts.length > 0)
-    return { status: "conflict", detail: "merge aborted; branch unchanged", conflicts };
-  return { status: "failed", detail: (merge.stderr || merge.stdout).trim() };
+  if (conflicts.length > 0) {
+    return {
+      status: "conflict",
+      detail: "merge aborted; branch unchanged",
+      conflicts,
+      ...diagnostics,
+    };
+  }
+  const parts = [
+    errorText ? `error=${errorText}` : "",
+    merge.signal ? `signal=${merge.signal}` : "",
+    merge.status !== null && merge.status !== 0 ? `exit=${merge.status}` : "",
+    boundDetail(merge.stderr || merge.stdout || ""),
+  ].filter(Boolean);
+  return {
+    status: "failed",
+    detail: parts.join(" | ") || "git merge failed without output",
+    ...diagnostics,
+  };
 }
 
 async function fileIssues(digest: Digest, repo: string, dryRun: boolean): Promise<string[]> {

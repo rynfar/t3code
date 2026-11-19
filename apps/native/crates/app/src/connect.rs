@@ -18,7 +18,10 @@ use t3_client::ssh::{DiscoveredSshHost, SshTarget};
 use t3_client::status::{DotTone, HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
 use t3_client::store::SavedEnvironment;
 use t3_core::compatibility::resolve_version_mismatch;
-use t3_core::pairing::session_has_legacy_permissions;
+use t3_core::pairing::{
+    ANOTHER_ADDRESS, LinkMachineBadge, LinkableMachine, link_destination, link_machine_badge as resolve_link_machine_badge,
+    link_machine_select_label, session_has_legacy_permissions,
+};
 use t3_core::ssh::{filter_hosts, format_target, parse_manual_target};
 
 use crate::app_state::{AppEvent, AppState};
@@ -72,6 +75,205 @@ pub fn status_dot(tone: Option<DotTone>, cx: &App) -> Div {
         None => hsla(p.muted_foreground).opacity(0.4),
     };
     div().size(px(12.)).flex_none().flex().items_center().justify_center().child(div().size(px(8.)).rounded_full().bg(color))
+}
+
+/// `EnvironmentMachineIcon` (`apps/web/src/components/EnvironmentMachineIcon.tsx`).
+pub fn environment_machine_icon(kind: Option<&str>) -> Icon {
+    match kind {
+        Some("cloud") => Icon::Cloud,
+        Some("linux") => Icon::Linux,
+        Some("desktop") => Icon::Monitor,
+        Some("laptop") => Icon::Laptop,
+        Some("mac-mini") => Icon::MacMini,
+        Some("mac-studio") => Icon::MacStudio,
+        _ => Icon::Server,
+    }
+}
+
+/// `LinkAddressWarning` (`apps/web/src/components/settings/LinkMachineSelect.tsx`):
+/// shown wherever a link goes to an address this app does not already know for a machine.
+pub fn link_address_warning(address: &str, cx: &App) -> Div {
+    let p = palette(cx);
+    let destination = link_destination(address);
+    v_flex()
+        .px(px(12.))
+        .py(px(10.))
+        .gap(px(4.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(hsla(p.warning).opacity(0.35))
+        .bg(hsla(p.warning_surface))
+        .child(
+            h_flex()
+                .gap(px(6.))
+                .items_center()
+                .child(Icon::TriangleAlert.render(px(14.), hsla(p.warning_foreground)))
+                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.warning_foreground)).child("Check this address")),
+        )
+        .child(
+            div()
+                .text_xs()
+                .line_height(px(18.))
+                .text_color(hsla(p.muted_foreground))
+                .child("This app cannot confirm it is one of your machines. The pairing code you paste is sent there."),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_color(hsla(p.foreground))
+                .child(destination),
+        )
+}
+
+/// `LinkMachineBadge` (`apps/web/src/components/settings/LinkMachineSelect.tsx`).
+pub fn link_machine_badge(machine: &LinkableMachine, cx: &App) -> Option<Div> {
+    let badge = resolve_link_machine_badge(machine)?;
+    let p = palette(cx);
+    let (bg, border, fg) = match badge {
+        LinkMachineBadge::Linked => (hsla(p.success).opacity(0.14), hsla(p.success).opacity(0.35), hsla(p.success_foreground)),
+        LinkMachineBadge::T3Connect | LinkMachineBadge::NotConnected => (hsla(p.background), hsla(p.border), hsla(p.muted_foreground)),
+    };
+    Some(
+        div()
+            .flex_none()
+            .px(px(6.))
+            .py(px(2.))
+            .rounded(px(999.))
+            .border_1()
+            .border_color(border)
+            .bg(bg)
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(fg)
+            .child(badge.label()),
+    )
+}
+
+/// `LinkMachineSelect` (`apps/web/src/components/settings/LinkMachineSelect.tsx`):
+/// the user's other machines, including those on T3 Connect, followed by `"Another address…"`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_link_machine_select(
+    id: impl Into<SharedString>,
+    machines: &[LinkableMachine],
+    selected: Option<&str>,
+    open: bool,
+    disabled: bool,
+    on_toggle: impl Fn(&mut Window, &mut App) + 'static,
+    on_select: impl Fn(String, &mut Window, &mut App) + Clone + 'static,
+    cx: &App,
+) -> Div {
+    let id = id.into();
+    let p = palette(cx);
+    let selected_machine = selected
+        .filter(|value| *value != ANOTHER_ADDRESS)
+        .and_then(|value| machines.iter().find(|candidate| candidate.environment_id == value));
+    let trigger_label = link_machine_select_label(machines, selected);
+
+    let trigger = h_flex()
+        .id(SharedString::from(format!("{id}-trigger")))
+        .w_full()
+        .h(px(32.))
+        .px(px(10.))
+        .gap(px(8.))
+        .items_center()
+        .justify_between()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(hsla(p.input))
+        .bg(hsla(p.background))
+        .when(disabled, |this| this.opacity(0.6))
+        .when(!disabled, |this| {
+            this.cursor_pointer()
+                .hover(|this| this.bg(hsla(p.accent)))
+                .on_click(move |_, window, cx| on_toggle(window, cx))
+        })
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(8.))
+                .items_center()
+                .when_some(selected_machine, |this, machine| {
+                    this.child(
+                        environment_machine_icon(machine.machine.as_deref())
+                            .render(px(14.), hsla(p.muted_foreground).opacity(0.8)),
+                    )
+                })
+                .child(div().min_w_0().truncate().text_sm().text_color(hsla(p.foreground)).child(trigger_label)),
+        )
+        .child(
+            (if open { Icon::ChevronUp } else { Icon::ChevronDown })
+                .render(px(14.), hsla(p.icon_muted).opacity(0.8)),
+        );
+
+    let mut container = v_flex()
+        .gap(px(6.))
+        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Machine"))
+        .child(trigger);
+
+    if open && !disabled {
+        let mut list = v_flex()
+            .p(px(4.))
+            .gap(px(2.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(hsla(p.border))
+            .bg(hsla(p.popover));
+
+        for (index, machine) in machines.iter().enumerate() {
+            let is_selected = selected == Some(machine.environment_id.as_str());
+            let env_id = machine.environment_id.clone();
+            let select_cb = on_select.clone();
+            list = list.child(
+                h_flex()
+                    .id(SharedString::from(format!("{id}-opt-{index}")))
+                    .w_full()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .gap(px(8.))
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(is_selected, |this| this.bg(hsla(p.accent)))
+                    .hover(|this| this.bg(hsla(p.accent)))
+                    .on_click(move |_, window, cx| select_cb(env_id.clone(), window, cx))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(8.))
+                            .items_center()
+                            .child(
+                                environment_machine_icon(machine.machine.as_deref())
+                                    .render(px(14.), hsla(p.muted_foreground).opacity(0.8)),
+                            )
+                            .child(div().min_w_0().truncate().text_sm().text_color(hsla(p.foreground)).child(machine.label.clone())),
+                    )
+                    .children(link_machine_badge(machine, cx)),
+            );
+        }
+
+        let another_selected = selected == Some(ANOTHER_ADDRESS);
+        let select_another = on_select;
+        list = list.child(
+            h_flex()
+                .id(SharedString::from(format!("{id}-another")))
+                .w_full()
+                .px(px(8.))
+                .py(px(6.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(another_selected, |this| this.bg(hsla(p.accent)))
+                .hover(|this| this.bg(hsla(p.accent)))
+                .on_click(move |_, window, cx| select_another(ANOTHER_ADDRESS.to_owned(), window, cx))
+                .child(div().text_sm().text_color(hsla(p.foreground)).child("Another address\u{2026}")),
+        );
+        container = container.child(list);
+    }
+
+    container
 }
 
 fn label(text: impl Into<SharedString>, cx: &App) -> Div {
@@ -545,6 +747,8 @@ impl ConnectView {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.dismissed_permission_notice.insert(dismiss_env.clone(), true);
                                 t3_client::store::save_ui_state(&dismiss_key, &serde_json::Value::Bool(true));
+                                let toast_key = format!("permission-update:{dismiss_env}");
+                                this.state.update(cx, |state, cx| state.close_toast_by_key(&toast_key, cx));
                                 cx.notify();
                             })),
                     ),
@@ -726,17 +930,44 @@ impl ConnectView {
     }
 
     fn render_saved(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let environments = self.state.read(cx).environments.environments.clone();
+        let state = self.state.read(cx);
+        let environments = state.environments.environments.clone();
         if environments.is_empty() {
             return None;
         }
+        let connected_count = state
+            .fleet
+            .environments
+            .iter()
+            .filter(|view| view.status == t3_client::supervisor::ConnectionStatus::Connected)
+            .count();
+        let lb_doc = crate::settings::client_settings(cx);
+        let lb_enabled = t3_core::settings::read_load_balancing_enabled(lb_doc);
+        let lb_weights = t3_core::settings::read_load_balancing_weights(lb_doc);
         let divider = hsla(palette(cx).border).opacity(0.5);
         let rows: Vec<_> = environments
             .iter()
             .enumerate()
             .map(|(index, environment)| div().when(index > 0, |this| this.border_t_1().border_color(divider)).child(self.render_saved_row(environment, cx)))
             .collect();
-        Some(v_flex().gap(px(8.)).child(label("Saved environments", cx)).child(card(cx).children(rows)))
+        let header = h_flex()
+            .justify_between()
+            .items_center()
+            .child(label("Saved environments", cx))
+            .when(lb_enabled && connected_count >= 2, |this| {
+                let weights: HashMap<String, f64> = lb_weights.into_iter().map(|(k, v)| (k, f64::from(v))).collect();
+                this.child(
+                    Button::new("connect-auto-balance", ButtonVariant::Outline, ButtonSize::Compact)
+                        .label("Auto balance")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let weights = weights.clone();
+                            this.state.update(cx, |state, cx| {
+                                state.route_draft_load_balanced(None, None, false, Vec::new(), weights, None, cx);
+                            });
+                        })),
+                )
+            });
+        Some(v_flex().gap(px(8.)).child(header).child(card(cx).children(rows)))
     }
 
     /// `renderConnectionModeCard`.
@@ -950,5 +1181,77 @@ impl Render for ConnectView {
                         .child(self.render_add(cx)),
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_machine_icon_maps_every_machine_kind() {
+        assert_eq!(environment_machine_icon(Some("cloud")), Icon::Cloud);
+        assert_eq!(environment_machine_icon(Some("linux")), Icon::Linux);
+        assert_eq!(environment_machine_icon(Some("desktop")), Icon::Monitor);
+        assert_eq!(environment_machine_icon(Some("laptop")), Icon::Laptop);
+        assert_eq!(environment_machine_icon(Some("mac-mini")), Icon::MacMini);
+        assert_eq!(environment_machine_icon(Some("mac-studio")), Icon::MacStudio);
+        assert_eq!(environment_machine_icon(Some("server")), Icon::Server);
+        assert_eq!(environment_machine_icon(None), Icon::Server);
+    }
+
+    #[gpui::test]
+    async fn link_machine_select_renders_badges_and_address_warning(cx: &mut gpui::TestAppContext) {
+        struct Preview(Vec<LinkableMachine>);
+        impl Render for Preview {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                v_flex()
+                    .gap_2()
+                    .child(render_link_machine_select(
+                        "test-link-machine",
+                        &self.0,
+                        Some(ANOTHER_ADDRESS),
+                        true,
+                        false,
+                        |_, _| {},
+                        |_, _, _| {},
+                        cx,
+                    ))
+                    .child(link_address_warning("https://box.example.ts.net:3773/pair#token=abc", cx))
+            }
+        }
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let machines = vec![
+            LinkableMachine {
+                environment_id: "env-a".into(),
+                label: "Studio".into(),
+                machine: Some("mac-studio".into()),
+                urls: vec!["https://studio.ts.net:3773".into()],
+                connected: true,
+                connect_only: false,
+                linked: true,
+            },
+            LinkableMachine {
+                environment_id: "env-b".into(),
+                label: "Cloud Box".into(),
+                machine: Some("cloud".into()),
+                urls: vec!["https://cloud.example:3773".into()],
+                connected: false,
+                connect_only: true,
+                linked: false,
+            },
+        ];
+        let window = cx.open_window(gpui::size(px(480.), px(360.)), |_, _| Preview(machines));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
     }
 }

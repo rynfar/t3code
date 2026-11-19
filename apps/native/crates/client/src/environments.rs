@@ -121,6 +121,8 @@ enum Command {
         id: String,
         generation: u64,
         credentials: Credentials,
+        alternate_routes: Vec<crate::routes::CandidateRoute>,
+        expected_environment_id: Option<String>,
         prepare: Option<Prepare>,
     },
     Activate(Option<String>),
@@ -175,6 +177,18 @@ impl Environments {
     }
 
     pub fn watch(&mut self, id: &str, credentials: Credentials, prepare: Option<Prepare>) {
+        self.watch_with_routes(id, credentials, Vec::new(), None, prepare);
+    }
+
+    /// `watch` with alternate candidate routes and expected canonical `environmentId` (`CN-SESSION`).
+    pub fn watch_with_routes(
+        &mut self,
+        id: &str,
+        credentials: Credentials,
+        alternate_routes: Vec<crate::routes::CandidateRoute>,
+        expected_environment_id: Option<String>,
+        prepare: Option<Prepare>,
+    ) {
         if self
             .leases
             .get(id)
@@ -189,6 +203,8 @@ impl Environments {
             id: id.into(),
             generation: self.generation,
             credentials,
+            alternate_routes,
+            expected_environment_id,
             prepare,
         });
     }
@@ -587,10 +603,16 @@ async fn run(
                     });
                     let _ = reply.send(snapshot);
                 }
-                Some(Command::Watch { id, generation, credentials, prepare }) => {
+                Some(Command::Watch { id, generation, credentials, alternate_routes, expected_environment_id, prepare }) => {
                     if entries.get(&id).is_some_and(|e| e.credentials == credentials) { continue; }
                     let prior = entries.remove(&id);
-                    let (client, events) = supervisor::start_prepared(&tokio::runtime::Handle::current(), credentials.clone(), prepare);
+                    let (client, events) = supervisor::start_with_routes(
+                        &tokio::runtime::Handle::current(),
+                        credentials.clone(),
+                        alternate_routes,
+                        expected_environment_id,
+                        prepare,
+                    );
                     let (tx, key, epoch) = (frames.clone(), id.clone(), generation);
                     let relay = tokio::spawn(relay_events(events, client.session_state(), client.connection_generation(), tx, key, epoch));
                     let mut shell = prior.as_ref().map(|e| e.shell.clone()).unwrap_or_default();
