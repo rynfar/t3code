@@ -24,6 +24,7 @@ use t3_client::session::RpcError;
 use t3_core::pull_requests::failure_message;
 use tokio::task::JoinHandle;
 
+pub(crate) use detail::{DetailView, Tab as DetailTab};
 pub use link_dialog::LinkPullRequestDialog;
 pub use page::PullRequestsPage;
 pub use thread_panel::ThreadPullRequestsPanel;

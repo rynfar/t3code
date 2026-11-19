@@ -51,9 +51,18 @@ impl AppState {
         }
     }
 
-    /// A breadcrumb opened a folder: in place of `surface_id`, or beside it when `keep_source`.
-    pub fn navigate_file_folder(&mut self, surface_id: &str, folder: &str, keep_source: bool, cx: &mut Context<Self>) {
-        self.mutate_panels(cx, |state, thread| state.panels.navigate_folder(thread, surface_id, folder, keep_source));
+    /// A breadcrumb opened a folder while keeping its deeper `folder_trail` (`FileBreadcrumbs.tsx`).
+    pub fn navigate_file_folder_with_trail(
+        &mut self,
+        surface_id: &str,
+        folder: &str,
+        folder_trail: &str,
+        keep_source: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.mutate_panels(cx, |state, thread| {
+            state.panels.navigate_folder_with_trail(thread, surface_id, folder, folder_trail, keep_source)
+        });
     }
 
     /// "Copy mention".

@@ -2,11 +2,12 @@
 //! "Open a surface" launcher (`RightPanelEmptyState`) from `components/RightPanelTabs.tsx`.
 
 use gpui::{AnyElement, App, ElementId, Entity, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, WindowControlArea, div, prelude::*, px};
+use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
-use gpui_component::{h_flex, v_flex};
+use gpui_component::{Sizable, h_flex, v_flex};
 use t3_core::right_panel::{Surface, SurfaceKind, ThreadPanel};
 
-use super::{Button, Size, Variant, focusable, header_controls};
+use super::{Button, Size, Variant, focusable, header_controls_with_options};
 use crate::app_state::AppState;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -39,10 +40,18 @@ fn server_thread_unavailable(state: &AppState, _: &App) -> Option<&'static str> 
     state.selected_thread.is_none().then_some("Available for server threads.")
 }
 
+fn terminal_unavailable(state: &AppState, cx: &App) -> Option<&'static str> {
+    if state.file_workspace().is_none() {
+        return Some("Available when a project is open.");
+    }
+    (!crate::terminal::can_operate_terminals(cx)).then_some("Pair this client again with terminal access to open terminals.")
+}
+
 const SURFACE_ACTIONS: &[SurfaceAction] = &[
     SurfaceAction { label: "Browser", icon: Icon::Earth, shortcut: "B", open: crate::preview::add_browser_surface, unavailable: browser_unavailable },
     SurfaceAction { label: "Files", icon: Icon::Files, shortcut: "F", open: AppState::add_files_surface, unavailable: files_unavailable },
     SurfaceAction { label: "Diff", icon: Icon::FileDiff, shortcut: "D", open: AppState::add_diff_surface, unavailable: server_thread_unavailable },
+    SurfaceAction { label: "Terminal", icon: Icon::SquareTerminal, shortcut: "T", open: AppState::add_terminal_surface, unavailable: terminal_unavailable },
     SurfaceAction { label: "Linked pull requests", icon: Icon::Link2, shortcut: "L", open: AppState::add_pull_requests_surface, unavailable: server_thread_unavailable },
     SurfaceAction { label: "Device", icon: Icon::Smartphone, shortcut: "M", open: crate::device::add_device_surface, unavailable: always },
 ];
@@ -87,11 +96,14 @@ pub fn open_surface(state: &mut AppState, label: &str, cx: &mut gpui::Context<Ap
 }
 
 fn surface_icon(surface: &Surface) -> Icon {
-    match surface.kind {
+    match &surface.kind {
         SurfaceKind::Diff => Icon::FileDiff,
         SurfaceKind::PullRequests => Icon::Link2,
-        SurfaceKind::Files => Icon::Files,
+        SurfaceKind::PullRequest { .. } => Icon::GitPullRequest,
+        SurfaceKind::Files { .. } => Icon::Files,
+        SurfaceKind::File { attachment: Some(_), .. } => Icon::Paperclip,
         SurfaceKind::File { .. } => Icon::File,
+        SurfaceKind::Terminal { .. } => Icon::SquareTerminal,
         SurfaceKind::SideChat { .. } => Icon::MessagesSquare,
         SurfaceKind::Preview { .. } => Icon::Earth,
         SurfaceKind::Device { .. } => Icon::Smartphone,
@@ -139,12 +151,16 @@ pub(super) fn add_menu_entries(state: &AppState, cx: &App) -> Vec<AddMenuEntry> 
     entries
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn tab_bar(
     state: Entity<AppState>,
     panel: &ThreadPanel,
     titlebar_inset: bool,
+    sheet_mode: bool,
     add_menu_open: bool,
+    renaming: Option<(&str, &Entity<InputState>)>,
     on_toggle_add: impl Fn(&mut Window, &mut App) + 'static,
+    on_start_rename: impl Fn(String, String, &mut Window, &mut App) + Clone + 'static,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -155,7 +171,8 @@ pub fn tab_bar(
         .enumerate()
         .map(|(index, surface)| {
             let active = panel.active_surface_id.as_deref() == Some(surface.id.as_str());
-            tab(state.clone(), surface, index, count, active, window, cx)
+            let rename_input = renaming.and_then(|(id, input)| (id == surface.id).then_some(input));
+            tab(state.clone(), surface, index, count, active, rename_input, on_start_rename.clone(), window, cx)
         })
         .collect();
     let add_tooltip = crate::keymap::label("rightPanel.new", cx)
@@ -184,7 +201,7 @@ pub fn tab_bar(
                         .on_click(move |_, window, cx| on_toggle_add(window, cx)),
                 ),
         )
-        .child(header_controls(&state, cx))
+        .child(header_controls_with_options(&state, !sheet_mode, cx))
         .into_any_element()
 }
 
@@ -250,19 +267,35 @@ pub(super) fn render_add_menu(
     .into_any_element()
 }
 
-fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, active: bool, window: &mut Window, cx: &mut App) -> AnyElement {
+#[allow(clippy::too_many_arguments)]
+fn tab(
+    state: Entity<AppState>,
+    surface: &Surface,
+    index: usize,
+    count: usize,
+    active: bool,
+    rename_input: Option<&Entity<InputState>>,
+    on_start_rename: impl Fn(String, String, &mut Window, &mut App) + Clone + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let p = palette(cx);
     let side_chat = surface.side_chat_thread().and_then(|id| state.read(cx).thread_shell(id));
-    let title: SharedString = match (side_chat, surface.preview_tab()) {
-        (Some(thread), _) => thread.title.clone().into(),
-        (None, Some(tab)) => {
+    let title: SharedString = match &surface.kind {
+        SurfaceKind::SideChat { .. } => side_chat.map_or_else(|| surface.title(), |thread| thread.title.clone()).into(),
+        SurfaceKind::Preview { resource_id: Some(tab) } => {
             let previews = crate::preview::previews(cx);
             let thread_key = state.read(cx).panel_thread();
             let snapshot = previews.as_ref().zip(thread_key.as_deref()).and_then(|(previews, thread)| previews.read(cx).session(thread, tab));
             t3_core::preview::tab_title(snapshot).into()
         }
-        (None, None) => surface.title().into(),
+        SurfaceKind::Terminal { active_terminal_id, .. } => {
+            let thread_key = state.read(cx).panel_thread().unwrap_or_default();
+            crate::terminal::terminal_label(&thread_key, active_terminal_id, cx).into()
+        }
+        _ => surface.title().into(),
     };
+    let is_device = matches!(surface.kind, SurfaceKind::Device { .. });
     // Static dot: a side chat tab can stay open for a whole run.
     let dot = side_chat.and_then(t3_core::side_chat::TabState::of).map(|tab_state| match tab_state {
         t3_core::side_chat::TabState::Running => hsla(p.muted_foreground),
@@ -270,14 +303,28 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
     });
     let id = surface.id.clone();
     let file_path = match &surface.kind {
-        SurfaceKind::File { relative_path, .. } => Some(relative_path.clone()),
+        SurfaceKind::File { relative_path, attachment: None, .. } => Some(relative_path.clone()),
         _ => None,
     };
     let (activate, close, middle) = (state.clone(), state.clone(), state.clone());
     let (activate_id, close_id, middle_id) = (id.clone(), id.clone(), id.clone());
+    let rename_id_click = id.clone();
+    let rename_title_click = title.to_string();
+    let on_rename_click = on_start_rename.clone();
+    let rename_id_menu = id.clone();
+    let rename_title_menu = title.to_string();
+    let on_rename_menu = on_start_rename;
     let group: SharedString = format!("tab-{id}").into();
     let icon_color = hsla(if active { p.foreground } else { p.muted_foreground });
     let tab_id = ElementId::from(SharedString::from(format!("right-panel-tab-{id}")));
+    let label_el = match rename_input {
+        Some(input) => div()
+            .w(px(96.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(Input::new(input).xsmall())
+            .into_any_element(),
+        None => div().min_w_0().truncate().child(title.clone()).into_any_element(),
+    };
     focusable(div().id(tab_id.clone()), tab_id, true, window, cx)
         .group(group.clone())
         .flex()
@@ -296,7 +343,13 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
             this.text_color(hsla(p.muted_foreground))
                 .hover(|style| style.bg(hsla(p.accent).opacity(0.6)).text_color(hsla(p.foreground)))
         })
-        .on_click(move |_, _, cx| activate.update(cx, |state, cx| state.activate_surface(&activate_id, cx)))
+        .on_click(move |event, window, cx| {
+            if is_device && event.click_count() == 2 {
+                on_rename_click(rename_id_click.clone(), rename_title_click.clone(), window, cx);
+                return;
+            }
+            activate.update(cx, |state, cx| state.activate_surface(&activate_id, cx));
+        })
         .on_mouse_up(MouseButton::Middle, move |_, _, cx| {
             middle.update(cx, |state, cx| state.close_surface(&middle_id, cx));
         })
@@ -342,7 +395,7 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
                 )
                 .children(dot.map(|dot| div().absolute().top(px(0.)).right(px(0.)).size(px(6.)).rounded_full().bg(dot))),
         )
-        .child(div().min_w_0().truncate().child(title))
+        .child(label_el)
         .context_menu(move |menu, _, _| {
             let item = |label: &'static str, disabled: bool, run: fn(&mut AppState, &str, &mut gpui::Context<AppState>)| {
                 let state = state.clone();
@@ -357,6 +410,16 @@ fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, a
                     menu.item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| state.update(cx, |state, cx| state.copy_file_path(&path, cx))))
                 }
                 None => menu,
+            };
+            let menu = if is_device {
+                let on_rename = on_rename_menu.clone();
+                let rename_id = rename_id_menu.clone();
+                let rename_title = rename_title_menu.clone();
+                menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                    on_rename(rename_id.clone(), rename_title.clone(), window, cx);
+                }))
+            } else {
+                menu
             };
             menu.item(item("Close", false, |state, id, cx| state.close_surface(id, cx)))
                 .item(item("Close others", count <= 1, |state, id, cx| state.close_other_surfaces(id, cx)))

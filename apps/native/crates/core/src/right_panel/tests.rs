@@ -533,3 +533,369 @@ fn renamed_device_tabs_reopen_in_the_lists_place_with_their_name() {
     assert_eq!(ids(&panels, "t"), ["diff", "device:local:A"]);
     assert_eq!(panels.panel("t").active().map(Surface::title).as_deref(), Some("Test phone"));
 }
+
+#[test]
+fn narrow_window_sheet_mode_and_widths_match_web_breakpoints() {
+    assert!(is_sheet_mode(SHEET_BREAKPOINT));
+    assert!(is_sheet_mode(760.));
+    assert!(!is_sheet_mode(SHEET_BREAKPOINT + 1.));
+    // <= 760px: min(88vw, 24rem = 384px)
+    assert!((sheet_width(400.) - 352.).abs() < 0.01);
+    assert_eq!(sheet_width(600.), 384.);
+    assert_eq!(sheet_width(760.), 384.);
+    // 761..=980px: min(42vw, 28rem = 448px), min-w-80 = 320px, floored to pixels
+    assert_eq!(sheet_width(900.), 378.);
+    assert_eq!(sheet_width(980.), 411.);
+}
+
+#[test]
+fn terminal_panel_tabs_split_activate_close_persist_and_skip_closed_history() {
+    let mut panels = RightPanels::default();
+    assert!(panels.open_terminal("t", "term-2"));
+    assert_eq!(ids(&panels, "t"), ["terminal:term-2"]);
+    assert_eq!(panels.panel_terminal_ids("t"), HashSet::from(["term-2".to_owned()]));
+    assert!(panels.split_terminal("t", "terminal:term-2", "term-3", SplitDirection::Vertical));
+    assert!(panels.split_terminal("t", "terminal:term-2", "term-4", SplitDirection::Horizontal));
+    assert!(panels.split_terminal("t", "terminal:term-2", "term-5", SplitDirection::Horizontal));
+    // Capped at MAX_TERMINALS_PER_GROUP (4).
+    assert!(!panels.split_terminal("t", "terminal:term-2", "term-6", SplitDirection::Horizontal));
+    assert_eq!(
+        panels.panel_terminal_ids("t"),
+        HashSet::from(["term-2".into(), "term-3".into(), "term-4".into(), "term-5".into()])
+    );
+    assert!(panels.activate_terminal("t", "terminal:term-2", "term-3"));
+    // Round-trip persistence keeps valid terminal tabs.
+    let saved = serde_json::to_value(&panels).unwrap();
+    let restored = RightPanels::from_value(&saved);
+    assert_eq!(restored.panel("t").surfaces, panels.panel("t").surfaces);
+    // Closing terminals inside a split keeps the tab until the last terminal closes.
+    assert!(panels.close_terminal("t", "terminal:term-2", "term-3"));
+    assert!(panels.close_terminal("t", "terminal:term-2", "term-4"));
+    assert!(panels.close_terminal("t", "terminal:term-2", "term-5"));
+    assert!(panels.is_open("t"));
+    assert!(panels.close_terminal("t", "terminal:term-2", "term-2"));
+    assert!(!panels.is_open("t"));
+    assert!(panels.closed_views().is_empty(), "terminal tabs are never remembered for cmd-shift-t");
+}
+
+#[test]
+fn pull_request_tabs_track_detail_tab_strip_reveal_url_and_reopen() {
+    let reveal_url = "https://github.com/owner/repo/pull/42#discussion_r1";
+    let target = PullRequestTarget {
+        environment_id: None,
+        project_id: "proj-1".into(),
+        host: Some("github.com".into()),
+        repository: "owner/repo".into(),
+        number: 42,
+        url: Some("https://github.com/owner/repo/pull/42".into()),
+        reveal_url: Some(reveal_url.into()),
+        detail_tab: Some(PullRequestDetailTab::Summary),
+    };
+    let expected_id = pull_request_surface_id(None, "proj-1", Some("github.com"), "owner/repo", 42);
+    let mut panels = RightPanels::default();
+    assert!(panels.open_pull_request("t", target));
+    assert_eq!(ids(&panels, "t"), [expected_id.as_str()]);
+    assert_eq!(panels.active_surface("t").map(Surface::title).as_deref(), Some("#42"));
+    assert!(panels.set_pull_request_detail_tab("t", &expected_id, PullRequestDetailTab::Code));
+    // Persistence strips ephemeral revealUrl.
+    let saved = serde_json::to_value(&panels).unwrap();
+    let restored = RightPanels::from_value(&saved);
+    match &restored.panel("t").surfaces[0].kind {
+        SurfaceKind::PullRequest { detail_tab, reveal_url, number, .. } => {
+            assert_eq!(*number, 42);
+            assert_eq!(*detail_tab, Some(PullRequestDetailTab::Code));
+            assert_eq!(*reveal_url, None);
+        }
+        other => panic!("expected pull request surface, got {other:?}"),
+    }
+    assert!(panels.settle_pull_request_reveal("t", &expected_id, reveal_url));
+    assert!(!panels.settle_pull_request_reveal("t", &expected_id, reveal_url));
+    panels.close_surface("t", &expected_id);
+    assert_eq!(reopen(&mut panels, |_| true), Some("t".into()));
+    assert_eq!(ids(&panels, "t"), [expected_id.as_str()]);
+}
+
+#[test]
+fn folder_trail_and_attachment_tabs_preserve_history_and_survive_workspace_close() {
+    assert_eq!(retained_breadcrumb_trail(Some("src/a/b"), "src/a"), "src/a/b");
+    assert_eq!(retained_breadcrumb_trail(Some("src/a/b"), "docs"), "docs");
+    let mut panels = RightPanels::default();
+    panels.open_file("t", Some("src/a/b.rs"), None);
+    assert!(panels.navigate_folder_with_trail("t", "file:src/a/b.rs", "src", "src/a", false));
+    assert_eq!(panels.active_surface("t").and_then(Surface::folder_trail), Some("src/a"));
+    // Attachment tabs survive close_file_surfaces and reopen even without a workspace.
+    let attachment = FileAttachment {
+        id: "att-1".into(),
+        name: "spec.txt".into(),
+        mime_type: "text/plain".into(),
+        size_bytes: 128,
+        url: Some("/api/attachments/att-1".into()),
+    };
+    assert!(panels.open_attachment("t", attachment));
+    assert!(panels.close_file_surfaces("t"));
+    assert_eq!(ids(&panels, "t"), ["attachment:att-1"]);
+    panels.close_surface("t", "attachment:att-1");
+    assert_eq!(panels.reopen_closed(|_| true, true, |_| false), Some(Reopened::Thread("t".into())));
+    assert_eq!(ids(&panels, "t"), ["attachment:att-1"]);
+    assert!(panels.active_surface("t").is_some_and(Surface::is_attachment));
+}
+
+#[test]
+fn proactive_panels_coordinate_pr_priority_retargeting_and_diff_thresholds() {
+    use crate::diff::{CheckpointFile, TurnDiffSummary};
+    let mut panels = RightPanels::default();
+    let mut coord = ProactivePanelCoordinator::default();
+    let pr = |number: u64| PullRequestTarget {
+        environment_id: None,
+        project_id: "p1".into(),
+        host: None,
+        repository: "o/r".into(),
+        number,
+        url: Some(format!("https://github.com/o/r/pull/{number}")),
+        reveal_url: None,
+        detail_tab: None,
+    };
+    let summary = |run_id: &str, files: usize, additions: u64| TurnDiffSummary {
+        checkpoint_id: format!("cp-{run_id}"),
+        run_id: run_id.into(),
+        turn_count: 1,
+        status: "ready".into(),
+        files: (0..files)
+            .map(|idx| CheckpointFile {
+                path: format!("f{idx}.rs"),
+                kind: "modified".into(),
+                additions: if idx == 0 { additions } else { 0 },
+                deletions: 0,
+            })
+            .collect(),
+        files_total: None,
+        completed_at: "2026-11-19T00:00:00Z".into(),
+    };
+    let summaries_big = [summary("turn-1", 5, 80)];
+
+    // Disabled: does not open proactively on entering a thread.
+    let disabled = coord.evaluate(
+        &mut panels,
+        ProactiveEvaluationInput {
+            thread_id: Some("t-disabled"),
+            enabled: false,
+            settings_hydrated: true,
+            thread_detail_loading: false,
+            running_turn_id: None,
+            latest_run_id: Some("turn-1"),
+            latest_run_completed: true,
+            latest_run_settled: true,
+            turn_diff_summaries: &summaries_big,
+            is_git_repo: Some(true),
+            linked_pull_request: Some(pr(7)),
+            has_linked_pull_request_detail: true,
+            pull_requests_key: Some("o/r#7".into()),
+            pull_requests_capability_known: true,
+            supports_pull_requests: true,
+            pull_requests_surface_available: true,
+            visible_pull_request_count: 1,
+        },
+    );
+    assert_eq!(disabled, ProactiveEvaluationOutcome::default());
+    assert!(!panels.is_open("t-disabled"));
+
+    // Enabled with linked PR on entering a fresh thread: PR takes priority over Changes.
+    let pr_open = coord.evaluate(
+        &mut panels,
+        ProactiveEvaluationInput {
+            thread_id: Some("t"),
+            enabled: true,
+            settings_hydrated: true,
+            thread_detail_loading: false,
+            running_turn_id: None,
+            latest_run_id: Some("turn-1"),
+            latest_run_completed: true,
+            latest_run_settled: true,
+            turn_diff_summaries: &summaries_big,
+            is_git_repo: Some(true),
+            linked_pull_request: Some(pr(7)),
+            has_linked_pull_request_detail: true,
+            pull_requests_key: Some("o/r#7".into()),
+            pull_requests_capability_known: true,
+            supports_pull_requests: true,
+            pull_requests_surface_available: true,
+            visible_pull_request_count: 1,
+        },
+    );
+    assert!(pr_open.panels_changed);
+    assert!(!pr_open.diff_opened);
+    let pr7_id = pull_request_surface_id(None, "p1", None, "o/r", 7);
+    assert_eq!(panels.active_surface("t").map(Surface::id), Some(pr7_id.as_str()));
+
+    // Retargets an already-open thread PR even when proactive setting is turned off.
+    let retarget = coord.evaluate(
+        &mut panels,
+        ProactiveEvaluationInput {
+            thread_id: Some("t"),
+            enabled: false,
+            settings_hydrated: true,
+            thread_detail_loading: false,
+            running_turn_id: None,
+            latest_run_id: Some("turn-1"),
+            latest_run_completed: true,
+            latest_run_settled: true,
+            turn_diff_summaries: &summaries_big,
+            is_git_repo: Some(true),
+            linked_pull_request: Some(pr(8)),
+            has_linked_pull_request_detail: true,
+            pull_requests_key: Some("o/r#8".into()),
+            pull_requests_capability_known: true,
+            supports_pull_requests: true,
+            pull_requests_surface_available: true,
+            visible_pull_request_count: 1,
+        },
+    );
+    assert!(retarget.panels_changed);
+    let pr8_id = pull_request_surface_id(None, "p1", None, "o/r", 8);
+    assert_eq!(panels.active_surface("t").map(Surface::id), Some(pr8_id.as_str()));
+
+    // Fresh thread without PR: defers until is_git_repo is known.
+    let mut diff_panels = RightPanels::default();
+    let mut diff_coord = ProactivePanelCoordinator::default();
+    let summaries_small = [summary("turn-1", 2, 49)];
+    assert_eq!(
+        diff_coord.evaluate(
+            &mut diff_panels,
+            ProactiveEvaluationInput {
+                thread_id: Some("t2"),
+                enabled: true,
+                settings_hydrated: true,
+                thread_detail_loading: false,
+                running_turn_id: None,
+                latest_run_id: Some("turn-1"),
+                latest_run_completed: true,
+                latest_run_settled: true,
+                turn_diff_summaries: &summaries_small,
+                is_git_repo: None,
+                linked_pull_request: None,
+                has_linked_pull_request_detail: false,
+                pull_requests_key: None,
+                pull_requests_capability_known: true,
+                supports_pull_requests: false,
+                pull_requests_surface_available: false,
+                visible_pull_request_count: 0,
+            },
+        ),
+        ProactiveEvaluationOutcome::default()
+    );
+    // Below threshold (2 files, 49 lines): stays closed.
+    assert_eq!(
+        diff_coord.evaluate(
+            &mut diff_panels,
+            ProactiveEvaluationInput {
+                thread_id: Some("t2"),
+                enabled: true,
+                settings_hydrated: true,
+                thread_detail_loading: false,
+                running_turn_id: None,
+                latest_run_id: Some("turn-1"),
+                latest_run_completed: true,
+                latest_run_settled: true,
+                turn_diff_summaries: &summaries_small,
+                is_git_repo: Some(true),
+                linked_pull_request: None,
+                has_linked_pull_request_detail: false,
+                pull_requests_key: None,
+                pull_requests_capability_known: true,
+                supports_pull_requests: false,
+                pull_requests_surface_available: false,
+                visible_pull_request_count: 0,
+            },
+        ),
+        ProactiveEvaluationOutcome::default()
+    );
+    // Next turn runs then settles with >= 50 lines: opens diff once.
+    let summaries_next = [summary("turn-2", 1, 50)];
+    diff_coord.evaluate(
+        &mut diff_panels,
+        ProactiveEvaluationInput {
+            thread_id: Some("t2"),
+            enabled: true,
+            settings_hydrated: true,
+            thread_detail_loading: false,
+            running_turn_id: Some("turn-2"),
+            latest_run_id: Some("turn-2"),
+            latest_run_completed: false,
+            latest_run_settled: false,
+            turn_diff_summaries: &summaries_small,
+            is_git_repo: Some(true),
+            linked_pull_request: None,
+            has_linked_pull_request_detail: false,
+            pull_requests_key: None,
+            pull_requests_capability_known: true,
+            supports_pull_requests: false,
+            pull_requests_surface_available: false,
+            visible_pull_request_count: 0,
+        },
+    );
+    let open_diff = diff_coord.evaluate(
+        &mut diff_panels,
+        ProactiveEvaluationInput {
+            thread_id: Some("t2"),
+            enabled: true,
+            settings_hydrated: true,
+            thread_detail_loading: false,
+            running_turn_id: None,
+            latest_run_id: Some("turn-2"),
+            latest_run_completed: true,
+            latest_run_settled: true,
+            turn_diff_summaries: &summaries_next,
+            is_git_repo: Some(true),
+            linked_pull_request: None,
+            has_linked_pull_request_detail: false,
+            pull_requests_key: None,
+            pull_requests_capability_known: true,
+            supports_pull_requests: false,
+            pull_requests_surface_available: false,
+            visible_pull_request_count: 0,
+        },
+    );
+    assert!(open_diff.diff_opened);
+    assert_eq!(diff_panels.active_surface("t2"), Some(&Surface::diff()));
+    // User closes diff: manual choice prevents reopening for turn-2.
+    diff_panels.close_surface("t2", "diff");
+    let after_close = diff_coord.evaluate(
+        &mut diff_panels,
+        ProactiveEvaluationInput {
+            thread_id: Some("t2"),
+            enabled: true,
+            settings_hydrated: true,
+            thread_detail_loading: false,
+            running_turn_id: None,
+            latest_run_id: Some("turn-2"),
+            latest_run_completed: true,
+            latest_run_settled: true,
+            turn_diff_summaries: &summaries_next,
+            is_git_repo: Some(true),
+            linked_pull_request: None,
+            has_linked_pull_request_detail: false,
+            pull_requests_key: None,
+            pull_requests_capability_known: true,
+            supports_pull_requests: false,
+            pull_requests_surface_available: false,
+            visible_pull_request_count: 0,
+        },
+    );
+    assert_eq!(after_close, ProactiveEvaluationOutcome::default());
+}
+
+#[test]
+fn reopened_browser_snapshot_falls_back_to_browser_defaults() {
+    let idle = session("a", Value::Null);
+    let snapshot = BrowserSnapshot::from_session(&idle);
+    let defaults = crate::preview::viewport::BrowserDefaults {
+        viewport: crate::preview::viewport::ViewportSetting::Preset { preset_id: "iphone".into(), width: 390, height: 844 },
+        zoom_factor: 1.25,
+        appearance: crate::preview::viewport::AppearancePreference::Dark,
+        ..Default::default()
+    };
+    let payload = snapshot.open_input_with_defaults("t", &defaults);
+    assert_eq!(payload["zoomFactor"], 1.25);
+    assert_eq!(payload["colorScheme"], "dark");
+    assert_eq!(payload["viewport"]["_tag"], "preset");
+}

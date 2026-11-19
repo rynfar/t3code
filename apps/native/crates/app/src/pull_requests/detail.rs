@@ -119,7 +119,7 @@ pub(super) fn has_held_detail(state: &AppState, reference: &PrRef, cx: &App) -> 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Tab {
+pub(crate) enum Tab {
     Summary,
     Guide,
     Timeline,
@@ -140,8 +140,8 @@ struct PendingReactionOverlay {
     values: HashMap<ReactionContent, bool>,
 }
 
-pub(super) type CloseHandler = Rc<dyn Fn(&mut App)>;
-pub(super) type SelectPrHandler = Rc<dyn Fn(PrRef, &mut App)>;
+pub(crate) type CloseHandler = Rc<dyn Fn(&mut App)>;
+pub(crate) type SelectPrHandler = Rc<dyn Fn(PrRef, &mut App)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Confirm {
@@ -261,8 +261,9 @@ impl DetailView {
         Self::new_with_hooks(state, page, None, None, reference, entry, cx)
     }
 
-    /// Creates a `DetailView` embedded inside another surface (such as `ThreadPullRequestsPanel`).
-    pub(super) fn new_embedded(
+    /// Creates a `DetailView` embedded inside another surface (such as `ThreadPullRequestsPanel`
+    /// or a single-PR right-panel tab).
+    pub(crate) fn new_embedded(
         state: Entity<AppState>,
         reference: PrRef,
         entry: Option<ListEntry>,
@@ -1066,7 +1067,11 @@ impl DetailView {
         cx.notify();
     }
 
-    pub(super) fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+    pub(crate) fn current_tab(&self) -> Tab {
+        self.tab
+    }
+
+    pub(crate) fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.disarm(cx);
         self.tab = tab;
         if tab == Tab::Code && self.code.is_none() {
