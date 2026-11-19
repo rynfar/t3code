@@ -432,6 +432,7 @@ impl FrameView {
     /// Prompts for a local destination and downloads a preview artifact from the server.
     pub fn save_download(&self, download_id: String, file_name: String, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
+        let connection = state.connection_id();
         let Some(client) = state.client_handle() else { return };
         let credentials = client.credentials().clone();
         let runtime = state.runtime().clone();
@@ -448,14 +449,23 @@ impl FrameView {
             let Ok(Ok(Some(path))) = prompt.await else { return };
             let fetched = runtime.spawn(async move { download_file(&credentials, &thread_id, &tab_id, &download_id).await }).await;
             let result: Result<(), String> = match fetched {
-                Ok(Ok(bytes)) => std::fs::write(&path, bytes).map_err(|err| err.to_string()),
+                Ok(Ok(bytes)) => {
+                    cx.background_executor()
+                        .spawn(async move { std::fs::write(&path, bytes).map_err(|err| err.to_string()) })
+                        .await
+                }
                 Ok(Err(err)) => Err(err),
                 Err(err) => Err(err.to_string()),
             };
             cx.update(|cx| {
-                app_state.update(cx, |state, cx| match result {
-                    Ok(()) => state.show_toast(Toast::new(ToastKind::Success, format!("Downloaded {file_name}")), cx),
-                    Err(err) => state.show_toast(Toast::new(ToastKind::Error, "Could not save download").description(err), cx),
+                app_state.update(cx, |state, cx| {
+                    if state.connection_id() != connection {
+                        return;
+                    }
+                    match result {
+                        Ok(()) => state.show_toast(Toast::new(ToastKind::Success, format!("Downloaded {file_name}")), cx),
+                        Err(err) => state.show_toast(Toast::new(ToastKind::Error, "Could not save download").description(err), cx),
+                    }
                 });
             });
         })
@@ -466,6 +476,7 @@ impl FrameView {
         let Some(offer) = self.file_chooser.take() else { return };
         cx.notify();
         let state = self.state.read(cx);
+        let connection = state.connection_id();
         let Some(client) = state.client_handle() else { return };
         let credentials = client.credentials().clone();
         let runtime = state.runtime().clone();
@@ -483,6 +494,9 @@ impl FrameView {
             };
             cx.update(|cx| {
                 app_state.update(cx, |state, cx| {
+                    if state.connection_id() != connection {
+                        return;
+                    }
                     state.show_toast(Toast::new(ToastKind::Error, "Could not send the files to the page").description(err), cx);
                 });
             });
@@ -492,6 +506,7 @@ impl FrameView {
 
     fn open_file_chooser_dialog(&mut self, cx: &mut Context<Self>) {
         let Some(offer) = self.file_chooser.clone() else { return };
+        let connection = self.state.read(cx).connection_id();
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -503,17 +518,24 @@ impl FrameView {
             if paths.is_empty() {
                 return;
             }
-            let files: Vec<UploadFile> = paths
-                .into_iter()
-                .filter_map(|path| {
-                    let bytes = std::fs::read(&path).ok()?;
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
-                    Some(UploadFile { name, mime_type: "application/octet-stream".to_owned(), bytes })
+            let files: Vec<UploadFile> = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .filter_map(|path| {
+                            let bytes = std::fs::read(&path).ok()?;
+                            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
+                            Some(UploadFile { name, mime_type: "application/octet-stream".to_owned(), bytes })
+                        })
+                        .collect()
                 })
-                .collect();
+                .await;
             if !files.is_empty() {
                 let _ = this.update(cx, |this, cx| {
-                    if this.file_chooser.as_ref().is_some_and(|current| current.id == offer.id) {
+                    if this.state.read(cx).connection_id() == connection
+                        && this.file_chooser.as_ref().is_some_and(|current| current.id == offer.id)
+                    {
                         this.answer_file_chooser(files, cx);
                     }
                 });

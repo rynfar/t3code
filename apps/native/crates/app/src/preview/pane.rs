@@ -34,7 +34,7 @@ use super::annotation::{AnnotationEditor, AnnotationEditorEvent};
 use super::device_toolbar::{DeviceToolbar, DeviceToolbarEvent};
 use super::frame::{CONTROL_BAR_HEIGHT, FrameEvent, FrameView};
 use super::{
-    AUTHORIZATION_ERROR, Abort, Availability, FocusUrl, Previews, PreviewsEvent, Refresh, ReopenClosedTab, ResetZoom, ZoomIn, ZoomOut,
+    AUTHORIZATION_ERROR, Abort, Availability, FocusUrl, Previews, PreviewsEvent, Refresh, ResetZoom, ZoomIn, ZoomOut,
 };
 use crate::app_state::{AppState, RestoredAttachment};
 use crate::composer::controls::{MenuItem, popup_surface};
@@ -645,7 +645,7 @@ impl PreviewPane {
         let defaults = self.previews.read(cx).browser_defaults(cx);
         let active_profile_id = snapshot.map_or(defaults.profile_id.as_str(), SessionSnapshot::profile_id_or_default);
         let active_profile_name = profile_name(&defaults.profiles, active_profile_id);
-        let has_closed = self.previews.read(cx).has_closed_tab(&self.thread_id);
+        let has_closed = !self.state.read(cx).panels.panels.closed_views().is_empty();
         let p = palette(cx);
 
         Some(deferred(
@@ -690,10 +690,7 @@ impl PreviewPane {
                         .when(has_closed, |this| {
                             this.child(MenuItem::new("preview-menu-reopen-closed", "Reopen closed tab").on_click(cx.listener(|this, _, _, cx| {
                                 this.more_menu_open = false;
-                                let thread = this.thread_id.clone();
-                                this.previews.update(cx, |previews, cx| {
-                                    previews.reopen_last_closed(&thread, cx);
-                                });
+                                this.state.update(cx, |state, cx| state.reopen_closed_view(cx));
                                 cx.notify();
                             })))
                         })
@@ -1205,16 +1202,8 @@ impl Render for PreviewPane {
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1, cx)))
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.zoom(0, cx)))
-            .on_action(cx.listener(|this, _: &ReopenClosedTab, _, cx| {
-                let thread = this.thread_id.clone();
-                this.previews.update(cx, |previews, cx| {
-                    previews.reopen_last_closed(&thread, cx);
-                });
-            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let key = event.keystroke.key.as_str();
-                let mods = &event.keystroke.modifiers;
-                if key == "escape" {
+                if event.keystroke.key == "escape" {
                     if this.more_menu_open {
                         cx.stop_propagation();
                         this.more_menu_open = false;
@@ -1230,13 +1219,6 @@ impl Render for PreviewPane {
                     if this.pick_active {
                         cx.stop_propagation();
                         this.cancel_annotation(window, cx);
-                        return;
-                    }
-                }
-                if key == "t" && mods.shift && (mods.platform || mods.control) && !mods.alt {
-                    let thread = this.thread_id.clone();
-                    if this.previews.update(cx, |previews, cx| previews.reopen_last_closed(&thread, cx)) {
-                        cx.stop_propagation();
                     }
                 }
             }))

@@ -1,15 +1,11 @@
-//! The address bar, recently used history, and closed preview tab history. Ports
-//! `normalizePreviewUrl` and `resolveAddressBarInput` from `packages/shared/src/preview.ts`,
-//! per-project history and Incognito exclusion from `apps/web/src/browserHistoryStore.ts`
-//! (`pingdotgg/t3code#34859`), labels from `PreviewRecentUrlCard.tsx`, and closed browser tab
-//! persistence from `apps/web/src/closedViewStore.ts` and `apps/web/src/reopenClosedView.ts`.
+//! The address bar and recently used history. Ports `normalizePreviewUrl` and
+//! `resolveAddressBarInput` from `packages/shared/src/preview.ts`, per-project history and
+//! Incognito exclusion from `apps/web/src/browserHistoryStore.ts` (`pingdotgg/t3code#34859`),
+//! and labels from `PreviewRecentUrlCard.tsx`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use super::viewport::{
-    AppearancePreference, INCOGNITO_BROWSER_PROFILE_ID, OpenPreviewOverrides, ViewportSetting, is_incognito_profile,
-};
+use super::viewport::{INCOGNITO_BROWSER_PROFILE_ID, is_incognito_profile};
 use super::{NavStatus, SessionSnapshot};
 
 /// `PreviewUrlNormalizationError`; every reason reads the same to the user.
@@ -345,115 +341,6 @@ impl BrowserHistory {
     }
 }
 
-/// Bounded stack of recently closed browser tabs (`closedViewStore.ts` + `reopenClosedView.ts`,
-/// `pingdotgg/t3code#34859` & `pingdotgg/t3code#25874`).
-pub const CLOSED_PREVIEW_LIMIT: usize = 20;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClosedPreviewEntry {
-    pub thread_id: String,
-    pub tab_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub viewport: Option<ViewportSetting>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zoom_factor: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color_scheme: Option<AppearancePreference>,
-}
-
-impl ClosedPreviewEntry {
-    pub fn from_snapshot(snapshot: &SessionSnapshot) -> Self {
-        let url = snapshot.nav_status.url().map(str::to_owned);
-        let viewport = snapshot.viewport.as_ref().map(ViewportSetting::from_value);
-        let color_scheme = snapshot.color_scheme.as_deref().and_then(AppearancePreference::parse);
-        Self {
-            thread_id: snapshot.thread_id.clone(),
-            tab_id: snapshot.tab_id.clone(),
-            url,
-            viewport,
-            profile_id: snapshot.profile_id.clone(),
-            zoom_factor: snapshot.zoom_factor,
-            color_scheme,
-        }
-    }
-
-    /// `isPersistentView` (`closedViewStore.ts`): Incognito tabs are never persisted to disk.
-    pub fn is_persistent(&self) -> bool {
-        self.profile_id.as_deref() != Some(INCOGNITO_BROWSER_PROFILE_ID)
-    }
-
-    /// Parameters passed to `preview.open` when reopening this closed tab (`reopenClosedView.ts`).
-    pub fn reopen_overrides(&self) -> OpenPreviewOverrides {
-        OpenPreviewOverrides {
-            url: self.url.clone(),
-            viewport: self.viewport.clone(),
-            profile_id: self.profile_id.clone(),
-            zoom_factor: self.zoom_factor,
-            color_scheme: self.color_scheme,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ClosedPreviewHistory {
-    #[serde(default)]
-    entries: Vec<ClosedPreviewEntry>,
-}
-
-impl ClosedPreviewHistory {
-    pub fn entries(&self) -> &[ClosedPreviewEntry] {
-        &self.entries
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    pub fn has_for_thread(&self, thread_id: &str) -> bool {
-        self.entries.iter().any(|entry| entry.thread_id == thread_id)
-    }
-
-    /// Remembers a closed tab in memory (newest first, deduped by `(thread_id, tab_id)`,
-    /// capped at `CLOSED_PREVIEW_LIMIT`).
-    pub fn remember(&mut self, snapshot: &SessionSnapshot) {
-        let entry = ClosedPreviewEntry::from_snapshot(snapshot);
-        self.entries.retain(|existing| !(existing.thread_id == entry.thread_id && existing.tab_id == entry.tab_id));
-        self.entries.insert(0, entry);
-        self.entries.truncate(CLOSED_PREVIEW_LIMIT);
-    }
-
-    /// Pops the newest closed tab for `thread_id`.
-    pub fn pop_for_thread(&mut self, thread_id: &str) -> Option<ClosedPreviewEntry> {
-        let index = self.entries.iter().position(|entry| entry.thread_id == thread_id)?;
-        Some(self.entries.remove(index))
-    }
-
-    /// Only non-Incognito entries are serialized for disk persistence (`partialize`).
-    pub fn to_persisted_value(&self) -> Value {
-        let persisted: Vec<&ClosedPreviewEntry> = self.entries.iter().filter(|entry| entry.is_persistent()).collect();
-        serde_json::json!({ "entries": persisted })
-    }
-
-    /// Loads persisted entries, discarding invalid or Incognito entries (`migrate`).
-    pub fn from_persisted_value(value: Option<&Value>) -> Self {
-        let Some(entries) = value.and_then(|v| v.get("entries")).and_then(Value::as_array) else {
-            return Self::default();
-        };
-        let mut loaded: Vec<ClosedPreviewEntry> = entries
-            .iter()
-            .filter_map(|item| serde_json::from_value::<ClosedPreviewEntry>(item.clone()).ok())
-            .filter(|entry| !entry.thread_id.is_empty() && !entry.tab_id.is_empty() && entry.is_persistent())
-            .collect();
-        loaded.truncate(CLOSED_PREVIEW_LIMIT);
-        Self { entries: loaded }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,53 +430,5 @@ mod tests {
         .unwrap();
         assert!(history.record_settled_titles("p", &[normal_session]));
         assert_eq!(history.recent("p")[0].title.as_deref(), Some("Public Title"));
-    }
-
-    #[test]
-    fn closed_preview_history_remembers_tab_settings_and_never_persists_incognito() {
-        let mut closed = ClosedPreviewHistory::default();
-        let normal = SessionSnapshot::decode(serde_json::json!({
-            "threadId": "t1",
-            "tabId": "tab-1",
-            "navStatus": { "_tag": "Success", "url": "https://example.com/", "title": "Example" },
-            "canGoBack": false,
-            "canGoForward": false,
-            "viewport": { "_tag": "freeform", "width": 1200, "height": 800 },
-            "profileId": "work",
-            "zoomFactor": 1.5,
-            "colorScheme": "dark",
-            "updatedAt": "2026-11-12T00:00:01Z"
-        }))
-        .unwrap();
-        let incognito = SessionSnapshot::decode(serde_json::json!({
-            "threadId": "t1",
-            "tabId": "tab-inc",
-            "navStatus": { "_tag": "Success", "url": "https://private.test/", "title": "Private" },
-            "canGoBack": false,
-            "canGoForward": false,
-            "profileId": "incognito",
-            "updatedAt": "2026-11-12T00:00:02Z"
-        }))
-        .unwrap();
-        closed.remember(&normal);
-        closed.remember(&incognito);
-        assert_eq!(closed.entries().len(), 2);
-
-        // Persisted form drops incognito tabs; loading also rejects incognito entries.
-        let persisted = closed.to_persisted_value();
-        let reloaded = ClosedPreviewHistory::from_persisted_value(Some(&persisted));
-        assert_eq!(reloaded.entries().len(), 1);
-        assert_eq!(reloaded.entries()[0].tab_id, "tab-1");
-        let overrides = reloaded.entries()[0].reopen_overrides();
-        assert_eq!(overrides.url.as_deref(), Some("https://example.com/"));
-        assert_eq!(overrides.viewport, Some(ViewportSetting::Freeform { width: 1200, height: 800 }));
-        assert_eq!(overrides.profile_id.as_deref(), Some("work"));
-        assert_eq!(overrides.zoom_factor, Some(1.5));
-        assert_eq!(overrides.color_scheme, Some(AppearancePreference::Dark));
-
-        // In-memory pop returns newest closed tab for the thread.
-        assert_eq!(closed.pop_for_thread("t1").unwrap().tab_id, "tab-inc");
-        assert_eq!(closed.pop_for_thread("t1").unwrap().tab_id, "tab-1");
-        assert!(closed.pop_for_thread("t1").is_none());
     }
 }

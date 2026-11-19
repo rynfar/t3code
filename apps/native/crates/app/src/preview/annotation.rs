@@ -7,10 +7,10 @@ use std::io::Cursor;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
-    Render, SharedString, Styled, Subscription, Window, div, px,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, Render, SharedString, Styled, Subscription, Window, div, px,
 };
-use gpui_component::input::{InputEvent, Textarea, TextareaState};
+use gpui_component::input::{Escape, InputEvent, Textarea, TextareaState};
 use gpui_component::{h_flex, v_flex};
 use t3_core::preview::annotation::{AnnotationTarget, PreviewAnnotationDraft};
 use t3_core::preview::stream::Viewport;
@@ -55,6 +55,7 @@ pub struct AnnotationEditor {
     page_url: String,
     page_title: String,
     target: AnnotationTarget,
+    focus: FocusHandle,
     comment: Entity<TextareaState>,
     voice: Entity<VoiceSpeechController>,
     dictation_target_id: u64,
@@ -63,6 +64,12 @@ pub struct AnnotationEditor {
 }
 
 impl EventEmitter<AnnotationEditorEvent> for AnnotationEditor {}
+
+impl Focusable for AnnotationEditor {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
 
 impl AnnotationEditor {
     #[allow(clippy::too_many_arguments)]
@@ -191,6 +198,7 @@ impl AnnotationEditor {
             page_url,
             page_title,
             target,
+            focus: cx.focus_handle(),
             comment,
             voice,
             dictation_target_id,
@@ -202,11 +210,6 @@ impl AnnotationEditor {
     #[cfg(all(test, feature = "snapshot"))]
     pub fn voice(&self) -> &Entity<VoiceSpeechController> {
         &self.voice
-    }
-
-    #[cfg(all(test, feature = "snapshot"))]
-    pub fn comment_input(&self) -> &Entity<TextareaState> {
-        &self.comment
     }
 
     pub fn dispose(&mut self, cx: &mut App) {
@@ -232,6 +235,11 @@ impl AnnotationEditor {
 
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         if self.voice.read(cx).blocks_submission() {
+            if !self.voice.read(cx).preparing() {
+                self.voice.update(cx, |voice, cx| {
+                    voice.submit_after_dictation(cx);
+                });
+            }
             return;
         }
         let comment = self.comment.read(cx).value().trim().to_owned();
@@ -254,11 +262,13 @@ impl Render for AnnotationEditor {
         let p = palette(cx);
         let voice = self.voice.read(cx);
         let blocks = voice.blocks_submission();
-        let can_submit = !blocks && !self.comment.read(cx).value().trim().is_empty();
+        let preparing = voice.preparing();
+        let can_submit = if blocks { !preparing } else { !self.comment.read(cx).value().trim().is_empty() };
         let summary = SharedString::from(self.target.summary());
 
         v_flex()
             .id("preview-annotation-editor")
+            .track_focus(&self.focus)
             .w_full()
             .max_w(px(384.))
             .gap(px(8.))
@@ -269,6 +279,21 @@ impl Render for AnnotationEditor {
             .bg(hsla(p.popover))
             .shadow_lg()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter"
+                    && !event.is_held
+                    && (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
+                    && this.voice.read(cx).blocks_submission()
+                    && !this.voice.read(cx).preparing()
+                {
+                    this.voice.update(cx, |voice, cx| voice.submit_after_dictation(cx));
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+                cx.stop_propagation();
+                this.handle_escape(cx);
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
                     cx.stop_propagation();

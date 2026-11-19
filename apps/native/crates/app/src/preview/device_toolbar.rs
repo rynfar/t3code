@@ -3,6 +3,8 @@
 //! preset selector ("Responsive" + Chrome DevTools standard devices), editable width × height
 //! inputs with bounds validation, aspect ratio lock, rotate, and close back to Fill.
 
+use std::time::{Duration, Instant};
+
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString, Styled,
     Subscription, Window, deferred, div, prelude::*, px,
@@ -29,6 +31,7 @@ pub struct DeviceToolbar {
     panel_width: f32,
     aspect_ratio: Option<f64>,
     preset_menu_open: bool,
+    preset_menu_closed_at: Option<Instant>,
     editing_axis: Option<bool>, // Some(true) = width, Some(false) = height
     width_input: Entity<InputState>,
     height_input: Entity<InputState>,
@@ -69,6 +72,7 @@ impl DeviceToolbar {
             panel_width: 800.,
             aspect_ratio: None,
             preset_menu_open: false,
+            preset_menu_closed_at: None,
             editing_axis: None,
             width_input,
             height_input,
@@ -228,67 +232,66 @@ impl DeviceToolbar {
         let p = palette(cx);
         let active_preset = self.setting.preset_id().map(str::to_owned);
         let is_responsive = active_preset.as_deref().and_then(find_viewport_preset).is_none();
-        Some(deferred(
-            div()
-                .id("preview-device-preset-backdrop")
-                .absolute()
-                .inset_0()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.preset_menu_open = false;
-                    cx.notify();
-                }))
-                .child(
-                    popup_surface(cx)
-                        .id("preview-device-preset-menu")
-                        .absolute()
-                        .top(px(BROWSER_DEVICE_TOOLBAR_HEIGHT + 2.))
-                        .left(px(6.))
-                        .w(px(252.))
-                        .max_h(px(320.))
-                        .overflow_y_scroll()
-                        .p(px(4.))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            MenuItem::new("preview-preset-responsive", "Responsive")
-                                .checked(is_responsive)
-                                .on_click(cx.listener(|this, _, _, cx| this.select_responsive(cx))),
-                        )
-                        .child(
-                            div()
-                                .px(px(8.))
-                                .pt(px(6.))
-                                .pb(px(2.))
-                                .text_xs()
-                                .text_color(hsla(p.muted_foreground))
-                                .child("Standard"),
-                        )
-                        .children(VIEWPORT_PRESETS.iter().enumerate().map(|(index, preset)| {
-                            let id = preset.id;
-                            let checked = active_preset.as_deref() == Some(id);
-                            h_flex()
-                                .id(("preview-preset-item", index))
-                                .min_h(px(28.))
-                                .px(px(8.))
-                                .py(px(4.))
-                                .gap(px(8.))
-                                .rounded(px(4.))
-                                .items_center()
-                                .cursor_pointer()
-                                .text_sm()
-                                .text_color(hsla(p.foreground))
-                                .hover(|style| style.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
-                                .on_click(cx.listener(move |this, _, _, cx| this.select_preset(id, cx)))
-                                .child(
-                                    div()
-                                        .size(px(16.))
-                                        .flex_none()
-                                        .children(checked.then(|| Icon::Check.render(px(16.), hsla(p.foreground)))),
-                                )
-                                .child(div().min_w_0().flex_1().truncate().child(preset.label))
-                                .child(div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(preset.detail))
-                        })),
-                ),
-        ))
+        Some(
+            deferred(
+                popup_surface(cx)
+                    .id("preview-device-preset-menu")
+                    .occlude()
+                    .absolute()
+                    .top(px(BROWSER_DEVICE_TOOLBAR_HEIGHT + 2.))
+                    .left(px(6.))
+                    .w(px(252.))
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .p(px(4.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.preset_menu_open = false;
+                        this.preset_menu_closed_at = Some(Instant::now());
+                        cx.notify();
+                    }))
+                    .child(
+                        MenuItem::new("preview-preset-responsive", "Responsive")
+                            .checked(is_responsive)
+                            .on_click(cx.listener(|this, _, _, cx| this.select_responsive(cx))),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.))
+                            .pt(px(6.))
+                            .pb(px(2.))
+                            .text_xs()
+                            .text_color(hsla(p.muted_foreground))
+                            .child("Standard"),
+                    )
+                    .children(VIEWPORT_PRESETS.iter().enumerate().map(|(index, preset)| {
+                        let id = preset.id;
+                        let checked = active_preset.as_deref() == Some(id);
+                        h_flex()
+                            .id(("preview-preset-item", index))
+                            .min_h(px(28.))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .gap(px(8.))
+                            .rounded(px(4.))
+                            .items_center()
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(hsla(p.foreground))
+                            .hover(|style| style.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.select_preset(id, cx)))
+                            .child(
+                                div()
+                                    .size(px(16.))
+                                    .flex_none()
+                                    .children(checked.then(|| Icon::Check.render(px(16.), hsla(p.foreground)))),
+                            )
+                            .child(div().min_w_0().flex_1().truncate().child(preset.label))
+                            .child(div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(preset.detail))
+                    })),
+            )
+            .with_priority(2),
+        )
     }
 }
 
@@ -332,8 +335,14 @@ impl Render for DeviceToolbar {
                             .cursor_pointer()
                             .hover(|style| style.bg(hsla(p.accent)))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.preset_menu_open = !this.preset_menu_open;
-                                cx.notify();
+                                let just_closed = this
+                                    .preset_menu_closed_at
+                                    .take()
+                                    .is_some_and(|at| at.elapsed() < Duration::from_millis(150));
+                                if !just_closed {
+                                    this.preset_menu_open = !this.preset_menu_open;
+                                    cx.notify();
+                                }
                             }))
                             .child(div().truncate().text_xs().text_color(hsla(p.foreground)).child(self.selected_label()))
                             .child(Icon::ChevronDown.sized(px(12.)).text_color(hsla(p.muted_foreground))),

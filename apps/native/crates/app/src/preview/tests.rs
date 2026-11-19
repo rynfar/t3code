@@ -1,14 +1,16 @@
 //! Offscreen GPUI integration tests for `PN-PREVIEW` (`#222`, `#390`, `#249`):
-//! - Default zoom & appearance forwarded on `preview.open` (`pingdotgg/t3code#34943`, `#25874`)
-//! - Incognito visit & title exclusion + closed-tab history reopen (`pingdotgg/t3code#34859`)
+//! - Default zoom & appearance forwarded on `preview.open` (`pingdotgg/t3code#34943`, `pingdotgg/t3code#25874`)
+//! - Unified `RightPanels` closed-tab reopen preserving browser tab settings (`pingdotgg/t3code#34859`)
+//! - Incognito visit & title exclusion (`pingdotgg/t3code#34859`)
 //! - Stale file-picker withdrawal in `FrameView` on stream drop/disconnect (`pingdotgg/t3code#29655`)
 //! - Device toolbar toggle sizing (`pingdotgg/t3code#35664`)
 //! - Preview annotation editor wired to `VoiceSpeechController` dictation (`pingdotgg/t3code#30624`)
-//!   with Escape canceling dictation first (`pingdotgg/t3code#32682`), commit draft, and composer delivery.
+//!   with real Escape key/action dispatch canceling dictation first (`pingdotgg/t3code#32682`),
+//!   `submit_after_dictation`, commit draft, and composer delivery.
 
 use std::sync::Arc;
 
-use gpui::{AppContext, Entity};
+use gpui::{AppContext, Entity, Focusable};
 use serde_json::json;
 use t3_client::preview_stream::StreamEvent;
 use t3_client::supervisor::{ClientFixture, FixtureRequest};
@@ -31,9 +33,8 @@ fn setup(cx: &mut gpui::TestAppContext) -> (Entity<AppState>, Entity<Previews>, 
         crate::settings::store::init(cx);
         installed
     });
-    state.update(cx, |state, _| {
-        let config = state.server_config.config.as_mut().unwrap();
-        config.environment.capabilities.server_browser = Some(true);
+    state.update(cx, |state, cx| {
+        state.select_thread("menu-thread", cx);
     });
     fixture
         .grants
@@ -46,18 +47,23 @@ fn setup(cx: &mut gpui::TestAppContext) -> (Entity<AppState>, Entity<Previews>, 
         ))
         .unwrap();
     let previews = cx.update(|cx| {
-        let entity = cx.new(|cx| Previews::new(state.clone(), cx));
+        super::init(state.clone(), cx);
+        let entity = super::previews(cx).expect("previews global initialized");
         entity.update(cx, |previews, _| previews.set_server_browser_for_test(true));
         entity
     });
     (state, previews, fixture, runtime)
 }
 
-async fn next_request_skipping_list(fixture: &mut ClientFixture) -> FixtureRequest {
+async fn next_preview_request(fixture: &mut ClientFixture) -> FixtureRequest {
     loop {
         let (rpc_method, payload, reply) = fixture.next_request().await;
         if rpc_method == method::LIST {
             let _ = reply.send(Ok(json!({ "sessions": [], "serverEpoch": "epoch-1", "revision": 1 })));
+            continue;
+        }
+        if !rpc_method.starts_with("preview.") {
+            let _ = reply.send(Ok(json!({})));
             continue;
         }
         return (rpc_method, payload, reply);
@@ -118,7 +124,7 @@ async fn open_session_sends_default_zoom_and_appearance_and_reopen_preserves_clo
         previews.open_session("menu-thread".into(), Some("https://t3.chat/".into()), cx);
     });
 
-    let (rpc_method, payload, reply) = next_request_skipping_list(&mut fixture).await;
+    let (rpc_method, payload, reply) = next_preview_request(&mut fixture).await;
     assert_eq!(rpc_method, method::OPEN);
     assert_eq!(payload["runtime"], "server");
     assert_eq!(payload["zoomFactor"], 0.8);
@@ -139,21 +145,23 @@ async fn open_session_sends_default_zoom_and_appearance_and_reopen_preserves_clo
         "updatedAt": "2026-11-14T00:00:02Z"
     })));
     opened_rx.await.unwrap();
+    cx.run_until_parked();
 
-    // Closing the tab remembers it in closed-view history; reopening restores its exact settings.
-    previews.update(cx, |previews, cx| {
-        previews.close_session("menu-thread", "tab-open-1", cx);
-        assert!(previews.has_closed_tab("menu-thread"));
+    // Closing the browser tab through AppState records it once in the unified RightPanels
+    // closed-view stack; reopening restores its exact settings and consumes that single entry.
+    state.update(cx, |state, cx| {
+        state.close_surface("browser:tab-open-1", cx);
+        assert_eq!(state.panels.panels.closed_views().len(), 1);
     });
-    let (close_method, _, close_reply) = next_request_skipping_list(&mut fixture).await;
+    let (close_method, _, close_reply) = next_preview_request(&mut fixture).await;
     assert_eq!(close_method, method::CLOSE);
     let _ = close_reply.send(Ok(json!({})));
 
-    previews.update(cx, |previews, cx| {
-        assert!(previews.reopen_last_closed("menu-thread", cx));
-        assert!(!previews.has_closed_tab("menu-thread"));
+    state.update(cx, |state, cx| {
+        state.reopen_closed_view(cx);
+        assert!(state.panels.panels.closed_views().is_empty());
     });
-    let (reopen_method, reopen_payload, reopen_reply) = next_request_skipping_list(&mut fixture).await;
+    let (reopen_method, reopen_payload, reopen_reply) = next_preview_request(&mut fixture).await;
     assert_eq!(reopen_method, method::OPEN);
     assert_eq!(reopen_payload["url"], "https://t3.chat/");
     assert_eq!(reopen_payload["viewport"], json!({ "_tag": "freeform", "width": 1200, "height": 800 }));
@@ -265,13 +273,14 @@ async fn frame_view_withdraws_stale_file_picker_on_disconnect_and_accepts_reoffe
     window_cx.run_until_parked();
 }
 
-struct HeadlessHost {
+struct AnnotationHost {
     pane: Entity<PreviewPane>,
 }
 
-impl gpui::Render for HeadlessHost {
-    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
-        gpui::div()
+impl gpui::Render for AnnotationHost {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        use gpui::ParentElement;
+        gpui::div().children(self.pane.read(cx).annotation_for_test())
     }
 }
 
@@ -283,7 +292,7 @@ async fn preview_annotation_editor_wires_voice_dictation_and_delivers_to_compose
         previews.seed_snapshot_for_test(snapshot("tab-1", "http://localhost:5173/app", Some("default")), cx);
     });
 
-    let window = cx.add_window(|window, cx| {
+    let (host, window_cx) = cx.add_window_view(|window, cx| {
         let pane = cx.new(|cx| {
             PreviewPane::new(
                 state.clone(),
@@ -295,11 +304,11 @@ async fn preview_annotation_editor_wires_voice_dictation_and_delivers_to_compose
                 cx,
             )
         });
-        HeadlessHost { pane }
+        AnnotationHost { pane }
     });
 
-    let (editor, voice) = window
-        .update(cx, |host, window, cx| {
+    let (editor, voice) = window_cx.update(|window, cx| {
+        host.update(cx, |host, cx| {
             host.pane.update(cx, |pane, cx| {
                 pane.open_annotation_for_test(
                     AnnotationTarget::Region(AnnotationRegion { x: 10., y: 20., width: 200., height: 100. }),
@@ -307,14 +316,21 @@ async fn preview_annotation_editor_wires_voice_dictation_and_delivers_to_compose
                     cx,
                 );
                 let editor = pane.annotation_for_test().expect("annotation editor open");
+                // Focus the editor container rather than the native macOS Textarea input so GPUI's
+                // TestWindow renders the real AnnotationEditor view tree without hitting
+                // `TestWindow::window_handle` in `set_text_content_type`.
+                let focus = editor.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
                 let voice = editor.read(cx).voice().clone();
                 (editor, voice)
             })
         })
-        .unwrap();
+    });
+    let _ = window_cx.refresh();
 
-    // Simulate active recording: Escape cancels dictation first without closing the annotation editor (#32682).
-    voice.update(cx, |voice, cx| {
+    // Simulate active recording: real Escape action & key dispatch cancel dictation first without
+    // closing the annotation editor (`pingdotgg/t3code#32682`).
+    voice.update(window_cx, |voice, cx| {
         voice.set_snapshot_state_for_preview(
             VoiceInputState { phase: VoiceInputPhase::Recording, ..VoiceInputState::default() },
             None,
@@ -324,33 +340,65 @@ async fn preview_annotation_editor_wires_voice_dictation_and_delivers_to_compose
             cx,
         );
     });
-    editor.update(cx, |editor, cx| editor.handle_escape(cx));
-    assert!(window.read_with(cx, |host, cx| host.pane.read(cx).annotation_for_test().is_some()).unwrap());
-    assert_eq!(voice.read_with(cx, |voice, _| voice.state().phase), VoiceInputPhase::Idle);
+    window_cx.dispatch_action(gpui_component::input::Escape);
+    window_cx.run_until_parked();
+    assert!(host.read_with(window_cx, |host, cx| host.pane.read(cx).annotation_for_test().is_some()));
+    assert_eq!(voice.read_with(window_cx, |voice, _| voice.state().phase), VoiceInputPhase::Idle);
 
-    // Simulate voice dictation commit into the annotation comment input (#30624).
-    voice.update(cx, |_, cx| {
+    // Submitting while recording defers to `submit_after_dictation` instead of silently dropping.
+    voice.update(window_cx, |voice, cx| {
+        voice.set_snapshot_state_for_preview(
+            VoiceInputState { phase: VoiceInputPhase::Recording, ..VoiceInputState::default() },
+            None,
+            0.5,
+            3,
+            None,
+            cx,
+        );
+    });
+    editor.update(window_cx, |editor, cx| editor.submit(cx));
+    assert!(host.read_with(window_cx, |host, cx| host.pane.read(cx).annotation_for_test().is_some()));
+    assert!(state.update(window_cx, |state, _| state.take_composer_restore("menu-thread")).is_none());
+
+    // Simulate voice dictation commit + SubmitAfterDictation delivering into the composer (`pingdotgg/t3code#30624`).
+    voice.update(window_cx, |voice, cx| {
+        voice.set_snapshot_state_for_preview(VoiceInputState::default(), None, 0.0, 0, None, cx);
         cx.emit(VoiceControllerEvent::CommitDraft {
             text: "Make the header sticky on scroll".into(),
             selection: VoiceSelection { start: 32, end: 32 },
         });
+        cx.emit(VoiceControllerEvent::SubmitAfterDictation { text: "Make the header sticky on scroll".into() });
     });
-    cx.run_until_parked();
-    let committed = editor.read_with(cx, |editor, cx| editor.comment_input().read(cx).value().to_string());
-    assert_eq!(committed, "Make the header sticky on scroll");
-
-    // Submitting delivers the structured annotation into AppState's composer restore queue and closes the editor.
-    editor.update(cx, |editor, cx| editor.submit(cx));
-    cx.run_until_parked();
-    assert!(window.read_with(cx, |host, cx| host.pane.read(cx).annotation_for_test().is_none()).unwrap());
-    let restored = state.update(cx, |state, _| state.take_composer_restore("menu-thread"));
+    window_cx.run_until_parked();
+    assert!(host.read_with(window_cx, |host, cx| host.pane.read(cx).annotation_for_test().is_none()));
+    let restored = state.update(window_cx, |state, _| state.take_composer_restore("menu-thread"));
     let (prompt, _attachments) = restored.expect("annotation delivered to composer");
     assert!(prompt.contains("http://localhost:5173/app"));
     assert!(prompt.contains("Region 200×100 at (10, 20)"));
     assert!(prompt.contains("Make the header sticky on scroll"));
 
-    state.update(cx, |state, _| state.stop_pump());
-    cx.run_until_parked();
+    // Reopen and verify a real Escape action when idle cancels and closes the editor.
+    window_cx.update(|window, cx| {
+        host.update(cx, |host, cx| {
+            host.pane.update(cx, |pane, cx| {
+                pane.open_annotation_for_test(
+                    AnnotationTarget::Region(AnnotationRegion { x: 10., y: 20., width: 200., height: 100. }),
+                    window,
+                    cx,
+                );
+                let editor2 = pane.annotation_for_test().expect("annotation editor reopened");
+                let focus = editor2.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            })
+        })
+    });
+    let _ = window_cx.refresh();
+    window_cx.dispatch_action(gpui_component::input::Escape);
+    window_cx.run_until_parked();
+    assert!(host.read_with(window_cx, |host, cx| host.pane.read(cx).annotation_for_test().is_none()));
+
+    state.update(window_cx, |state, _| state.stop_pump());
+    window_cx.run_until_parked();
 }
 
 #[gpui::test]
@@ -388,7 +436,7 @@ async fn toggle_device_toolbar_dispatches_preview_resize(cx: &mut gpui::TestAppC
     });
 
     pane.update(window_cx, |pane, cx| pane.toggle_device_toolbar_for_test(cx));
-    let (rpc_method, payload, reply) = next_request_skipping_list(&mut fixture).await;
+    let (rpc_method, payload, reply) = next_preview_request(&mut fixture).await;
     assert_eq!(rpc_method, method::RESIZE);
     assert_eq!(payload["tabId"], "tab-1");
     assert_eq!(payload["viewport"]["_tag"], "freeform");
@@ -406,7 +454,7 @@ async fn toggle_device_toolbar_dispatches_preview_resize(cx: &mut gpui::TestAppC
 
     // Toggling again returns to Fill.
     pane.update(window_cx, |pane, cx| pane.toggle_device_toolbar_for_test(cx));
-    let (rpc_method2, payload2, reply2) = next_request_skipping_list(&mut fixture).await;
+    let (rpc_method2, payload2, reply2) = next_preview_request(&mut fixture).await;
     assert_eq!(rpc_method2, method::RESIZE);
     assert_eq!(payload2["viewport"], json!({ "_tag": "fill" }));
     let _ = reply2.send(Ok(json!({

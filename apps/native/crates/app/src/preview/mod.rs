@@ -5,8 +5,8 @@
 //! and closes sessions (`addBrowserSurface.ts`, `openPreviewSession.ts`, `closePreviewSession.ts`,
 //! the browser part of `hooks/useRightPanelSurfaceClose.ts`) with default zoom and appearance
 //! (`pingdotgg/t3code#34943`, `pingdotgg/t3code#25874`), keeps the per-project recently used list
-//! and closed-tab history excluding Incognito (`browserHistoryStore.ts`, `closedViewStore.ts`,
-//! `reopenClosedView.ts`, `pingdotgg/t3code#34859`), and decides availability as
+//! excluding Incognito (`browserHistoryStore.ts`, `pingdotgg/t3code#34859`; closed-tab history
+//! lives on `RightPanels` / `AppState::reopen_closed_view`), and decides availability as
 //! `PreviewPanel.tsx` does. The tab itself is `PreviewPane`; its stream and input are
 //! `frame::FrameView`.
 
@@ -24,7 +24,7 @@ use gpui::{App, AppContext, Context, Entity, EventEmitter, Global, Subscription,
 use serde_json::{Value, json};
 use t3_client::session::RpcError;
 use t3_client::store;
-use t3_core::preview::address::{BrowserHistory, ClosedPreviewHistory, HistoryEntry, is_history_profile};
+use t3_core::preview::address::{BrowserHistory, HistoryEntry, is_history_profile};
 use t3_core::preview::viewport::{BrowserDefaults, OpenPreviewOverrides, ViewportSetting, open_session_payload};
 use t3_core::preview::{ListResult, PREVIEW_OPERATE_SCOPE, PreviewEvent, PreviewThreads, SessionSnapshot, TabsEdit, method};
 
@@ -33,7 +33,7 @@ pub use pane::PreviewPane;
 use crate::app_state::{AppEvent, AppState};
 use crate::toast::{Toast, ToastKind};
 
-actions!(preview, [TogglePreview, Refresh, FocusUrl, ZoomIn, ZoomOut, ResetZoom, ReopenClosedTab]);
+actions!(preview, [TogglePreview, Refresh, FocusUrl, ZoomIn, ZoomOut, ResetZoom]);
 
 const AUTHORIZATION_ERROR: &str = "EnvironmentAuthorizationError";
 
@@ -95,8 +95,6 @@ pub struct Previews {
     panel_tabs: HashMap<String, Vec<String>>,
     history: BrowserHistory,
     history_store: Option<String>,
-    closed_tabs: ClosedPreviewHistory,
-    closed_store: Option<String>,
     /// `None` until the session state answers; unknown counts as granted.
     can_operate: Option<bool>,
     /// `None` until the server config arrives.
@@ -186,8 +184,6 @@ impl Previews {
             panel_tabs: HashMap::new(),
             history: BrowserHistory::default(),
             history_store: None,
-            closed_tabs: ClosedPreviewHistory::default(),
-            closed_store: None,
             can_operate: None,
             server_browser: None,
             connection: None,
@@ -220,10 +216,6 @@ impl Previews {
             .unwrap_or_default()
     }
 
-    pub fn has_closed_tab(&self, thread_id: &str) -> bool {
-        self.closed_tabs.has_for_thread(thread_id)
-    }
-
     /// A new connection starts over: its sessions, grants and history are its own.
     fn sync_connection(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
@@ -247,8 +239,6 @@ impl Previews {
             .and_then(store::load_ui_state)
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
-        self.closed_store = state.environments.active.as_deref().map(|environment| format!("preview-closed-tabs-{environment}"));
-        self.closed_tabs = ClosedPreviewHistory::from_persisted_value(self.closed_store.as_deref().and_then(store::load_ui_state).as_ref());
         if let Some(client) = state.client_handle() {
             self.watch_grants(&client, cx);
         }
@@ -380,22 +370,28 @@ impl Previews {
         }
         let Some(thread_id) = self.state.read(cx).panel_thread() else { return };
         self.threads.thread_mut(&thread_id);
+        let connection = self.connection;
         let Some(task) = self.state.read(cx).request(method::LIST, json!({ "threadId": thread_id }), ListResult::decode) else { return };
         self.listing = Some(cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(list) => {
-                    let (changed, relist, edit) = this.threads.listed(&thread_id, &list);
-                    if changed {
-                        this.changed(&thread_id, cx);
-                    }
-                    this.apply_edit(Some(&thread_id), edit, cx);
-                    if relist {
-                        // An event overtook the list; ask again before trusting it for tab cleanup.
-                        cx.spawn(async move |this, cx| this.update(cx, |this, cx| this.list_selected(cx))).detach();
-                    }
+            let _ = this.update(cx, |this, cx| {
+                if this.connection != connection {
+                    return;
                 }
-                Err(error) => tracing::warn!(%error, "preview.list failed"),
+                match result {
+                    Ok(list) => {
+                        let (changed, relist, edit) = this.threads.listed(&thread_id, &list);
+                        if changed {
+                            this.changed(&thread_id, cx);
+                        }
+                        this.apply_edit(Some(&thread_id), edit, cx);
+                        if relist {
+                            // An event overtook the list; ask again before trusting it for tab cleanup.
+                            cx.spawn(async move |this, cx| this.update(cx, |this, cx| this.list_selected(cx))).detach();
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "preview.list failed"),
+                }
             });
         }));
     }
@@ -463,6 +459,7 @@ impl Previews {
             }
             return;
         }
+        let connection = self.connection;
         let defaults = self.browser_defaults(cx);
         let payload = open_session_payload(&thread_id, &defaults, &overrides);
         let Some(task) = self.state.read(cx).request(method::OPEN, payload, SessionSnapshot::decode) else {
@@ -473,31 +470,36 @@ impl Previews {
         };
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(snapshot) => {
-                    let tab = snapshot.tab_id.clone();
-                    let opened_profile = snapshot.profile_id.clone();
-                    let opened_url = snapshot.nav_status.url().map(str::to_owned).or_else(|| url.clone());
-                    let thread = this.threads.thread_mut(&thread_id);
-                    if let Some(opened_url) = &opened_url {
-                        thread.remember_url(opened_url);
-                    }
-                    thread.apply_snapshot(snapshot);
-                    if let Some(opened_url) = &opened_url
-                        && is_history_profile(opened_profile.as_deref())
-                        && let Some(project) = this.project_of(&thread_id, cx)
-                        && this.history.record(&project, opened_url, now_ms())
-                    {
-                        this.save_history();
-                    }
-                    cx.emit(PreviewsEvent::Thread(thread_id.clone()));
-                    this.apply_edit(Some(&thread_id), Some(TabsEdit { tabs: None, fronted: vec![tab] }), cx);
+            let _ = this.update(cx, |this, cx| {
+                if this.connection != connection {
+                    return;
                 }
-                Err(error) => {
-                    if external_fallback && let Some(url) = &url {
-                        cx.open_url(url);
-                    } else {
-                        this.toast("Unable to open browser", error, cx);
+                match result {
+                    Ok(snapshot) => {
+                        let tab = snapshot.tab_id.clone();
+                        let opened_profile = snapshot.profile_id.clone();
+                        let opened_url = snapshot.nav_status.url().map(str::to_owned).or_else(|| url.clone());
+                        let thread = this.threads.thread_mut(&thread_id);
+                        if let Some(opened_url) = &opened_url {
+                            thread.remember_url(opened_url);
+                        }
+                        thread.apply_snapshot(snapshot);
+                        if let Some(opened_url) = &opened_url
+                            && is_history_profile(opened_profile.as_deref())
+                            && let Some(project) = this.project_of(&thread_id, cx)
+                            && this.history.record(&project, opened_url, now_ms())
+                        {
+                            this.save_history();
+                        }
+                        cx.emit(PreviewsEvent::Thread(thread_id.clone()));
+                        this.apply_edit(Some(&thread_id), Some(TabsEdit { tabs: None, fronted: vec![tab] }), cx);
+                    }
+                    Err(error) => {
+                        if external_fallback && let Some(url) = &url {
+                            cx.open_url(url);
+                        } else {
+                            this.toast("Unable to open browser", error, cx);
+                        }
                     }
                 }
             });
@@ -505,14 +507,11 @@ impl Previews {
         .detach();
     }
 
-    /// `closePreviewSession`: remembers the tab in closed-view history (Incognito stays in-memory
-    /// only, never persisted — `pingdotgg/t3code#34859`), hides at once, restores if the server refuses.
+    /// `closePreviewSession`: hides at once, restores if the server refuses. Closed-view history
+    /// is recorded by `AppState::close_surfaces` on `RightPanels`.
     pub fn close_session(&mut self, thread_id: &str, tab_id: &str, cx: &mut Context<Self>) {
+        let connection = self.connection;
         let snapshot = self.session(thread_id, tab_id).cloned();
-        if let Some(snapshot) = &snapshot {
-            self.closed_tabs.remember(snapshot);
-            self.save_closed_tabs();
-        }
         self.threads.thread_mut(thread_id).begin_close(tab_id);
         cx.emit(PreviewsEvent::Thread(thread_id.to_owned()));
         let task = self.state.read(cx).rpc(method::CLOSE, json!({ "threadId": thread_id, "tabId": tab_id }));
@@ -520,6 +519,9 @@ impl Previews {
         cx.spawn(async move |this, cx| {
             let Err(error) = task.await else { return };
             let _ = this.update(cx, |this, cx| {
+                if this.connection != connection {
+                    return;
+                }
                 let thread = this.threads.thread_mut(&thread_id);
                 let before = thread.clone();
                 if thread.cancel_close(snapshot, &tab_id) {
@@ -533,20 +535,9 @@ impl Previews {
         .detach();
     }
 
-    /// Reopens the most recently closed preview tab for `thread_id`, preserving its URL, viewport,
-    /// profile, zoom, and appearance (`reopenClosedView.ts`, `pingdotgg/t3code#25874`).
-    pub fn reopen_last_closed(&mut self, thread_id: &str, cx: &mut Context<Self>) -> bool {
-        let Some(entry) = self.closed_tabs.pop_for_thread(thread_id) else {
-            return false;
-        };
-        self.save_closed_tabs();
-        self.open_session_with(thread_id.to_owned(), entry.reopen_overrides(), false, cx);
-        cx.emit(PreviewsEvent::Thread(thread_id.to_owned()));
-        true
-    }
-
     /// `preview.resize`: commits a viewport change from the device toolbar (`browserViewportActions.ts`).
     pub fn resize(&mut self, thread_id: &str, tab_id: &str, viewport: ViewportSetting, cx: &mut Context<Self>) {
+        let connection = self.connection;
         let payload = json!({
             "threadId": thread_id,
             "tabId": tab_id,
@@ -556,13 +547,18 @@ impl Previews {
         let thread_id = thread_id.to_owned();
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(snapshot) => {
-                    if this.threads.thread_mut(&thread_id).update_snapshot(snapshot) {
-                        cx.emit(PreviewsEvent::Thread(thread_id));
-                    }
+            let _ = this.update(cx, |this, cx| {
+                if this.connection != connection {
+                    return;
                 }
-                Err(error) => this.toast("Unable to resize browser viewport", error, cx),
+                match result {
+                    Ok(snapshot) => {
+                        if this.threads.thread_mut(&thread_id).update_snapshot(snapshot) {
+                            cx.emit(PreviewsEvent::Thread(thread_id));
+                        }
+                    }
+                    Err(error) => this.toast("Unable to resize browser viewport", error, cx),
+                }
             });
         })
         .detach();
@@ -570,6 +566,7 @@ impl Previews {
 
     /// `preview.adjust` (zoom, appearance, hard reload, clear cookies/cache): needs no control of the tab.
     pub fn adjust(&mut self, thread_id: &str, tab_id: &str, change: Value, cx: &mut Context<Self>) {
+        let connection = self.connection;
         let mut payload = json!({ "threadId": thread_id, "tabId": tab_id });
         if let (Some(payload), Some(change)) = (payload.as_object_mut(), change.as_object()) {
             payload.extend(change.clone());
@@ -578,13 +575,18 @@ impl Previews {
         let thread_id = thread_id.to_owned();
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Disconnected.".to_owned()));
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(snapshot) => {
-                    if this.threads.thread_mut(&thread_id).update_snapshot(snapshot) {
-                        cx.emit(PreviewsEvent::Thread(thread_id));
-                    }
+            let _ = this.update(cx, |this, cx| {
+                if this.connection != connection {
+                    return;
                 }
-                Err(error) => this.toast("Unable to change the browser tab", error, cx),
+                match result {
+                    Ok(snapshot) => {
+                        if this.threads.thread_mut(&thread_id).update_snapshot(snapshot) {
+                            cx.emit(PreviewsEvent::Thread(thread_id));
+                        }
+                    }
+                    Err(error) => this.toast("Unable to change the browser tab", error, cx),
+                }
             });
         })
         .detach();
@@ -638,12 +640,6 @@ impl Previews {
     fn save_history(&self) {
         if let Some(name) = &self.history_store {
             store::save_ui_state(name, &self.history);
-        }
-    }
-
-    fn save_closed_tabs(&self) {
-        if let Some(name) = &self.closed_store {
-            store::save_ui_state(name, &self.closed_tabs.to_persisted_value());
         }
     }
 
