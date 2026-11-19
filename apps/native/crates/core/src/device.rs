@@ -7,9 +7,12 @@
 //! `DeviceHubSetupStatus`, `AgentDeviceSetupStatus`), `DevicePanel.tsx` (`groupDevices`, the
 //! discovery warnings, the loading and empty messages, the device rows), `DeviceHostUpdates.tsx`,
 //! and the hub URLs of `client-runtime/src/state/deviceHubAccess.ts` and `device/hubAccess.ts`.
-//! The stream protocol is in `stream`.
+//! The stream protocol is in `stream`, a device's settings and tools in `tools`, and cloud host
+//! settings in `hosts`.
 
+pub mod hosts;
 pub mod stream;
+pub mod tools;
 
 #[cfg(test)]
 mod tests;
@@ -26,7 +29,13 @@ pub mod method {
     pub const CONFIGURE: &str = "device.configure";
     pub const OPEN: &str = "device.open";
     pub const CLOSE: &str = "device.close";
+    pub const DETAIL: &str = "device.detail";
+    pub const ACTION: &str = "device.action";
+    pub const EAS_ACCOUNT: &str = "device.easAccount";
 }
+
+/// `LOCAL_DEVICE_HOST_ID`: this machine, reserved for it.
+pub const LOCAL_HOST_ID: &str = "local";
 
 /// `AuthSettingsWriteScope`: Device setup's switches and Done need it.
 pub const SETTINGS_WRITE_SCOPE: &str = "settings:write";
@@ -173,6 +182,10 @@ pub struct ServiceState {
     pub onboarding_completed: bool,
     pub agent_access_enabled: bool,
     pub supports_host_retry: bool,
+    /// The server reads `easDeviceHosts`; older ones ignore them, so clients offer them only then.
+    pub supports_eas_hosts: bool,
+    /// The server reads `simlockDeviceHosts`.
+    pub supports_simlock_hosts: bool,
     pub revision: i64,
 }
 
@@ -200,6 +213,10 @@ struct Wire {
     agent_access_enabled: bool,
     #[serde(default)]
     supports_host_retry: bool,
+    #[serde(default)]
+    supports_eas_hosts: bool,
+    #[serde(default)]
+    supports_simlock_hosts: bool,
     revision: i64,
 }
 
@@ -228,6 +245,8 @@ impl ServiceState {
             onboarding_completed: false,
             agent_access_enabled: false,
             supports_host_retry: false,
+            supports_eas_hosts: false,
+            supports_simlock_hosts: false,
             revision: 0,
         }
     }
@@ -248,6 +267,8 @@ impl ServiceState {
             onboarding_completed: wire.onboarding_completed,
             agent_access_enabled: wire.agent_access_enabled,
             supports_host_retry: wire.supports_host_retry,
+            supports_eas_hosts: wire.supports_eas_hosts,
+            supports_simlock_hosts: wire.supports_simlock_hosts,
             revision: wire.revision,
         })
     }

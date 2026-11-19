@@ -5,7 +5,11 @@
 //! JPEG and a repeated still is never sent twice; status, screen config and input state go out
 //! as events. A refused ticket mints new access, a few times in a row at most. A refused or
 //! silent feed stops with the error the view offers to reconnect from, as the web's MJPEG image
-//! does when no WebRTC fallback exists.
+//! does when no WebRTC fallback exists. An input socket closed because the device's lease ended
+//! stops the stream with the gateway's reason instead of reconnecting (`pingdotgg/t3code#35994`).
+//!
+//! `capture_screenshot` ports `client-runtime/src/device/screenshot.ts`: one PNG from the hub,
+//! fetched with a fresh `media` ticket so a stale one never needs refreshing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,9 +18,10 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use t3_core::device::stream::{
     CloseAction, FIRST_FRAME_TIMEOUT_MS, HardwareButton, INPUT_UNAVAILABLE, IosMessage, KeyPhase, MjpegParser, NO_VIDEO, Orientation, RETRY_DELAY_MS,
-    STREAM_FAILED, Screen, StreamStatus, TouchPhase, classify_close, close_detail, decode_ios_message,
+    STREAM_FAILED, Screen, StreamStatus, TouchPhase, classify_close, close_detail, decode_ios_message, lease_ended,
 };
-use t3_core::device::{HubAccess, encode_component};
+use t3_core::device::tools::{SCREENSHOT_FAILED, SCREENSHOT_INCOMPLETE, SCREENSHOT_TIMEOUT_MS, extract_png, screenshot_path, screenshot_serve_sim, screenshot_status_error};
+use t3_core::device::{HubAccess, Platform, encode_component};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -335,15 +340,43 @@ async fn input_socket(
                 },
             }
         };
-        if classify_close(code) == CloseAction::Unauthorized {
-            let _ = outcome.send(Outcome::Unauthorized);
-            return;
+        match classify_close(code) {
+            CloseAction::Unauthorized => {
+                let _ = outcome.send(Outcome::Unauthorized);
+                return;
+            }
+            // Reconnecting would only be refused again: stop with the gateway's reason.
+            CloseAction::LeaseEnded => {
+                let _ = outcome.send(Outcome::Failed(lease_ended(&reason)));
+                return;
+            }
+            CloseAction::Retry => {}
         }
         let _ = events.send(DeviceStreamEvent::Input { connected: false, detail: Some(close_detail(code, &reason)) });
         if !pause(RETRY_DELAY_MS, &mut input).await {
             return;
         }
     }
+}
+
+/// One PNG of the device's screen (`captureDeviceScreenshot`), or the message to show.
+pub async fn capture_screenshot(credentials: Arc<Credentials>, target: DeviceTarget, platform: Platform) -> Result<Vec<u8>, String> {
+    let ticket = issue_media_ticket(&credentials).await.map_err(|error| {
+        tracing::debug!(%error, "device hub ticket failed");
+        SCREENSHOT_FAILED.to_owned()
+    })?;
+    let access = HubAccess::new(&credentials.http_base, &ticket, &target.host_id).ok_or(SCREENSHOT_FAILED)?;
+    let url = access.http_url(screenshot_serve_sim(platform), &screenshot_path(&target.device_id));
+    let client = reqwest::Client::builder().timeout(Duration::from_millis(SCREENSHOT_TIMEOUT_MS)).build().map_err(|_| SCREENSHOT_FAILED)?;
+    let response = client.post(&url).send().await.map_err(|error| {
+        tracing::debug!(%error, "device screenshot failed");
+        SCREENSHOT_FAILED.to_owned()
+    })?;
+    if !response.status().is_success() {
+        return Err(screenshot_status_error(response.status().as_u16()));
+    }
+    let bytes = response.bytes().await.map_err(|_| SCREENSHOT_FAILED)?;
+    extract_png(&bytes).map(<[u8]>::to_vec).ok_or_else(|| SCREENSHOT_INCOMPLETE.to_owned())
 }
 
 #[cfg(test)]
@@ -361,6 +394,15 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(10);
 
     /// A fake server with a device hub: a media ticket, serve-sim's MJPEG feed and HID socket.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Live,
+        /// The feed answers 401, as an expired ticket would.
+        RefuseFeed,
+        /// The input socket closes with 4001, as a Simlock gateway does when the lease ended.
+        LeaseEnded,
+    }
+
     struct FakeHub {
         addr: std::net::SocketAddr,
         /// What the HID socket received.
@@ -384,8 +426,7 @@ mod tests {
     }
 
     impl FakeHub {
-        /// `refuse_feed`: the feed answers 401, as an expired ticket would.
-        async fn start(refuse_feed: bool) -> FakeHub {
+        async fn start(mode: Mode) -> FakeHub {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let (sent, received) = mpsc::unbounded_channel();
@@ -401,7 +442,7 @@ mod tests {
                             let body = r#"{"ticket":"tick"}"#;
                             let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
                         } else if head.contains("/stream.mjpeg?") {
-                            if refuse_feed {
+                            if mode == Mode::RefuseFeed {
                                 let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                                 return;
                             }
@@ -411,6 +452,14 @@ mod tests {
                             // Hold the feed open, as a still screen does.
                             let mut rest = Vec::new();
                             let _ = stream.read_to_end(&mut rest).await;
+                        } else if head.starts_with("POST /api/device-hub/vendor/") && head.contains("/api/screenshot?") {
+                            if head.contains("device=broken") {
+                                let _ = stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                                return;
+                            }
+                            let body = [b"WARNING: two displays\n".as_slice(), &tiny_png(), b"\n"].concat();
+                            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).await;
+                            let _ = stream.write_all(&body).await;
                         } else if head.contains("/helper/ws?") {
                             let key = head.lines().find_map(|line| line.strip_prefix("Sec-WebSocket-Key: ").or_else(|| line.strip_prefix("sec-websocket-key: "))).unwrap_or_default().trim().to_owned();
                             let accept = derive_accept_key(key.as_bytes());
@@ -419,6 +468,11 @@ mod tests {
                             let config = [&[0x82u8][..], br#"{"width":1170,"height":2532,"orientation":"landscape_left"}"#].concat();
                             let _ = socket.send(Message::Binary(config)).await;
                             let _ = socket.send(Message::Binary(vec![0x83])).await;
+                            if mode == Mode::LeaseEnded {
+                                let frame = tokio_tungstenite::tungstenite::protocol::CloseFrame { code: 4001.into(), reason: "lease expired".into() };
+                                let _ = socket.close(Some(frame)).await;
+                                return;
+                            }
                             while let Some(Ok(message)) = socket.next().await {
                                 if let Message::Binary(bytes) = message {
                                     let _ = sent.send(bytes);
@@ -436,13 +490,17 @@ mod tests {
         }
     }
 
+    fn tiny_png() -> Vec<u8> {
+        [&[137u8, 80, 78, 71, 13, 10, 26, 10][..], &[0, 0, 0, 0], b"IEND", &[0, 0, 0, 0]].concat()
+    }
+
     async fn next_event(stream: &mut DeviceStream) -> DeviceStreamEvent {
         tokio::time::timeout(WAIT, stream.events.recv()).await.expect("an event arrives").expect("the stream runs")
     }
 
     #[tokio::test]
     async fn streams_newest_frames_and_sends_input_once_admitted() {
-        let mut hub = FakeHub::start(false).await;
+        let mut hub = FakeHub::start(Mode::Live).await;
         let target = DeviceTarget { host_id: "local".into(), device_id: "SIM 1".into() };
         let mut stream = open(&tokio::runtime::Handle::current(), hub.credentials(), target);
         // Input before the helper admits this viewer goes nowhere.
@@ -484,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_feed_mints_new_access_then_gives_up() {
-        let hub = FakeHub::start(true).await;
+        let hub = FakeHub::start(Mode::RefuseFeed).await;
         let target = DeviceTarget { host_id: "local".into(), device_id: "sim".into() };
         let mut stream = open(&tokio::runtime::Handle::current(), hub.credentials(), target);
         let detail = loop {
@@ -495,5 +553,34 @@ mod tests {
         assert_eq!(detail, STREAM_FAILED);
         let tickets = hub.requests.lock().unwrap().iter().filter(|line| line.starts_with("POST /api/auth/websocket-ticket/media")).count();
         assert_eq!(tickets, MAX_REFUSALS as usize);
+    }
+
+    #[tokio::test]
+    async fn an_ended_lease_stops_the_stream_with_its_reason_instead_of_reconnecting() {
+        let hub = FakeHub::start(Mode::LeaseEnded).await;
+        let target = DeviceTarget { host_id: "lab".into(), device_id: "sim".into() };
+        let mut stream = open(&tokio::runtime::Handle::current(), hub.credentials(), target);
+        let detail = loop {
+            if let DeviceStreamEvent::Status(StreamStatus::Error(detail)) = next_event(&mut stream).await {
+                break detail;
+            }
+        };
+        assert_eq!(detail, "Device lease ended: lease expired");
+        let sockets = hub.requests.lock().unwrap().iter().filter(|line| line.contains("/helper/ws?")).count();
+        assert_eq!(sockets, 1, "the input socket is not retried");
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_is_the_png_the_hub_returns() {
+        let hub = FakeHub::start(Mode::Live).await;
+        let png = capture_screenshot(hub.credentials(), DeviceTarget { host_id: "local".into(), device_id: "SIM 1".into() }, Platform::Ios).await;
+        assert_eq!(png, Ok(tiny_png()));
+        let android = capture_screenshot(hub.credentials(), DeviceTarget { host_id: "mac".into(), device_id: "emu".into() }, Platform::Android).await;
+        assert!(android.is_ok());
+        let failed = capture_screenshot(hub.credentials(), DeviceTarget { host_id: "local".into(), device_id: "broken".into() }, Platform::Ios).await;
+        assert_eq!(failed, Err("Screenshot capture failed (500). Try again.".to_owned()));
+        let requests = hub.requests.lock().unwrap().clone();
+        assert!(requests.iter().any(|line| line.starts_with("POST /api/device-hub/vendor/serve-sim/api/screenshot?device=SIM%201&wsTicket=tick&hostId=local ")), "{requests:?}");
+        assert!(requests.iter().any(|line| line.starts_with("POST /api/device-hub/vendor/serve-emu/api/screenshot?device=emu&wsTicket=tick&hostId=mac ")), "{requests:?}");
     }
 }

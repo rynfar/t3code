@@ -14,6 +14,7 @@ use std::time::Duration;
 use gpui::{App, AppContext, Context, Entity, EventEmitter, Global, Subscription, Task};
 use serde_json::{Value, json};
 use t3_client::session::RpcError;
+use t3_core::device::tools::{Action, Detail, action_payload, detail_payload};
 use t3_core::device::{Device, DeviceFeed, Opened, Operation, Operations, SETTINGS_WRITE_SCOPE, ServiceState, close_payload, method, open_payload};
 use t3_core::right_panel::{DeviceTarget, RightPanels, Surface};
 
@@ -280,6 +281,21 @@ impl Devices {
     /// helpers.
     pub fn list(&mut self, input: Value, cx: &mut Context<Self>) -> Task<Result<(), String>> {
         self.command(method::LIST, input, cx)
+    }
+
+    /// `device.detail`: the settings a device's host can read (`deviceDetailReadAtom`).
+    pub fn detail(&self, host_id: &str, device_id: &str, cx: &App) -> Task<Result<Detail, String>> {
+        self.detail_request(method::DETAIL, detail_payload(host_id, device_id), cx)
+    }
+
+    /// `device.action`, answered with the detail it confirmed (`useDeviceControls.act`).
+    pub fn action(&self, host_id: &str, device_id: &str, action: &Action, cx: &App) -> Task<Result<Detail, String>> {
+        self.detail_request(method::ACTION, action_payload(host_id, device_id, action), cx)
+    }
+
+    fn detail_request(&self, method: &'static str, input: Value, cx: &App) -> Task<Result<Detail, String>> {
+        let task = self.state.read(cx).rpc(method, input);
+        cx.background_spawn(async move { task.await.map_err(|error| error_text(&error)).and_then(Detail::decode) })
     }
 
     /// `device.configure` from setup.

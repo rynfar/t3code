@@ -1,10 +1,17 @@
 //! An open device's live screen, as `DeviceWorkspace.tsx` and `DeviceStreamView.tsx` show it in
 //! the flat view: the newest frame fitted to the screen's aspect beside the controls rail
-//! (`DeviceControlsRail.tsx`: Home, Rotate, and More with Close device panel and Power off), a
-//! touch per left-button drag, HID keys while the screen has focus, the loading view until video
-//! arrives (Reconnect after a failure), and a bar while input reconnects. Frames decode and turn
-//! upright on the network runtime; only the newest waits, and the view repaints once per decoded
-//! frame, never on a timer. It streams only while its tab shows.
+//! (`DeviceControlsRail.tsx`: Home, Rotate, the appearance switch, Text size, Device tools,
+//! Save screenshot, and More with Close device panel and Power off), a touch per left-button
+//! drag, HID keys while the screen has focus, the loading view until video arrives (Reconnect
+//! after a failure), and a bar while input reconnects. Frames decode and turn upright on the
+//! network runtime; only the newest waits, and the view repaints once per decoded frame, never on
+//! a timer. It streams only while its tab shows.
+//!
+//! Settings and tools run commands on the device's own machine (`runsHostCommands`: local and
+//! SSH hosts): their detail is read each time the tab shows and every action answers with the
+//! detail it confirmed (`useDeviceControls.ts`). The tools panel is `tools`.
+
+mod tools;
 
 use std::sync::Arc;
 
@@ -13,12 +20,16 @@ use gpui::{
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, RenderOnce, SharedString, Styled, Task,
     Window, canvas, div, point, prelude::*, px, size,
 };
+use gpui_component::input::InputState;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{Selectable, v_flex};
-use t3_client::device_stream::{DeviceInput, DeviceStream, DeviceStreamEvent, DeviceTarget, Frame, InputSender};
+use t3_client::device_stream::{DeviceInput, DeviceStream, DeviceStreamEvent, DeviceTarget, Frame, InputSender, capture_screenshot};
 use t3_core::device::stream::{
     CONNECTING_VIDEO, HardwareButton, KeyPhase, Screen, StreamStatus, TouchPhase, fit_frame, input_disconnected_label, screen_aspect, screen_rotation,
     transport,
+};
+use t3_core::device::tools::{
+    Action, Controls, RAIL_ORIENTATIONS, SCREENSHOT_FAILED, TextSize, appearance_label, next_appearance, offers_screenshot, runs_host_commands, screenshot_file_name,
 };
 use t3_core::device::{Device, HostKind, Platform};
 use t3_core::preview::stream::{dom_key, fit};
@@ -34,13 +45,14 @@ use crate::theme::{hsla, palette};
 /// `CONTROLS_RAIL_WIDTH`: the screen keeps clear of the rail.
 const RAIL_WIDTH: f32 = 56.;
 
-// DropdownMenu forwards its open state through Selectable before rendering the trigger.
+// DropdownMenu forwards its open state through Selectable before rendering the trigger; the
+// tooltip hides while the menu is open.
 #[derive(IntoElement)]
-struct MoreButton(Button);
+struct MenuButton(Button, &'static str);
 
-impl Selectable for MoreButton {
+impl Selectable for MenuButton {
     fn selected(self, selected: bool) -> Self {
-        Self(self.0.selected(selected))
+        Self(self.0.selected(selected), self.1)
     }
 
     fn is_selected(&self) -> bool {
@@ -48,25 +60,30 @@ impl Selectable for MoreButton {
     }
 }
 
-impl Styled for MoreButton {
+impl Styled for MenuButton {
     fn style(&mut self) -> &mut gpui::StyleRefinement {
         self.0.style()
     }
 }
 
-impl InteractiveElement for MoreButton {
+impl InteractiveElement for MenuButton {
     fn interactivity(&mut self) -> &mut gpui::Interactivity {
         self.0.interactivity()
     }
 }
 
-impl DropdownMenu for MoreButton {}
+impl DropdownMenu for MenuButton {}
 
-impl RenderOnce for MoreButton {
+impl RenderOnce for MenuButton {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         let open = self.is_selected();
-        self.0.when(!open, |button| button.tooltip("More device actions"))
+        let tooltip = self.1;
+        self.0.when(!open, |button| button.tooltip(tooltip))
     }
+}
+
+fn rail_divider(cx: &App) -> gpui::Div {
+    div().my(px(4.)).h(px(1.)).w(px(20.)).flex_shrink_0().bg(hsla(palette(cx).border).opacity(0.7))
 }
 
 struct Decoded {
@@ -125,6 +142,14 @@ pub struct DeviceScreen {
     /// Modifier keys sent down, as the web sends each modifier key's own events.
     held: Modifiers,
     focus: FocusHandle,
+    /// The device's settings as its host last confirmed, and the action running on it.
+    controls: Controls,
+    tools_open: bool,
+    /// The tools panel's fields, made the first time it opens.
+    form: Option<tools::Form>,
+    /// A capture always finishes, even if the tab hides meanwhile; the user asked for it.
+    screenshot_pending: bool,
+    screenshot_error: Option<String>,
 }
 
 impl DeviceScreen {
@@ -154,6 +179,11 @@ impl DeviceScreen {
             touching: false,
             held: Modifiers::default(),
             focus: cx.focus_handle(),
+            controls: Controls::default(),
+            tools_open: false,
+            form: None,
+            screenshot_pending: false,
+            screenshot_error: None,
         }
     }
 
@@ -170,7 +200,107 @@ impl DeviceScreen {
             return;
         }
         self.visible = visible;
-        if visible { self.connect(cx) } else { self.disconnect(cx) }
+        if visible {
+            self.connect(cx);
+            self.read_detail(cx);
+        } else {
+            self.disconnect(cx);
+        }
+    }
+
+    fn runs_host_commands(&self, cx: &App) -> bool {
+        runs_host_commands(self.host_kind(cx))
+    }
+
+    /// Whether settings and tools take actions now: shown, on a host that runs its commands.
+    fn controls_visible(&self, cx: &App) -> bool {
+        self.visible && self.runs_host_commands(cx)
+    }
+
+    /// `deviceDetailReadAtom` mounting: reads the device's settings while it shows.
+    fn read_detail(&mut self, cx: &mut Context<Self>) {
+        if !self.controls_visible(cx) {
+            return;
+        }
+        let ticket = self.controls.start_read();
+        let task = self.devices.read(cx).detail(&self.device.host_id, &self.device.id, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.controls.read(ticket, result) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// `act`: one action at a time; `clear` empties a field once the action succeeds.
+    fn act(&mut self, action: Action, clear: Option<Entity<InputState>>, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.controls_visible(cx);
+        if !self.controls.begin(visible) {
+            return;
+        }
+        cx.notify();
+        let task = self.devices.read(cx).action(&self.device.host_id, &self.device.id, &action, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.controls.finish(result)
+                    && let Some(input) = clear
+                {
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_tools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tools_open = !self.tools_open;
+        if self.tools_open && self.form.is_none() {
+            self.form = Some(tools::Form::new(self.device.platform, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// `saveScreenshot`: one PNG from the hub, saved where the user picks.
+    fn save_screenshot(&mut self, cx: &mut Context<Self>) {
+        if self.screenshot_pending || !self.visible {
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else { return };
+        let credentials = Arc::new(client.credentials().clone());
+        let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
+        let capture = state.runtime().spawn(capture_screenshot(credentials, target, self.device.platform));
+        let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_millis());
+        let name = screenshot_file_name(&self.device.name, millis);
+        self.screenshot_pending = true;
+        self.screenshot_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let saved = match capture.await.unwrap_or_else(|_| Err(SCREENSHOT_FAILED.to_owned())) {
+                Ok(png) => {
+                    let downloads = std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join("Downloads")).filter(|dir| dir.is_dir());
+                    let directory = downloads.unwrap_or_else(|| std::path::PathBuf::from("/"));
+                    let Ok(path) = this.update(cx, |_, cx| cx.prompt_for_new_path(&directory, Some(&name))) else { return };
+                    match path.await {
+                        Ok(Ok(Some(path))) => cx.background_executor().spawn(async move { std::fs::write(&path, &png) }).await.map_err(|error| error.to_string()),
+                        // Cancelled: nothing to report.
+                        _ => Ok(()),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.screenshot_pending = false;
+                this.screenshot_error = saved.err();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
@@ -362,11 +492,16 @@ impl DeviceScreen {
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let disabled = !self.input_connected;
-        let ios = self.device.platform == Platform::Ios;
-        let simlock = self.host_kind(cx) == Some(HostKind::Simlock);
+        let platform = self.device.platform;
+        let kind = self.host_kind(cx);
+        let simlock = kind == Some(HostKind::Simlock);
+        let host_commands = runs_host_commands(kind);
+        let controls_disabled = self.controls.disabled(self.controls_visible(cx));
+        let settings = self.controls.settings();
+        let view = cx.entity().downgrade();
         let (devices, thread, surface) = (self.devices.clone(), self.thread_id.clone(), self.surface_id.clone());
         let session = (self.device.host_id.clone(), self.device.id.clone());
-        let more = MoreButton(Button::new("device-more").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::Ellipsis)).dropdown_menu(move |menu, _, _| {
+        let more = MenuButton(Button::new("device-more").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::Ellipsis), "More device actions").dropdown_menu(move |menu, _, _| {
             let (close_devices, close_thread, close_surface) = (devices.clone(), thread.clone(), surface.clone());
             let (power_devices, power_thread, power_surface, power_session) = (devices.clone(), thread.clone(), surface.clone(), session.clone());
             menu.item(PopupMenuItem::new("Close device panel").on_click(move |_, _, cx| {
@@ -377,6 +512,84 @@ impl DeviceScreen {
                 let session = Some(power_session.clone());
                 power_devices.update(cx, |devices, cx| devices.close_device(&power_thread, &power_surface, session, true, cx));
             }))
+        });
+        // Android rotates through a host command, iOS through its input socket.
+        let rotate = match platform {
+            Platform::Android if host_commands && controls_disabled => Some(Button::new("device-rotate").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::RotateCcw).disabled(true).into_any_element()),
+            Platform::Android if host_commands => {
+                let view = view.clone();
+                Some(
+                    MenuButton(Button::new("device-rotate").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::RotateCcw), "Rotate device")
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for (orientation, label) in RAIL_ORIENTATIONS {
+                                let view = view.clone();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                    let _ = view.update(cx, |this, cx| this.act(Action::SetOrientation(orientation), None, window, cx));
+                                }));
+                            }
+                            menu
+                        })
+                        .into_any_element(),
+                )
+            }
+            Platform::Android => None,
+            Platform::Ios if simlock => None,
+            Platform::Ios => Some(
+                Button::new("device-rotate")
+                    .variant(Variant::Ghost)
+                    .size(Size::IconSm)
+                    .icon(Icon::RotateCcw)
+                    .tooltip("Rotate device")
+                    .disabled(disabled)
+                    .on_click(cx.listener(|this, _, _, _| this.send(DeviceInput::Rotate)))
+                    .into_any_element(),
+            ),
+        };
+        let host_controls = host_commands.then(|| {
+            let next = next_appearance(settings);
+            let text_size = settings.and_then(|settings| settings.text_size);
+            let appearance = Button::new("device-appearance")
+                .variant(Variant::Ghost)
+                .size(Size::IconSm)
+                .icon(Icon::Palette)
+                .tooltip(appearance_label(next))
+                .disabled(controls_disabled || settings.and_then(|settings| settings.appearance).is_none())
+                .on_click(cx.listener(move |this, _, window, cx| this.act(Action::SetAppearance(next), None, window, cx)));
+            let text = if controls_disabled || text_size.is_none() {
+                Button::new("device-text-size").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::Pilcrow).disabled(true).into_any_element()
+            } else {
+                let view = view.clone();
+                MenuButton(Button::new("device-text-size").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::Pilcrow), "Text size")
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for size in TextSize::ALL {
+                            let view = view.clone();
+                            menu = menu.item(PopupMenuItem::new(size.label()).checked(text_size == Some(size)).on_click(move |_, window, cx| {
+                                if text_size != Some(size) {
+                                    let _ = view.update(cx, |this, cx| this.act(Action::SetTextSize(size), None, window, cx));
+                                }
+                            }));
+                        }
+                        menu
+                    })
+                    .into_any_element()
+            };
+            let tools = Button::new("device-tools")
+                .variant(Variant::Ghost)
+                .size(Size::IconSm)
+                .icon(Icon::SlidersHorizontal)
+                .tooltip("Device tools")
+                .pressed(self.tools_open)
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_tools(window, cx)));
+            [rail_divider(cx).into_any_element(), appearance.into_any_element(), text, tools.into_any_element()]
+        });
+        let screenshot = offers_screenshot(kind).then(|| {
+            Button::new("device-screenshot")
+                .variant(Variant::Ghost)
+                .size(Size::IconSm)
+                .icon(Icon::Image)
+                .tooltip(if self.screenshot_pending { "Capturing screenshot" } else { "Save screenshot" })
+                .disabled(self.status != StreamStatus::Streaming || self.screenshot_pending)
+                .on_click(cx.listener(|this, _, _, cx| this.save_screenshot(cx)))
         });
         div()
             .absolute()
@@ -409,17 +622,9 @@ impl DeviceScreen {
                             .disabled(disabled)
                             .on_click(cx.listener(|this, _, _, _| this.send(DeviceInput::Button(HardwareButton::Home)))),
                     )
-                    .when(ios && !simlock, |this| {
-                        this.child(
-                            Button::new("device-rotate")
-                                .variant(Variant::Ghost)
-                                .size(Size::IconSm)
-                                .icon(Icon::RotateCcw)
-                                .tooltip("Rotate device")
-                                .disabled(disabled)
-                                .on_click(cx.listener(|this, _, _, _| this.send(DeviceInput::Rotate))),
-                        )
-                    })
+                    .children(rotate)
+                    .children(host_controls.into_iter().flatten())
+                    .children(screenshot)
                     .child(more),
             )
     }
@@ -504,10 +709,15 @@ impl Render for DeviceScreen {
                     .child(input_disconnected_label(self.input_detail.as_deref())),
             )
         });
-        div()
+        // `role="alert"`: a failed screenshot, or a failed action while the tools are closed.
+        let alert = tools::alert(self.screenshot_error.as_deref(), self.controls.error(), self.tools_open);
+        let alert = alert.map(|alert| div().flex_shrink_0().px(px(12.)).py(px(8.)).text_xs().text_color(hsla(p.destructive)).child(alert));
+        let screen = div()
             .id("device-screen")
             .relative()
-            .size_full()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .overflow_hidden()
             .bg(hsla(p.background))
             .track_focus(&self.focus)
@@ -518,6 +728,12 @@ impl Render for DeviceScreen {
             .child(page)
             .children(input_bar)
             .children(loading)
-            .child(self.render_rail(cx))
+            .child(self.render_rail(cx));
+        let tools = (self.tools_open && self.runs_host_commands(cx)).then(|| self.render_tools(cx));
+        div()
+            .flex()
+            .size_full()
+            .child(div().flex().flex_col().flex_1().min_w_0().h_full().children(alert).child(screen))
+            .children(tools)
     }
 }

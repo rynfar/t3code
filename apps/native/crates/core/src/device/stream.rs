@@ -9,7 +9,9 @@
 //! from `deviceFrameLayout.ts`.
 //!
 //! Android (serve-emu) and Simlock hosts stream only H.264 (or WebRTC), which this client cannot
-//! decode yet; `transport` says so in the web's words for a browser without WebCodecs.
+//! decode yet; `transport` says so in the web's words for a browser without WebCodecs. A lease
+//! that ended closes the input socket with `LEASE_ENDED_CLOSE` and its reason; the stream stops
+//! there with `lease_ended` instead of reconnecting (`pingdotgg/t3code#35994`).
 
 use serde::Deserialize;
 use serde_json::json;
@@ -270,18 +272,30 @@ pub fn hid_usage(code: &str) -> Option<u8> {
     })
 }
 
-/// What a closed input socket means: a refused ticket mints new access, anything else retries.
+/// The close code a Simlock gateway sends when the device's lease ended.
+pub const LEASE_ENDED_CLOSE: u16 = 4001;
+
+/// What a closed input socket means: a refused ticket mints new access, an ended lease stops
+/// for good (retrying would only be refused again), anything else retries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
     Unauthorized,
+    LeaseEnded,
     Retry,
 }
 
 pub fn classify_close(code: Option<u16>) -> CloseAction {
     match code {
         Some(1008 | 4401) => CloseAction::Unauthorized,
+        Some(LEASE_ENDED_CLOSE) => CloseAction::LeaseEnded,
         _ => CloseAction::Retry,
     }
+}
+
+/// `leaseEnded`: the error a stream stops with, keeping the gateway's reason.
+pub fn lease_ended(reason: &str) -> String {
+    let reason = if reason.is_empty() { "ended" } else { reason };
+    format!("Device lease ended: {reason}")
 }
 
 /// The detail an input close reports: its reason, else its code.
