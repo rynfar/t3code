@@ -11,25 +11,23 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Sizable, h_flex, v_flex};
 use serde_json::{Value, json};
-use t3_client::auth::{ORCHESTRATION_PROTOCOL_VERSION, post_access};
+use t3_client::auth::ORCHESTRATION_PROTOCOL_VERSION;
 use t3_client::store::{SavedEnvironment, load_ui_state, save_ui_state};
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::client_settings::ClientSettingChange;
+use t3_core::pairing::{ANOTHER_ADDRESS, LinkableMachine, collect_known_machine_urls};
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::access::ACCESS_READ as ACCESS_READ_SCOPE;
 use t3_core::settings::{
     LoadPreference, PEER_LINKS_LINK_METHOD, PEER_LINKS_LIST_METHOD, PEER_LINKS_UNLINK_METHOD,
     PeerLinkHealth, PeerLinkSummary, PullRequestRoutingPermission,
     StoredPullRequestRoutingPermission, load_balancing_enabled_patch, load_balancing_weight_patch,
-    load_preference_for_weight, mcp_client_scopes, peer_link_create_payload, peer_link_health,
-    peer_link_status_text, peer_link_unlink_payload, pull_request_routing_connection_key,
+    load_preference_for_weight, peer_link_create_payload, peer_link_health, peer_link_status_text,
+    peer_link_unlink_payload, pull_request_routing_connection_key,
     pull_request_routing_permission_for, read_load_balancing_enabled, read_load_balancing_weights,
     set_pull_request_routing_permission, summarize_load_preferences, summarize_pull_request_routing,
 };
-use t3_core::timeline::{
-    ANOTHER_ADDRESS, ExistingPeerLink, MachineCandidate, can_manage_peer_links,
-    link_access_description, link_access_label, link_destination, linkable_machines,
-};
+use t3_core::timeline::{can_manage_peer_links, link_access_description, link_access_label};
 
 use super::controls::{
     Button, ButtonSize, ButtonVariant, DialogFrame, Row, Select, SelectOption, Switch,
@@ -55,6 +53,7 @@ struct LinkEnvironmentDialog {
     host_saved_id: String,
     host_env_id: String,
     choice: Option<String>,
+    select_open: bool,
     address: Entity<InputState>,
     pairing_code: Entity<InputState>,
     access: String,
@@ -386,8 +385,14 @@ impl SettingsView {
             InputState::new(window, cx).placeholder("From Sharing & access there, or t3 pair")
         });
         let subscriptions = vec![
-            cx.subscribe_in(&address, window, |_, _, event: &InputEvent, _, cx| {
+            cx.subscribe_in(&address, window, |this, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
+                    if let Some(dialog) = this.environments.link_dialog.as_mut()
+                        && dialog.choice.is_none()
+                        && !input.read(cx).value().is_empty()
+                    {
+                        dialog.choice = Some(ANOTHER_ADDRESS.to_owned());
+                    }
                     cx.notify();
                 }
             }),
@@ -399,10 +404,12 @@ impl SettingsView {
         ];
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let refresh_host = host_saved_id.clone();
         self.environments.link_dialog = Some(LinkEnvironmentDialog {
             host_saved_id,
             host_env_id,
             choice: None,
+            select_open: false,
             address,
             pairing_code,
             access: "approval-required".to_owned(),
@@ -412,6 +419,17 @@ impl SettingsView {
             focus,
             _subscriptions: subscriptions,
         });
+        self.refresh_peer_links(&refresh_host, false, cx);
+        let should_discover_cloud = {
+            let app = self.state.read(cx);
+            app.cloud.identity.is_some()
+                && app.cloud.discovery.environments.is_empty()
+                && !app.cloud.discovery.refreshing
+                && !app.cloud.busy
+        };
+        if should_discover_cloud {
+            self.state.update(cx, |state, cx| state.refresh_cloud(cx));
+        }
         cx.notify();
     }
 
@@ -420,68 +438,84 @@ impl SettingsView {
         host_saved_id: &str,
         host_env_id: &str,
         cx: &App,
-    ) -> Vec<t3_core::timeline::requests::LinkableMachine> {
+    ) -> Vec<LinkableMachine> {
         let app = self.state.read(cx);
-        let existing: Vec<ExistingPeerLink> = match self.environments.peer_links.get(host_saved_id) {
-            Some(PeerLinksLoad::Loaded { links, .. }) => links
-                .iter()
-                .map(|l| ExistingPeerLink {
-                    environment_id: l.environment_id.clone(),
-                    label: l.label.clone(),
-                })
-                .collect(),
-            _ => Vec::new(),
+        let linked_ids: HashSet<&str> = match self.environments.peer_links.get(host_saved_id) {
+            Some(PeerLinksLoad::Loaded { links, .. }) => {
+                links.iter().map(|link| link.environment_id.as_str()).collect()
+            }
+            _ => HashSet::new(),
         };
-        let candidates: Vec<MachineCandidate> = app
-            .environments
-            .environments
-            .iter()
-            .filter(|saved| !saved.disabled)
-            .map(|saved| {
-                let fleet_view = app.fleet.environment(&saved.id);
-                let env_id = fleet_view
-                    .and_then(|v| v.config.config.as_ref())
-                    .map(|c| c.environment.environment_id.clone())
-                    .filter(|id| !id.is_empty())
-                    .unwrap_or_else(|| saved.id.clone());
-                let label = fleet_view
-                    .and_then(|v| v.config.config.as_ref())
-                    .map(|c| c.environment.label.clone())
-                    .filter(|l| !l.trim().is_empty())
-                    .or_else(|| (!saved.label.trim().is_empty()).then(|| saved.label.clone()))
-                    .unwrap_or_else(|| saved.address());
-                let reachable = fleet_view.is_some_and(|v| v.status == ConnectionStatus::Connected);
-                let mut urls = Vec::new();
-                if !saved.http_base.trim().is_empty() {
-                    urls.push(saved.http_base.clone());
-                }
-                MachineCandidate { id: env_id, label, urls, reachable }
-            })
-            .collect();
-        linkable_machines(&candidates, &existing, Some(host_env_id))
+        let mut machines = Vec::new();
+        let mut seen = HashSet::new();
+        for saved in &app.environments.environments {
+            if saved.disabled || saved.id == host_saved_id {
+                continue;
+            }
+            let fleet_view = app.fleet.environment(&saved.id);
+            let cfg = fleet_view.and_then(|v| v.config.config.as_ref());
+            let env_id = cfg
+                .map(|c| c.environment.environment_id.clone())
+                .filter(|id| !id.is_empty())
+                .or_else(|| saved.environment_id.clone())
+                .unwrap_or_else(|| saved.id.clone());
+            if env_id == host_env_id || !seen.insert(env_id.clone()) {
+                continue;
+            }
+            let label = cfg
+                .map(|c| c.environment.label.clone())
+                .filter(|l| !l.trim().is_empty())
+                .or_else(|| (!saved.label.trim().is_empty()).then(|| saved.label.clone()))
+                .unwrap_or_else(|| saved.address());
+            let machine = cfg.and_then(|c| {
+                c.settings
+                    .environment_icon
+                    .clone()
+                    .or_else(|| c.environment.platform.as_ref().map(|p| p.machine.clone()))
+            });
+            let extras = t3_client::supervisor::server_config_extras_for(&saved.http_base)
+                .borrow()
+                .clone();
+            let mut raw_urls: Vec<&str> =
+                extras.direct_endpoints.iter().map(String::as_str).collect();
+            raw_urls.push(saved.http_base.as_str());
+            let urls = collect_known_machine_urls(raw_urls);
+            let connected = fleet_view.is_some_and(|v| v.status == ConnectionStatus::Connected);
+            let linked = linked_ids.contains(env_id.as_str());
+            machines.push(LinkableMachine {
+                environment_id: env_id,
+                label,
+                machine,
+                urls,
+                connected,
+                connect_only: false,
+                linked,
+            });
+        }
+        for cloud_env in &app.cloud.discovery.environments {
+            if cloud_env.environment_id == host_env_id
+                || !seen.insert(cloud_env.environment_id.clone())
+            {
+                continue;
+            }
+            let linked = linked_ids.contains(cloud_env.environment_id.as_str());
+            machines.push(LinkableMachine {
+                environment_id: cloud_env.environment_id.clone(),
+                label: cloud_env.label.clone(),
+                machine: Some("cloud".to_owned()),
+                urls: Vec::new(),
+                connected: false,
+                connect_only: true,
+                linked,
+            });
+        }
+        machines
     }
 
-    fn can_mint_on_machine(&self, target_env_id: &str, cx: &App) -> Option<t3_client::auth::Credentials> {
-        let app = self.state.read(cx);
-        for view in &app.fleet.environments {
-            if view.status != ConnectionStatus::Connected {
-                continue;
-            }
-            let Some(cfg) = view.config.config.as_ref() else {
-                continue;
-            };
-            if cfg.environment.environment_id != target_env_id {
-                continue;
-            }
-            if !can_manage_peer_links(view.grants.as_ref()) {
-                return None;
-            }
-            return app
-                .environments
-                .get(&view.summary.owner.saved_id)
-                .and_then(|s| s.credentials());
-        }
-        None
+    fn can_mint_on_machine(&self, machine: &LinkableMachine, needs_address: bool, cx: &App) -> bool {
+        !needs_address
+            && machine.connected
+            && self.state.read(cx).can_mint_pairing_code_on(&machine.environment_id)
     }
 
     fn submit_link_dialog(&mut self, cx: &mut Context<Self>) {
@@ -501,7 +535,7 @@ impl SettingsView {
         let Some(selected) = selected else {
             return;
         };
-        let machine = machines.iter().find(|m| m.id == selected).cloned();
+        let machine = machines.iter().find(|m| m.environment_id == selected).cloned();
         let needs_address = machine.as_ref().is_none_or(|m| m.urls.is_empty());
         let typed_address = dialog.address.read(cx).value().trim().to_owned();
         let typed_code = dialog.pairing_code.read(cx).value().trim().to_owned();
@@ -511,7 +545,7 @@ impl SettingsView {
             (Some(m), false) => {
                 let first = m.urls[0].clone();
                 let rest = m.urls[1..].to_vec();
-                (first, rest, Some(m.id.clone()), Some(m.label.clone()))
+                (first, rest, Some(m.environment_id.clone()), Some(m.label.clone()))
             }
             _ => {
                 if typed_address.is_empty() {
@@ -521,15 +555,11 @@ impl SettingsView {
             }
         };
 
-        let mint_creds = if !needs_address
-            && let Some(m) = &machine
-            && !dialog.mint_failed.contains(&m.id)
-        {
-            self.can_mint_on_machine(&m.id, cx)
-        } else {
-            None
-        };
-        if mint_creds.is_none() && typed_code.is_empty() {
+        let can_mint = machine.as_ref().is_some_and(|m| {
+            !dialog.mint_failed.contains(&m.environment_id)
+                && self.can_mint_on_machine(m, needs_address, cx)
+        });
+        if !can_mint && typed_code.is_empty() {
             return;
         }
 
@@ -549,25 +579,20 @@ impl SettingsView {
         let active_client = is_active.then(|| app.client_handle()).flatten();
         let lookup = (!is_active).then(|| app.connections.client(&host_saved_id));
         let runtime = app.runtime().clone();
-        let mint_target_id = machine.as_ref().map(|m| m.id.clone());
+        let mint_target_id = machine.as_ref().map(|m| m.environment_id.clone());
+        let mint_future = can_mint.then(|| {
+            let env_id = machine
+                .as_ref()
+                .expect("machine present when can_mint is true")
+                .environment_id
+                .clone();
+            app.mint_pairing_code_on(&env_id, &access)
+        });
 
         let task = runtime.spawn(async move {
-            let code = if let Some(creds) = mint_creds {
-                let scopes = mcp_client_scopes(&access);
-                let body = json!({
-                    "label": "T3 Code link",
-                    "scopes": scopes,
-                });
-                match post_access(&creds, "/api/auth/pairing-token", Some(body)).await {
-                    Ok(reply) => reply
-                        .get("credential")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .ok_or_else(|| (true, "Target environment did not return a pairing code.".to_owned()))?,
-                    Err(err) => return Err((true, format!("Could not mint pairing code: {err}"))),
-                }
-            } else {
-                typed_code
+            let code = match mint_future {
+                Some(fut) => fut.await.map_err(|err| (true, err.to_string()))?,
+                None => typed_code,
             };
 
             let client = match active_client {
@@ -1285,12 +1310,12 @@ impl SettingsView {
             .or_else(|| machines.is_empty().then(|| ANOTHER_ADDRESS.to_owned()));
         let machine = selected
             .as_deref()
-            .and_then(|sel| machines.iter().find(|m| m.id == sel));
+            .and_then(|sel| machines.iter().find(|m| m.environment_id == sel));
         let needs_address = selected.is_some() && machine.is_none_or(|m| m.urls.is_empty());
-        let can_mint = !needs_address
-            && machine.is_some_and(|m| {
-                !dialog.mint_failed.contains(&m.id) && self.can_mint_on_machine(&m.id, cx).is_some()
-            });
+        let can_mint = machine.is_some_and(|m| {
+            !dialog.mint_failed.contains(&m.environment_id)
+                && self.can_mint_on_machine(m, needs_address, cx)
+        });
         let address_val = dialog.address.read(cx).value().trim().to_owned();
         let code_val = dialog.pairing_code.read(cx).value().trim().to_owned();
         selected.is_some()
@@ -1367,73 +1392,51 @@ impl SettingsView {
             .or_else(|| machines.is_empty().then(|| ANOTHER_ADDRESS.to_owned()));
         let machine = selected
             .as_deref()
-            .and_then(|sel| machines.iter().find(|m| m.id == sel));
+            .and_then(|sel| machines.iter().find(|m| m.environment_id == sel));
         let needs_address = selected.is_some() && machine.is_none_or(|m| m.urls.is_empty());
-        let can_mint = !needs_address
-            && machine.is_some_and(|m| {
-                !dialog.mint_failed.contains(&m.id) && self.can_mint_on_machine(&m.id, cx).is_some()
-            });
+        let can_mint = machine.is_some_and(|m| {
+            !dialog.mint_failed.contains(&m.environment_id)
+                && self.can_mint_on_machine(m, needs_address, cx)
+        });
         let address_val = dialog.address.read(cx).value().trim().to_owned();
         let ready = self.link_dialog_ready(cx);
         let busy = dialog.busy;
+        let weak_toggle = cx.entity().downgrade();
         let weak_choice = cx.entity().downgrade();
         let weak_access = cx.entity().downgrade();
         let weak_dismiss = cx.entity().downgrade();
 
         let mut body = v_flex().gap(r(14.));
         if !machines.is_empty() {
-            let mut machine_options: Vec<SelectOption> = machines
-                .iter()
-                .map(|m| {
-                    let mut opt = SelectOption::new(m.id.clone(), m.label.clone());
-                    if m.existing_link_environment_id.is_some() {
-                        opt = opt.description("Linked");
-                    } else if !m.reachable {
-                        opt = opt.description("Not connected");
-                    }
-                    opt
-                })
-                .collect();
-            machine_options.push(SelectOption::new(ANOTHER_ADDRESS, "Another address\u{2026}"));
-            let selected_label = match selected.as_deref() {
-                Some(ANOTHER_ADDRESS) => "Another address\u{2026}".to_owned(),
-                Some(id) => machines
-                    .iter()
-                    .find(|m| m.id == id)
-                    .map(|m| m.label.clone())
-                    .unwrap_or_else(|| "Choose a machine".to_owned()),
-                None => "Choose a machine".to_owned(),
-            };
-            body = body.child(
-                v_flex()
-                    .gap(r(6.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(hsla(p.foreground))
-                            .child("Machine"),
-                    )
-                    .child(
-                        Select::new("peer-link-machine-select", machine_options)
-                            .selected(selected.clone().unwrap_or_default())
-                            .label(selected_label)
-                            .width(360.)
-                            .disabled(busy)
-                            .on_change(move |value, _, cx| {
-                                let _ = weak_choice.update(cx, |this, cx| {
-                                    if let Some(d) = this.environments.link_dialog.as_mut() {
-                                        d.choice = Some(value.to_string());
-                                        d.error = None;
-                                        cx.notify();
-                                    }
-                                });
-                            }),
-                    ),
-            );
+            body = body.child(crate::connect::render_link_machine_select(
+                "peer-link-machine-select",
+                &machines,
+                selected.as_deref(),
+                dialog.select_open,
+                busy,
+                move |_, cx| {
+                    let _ = weak_toggle.update(cx, |this, cx| {
+                        if let Some(d) = this.environments.link_dialog.as_mut() {
+                            d.select_open = !d.select_open;
+                            cx.notify();
+                        }
+                    });
+                },
+                move |value, _, cx| {
+                    let _ = weak_choice.update(cx, |this, cx| {
+                        if let Some(d) = this.environments.link_dialog.as_mut() {
+                            d.choice = Some(value);
+                            d.select_open = false;
+                            d.error = None;
+                            cx.notify();
+                        }
+                    });
+                },
+                cx,
+            ));
         }
 
-        if machine.is_some_and(|m| m.existing_link_environment_id.is_some()) {
+        if machine.is_some_and(|m| m.linked) {
             body = body.child(
                 div()
                     .text_xs()
@@ -1459,38 +1462,13 @@ impl SettingsView {
                             .text_color(hsla(p.foreground))
                             .child("Address"),
                     )
-                    .child(Input::new(&dialog.address).small())
+                    .child(Input::new(&dialog.address).small().disabled(busy))
                     .children(no_reachable_note.map(|note| {
                         div().text_xs().text_color(hsla(p.muted_foreground)).child(note)
                     })),
             );
             if !address_val.is_empty() {
-                body = body.child(
-                    v_flex()
-                        .px(r(12.))
-                        .py(r(10.))
-                        .gap(r(4.))
-                        .rounded(r(8.))
-                        .border_1()
-                        .border_color(hsla(p.warning).opacity(0.4))
-                        .bg(hsla(p.warning).opacity(0.08))
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(hsla(p.foreground))
-                                .child("Check this address"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(hsla(p.muted_foreground))
-                                .child(format!(
-                                    "This app cannot confirm it is one of your machines. The pairing code you paste is sent there: {}",
-                                    link_destination(&address_val)
-                                )),
-                        ),
-                );
+                body = body.child(crate::connect::link_address_warning(&address_val, cx));
             }
         }
 
@@ -1511,7 +1489,7 @@ impl SettingsView {
                             .text_color(hsla(p.foreground))
                             .child("Pairing code"),
                     )
-                    .child(Input::new(&dialog.pairing_code).small())
+                    .child(Input::new(&dialog.pairing_code).small().disabled(busy))
                     .children(help_note.map(|note| {
                         div().text_xs().text_color(hsla(p.muted_foreground)).child(note)
                     })),
@@ -1778,11 +1756,335 @@ mod tests {
         drive(&mut vcx);
 
         drop(view);
-        vcx.update(|window, cx| crate::settings::finish_close(window, cx));
+        vcx.update(crate::settings::finish_close);
         state.update(&mut vcx, |state, _| state.stop_pump());
         vcx.run_until_parked();
         drop(vcx);
         drop(fixture);
         drop(runtime);
+    }
+
+    #[gpui::test]
+    async fn link_dialog_reuses_link_machine_select_and_auto_mints_via_peer_pairing_code(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (peer_base, mint_calls, server_task) = runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+            let calls_bg = calls.clone();
+            let replies = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+                (403u16, json!({ "error": "access:write required" })),
+                (
+                    200u16,
+                    json!({
+                        "id": "pair-auto-1",
+                        "credential": "MINTED-PEER-CODE",
+                        "label": "T3 Code link",
+                        "expiresAt": "2099-01-01T00:00:00.000Z"
+                    }),
+                ),
+            ])));
+            let task = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = socket.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(head) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&buf[..head]);
+                            let len = header
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= head + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let raw = String::from_utf8_lossy(&buf);
+                    let first_line = raw.lines().next().unwrap_or("").to_owned();
+                    let body_str = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let body_json = serde_json::from_str::<Value>(body_str).unwrap_or(Value::Null);
+                    calls_bg.lock().unwrap().push((first_line, body_json));
+                    let (status, reply) = replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or((200, json!({})));
+                    let body = reply.to_string();
+                    let resp = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            });
+            (base, calls, task)
+        });
+
+        cx.executor().allow_parking();
+        let (state, mut fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "access:read", "access:write"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.environments.environments = vec![
+                    SavedEnvironment {
+                        id: "host-mac".into(),
+                        environment_id: Some("mac-env".into()),
+                        label: "Mac".into(),
+                        http_base: "http://127.0.0.1:3773".into(),
+                        access_token: Some("tok-host".into()),
+                        local: true,
+                        disabled: false,
+                        ssh: None,
+                        server_version: None,
+                    },
+                    SavedEnvironment {
+                        id: "peer-vps".into(),
+                        environment_id: Some("vps-1".into()),
+                        label: "Build VPS".into(),
+                        http_base: peer_base.clone(),
+                        access_token: Some("tok-peer".into()),
+                        local: false,
+                        disabled: false,
+                        ssh: None,
+                        server_version: None,
+                    },
+                ];
+                t3_client::supervisor::set_server_config_extras_for(
+                    &peer_base,
+                    t3_client::supervisor::ServerConfigExtras {
+                        direct_endpoints: vec!["https://vps.example.ts.net".to_owned()],
+                        ..Default::default()
+                    },
+                );
+                state.environments.active = Some("host-mac".into());
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": { "environmentId": "mac-env", "label": "Mac" },
+                        "settings": { "linkedEnvironmentsEnabled": true }
+                    }))
+                    .unwrap(),
+                );
+                let peer_cfg: ServerConfig = serde_json::from_value(json!({
+                    "environment": {
+                        "environmentId": "vps-1",
+                        "label": "Build VPS",
+                        "platform": { "os": "linux", "arch": "x64", "machine": "linux" }
+                    },
+                    "auth": { "policy": "remote-reachable" }
+                }))
+                .unwrap();
+                let mut peer_cfg_state = t3_core::server_config::ServerConfigState::default();
+                peer_cfg_state.config = Some(peer_cfg);
+                let peer_grants: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "access:read", "access:write"]
+                }))
+                .unwrap();
+                let mut peer_shell = t3_core::shell::ShellState::default();
+                peer_shell.synchronized = true;
+                let peer_owner = t3_core::sidebar::grouping::EnvironmentOwner {
+                    saved_id: "peer-vps".into(),
+                    canonical_id: Some("vps-1".into()),
+                    generation: 1,
+                    connection_generation: 1,
+                    shell_generation: 1,
+                };
+                state.fleet = std::sync::Arc::new(t3_client::environments::FleetView {
+                    revision: 1,
+                    environments: vec![std::sync::Arc::new(t3_client::environments::EnvironmentView {
+                        summary: std::sync::Arc::new(t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                            peer_owner,
+                            &peer_shell,
+                            &peer_cfg_state,
+                        )),
+                        status: ConnectionStatus::Connected,
+                        config: peer_cfg_state,
+                        grants: Some(peer_grants),
+                        settings_revision: 0,
+                        keybindings_revision: 0,
+                    })],
+                });
+                state.cloud.discovery.environments.push(t3_core::relay::Environment {
+                    environment_id: "cloud-only-1".into(),
+                    label: "Cloud Box".into(),
+                    endpoint: t3_core::relay::Endpoint {
+                        http_base_url: "https://cloud-box.t3coderelay.com".into(),
+                        ws_base_url: "wss://cloud-box.t3coderelay.com/ws".into(),
+                        provider_kind: "relay".into(),
+                    },
+                });
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+            crate::settings::open(Section::Connections, cx);
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let view = vcx.read(|cx| cx.global::<crate::settings::Host>().view.clone().expect("settings view"));
+
+        // 1. `linkable_machines_for` includes connected peer (with machine icon + known URL) and T3 Connect discovery machine (`connect_only`).
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.environments.peer_links.insert(
+                    "host-mac".into(),
+                    PeerLinksLoad::Loaded { links: Vec::new(), fetched_at: Instant::now() },
+                );
+                let machines = view.linkable_machines_for("host-mac", "mac-env", cx);
+                let vps = machines.iter().find(|m| m.environment_id == "vps-1").expect("vps machine");
+                assert!(vps.connected);
+                assert!(!vps.connect_only);
+                assert_eq!(vps.machine.as_deref(), Some("linux"));
+                // Loopback `peer_base` is filtered out by `collect_known_machine_urls`; direct endpoint is kept.
+                assert_eq!(vps.urls, vec!["https://vps.example.ts.net".to_owned()]);
+                let cloud = machines
+                    .iter()
+                    .find(|m| m.environment_id == "cloud-only-1")
+                    .expect("cloud machine");
+                assert!(cloud.connect_only);
+                assert!(!cloud.connected);
+                assert!(cloud.urls.is_empty());
+
+                // Open link dialog and pick the connected peer -> ready without typing a manual code.
+                view.open_link_dialog("host-mac".into(), "mac-env".into(), window, cx);
+                let dialog = view.environments.link_dialog.as_mut().unwrap();
+                dialog.choice = Some("vps-1".into());
+                assert!(view.link_dialog_ready(cx), "connected peer with access:write should be ready to auto-mint");
+                view.submit_link_dialog(cx);
+            });
+        });
+
+        // First auto-mint gets HTTP 403 -> marks `vps-1` in `mint_failed`, shows PeerPairingCodeError message, and disables readiness until manual code is entered.
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut fail_tx = Some(fail_tx);
+        let _fail_obs = vcx.update(|_, cx| {
+            cx.observe(&view, move |view, cx| {
+                if view
+                    .read(cx)
+                    .environments
+                    .link_dialog
+                    .as_ref()
+                    .is_some_and(|d| !d.busy && d.mint_failed.contains("vps-1"))
+                    && let Some(tx) = fail_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        if view.read_with(&vcx, |view, _| {
+            !view
+                .environments
+                .link_dialog
+                .as_ref()
+                .is_some_and(|d| !d.busy && d.mint_failed.contains("vps-1"))
+        }) {
+            fail_rx.await.unwrap();
+        }
+        drop(_fail_obs);
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let v = view.read(cx);
+            let d = v.environments.link_dialog.as_ref().expect("dialog stays open on mint failure");
+            assert!(d.mint_failed.contains("vps-1"));
+            assert!(
+                d.error.as_deref().is_some_and(|msg| msg.contains("cannot create pairing codes")),
+                "403 must surface PeerPairingCodeError::NotAllowed message, got: {:?}",
+                d.error
+            );
+            assert!(!v.link_dialog_ready(cx), "after mint failure, manual pairing code is required");
+        });
+
+        // Clear `mint_failed` and retry -> second mint gets HTTP 200 and sends `peerLinks.link` with minted credential.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let d = view.environments.link_dialog.as_mut().unwrap();
+                d.mint_failed.clear();
+                view.submit_link_dialog(cx);
+            });
+        });
+        let (method, payload, reply) = loop {
+            let req = fixture.next_request().await;
+            if req.0 == PEER_LINKS_LINK_METHOD {
+                break req;
+            }
+            let _ = req.2.send(Ok(json!({})));
+        };
+        assert_eq!(method, PEER_LINKS_LINK_METHOD);
+        assert_eq!(payload["url"], json!("https://vps.example.ts.net"));
+        assert_eq!(payload["pairingCode"], json!("MINTED-PEER-CODE"));
+        assert_eq!(payload["expectedEnvironmentId"], json!("vps-1"));
+        assert_eq!(payload["expectedLabel"], json!("Build VPS"));
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut closed_tx = Some(closed_tx);
+        let _closed_obs = vcx.update(|_, cx| {
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).environments.link_dialog.is_none()
+                    && let Some(tx) = closed_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        let _ = reply.send(Ok(json!({ "label": "Build VPS" })));
+        closed_rx.await.unwrap();
+        drop(_closed_obs);
+        vcx.run_until_parked();
+        assert!(view.read_with(&vcx, |v, _| v.environments.link_dialog.is_none()));
+        let recorded = mint_calls.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|(req, body)| {
+                req.starts_with("POST /api/auth/pairing-token")
+                    && body["label"] == "T3 Code link"
+                    && body["scopes"].is_array()
+            }),
+            "expected POST /api/auth/pairing-token from mint_pairing_code_on, got: {recorded:?}"
+        );
+
+        server_task.abort();
+        drop(view);
+        vcx.update(crate::settings::finish_close);
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        vcx.run_until_parked();
+        drop(vcx);
+        drop(fixture);
+        runtime.shutdown_background();
     }
 }

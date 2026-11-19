@@ -454,6 +454,9 @@ impl DraftHero {
                 Some(owner) => state.navigate_scoped(owner.clone(), crate::app_state::ScopedRouteAction::Draft(entry.project_id), cx),
                 None => state.start_draft(&entry.project_id, cx),
             });
+            self.composer.update(cx, |composer, cx| {
+                composer.prepare_draft_routing_on_project_pick(window, cx);
+            });
         }
         self.composer.update(cx, |composer, cx| composer.focus(window, cx));
     }
@@ -1617,6 +1620,250 @@ mod tests {
             cx.clear_globals();
         });
         drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn draft_hero_project_pick_triggers_load_balanced_auto_routing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(
+                cx,
+                runtime.handle().clone(),
+            );
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        let (connections, _output) =
+            t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+        });
+
+        let grants: t3_core::auth::AuthSessionState = serde_json::from_value(serde_json::json!({
+            "authenticated": true,
+            "permissions": ["orchestration:read", "orchestration:operate"]
+        }))
+        .unwrap();
+        let (local_client, mut local_fixture) =
+            t3_client::supervisor::ClientFixture::handle(grants.clone());
+        let (remote_client, mut remote_fixture) =
+            t3_client::supervisor::ClientFixture::handle(grants);
+
+        let repo_identity = serde_json::json!({
+            "canonicalKey": "github.com/acme/hero-repo",
+            "locator": { "source": "git-remote", "remoteName": "origin", "remoteUrl": "https://github.com/acme/hero-repo.git" }
+        });
+        let make_shell = |projects: Vec<t3_core::shell::ProjectShell>| {
+            let mut shell = t3_core::shell::ShellState::default();
+            shell.synchronized = true;
+            shell.generation = 1;
+            shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                projects,
+                ..Default::default()
+            });
+            shell
+        };
+        let make_proj = |id: &str, title: &str, root: &str, identity: Option<serde_json::Value>| {
+            t3_core::shell::ProjectShell {
+                id: id.to_owned(),
+                title: title.to_owned(),
+                has_custom_title: None,
+                workspace_root: root.to_owned(),
+                repository_identity: identity,
+                default_model_selection: None,
+                pinned_at: None,
+                archived_at: None,
+                favicon_path: None,
+                project_icon: None,
+                scripts: Vec::new(),
+                created_at: "2026-04-01T00:00:00.000Z".to_owned(),
+                updated_at: "2026-04-01T00:00:00.000Z".to_owned(),
+            }
+        };
+        let make_cfg = |env_id: &str, label: &str| {
+            let mut cfg = t3_core::server_config::ServerConfigState::default();
+            cfg.config = Some(
+                serde_json::from_value(serde_json::json!({
+                    "environment": { "environmentId": env_id, "label": label, "platform": { "os": "linux", "arch": "x64", "machine": "linux" }, "homeDir": "/home/me", "capabilities": {}, "serverVersion": "1.2.3" },
+                    "providers": [{
+                        "instanceId": "codex",
+                        "driver": "codex",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "auth": { "status": "authenticated" },
+                        "availability": "available",
+                        "models": [{ "slug": "gpt-5", "name": "GPT-5" }]
+                    }],
+                    "auth": { "policy": "remote-reachable" }
+                }))
+                .unwrap(),
+            );
+            cfg
+        };
+
+        let local_shell = make_shell(vec![
+            make_proj("solo-local", "Solo", "/Users/me/solo", None),
+            make_proj("shared-local", "Hero Repo", "/Users/me/hero-repo", Some(repo_identity.clone())),
+        ]);
+        let remote_shell = make_shell(vec![make_proj(
+            "shared-remote",
+            "Hero Repo",
+            "/home/me/hero-repo",
+            Some(repo_identity),
+        )]);
+        let local_cfg = make_cfg("env-local", "MacBook");
+        let remote_cfg = make_cfg("env-remote", "Build Box");
+
+        let mut view = state.read_with(cx, |state, _| state.connections.view());
+        let install_local = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "local",
+                local_client.clone(),
+                local_shell.clone(),
+                local_cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _local_events = runtime.spawn(install_local).await.unwrap();
+        let install_remote = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "remote-1",
+                remote_client.clone(),
+                remote_shell.clone(),
+                remote_cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _remote_events = runtime.spawn(install_remote).await.unwrap();
+        let fleet = view.borrow_and_update().clone();
+
+        cx.update(|cx| {
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::ThemePatch(
+                    t3_core::settings::load_balancing_enabled_patch(true),
+                ),
+                cx,
+            );
+            state.update(cx, |state, cx| {
+                state.environments.environments = vec![
+                    t3_client::store::SavedEnvironment {
+                        id: "local".into(),
+                        environment_id: Some("env-local".into()),
+                        label: "MacBook".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:3773".into(),
+                        access_token: Some("tok-local".into()),
+                        server_version: Some("1.2.3".into()),
+                        local: true,
+                        ssh: None,
+                    },
+                    t3_client::store::SavedEnvironment {
+                        id: "remote-1".into(),
+                        environment_id: Some("env-remote".into()),
+                        label: "Build Box".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:3774".into(),
+                        access_token: Some("tok-remote".into()),
+                        server_version: Some("1.2.3".into()),
+                        local: false,
+                        ssh: None,
+                    },
+                ];
+                state.environments.active = Some("local".into());
+                state.install_active_environment(
+                    local_client,
+                    local_shell,
+                    local_cfg,
+                    t3_client::supervisor::ConnectionStatus::Connected,
+                    cx,
+                );
+                state.apply_fleet_view(fleet, cx);
+                state.start_draft("solo-local", cx);
+            });
+        });
+
+        let (harness, vcx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let hero = cx.new(|cx| DraftHero::new(state.clone(), composer.clone(), cx));
+            let unfocus = cx.focus_handle();
+            window.focus(&unfocus, cx);
+            HeroHarness { hero, composer, render_hero: false, unfocus }
+        });
+        let hero = harness.read_with(vcx, |h, _| h.hero.clone());
+
+        // Picking the shared project in `DraftHero` triggers host-resource queries and routes to
+        // the less-loaded remote machine.
+        vcx.update(|window, cx| {
+            let (entries, _) = hero.read(cx).entries(cx);
+            let shared = entries
+                .into_iter()
+                .find(|entry| entry.label == "Hero Repo")
+                .expect("shared project in hero picker");
+            hero.update(cx, |hero, cx| hero.select_entry(shared, window, cx));
+        });
+
+        let reply_resources = async |fx: &mut t3_client::supervisor::ClientFixture, cpu: f64| {
+            loop {
+                let (method, _, reply) = fx.next_request().await;
+                if method == t3_client::load_balancing::SERVER_GET_HOST_RESOURCES {
+                    let now = crate::sidebar::controller::now_ms();
+                    let _ = reply.send(Ok(serde_json::json!({
+                        "sampledAt": now,
+                        "cpuUtilization": cpu,
+                        "cpuCount": 8,
+                        "availableMemoryBytes": 12_000_000_000u64,
+                        "totalMemoryBytes": 16_000_000_000u64
+                    })));
+                    return;
+                }
+                let _ = reply.send(Ok(serde_json::json!({})));
+            }
+        };
+        let (routed_tx, routed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut routed_tx = Some(routed_tx);
+        let _routed_sub = vcx.update(|_, cx| {
+            cx.subscribe(&state, move |state, event: &AppEvent, cx| {
+                if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::Phase)
+                    && state.read(cx).environments.active.as_deref() == Some("remote-1")
+                    && let Some(tx) = routed_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        futures::future::join(
+            reply_resources(&mut local_fixture, 0.85),
+            reply_resources(&mut remote_fixture, 0.15),
+        )
+        .await;
+        routed_rx.await.unwrap();
+        drop(_routed_sub);
+        vcx.run_until_parked();
+        assert_eq!(
+            vcx.read(|cx| state.read(cx).environments.active.clone()).as_deref(),
+            Some("remote-1")
+        );
+
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
         cx.run_until_parked();
     }
 }

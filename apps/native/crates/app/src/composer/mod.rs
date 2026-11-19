@@ -344,6 +344,7 @@ pub struct Composer {
     stash: Option<String>,
     sending: bool,
     pending_send: t3_core::composer::attachments::PendingSend,
+    pending_routed_send: Option<send::PendingRoutedSend>,
     pending_questions: Vec<(String, String)>,
     send_connection: Option<(Option<u64>, Option<u64>, crate::app_state::Phase)>,
     has_text: bool,
@@ -600,6 +601,7 @@ impl Composer {
                 }
                 if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Phase) {
                     this.sync_workspace(*event == AppEvent::ServerConfig, cx);
+                    this.sync_draft_routing(window, cx);
                     this.sync_menu(false, cx);
                 }
                 if matches!(event, AppEvent::SidebarSelection | AppEvent::Shell | AppEvent::Phase) && !this.context.linked.is_empty() { cx.notify(); }
@@ -641,6 +643,7 @@ impl Composer {
                 if *event == AppEvent::Rewind {
                     if this.is_rewinding(cx) {
                         let _ = this.cancel_pending_send();
+                        let _ = this.cancel_pending_routed_send();
                         this.picker_open = false;
                         this.permissions_open = false;
                         this.workspace.open = false;
@@ -735,6 +738,7 @@ impl Composer {
             stash: None,
             sending: false,
             pending_send: Default::default(),
+            pending_routed_send: None,
             pending_questions: Vec::new(),
             send_connection: None,
             has_text: false,
@@ -781,6 +785,7 @@ impl Composer {
         composer.load_stash();
         composer.refresh(true, window, cx);
         composer.sync_workspace(true, cx);
+        composer.sync_draft_routing(window, cx);
         composer
     }
 
@@ -4456,6 +4461,489 @@ mod stream_error_tests {
         });
         drop(fixture);
         drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn draft_environment_auto_routing_selector_label_and_refresh_before_send(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use serde_json::json;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, _initial_fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(
+                cx,
+                runtime.handle().clone(),
+            );
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+
+        let (connections, _output) =
+            t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+        });
+
+        let grants: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["orchestration:read", "orchestration:operate", "source-control:write"]
+        }))
+        .unwrap();
+        let (local_client, mut local_fixture) =
+            t3_client::supervisor::ClientFixture::handle(grants.clone());
+        let (remote_client, mut remote_fixture) =
+            t3_client::supervisor::ClientFixture::handle(grants);
+
+        let repo_identity = json!({
+            "canonicalKey": "github.com/acme/shared-app",
+            "locator": { "source": "git-remote", "remoteName": "origin", "remoteUrl": "https://github.com/acme/shared-app.git" }
+        });
+        let make_shell = |pid: &str, root: &str| {
+            let mut shell = t3_core::shell::ShellState::default();
+            shell.synchronized = true;
+            shell.generation = 1;
+            shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                projects: vec![t3_core::shell::ProjectShell {
+                    id: pid.to_owned(),
+                    title: "Shared App".to_owned(),
+                    has_custom_title: None,
+                    workspace_root: root.to_owned(),
+                    repository_identity: Some(repo_identity.clone()),
+                    default_model_selection: None,
+                    pinned_at: None,
+                    archived_at: None,
+                    favicon_path: None,
+                    project_icon: None,
+                    scripts: Vec::new(),
+                    created_at: "2026-04-01T00:00:00.000Z".to_owned(),
+                    updated_at: "2026-04-01T00:00:00.000Z".to_owned(),
+                }],
+                ..Default::default()
+            });
+            shell
+        };
+        let make_cfg = |env_id: &str, label: &str| {
+            let mut cfg = t3_core::server_config::ServerConfigState::default();
+            cfg.config = Some(
+                serde_json::from_value(json!({
+                    "environment": { "environmentId": env_id, "label": label, "platform": { "os": "linux", "arch": "x64", "machine": "linux" }, "homeDir": "/home/me", "capabilities": {}, "serverVersion": "1.2.3" },
+                    "providers": [{
+                        "instanceId": "codex",
+                        "driver": "codex",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "auth": { "status": "authenticated" },
+                        "availability": "available",
+                        "models": [{ "slug": "gpt-5", "name": "GPT-5" }]
+                    }],
+                    "auth": { "policy": "remote-reachable" }
+                }))
+                .unwrap(),
+            );
+            cfg
+        };
+
+        let local_shell = make_shell("proj-local", "/Users/me/shared-app");
+        let remote_shell = make_shell("proj-remote", "/home/me/shared-app");
+        let local_cfg = make_cfg("env-local", "MacBook Pro");
+        let remote_cfg = make_cfg("env-remote", "Build Box");
+
+        let mut view = state.read_with(cx, |state, _| state.connections.view());
+        let install_local = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "local",
+                local_client.clone(),
+                local_shell.clone(),
+                local_cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _local_events = runtime.spawn(install_local).await.unwrap();
+        let install_remote = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "remote-1",
+                remote_client.clone(),
+                remote_shell.clone(),
+                remote_cfg.clone(),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _remote_events = runtime.spawn(install_remote).await.unwrap();
+        let fleet = view.borrow_and_update().clone();
+
+        // Enable load balancing in client settings.
+        cx.update(|cx| {
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::ThemePatch(
+                    t3_core::settings::load_balancing_enabled_patch(true),
+                ),
+                cx,
+            );
+            state.update(cx, |state, cx| {
+                state.environments.environments = vec![
+                    t3_client::store::SavedEnvironment {
+                        id: "local".into(),
+                        environment_id: Some("env-local".into()),
+                        label: "MacBook Pro".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:3773".into(),
+                        access_token: Some("tok-local".into()),
+                        server_version: Some("1.2.3".into()),
+                        local: true,
+                        ssh: None,
+                    },
+                    t3_client::store::SavedEnvironment {
+                        id: "remote-1".into(),
+                        environment_id: Some("env-remote".into()),
+                        label: "Build Box".into(),
+                        disabled: false,
+                        http_base: "http://127.0.0.1:3774".into(),
+                        access_token: Some("tok-remote".into()),
+                        server_version: Some("1.2.3".into()),
+                        local: false,
+                        ssh: None,
+                    },
+                ];
+                state.environments.active = Some("local".into());
+                state.install_active_environment(
+                    local_client.clone(),
+                    local_shell.clone(),
+                    local_cfg.clone(),
+                    t3_client::supervisor::ConnectionStatus::Connected,
+                    cx,
+                );
+                state.apply_fleet_view(fleet, cx);
+                state.start_draft("proj-local", cx);
+            });
+        });
+
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                let workspace = self.0.update(cx, |composer, cx| composer.render_workspace(cx));
+                gpui::div().w(gpui::px(720.)).children(workspace)
+            }
+        }
+        let (host, vcx) =
+            cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+
+        // 1. Opening a draft in a multi-environment project triggers auto-routing and shows
+        //    `"Checking machines…"` while `server.getHostResources` is pending.
+        vcx.update(|window, cx| {
+            let c = composer.read(cx);
+            let opts = c.host_options(cx);
+            assert_eq!(opts.options.len(), 2, "shared logical project spans both machines");
+            assert_eq!(
+                c.draft_auto_environment_label(&opts, cx),
+                Some("Checking machines\u{2026}"),
+                "pending host-resource check surfaces Checking machines…"
+            );
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("composer-host").is_some());
+
+        let reply_host_resources = async |fx: &mut t3_client::supervisor::ClientFixture, cpu: f64| {
+            loop {
+                let (method, _, reply) = fx.next_request().await;
+                if method == t3_client::load_balancing::SERVER_GET_HOST_RESOURCES {
+                    let now = crate::sidebar::controller::now_ms();
+                    let _ = reply.send(Ok(json!({
+                        "sampledAt": now,
+                        "cpuUtilization": cpu,
+                        "cpuCount": 8,
+                        "availableMemoryBytes": 12_000_000_000u64,
+                        "totalMemoryBytes": 16_000_000_000u64
+                    })));
+                    return;
+                }
+                let _ = reply.send(Ok(json!({})));
+            }
+        };
+
+        // `local` is busy (0.85 CPU), `remote-1` is idle (0.10 CPU) -> auto-routing picks `env-remote`.
+        let (routed_tx, routed_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut routed_tx = Some(routed_tx);
+        let _routed_obs = vcx.update(|_, cx| {
+            cx.observe(&composer, move |composer, cx| {
+                if composer.read(cx).workspace.routing.resolved_environment_id.as_deref()
+                    == Some("env-remote")
+                    && let Some(tx) = routed_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        futures::future::join(
+            reply_host_resources(&mut local_fixture, 0.85),
+            reply_host_resources(&mut remote_fixture, 0.10),
+        )
+        .await;
+        routed_rx.await.unwrap();
+        drop(_routed_obs);
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(
+                composer.read(cx).workspace.routing.resolved_environment_id.as_deref(),
+                Some("env-remote")
+            );
+            assert_eq!(state.read(cx).environments.active.as_deref(), Some("remote-1"));
+            // Complete async activation of `remote-1` (simulating the connection pump).
+            state.update(cx, |state, cx| {
+                state.install_active_environment(
+                    remote_client.clone(),
+                    remote_shell.clone(),
+                    remote_cfg.clone(),
+                    t3_client::supervisor::ConnectionStatus::Connected,
+                    cx,
+                );
+                state.start_draft("proj-remote", cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let c = composer.read(cx);
+            let opts = c.host_options(cx);
+            assert_eq!(
+                c.draft_auto_environment_label(&opts, cx),
+                Some("Auto balance"),
+                "resolved automatic draft shows Auto balance label"
+            );
+        });
+
+        // 2. `refreshBeforeSend`: submit on `remote-1`; fresh probes show `local` is now idle
+        //    (0.10) and `remote-1` is busy (0.90) -> retargets to `local` keeping prompt + branch
+        //    and dispatches `LAUNCH_THREAD` on `local`.
+        let (switched_tx, switched_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut switched_tx = Some(switched_tx);
+        let _switched_sub = vcx.update(|_, cx| {
+            cx.subscribe(&state, move |state, event: &AppEvent, cx| {
+                if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::Phase)
+                    && state.read(cx).environments.active.as_deref() == Some("local")
+                    && let Some(tx) = switched_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_test_prompt("Run on freshest machine", window, cx);
+                composer.workspace.is_repo = true;
+                composer.mutate_draft_workspace(cx, |ws| {
+                    ws.mode = t3_core::server_config::ThreadEnvMode::Worktree;
+                    ws.branch = Some("main".into());
+                });
+                composer.workspace.routing.selection = workspace::DraftEnvSelection::Auto;
+                composer.submit(rules::SubmitIntent::Foreground, window, cx);
+            });
+        });
+        futures::future::join(
+            reply_host_resources(&mut local_fixture, 0.10),
+            reply_host_resources(&mut remote_fixture, 0.90),
+        )
+        .await;
+        switched_rx.await.unwrap();
+        drop(_switched_sub);
+        vcx.run_until_parked();
+        // Complete activation of `local` -> `try_finish_pending_routed_send` dispatches LAUNCH_THREAD on `local`.
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.install_active_environment(
+                    local_client.clone(),
+                    local_shell.clone(),
+                    local_cfg.clone(),
+                    t3_client::supervisor::ConnectionStatus::Connected,
+                    cx,
+                );
+                state.start_draft("proj-local", cx);
+            });
+        });
+        let launched_payload = loop {
+            vcx.run_until_parked();
+            let (method, payload, reply) = local_fixture.next_request().await;
+            if method == t3_core::commands::method::LAUNCH_THREAD {
+                let _ = reply.send(Ok(json!({})));
+                break payload;
+            }
+            if method == t3_core::commands::method::VCS_LIST_REFS {
+                let _ = reply.send(Ok(json!({
+                    "isRepo": true,
+                    "hasPrimaryRemote": true,
+                    "refs": [{ "name": "main", "current": true, "isDefault": true }]
+                })));
+                continue;
+            }
+            let _ = reply.send(Ok(json!({})));
+        };
+        assert_eq!(launched_payload["projectId"], json!("proj-local"));
+        assert_eq!(launched_payload["workspaceStrategy"]["baseRef"], json!("main"));
+        assert_eq!(
+            launched_payload["initialMessage"]["text"],
+            json!("Run on freshest machine")
+        );
+        let (launched_tx, launched_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut launched_tx = Some(launched_tx);
+        let _launched_obs = vcx.update(|_, cx| {
+            if !composer.read(cx).sending
+                && let Some(tx) = launched_tx.take()
+            {
+                let _ = tx.send(());
+            }
+            cx.observe(&composer, move |composer, cx| {
+                if !composer.read(cx).sending
+                    && let Some(tx) = launched_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        launched_rx.await.unwrap();
+        drop(_launched_obs);
+        vcx.run_until_parked();
+
+        // 3. `refreshBeforeSend` with no winner (both overloaded) shows warning toast and does NOT
+        //    reuse stale machine or dispatch LAUNCH_THREAD.
+        vcx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.start_draft("proj-local", cx);
+            });
+        });
+        vcx.run_until_parked();
+        let (warn_tx, warn_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut warn_tx = Some(warn_tx);
+        let state_for_warn = state.clone();
+        let _warn_obs = vcx.update(|_, cx| {
+            cx.observe(&composer, move |composer, cx| {
+                if !composer.read(cx).sending
+                    && state_for_warn
+                        .read(cx)
+                        .toasts
+                        .latest()
+                        .is_some_and(|t| t.title == "Choose a machine to continue")
+                    && let Some(tx) = warn_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.workspace.routing.selection = workspace::DraftEnvSelection::Auto;
+                composer.workspace.routing.resolved_environment_id = Some("env-local".into());
+                composer.set_test_prompt("Should block on overload", window, cx);
+                composer.submit(rules::SubmitIntent::Foreground, window, cx);
+            });
+        });
+        futures::future::join(
+            reply_host_resources(&mut local_fixture, 0.99),
+            reply_host_resources(&mut remote_fixture, 0.99),
+        )
+        .await;
+        warn_rx.await.unwrap();
+        drop(_warn_obs);
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(
+                state.read(cx).toasts.latest().map(|t| t.title.as_ref()),
+                Some("Choose a machine to continue"),
+                "expected no-winner warning toast"
+            );
+            assert!(!composer.read(cx).sending);
+        });
+        let (local_reqs, _) = local_fixture.take_requests();
+        assert!(
+            !local_reqs.iter().any(|(m, _, _)| *m == t3_core::commands::method::LAUNCH_THREAD),
+            "no-winner refresh must not launch on stale machine"
+        );
+
+        // 4. Editing prompt while `refreshBeforeSend` is in flight abandons send cleanly.
+        let (abandoned_tx, abandoned_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut abandoned_tx = Some(abandoned_tx);
+        let _abandoned_obs = vcx.update(|_, cx| {
+            cx.observe(&composer, move |composer, cx| {
+                if !composer.read(cx).sending
+                    && composer.read(cx).test_prompt(cx) == "Edited while checking"
+                    && let Some(tx) = abandoned_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_test_prompt("Before edit", window, cx);
+                composer.submit(rules::SubmitIntent::Foreground, window, cx);
+                composer.set_test_prompt("Edited while checking", window, cx);
+            });
+        });
+        futures::future::join(
+            reply_host_resources(&mut local_fixture, 0.10),
+            reply_host_resources(&mut remote_fixture, 0.80),
+        )
+        .await;
+        abandoned_rx.await.unwrap();
+        drop(_abandoned_obs);
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            assert_eq!(composer.read(cx).test_prompt(cx), "Edited while checking");
+            assert!(!composer.read(cx).sending);
+        });
+        let (local_reqs, _) = local_fixture.take_requests();
+        assert!(
+            !local_reqs.iter().any(|(m, _, _)| *m == t3_core::commands::method::LAUNCH_THREAD),
+            "edited draft must abandon in-flight refreshBeforeSend"
+        );
+
+        // 5. Manual host selection disables auto label, and selecting Auto balance with attachments
+        //    emits the attachments warning toast.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                let opts = composer.host_options(cx);
+                let local_opt = opts.options.iter().find(|o| o.saved_id == "local").unwrap().clone();
+                composer.select_host(local_opt, window, cx);
+                assert_eq!(composer.draft_auto_environment_label(&opts, cx), None);
+
+                let target = Target::Draft("proj-local".into());
+                let attachment = t3_core::composer::attachments::Attachment {
+                    id: "img-1".into(),
+                    kind: t3_core::composer::attachments::AttachmentKind::Image,
+                    name: "shot.png".into(),
+                    mime_type: "image/png".into(),
+                    size_bytes: 128,
+                    pasted_text: false,
+                    upload: t3_core::composer::attachments::Upload::Ready {
+                        attachment_id: "upload-1".into(),
+                    },
+                };
+                composer.seed_attachments(&target, vec![attachment], false, cx);
+                composer.select_auto_host(window, cx);
+                assert_eq!(
+                    state.read(cx).toasts.latest().map(|t| t.title.as_ref()),
+                    Some("Keep attachments on this machine"),
+                    "selecting Auto balance with attachments must show warning toast"
+                );
+            });
+        });
+
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
         cx.run_until_parked();
     }
 }

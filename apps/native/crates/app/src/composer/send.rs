@@ -6,6 +6,10 @@
 
 use gpui::{App, Context, EventEmitter, Window};
 use serde_json::Value;
+use t3_client::load_balancing::{
+    DEFAULT_LOAD_BALANCING_WEIGHT, LoadBalanceCandidate, choose_load_balanced_environment,
+    load_balancing_send_warning,
+};
 use t3_core::commands::{self, ApprovalDecision, ComposerMessage, LaunchThread, method};
 use t3_core::composer::attachments::{self, Attachment};
 use t3_core::composer::context::{ExpiredNotice, TerminalContext, TerminalSend, expired_toast_copy};
@@ -17,7 +21,8 @@ use t3_core::traits;
 use t3_core::workspace::{self, VcsRefs};
 
 use super::{Composer, Resolved, Target};
-use crate::app_state::uuid_v4;
+use crate::app_state::{ScopedRouteAction, uuid_v4};
+use crate::sidebar::controller::now_ms;
 use crate::toast::{Toast, ToastKind};
 
 const NO_PROVIDER: &str = "Enable a provider in Settings to send a message";
@@ -56,6 +61,16 @@ pub(super) struct Outgoing {
     pub(super) title: String,
     pub(super) context: Option<Value>,
     pub(super) attachments: Vec<Value>,
+}
+
+/// A send waiting for an automatic load-balanced `refreshBeforeSend` machine switch to finish
+/// activating its destination environment before launching the draft thread.
+pub(super) struct PendingRoutedSend {
+    saved_id: String,
+    project_id: String,
+    intent: SubmitIntent,
+    preserved_workspace: Option<(ThreadEnvMode, Option<String>, Option<bool>)>,
+    preserved_multi_models: Vec<ModelSelection>,
 }
 
 /// Emitted by `Composer` after a `composer.sendAndNewThread` send to an existing server thread
@@ -233,10 +248,265 @@ impl Composer {
             self.expired_toast(terminals.expired, ExpiredNotice::Omitted, cx);
         }
         match self.snapshot.target.clone() {
-            Some(Target::Draft(project_id)) => self.launch(project_id, outgoing, intent, window, cx),
+            Some(Target::Draft(project_id)) => {
+                self.submit_draft_with_routing(project_id, outgoing, intent, window, cx)
+            }
             Some(Target::Thread(thread_id)) => self.send(thread_id, outgoing, intent, window, cx),
             _ => {}
         }
+    }
+
+    /// Cancels a pending `refreshBeforeSend` handoff when the user edits the prompt or rewinds.
+    pub(super) fn cancel_pending_routed_send(&mut self) -> bool {
+        if self.pending_routed_send.take().is_some() {
+            self.sending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Completes a draft launch once the destination environment selected by `refreshBeforeSend`
+    /// has activated and synchronized its shell and server config.
+    pub(super) fn try_finish_pending_routed_send(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_routed_send.as_ref() else {
+            return;
+        };
+        let (selected_thread, active_env, draft_project, has_client, has_config, has_project) = {
+            let state = self.state.read(cx);
+            (
+                state.selected_thread.is_some(),
+                state.environments.active.clone(),
+                state.draft_project.clone(),
+                state.client_handle().is_some(),
+                state.server_config.config.is_some(),
+                state.shell.project(&pending.project_id).is_some(),
+            )
+        };
+        if selected_thread || active_env.as_deref() != Some(pending.saved_id.as_str()) {
+            self.pending_routed_send = None;
+            self.sending = false;
+            cx.notify();
+            return;
+        }
+        let ready = draft_project.as_deref() == Some(pending.project_id.as_str())
+            && has_client
+            && has_config
+            && has_project;
+        if !ready {
+            return;
+        }
+        let pending = self.pending_routed_send.take().expect("checked above");
+        self.sending = false;
+        let expected_target = Target::Draft(pending.project_id.clone());
+        if self.snapshot.target.as_ref() != Some(&expected_target) {
+            self.refresh(false, window, cx);
+            self.sync_workspace(false, cx);
+        }
+        if let Some((mode, branch, start_from_origin)) = pending.preserved_workspace {
+            self.mutate_draft_workspace(cx, |ws| {
+                ws.mode = mode;
+                ws.branch = branch;
+                ws.start_from_origin = start_from_origin;
+            });
+        }
+        if !pending.preserved_multi_models.is_empty() {
+            self.choices
+                .entry(expected_target)
+                .or_default()
+                .multi_models = pending.preserved_multi_models;
+        }
+        let prompt = self.prompt(cx);
+        let staged = self.staged_attachments();
+        let terminals = TerminalSend::of(&prompt, self.current_terminals());
+        let outgoing = self.outgoing(terminals.text, &staged);
+        self.launch(pending.project_id, outgoing, pending.intent, window, cx);
+    }
+
+    /// Ports `needsLoadBalancing` (`useComposerSend.ts:461-474`) and `refreshBeforeSend`
+    /// (`useDraftEnvironmentRouting.ts:135-200`, `useComposerSend.ts:1487-1499`).
+    fn submit_draft_with_routing(
+        &mut self,
+        project_id: String,
+        outgoing: Outgoing,
+        intent: SubmitIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host = self.host_options(cx);
+        let automatic = self.automatic_environment(&host, cx);
+        if automatic && self.workspace.routing.resolved_environment_id.is_none() {
+            let (candidates, weights, referenced_threads) =
+                self.draft_load_balancing_candidates(&host, cx);
+            let candidate_ids: Vec<String> =
+                candidates.iter().map(|c| c.environment_id.clone()).collect();
+            let eval = self
+                .workspace
+                .routing
+                .cache
+                .evaluate(&candidate_ids, &weights, now_ms());
+            let pending = eval.pending || self.workspace.routing.task.is_some();
+            let logical_ids: Vec<String> = host
+                .options
+                .iter()
+                .map(|o| o.canonical_environment_id.clone())
+                .collect();
+            let warn = load_balancing_send_warning(pending, &referenced_threads, &logical_ids);
+            self.state.update(cx, |state, cx| {
+                state.show_toast(
+                    Toast::new(ToastKind::Warning, warn.title).description(warn.description),
+                    cx,
+                );
+            });
+            return;
+        }
+        if !automatic
+            || self.workspace.routing.resolved_environment_id.is_none()
+            || !self.staged_attachments().is_empty()
+        {
+            self.launch(project_id, outgoing, intent, window, cx);
+            return;
+        }
+
+        let (candidates, orig_weights, referenced_threads) =
+            self.draft_load_balancing_candidates(&host, cx);
+        let orig_candidate_ids: Vec<String> =
+            candidates.iter().map(|c| c.environment_id.clone()).collect();
+        let orig_active_env = self.state.read(cx).environments.active.clone();
+        let orig_logical_key = self.workspace.routing.logical_project_key.clone();
+        let orig_prompt = self.prompt(cx);
+        let resolved_before = self.resolve(cx);
+        let orig_driver = resolved_before.driver.clone();
+        let orig_instance = resolved_before.model.as_ref().map(|m| m.instance_id.clone());
+        let orig_multi_models = resolved_before.multi_models.clone();
+        let orig_workspace = self
+            .selected_workspace()
+            .map(|w| (w.mode, w.branch, w.start_from_origin));
+        let orig_project_id = project_id.clone();
+
+        self.sending = true;
+        cx.notify();
+        let fetch = self.state.read(cx).fetch_load_balancing_resources(&candidates);
+        cx.spawn_in(window, async move |this, cx| {
+            let samples = fetch.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.sending = false;
+                let fresh_now = now_ms();
+                let mut fresh_candidates = Vec::with_capacity(samples.len());
+                for (env_id, resources, received_at_ms) in samples {
+                    this.workspace
+                        .routing
+                        .cache
+                        .record(&env_id, resources.clone(), received_at_ms);
+                    let weight = orig_weights
+                        .get(&env_id)
+                        .copied()
+                        .unwrap_or(DEFAULT_LOAD_BALANCING_WEIGHT);
+                    fresh_candidates.push(LoadBalanceCandidate {
+                        environment_id: env_id,
+                        resources,
+                        received_at: Some(received_at_ms),
+                        weight,
+                    });
+                }
+
+                let cur_host = this.host_options(cx);
+                let (cur_candidates, cur_weights, _) =
+                    this.draft_load_balancing_candidates(&cur_host, cx);
+                let cur_candidate_ids: Vec<String> =
+                    cur_candidates.iter().map(|c| c.environment_id.clone()).collect();
+                let cur_resolved = this.resolve(cx);
+                let cur_instance = cur_resolved.model.as_ref().map(|m| m.instance_id.clone());
+                let unchanged = this.snapshot.target.as_ref()
+                    == Some(&Target::Draft(orig_project_id.clone()))
+                    && this.state.read(cx).environments.active == orig_active_env
+                    && this.workspace.routing.logical_project_key == orig_logical_key
+                    && this.automatic_environment(&cur_host, cx)
+                    && this.staged_attachments().is_empty()
+                    && this.prompt(cx) == orig_prompt
+                    && cur_resolved.driver == orig_driver
+                    && cur_instance == orig_instance
+                    && cur_weights == orig_weights
+                    && cur_candidate_ids == orig_candidate_ids;
+                if !unchanged {
+                    cx.notify();
+                    return;
+                }
+
+                let winner_env_id = choose_load_balanced_environment(&fresh_candidates, fresh_now);
+                let target = winner_env_id.as_deref().and_then(|wanted| {
+                    cur_host
+                        .options
+                        .iter()
+                        .find(|opt| {
+                            opt.canonical_environment_id == wanted || opt.saved_id == wanted
+                        })
+                        .cloned()
+                });
+                let Some(target) = target else {
+                    let warn = load_balancing_send_warning(
+                        false,
+                        &referenced_threads,
+                        &orig_candidate_ids,
+                    );
+                    this.state.update(cx, |state, cx| {
+                        state.show_toast(
+                            Toast::new(ToastKind::Warning, warn.title)
+                                .description(warn.description),
+                            cx,
+                        );
+                    });
+                    cx.notify();
+                    return;
+                };
+
+                this.workspace.routing.resolved_environment_id =
+                    Some(target.canonical_environment_id.clone());
+                let same_env = orig_active_env.as_deref() == Some(target.saved_id.as_str());
+                if same_env && target.project_id == orig_project_id {
+                    let prompt = this.prompt(cx);
+                    let staged = this.staged_attachments();
+                    let terminals = TerminalSend::of(&prompt, this.current_terminals());
+                    let fresh_outgoing = this.outgoing(terminals.text, &staged);
+                    this.launch(orig_project_id, fresh_outgoing, intent, window, cx);
+                    return;
+                }
+
+                let Some(owner) = target.owner else {
+                    cx.notify();
+                    return;
+                };
+                this.retarget_draft_for_routing(
+                    &orig_project_id,
+                    &target.project_id,
+                    same_env,
+                    window,
+                    cx,
+                );
+                this.pending_routed_send = Some(PendingRoutedSend {
+                    saved_id: target.saved_id.clone(),
+                    project_id: target.project_id.clone(),
+                    intent,
+                    preserved_workspace: orig_workspace,
+                    preserved_multi_models: orig_multi_models,
+                });
+                if !same_env {
+                    this.workspace.routing.pending_navigation =
+                        Some((target.saved_id, target.project_id.clone()));
+                }
+                this.sending = true;
+                this.state.update(cx, |state, cx| {
+                    state.navigate_scoped(owner, ScopedRouteAction::Draft(target.project_id), cx);
+                });
+                this.try_finish_pending_routed_send(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// `buildExpiredTerminalContextToastCopy` as a warning.
