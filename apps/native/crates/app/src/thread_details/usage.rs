@@ -90,18 +90,19 @@ fn usage_bar(bar: &BarSpec, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn usage_row(
-    id: impl Into<SharedString>,
+struct UsageRowSpec {
+    id: SharedString,
     label: String,
     bar: Option<BarSpec>,
     tone: Option<UsageTone>,
     value: String,
     tooltip: String,
     opens_usage: bool,
-    cx: &App,
-) -> AnyElement {
+}
+
+fn usage_row(spec: UsageRowSpec, cx: &App) -> AnyElement {
+    let UsageRowSpec { id, label, bar, tone, value, tooltip, opens_usage } = spec;
     let p = palette(cx);
-    let id = id.into();
     let tip: SharedString = if opens_usage {
         format!("{tooltip}\nOpen usage").into()
     } else {
@@ -140,7 +141,18 @@ pub(super) fn usage_limits_section(app: &AppState, draft_provider: Option<&str>,
     let timestamp_format = crate::settings::store::client(cx).timestamp_format();
     let zone = crate::timestamp::viewer_zone();
     let rows: Vec<AnyElement> = if let Some(notice) = limits_notice(&limits) {
-        vec![usage_row("details-usage-unavailable", "Limits".to_owned(), None, None, "Unavailable".to_owned(), notice, true, cx)]
+        vec![usage_row(
+            UsageRowSpec {
+                id: "details-usage-unavailable".into(),
+                label: "Limits".to_owned(),
+                bar: None,
+                tone: None,
+                value: "Unavailable".to_owned(),
+                tooltip: notice,
+                opens_usage: true,
+            },
+            cx,
+        )]
     } else if limits.windows.is_empty() {
         return None;
     } else {
@@ -177,17 +189,19 @@ pub(super) fn usage_limits_section(app: &AppState, draft_provider: Option<&str>,
                     }
                 }
                 usage_row(
-                    format!("details-usage-{}", win.id),
-                    win.label.clone(),
-                    Some(BarSpec {
-                        fill_pct: left as f32,
-                        color: bar_color,
-                        tick_frac: time_left.map(|pct| (pct as f32 / 100.).clamp(0., 1.)),
-                    }),
-                    tone,
-                    format!("{left}%"),
-                    tip_lines.join("\n"),
-                    true,
+                    UsageRowSpec {
+                        id: format!("details-usage-{}", win.id).into(),
+                        label: win.label.clone(),
+                        bar: Some(BarSpec {
+                            fill_pct: left as f32,
+                            color: bar_color,
+                            tick_frac: time_left.map(|pct| (pct as f32 / 100.).clamp(0., 1.)),
+                        }),
+                        tone,
+                        value: format!("{left}%"),
+                        tooltip: tip_lines.join("\n"),
+                        opens_usage: true,
+                    },
                     cx,
                 )
             })
@@ -229,6 +243,17 @@ pub(super) fn context_window_section(app: &AppState, separated: bool, essential:
     }
 
     let bar = used.map(|pct| BarSpec { fill_pct: pct as f32, color: bar_color, tick_frac: tick });
-    let row = usage_row("details-context-window", "Context".to_owned(), bar, tone, value, tip_lines.join("\n"), false, cx);
+    let row = usage_row(
+        UsageRowSpec {
+            id: "details-context-window".into(),
+            label: "Context".to_owned(),
+            bar,
+            tone,
+            value,
+            tooltip: tip_lines.join("\n"),
+            opens_usage: false,
+        },
+        cx,
+    );
     Some(section_with_options(separated, None, essential, cx).child(row).into_any_element())
 }

@@ -345,14 +345,17 @@ pub async fn run_with_progress(
             failures: provider_failures,
         });
     }
+    let mut staged_handles = staged_handles;
     let targets = plan
         .servers
         .into_iter()
-        .map(|target| (target, ServerRequestOptions::default()))
+        .map(|target| {
+            let stage_handle = staged_handles.remove(&target.environment_id);
+            PreparedServerTarget { target, options: ServerRequestOptions::default(), stage_handle }
+        })
         .collect();
     execute_server_targets(
         targets,
-        staged_handles,
         unresolved_provider,
         &provider_outcomes,
         &provider_failures_by_env,
@@ -386,13 +389,12 @@ pub async fn run_channel_switch_with_progress(
                 target_database_migration: target.target_database_migration,
                 track_only: target.track_only,
             };
-            (target.server, options)
+            PreparedServerTarget { target: target.server, options, stage_handle: None }
         })
         .collect();
     let provider_failures_by_env = std::collections::HashMap::new();
     execute_server_targets(
         targets,
-        std::collections::HashMap::new(),
         false,
         &[],
         &provider_failures_by_env,
@@ -403,9 +405,14 @@ pub async fn run_channel_switch_with_progress(
     .await
 }
 
+struct PreparedServerTarget {
+    target: ServerTarget,
+    options: ServerRequestOptions,
+    stage_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
 async fn execute_server_targets(
-    targets: Vec<(ServerTarget, ServerRequestOptions)>,
-    mut staged_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    targets: Vec<PreparedServerTarget>,
     unresolved_provider: bool,
     provider_outcomes: &[ProviderOutcome],
     provider_failures_by_env: &std::collections::HashMap<String, String>,
@@ -415,8 +422,7 @@ async fn execute_server_targets(
 ) -> UpdateEverythingResult {
     let futures: Vec<_> = targets
         .into_iter()
-        .map(|(target, options)| {
-            let stage_handle = staged_handles.remove(&target.environment_id);
+        .map(|PreparedServerTarget { target, options, stage_handle }| {
             let provider_failure = provider_failures_by_env.get(&target.environment_id).cloned();
             async move {
                 // Each server awaits only its own staging task before applying its update (`#35346`).

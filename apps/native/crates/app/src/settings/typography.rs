@@ -291,7 +291,7 @@ impl SettingsView {
         // Short windows cap the popup; shrink the list viewport so every font stays scrollable
         // (`pingdotgg/t3code#22795`).
         let viewport_height = f32::from(window.viewport_size().height);
-        let max_list_height = ((viewport_height - 96.).max(56.)).min(288.);
+        let max_list_height = (viewport_height - 96.).clamp(56., 288.);
         let desired_list_height = (count.clamp(1, 9) * 28) as f32;
         let list_height = desired_list_height.min(max_list_height);
         let list = uniform_list(
