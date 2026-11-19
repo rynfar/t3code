@@ -1,0 +1,1072 @@
+//! Issues page (`apps/web/src/components/issue/IssuesPage.tsx`): multi-tracker virtualized list,
+//! debounced search, filters (state, involvement, project, tracker/host, labels, assignee),
+//! named saved views, per-tracker cursor continuation, retry-failed-only for environments and
+//! candidate repositories, manual AZDO refresh (`refresh: true`), and row selection / quick actions.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
+
+use gpui::{
+    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight,
+    IntoElement, ListAlignment, ListState, ParentElement, Render, Styled, Subscription, Task,
+    Window, WindowControlArea, div, list, prelude::*, px,
+};
+use gpui_component::h_flex;
+use gpui_component::input::{InputEvent, InputState};
+use serde_json::Value;
+use t3_client::store;
+use t3_core::issues::list::{
+    EnvironmentIssueEntry, FilterProject, HeldIssuePage, HostOption, IssueCandidatesTracker,
+    IssueListPreferences, IssueListReadTracker, IssueListRefreshMode, IssueTrackerGroup, PAGE_SIZE,
+    PREFERENCES_KEY, ProjectDescriptor, SEARCH_DEBOUNCE_MS, continue_issue_page,
+    filter_held_by_host, group_issues, hold_issue_pages, host_options_for, issue_cursors_for_host,
+    issue_filter_projects, issue_filter_scopes,
+};
+use t3_core::issues::saved_views::{
+    ISSUE_SAVED_VIEW_PLACEHOLDER, ISSUE_SAVED_VIEWS_KEY, SavedView, create_saved_view,
+    decode_saved_views, delete_saved_view, issue_view_matches, rename_saved_view,
+    resolve_selected_view, update_saved_view_preferences,
+};
+use t3_core::issues::wire::{
+    IssueCandidates, IssueListResult, IssueRef, IssueTrackerSummary, decode, method,
+};
+
+use super::{ReadFailure, read, settle, state_glyph};
+use crate::app_state::{AppEvent, AppState};
+use crate::i18n::t;
+use crate::icons::Icon;
+use crate::pull_requests::controls::{Button, Size, Variant};
+use crate::theme::{hsla, palette};
+use crate::toast::{Toast, ToastKind};
+
+pub(super) const ROW_HEIGHT: f32 = 56.;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Row {
+    TrackerHeader(usize),
+    TrackerNotice(usize),
+    ProjectError(usize, usize),
+    GroupEmpty(usize),
+    Entry(usize, usize),
+    LoadMore(usize, usize),
+}
+
+pub(super) struct SavedViewEditor {
+    pub(super) editing_id: Option<String>,
+    pub(super) input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+pub struct IssuesPage {
+    pub(super) state: Entity<AppState>,
+    pub(super) prefs: IssueListPreferences,
+    pub(super) search: Entity<InputState>,
+    pub(super) typed: String,
+    pub(super) sent: String,
+    pub(super) read_tracker: IssueListReadTracker,
+    pub(super) held_pages: BTreeMap<String, HeldIssuePage>,
+    pub(super) groups: Vec<IssueTrackerGroup>,
+    pub(super) rows: Vec<Row>,
+    pub(super) list: ListState,
+    pub(super) selected: Option<IssueRef>,
+    pub(super) selected_entry: Option<EnvironmentIssueEntry>,
+    pub(super) loading_more: Option<String>,
+    pub(super) unsupported: bool,
+    pub(super) candidates_tracker: IssueCandidatesTracker,
+    pub(super) saved_views: Vec<SavedView<IssueListPreferences>>,
+    pub(super) selected_view_id: Option<String>,
+    saved_view_editor: Option<SavedViewEditor>,
+    next_view_seq: u64,
+    focus: FocusHandle,
+    connected: bool,
+    open: bool,
+    _debounce: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Focusable for IssuesPage {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl IssuesPage {
+    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let prefs: IssueListPreferences = store::load_ui_state(PREFERENCES_KEY)
+            .and_then(|value| serde_json::from_value::<IssueListPreferences>(value).ok())
+            .map(|p| p.normalized())
+            .unwrap_or_default();
+        let saved_views: Vec<SavedView<IssueListPreferences>> =
+            decode_saved_views(store::load_ui_state(ISSUE_SAVED_VIEWS_KEY));
+        let typed = prefs.q.clone().unwrap_or_default();
+        let placeholder = t(cx, "Search issues").to_owned();
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(placeholder)
+                .default_value(typed.clone())
+        });
+        let subscriptions = vec![
+            cx.subscribe_in(&search, window, |this, input, event: &InputEvent, _, cx| match event {
+                InputEvent::Change => this.typed_changed(input.read(cx).value().to_string(), cx),
+                InputEvent::PressEnter { .. } => this.submit_query(cx),
+                _ => {}
+            }),
+            cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
+                if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Shell) {
+                    this.sync(cx);
+                }
+            }),
+        ];
+        let selected_view_id =
+            resolve_selected_view(&saved_views, None, &prefs, issue_view_matches)
+                .map(|view| view.id.clone());
+        let mut page = Self {
+            state,
+            prefs,
+            search,
+            sent: typed.trim().to_owned(),
+            typed,
+            read_tracker: IssueListReadTracker::default(),
+            held_pages: BTreeMap::new(),
+            groups: Vec::new(),
+            rows: Vec::new(),
+            list: ListState::new(0, ListAlignment::Top, px(800.)),
+            selected: None,
+            selected_entry: None,
+            loading_more: None,
+            unsupported: false,
+            candidates_tracker: IssueCandidatesTracker::default(),
+            saved_views,
+            selected_view_id,
+            saved_view_editor: None,
+            next_view_seq: 1,
+            focus: cx.focus_handle(),
+            connected: false,
+            open: false,
+            _debounce: None,
+            _subscriptions: subscriptions,
+        };
+        page.sync(cx);
+        page
+    }
+
+    fn environment_key(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        state
+            .environment()
+            .or(state.environments.active.as_deref())
+            .map(str::to_owned)
+    }
+
+    fn environment_labels(&self, cx: &App) -> HashMap<String, String> {
+        let state = self.state.read(cx);
+        let mut map = HashMap::new();
+        for env in &state.environments.environments {
+            if let Some(canonical) = &env.environment_id {
+                map.insert(canonical.clone(), env.label.clone());
+            }
+            map.insert(env.id.clone(), env.label.clone());
+        }
+        if let Some(config) = &state.server_config.config
+            && !config.environment.environment_id.is_empty()
+        {
+            map.insert(
+                config.environment.environment_id.clone(),
+                config.environment.label.clone(),
+            );
+        }
+        map
+    }
+
+    pub(super) fn environment_label_for_row(&self, env_id: &str, cx: &App) -> Option<String> {
+        if self.held_pages.len() <= 1 {
+            return None;
+        }
+        self.environment_labels(cx).get(env_id).cloned()
+    }
+
+    fn project_descriptors(&self, cx: &App) -> Vec<ProjectDescriptor> {
+        let state = self.state.read(cx);
+        let env_id = self
+            .environment_key(cx)
+            .unwrap_or_else(|| "local".to_owned());
+        let Some(snapshot) = &state.shell.snapshot else {
+            return Vec::new();
+        };
+        snapshot
+            .projects
+            .iter()
+            .filter(|project| project.archived_at.is_none())
+            .map(|project| {
+                let provider = project
+                    .repository_identity
+                    .as_ref()
+                    .and_then(|id| id.get("provider").and_then(Value::as_str))
+                    .map(str::to_owned);
+                let host = project
+                    .repository_identity
+                    .as_ref()
+                    .and_then(|id| id.get("host").and_then(Value::as_str))
+                    .or_else(|| {
+                        project
+                            .repository_identity
+                            .as_ref()
+                            .and_then(|id| id.get("canonicalKey").and_then(Value::as_str))
+                            .and_then(|key| key.split('/').next())
+                    })
+                    .map(str::to_owned);
+                let issue_scope = project
+                    .repository_identity
+                    .as_ref()
+                    .and_then(|id| id.get("nameWithOwner").and_then(Value::as_str))
+                    .or_else(|| {
+                        project
+                            .repository_identity
+                            .as_ref()
+                            .and_then(|id| id.get("canonicalKey").and_then(Value::as_str))
+                            .and_then(|key| key.split_once('/').map(|(_, rest)| rest))
+                    })
+                    .map(str::to_owned);
+                ProjectDescriptor {
+                    environment_id: env_id.clone(),
+                    project_id: project.id.clone(),
+                    title: project.title.clone(),
+                    is_scratch: state.is_scratch_project(&project.id),
+                    provider,
+                    host,
+                    issue_scope,
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn filter_projects(&self, cx: &App) -> Vec<FilterProject> {
+        let descriptors = self.project_descriptors(cx);
+        let labels = self.environment_labels(cx);
+        issue_filter_projects(&descriptors, &labels)
+    }
+
+    pub(super) fn host_options(&self) -> Vec<HostOption> {
+        let trackers: Vec<IssueTrackerSummary> = self
+            .held_pages
+            .values()
+            .flat_map(|page| page.answer.trackers.iter().cloned())
+            .collect();
+        host_options_for(&trackers, self.prefs.host.as_deref())
+    }
+
+    pub(super) fn is_pending(&self) -> bool {
+        self.read_tracker.is_pending()
+    }
+
+    fn active_targets(&self, cx: &App) -> Vec<String> {
+        let Some(env_id) = self.environment_key(cx) else {
+            return Vec::new();
+        };
+        if let Some(scoped) = self.prefs.scoped_project()
+            && scoped.environment_id != env_id
+        {
+            return Vec::new();
+        }
+        vec![env_id]
+    }
+
+    fn search_scope_key(&self) -> String {
+        let normalized = self.prefs.normalized();
+        format!(
+            "{}|{}",
+            serde_json::to_string(&normalized).unwrap_or_default(),
+            self.sent
+        )
+    }
+
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let connected = state.client_handle().is_some()
+            && matches!(
+                state.phase,
+                crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected)
+            );
+        let open = state.issues_open && !state.pull_requests_open;
+        let returned = connected && open && (!self.connected || !self.open);
+        let left = self.open && !open;
+        self.connected = connected;
+        self.open = open;
+
+        if left {
+            // Closed searches do not accumulate in memory once the page closes (`pingdotgg/t3code#38493`).
+            self.read_tracker.prune_closed_searches();
+            self.close_saved_view_editor(cx);
+        }
+
+        if open
+            && connected
+            && ((returned && self.read_tracker.should_live_refresh())
+                || (self.held_pages.is_empty() && !self.is_pending()))
+        {
+            self.fetch_all(IssueListRefreshMode::Background, cx);
+        } else if open {
+            self.rebuild(cx);
+        }
+        cx.notify();
+    }
+
+    fn save_prefs(&self) {
+        store::save_ui_state(PREFERENCES_KEY, &self.prefs.normalized());
+    }
+
+    fn save_views(&self) {
+        store::save_ui_state(ISSUE_SAVED_VIEWS_KEY, &self.saved_views);
+    }
+
+    pub(super) fn update_prefs(
+        &mut self,
+        change: impl FnOnce(&mut IssueListPreferences),
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.search_scope_key();
+        change(&mut self.prefs);
+        self.prefs = self.prefs.normalized();
+        self.save_prefs();
+        if self.search_scope_key() != before {
+            self.candidates_tracker.clear();
+            self.fetch_all(IssueListRefreshMode::Background, cx);
+        } else {
+            self.rebuild(cx);
+        }
+        cx.notify();
+    }
+
+    fn typed_changed(&mut self, value: String, cx: &mut Context<Self>) {
+        if value == self.typed {
+            return;
+        }
+        self.typed = value.clone();
+        let trimmed = value.trim();
+        self.prefs.q = (!trimmed.is_empty()).then(|| trimmed.chars().take(200).collect());
+        self.save_prefs();
+        self.rebuild(cx);
+        let next_query = trimmed.to_owned();
+        self._debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SEARCH_DEBOUNCE_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| this.send_query(next_query, cx));
+        }));
+        cx.notify();
+    }
+
+    fn submit_query(&mut self, cx: &mut Context<Self>) {
+        self._debounce = None;
+        let query = self.typed.trim().to_owned();
+        self.send_query(query, cx);
+    }
+
+    fn send_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if query != self.sent {
+            self.sent = query;
+            self.fetch_all(IssueListRefreshMode::Background, cx);
+        }
+    }
+
+    pub(super) fn clear_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.typed_changed(String::new(), cx);
+        self.submit_query(cx);
+    }
+
+    /// Explicit refresh: passes `refresh: true` so Azure DevOps re-reads each project's
+    /// finished states and tracker metadata (`pingdotgg/t3code#38986`).
+    pub(super) fn manual_refresh(&mut self, cx: &mut Context<Self>) {
+        self.candidates_tracker.clear();
+        self.fetch_all(IssueListRefreshMode::Manual, cx);
+    }
+
+    /// Retries ONLY environments whose read failed, never restarting already-loaded or
+    /// still-in-flight environments (`pingdotgg/t3code#38654`).
+    pub(super) fn retry_failed(&mut self, cx: &mut Context<Self>) {
+        let failed = self.read_tracker.failed_environments();
+        if failed.is_empty() {
+            if self.held_pages.is_empty() && !self.is_pending() {
+                self.fetch_all(IssueListRefreshMode::Background, cx);
+            }
+            return;
+        }
+        let search_key = self.search_scope_key();
+        for env_id in failed {
+            self.fetch_environment(env_id, search_key.clone(), IssueListRefreshMode::Background, cx);
+        }
+    }
+
+    fn fetch_all(&mut self, mode: IssueListRefreshMode, cx: &mut Context<Self>) {
+        let targets = self.active_targets(cx);
+        let search_key = self.search_scope_key();
+        self.read_tracker.set_search_key(search_key.clone(), &targets);
+        self.unsupported = false;
+        if targets.is_empty() {
+            self.held_pages.clear();
+            self.rebuild(cx);
+            return;
+        }
+        for env_id in targets {
+            self.fetch_environment(env_id, search_key.clone(), mode, cx);
+        }
+    }
+
+    fn fetch_environment(
+        &mut self,
+        env_id: String,
+        search_key: String,
+        mode: IssueListRefreshMode,
+        cx: &mut Context<Self>,
+    ) {
+        let (generation, send_refresh) = self.read_tracker.begin_read(&env_id, mode);
+        let input = self
+            .prefs
+            .to_list_input(PAGE_SIZE, &self.sent, None, send_refresh);
+        let payload = serde_json::to_value(&input).unwrap_or_else(|_| Value::Object(Default::default()));
+        let task = read(self.state.read(cx), method::LIST, payload, decode::<IssueListResult>);
+        cx.spawn(async move |this, cx| {
+            let result = settle(task).await;
+            let _ = this.update(cx, |page, cx| {
+                page.apply_environment_result(env_id, search_key, generation, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn apply_environment_result(
+        &mut self,
+        env_id: String,
+        search_key: String,
+        generation: u64,
+        result: Result<IssueListResult, ReadFailure>,
+        cx: &mut Context<Self>,
+    ) {
+        if search_key != self.search_scope_key() {
+            return;
+        }
+        match result {
+            Ok(answer) => {
+                self.unsupported = false;
+                if self.read_tracker.finish_read(&env_id, generation, Ok(answer)) {
+                    let answers = self.read_tracker.answers();
+                    self.held_pages = hold_issue_pages(&answers, &self.held_pages);
+                    self.rebuild(cx);
+                }
+            }
+            Err(failure) => {
+                if failure.unsupported {
+                    self.unsupported = true;
+                }
+                if self
+                    .read_tracker
+                    .finish_read(&env_id, generation, Err(failure.message))
+                {
+                    let answers = self.read_tracker.answers();
+                    self.held_pages = hold_issue_pages(&answers, &self.held_pages);
+                    self.rebuild(cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Loads the next cursor page for one tracker host on one environment (`loadMore`).
+    pub(super) fn load_more(
+        &mut self,
+        env_id: String,
+        host: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(page) = self.held_pages.get(&env_id).cloned() else {
+            return;
+        };
+        let cursors = issue_cursors_for_host(&page.next_cursors, &host);
+        if cursors.is_empty() || self.loading_more.is_some() {
+            return;
+        }
+        let search_key = self.search_scope_key();
+        self.loading_more = Some(format!("{env_id} {host}"));
+        let input = self
+            .prefs
+            .to_list_input(PAGE_SIZE, &self.sent, Some(cursors.clone()), false);
+        let payload = serde_json::to_value(&input).unwrap_or_else(|_| Value::Object(Default::default()));
+        let task = read(self.state.read(cx), method::LIST, payload, decode::<IssueListResult>);
+        cx.spawn(async move |this, cx| {
+            let result = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.loading_more = None;
+                if search_key != this.search_scope_key() {
+                    return;
+                }
+                if let Some(current) = this.held_pages.get(&env_id).cloned() {
+                    let next = match result {
+                        Ok(ref answer) => Ok(answer),
+                        Err(failure) => Err(failure.message),
+                    };
+                    let updated = continue_issue_page(&current, next, &cursors);
+                    this.held_pages.insert(env_id, updated);
+                    this.rebuild(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Fetches `issues.candidates` lazily when the Filters menu opens.
+    pub(super) fn ensure_candidates(&mut self, cx: &mut Context<Self>) {
+        let projects = self.project_descriptors(cx);
+        let shown = filter_held_by_host(&self.held_pages, self.prefs.host.as_deref());
+        let scopes = issue_filter_scopes(&shown, &projects, self.prefs.scoped_project().as_ref());
+        let to_fetch = self.candidates_tracker.sync_targets(scopes);
+        for target in to_fetch {
+            self.fetch_candidate_target(target, cx);
+        }
+    }
+
+    /// Retries ONLY failed candidate scopes without reloading answered or in-flight scopes
+    /// (`pingdotgg/t3code#38423`).
+    pub(super) fn retry_failed_candidates(&mut self, cx: &mut Context<Self>) {
+        let failed = self.candidates_tracker.failed_targets();
+        for target in failed {
+            self.fetch_candidate_target(target, cx);
+        }
+    }
+
+    fn fetch_candidate_target(
+        &mut self,
+        target: t3_core::issues::list::IssueCandidatesTarget,
+        cx: &mut Context<Self>,
+    ) {
+        let target_key = target.key();
+        let generation = self.candidates_tracker.begin_read(&target);
+        let payload = target.input.payload();
+        let task = read(
+            self.state.read(cx),
+            method::CANDIDATES,
+            payload,
+            decode::<IssueCandidates>,
+        );
+        cx.spawn(async move |this, cx| {
+            let result = settle(task).await;
+            let _ = this.update(cx, |page, cx| {
+                let outcome = result.map_err(|failure| failure.message);
+                if page
+                    .candidates_tracker
+                    .finish_read(&target_key, generation, outcome)
+                {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn rebuild(&mut self, cx: &mut Context<Self>) {
+        let projects = self.project_descriptors(cx);
+        let shown = filter_held_by_host(&self.held_pages, self.prefs.host.as_deref());
+        self.groups = group_issues(&shown, &self.sent, &projects, self.prefs.effective_sort());
+
+        let mut rows = Vec::new();
+        for (group_idx, group) in self.groups.iter().enumerate() {
+            rows.push(Row::TrackerHeader(group_idx));
+            if !group.tracker.configured {
+                rows.push(Row::TrackerNotice(group_idx));
+            }
+            for err_idx in 0..group.errors.len() {
+                rows.push(Row::ProjectError(group_idx, err_idx));
+            }
+            if group.tracker.configured && group.rows.is_empty() && group.errors.is_empty() {
+                rows.push(Row::GroupEmpty(group_idx));
+            }
+            for row_idx in 0..group.rows.len() {
+                rows.push(Row::Entry(group_idx, row_idx));
+            }
+            for env_idx in 0..group.more.len() {
+                rows.push(Row::LoadMore(group_idx, env_idx));
+            }
+        }
+
+        if rows != self.rows {
+            let top = self.list.logical_scroll_top();
+            self.list.reset(rows.len());
+            if top.item_ix < rows.len() {
+                self.list.scroll_to(top);
+            }
+            self.rows = rows;
+        }
+        cx.notify();
+    }
+
+    pub(super) fn select(
+        &mut self,
+        reference: IssueRef,
+        entry: EnvironmentIssueEntry,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = Some(reference);
+        self.selected_entry = Some(entry);
+        cx.notify();
+    }
+
+    pub(super) fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.selected_entry = None;
+        cx.notify();
+    }
+
+    pub fn copy_selected_key(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(entry) = self
+            .selected_entry
+            .as_ref()
+            .filter(|_| self.state.read(cx).issues_open)
+            .cloned()
+        else {
+            return false;
+        };
+        self.copy_text(entry.entry.display_key, "Issue key", cx);
+        true
+    }
+
+    pub(super) fn copy_text(&mut self, text: String, what: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        let toast = Toast::new(ToastKind::Success, format!("{what} copied")).description(text);
+        self.state
+            .update(cx, |state, cx| state.show_toast(toast, cx));
+    }
+
+    // --- Saved views ---
+
+    pub(super) fn apply_saved_view(
+        &mut self,
+        view_id: String,
+        preferences: IssueListPreferences,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_view_id = Some(view_id);
+        let q = preferences.q.clone().unwrap_or_default();
+        self.typed = q.clone();
+        self.sent = q.trim().to_owned();
+        self._debounce = None;
+        self.search
+            .update(cx, |input, cx| input.set_value(q, window, cx));
+        self.update_prefs(move |prefs| *prefs = preferences, cx);
+    }
+
+    pub(super) fn open_saved_view_editor(
+        &mut self,
+        editing_id: Option<String>,
+        initial_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = t(cx, ISSUE_SAVED_VIEW_PLACEHOLDER).to_owned();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(placeholder)
+                .default_value(initial_name)
+        });
+        let subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => this.submit_saved_view_editor(cx),
+                _ => {}
+            });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.saved_view_editor = Some(SavedViewEditor {
+            editing_id,
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn close_saved_view_editor(&mut self, cx: &mut Context<Self>) {
+        if self.saved_view_editor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn submit_saved_view_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.saved_view_editor.as_ref() else {
+            return;
+        };
+        let name = editor.input.read(cx).value().to_string();
+        let editing_id = editor.editing_id.clone();
+        match editing_id {
+            Some(id) => match rename_saved_view(&mut self.saved_views, &id, &name) {
+                Ok(true) => {
+                    self.save_views();
+                    self.selected_view_id = Some(id);
+                    self.saved_view_editor = None;
+                    cx.notify();
+                }
+                Ok(false) => {
+                    if let Some(ed) = self.saved_view_editor.as_mut() {
+                        ed.editing_id = None;
+                    }
+                    let toast = Toast::new(ToastKind::Error, t(cx, "This saved view was removed"))
+                        .description(t(
+                            cx,
+                            "Your name has been kept. Save it as a new view or cancel.",
+                        ));
+                    self.state
+                        .update(cx, |state, cx| state.show_toast(toast, cx));
+                    cx.notify();
+                }
+                Err(_) => {}
+            },
+            None => {
+                let id = format!(
+                    "issue-view-{}-{}",
+                    crate::sidebar::controller::now_ms(),
+                    self.next_view_seq
+                );
+                self.next_view_seq += 1;
+                if let Ok(saved_id) = create_saved_view(
+                    &mut self.saved_views,
+                    id,
+                    &name,
+                    self.prefs.normalized(),
+                ) {
+                    self.save_views();
+                    self.selected_view_id = Some(saved_id);
+                    self.saved_view_editor = None;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    pub(super) fn update_active_saved_view(&mut self, view_id: &str, cx: &mut Context<Self>) {
+        if update_saved_view_preferences(&mut self.saved_views, view_id, self.prefs.normalized()) {
+            self.save_views();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn delete_active_saved_view(&mut self, view_id: &str, cx: &mut Context<Self>) {
+        if delete_saved_view(&mut self.saved_views, view_id) {
+            self.save_views();
+            if self.selected_view_id.as_deref() == Some(view_id) {
+                self.selected_view_id = None;
+            }
+            cx.notify();
+        }
+    }
+
+    fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let collapsed = crate::workspace::sidebar_inline_width(
+            self.state.read(cx),
+            f32::from(window.viewport_size().width),
+        ) == 0.;
+        h_flex()
+            .window_control_area(WindowControlArea::Drag)
+            .h(px(crate::workspace::TITLEBAR_HEIGHT))
+            .flex_none()
+            .pl(px(if collapsed { 130. } else { 20. }))
+            .pr(px(12.))
+            .gap(px(12.))
+            .border_b_1()
+            .border_color(hsla(p.border))
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(hsla(p.foreground))
+                    .child(t(cx, "Issues").to_owned()),
+            )
+    }
+
+    fn render_selected_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let selected = self.selected_entry.as_ref()?;
+        let entry = &selected.entry;
+        let p = palette(cx);
+        let (icon, color) = state_glyph(&entry.state, cx);
+        let copy_key = entry.display_key.clone();
+        let open_url = entry.url.clone();
+
+        Some(
+            h_flex()
+                .id("issues-selected-bar")
+                .flex_none()
+                .mx(px(20.))
+                .mb(px(8.))
+                .px(px(12.))
+                .py(px(8.))
+                .gap(px(8.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(hsla(p.border))
+                .bg(hsla(p.card))
+                .child(icon.sized(px(14.)).text_color(color))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.muted_foreground))
+                        .child(entry.display_key.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(hsla(p.foreground))
+                        .child(entry.title.clone()),
+                )
+                .child(
+                    Button::new("issues-selected-copy", Variant::Outline, Size::Xs)
+                        .icon(Icon::Copy)
+                        .label(t(cx, "Copy key").to_owned())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_text(copy_key.clone(), "Issue key", cx);
+                        })),
+                )
+                .child(
+                    Button::new("issues-selected-open", Variant::Outline, Size::Xs)
+                        .icon(Icon::ExternalLink)
+                        .label(t(cx, "Open in browser").to_owned())
+                        .on_click(move |_, _, cx| cx.open_url(&open_url)),
+                )
+                .child(
+                    Button::new("issues-selected-close", Variant::GhostMuted, Size::Xs)
+                        .icon(Icon::X)
+                        .tooltip(t(cx, "Clear selection").to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_body(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.unsupported {
+            return super::row::unsupported_state(cx).into_any_element();
+        }
+        let none_answered = self.held_pages.is_empty();
+        let pending = self.is_pending();
+        let first_error = self.read_tracker.first_error().map(str::to_owned);
+
+        if none_answered && pending {
+            return super::row::ghost(t(cx, "Loading issues…"), cx).into_any_element();
+        }
+        if let Some(error) = first_error.filter(|_| none_answered) {
+            let retry = cx.listener(|this, _, _, cx| this.retry_failed(cx));
+            return super::row::unavailable(error, pending, retry, cx).into_any_element();
+        }
+        if self.groups.is_empty() {
+            return super::row::empty_no_trackers(cx).into_any_element();
+        }
+        list(
+            self.list.clone(),
+            cx.processor(|this, index: usize, window, cx| super::row::render(this, index, window, cx)),
+        )
+        .flex_1()
+        .into_any_element()
+    }
+}
+
+impl Render for IssuesPage {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let partial_error = self
+            .read_tracker
+            .first_error()
+            .filter(|_| !self.held_pages.is_empty())
+            .map(str::to_owned);
+        let selected_bar = self.render_selected_bar(cx);
+        let dialog = self
+            .saved_view_editor
+            .as_ref()
+            .map(|editor| super::toolbar::render_saved_view_dialog(self, editor, cx));
+
+        div()
+            .id("issues-page")
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .bg(hsla(p.background))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.saved_view_editor.is_some() {
+                    this.close_saved_view_editor(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(self.render_header(window, cx))
+            .child(super::toolbar::render(self, window, cx))
+            .children(partial_error.map(|error| {
+                let retry = cx.listener(|this, _, _, cx| this.retry_failed(cx));
+                h_flex()
+                    .flex_none()
+                    .mx(px(20.))
+                    .mb(px(8.))
+                    .px(px(12.))
+                    .py(px(8.))
+                    .gap(px(12.))
+                    .justify_between()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(hsla(p.warning).opacity(0.3))
+                    .bg(hsla(p.warning_surface))
+                    .text_xs()
+                    .text_color(hsla(p.foreground))
+                    .child(format!("{error} {}", t(cx, "Showing the issues that loaded.")))
+                    .child(
+                        Button::new("issues-partial-retry", Variant::Outline, Size::Xs)
+                            .label(t(cx, "Retry").to_owned())
+                            .on_click(retry),
+                    )
+            }))
+            .children(selected_bar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .px(px(8.))
+                    .child(self.render_body(window, cx)),
+            )
+            .children(dialog)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+
+    use serde_json::json;
+    use t3_core::issues::wire::{IssueInvolvement, IssueListResult, IssueListState, decode};
+
+    use super::*;
+
+    fn test_runtime() -> tokio::runtime::Handle {
+        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("test tokio runtime")
+        })
+        .handle()
+        .clone()
+    }
+
+    #[gpui::test]
+    fn issues_page_renders_groups_filters_saved_views_and_selection(cx: &mut gpui::TestAppContext) {
+        let handle = test_runtime();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(handle.clone(), cx));
+            state.update(cx, |state, _| {
+                state.environments.active = Some("env-a".into());
+                state.issues_open = true;
+            });
+            state
+        });
+        let (page, cx) = cx.add_window_view(|window, cx| IssuesPage::new(state.clone(), window, cx));
+
+        let result: IssueListResult = decode(json!({
+            "viewers": { "github.com": "alice" },
+            "trackers": [{
+                "tracker": "github",
+                "host": "github.com",
+                "projectCount": 1,
+                "capabilities": {
+                    "create": true, "edit": true, "comment": true, "labels": true,
+                    "assignees": true, "reactions": true, "templates": true,
+                    "linkedPullRequests": true, "events": true, "search": true
+                },
+                "configured": true,
+                "detail": null
+            }],
+            "entries": [{
+                "tracker": "github",
+                "host": "github.com",
+                "scope": "acme/app",
+                "key": "42",
+                "displayKey": "#42",
+                "title": "Fix issues page layout",
+                "url": "https://github.com/acme/app/issues/42",
+                "author": { "login": "alice" },
+                "state": { "category": "open", "name": "Open" },
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-02T00:00:00Z",
+                "closedAt": null,
+                "assignees": [{ "login": "bob" }],
+                "labels": [{ "name": "bug", "color": "d73a4a" }],
+                "commentCount": 3,
+                "projectId": "p1",
+                "projectTitle": "App"
+            }],
+            "errors": [],
+            "nextCursors": {}
+        }))
+        .unwrap();
+
+        page.update(cx, |page, cx| {
+            let search_key = page.search_scope_key();
+            page.read_tracker
+                .set_search_key(search_key.clone(), &["env-a".to_owned()]);
+            let (generation, _) = page
+                .read_tracker
+                .begin_read("env-a", IssueListRefreshMode::Background);
+            page.apply_environment_result("env-a".into(), search_key, generation, Ok(result), cx);
+
+            assert_eq!(page.groups.len(), 1);
+            assert_eq!(page.groups[0].rows.len(), 1);
+            assert_eq!(page.groups[0].rows[0].entry.display_key, "#42");
+            assert_eq!(page.rows.len(), 2); // TrackerHeader + Entry
+
+            // Select entry and verify copy_selected_key.
+            let row = page.groups[0].rows[0].clone();
+            let reference = IssueRef::of(&row.entry);
+            page.select(reference.clone(), row, cx);
+            assert_eq!(page.selected, Some(reference));
+            assert!(page.copy_selected_key(cx));
+        });
+
+        // Saved view creation, modification detection, rename, and deletion.
+        page.update_in(cx, |page, window, cx| {
+            page.prefs.who = IssueInvolvement::Assigned;
+            page.prefs.status = IssueListState::Open;
+            page.open_saved_view_editor(None, "Assigned Open".into(), window, cx);
+            page.submit_saved_view_editor(cx);
+            assert_eq!(page.saved_views.len(), 1);
+            assert_eq!(page.saved_views[0].name, "Assigned Open");
+
+            let view_id = page.saved_views[0].id.clone();
+            page.open_saved_view_editor(Some(view_id.clone()), "My Queue".into(), window, cx);
+            page.submit_saved_view_editor(cx);
+            assert_eq!(page.saved_views[0].name, "My Queue");
+
+            page.delete_active_saved_view(&view_id, cx);
+            assert!(page.saved_views.is_empty());
+        });
+
+        // Verify mutual exclusivity with pull_requests_open.
+        state.update(cx, |state, cx| {
+            state.pull_requests_open = true;
+            state.issues_open = false;
+            state.set_issues_open(true, cx);
+            assert!(state.issues_open);
+            assert!(!state.pull_requests_open);
+        });
+    }
+}

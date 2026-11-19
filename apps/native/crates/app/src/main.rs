@@ -18,6 +18,7 @@ mod glass;
 mod home;
 mod i18n;
 mod icons;
+mod issues;
 mod keymap;
 mod mcp;
 mod media;
@@ -153,6 +154,7 @@ fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppS
     preview::init(state.clone(), cx);
     device::init(state.clone(), cx);
     pull_requests::init(state.clone(), cx);
+    issues::init(state.clone(), cx);
     terminal::init(cx);
     files::init(cx);
     selectable_text::init(cx);
