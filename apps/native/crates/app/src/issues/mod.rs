@@ -8,11 +8,14 @@ mod toolbar;
 
 use gpui::{App, Context, Entity, Hsla, actions};
 use serde_json::Value;
+use t3_client::environments::DestinationError;
 use t3_client::session::RpcError;
+use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::issues::wire::{
     IssueState, IssueStateCategory, IssueTrackerKind, failure_message,
     is_issues_unsupported_error,
 };
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use tokio::task::JoinHandle;
 
 pub use page::IssuesPage;
@@ -63,32 +66,68 @@ pub(crate) type Read<T> = Option<JoinHandle<Result<T, ReadFailure>>>;
 
 pub(crate) const NOT_CONNECTED: &str = "Not connected to the server.";
 
-/// One issue RPC read, run and decoded on the network runtime.
-pub(crate) fn read<T: Send + 'static>(
+fn map_rpc_result<T>(
+    result: Result<Value, RpcError>,
+    decode: fn(Value) -> Result<T, String>,
+) -> Result<T, ReadFailure> {
+    match result {
+        Ok(value) => decode(value).map_err(|message| ReadFailure {
+            message,
+            unsupported: false,
+        }),
+        Err(RpcError::Failure(failure)) => {
+            let unsupported =
+                is_issues_unsupported_error(failure.tag.as_deref(), &failure.message);
+            let message =
+                failure_message(failure.tag.as_deref(), &failure.error, &failure.message);
+            Err(ReadFailure { message, unsupported })
+        }
+        Err(RpcError::Closed) => Err(ReadFailure {
+            message: NOT_CONNECTED.to_owned(),
+            unsupported: false,
+        }),
+    }
+}
+
+fn destination_error_message(error: DestinationError) -> String {
+    match error {
+        DestinationError::Denied => "Permission required for this environment.".to_owned(),
+        DestinationError::Disconnected | DestinationError::Unsynchronized => {
+            NOT_CONNECTED.to_owned()
+        }
+        DestinationError::Missing | DestinationError::Stale => {
+            "This environment is no longer available.".to_owned()
+        }
+    }
+}
+
+/// One issue RPC read targeting a fleet environment via `connections.destination`, or falling
+/// back to the active `client_handle` when `owner` is `None`.
+pub(crate) fn read_for_owner<T: Send + 'static>(
     state: &AppState,
+    owner: Option<&EnvironmentOwner>,
     method: &'static str,
     payload: Value,
     decode: fn(Value) -> Result<T, String>,
 ) -> Read<T> {
+    if let Some(owner) = owner {
+        let dest_fut = state.connections.destination(owner, ORCHESTRATION_READ_SCOPE);
+        return Some(state.runtime().spawn(async move {
+            let client = match dest_fut.await {
+                Ok(dest) => dest.client,
+                Err(error) => {
+                    return Err(ReadFailure {
+                        message: destination_error_message(error),
+                        unsupported: false,
+                    });
+                }
+            };
+            map_rpc_result(client.request(method, payload).await, decode)
+        }));
+    }
     let client = state.client_handle()?;
     Some(state.runtime().spawn(async move {
-        match client.request(method, payload).await {
-            Ok(value) => decode(value).map_err(|message| ReadFailure {
-                message,
-                unsupported: false,
-            }),
-            Err(RpcError::Failure(failure)) => {
-                let unsupported =
-                    is_issues_unsupported_error(failure.tag.as_deref(), &failure.message);
-                let message =
-                    failure_message(failure.tag.as_deref(), &failure.error, &failure.message);
-                Err(ReadFailure { message, unsupported })
-            }
-            Err(RpcError::Closed) => Err(ReadFailure {
-                message: NOT_CONNECTED.to_owned(),
-                unsupported: false,
-            }),
-        }
+        map_rpc_result(client.request(method, payload).await, decode)
     }))
 }
 

@@ -468,6 +468,193 @@ pub struct ProjectDescriptor {
     pub issue_scope: Option<String>,
 }
 
+fn non_empty_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+}
+
+fn http_url_host_with_port(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = url.host_str()?.to_lowercase();
+    match url.port() {
+        Some(port) => Some(format!("{host}:{port}")),
+        None => Some(host),
+    }
+}
+
+/// Decodes percent-encoded UTF-8 URL path segments (`decodeUrlPathSegment`), returning the
+/// original segment unchanged when percent escapes or UTF-8 bytes are invalid.
+fn decode_url_path_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return segment.to_owned();
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            let (Some(hi), Some(lo)) = (hi, lo) else {
+                return segment.to_owned();
+            };
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| segment.to_owned())
+}
+
+/// Extracts the change-request / issue tracker host from a `RepositoryIdentity` JSON value
+/// (`sourceControlClients.changeRequestHost` in `packages/source-control-core` and
+/// `packages/source-control-forgejo`).
+pub fn repository_change_request_host(
+    identity: &Value,
+    provider: Option<&str>,
+) -> Option<String> {
+    if provider == Some("forgejo") {
+        if let Some(web_url) = non_empty_str(identity, "webUrl")
+            && let Some(host) = http_url_host_with_port(web_url)
+        {
+            return Some(host);
+        }
+        if let Some(remote_url) = identity
+            .get("locator")
+            .and_then(|locator| non_empty_str(locator, "remoteUrl"))
+            && let Some(host) = http_url_host_with_port(remote_url)
+        {
+            return Some(host);
+        }
+    }
+    if let Some(canonical_key) = non_empty_str(identity, "canonicalKey")
+        && let Some(host) = canonical_key
+            .split('/')
+            .next()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+    {
+        return Some(host.to_lowercase());
+    }
+    if let Some(web_url) = non_empty_str(identity, "webUrl")
+        && let Some(host) = http_url_host_with_port(web_url)
+    {
+        return Some(host);
+    }
+    provider
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// Extracts the issue container scope from a `RepositoryIdentity` JSON value
+/// (`sourceControlClients.issueScope` in `packages/source-control-core` and
+/// `packages/source-control-azure-devops/src/shared/definition.ts:179-196`).
+pub fn repository_issue_scope(identity: &Value) -> Option<String> {
+    let provider = non_empty_str(identity, "provider");
+    if provider == Some("azure-devops") {
+        let display_name = identity
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let segments: Vec<String> = display_name
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(decode_url_path_segment)
+            .collect();
+        let at = segments.iter().position(|part| part == "_git")?;
+        if at == 2 {
+            return Some(segments[..2].join("/"));
+        }
+        let repository = segments.get(at + 1)?;
+        if at != 0 && at != 1 {
+            return None;
+        }
+        let host = identity
+            .get("canonicalKey")
+            .and_then(Value::as_str)
+            .and_then(|key| key.split('/').next())
+            .unwrap_or("")
+            .to_lowercase();
+        let legacy = host.ends_with(".visualstudio.com");
+        let first = segments.first().map(String::as_str).unwrap_or("");
+        if at == 0 {
+            return legacy.then(|| repository.clone());
+        }
+        if host == "dev.azure.com" {
+            return Some(format!("{first}/{repository}"));
+        }
+        if !legacy {
+            return None;
+        }
+        return if first.eq_ignore_ascii_case("defaultcollection") {
+            Some(repository.clone())
+        } else {
+            Some(first.to_owned())
+        };
+    }
+
+    if let Some(display_name) = non_empty_str(identity, "displayName") {
+        return Some(display_name.to_owned());
+    }
+    if let (Some(owner), Some(name)) = (
+        non_empty_str(identity, "owner"),
+        non_empty_str(identity, "name"),
+    ) {
+        return Some(format!("{owner}/{name}"));
+    }
+    if let Some(web_url) = non_empty_str(identity, "webUrl")
+        && let Ok(url) = url::Url::parse(web_url)
+        && matches!(url.scheme(), "http" | "https")
+    {
+        let segments: Vec<&str> = url
+            .path()
+            .trim_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segments.len() >= 2 {
+            return Some(segments.join("/"));
+        }
+    }
+    None
+}
+
+impl ProjectDescriptor {
+    /// Builds a `ProjectDescriptor` from a project's metadata and optional `RepositoryIdentity`.
+    pub fn from_repository_identity(
+        environment_id: String,
+        project_id: String,
+        title: String,
+        is_scratch: bool,
+        identity: Option<&Value>,
+    ) -> Self {
+        let provider = identity
+            .and_then(|id| non_empty_str(id, "provider"))
+            .map(str::to_owned);
+        let host = identity
+            .and_then(|id| repository_change_request_host(id, provider.as_deref()));
+        let issue_scope = identity.and_then(repository_issue_scope);
+        Self {
+            environment_id,
+            project_id,
+            title,
+            is_scratch,
+            provider,
+            host,
+            issue_scope,
+        }
+    }
+}
+
 /// One tracker section on the Issues page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueTrackerGroup {

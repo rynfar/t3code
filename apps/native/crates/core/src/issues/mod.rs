@@ -21,6 +21,7 @@ mod tests {
         ProjectDescriptor, ScopedProject, continue_issue_page, filter_held_by_host, group_issues,
         hold_issue_pages, host_options_for, issue_cursors_for_host, issue_entry_key,
         issue_filter_projects, issue_filter_scopes, issues_search_from_url, merge_issue_list_page,
+        repository_change_request_host, repository_issue_scope,
     };
     use super::saved_views::{
         SAVED_VIEW_NAME_MAX_LENGTH, SavedView, SavedViewNameError, create_saved_view,
@@ -635,5 +636,111 @@ mod tests {
         let input = IssueListPreferences::default().to_list_input(PAGE_SIZE, "crash", None, true);
         assert_eq!(input.refresh, Some(true));
         assert_eq!(input.query.as_deref(), Some("crash"));
+    }
+
+    #[test]
+    fn repository_identity_extracts_host_and_issue_scope_including_azure_devops_and_forgejo() {
+        // GitHub with owner/name fallback (no displayName)
+        let gh = json!({
+            "canonicalKey": "github.com/acme/app",
+            "provider": "github",
+            "owner": "acme",
+            "name": "app",
+            "webUrl": "https://github.com/acme/app"
+        });
+        assert_eq!(
+            repository_change_request_host(&gh, Some("github")).as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(repository_issue_scope(&gh).as_deref(), Some("acme/app"));
+
+        // Forgejo preserves port from webUrl or HTTP locator.remoteUrl
+        let forgejo_web = json!({
+            "canonicalKey": "git.example.com/team/repo",
+            "provider": "forgejo",
+            "displayName": "team/repo",
+            "webUrl": "https://git.example.com:3000/team/repo"
+        });
+        assert_eq!(
+            repository_change_request_host(&forgejo_web, Some("forgejo")).as_deref(),
+            Some("git.example.com:3000")
+        );
+        let forgejo_remote = json!({
+            "canonicalKey": "git.example.com/team/repo",
+            "provider": "forgejo",
+            "displayName": "team/repo",
+            "locator": { "remoteUrl": "http://git.example.com:8080/team/repo.git" }
+        });
+        assert_eq!(
+            repository_change_request_host(&forgejo_remote, Some("forgejo")).as_deref(),
+            Some("git.example.com:8080")
+        );
+
+        // Azure DevOps: org/project/_git/repo with percent-encoded project name
+        let azdo_full = json!({
+            "canonicalKey": "dev.azure.com/acme/My%20Project/_git/web",
+            "provider": "azure-devops",
+            "displayName": "acme/My%20Project/_git/web"
+        });
+        assert_eq!(
+            repository_change_request_host(&azdo_full, Some("azure-devops")).as_deref(),
+            Some("dev.azure.com")
+        );
+        assert_eq!(
+            repository_issue_scope(&azdo_full).as_deref(),
+            Some("acme/My Project")
+        );
+
+        // Azure DevOps short dev.azure.com: org/_git/repo -> org/repo
+        let azdo_short = json!({
+            "canonicalKey": "dev.azure.com/acme/_git/web",
+            "provider": "azure-devops",
+            "displayName": "acme/_git/web"
+        });
+        assert_eq!(
+            repository_issue_scope(&azdo_short).as_deref(),
+            Some("acme/web")
+        );
+
+        // Legacy *.visualstudio.com: /_git/web -> web, /DefaultCollection/_git/web -> web, /Proj/_git/repo -> Proj
+        let azdo_legacy_bare = json!({
+            "canonicalKey": "acme.visualstudio.com/_git/web",
+            "provider": "azure-devops",
+            "displayName": "_git/web"
+        });
+        assert_eq!(
+            repository_issue_scope(&azdo_legacy_bare).as_deref(),
+            Some("web")
+        );
+        let azdo_legacy_default_coll = json!({
+            "canonicalKey": "acme.visualstudio.com/DefaultCollection/_git/web",
+            "provider": "azure-devops",
+            "displayName": "DefaultCollection/_git/web"
+        });
+        assert_eq!(
+            repository_issue_scope(&azdo_legacy_default_coll).as_deref(),
+            Some("web")
+        );
+        let azdo_legacy_proj = json!({
+            "canonicalKey": "acme.visualstudio.com/Core%20Team/_git/repo",
+            "provider": "azure-devops",
+            "displayName": "Core%20Team/_git/repo"
+        });
+        assert_eq!(
+            repository_issue_scope(&azdo_legacy_proj).as_deref(),
+            Some("Core Team")
+        );
+
+        // ProjectDescriptor::from_repository_identity wires everything together
+        let desc = ProjectDescriptor::from_repository_identity(
+            "env-a".into(),
+            "p1".into(),
+            "Web".into(),
+            false,
+            Some(&azdo_full),
+        );
+        assert_eq!(desc.provider.as_deref(), Some("azure-devops"));
+        assert_eq!(desc.host.as_deref(), Some("dev.azure.com"));
+        assert_eq!(desc.issue_scope.as_deref(), Some("acme/My Project"));
     }
 }

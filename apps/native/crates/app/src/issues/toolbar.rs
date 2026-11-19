@@ -26,6 +26,52 @@ use crate::theme::{hsla, palette};
 
 const VISIBLE_CHOICES: usize = 30;
 
+/// Places active selections ahead of alphabetical choices before truncating to `limit` so a
+/// chosen label that sorts past `limit` always stays visible and clearable
+/// (`IssueListFilterPickers.tsx:182-188`).
+pub(super) fn prioritize_labels(
+    active: &[String],
+    known: impl IntoIterator<Item = String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in active {
+        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(name)) {
+            out.push(name.clone());
+        }
+    }
+    let sorted: BTreeSet<String> = known.into_iter().collect();
+    for name in sorted {
+        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(&name)) {
+            out.push(name);
+        }
+    }
+    out.truncate(limit);
+    out
+}
+
+/// Places the active assignee ahead of alphabetical choices before truncating to `limit` so a
+/// chosen person who sorts past `limit` always stays visible and clearable
+/// (`IssueListFilterPickers.tsx:248-253`).
+pub(super) fn prioritize_assignees(
+    active: Option<&str>,
+    known: impl IntoIterator<Item = String>,
+    limit: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(active) = active.map(str::trim).filter(|a| !a.is_empty()) {
+        out.push(active.to_owned());
+    }
+    let sorted: BTreeSet<String> = known.into_iter().collect();
+    for login in sorted {
+        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(&login)) {
+            out.push(login);
+        }
+    }
+    out.truncate(limit);
+    out
+}
+
 pub fn render(
     page: &mut IssuesPage,
     _window: &mut Window,
@@ -174,43 +220,40 @@ fn filters_menu(
 ) -> AnyElement {
     let prefs = page.prefs.clone();
     let filter_projects = page.filter_projects(cx);
-    let scoped_project = prefs.scoped_project();
+    let scoped_project = page.canonical_scoped_project(cx);
     let candidates = page.candidates_tracker.merged();
     let failed_candidates = !page.candidates_tracker.failed_targets().is_empty();
 
-    // Collect labels from candidates, loaded rows, and currently active selections.
-    let mut label_names: BTreeSet<String> = BTreeSet::new();
-    for name in &prefs.label {
-        label_names.insert(name.clone());
-    }
-    for label in &candidates.labels {
-        label_names.insert(label.name.clone());
-    }
-    for group in &page.groups {
-        for row in &group.rows {
-            for label in &row.entry.labels {
-                label_names.insert(label.name.clone());
-            }
-        }
-    }
-    let visible_labels: Vec<String> = label_names.into_iter().take(VISIBLE_CHOICES).collect();
+    // Active selections lead so choices beyond VISIBLE_CHOICES can still be seen and cleared.
+    let visible_labels = prioritize_labels(
+        &prefs.label,
+        candidates
+            .labels
+            .iter()
+            .map(|label| label.name.clone())
+            .chain(
+                page.groups
+                    .iter()
+                    .flat_map(|group| group.rows.iter())
+                    .flat_map(|row| row.entry.labels.iter().map(|label| label.name.clone())),
+            ),
+        VISIBLE_CHOICES,
+    );
 
-    // Collect assignees from candidates, loaded rows, and currently active assignee.
-    let mut assignee_logins: BTreeSet<String> = BTreeSet::new();
-    if let Some(active) = &prefs.assignee {
-        assignee_logins.insert(active.clone());
-    }
-    for actor in &candidates.assignees {
-        assignee_logins.insert(actor.login.clone());
-    }
-    for group in &page.groups {
-        for row in &group.rows {
-            for actor in &row.entry.assignees {
-                assignee_logins.insert(actor.login.clone());
-            }
-        }
-    }
-    let visible_assignees: Vec<String> = assignee_logins.into_iter().take(VISIBLE_CHOICES).collect();
+    let visible_assignees = prioritize_assignees(
+        prefs.assignee.as_deref(),
+        candidates
+            .assignees
+            .iter()
+            .map(|actor| actor.login.clone())
+            .chain(
+                page.groups
+                    .iter()
+                    .flat_map(|group| group.rows.iter())
+                    .flat_map(|row| row.entry.assignees.iter().map(|actor| actor.login.clone())),
+            ),
+        VISIBLE_CHOICES,
+    );
     let candidates_pending = candidates.is_pending;
     let candidates_error = candidates.error.clone();
     let candidates_truncated = candidates.truncated;
@@ -643,16 +686,20 @@ fn host_filter_menu(
                 options.iter().fold(menu, |menu, opt| {
                     let host = opt.host.clone();
                     let checked = opt.host == current;
+                    let unavailable = opt.unavailable.is_some();
                     let text = match &opt.unavailable {
                         Some(detail) => format!("{} · {detail}", opt.label),
                         None => opt.label.clone(),
                     };
                     let entity = entity.clone();
                     menu.item(
-                        PopupMenuItem::new(text).checked(checked).on_click(move |_, _, cx| {
-                            let host = host.clone();
-                            update(&entity, cx, move |prefs| prefs.host = host);
-                        }),
+                        PopupMenuItem::new(text)
+                            .checked(checked)
+                            .disabled(unavailable)
+                            .on_click(move |_, _, cx| {
+                                let host = host.clone();
+                                update(&entity, cx, move |prefs| prefs.host = host);
+                            }),
                     )
                 })
             })

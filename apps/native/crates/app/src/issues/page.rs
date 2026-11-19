@@ -15,6 +15,7 @@ use gpui_component::h_flex;
 use gpui_component::input::{InputEvent, InputState};
 use serde_json::Value;
 use t3_client::store;
+use t3_client::supervisor::ConnectionStatus;
 use t3_core::issues::list::{
     EnvironmentIssueEntry, FilterProject, HeldIssuePage, HostOption, IssueCandidatesTracker,
     IssueListPreferences, IssueListReadTracker, IssueListRefreshMode, IssueTrackerGroup, PAGE_SIZE,
@@ -30,8 +31,9 @@ use t3_core::issues::saved_views::{
 use t3_core::issues::wire::{
     IssueCandidates, IssueListResult, IssueRef, IssueTrackerSummary, decode, method,
 };
+use t3_core::sidebar::grouping::EnvironmentOwner;
 
-use super::{ReadFailure, read, settle, state_glyph};
+use super::{ReadFailure, read_for_owner, settle, state_glyph};
 use crate::app_state::{AppEvent, AppState};
 use crate::i18n::t;
 use crate::icons::Icon;
@@ -57,6 +59,23 @@ pub(super) struct SavedViewEditor {
     _subscription: Subscription,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnvironmentTarget {
+    /// Saved environment ID (consistent with `EnvironmentOwner.saved_id` and `ProjectRef`).
+    env_id: String,
+    /// Canonical server `environmentId`, when known, so saved/URL preferences matching either
+    /// saved or canonical ID resolve cleanly.
+    canonical_id: Option<String>,
+    /// `Some` when backed by `state.fleet.environments`, `None` for single-client fallback.
+    owner: Option<EnvironmentOwner>,
+}
+
+impl EnvironmentTarget {
+    fn matches_id(&self, id: &str) -> bool {
+        self.env_id == id || self.canonical_id.as_deref() == Some(id)
+    }
+}
+
 pub struct IssuesPage {
     pub(super) state: Entity<AppState>,
     pub(super) prefs: IssueListPreferences,
@@ -71,6 +90,7 @@ pub struct IssuesPage {
     pub(super) selected: Option<IssueRef>,
     pub(super) selected_entry: Option<EnvironmentIssueEntry>,
     pub(super) loading_more: Option<String>,
+    loading_more_gen: u64,
     pub(super) unsupported: bool,
     pub(super) candidates_tracker: IssueCandidatesTracker,
     pub(super) saved_views: Vec<SavedView<IssueListPreferences>>,
@@ -78,7 +98,7 @@ pub struct IssuesPage {
     saved_view_editor: Option<SavedViewEditor>,
     next_view_seq: u64,
     focus: FocusHandle,
-    connected: bool,
+    connected_targets: Vec<String>,
     open: bool,
     _debounce: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -112,7 +132,10 @@ impl IssuesPage {
                 _ => {}
             }),
             cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
-                if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Shell) {
+                if matches!(
+                    event,
+                    AppEvent::Phase | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig
+                ) {
                     this.sync(cx);
                 }
             }),
@@ -134,6 +157,7 @@ impl IssuesPage {
             selected: None,
             selected_entry: None,
             loading_more: None,
+            loading_more_gen: 0,
             unsupported: false,
             candidates_tracker: IssueCandidatesTracker::default(),
             saved_views,
@@ -141,7 +165,7 @@ impl IssuesPage {
             saved_view_editor: None,
             next_view_seq: 1,
             focus: cx.focus_handle(),
-            connected: false,
+            connected_targets: Vec::new(),
             open: false,
             _debounce: None,
             _subscriptions: subscriptions,
@@ -150,22 +174,112 @@ impl IssuesPage {
         page
     }
 
-    fn environment_key(&self, cx: &App) -> Option<String> {
-        let state = self.state.read(cx);
+    fn is_environment_disabled(state: &AppState, saved_id: &str) -> bool {
         state
-            .environment()
-            .or(state.environments.active.as_deref())
-            .map(str::to_owned)
+            .environments
+            .environments
+            .iter()
+            .any(|record| record.id == saved_id && record.disabled)
+    }
+
+    /// All connected, non-disabled environment targets across the fleet, falling back to the
+    /// active single-client environment when `state.fleet.environments` is empty.
+    fn all_environment_targets(&self, cx: &App) -> Vec<EnvironmentTarget> {
+        let state = self.state.read(cx);
+        if !state.fleet.environments.is_empty() {
+            let mut targets = Vec::new();
+            for env in &state.fleet.environments {
+                let saved_id = &env.summary.owner.saved_id;
+                if Self::is_environment_disabled(state, saved_id) {
+                    continue;
+                }
+                if env.status != ConnectionStatus::Connected {
+                    continue;
+                }
+                let canonical_id = env
+                    .summary
+                    .owner
+                    .canonical_id
+                    .clone()
+                    .or_else(|| {
+                        env.config
+                            .config
+                            .as_ref()
+                            .map(|c| c.environment.environment_id.clone())
+                            .filter(|id| !id.is_empty())
+                    });
+                targets.push(EnvironmentTarget {
+                    env_id: saved_id.clone(),
+                    canonical_id,
+                    owner: Some(env.summary.owner.clone()),
+                });
+            }
+            return targets;
+        }
+        let active_connected = state.client_handle().is_some()
+            && matches!(
+                state.phase,
+                crate::app_state::Phase::Online(ConnectionStatus::Connected)
+            );
+        let fallback_id = state
+            .environments
+            .active
+            .as_deref()
+            .or_else(|| state.environment())
+            .map(str::to_owned);
+        let Some(env_id) = fallback_id.filter(|id| !Self::is_environment_disabled(state, id))
+        else {
+            return Vec::new();
+        };
+        if !active_connected {
+            return Vec::new();
+        }
+        let canonical_id = state
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.environment.environment_id.clone())
+            .filter(|id| !id.is_empty());
+        vec![EnvironmentTarget {
+            env_id,
+            canonical_id,
+            owner: None,
+        }]
+    }
+
+    fn environment_target_for(&self, env_id: &str, cx: &App) -> Option<EnvironmentTarget> {
+        self.all_environment_targets(cx)
+            .into_iter()
+            .find(|target| target.matches_id(env_id))
     }
 
     fn environment_labels(&self, cx: &App) -> HashMap<String, String> {
         let state = self.state.read(cx);
         let mut map = HashMap::new();
         for env in &state.environments.environments {
+            map.insert(env.id.clone(), env.label.clone());
             if let Some(canonical) = &env.environment_id {
                 map.insert(canonical.clone(), env.label.clone());
             }
-            map.insert(env.id.clone(), env.label.clone());
+        }
+        for env in &state.fleet.environments {
+            let label = env
+                .config
+                .config
+                .as_ref()
+                .map(|c| c.environment.label.clone())
+                .filter(|l| !l.trim().is_empty())
+                .or_else(|| map.get(&env.summary.owner.saved_id).cloned())
+                .unwrap_or_else(|| env.summary.owner.saved_id.clone());
+            map.insert(env.summary.owner.saved_id.clone(), label.clone());
+            if let Some(canonical) = &env.summary.owner.canonical_id {
+                map.insert(canonical.clone(), label.clone());
+            }
+            if let Some(config) = &env.config.config
+                && !config.environment.environment_id.is_empty()
+            {
+                map.insert(config.environment.environment_id.clone(), label);
+            }
         }
         if let Some(config) = &state.server_config.config
             && !config.environment.environment_id.is_empty()
@@ -174,12 +288,16 @@ impl IssuesPage {
                 config.environment.environment_id.clone(),
                 config.environment.label.clone(),
             );
+            if let Some(active) = &state.environments.active {
+                map.entry(active.clone())
+                    .or_insert_with(|| config.environment.label.clone());
+            }
         }
         map
     }
 
     pub(super) fn environment_label_for_row(&self, env_id: &str, cx: &App) -> Option<String> {
-        if self.held_pages.len() <= 1 {
+        if self.all_environment_targets(cx).len() <= 1 && self.held_pages.len() <= 1 {
             return None;
         }
         self.environment_labels(cx).get(env_id).cloned()
@@ -187,9 +305,35 @@ impl IssuesPage {
 
     fn project_descriptors(&self, cx: &App) -> Vec<ProjectDescriptor> {
         let state = self.state.read(cx);
-        let env_id = self
-            .environment_key(cx)
-            .unwrap_or_else(|| "local".to_owned());
+        if !state.fleet.environments.is_empty() {
+            let mut out = Vec::new();
+            for env in &state.fleet.environments {
+                let saved_id = &env.summary.owner.saved_id;
+                if Self::is_environment_disabled(state, saved_id) {
+                    continue;
+                }
+                for scoped in &env.summary.projects {
+                    if scoped.project.archived_at.is_some() {
+                        continue;
+                    }
+                    out.push(ProjectDescriptor::from_repository_identity(
+                        saved_id.clone(),
+                        scoped.project.id.clone(),
+                        scoped.project.title.clone(),
+                        scoped.is_scratch,
+                        scoped.project.repository_identity.as_ref(),
+                    ));
+                }
+            }
+            return out;
+        }
+        let env_id = state
+            .environments
+            .active
+            .as_deref()
+            .or_else(|| state.environment())
+            .unwrap_or("local")
+            .to_owned();
         let Some(snapshot) = &state.shell.snapshot else {
             return Vec::new();
         };
@@ -198,44 +342,13 @@ impl IssuesPage {
             .iter()
             .filter(|project| project.archived_at.is_none())
             .map(|project| {
-                let provider = project
-                    .repository_identity
-                    .as_ref()
-                    .and_then(|id| id.get("provider").and_then(Value::as_str))
-                    .map(str::to_owned);
-                let host = project
-                    .repository_identity
-                    .as_ref()
-                    .and_then(|id| id.get("host").and_then(Value::as_str))
-                    .or_else(|| {
-                        project
-                            .repository_identity
-                            .as_ref()
-                            .and_then(|id| id.get("canonicalKey").and_then(Value::as_str))
-                            .and_then(|key| key.split('/').next())
-                    })
-                    .map(str::to_owned);
-                let issue_scope = project
-                    .repository_identity
-                    .as_ref()
-                    .and_then(|id| id.get("nameWithOwner").and_then(Value::as_str))
-                    .or_else(|| {
-                        project
-                            .repository_identity
-                            .as_ref()
-                            .and_then(|id| id.get("canonicalKey").and_then(Value::as_str))
-                            .and_then(|key| key.split_once('/').map(|(_, rest)| rest))
-                    })
-                    .map(str::to_owned);
-                ProjectDescriptor {
-                    environment_id: env_id.clone(),
-                    project_id: project.id.clone(),
-                    title: project.title.clone(),
-                    is_scratch: state.is_scratch_project(&project.id),
-                    provider,
-                    host,
-                    issue_scope,
-                }
+                ProjectDescriptor::from_repository_identity(
+                    env_id.clone(),
+                    project.id.clone(),
+                    project.title.clone(),
+                    state.is_scratch_project(&project.id),
+                    project.repository_identity.as_ref(),
+                )
             })
             .collect()
     }
@@ -259,16 +372,27 @@ impl IssuesPage {
         self.read_tracker.is_pending()
     }
 
-    fn active_targets(&self, cx: &App) -> Vec<String> {
-        let Some(env_id) = self.environment_key(cx) else {
-            return Vec::new();
-        };
-        if let Some(scoped) = self.prefs.scoped_project()
-            && scoped.environment_id != env_id
-        {
-            return Vec::new();
+    fn active_targets(&self, cx: &App) -> Vec<EnvironmentTarget> {
+        let targets = self.all_environment_targets(cx);
+        if let Some(scoped) = self.prefs.scoped_project() {
+            targets
+                .into_iter()
+                .filter(|target| target.matches_id(&scoped.environment_id))
+                .collect()
+        } else {
+            targets
         }
-        vec![env_id]
+    }
+
+    pub(super) fn canonical_scoped_project(
+        &self,
+        cx: &App,
+    ) -> Option<t3_core::issues::list::ScopedProject> {
+        let mut scoped = self.prefs.scoped_project()?;
+        if let Some(target) = self.environment_target_for(&scoped.environment_id, cx) {
+            scoped.environment_id = target.env_id;
+        }
+        Some(scoped)
     }
 
     fn search_scope_key(&self) -> String {
@@ -282,28 +406,29 @@ impl IssuesPage {
 
     fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let connected = state.client_handle().is_some()
-            && matches!(
-                state.phase,
-                crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected)
-            );
         let open = state.issues_open && !state.pull_requests_open;
-        let returned = connected && open && (!self.connected || !self.open);
+        let targets = self.active_targets(cx);
+        let target_ids: Vec<String> = targets.iter().map(|t| t.env_id.clone()).collect();
+        let targets_changed = target_ids != self.connected_targets;
+        let has_targets = !target_ids.is_empty();
+        let reopened = open && !self.open;
         let left = self.open && !open;
-        self.connected = connected;
+
         self.open = open;
+        self.connected_targets = target_ids;
 
         if left {
             // Closed searches do not accumulate in memory once the page closes (`pingdotgg/t3code#38493`).
+            self._debounce = None;
             self.read_tracker.prune_closed_searches();
             self.close_saved_view_editor(cx);
         }
 
-        if open
-            && connected
-            && ((returned && self.read_tracker.should_live_refresh())
-                || (self.held_pages.is_empty() && !self.is_pending()))
-        {
+        let should_fetch = (has_targets
+            && (((reopened || targets_changed) && self.read_tracker.should_live_refresh())
+                || (self.held_pages.is_empty() && !self.is_pending())))
+            || (!has_targets && targets_changed);
+        if open && should_fetch {
             self.fetch_all(IssueListRefreshMode::Background, cx);
         } else if open {
             self.rebuild(cx);
@@ -329,6 +454,8 @@ impl IssuesPage {
         self.prefs = self.prefs.normalized();
         self.save_prefs();
         if self.search_scope_key() != before {
+            self._debounce = None;
+            self.sent = self.typed.trim().to_owned();
             self.candidates_tracker.clear();
             self.fetch_all(IssueListRefreshMode::Background, cx);
         } else {
@@ -363,6 +490,9 @@ impl IssuesPage {
     }
 
     fn send_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if !self.open {
+            return;
+        }
         if query != self.sent {
             self.sent = query;
             self.fetch_all(IssueListRefreshMode::Background, cx);
@@ -394,39 +524,66 @@ impl IssuesPage {
             return;
         }
         let search_key = self.search_scope_key();
+        let active = self.active_targets(cx);
         for env_id in failed {
-            self.fetch_environment(env_id, search_key.clone(), IssueListRefreshMode::Background, cx);
+            let target = active
+                .iter()
+                .find(|t| t.matches_id(&env_id))
+                .cloned()
+                .unwrap_or(EnvironmentTarget {
+                    env_id,
+                    canonical_id: None,
+                    owner: None,
+                });
+            self.fetch_environment(
+                target,
+                search_key.clone(),
+                IssueListRefreshMode::Background,
+                cx,
+            );
         }
     }
 
     fn fetch_all(&mut self, mode: IssueListRefreshMode, cx: &mut Context<Self>) {
         let targets = self.active_targets(cx);
+        let target_ids: Vec<String> = targets.iter().map(|t| t.env_id.clone()).collect();
         let search_key = self.search_scope_key();
-        self.read_tracker.set_search_key(search_key.clone(), &targets);
+        self.loading_more = None;
+        self.loading_more_gen += 1;
+        self.read_tracker
+            .set_search_key(search_key.clone(), &target_ids);
         self.unsupported = false;
         if targets.is_empty() {
             self.held_pages.clear();
             self.rebuild(cx);
             return;
         }
-        for env_id in targets {
-            self.fetch_environment(env_id, search_key.clone(), mode, cx);
+        for target in targets {
+            self.fetch_environment(target, search_key.clone(), mode, cx);
         }
     }
 
     fn fetch_environment(
         &mut self,
-        env_id: String,
+        target: EnvironmentTarget,
         search_key: String,
         mode: IssueListRefreshMode,
         cx: &mut Context<Self>,
     ) {
+        let env_id = target.env_id;
         let (generation, send_refresh) = self.read_tracker.begin_read(&env_id, mode);
         let input = self
             .prefs
             .to_list_input(PAGE_SIZE, &self.sent, None, send_refresh);
-        let payload = serde_json::to_value(&input).unwrap_or_else(|_| Value::Object(Default::default()));
-        let task = read(self.state.read(cx), method::LIST, payload, decode::<IssueListResult>);
+        let payload =
+            serde_json::to_value(&input).unwrap_or_else(|_| Value::Object(Default::default()));
+        let task = read_for_owner(
+            self.state.read(cx),
+            target.owner.as_ref(),
+            method::LIST,
+            payload,
+            decode::<IssueListResult>,
+        );
         cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |page, cx| {
@@ -489,15 +646,30 @@ impl IssuesPage {
             return;
         }
         let search_key = self.search_scope_key();
+        self.loading_more_gen += 1;
+        let load_gen = self.loading_more_gen;
         self.loading_more = Some(format!("{env_id} {host}"));
+        let owner = self
+            .environment_target_for(&env_id, cx)
+            .and_then(|target| target.owner);
         let input = self
             .prefs
             .to_list_input(PAGE_SIZE, &self.sent, Some(cursors.clone()), false);
-        let payload = serde_json::to_value(&input).unwrap_or_else(|_| Value::Object(Default::default()));
-        let task = read(self.state.read(cx), method::LIST, payload, decode::<IssueListResult>);
+        let payload =
+            serde_json::to_value(&input).unwrap_or_else(|_| Value::Object(Default::default()));
+        let task = read_for_owner(
+            self.state.read(cx),
+            owner.as_ref(),
+            method::LIST,
+            payload,
+            decode::<IssueListResult>,
+        );
         cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |this, cx| {
+                if this.loading_more_gen != load_gen {
+                    return;
+                }
                 this.loading_more = None;
                 if search_key != this.search_scope_key() {
                     return;
@@ -522,7 +694,8 @@ impl IssuesPage {
     pub(super) fn ensure_candidates(&mut self, cx: &mut Context<Self>) {
         let projects = self.project_descriptors(cx);
         let shown = filter_held_by_host(&self.held_pages, self.prefs.host.as_deref());
-        let scopes = issue_filter_scopes(&shown, &projects, self.prefs.scoped_project().as_ref());
+        let scoped = self.canonical_scoped_project(cx);
+        let scopes = issue_filter_scopes(&shown, &projects, scoped.as_ref());
         let to_fetch = self.candidates_tracker.sync_targets(scopes);
         for target in to_fetch {
             self.fetch_candidate_target(target, cx);
@@ -545,9 +718,13 @@ impl IssuesPage {
     ) {
         let target_key = target.key();
         let generation = self.candidates_tracker.begin_read(&target);
+        let owner = self
+            .environment_target_for(&target.environment_id, cx)
+            .and_then(|env| env.owner);
         let payload = target.input.payload();
-        let task = read(
+        let task = read_for_owner(
             self.state.read(cx),
+            owner.as_ref(),
             method::CANDIDATES,
             payload,
             decode::<IssueCandidates>,
@@ -956,8 +1133,7 @@ mod tests {
     fn test_runtime() -> tokio::runtime::Handle {
         static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
         RT.get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
+            tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("test tokio runtime")
@@ -1067,6 +1243,171 @@ mod tests {
             state.set_issues_open(true, cx);
             assert!(state.issues_open);
             assert!(!state.pull_requests_open);
+        });
+    }
+
+    #[gpui::test]
+    fn fleet_multi_environment_targets_prioritized_pickers_and_cleanup(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::Arc;
+
+        let handle = test_runtime();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(handle.clone(), cx));
+            state.update(cx, |state, _| {
+                let make_env = |saved: &str, canonical: &str, label: &str, project_id: &str, title: &str| {
+                    let mut config = t3_core::server_config::ServerConfigState::default();
+                    config.apply(
+                        serde_json::from_value(json!({
+                            "type": "snapshot",
+                            "config": {
+                                "environment": { "environmentId": canonical, "label": label },
+                                "cwd": "/tmp",
+                                "providers": []
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                    let mut shell = t3_core::shell::ShellState::default();
+                    shell.synchronized = true;
+                    shell.snapshot = Some(
+                        serde_json::from_value(json!({
+                            "snapshotSequence": 1,
+                            "projects": [{
+                                "id": project_id,
+                                "title": title,
+                                "workspaceRoot": format!("/tmp/{project_id}"),
+                                "repositoryIdentity": {
+                                    "canonicalKey": format!("dev.azure.com/acme/{title}/_git/repo"),
+                                    "provider": "azure-devops",
+                                    "displayName": format!("acme/{title}/_git/repo")
+                                },
+                                "defaultModelSelection": null,
+                                "scripts": [],
+                                "createdAt": "2026-01-01T00:00:00Z",
+                                "updatedAt": "2026-01-01T00:00:00Z"
+                            }],
+                            "threads": [],
+                            "updatedAt": "2026-01-02T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    );
+                    let owner = EnvironmentOwner {
+                        saved_id: saved.into(),
+                        canonical_id: Some(canonical.into()),
+                        generation: 1,
+                        connection_generation: 1,
+                        shell_generation: 1,
+                    };
+                    Arc::new(t3_client::environments::EnvironmentView {
+                        summary: Arc::new(
+                            t3_core::sidebar::fleet::EnvironmentSummary::from_shell(
+                                owner, &shell, &config,
+                            ),
+                        ),
+                        status: ConnectionStatus::Connected,
+                        config,
+                        grants: None,
+                        settings_revision: 0,
+                        keybindings_revision: 0,
+                    })
+                };
+
+                state.environments.active = Some("saved-local".into());
+                state.environments.environments = vec![
+                    t3_client::store::SavedEnvironment {
+                        id: "saved-disabled".into(),
+                        environment_id: Some("canon-disabled".into()),
+                        label: "Disabled".into(),
+                        http_base: "http://localhost:9003".into(),
+                        disabled: true,
+                        access_token: None,
+                        server_version: None,
+                        local: false,
+                        ssh: None,
+                    },
+                ];
+                state.fleet = Arc::new(t3_client::environments::FleetView {
+                    revision: 1,
+                    environments: vec![
+                        make_env("saved-local", "canon-local", "MacBook", "p-local", "Core"),
+                        make_env("saved-remote", "canon-remote", "Linux Box", "p-remote", "Core"),
+                        make_env("saved-disabled", "canon-disabled", "Disabled", "p-off", "Off"),
+                    ],
+                });
+                state.issues_open = true;
+            });
+            state
+        });
+        let (page, cx) = cx.add_window_view(|window, cx| IssuesPage::new(state.clone(), window, cx));
+
+        page.update(cx, |page, cx| {
+            // 1. Multi-env targets include both connected enabled envs, skip disabled env.
+            let targets = page.active_targets(cx);
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].env_id, "saved-local");
+            assert_eq!(targets[1].env_id, "saved-remote");
+            assert_eq!(
+                page.environment_label_for_row("saved-remote", cx).as_deref(),
+                Some("Linux Box")
+            );
+
+            // Secondary-env project appears in filter_projects with disambiguated title, and
+            // Azure DevOps issueScope is extracted properly from RepositoryIdentity.
+            let projects = page.filter_projects(cx);
+            assert_eq!(projects.len(), 2);
+            assert!(projects.iter().any(|p| p.project_id == "p-remote" && p.title == "Core · Linux Box"));
+            let descriptors = page.project_descriptors(cx);
+            let remote_desc = descriptors.iter().find(|d| d.project_id == "p-remote").unwrap();
+            assert_eq!(remote_desc.host.as_deref(), Some("dev.azure.com"));
+            assert_eq!(remote_desc.issue_scope.as_deref(), Some("acme/Core"));
+
+            // Selecting a secondary-env project by canonical ID still matches saved-remote!
+            page.prefs.issue_server = Some("canon-remote".into());
+            page.prefs.issue_project = Some("p-remote".into());
+            let scoped_targets = page.active_targets(cx);
+            assert_eq!(scoped_targets.len(), 1);
+            assert_eq!(scoped_targets[0].env_id, "saved-remote");
+            assert_eq!(
+                page.canonical_scoped_project(cx).map(|s| s.environment_id),
+                Some("saved-remote".into())
+            );
+
+            // 2. Active labels/assignee lead before 30-item truncation.
+            let many_labels: Vec<String> = (0..35).map(|i| format!("a-label-{i:02}")).collect();
+            let prioritized_labels = super::super::toolbar::prioritize_labels(
+                &["z-active".to_owned()],
+                many_labels,
+                30,
+            );
+            assert_eq!(prioritized_labels.len(), 30);
+            assert_eq!(prioritized_labels[0], "z-active");
+
+            let many_people: Vec<String> = (0..35).map(|i| format!("a-user-{i:02}")).collect();
+            let prioritized_people = super::super::toolbar::prioritize_assignees(
+                Some("z-assignee"),
+                many_people,
+                30,
+            );
+            assert_eq!(prioritized_people.len(), 30);
+            assert_eq!(prioritized_people[0], "z-assignee");
+
+            // 3. Debounce cancels on update_prefs and send_query is a no-op when closed.
+            page.typed_changed("pending".into(), cx);
+            assert!(page._debounce.is_some());
+            page.loading_more = Some("saved-remote dev.azure.com".into());
+            page.update_prefs(|p| p.status = IssueListState::Closed, cx);
+            assert!(page._debounce.is_none());
+            assert!(page.loading_more.is_none(), "fetch_all must clear stale loading_more");
+
+            page.open = false;
+            page.sent = "old".into();
+            page.send_query("after-close".into(), cx);
+            assert_eq!(page.sent, "old", "send_query must not fetch after closing page");
         });
     }
 }
