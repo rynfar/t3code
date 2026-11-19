@@ -283,11 +283,22 @@ impl UsageView {
         }
     }
 
-    /// Esc peels one layer: the confirm, prices dialog, a menu or popover, the model dialog, then the page.
+    /// Esc peels one layer: the confirm, prices dialog (unless saving), a menu or popover, the model dialog, then the page.
     fn escape(&mut self, cx: &mut Context<Self>) {
-        if self.confirm_reset.take().is_some()
-            || self.prices.take().is_some()
-            || self.menu.take().is_some()
+        if self.confirm_reset.take().is_some() {
+            self.dialog_hover = None;
+            cx.notify();
+            return;
+        }
+        if let Some(dialog) = self.prices.as_ref() {
+            if !dialog.is_saving() {
+                self.prices = None;
+                self.dialog_hover = None;
+                cx.notify();
+            }
+            return;
+        }
+        if self.menu.take().is_some()
             || self.segment.take().is_some()
             || self.selected_model.take().is_some()
         {

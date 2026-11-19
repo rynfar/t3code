@@ -24,7 +24,9 @@ struct PriceRowInputs {
     id: String,
     is_new: bool,
     removed: bool,
-    model: Entity<InputState>,
+    /// Immutable model ID for existing (`!is_new`) rows so saved server keys are never orphaned.
+    fixed_model: String,
+    model: Option<Entity<InputState>>,
     input: Entity<InputState>,
     output: Entity<InputState>,
     cache_read: Entity<InputState>,
@@ -44,6 +46,10 @@ pub(super) struct PriceOverridesDialog {
 }
 
 impl PriceOverridesDialog {
+    pub(super) fn is_saving(&self) -> bool {
+        self.saving
+    }
+
     fn new(seed_model: Option<String>) -> Self {
         Self {
             loading: true,
@@ -82,7 +88,8 @@ impl PriceOverridesDialog {
             id,
             is_new,
             removed: false,
-            model: mk(model, "model-id", window, cx),
+            fixed_model: model.to_owned(),
+            model: is_new.then(|| mk(model, "model-id", window, cx)),
             input: mk(&form.input, "0.00", window, cx),
             output: mk(&form.output, "0.00", window, cx),
             cache_read: mk(&form.cache_read, "Input rate", window, cx),
@@ -95,7 +102,10 @@ impl PriceOverridesDialog {
         self.rows
             .iter()
             .map(|row| {
-                let model = row.model.read(cx).value().to_string();
+                let model = match &row.model {
+                    Some(input) if row.is_new => input.read(cx).value().to_string(),
+                    _ => row.fixed_model.clone(),
+                };
                 UsagePriceRowDraft {
                     id: row.id.clone(),
                     model: model.clone(),
@@ -160,6 +170,9 @@ impl UsageView {
     }
 
     fn add_price_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prices.as_ref().is_none_or(|d| d.saving) {
+            return;
+        }
         let Some(mut dialog) = self.prices.take() else { return };
         dialog.push_row("", &UsagePriceForm::default(), "", true, window, cx);
         self.prices = Some(dialog);
@@ -243,7 +256,24 @@ impl UsageView {
                         h_flex()
                             .gap(r(6.))
                             .items_center()
-                            .child(div().flex_1().min_w(r(140.)).child(Input::new(&row.model).small()))
+                            .child(match &row.model {
+                                Some(input) if row.is_new => {
+                                    div().flex_1().min_w(r(140.)).child(Input::new(input).small()).into_any_element()
+                                }
+                                _ => div()
+                                    .flex_1()
+                                    .min_w(r(140.))
+                                    .px(r(8.))
+                                    .py(r(5.))
+                                    .rounded(r(6.))
+                                    .bg(hsla(p.muted).opacity(0.45))
+                                    .text_size(r(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(hsla(p.foreground))
+                                    .truncate()
+                                    .child(row.fixed_model.clone())
+                                    .into_any_element(),
+                            })
                             .child(div().w(r(76.)).child(Input::new(&row.input).small()))
                             .child(div().w(r(76.)).child(Input::new(&row.output).small()))
                             .child(div().w(r(84.)).child(Input::new(&row.cache_read).small()))
@@ -254,9 +284,11 @@ impl UsageView {
                                     .variant(Variant::Ghost)
                                     .size(Size::IconSm)
                                     .icon(Icon::X)
+                                    .disabled(saving)
                                     .tooltip("Remove override")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(d) = this.prices.as_mut()
+                                            && !d.saving
                                             && let Some(r) = d.rows.get_mut(index)
                                         {
                                             r.removed = true;
@@ -338,6 +370,7 @@ impl UsageView {
                         .child(
                             h_flex().pt(r(4.)).child(
                                 ActionButton::new("usage-prices-add", "Add model", ButtonVariant::Outline, ButtonSize::Xs)
+                                    .disabled(saving)
                                     .on_click(cx.listener(|this, _, window, cx| this.add_price_row(window, cx))),
                             ),
                         )
@@ -355,7 +388,11 @@ impl UsageView {
                     .bg(hsla(p.muted))
                     .child(
                         ActionButton::new("usage-prices-cancel", "Cancel", ButtonVariant::Outline, ButtonSize::Default)
+                            .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| {
+                                if this.prices.as_ref().is_some_and(|d| d.saving) {
+                                    return;
+                                }
                                 this.prices = None;
                                 cx.notify();
                             })),
@@ -386,6 +423,9 @@ impl UsageView {
                 .on_mouse_down(
                     gpui::MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
+                        if this.prices.as_ref().is_some_and(|d| d.saving) {
+                            return;
+                        }
                         this.prices = None;
                         cx.notify();
                     }),

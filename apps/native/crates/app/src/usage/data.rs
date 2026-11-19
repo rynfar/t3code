@@ -296,14 +296,19 @@ impl UsageView {
                 Ok(None) => Err("not connected".to_owned()),
                 Err(_) => return,
             };
-            // On slow-refresh failure, preserve the already-displayed summary rather than wiping it.
+            // On slow-refresh failure, preserve and settle on the already-displayed summary rather than wiping it.
             let _ = this.update(cx, |view, cx| match await_reply {
                 Ok(summary) => view.apply(&window, Ok(summary), false, cx),
                 Err(error) => {
                     tracing::warn!(%error, "could not refresh slow usage sources");
-                    view.data.pending = false;
-                    view.data.refreshing = false;
-                    cx.notify();
+                    if view.data.window.same_window(&window) {
+                        if let Some(summary) = view.data.summary.clone() {
+                            view.data.remember(&window, summary);
+                        }
+                        view.data.pending = false;
+                        view.data.refreshing = false;
+                        cx.notify();
+                    }
                 }
             });
         }));
@@ -316,7 +321,10 @@ impl UsageView {
         match reply {
             Ok(summary) => {
                 let summary = Arc::new(summary);
-                self.data.remember(window, summary.clone());
+                // Provisional / still-refreshing summaries emit without populating the 60s settled cache.
+                if !settling {
+                    self.data.remember(window, summary.clone());
+                }
                 self.data.summary = Some(summary);
                 self.data.error = None;
             }

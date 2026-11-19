@@ -196,7 +196,7 @@ pub fn swipe_indicator(
         .rounded_full()
         .bg(bg)
         .text_color(fg)
-        .opacity(if indicator.tracking { 1.0 } else { 0.0 })
+        .opacity(indicator.opacity)
         .child(icon.sized(px(16.)).opacity(if armed { 1.0 } else { 0.4 }));
     div()
         .absolute()

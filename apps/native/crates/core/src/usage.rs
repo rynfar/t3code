@@ -805,6 +805,7 @@ pub mod price_overrides {
     ) -> (Vec<UsagePriceChange>, BTreeMap<String, String>) {
         let mut changes = Vec::new();
         let mut errors = BTreeMap::new();
+        let mut seen_models = BTreeSet::new();
         for draft in drafts {
             if draft.is_empty() {
                 continue;
@@ -819,6 +820,10 @@ pub mod price_overrides {
                 if current_alias.is_some() {
                     changes.push(UsagePriceChange::Alias { model: model.to_owned(), alias: None });
                 }
+                continue;
+            }
+            if !model.is_empty() && !seen_models.insert(model.to_owned()) {
+                errors.insert(draft.id.clone(), format!("{model} is already listed on {label}."));
                 continue;
             }
             let alias = draft.alias.trim();
@@ -994,11 +999,16 @@ pub mod price_overrides {
                 alias: String::new(),
                 removed: true,
             };
-            let (changes, errs) = usage_price_table_changes("Local", &current, &[add, remove]);
+            let (changes, errs) = usage_price_table_changes("Local", &current, &[add.clone(), remove]);
             assert!(errs.is_empty());
             let payload = usage_price_patch_payload(&changes).expect("patch payload");
             assert_eq!(payload["patch"]["usagePriceOverrides"]["old-model"], Value::Null);
             assert_eq!(payload["patch"]["usagePriceOverrides"]["custom-model"]["inputCostPerMillionTokens"], 3.5);
+
+            // Duplicate non-removed model IDs across rows are rejected.
+            let dup = UsagePriceRowDraft { id: "4".into(), ..add.clone() };
+            let (_, errs) = usage_price_table_changes("Local", &current, &[add, dup]);
+            assert_eq!(errs.get("4").map(String::as_str), Some("custom-model is already listed on Local."));
         }
     }
 }

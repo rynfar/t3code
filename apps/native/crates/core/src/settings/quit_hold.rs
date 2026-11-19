@@ -226,6 +226,7 @@ pub mod swipe {
         pub progress: f32,
         pub y: f32,
         pub tracking: bool,
+        pub opacity: f32,
     }
 
     impl SwipeIndicator {
@@ -314,6 +315,14 @@ pub mod swipe {
             }
         }
 
+        pub fn set_indicator_opacity(&mut self, opacity: f32) {
+            if let Some(indicator) = &mut self.indicator
+                && !indicator.tracking
+            {
+                indicator.opacity = opacity.clamp(0.0, 1.0);
+            }
+        }
+
         pub fn reset(&mut self) {
             self.gesture = None;
             self.indicator = None;
@@ -340,9 +349,10 @@ pub mod swipe {
         }
 
         pub fn on_scroll_begin(&mut self) {
-            if matches!(self.gesture, Some(Gesture::Ignored)) {
-                self.gesture = None;
+            if matches!(self.gesture, Some(Gesture::Tracking { .. })) {
+                self.hide_indicator();
             }
+            self.gesture = None;
         }
 
         pub fn on_scroll_end(&mut self) -> SwipeAction {
@@ -351,7 +361,9 @@ pub mod swipe {
             } else {
                 SwipeAction::None
             };
-            self.gesture = None;
+            // Stay `Ignored` until the next `SwipePhase::Started` so post-lift AppKit momentum
+            // events (`NSEventPhaseNone` -> `TouchPhase::Moved`) cannot start a new gesture.
+            self.gesture = Some(Gesture::Ignored);
             action
         }
 
@@ -473,6 +485,7 @@ pub mod swipe {
                     progress: (*distance / SWIPE_TRIGGER_DISTANCE).min(1.0),
                     y: *y,
                     tracking: true,
+                    opacity: 1.0,
                 });
             }
             self.gesture = Some(next_gesture);
@@ -555,6 +568,41 @@ pub mod swipe {
             // Trailing momentum events after release do not navigate again.
             assert_eq!(swipe.on_wheel(wheel(-8.0, 0.0, SwipePhase::Moved), |_| true), SwipeAction::None);
             assert_eq!(swipe.on_wheel(wheel(0.0, 0.0, SwipePhase::Ended), |_| true), SwipeAction::None);
+        }
+
+        #[test]
+        fn post_lift_momentum_after_ended_never_starts_new_swipe_until_next_started() {
+            // Case 1: Triggered swipe followed by AppKit momentum (`Moved` after `Ended`).
+            let mut swipe = HistorySwipe::default();
+            swipe.on_wheel(wheel(-20.0, 0.0, SwipePhase::Started), |_| true);
+            swipe.on_wheel(wheel(-110.0, 0.0, SwipePhase::Moved), |_| true);
+            assert_eq!(
+                swipe.on_wheel(wheel(0.0, 0.0, SwipePhase::Ended), |_| true),
+                SwipeAction::Navigate(HistoryDirection::Back)
+            );
+            // Post-lift momentum events arrive with `TouchPhase::Moved` and must not start a new swipe.
+            for d in [45.0_f32, 38.0, 32.0, 27.0, 23.0, 0.0] {
+                assert_eq!(swipe.on_wheel(wheel(-d, 0.0, SwipePhase::Moved), |_| true), SwipeAction::None);
+            }
+            assert!(!swipe.indicator().is_some_and(|i| i.tracking));
+
+            // Case 2: Aborted flick (< 120px) followed by strong momentum must not navigate.
+            let mut swipe = HistorySwipe::default();
+            swipe.on_wheel(wheel(-20.0, 0.0, SwipePhase::Started), |_| true);
+            swipe.on_wheel(wheel(-40.0, 0.0, SwipePhase::Moved), |_| true);
+            assert_eq!(swipe.on_wheel(wheel(0.0, 0.0, SwipePhase::Ended), |_| true), SwipeAction::None);
+            for d in [60.0_f32, 50.0, 42.0, 35.0, 29.0, 0.0] {
+                assert_eq!(swipe.on_wheel(wheel(-d, 0.0, SwipePhase::Moved), |_| true), SwipeAction::None);
+            }
+            assert!(!swipe.indicator().is_some_and(|i| i.tracking));
+
+            // Case 3: A fresh finger-down `SwipePhase::Started` re-arms swipes cleanly.
+            swipe.on_wheel(wheel(-20.0, 0.0, SwipePhase::Started), |_| true);
+            swipe.on_wheel(wheel(-110.0, 0.0, SwipePhase::Moved), |_| true);
+            assert_eq!(
+                swipe.on_wheel(wheel(0.0, 0.0, SwipePhase::Ended), |_| true),
+                SwipeAction::Navigate(HistoryDirection::Back)
+            );
         }
     }
 }

@@ -594,7 +594,13 @@ impl Render for Workspace {
                                 )
                                 .child(self.details.clone()),
                         )
-                        .child(div().track_focus(&self.area_focus.terminal).w_full().child(self.terminal.clone()))
+                        .child(
+                            div()
+                                .track_focus(&self.area_focus.terminal)
+                                .w_full()
+                                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                                .child(self.terminal.clone()),
+                        )
                     })
                     .when(has_draft, |this| {
                         this.child(
@@ -606,7 +612,13 @@ impl Render for Workspace {
                                 .child(div().track_focus(&self.area_focus.composer).flex_1().min_h_0().child(self.draft.clone()))
                                 .child(self.details.clone()),
                         )
-                        .child(div().track_focus(&self.area_focus.terminal).w_full().child(self.terminal.clone()))
+                        .child(
+                            div()
+                                .track_focus(&self.area_focus.terminal)
+                                .w_full()
+                                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                                .child(self.terminal.clone()),
+                        )
                     })
                     .when(!has_thread && !has_draft, |this| {
                         this.child(div().track_focus(&self.area_focus.home).flex_1().min_h_0().child(self.home.clone()))
@@ -1145,11 +1157,22 @@ impl Workspace {
             self.state.update(cx, |state, cx| state.navigate_history(dir.is_back(), cx));
         }
         let after = self.history_swipe.indicator();
-        if after.is_some_and(|i| !i.tracking) {
+        if after.is_some_and(|i| !i.tracking) && self._swipe_clear.is_none() {
             self._swipe_clear = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_millis(200)).await;
+                for opacity in [0.75_f32, 0.5, 0.25, 0.0] {
+                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                    let keep_going = this.update(cx, |ws, cx| {
+                        ws.history_swipe.set_indicator_opacity(opacity);
+                        cx.notify();
+                        ws.history_swipe.indicator().is_some_and(|i| !i.tracking)
+                    });
+                    if !matches!(keep_going, Ok(true)) {
+                        return;
+                    }
+                }
                 let _ = this.update(cx, |ws, cx| {
                     ws.history_swipe.clear_indicator();
+                    ws._swipe_clear = None;
                     cx.notify();
                 });
             }));

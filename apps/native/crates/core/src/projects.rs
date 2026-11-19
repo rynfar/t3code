@@ -470,7 +470,38 @@ pub fn is_unsupported_windows_project_path(raw: &str, platform: &str) -> bool {
     !matches!(platform, "win32" | "windows") && (is_windows_drive(raw) || raw.starts_with("\\\\"))
 }
 
-/// `resolveAddProjectPath`.
+struct AbsolutePathParts {
+    root: String,
+    separator: char,
+    segments: Vec<String>,
+}
+
+fn split_absolute_path(value: &str) -> Option<AbsolutePathParts> {
+    if is_windows_drive(value) {
+        let root = format!("{}\\", &value[..2]);
+        let rest = value[2..].trim_start_matches(['/', '\\']);
+        let segments = rest.split(['/', '\\']).filter(|s| !s.is_empty()).map(str::to_owned).collect();
+        return Some(AbsolutePathParts { root, separator: '\\', segments });
+    }
+    if value.starts_with("\\\\") {
+        let parts: Vec<&str> = value.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+        let (Some(server), Some(share)) = (parts.first(), parts.get(1)) else {
+            return None;
+        };
+        return Some(AbsolutePathParts {
+            root: format!("\\\\{server}\\{share}\\"),
+            separator: '\\',
+            segments: parts[2..].iter().map(|s| (*s).to_owned()).collect(),
+        });
+    }
+    if let Some(rest) = value.strip_prefix('/') {
+        let segments = rest.split('/').filter(|s| !s.is_empty()).map(str::to_owned).collect();
+        return Some(AbsolutePathParts { root: "/".to_owned(), separator: '/', segments });
+    }
+    None
+}
+
+/// `resolveAddProjectPath` / `resolveProjectPathForDispatch` (`packages/client-runtime/src/state/projects.ts`).
 pub fn resolve_add_project_path(raw_path: &str, current_project_cwd: Option<&str>, platform: &str) -> Result<String, &'static str> {
     let raw = raw_path.trim();
     if raw.is_empty() {
@@ -485,14 +516,28 @@ pub fn resolve_add_project_path(raw_path: &str, current_project_cwd: Option<&str
     if is_explicit_relative_project_path(raw)
         && let Some(cwd) = current_project_cwd
     {
-        let sep = preferred_separator(cwd);
-        let base = cwd.trim_end_matches(['/', '\\']);
-        let joined = if raw == "." {
-            base.to_owned()
-        } else {
-            format!("{base}{sep}{raw}")
-        };
-        return Ok(add_target(&joined));
+        let normalized_cwd = add_target(cwd);
+        if let Some(base) = split_absolute_path(&normalized_cwd) {
+            let mut next_segments = base.segments;
+            for segment in raw.split(['/', '\\']) {
+                if segment.is_empty() || segment == "." {
+                    continue;
+                }
+                if segment == ".." {
+                    next_segments.pop();
+                    continue;
+                }
+                next_segments.push(segment.to_owned());
+            }
+            let sep = base.separator.to_string();
+            let joined = next_segments.join(&sep);
+            let combined = if joined.is_empty() {
+                base.root
+            } else {
+                format!("{}{joined}", base.root)
+            };
+            return Ok(add_target(&combined));
+        }
     }
     let resolved = add_target(raw);
     if resolved.is_empty() {
@@ -815,7 +860,12 @@ mod tests {
             resolve_add_project_path("./sub", None, "darwin"),
             Err("Relative paths require an active project in this environment.")
         );
-        assert_eq!(resolve_add_project_path("./sub", Some("/work/app"), "darwin"), Ok("/work/app/./sub".into()));
+        assert_eq!(resolve_add_project_path("./sub", Some("/work/app"), "darwin"), Ok("/work/app/sub".into()));
+        assert_eq!(resolve_add_project_path("../sibling", Some("/work/app"), "darwin"), Ok("/work/sibling".into()));
+        assert_eq!(resolve_add_project_path("./", Some("/work/app"), "darwin"), Ok("/work/app".into()));
+        assert_eq!(resolve_add_project_path("..", Some("/work/app"), "darwin"), Ok("/work".into()));
+        assert_eq!(resolve_add_project_path("./sub", Some("/"), "darwin"), Ok("/sub".into()));
+        assert_eq!(resolve_add_project_path("..\\sibling", Some("C:\\work\\app"), "win32"), Ok("C:\\work\\sibling".into()));
         let browse: BrowseResult = serde_json::from_value(json!({
             "parentPath": "~/code/github.com/pingdotgg",
             "entries": [],
