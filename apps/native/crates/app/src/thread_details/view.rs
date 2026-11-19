@@ -252,6 +252,12 @@ fn items_menu(menu: gpui_component::menu::PopupMenu, details: &Entity<Details>, 
 
 impl Render for DetailsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(doc) = crate::settings::store::try_client(cx).cloned()
+            && (doc.entries().contains_key("threadDetailsItems")
+                || doc.entries().contains_key("threadDetailsUsageEnabled"))
+        {
+            self.details.update(cx, |details, cx| details.sync_from_client_settings(&doc, false, cx));
+        }
         let layout = layout(&self.state, window, cx);
         self.details.update(cx, |details, _| details.set_presentation(layout.presentation));
         let popover = layout.presentation == Presentation::Popover;

@@ -380,3 +380,189 @@ fn language_proactive_panels_and_screen_reader_settings_match_contract_defaults(
     assert!(!invalid.screen_reader_window_title());
     assert_eq!(invalid.entries()["future"], 9);
 }
+
+#[test]
+fn appearance_interface_settings_round_trip_clamp_and_reset() {
+    let mut doc = ClientSettingsDoc::default();
+    assert_eq!(doc.effort_display(), EffortDisplay::Label);
+    assert_eq!(doc.panel_animation_duration_ms(), DEFAULT_PANEL_ANIMATION_DURATION_MS);
+    assert_eq!(doc.environment_identification_mode(), EnvironmentIdentificationMode::Artwork);
+    assert!(!doc.persist_composer_context_strip());
+    assert!(doc.thread_details_is_default());
+    assert_eq!(doc.thread_details_enabled_count(), 10);
+    assert!(doc.thread_details_item_visible("environment"));
+    assert!(!doc.thread_details_item_visible("usage"));
+    assert!(!doc.thread_details_item_visible("context"));
+
+    // Effort display
+    assert!(!doc.apply_change(&ClientSettingChange::EffortDisplay(EffortDisplay::Bars)).is_empty());
+    assert!(doc.apply_change(&ClientSettingChange::EffortDisplay(EffortDisplay::Bars)).is_empty());
+    assert_eq!(doc.effort_display(), EffortDisplay::Bars);
+    assert_eq!(doc.entries()["effortDisplay"], serde_json::json!("bars"));
+
+    // Panel animation duration clamps to 0..=400
+    assert!(!doc.apply_change(&ClientSettingChange::PanelAnimationDurationMs(999)).is_empty());
+    assert_eq!(doc.panel_animation_duration_ms(), MAX_PANEL_ANIMATION_DURATION_MS);
+    assert!(!doc.apply_change(&ClientSettingChange::PanelAnimationDurationMs(175)).is_empty());
+    assert_eq!(doc.panel_animation_duration_ms(), 175);
+
+    // Environment identification mode
+    for (mode, wire) in [
+        (EnvironmentIdentificationMode::NightlyArtwork, "nightly-artwork"),
+        (EnvironmentIdentificationMode::DevArtwork, "dev-artwork"),
+        (EnvironmentIdentificationMode::Pill, "pill"),
+        (EnvironmentIdentificationMode::None, "none"),
+        (EnvironmentIdentificationMode::Artwork, "artwork"),
+    ] {
+        assert!(!doc.apply_change(&ClientSettingChange::EnvironmentIdentificationMode(mode)).is_empty());
+        assert_eq!(doc.environment_identification_mode(), mode);
+        assert_eq!(doc.entries()["environmentIdentificationMode"], serde_json::json!(wire));
+    }
+
+    // Persist composer context strip
+    assert!(!doc.apply_change(&ClientSettingChange::PersistComposerContextStrip(true)).is_empty());
+    assert!(doc.persist_composer_context_strip());
+    assert_eq!(doc.entries()["persistComposerContextStrip"], serde_json::json!(true));
+
+    // Round-trip through JSON
+    let reread = ClientSettingsDoc::from_json(&doc.to_json());
+    assert_eq!(reread.effort_display(), EffortDisplay::Bars);
+    assert_eq!(reread.panel_animation_duration_ms(), 175);
+    assert_eq!(reread.environment_identification_mode(), EnvironmentIdentificationMode::Artwork);
+    assert!(reread.persist_composer_context_strip());
+
+    // Invalid / out-of-range values fall back per-key without dropping unknown fields
+    let invalid = ClientSettingsDoc::from_json(
+        r#"{"effortDisplay":"emoji","panelAnimationDurationMs":500,"environmentIdentificationMode":"badge","persistComposerContextStrip":"yes","threadDetailsItems":{"servers":"nope","usage":true,"futureItem":false},"future":11}"#,
+    );
+    assert_eq!(invalid.effort_display(), EffortDisplay::Label);
+    assert_eq!(invalid.panel_animation_duration_ms(), 0);
+    assert_eq!(invalid.environment_identification_mode(), EnvironmentIdentificationMode::Artwork);
+    assert!(!invalid.persist_composer_context_strip());
+    assert!(invalid.thread_details_item_visible("servers"));
+    assert!(invalid.thread_details_item_visible("usage"));
+    assert_eq!(invalid.entries()["future"], 11);
+}
+
+#[test]
+fn thread_details_items_are_sparse_preserve_unknown_keys_and_reset_clears_legacy_usage() {
+    // Legacy Labs toggle makes Usage & Context visible by default and marks visibility non-default.
+    let mut doc = ClientSettingsDoc::from_json(
+        r#"{"threadDetailsUsageEnabled":true,"threadDetailsItems":{"futureItem":true}}"#,
+    );
+    assert!(doc.thread_details_item_visible("usage"));
+    assert!(doc.thread_details_item_visible("context"));
+    assert!(!doc.thread_details_is_default());
+    assert_eq!(doc.thread_details_enabled_count(), 12);
+
+    // Hiding a default-visible item records only that override and keeps unknown ids.
+    let patch = doc.apply_change(&ClientSettingChange::ThreadDetailsItem {
+        id: "servers".into(),
+        visible: false,
+    });
+    assert_eq!(
+        patch["threadDetailsItems"],
+        serde_json::json!({"servers": false, "futureItem": true})
+    );
+    assert!(!doc.thread_details_item_visible("servers"));
+    assert_eq!(doc.thread_details_enabled_count(), 11);
+
+    // Restoring it back to default drops the key from the sparse map.
+    let patch = doc.apply_change(&ClientSettingChange::ThreadDetailsItem {
+        id: "servers".into(),
+        visible: true,
+    });
+    assert_eq!(patch["threadDetailsItems"], serde_json::json!({"futureItem": true}));
+
+    // Reset clears both overrides and the retired Labs flag, and is idempotent on repeat.
+    let reset = doc.apply_change(&ClientSettingChange::ResetThreadDetailsItems);
+    assert_eq!(reset["threadDetailsItems"], serde_json::json!({}));
+    assert_eq!(reset["threadDetailsUsageEnabled"], serde_json::json!(false));
+    assert!(doc.thread_details_is_default());
+    assert!(!doc.thread_details_item_visible("usage"));
+    assert!(!doc.thread_details_item_visible("context"));
+    assert_eq!(doc.thread_details_enabled_count(), 10);
+    assert!(doc.apply_change(&ClientSettingChange::ResetThreadDetailsItems).is_empty());
+}
+
+#[test]
+fn environment_identification_and_composer_context_helpers_match_web() {
+    assert!(is_nightly_server_version("0.1.7-nightly.20261102.4061"));
+    assert!(is_nightly_server_version("0.1.7-preview.20261102.1"));
+    assert!(!is_nightly_server_version("0.1.7"));
+    assert!(!is_nightly_server_version("0.1.7-nightly.202611.1"));
+
+    assert_eq!(
+        resolve_server_backed_stage_label(Some("0.1.7-nightly.20261102.4061"), "Latest"),
+        "Nightly"
+    );
+    assert_eq!(resolve_server_backed_stage_label(Some("0.1.7"), "Dev"), "Dev");
+    assert_eq!(resolve_server_backed_stage_label(None, "Latest"), "Latest");
+
+    assert_eq!(
+        resolve_sidebar_stage_backdrop_variant("Dev", EnvironmentIdentificationMode::Artwork),
+        Some(StageBackdropVariant::Dev)
+    );
+    assert_eq!(
+        resolve_sidebar_stage_backdrop_variant("Nightly", EnvironmentIdentificationMode::Artwork),
+        Some(StageBackdropVariant::Nightly)
+    );
+    assert_eq!(
+        resolve_sidebar_stage_backdrop_variant("Latest", EnvironmentIdentificationMode::Artwork),
+        None
+    );
+    assert_eq!(
+        resolve_sidebar_stage_backdrop_variant("Latest", EnvironmentIdentificationMode::NightlyArtwork),
+        Some(StageBackdropVariant::Nightly)
+    );
+    assert_eq!(
+        resolve_sidebar_stage_backdrop_variant("Latest", EnvironmentIdentificationMode::DevArtwork),
+        Some(StageBackdropVariant::Dev)
+    );
+    assert_eq!(
+        resolve_sidebar_stage_backdrop_variant("Dev", EnvironmentIdentificationMode::Pill),
+        None
+    );
+    assert_eq!(resolve_environment_identification_pill_label("Dev"), Some("Dev"));
+    assert_eq!(resolve_environment_identification_pill_label("Nightly"), Some("Nightly"));
+    assert_eq!(resolve_environment_identification_pill_label("Latest"), None);
+
+    // Custom/environment palette theme forces artwork modes to pill, leaving pill & none intact.
+    assert_eq!(
+        resolve_effective_environment_identification_mode(
+            EnvironmentIdentificationMode::Artwork,
+            true,
+            false
+        ),
+        EnvironmentIdentificationMode::Pill
+    );
+    assert_eq!(
+        resolve_effective_environment_identification_mode(
+            EnvironmentIdentificationMode::Artwork,
+            true,
+            true
+        ),
+        EnvironmentIdentificationMode::Artwork
+    );
+    assert_eq!(
+        resolve_effective_environment_identification_mode(
+            EnvironmentIdentificationMode::None,
+            true,
+            false
+        ),
+        EnvironmentIdentificationMode::None
+    );
+
+    assert_eq!(environment_identification_options(Some(StageBackdropVariant::Dev)).len(), 4);
+    assert_eq!(environment_identification_options(Some(StageBackdropVariant::Nightly)).len(), 4);
+    assert_eq!(environment_identification_options(None).len(), 3);
+    assert_eq!(environment_identification_options(None)[0], (EnvironmentIdentificationMode::Artwork, "None"));
+
+    // Composer context strip visibility matches BranchToolbar.logic.ts.
+    assert!(should_show_composer_context_strip(true, false, true, false, false));
+    assert!(!should_show_composer_context_strip(false, false, true, true, true));
+    assert!(should_show_composer_context_strip(false, true, true, true, false));
+    assert!(should_show_composer_context_strip(false, true, true, false, true));
+    assert!(!should_show_composer_context_strip(false, true, true, false, false));
+    assert!(!should_show_composer_context_strip(true, true, false, true, true));
+}

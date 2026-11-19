@@ -142,6 +142,95 @@ const CHECKOUT_RETRY_MIN: Duration = Duration::from_secs(2);
 const CHECKOUT_RETRY_MAX: Duration = Duration::from_secs(30);
 const SUBSCRIBE_VCS_BRANCH: &str = "subscribeVcsBranch";
 
+/// Primary environment server version (`primaryServerConfigAtom` in `SidebarStageBackdrop.tsx`).
+/// Prefers the local/primary environment's live or saved version over an active remote environment;
+/// falls back to the active server config only when no local/primary environment is configured.
+pub(crate) fn primary_server_version(app: &AppState) -> Option<&str> {
+    let primary = app.local_saved_environment().or_else(|| {
+        let mut local = app.environments.environments.iter().filter(|env| env.local);
+        let first = local.next()?;
+        local.next().is_none().then_some(first)
+    });
+    if let Some(primary) = primary {
+        let active_is_primary = app.environments.active.as_deref() == Some(primary.id.as_str());
+        if active_is_primary
+            && let Some(version) = app
+                .server_config
+                .config
+                .as_ref()
+                .map(|c| c.environment.server_version.as_str())
+                .filter(|v| !v.is_empty())
+        {
+            return Some(version);
+        }
+        return app
+            .scoped_environment(&primary.id)
+            .and_then(|entry| entry.config.config.as_ref())
+            .map(|c| c.environment.server_version.as_str())
+            .filter(|v| !v.is_empty())
+            .or_else(|| primary.server_version.as_deref().filter(|v| !v.is_empty()))
+            .or_else(|| {
+                app.connect
+                    .local_server
+                    .as_ref()
+                    .and_then(|server| server.server_version())
+                    .filter(|v| !v.is_empty())
+            });
+    }
+    app.connect
+        .local_server
+        .as_ref()
+        .and_then(|server| server.server_version())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            app.server_config
+                .config
+                .as_ref()
+                .map(|c| c.environment.server_version.as_str())
+                .filter(|v| !v.is_empty())
+        })
+}
+
+pub(crate) fn environment_stage_label(app: &AppState) -> &'static str {
+    let fallback = if cfg!(debug_assertions) { "Dev" } else { "Latest" };
+    t3_core::client_settings::resolve_server_backed_stage_label(primary_server_version(app), fallback)
+}
+
+pub(crate) fn effective_environment_identification_mode(
+    cx: &gpui::App,
+) -> t3_core::client_settings::EnvironmentIdentificationMode {
+    use gpui_component::ActiveTheme as _;
+    let Some(doc) = crate::settings::store::try_client(cx) else {
+        return t3_core::client_settings::EnvironmentIdentificationMode::None;
+    };
+    let dark = cx.theme().is_dark();
+    let active_theme = t3_core::themes::half_theme(
+        &doc.theme(),
+        &t3_core::themes::halves(doc),
+        dark,
+        &crate::theme::preferences(cx).custom,
+        crate::theme::environment_themes(cx),
+    );
+    let palette_theme_active = active_theme.is_some();
+    let palette_theme_allows_artwork =
+        active_theme.is_some_and(|theme| t3_core::themes::builtins().iter().any(|b| b.id == theme.id));
+    t3_core::client_settings::resolve_effective_environment_identification_mode(
+        doc.environment_identification_mode(),
+        palette_theme_active,
+        palette_theme_allows_artwork,
+    )
+}
+
+pub(crate) fn active_stage_backdrop_variant(
+    app: &AppState,
+    cx: &gpui::App,
+) -> Option<t3_core::client_settings::StageBackdropVariant> {
+    t3_core::client_settings::resolve_sidebar_stage_backdrop_variant(
+        environment_stage_label(app),
+        effective_environment_identification_mode(cx),
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct CheckoutRepoKey {
     scope_env_id: Option<String>,
@@ -983,22 +1072,144 @@ impl SidebarPane {
         self.activate_search_result(key, window, cx);
     }
 
-    /// `SidebarChromeHeader`: the brand (a link home) and the history buttons, in the 52px drag
-    /// strip after the window controls and the sidebar toggle.
+    /// `SidebarChromeHeader`: the brand (a link home), history buttons, and environment
+    /// identification artwork or version pill (`SidebarChrome.tsx`, `SidebarStageBackdrop.tsx`)
+    /// in the 52px drag strip after the window controls and the sidebar toggle.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use t3_core::client_settings::{
+            EnvironmentIdentificationMode, StageBackdropVariant,
+            resolve_environment_identification_pill_label,
+            resolve_sidebar_stage_backdrop_variant,
+        };
+
         let p = palette(cx);
         let state = self.state.clone();
+        let stage_label = environment_stage_label(self.state.read(cx));
+        let effective_mode = effective_environment_identification_mode(cx);
+        let backdrop_variant = resolve_sidebar_stage_backdrop_variant(stage_label, effective_mode);
+        let pill_label = (effective_mode == EnvironmentIdentificationMode::Pill)
+            .then(|| resolve_environment_identification_pill_label(stage_label))
+            .flatten();
+        let backdrop = backdrop_variant.map(|variant| {
+            let (top_color, mid_color, line_color) = match variant {
+                StageBackdropVariant::Dev => (
+                    hsla(p.info).opacity(0.24),
+                    hsla(p.primary).opacity(0.12),
+                    hsla(p.info).opacity(0.22),
+                ),
+                StageBackdropVariant::Nightly => (
+                    hsla(p.primary).opacity(0.26),
+                    hsla(p.accent).opacity(0.16),
+                    hsla(p.foreground).opacity(0.35),
+                ),
+            };
+            div()
+                .id("sidebar-stage-backdrop")
+                .debug_selector(move || format!("sidebar-stage-backdrop-{}", variant.as_str()))
+                .absolute()
+                .inset_0()
+                .overflow_hidden()
+                .bg(gpui::linear_gradient(
+                    180.,
+                    gpui::linear_color_stop(top_color, 0.),
+                    gpui::linear_color_stop(mid_color.opacity(0.), 1.),
+                ))
+                .child(
+                    gpui::canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            match variant {
+                                StageBackdropVariant::Dev => {
+                                    // Subtle blueprint grid lines (`DevBlueprintArt`).
+                                    let step = 16.0_f32;
+                                    let width = f32::from(bounds.size.width);
+                                    let height = f32::from(bounds.size.height);
+                                    let mut x = step;
+                                    while x < width {
+                                        window.paint_quad(gpui::fill(
+                                            gpui::Bounds::new(
+                                                gpui::point(bounds.origin.x + px(x), bounds.origin.y),
+                                                gpui::size(px(1.), bounds.size.height),
+                                            ),
+                                            line_color,
+                                        ));
+                                        x += step;
+                                    }
+                                    let mut y = step;
+                                    while y < height {
+                                        window.paint_quad(gpui::fill(
+                                            gpui::Bounds::new(
+                                                gpui::point(bounds.origin.x, bounds.origin.y + px(y)),
+                                                gpui::size(bounds.size.width, px(1.)),
+                                            ),
+                                            line_color,
+                                        ));
+                                        y += step;
+                                    }
+                                }
+                                StageBackdropVariant::Nightly => {
+                                    // Subtle night-sky stars (`NightlySkyArt`).
+                                    const STARS: [(f32, f32, f32); 10] = [
+                                        (18., 10., 1.5),
+                                        (52., 22., 1.0),
+                                        (84., 8., 1.5),
+                                        (118., 18., 1.0),
+                                        (148., 12., 1.5),
+                                        (182., 26., 1.0),
+                                        (212., 9., 1.5),
+                                        (244., 20., 1.0),
+                                        (276., 13., 1.5),
+                                        (68., 34., 1.0),
+                                    ];
+                                    for (sx, sy, sz) in STARS {
+                                        if sx < f32::from(bounds.size.width) && sy < f32::from(bounds.size.height) {
+                                            window.paint_quad(gpui::fill(
+                                                gpui::Bounds::new(
+                                                    gpui::point(bounds.origin.x + px(sx), bounds.origin.y + px(sy)),
+                                                    gpui::size(px(sz), px(sz)),
+                                                ),
+                                                line_color,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    .size_full(),
+                )
+        });
+        let pill = pill_label.map(|label| {
+            div()
+                .id("environment-identification-pill")
+                .debug_selector(move || format!("environment-identification-pill-{}", label.to_lowercase()))
+                .h(px(20.))
+                .px(px(6.))
+                .flex()
+                .flex_none()
+                .items_center()
+                .rounded(px(6.))
+                .bg(hsla(p.secondary))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(hsla(p.secondary_foreground))
+                .child(label)
+        });
         div()
+            .relative()
             .h(px(TITLEBAR_HEIGHT))
             .flex_none()
+            .overflow_hidden()
             .flex()
             .items_center()
             .pl(px(130.))
             .pr(px(12.))
             .gap(px(8.))
             .window_control_area(gpui::WindowControlArea::Drag)
+            .children(backdrop)
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_none()
                     .items_center()
@@ -1023,7 +1234,8 @@ impl SidebarPane {
                             )
                             .on_click(move |_, _, cx| state.update(cx, |state, cx| state.go_home(cx))),
                     )
-                    .child(div().flex().items_center().child(self.render_history_button(true, cx)).child(self.render_history_button(false, cx))),
+                    .child(div().flex().items_center().child(self.render_history_button(true, cx)).child(self.render_history_button(false, cx)))
+                    .children(pill),
             )
     }
 

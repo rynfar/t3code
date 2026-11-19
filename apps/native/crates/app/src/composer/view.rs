@@ -15,7 +15,10 @@ use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_la
 use t3_core::requests;
 use t3_core::traits;
 
-use super::controls::{Button, ButtonSize, ButtonVariant, ComposerControl, Float, Pill, RoundButton, RoundKind, floating, menu_surface};
+use super::controls::{
+    Button, ButtonSize, ButtonVariant, ComposerControl, EffortBars, Float, Pill, RoundButton, RoundKind, floating, menu_surface,
+    resolve_effort_glyph,
+};
 use super::model_picker::permissions_section;
 use super::{Composer, MenuKey, OpenPermissions, OutdentList, PasteAsText, Resolved, StashPrompt, StopPhase, Target, ToggleModelPicker, runtime_mode_icon};
 use crate::icons::Icon;
@@ -93,14 +96,39 @@ impl Composer {
             resolved.model_label.clone()
         };
         let suffix_color = if self.picker_open { hsla(p.foreground) } else { hsla(p.muted_foreground) };
+        let effort_display = crate::settings::store::try_client(cx)
+            .map_or(t3_core::client_settings::EffortDisplay::Label, t3_core::client_settings::ClientSettingsDoc::effort_display);
+        let effort_glyph = traits::layout(&resolved.driver, &resolved.descriptors)
+            .effort
+            .and_then(|descriptor| match descriptor {
+                t3_core::server_config::OptionDescriptor::Select(select) => {
+                    let current = traits::select_value(select);
+                    resolve_effort_glyph(select, current.as_deref())
+                }
+                t3_core::server_config::OptionDescriptor::Boolean(_) => None,
+            });
+        let (effort_word, effort_bars) = match (&effort_glyph, effort_display) {
+            (Some(glyph), t3_core::client_settings::EffortDisplay::Bars) if glyph.special.is_none() => {
+                (None, Some((glyph.count, glyph.filled)))
+            }
+            (Some(glyph), _) => (Some(glyph.special.clone().unwrap_or_else(|| glyph.label.clone())), None),
+            (None, _) => (suffix.word.clone(), None),
+        };
         let suffix = h_flex()
             .gap(px(6.))
             .text_color(suffix_color)
             .when(!multi, |this| {
-                this.children(suffix.word.map(|word| div().max_w(px(96.)).truncate().child(word)))
-                    .when(suffix.fast || suffix.ultrafast, |this| this.child(Icon::ZapFill.render(px(12.), suffix_color)))
-                    .when(suffix.ultracode, |this| this.child(Icon::Workflow.render(px(12.), suffix_color)))
-                    .children(suffix.context_window.map(|window| div().max_w(px(96.)).truncate().text_xs().child(window)))
+                this.children(effort_word.map(|word| {
+                    div()
+                        .debug_selector(|| "composer-effort-word".to_owned())
+                        .max_w(px(96.))
+                        .truncate()
+                        .child(word)
+                }))
+                .children(effort_bars.map(|(count, filled)| EffortBars::new(count, filled, suffix_color)))
+                .when(suffix.fast || suffix.ultrafast, |this| this.child(Icon::ZapFill.render(px(12.), suffix_color)))
+                .when(suffix.ultracode, |this| this.child(Icon::Workflow.render(px(12.), suffix_color)))
+                .children(suffix.context_window.map(|window| div().max_w(px(96.)).truncate().text_xs().child(window)))
             });
         let tooltip_label = resolved.multi_model_tooltip.as_deref().unwrap_or(&label);
         let tooltip = [Some(tooltip_label.to_owned()), Some("⌘⇧M".to_owned())].into_iter().flatten().collect::<Vec<_>>().join(" · ");
@@ -179,6 +207,109 @@ impl Composer {
                 ))
             })
             .into_any_element()
+    }
+
+    /// Renders the locked branch/worktree/environment strip below the composer for an active
+    /// thread when `persistComposerContextStrip` is enabled (`BranchToolbar.logic.ts`
+    /// `shouldShowComposerContextStrip` + `ChatView.tsx:1791-1799`).
+    fn render_active_thread_context_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.fixed.is_some() {
+            return None;
+        }
+        let Target::Thread(thread_id) = self.snapshot.target.as_ref()? else {
+            return None;
+        };
+        let persist = crate::settings::store::try_client(cx)
+            .is_some_and(t3_core::client_settings::ClientSettingsDoc::persist_composer_context_strip);
+        let state = self.state.read(cx);
+        let thread = state.thread_shell(thread_id)?;
+        let project = state.shell.project(&thread.project_id)?;
+        let is_scratch = state.is_scratch_project(&thread.project_id);
+        let git_status = crate::thread_details::details(cx)
+            .and_then(|details| details.read(cx).git.read(cx).status.clone());
+        let is_git_repo = !is_scratch
+            && git_status
+                .as_ref()
+                .map_or(thread.branch.is_some() || thread.worktree_path.is_some(), |s| s.local.is_repo);
+        let host = self.host_options(cx);
+        let primary_id = state.local_saved_environment().map(|env| env.id.as_str()).or_else(|| {
+            let mut local = state.environments.environments.iter().filter(|env| env.local);
+            let first = local.next()?;
+            local.next().is_none().then_some(first.id.as_str())
+        });
+        let active_is_primary = host.active.as_ref().is_some_and(|active| {
+            primary_id == Some(active.saved_id.as_str())
+                || state.environments.environments.iter().any(|e| e.id == active.saved_id && e.local)
+        });
+        let show_env_indicator = host.can_pick || (host.active.is_some() && !active_is_primary);
+        if !t3_core::client_settings::should_show_composer_context_strip(
+            false,
+            persist,
+            true,
+            is_git_repo,
+            show_env_indicator,
+        ) {
+            return None;
+        }
+        let p = palette(cx);
+        let env_chip = show_env_indicator.then_some(host.active.as_ref()).flatten().map(|active| {
+            let icon = crate::new_thread::environment_machine_icon(state, &active.saved_id);
+            ComposerControl::new("composer-active-environment")
+                .icon(icon)
+                .label(active.label.clone())
+                .max_label_width(160.)
+                .tooltip(active.label.clone())
+        });
+        let workspace_path = thread
+            .worktree_path
+            .as_deref()
+            .unwrap_or(&project.workspace_root)
+            .to_owned();
+        let workspace_chip = is_git_repo.then(|| {
+            let label = match thread.worktree_path.as_deref() {
+                Some(path) => path
+                    .split(['/', '\\'])
+                    .rfind(|part| !part.is_empty())
+                    .unwrap_or("Worktree")
+                    .to_owned(),
+                None => "Local checkout".to_owned(),
+            };
+            let icon = if thread.worktree_path.is_some() { Icon::FolderGit } else { Icon::Folder };
+            let copy_path = workspace_path.clone();
+            ComposerControl::new("composer-active-workspace")
+                .icon(icon)
+                .label(label)
+                .max_label_width(200.)
+                .tooltip(format!("{workspace_path} · Click to copy path"))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_path.clone()));
+                })
+        });
+        let branch_label = git_status
+            .as_ref()
+            .and_then(|status| status.local.ref_name.clone())
+            .or_else(|| thread.branch.clone());
+        let branch_chip = is_git_repo
+            .then_some(branch_label)
+            .flatten()
+            .filter(|b| !b.is_empty())
+            .map(|branch| {
+                ComposerControl::new("composer-active-branch")
+                    .icon(Icon::GitBranch)
+                    .label(branch.clone())
+                    .max_label_width(224.)
+                    .tooltip(branch)
+            });
+        Some(
+            h_flex()
+                .min_w_0()
+                .gap(px(4.))
+                .text_color(hsla(p.muted_foreground))
+                .children(env_chip)
+                .children(workspace_chip)
+                .children(branch_chip)
+                .into_any_element(),
+        )
     }
 
     fn render_primary(&self, resolved: &Resolved, cx: &mut Context<Self>) -> AnyElement {
@@ -266,10 +397,12 @@ impl Composer {
         if (can_interrupt || stop_retained) && !has_text && !editing_queued && !voice_blocks {
             return with_voice(stop_button().into_any_element());
         }
+        let stage_backdrop = crate::sidebar::active_stage_backdrop_variant(self.state.read(cx), cx);
         let show_resume = self.snapshot.can_resume && !has_text && !editing_queued && !voice_blocks;
         if show_resume {
             let resume_btn = RoundButton::new("send", RoundKind::Resume, "Resume thread")
                 .disabled(self.sending || !can_operate || rewinding)
+                .stage_backdrop(stage_backdrop)
                 .on_click(cx.listener(|this, _, window, cx| {
                     if this.stop_phase != StopPhase::Landed {
                         this.resume(window, cx);
@@ -335,6 +468,7 @@ impl Composer {
         let submit_btn = div().flex_none().debug_selector(|| "send".to_owned()).child(
             RoundButton::new("send", kind, tooltip)
                 .disabled(disabled)
+                .stage_backdrop(stage_backdrop)
                 .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                     if this.stop_phase == StopPhase::Landed {
                         return;
@@ -673,18 +807,26 @@ impl Render for Composer {
                         ),
                     ),
                 )
-                .children(self.render_workspace(cx).map(|control| {
-                    h_flex()
-                        .id("composer-context-strip")
-                        .relative()
-                        .block_mouse_except_scroll()
-                        .w_full()
-                        .pt(px(8.))
-                        .px(px(8.))
-                        .rounded_b(px(10.))
-                        .child(crate::glass::page_backdrop(10., cx))
-                        .child(div().relative().min_w_0().w_full().child(control))
-                }))
+                .children(
+                    if matches!(self.snapshot.target, Some(Target::Draft(_))) {
+                        self.render_workspace(cx)
+                    } else {
+                        self.render_active_thread_context_strip(cx)
+                    }
+                    .map(|control| {
+                            h_flex()
+                                .id("composer-context-strip")
+                                .debug_selector(|| "composer-context-strip".to_owned())
+                                .relative()
+                                .block_mouse_except_scroll()
+                                .w_full()
+                                .pt(px(8.))
+                                .px(px(8.))
+                                .rounded_b(px(10.))
+                                .child(crate::glass::page_backdrop(10., cx))
+                                .child(div().relative().min_w_0().w_full().child(control))
+                        }),
+                )
                 .when(matches!(self.snapshot.target, Some(Target::Draft(_))), |this| {
                     this.children(self.render_usage_limits_banner(true, cx).map(render_draft_usage_limits_overlay))
                 }),

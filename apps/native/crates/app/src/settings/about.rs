@@ -430,6 +430,36 @@ impl SettingsView {
                 .control(store_buttons)
                 .into_any_element(),
         );
+        // The Welcome page sets up this computer, so it targets the local/primary environment
+        // (`SettingsPanels.tsx:2292-2293` `usePrimaryEnvironmentId`).
+        let welcome_env = {
+            let app = self.state.read(cx);
+            app.local_saved_environment()
+                .or_else(|| {
+                    let mut local = app.environments.environments.iter().filter(|env| env.local);
+                    let first = local.next()?;
+                    local.next().is_none().then_some(first)
+                })
+                .map(|env| env.id.clone())
+        };
+        if let Some(env_id) = welcome_env {
+            app_rows.push(
+                Row::new("welcome-page", "Welcome page")
+                    .description("See your agents, import projects, and set up your phone.")
+                    .highlighted(self.is_target("welcome-page"))
+                    .control(
+                        div().debug_selector(|| "about-welcome-open".to_owned()).child(
+                            Button::new("about-welcome-open", ButtonVariant::Outline, ButtonSize::Sm)
+                                .label("Open")
+                                .on_click(move |_, window, cx| {
+                                    super::close(window, cx);
+                                    crate::onboarding::resume(env_id.clone(), cx);
+                                }),
+                        ),
+                    )
+                    .into_any_element(),
+            );
+        }
         let app = section("App", app_rows, cx);
 
         let privacy_description = match telemetry_off_message(policy.as_ref()) {
@@ -462,7 +492,7 @@ impl SettingsView {
         );
 
         vec![
-            Block::new(&["about", "app-version", "mobile-app"], app),
+            Block::new(&["about", "app-version", "mobile-app", "welcome-page"], app),
             Block::new(&["legal", "privacy-policy", "open-source-licenses"], legal),
         ]
     }
@@ -763,6 +793,107 @@ mod tests {
         state.update(&mut vcx, |state, _| state.stop_pump());
         drop(vcx);
         drop(fixture);
-        drop(runtime);
+        runtime.shutdown_background();
+    }
+
+    #[gpui::test]
+    fn about_welcome_page_row_reopens_welcome_and_hides_without_environment(cx: &mut gpui::TestAppContext) {
+        struct AboutWithWelcome {
+            wizard: Entity<crate::onboarding::WelcomeWizard>,
+        }
+        impl Render for AboutWithWelcome {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .relative()
+                    .size_full()
+                    .child(self.wizard.clone())
+                    .children(crate::settings::overlay(window, cx))
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.executor().allow_parking();
+        let (state, fixture) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::onboarding::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            // Mark onboarding already completed so Welcome stays closed until triggered from About.
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::OnboardingCompletedAt("2026-11-19T00:00:00Z".into()),
+                cx,
+            );
+        });
+        // Ensure a local primary environment exists alongside a secondary remote environment.
+        state.update(cx, |state, _| {
+            if let Some(env) = state.environments.environments.first_mut() {
+                env.local = true;
+            }
+            let mut remote = state.environments.environments[0].clone();
+            remote.id = "remote-box".into();
+            remote.local = false;
+            remote.label = "Remote Box".into();
+            state.environments.environments.push(remote);
+        });
+        let window = cx.add_window(|window, cx| {
+            let wizard = cx.new(|cx| crate::onboarding::WelcomeWizard::new(state.clone(), window, cx));
+            AboutWithWelcome { wizard }
+        });
+        let wizard = window.read_with(cx, |root, _| root.wizard.clone()).unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // With a local primary environment, the Welcome page row renders and "Open" closes Settings and opens Welcome.
+        vcx.update(|_, cx| crate::settings::open_setting("welcome-page", cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(!wizard.read_with(&vcx, |w, _| w.is_open()));
+        let open_center = vcx.debug_bounds("about-welcome-open").expect("Welcome page Open button").center();
+        vcx.simulate_click(open_center, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.read(|cx| cx.global::<crate::settings::Host>().view.is_none()),
+            "opening Welcome page from About closes Settings"
+        );
+        assert!(
+            wizard.read_with(&vcx, |w, _| w.is_open()),
+            "clicking Open on About -> Welcome page reopens WelcomeWizard"
+        );
+
+        // Remote-only setup (active environment is non-local and no local environment exists):
+        // Welcome page row must hide (`SettingsPanels.tsx:2292-2293`).
+        state.update(&mut vcx, |state, cx| {
+            for env in &mut state.environments.environments {
+                env.local = false;
+            }
+            state.connect.local_server = None;
+            cx.emit(crate::app_state::AppEvent::Phase);
+        });
+        vcx.update(|_, cx| crate::settings::open(Section::About, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("about-welcome-open").is_none(),
+            "Welcome page row must hide on remote-only setups without a local primary environment"
+        );
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        runtime.shutdown_background();
     }
 }
