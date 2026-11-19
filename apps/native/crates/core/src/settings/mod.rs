@@ -18,6 +18,7 @@ pub mod scheduled_tasks;
 pub mod secrets;
 pub mod snooze;
 pub mod source_control;
+pub mod voice;
 pub mod worktrees;
 
 use serde::de::DeserializeOwned;
@@ -128,6 +129,15 @@ pub fn text_generation_model_selection(settings: &ServerSettings) -> Option<Mode
     settings.provider_panel.text_generation_model_selection.clone().and_then(|value| serde_json::from_value(value).ok())
 }
 
+/// Reads the saved `speechPostProcessingModelSelection` from the provider panel's raw value.
+pub fn speech_post_processing_model_selection(settings: &ServerSettings) -> Option<ModelSelection> {
+    settings
+        .provider_panel
+        .speech_post_processing_model_selection
+        .clone()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 /// One `ServerSettingsPatch` entry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerSettingChange {
@@ -145,6 +155,8 @@ pub enum ServerSettingChange {
     AddProjectBaseDirectory(String),
     GhqCloneLayout(bool),
     TextGenerationModelSelection(Option<ModelSelection>),
+    SpeechPostProcessingModelSelection(Option<ModelSelection>),
+    SpeechProjectCustomWords(Vec<crate::voice_input::SpeechCustomWordEntry>),
     ThreadTitleInstructions(String),
     ResponseStreamingMode(ResponseStreamingMode),
     GuestSharingEnabled(bool),
@@ -181,6 +193,8 @@ impl ServerSettingChange {
             ServerSettingChange::AddProjectBaseDirectory(_) => "addProjectBaseDirectory",
             ServerSettingChange::GhqCloneLayout(_) => "ghqCloneLayout",
             ServerSettingChange::TextGenerationModelSelection(_) => "textGenerationModelSelection",
+            ServerSettingChange::SpeechPostProcessingModelSelection(_) => "speechPostProcessingModelSelection",
+            ServerSettingChange::SpeechProjectCustomWords(_) => "speechProjectCustomWords",
             ServerSettingChange::ThreadTitleInstructions(_) => "threadTitleInstructions",
             ServerSettingChange::ResponseStreamingMode(_) => "responseStreamingMode",
             ServerSettingChange::GuestSharingEnabled(_) => "guestSharingEnabled",
@@ -199,9 +213,11 @@ impl ServerSettingChange {
         match self {
             ServerSettingChange::DefaultModelSelection(selection)
             | ServerSettingChange::FallbackModelSelection(selection)
-            | ServerSettingChange::TextGenerationModelSelection(selection) => {
+            | ServerSettingChange::TextGenerationModelSelection(selection)
+            | ServerSettingChange::SpeechPostProcessingModelSelection(selection) => {
                 json!(selection)
             }
+            ServerSettingChange::SpeechProjectCustomWords(words) => json!(words),
             ServerSettingChange::AgentBrowserAccess(on) => json!(on),
             ServerSettingChange::DefaultRuntimeMode(mode) => json!(mode),
             ServerSettingChange::DefaultThreadEnvMode(mode) => json!(mode),
@@ -503,6 +519,763 @@ pub fn format_license_bundles(bundles: &[String]) -> String {
         .join(", ")
 }
 
+/// One selectable model row for a text-generation picker (`Threads` / `Voice` cleanup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextGenerationOption {
+    pub instance_id: String,
+    pub group_label: String,
+    pub model_slug: String,
+    pub model_label: String,
+    pub is_text_generator: bool,
+}
+
+/// Resolves all text-generation model options:
+/// - Excludes providers with `supportsTextGeneration === false` and models with
+///   `supportsTextGeneration === false`.
+/// - Drops provider instances shadowed by a `textGenerators` entry with the same id.
+/// - Appends enabled `textGenerators` using their fetched models (plus any currently selected
+///   model slugs so an already-selected model stays visible while the list loads).
+pub fn text_generation_options(
+    config: &crate::server_config::ServerConfig,
+    project_id: Option<&str>,
+    generator_models: &std::collections::HashMap<String, Vec<providers::text_generators::TextGeneratorModel>>,
+    selected_models: &[Option<&ModelSelection>],
+) -> Vec<TextGenerationOption> {
+    let generators = providers::text_generators::decode_text_generators(&config.settings.text_generators);
+    let mut out = Vec::new();
+    for entry in crate::providers::entries(config, project_id) {
+        if !entry.enabled || !entry.provider.is_available() || !entry.provider.supports_text_generation() {
+            continue;
+        }
+        if generators.contains_key(entry.instance_id()) {
+            continue;
+        }
+        for model in crate::providers::model_options(&config.settings, entry.provider) {
+            if !model.supports_text_generation() {
+                continue;
+            }
+            out.push(TextGenerationOption {
+                instance_id: entry.instance_id().to_owned(),
+                group_label: entry.display_name.clone(),
+                model_slug: model.slug.clone(),
+                model_label: crate::providers::model_name(model).to_owned(),
+                is_text_generator: false,
+            });
+        }
+    }
+
+    for (id, gen_cfg) in &generators {
+        if !gen_cfg.enabled {
+            continue;
+        }
+        let group_label = gen_cfg.display_name();
+        let discovered = generator_models.get(id).map(Vec::as_slice).unwrap_or(&[]);
+        let mut seen = std::collections::HashSet::new();
+        for model in discovered {
+            if seen.insert(model.id.clone()) {
+                out.push(TextGenerationOption {
+                    instance_id: id.clone(),
+                    group_label: group_label.clone(),
+                    model_slug: model.id.clone(),
+                    model_label: if model.name.trim().is_empty() { model.id.clone() } else { model.name.clone() },
+                    is_text_generator: true,
+                });
+            }
+        }
+        for sel in selected_models.iter().flatten() {
+            if sel.instance_id == *id && !sel.model.is_empty() && seen.insert(sel.model.clone()) {
+                out.push(TextGenerationOption {
+                    instance_id: id.clone(),
+                    group_label: group_label.clone(),
+                    model_slug: sel.model.clone(),
+                    model_label: sel.model.clone(),
+                    is_text_generator: true,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Resolves whether `selection` is currently enabled for text generation (either an enabled,
+/// text-gen-capable provider instance not shadowed by a text generator, or an enabled text
+/// generator).
+pub fn is_text_generation_selection_valid(
+    config: &crate::server_config::ServerConfig,
+    project_id: Option<&str>,
+    selection: &ModelSelection,
+) -> bool {
+    let generators = providers::text_generators::decode_text_generators(&config.settings.text_generators);
+    if let Some(gen_cfg) = generators.get(&selection.instance_id) {
+        return gen_cfg.enabled;
+    }
+    config
+        .provider(&selection.instance_id)
+        .filter(|provider| {
+            provider.is_available()
+                && provider.supports_text_generation()
+                && crate::providers::instance_enabled(&config.settings, project_id, &provider.instance_id)
+        })
+        .is_some_and(|provider| {
+            provider
+                .models
+                .iter()
+                .find(|model| model.slug == selection.model)
+                .is_none_or(|model| model.supports_text_generation())
+        })
+}
+
+/// Resolves the best fallback text-generation selection when none is explicitly saved or the
+/// saved one is disabled/unsupported.
+pub fn resolve_default_text_generation_selection(
+    config: &crate::server_config::ServerConfig,
+    project_id: Option<&str>,
+    generator_models: &std::collections::HashMap<String, Vec<providers::text_generators::TextGeneratorModel>>,
+) -> Option<ModelSelection> {
+    if let Some(saved) = text_generation_model_selection(&config.settings)
+        && is_text_generation_selection_valid(config, project_id, &saved)
+    {
+        return Some(saved);
+    }
+    if let Some(default) = config.settings.default_model_selection.as_ref()
+        && is_text_generation_selection_valid(config, project_id, default)
+    {
+        return Some(default.clone());
+    }
+    let options = text_generation_options(config, project_id, generator_models, &[]);
+    options.first().map(|opt| ModelSelection {
+        instance_id: opt.instance_id.clone(),
+        model: opt.model_slug.clone(),
+        options: None,
+    })
+}
+
+/// Display label for a text-generation selection across both providers and text generators.
+pub fn text_generation_selection_label(
+    config: &crate::server_config::ServerConfig,
+    selection: &ModelSelection,
+    generator_models: &std::collections::HashMap<String, Vec<providers::text_generators::TextGeneratorModel>>,
+) -> String {
+    let generators = providers::text_generators::decode_text_generators(&config.settings.text_generators);
+    if generators.contains_key(&selection.instance_id) {
+        if let Some(model) = generator_models
+            .get(&selection.instance_id)
+            .and_then(|models| models.iter().find(|m| m.id == selection.model))
+            && !model.name.trim().is_empty()
+        {
+            return model.name.clone();
+        }
+        return selection.model.clone();
+    }
+    config
+        .provider(&selection.instance_id)
+        .and_then(|provider| provider.models.iter().find(|model| model.slug == selection.model))
+        .map(|model| crate::providers::trigger_model_name(model).to_owned())
+        .unwrap_or_else(|| selection.model.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Settings scope axis & scoped model availability (`SettingsScopeSentence.tsx`,
+// `settingsScopeAxis.ts`, `useScopedModelAvailability.ts`)
+// ---------------------------------------------------------------------------
+
+pub const ALL_ENVIRONMENTS_VALUE: &str = "all";
+pub const ALL_PROJECTS_VALUE: &str = "all";
+pub const ALL_CHECKOUTS_VALUE: &str = "all";
+
+/// `SETTINGS_DEVICE_ONLY_PATHS` (`SettingsScopeSentence.tsx`).
+pub fn is_device_only_section(section: search::Section) -> bool {
+    matches!(
+        section,
+        search::Section::General
+            | search::Section::Appearance
+            | search::Section::Chat
+            | search::Section::Diffs
+            | search::Section::SnapShot
+            | search::Section::Connections
+            | search::Section::Access
+            | search::Section::About
+    )
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsScopeSearch {
+    pub project: Option<String>,
+    pub machine: Option<String>,
+    pub checkout: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedScopeKind {
+    All,
+    Environment,
+    Project,
+    Checkout,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeEnvironment {
+    pub environment_id: String,
+    pub label: String,
+    pub display_url: String,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeCheckout {
+    pub environment_id: String,
+    pub physical_project_key: String,
+    pub workspace_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeProjectGroup {
+    pub project_key: String,
+    pub display_name: String,
+    pub workspace_root: String,
+    pub archived: bool,
+    pub members: Vec<ScopeCheckout>,
+}
+
+pub fn settings_scope_environment_address(env: &ScopeEnvironment) -> String {
+    if env.display_url.is_empty() {
+        return env.environment_id.clone();
+    }
+    url::Url::parse(&env.display_url)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?;
+            Some(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_owned(),
+            })
+        })
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| env.display_url.clone())
+}
+
+pub fn settings_scope_environment_labels(
+    env: &ScopeEnvironment,
+    all: &[ScopeEnvironment],
+) -> (String, String) {
+    let duplicates: Vec<&ScopeEnvironment> = all
+        .iter()
+        .filter(|other| other.environment_id != env.environment_id && other.label == env.label)
+        .collect();
+    if duplicates.is_empty() {
+        return (env.label.clone(), String::new());
+    }
+    let address = settings_scope_environment_address(env);
+    let secondary = if duplicates.iter().any(|other| settings_scope_environment_address(other) == address) {
+        if !env.display_url.is_empty() { env.display_url.clone() } else { env.environment_id.clone() }
+    } else {
+        address
+    };
+    (env.label.clone(), secondary)
+}
+
+pub fn settings_scope_environment_label(env: &ScopeEnvironment, all: &[ScopeEnvironment]) -> String {
+    let (primary, secondary) = settings_scope_environment_labels(env, all);
+    if secondary.is_empty() { primary } else { format!("{primary} \u{00b7} {secondary}") }
+}
+
+pub fn select_environment_axis(search: &SettingsScopeSearch, value: &str) -> SettingsScopeSearch {
+    SettingsScopeSearch {
+        project: search.project.clone(),
+        machine: (value != ALL_ENVIRONMENTS_VALUE).then(|| value.to_owned()),
+        checkout: None,
+    }
+}
+
+pub fn select_project_axis(search: &SettingsScopeSearch, value: &str) -> SettingsScopeSearch {
+    SettingsScopeSearch {
+        project: (value != ALL_PROJECTS_VALUE).then(|| value.to_owned()),
+        machine: search.machine.clone(),
+        checkout: None,
+    }
+}
+
+pub fn select_checkout_axis(search: &SettingsScopeSearch, checkout: Option<&ScopeCheckout>) -> SettingsScopeSearch {
+    match checkout {
+        Some(member) => SettingsScopeSearch {
+            project: search.project.clone(),
+            machine: Some(member.environment_id.clone()),
+            checkout: Some(member.physical_project_key.clone()),
+        },
+        None => SettingsScopeSearch {
+            project: search.project.clone(),
+            machine: search.machine.clone(),
+            checkout: None,
+        },
+    }
+}
+
+pub fn project_scope_menu_groups<'a>(
+    groups: &'a [ScopeProjectGroup],
+    machine: Option<&str>,
+) -> Vec<&'a ScopeProjectGroup> {
+    match machine {
+        None => groups.iter().collect(),
+        Some(env_id) => groups
+            .iter()
+            .filter(|group| group.members.iter().any(|member| member.environment_id == env_id))
+            .collect(),
+    }
+}
+
+pub fn settings_scope_checkout_choices<'a>(
+    group: &'a ScopeProjectGroup,
+    search: &SettingsScopeSearch,
+) -> Vec<&'a ScopeCheckout> {
+    let selected_env = search.checkout.as_deref().and_then(|key| {
+        group
+            .members
+            .iter()
+            .find(|m| m.physical_project_key == key)
+            .map(|m| m.environment_id.as_str())
+    });
+    let env_id = search.machine.as_deref().or(selected_env);
+    let members: Vec<&ScopeCheckout> = match env_id {
+        None => group.members.iter().collect(),
+        Some(id) => group.members.iter().filter(|m| m.environment_id == id).collect(),
+    };
+    if members.len() > 1
+        && members.iter().all(|m| m.environment_id == members[0].environment_id)
+    {
+        members
+    } else {
+        Vec::new()
+    }
+}
+
+fn path_basename(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+}
+
+pub fn settings_scope_checkout_label(checkout: &ScopeCheckout, all: &[&ScopeCheckout]) -> String {
+    let name = path_basename(&checkout.workspace_root);
+    let count = all.iter().filter(|other| path_basename(&other.workspace_root) == name).count();
+    if count > 1 { checkout.workspace_root.clone() } else { name.to_owned() }
+}
+
+/// Checks whether `(instance_id, model)` is available across every target environment in scope
+/// (`useScopedModelDisabledReason` in `useScopedModelAvailability.ts`).
+pub fn scoped_model_disabled_reason(
+    shown_settings: &ServerSettings,
+    shown_driver: Option<&str>,
+    targets: &[(&str, &crate::server_config::ServerConfig, Option<&str>)],
+    instance_id: &str,
+    model: &str,
+    text_generation: bool,
+) -> Option<String> {
+    let shown_generators = providers::text_generators::decode_text_generators(&shown_settings.text_generators);
+    let shown_gen = shown_generators.get(instance_id);
+    for (env_label, config, project_id) in targets {
+        let unavailable = format!(
+            "This model is unavailable on {env_label}. Select that environment to choose its model separately."
+        );
+        let candidate_generators =
+            providers::text_generators::decode_text_generators(&config.settings.text_generators);
+        let candidate_gen = candidate_generators.get(instance_id);
+        if shown_gen.is_some() || candidate_gen.is_some() {
+            let matches = match (shown_gen, candidate_gen) {
+                (Some(s), Some(c)) => c.enabled && c.kind == s.kind && c.base_url == s.base_url,
+                _ => false,
+            };
+            if !matches {
+                return Some(unavailable);
+            }
+            continue;
+        }
+        let entry = crate::providers::entries(config, *project_id)
+            .into_iter()
+            .find(|entry| entry.instance_id() == instance_id);
+        let Some(entry) = entry else {
+            return Some(unavailable);
+        };
+        if !entry.enabled || !entry.provider.is_available() {
+            return Some(unavailable);
+        }
+        if let Some(driver) = shown_driver
+            && entry.driver() != driver
+        {
+            return Some(unavailable);
+        }
+        if text_generation && !entry.provider.supports_text_generation() {
+            return Some(unavailable);
+        }
+        let has_model = crate::providers::model_options(&config.settings, entry.provider)
+            .into_iter()
+            .any(|candidate| {
+                candidate.slug == model && (!text_generation || candidate.supports_text_generation())
+            });
+        if !has_model {
+            return Some(unavailable);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// ST-ENVS: Linked environments, Load balancing, Pull request sharing
+// (`LinkedEnvironmentsSettings.tsx`, `LoadBalancingSettings.tsx`,
+// `PullRequestRoutingSettings.tsx`, `peerLinks.ts`, `pullRequestRoutingPermissions.ts`)
+// ---------------------------------------------------------------------------
+
+pub const PEER_LINKS_LIST_METHOD: &str = "peerLinks.list";
+pub const PEER_LINKS_LINK_METHOD: &str = "peerLinks.link";
+pub const PEER_LINKS_UNLINK_METHOD: &str = "peerLinks.unlink";
+pub const PEER_LINK_EXPIRY_WARNING_DAYS: i64 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerLinkStatus {
+    Reachable,
+    Unreachable,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerLinkSummary {
+    pub environment_id: String,
+    pub label: String,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    pub access: String,
+    #[serde(default)]
+    pub linked_at: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub last_reached_at: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    pub status: PeerLinkStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerLinkHealth {
+    Reachable { expires_in_days: Option<i64> },
+    Unreachable { detail: Option<String> },
+    Failing { detail: String },
+    Expired,
+}
+
+/// `peerLinkHealth` (`packages/client-runtime/src/state/peerLinks.ts`).
+pub fn peer_link_health(link: &PeerLinkSummary, now_ms: i64) -> PeerLinkHealth {
+    let expires_ms = crate::sidebar::time::parse_iso(&link.expires_at);
+    if link.status == PeerLinkStatus::Expired || expires_ms.is_some_and(|exp| exp <= now_ms) {
+        return PeerLinkHealth::Expired;
+    }
+    if link.status == PeerLinkStatus::Unreachable {
+        return PeerLinkHealth::Unreachable { detail: link.last_error.clone() };
+    }
+    if let Some(detail) = link.last_error.clone() {
+        return PeerLinkHealth::Failing { detail };
+    }
+    let expires_in_days = expires_ms.and_then(|exp| {
+        let diff_ms = exp.saturating_sub(now_ms);
+        let day_ms: i64 = 86_400_000;
+        let days = (diff_ms + day_ms - 1) / day_ms;
+        (days <= PEER_LINK_EXPIRY_WARNING_DAYS).then_some(days.max(1))
+    });
+    PeerLinkHealth::Reachable { expires_in_days }
+}
+
+pub fn peer_link_status_text(health: &PeerLinkHealth) -> String {
+    match health {
+        PeerLinkHealth::Expired => "Expired. Link it again with a new pairing code.".to_owned(),
+        PeerLinkHealth::Unreachable { detail } => {
+            detail.clone().unwrap_or_else(|| "Not answering right now.".to_owned())
+        }
+        PeerLinkHealth::Failing { detail } => detail.clone(),
+        PeerLinkHealth::Reachable { expires_in_days: Some(days) } => {
+            let unit = if *days == 1 { "day" } else { "days" };
+            format!("Expires in {days} {unit}. Link it again to renew.")
+        }
+        PeerLinkHealth::Reachable { expires_in_days: None } => "Reachable".to_owned(),
+    }
+}
+
+/// `mcpClientScopes` (`packages/contracts/src/auth.ts`).
+pub fn mcp_client_scopes(access: &str) -> Vec<&'static str> {
+    match access {
+        "read-only" => vec![crate::auth::ORCHESTRATION_READ_SCOPE],
+        "full-access" => vec![
+            crate::auth::ORCHESTRATION_READ_SCOPE,
+            crate::auth::ORCHESTRATION_OPERATE_SCOPE,
+            "settings:write",
+            "source-control:write",
+        ],
+        _ => vec![crate::auth::ORCHESTRATION_READ_SCOPE, crate::auth::ORCHESTRATION_OPERATE_SCOPE],
+    }
+}
+
+pub fn peer_link_create_payload(
+    url: &str,
+    alternate_urls: &[String],
+    pairing_code: &str,
+    access: &str,
+    expected_environment_id: Option<&str>,
+    expected_label: Option<&str>,
+) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("url".to_owned(), json!(url.trim()));
+    if !alternate_urls.is_empty() {
+        obj.insert("alternateUrls".to_owned(), json!(alternate_urls));
+    }
+    obj.insert("pairingCode".to_owned(), json!(pairing_code.trim()));
+    obj.insert("access".to_owned(), json!(access));
+    if let Some(id) = expected_environment_id {
+        obj.insert("expectedEnvironmentId".to_owned(), json!(id));
+    }
+    if let Some(label) = expected_label.filter(|l| !l.trim().is_empty()) {
+        obj.insert("expectedLabel".to_owned(), json!(label.trim()));
+    }
+    Value::Object(obj)
+}
+
+pub fn peer_link_unlink_payload(environment_id: &str) -> Value {
+    json!({ "environmentId": environment_id })
+}
+
+/// `LoadPreference` (`LoadBalancingSettings.tsx`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LoadPreference {
+    Prefer = 100,
+    #[default]
+    Normal = 50,
+    LessOften = 25,
+    ManualOnly = 0,
+}
+
+impl LoadPreference {
+    pub const ALL: &'static [Self] = &[Self::Prefer, Self::Normal, Self::LessOften, Self::ManualOnly];
+
+    pub const fn weight(self) -> u32 {
+        self as u32
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefer => "100",
+            Self::Normal => "50",
+            Self::LessOften => "25",
+            Self::ManualOnly => "0",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "100" => Some(Self::Prefer),
+            "50" => Some(Self::Normal),
+            "25" => Some(Self::LessOften),
+            "0" => Some(Self::ManualOnly),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Prefer => "Prefer",
+            Self::Normal => "Normal",
+            Self::LessOften => "Less often",
+            Self::ManualOnly => "Manual only",
+        }
+    }
+}
+
+pub fn load_preference_for_weight(weight: Option<u32>) -> LoadPreference {
+    match weight {
+        None | Some(50) => LoadPreference::Normal,
+        Some(0) => LoadPreference::ManualOnly,
+        Some(w) if w < 50 => LoadPreference::LessOften,
+        Some(_) => LoadPreference::Prefer,
+    }
+}
+
+pub fn summarize_load_preferences(
+    environments: &[(&str, &str)],
+    weights: &std::collections::BTreeMap<String, u32>,
+) -> Option<String> {
+    let parts: Vec<String> = environments
+        .iter()
+        .filter_map(|(id, label)| {
+            let pref = load_preference_for_weight(weights.get(*id).copied());
+            (pref != LoadPreference::Normal).then(|| format!("{label} {}", pref.label().to_lowercase()))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" \u{00b7} "))
+}
+
+pub fn read_load_balancing_enabled(doc: &crate::client_settings::ClientSettingsDoc) -> bool {
+    doc.entries().get("loadBalancingEnabled").and_then(Value::as_bool).unwrap_or(false)
+}
+
+pub fn read_load_balancing_weights(
+    doc: &crate::client_settings::ClientSettingsDoc,
+) -> std::collections::BTreeMap<String, u32> {
+    doc.entries()
+        .get("loadBalancingWeights")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_u64().and_then(|n| u32::try_from(n).ok()).map(|w| (k.clone(), w)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn load_balancing_enabled_patch(enabled: bool) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("loadBalancingEnabled".to_owned(), Value::Bool(enabled));
+    map
+}
+
+pub fn load_balancing_weight_patch(
+    current: &std::collections::BTreeMap<String, u32>,
+    environment_id: &str,
+    preference: LoadPreference,
+) -> serde_json::Map<String, Value> {
+    let mut next = current.clone();
+    next.insert(environment_id.to_owned(), preference.weight());
+    let mut map = serde_json::Map::new();
+    map.insert("loadBalancingWeights".to_owned(), json!(next));
+    map
+}
+
+/// `PullRequestRoutingPermission` (`pullRequestRoutingPermissions.ts`, `PullRequestRoutingSettings.tsx`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullRequestRoutingPermission {
+    #[default]
+    Off,
+    Read,
+    ReadWrite,
+}
+
+impl PullRequestRoutingPermission {
+    pub const ALL: &'static [Self] = &[Self::Off, Self::Read, Self::ReadWrite];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Read => "read",
+            Self::ReadWrite => "read-write",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "read" => Some(Self::Read),
+            "read-write" => Some(Self::ReadWrite),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Read => "Read PRs",
+            Self::ReadWrite => "Read and act",
+        }
+    }
+
+    pub const fn summary_label(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Read => Some("read PRs"),
+            Self::ReadWrite => Some("read and act"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredPullRequestRoutingPermission {
+    pub environment_id: String,
+    pub connection_key: String,
+    pub permission: PullRequestRoutingPermission,
+}
+
+/// Derives a trust-bound connection key from saved endpoint details so changing a server's
+/// URL or SSH target automatically revokes trust (`pullRequestRoutingConnectionKey`).
+pub fn pull_request_routing_connection_key(
+    environment_id: &str,
+    http_base: &str,
+    ssh_target: Option<(&str, &str, Option<&str>, Option<u16>)>,
+) -> Option<String> {
+    if let Some((alias, hostname, username, port)) = ssh_target {
+        return Some(json!(["SshConnectionTarget", environment_id, alias, hostname, username, port]).to_string());
+    }
+    let parsed = url::Url::parse(http_base.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let normalized = parsed.as_str().trim_end_matches('/');
+    Some(json!(["BearerConnectionTarget", environment_id, normalized]).to_string())
+}
+
+pub fn pull_request_routing_permission_for(
+    connection_key: Option<&str>,
+    permissions: &[StoredPullRequestRoutingPermission],
+) -> PullRequestRoutingPermission {
+    let Some(key) = connection_key else {
+        return PullRequestRoutingPermission::Off;
+    };
+    permissions
+        .iter()
+        .find(|entry| entry.connection_key == key)
+        .map(|entry| entry.permission)
+        .unwrap_or(PullRequestRoutingPermission::Off)
+}
+
+pub fn set_pull_request_routing_permission(
+    permissions: &[StoredPullRequestRoutingPermission],
+    environment_id: &str,
+    connection_key: &str,
+    permission: PullRequestRoutingPermission,
+) -> Vec<StoredPullRequestRoutingPermission> {
+    let mut next: Vec<StoredPullRequestRoutingPermission> = permissions
+        .iter()
+        .filter(|entry| entry.environment_id != environment_id)
+        .cloned()
+        .collect();
+    if permission != PullRequestRoutingPermission::Off {
+        next.push(StoredPullRequestRoutingPermission {
+            environment_id: environment_id.to_owned(),
+            connection_key: connection_key.to_owned(),
+            permission,
+        });
+    }
+    next
+}
+
+pub fn summarize_pull_request_routing(
+    entries: &[(&str, PullRequestRoutingPermission)],
+) -> Option<String> {
+    let mut groups = Vec::new();
+    for permission in [PullRequestRoutingPermission::ReadWrite, PullRequestRoutingPermission::Read] {
+        let labels: Vec<&str> = entries
+            .iter()
+            .filter_map(|(label, perm)| (*perm == permission).then_some(*label))
+            .collect();
+        if !labels.is_empty()
+            && let Some(suffix) = permission.summary_label()
+        {
+            groups.push(format!("{} {suffix}", labels.join(", ")));
+        }
+    }
+    (!groups.is_empty()).then(|| groups.join(" \u{00b7} "))
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -642,5 +1415,176 @@ mod panel_tests {
             }]
         });
         assert!(decode_third_party_license_manifest(&bad_url).is_err());
+    }
+
+    #[test]
+    fn text_generation_options_filter_supports_text_generation_and_include_generators() {
+        let config: crate::server_config::ServerConfig = serde_json::from_value(json!({
+            "providers": [
+                {
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "displayName": "Codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "models": [
+                        { "slug": "gpt-5", "name": "GPT-5" },
+                        { "slug": "gpt-no-text", "name": "No Text", "supportsTextGeneration": false }
+                    ]
+                },
+                {
+                    "instanceId": "fx",
+                    "driver": "fx",
+                    "displayName": "fx",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready",
+                    "supportsTextGeneration": false,
+                    "models": [{ "slug": "fx-1", "name": "fx 1" }]
+                }
+            ],
+            "settings": {
+                "providerInstances": {
+                    "codex": { "driver": "codex", "enabled": true },
+                    "fx": { "driver": "fx", "enabled": true }
+                },
+                "textGenerators": {
+                    "openrouter": {
+                        "kind": "openaiCompatible",
+                        "baseUrl": "https://openrouter.ai/api/v1",
+                        "apiKey": "__REDACTED__",
+                        "enabled": true
+                    },
+                    "disabled-gen": {
+                        "kind": "anthropic",
+                        "baseUrl": "https://api.anthropic.com/v1",
+                        "apiKey": "",
+                        "enabled": false
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let mut gen_models = std::collections::HashMap::new();
+        gen_models.insert(
+            "openrouter".to_owned(),
+            vec![providers::text_generators::TextGeneratorModel {
+                id: "anthropic/claude-haiku".into(),
+                name: "Claude Haiku".into(),
+            }],
+        );
+        let sel = ModelSelection {
+            instance_id: "openrouter".into(),
+            model: "anthropic/claude-haiku".into(),
+            options: None,
+        };
+        let options = text_generation_options(&config, None, &gen_models, &[Some(&sel)]);
+        let slugs: Vec<(&str, &str)> = options
+            .iter()
+            .map(|o| (o.instance_id.as_str(), o.model_slug.as_str()))
+            .collect();
+        assert_eq!(slugs, vec![("codex", "gpt-5"), ("openrouter", "anthropic/claude-haiku")]);
+        assert_eq!(text_generation_selection_label(&config, &sel, &gen_models), "Claude Haiku");
+        assert!(!is_text_generation_selection_valid(
+            &config,
+            None,
+            &ModelSelection { instance_id: "fx".into(), model: "fx-1".into(), options: None }
+        ));
+        assert!(is_text_generation_selection_valid(&config, None, &sel));
+    }
+
+    #[test]
+    fn peer_link_health_load_balancing_and_pr_routing_match_web() {
+        let now = crate::sidebar::time::parse_iso("2026-11-19T00:00:00Z").unwrap();
+        let healthy = PeerLinkSummary {
+            environment_id: "vps".into(),
+            label: "VPS".into(),
+            urls: vec!["https://vps.example.ts.net".into()],
+            access: "approval-required".into(),
+            linked_at: "2026-11-01T00:00:00Z".into(),
+            expires_at: "2026-12-01T00:00:00Z".into(),
+            last_reached_at: None,
+            last_error: None,
+            status: PeerLinkStatus::Reachable,
+        };
+        assert_eq!(peer_link_health(&healthy, now), PeerLinkHealth::Reachable { expires_in_days: None });
+
+        let expiring = PeerLinkSummary { expires_at: "2026-11-22T00:00:00Z".into(), ..healthy.clone() };
+        assert_eq!(peer_link_health(&expiring, now), PeerLinkHealth::Reachable { expires_in_days: Some(3) });
+        assert_eq!(
+            peer_link_status_text(&peer_link_health(&expiring, now)),
+            "Expires in 3 days. Link it again to renew."
+        );
+
+        let expired = PeerLinkSummary { expires_at: "2026-11-18T00:00:00Z".into(), ..healthy.clone() };
+        assert_eq!(peer_link_health(&expired, now), PeerLinkHealth::Expired);
+
+        let failing = PeerLinkSummary { last_error: Some("Revoked".into()), ..healthy.clone() };
+        assert_eq!(peer_link_health(&failing, now), PeerLinkHealth::Failing { detail: "Revoked".into() });
+
+        let mut weights = std::collections::BTreeMap::new();
+        weights.insert("mac".into(), 100);
+        weights.insert("vps".into(), 25);
+        assert_eq!(
+            summarize_load_preferences(&[("mac", "Mac"), ("vps", "VPS")], &weights).as_deref(),
+            Some("Mac prefer \u{00b7} VPS less often")
+        );
+
+        let key = pull_request_routing_connection_key("vps", "https://vps.example.ts.net/", None).unwrap();
+        let perms = set_pull_request_routing_permission(&[], "vps", &key, PullRequestRoutingPermission::ReadWrite);
+        assert_eq!(pull_request_routing_permission_for(Some(&key), &perms), PullRequestRoutingPermission::ReadWrite);
+        // Changing endpoint revokes trust automatically.
+        let changed_key = pull_request_routing_connection_key("vps", "https://other.example.ts.net", None).unwrap();
+        assert_eq!(pull_request_routing_permission_for(Some(&changed_key), &perms), PullRequestRoutingPermission::Off);
+        assert_eq!(
+            summarize_pull_request_routing(&[
+                ("Mac", PullRequestRoutingPermission::Read),
+                ("VPS", PullRequestRoutingPermission::ReadWrite),
+            ])
+            .as_deref(),
+            Some("VPS read and act \u{00b7} Mac read PRs")
+        );
+    }
+
+    #[test]
+    fn settings_scope_axis_disambiguates_duplicate_labels_and_checkouts() {
+        let envs = vec![
+            ScopeEnvironment {
+                environment_id: "e1".into(),
+                label: "Mac".into(),
+                display_url: "https://mac-1.ts.net".into(),
+                connected: true,
+            },
+            ScopeEnvironment {
+                environment_id: "e2".into(),
+                label: "Mac".into(),
+                display_url: "https://mac-2.ts.net".into(),
+                connected: false,
+            },
+        ];
+        assert_eq!(settings_scope_environment_label(&envs[0], &envs), "Mac \u{00b7} mac-1.ts.net");
+        let group = ScopeProjectGroup {
+            project_key: "repo".into(),
+            display_name: "t3code".into(),
+            workspace_root: "/a/t3code".into(),
+            archived: false,
+            members: vec![
+                ScopeCheckout {
+                    environment_id: "e1".into(),
+                    physical_project_key: "e1::/a/t3code".into(),
+                    workspace_root: "/a/t3code".into(),
+                },
+                ScopeCheckout {
+                    environment_id: "e1".into(),
+                    physical_project_key: "e1::/b/t3code".into(),
+                    workspace_root: "/b/t3code".into(),
+                },
+            ],
+        };
+        let choices = settings_scope_checkout_choices(&group, &SettingsScopeSearch::default());
+        assert_eq!(choices.len(), 2);
+        assert_eq!(settings_scope_checkout_label(choices[0], &choices), "/a/t3code");
     }
 }

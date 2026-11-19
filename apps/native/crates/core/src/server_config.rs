@@ -174,7 +174,15 @@ pub struct ProviderModel {
     #[serde(default)]
     pub is_legacy: bool,
     #[serde(default)]
+    pub supports_text_generation: Option<bool>,
+    #[serde(default)]
     pub capabilities: Option<ModelCapabilities>,
+}
+
+impl ProviderModel {
+    pub fn supports_text_generation(&self) -> bool {
+        self.supports_text_generation != Some(false)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -316,6 +324,8 @@ pub struct ServerProvider {
     pub message: Option<String>,
     #[serde(default)]
     pub availability: Option<String>,
+    #[serde(default)]
+    pub supports_text_generation: Option<bool>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub models: Vec<ProviderModel>,
     #[serde(default, deserialize_with = "lenient_option")]
@@ -511,6 +521,10 @@ pub struct UsageLimitSource {
 impl ServerProvider {
     pub fn is_available(&self) -> bool {
         self.availability.as_deref() != Some("unavailable")
+    }
+
+    pub fn supports_text_generation(&self) -> bool {
+        self.supports_text_generation != Some(false)
     }
 }
 
@@ -1266,5 +1280,40 @@ mod keybindings_issues_tests {
         assert!(state.apply(cleared));
         assert_eq!(state.keybindings_updated_seq(), 2);
         assert_eq!(state.config.as_ref().unwrap().keybindings_issue_message(), None);
+    }
+
+    #[test]
+    fn decodes_supports_text_generation_on_provider_and_model() {
+        let provider: ServerProvider = serde_json::from_value(json!({
+            "instanceId": "pi",
+            "driver": "pi",
+            "enabled": true,
+            "installed": true,
+            "status": "ready",
+            "supportsTextGeneration": false,
+            "models": [
+                { "slug": "demo/model-a", "name": "Model A", "supportsTextGeneration": false },
+                { "slug": "demo/model-b", "name": "Model B", "supportsTextGeneration": true },
+                { "slug": "demo/model-c", "name": "Model C" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(provider.supports_text_generation, Some(false));
+        assert!(!provider.supports_text_generation());
+        assert!(!provider.models[0].supports_text_generation());
+        assert!(provider.models[1].supports_text_generation());
+        assert!(provider.models[2].supports_text_generation());
+
+        let default_provider: ServerProvider = serde_json::from_value(json!({
+            "instanceId": "codex",
+            "driver": "codex",
+            "enabled": true,
+            "installed": true,
+            "status": "ready",
+            "models": []
+        }))
+        .unwrap();
+        assert_eq!(default_provider.supports_text_generation, None);
+        assert!(default_provider.supports_text_generation());
     }
 }
