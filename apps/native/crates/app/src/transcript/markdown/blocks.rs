@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Entity, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement, RenderImage, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px,
+    AnyElement, App, AppContext, ClipboardItem, Entity, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement, RenderImage, ScrollDelta,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px,
 };
 use gpui_component::text::{MarkdownExtensions, MarkdownNode, MarkdownParseContext, TextView, TextViewState, markdown_ast as mdast};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -35,6 +35,24 @@ pub const ORDERED_LIST_NODE: &str = "t3-ordered-list";
 pub const MATH_NODE: &str = "t3-math-block";
 pub const MERMAID_NODE: &str = "t3-mermaid-block";
 pub const TABLE_NODE: &str = "t3-table-block";
+pub const CODE_BLOCK_NODE: &str = "t3-code-block";
+
+fn is_horizontal_wheel(event: &ScrollWheelEvent) -> bool {
+    let (dx, dy) = match event.delta {
+        ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
+        ScrollDelta::Lines(l) => (l.x, l.y),
+    };
+    dx != 0.0 && dx.abs() > dy.abs()
+}
+
+/// Prevents horizontal trackpad scrolling inside code blocks, tables, math, and mermaid code
+/// scrollers from bubbling up to `Workspace`'s `HistorySwipeNavigation` listener (`AP-SWIPE`),
+/// while letting vertical wheel events bubble normally to the transcript list.
+fn stop_horizontal_wheel(event: &ScrollWheelEvent, _window: &mut Window, cx: &mut App) {
+    if is_horizontal_wheel(event) {
+        cx.stop_propagation();
+    }
+}
 
 #[derive(Clone)]
 pub enum NestedSelection {
@@ -98,6 +116,12 @@ struct TableNodeData {
 }
 
 #[derive(Clone)]
+struct CodeBlockNodeData {
+    key: String,
+    raw_markdown: String,
+}
+
+#[derive(Clone)]
 pub(super) struct RichMarkdownMedia {
     pub(super) parse_document: media::MediaDocument,
     pub(super) gallery_document: media::MediaDocument,
@@ -147,6 +171,7 @@ pub(super) fn attach_rich_extensions_with_media_options(
         math_enabled,
         Some(media),
         true,
+        true,
         keep_ordered_list_numbers,
     )
 }
@@ -171,6 +196,7 @@ fn attach_extensions_inner(
     math_enabled: SharedMathEnabled,
     media: Option<RichMarkdownMedia>,
     intercept_tables: bool,
+    intercept_code_blocks: bool,
     keep_ordered_list_numbers: bool,
 ) -> MarkdownExtensions {
     let ctx_for_child = action_ctx.clone();
@@ -184,6 +210,7 @@ fn attach_extensions_inner(
             node,
             context,
             intercept_tables,
+            intercept_code_blocks,
             keep_ordered_list_numbers,
             math_for_parser.load(Ordering::Relaxed),
         )
@@ -212,11 +239,17 @@ fn attach_extensions_inner(
     let ctx_mermaid = ctx_for_child.clone();
     let nested_mermaid = nested_for_child.clone();
 
-    let ctx_table = ctx_for_child;
-    let nested_table = nested_for_child;
-    let meta_table = meta_for_child;
-    let math_table = math_for_child;
-    let media_table = media;
+    let ctx_table = ctx_for_child.clone();
+    let nested_table = nested_for_child.clone();
+    let meta_table = meta_for_child.clone();
+    let math_table = math_for_child.clone();
+    let media_table = media.clone();
+
+    let ctx_code = ctx_for_child;
+    let nested_code = nested_for_child;
+    let meta_code = meta_for_child;
+    let math_code = math_for_child;
+    let media_code = media;
 
     with_parsers
         .block_renderer(ALERT_NODE, move |node, window, cx| {
@@ -247,6 +280,11 @@ fn attach_extensions_inner(
             let env = RichBlockEnv { action_ctx: &ctx_table, nested_views: &nested_table, code_meta: &meta_table, math_enabled: &math_table, media: media_table.as_ref() };
             render_table_block(data, env, window, cx)
         })
+        .block_renderer(CODE_BLOCK_NODE, move |node, window, cx| {
+            let Some(data) = node.data::<CodeBlockNodeData>() else { return div().into_any_element() };
+            let env = RichBlockEnv { action_ctx: &ctx_code, nested_views: &nested_code, code_meta: &meta_code, math_enabled: &math_code, media: media_code.as_ref() };
+            render_code_block(data, env, window, cx)
+        })
 }
 
 fn alert_plain_body(bq: &mdast::Blockquote) -> String {
@@ -260,10 +298,36 @@ fn alert_plain_body(bq: &mdast::Blockquote) -> String {
     trimmed.to_owned()
 }
 
+fn fallback_code_fence(code: &mdast::Code) -> String {
+    let mut max_run = 0usize;
+    let mut run = 0usize;
+    for ch in code.value.chars() {
+        if ch == '`' {
+            run += 1;
+            max_run = max_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat(max_run.max(2) + 1);
+    let mut info = String::new();
+    if let Some(lang) = code.lang.as_deref() {
+        info.push_str(lang);
+        if let Some(meta) = code.meta.as_deref()
+            && !meta.is_empty()
+        {
+            info.push(' ');
+            info.push_str(meta);
+        }
+    }
+    format!("{fence}{info}\n{}\n{fence}", code.value)
+}
+
 fn parse_rich_block(
     node: &mdast::Node,
     context: &MarkdownParseContext<'_>,
     intercept_tables: bool,
+    intercept_code_blocks: bool,
     keep_ordered_list_numbers: bool,
     math_enabled: bool,
 ) -> Option<MarkdownNode> {
@@ -363,6 +427,17 @@ fn parse_rich_block(
                         .markdown(raw),
                 );
             }
+            if intercept_code_blocks {
+                let raw = context
+                    .node_source(node)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| fallback_code_fence(code));
+                return Some(
+                    MarkdownNode::new(CODE_BLOCK_NODE, CodeBlockNodeData { key, raw_markdown: raw.clone() })
+                        .text(code.value.clone())
+                        .markdown(raw),
+                );
+            }
             None
         }
         _ => None,
@@ -453,6 +528,7 @@ fn render_alert_block(
         math_enabled.clone(),
         media.cloned(),
         true,
+        true,
         false,
     );
     let view = super::style_markdown_internal(
@@ -542,6 +618,7 @@ fn render_ordered_list_block(
                 media.cloned(),
                 true,
                 true,
+                true,
             );
             let view = super::style_markdown_internal(
                 TextView::new(&entity).markdown_extensions(child_ext),
@@ -605,6 +682,7 @@ fn render_details_block(
         code_meta.clone(),
         math_enabled.clone(),
         media.cloned(),
+        true,
         true,
         false,
     );
@@ -727,35 +805,41 @@ fn render_math_block(data: &MathNodeData, nested_views: &NestedViews, window: &m
         )
         .child(
             div()
-                .id(SharedString::from(format!("math-scroll:{}", data.key)))
                 .w_full()
-                .overflow_x_scroll()
-                .py(px(4.))
+                .min_w_0()
+                .on_scroll_wheel(stop_horizontal_wheel)
                 .child(
                     div()
-                        .when(!show_tex, |d| d.flex().justify_center().text_size(px(16.)).line_height(px(24.)))
-                        .when(show_tex, |d| {
-                            d.font_family(cx.theme().mono_font_family.clone())
-                                .text_size(cx.theme().mono_font_size)
-                        })
-                        .text_color(hsla(p.foreground))
-                        .child({
-                            let nested = nested_views.clone();
-                            let key = format!("math:{}", data.key);
-                            let rendered = shown_text.clone();
-                            let raw_fallback = (shown_text != data.tex).then(|| data.tex.clone());
-                            SelectableText::new(SharedString::from(format!("math-sel:{}", data.key)), shown_text)
-                                .on_state(move |handle, _| {
-                                    nested.lock().unwrap().insert(
-                                        key.clone(),
-                                        NestedSelection::Selectable {
-                                            handle: handle.clone(),
-                                            rendered: rendered.clone(),
-                                            raw_fallback: raw_fallback.clone(),
-                                        },
-                                    );
+                        .id(SharedString::from(format!("math-scroll:{}", data.key)))
+                        .w_full()
+                        .overflow_x_scroll()
+                        .py(px(4.))
+                        .child(
+                            div()
+                                .when(!show_tex, |d| d.flex().justify_center().text_size(px(16.)).line_height(px(24.)))
+                                .when(show_tex, |d| {
+                                    d.font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(cx.theme().mono_font_size)
                                 })
-                        }),
+                                .text_color(hsla(p.foreground))
+                                .child({
+                                    let nested = nested_views.clone();
+                                    let key = format!("math:{}", data.key);
+                                    let rendered = shown_text.clone();
+                                    let raw_fallback = (shown_text != data.tex).then(|| data.tex.clone());
+                                    SelectableText::new(SharedString::from(format!("math-sel:{}", data.key)), shown_text)
+                                        .on_state(move |handle, _| {
+                                            nested.lock().unwrap().insert(
+                                                key.clone(),
+                                                NestedSelection::Selectable {
+                                                    handle: handle.clone(),
+                                                    rendered: rendered.clone(),
+                                                    raw_fallback: raw_fallback.clone(),
+                                                },
+                                            );
+                                        })
+                                }),
+                        ),
                 ),
         )
         .into_any_element()
@@ -927,27 +1011,33 @@ fn render_mermaid_block(
             let key = format!("mermaid-code:{}", data.key);
             let code_text = data.code.clone();
             div()
-                .id(SharedString::from(format!("mermaid-code:{}", data.key)))
                 .w_full()
-                .overflow_x_scroll()
-                .px(px(14.))
-                .py(px(12.))
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_size(cx.theme().mono_font_size)
-                .line_height(cx.theme().mono_font_size * 1.375)
-                .text_color(hsla(p.foreground))
+                .min_w_0()
+                .on_scroll_wheel(stop_horizontal_wheel)
                 .child(
-                    SelectableText::new(SharedString::from(format!("mermaid-sel:{}", data.key)), data.code.clone())
-                        .on_state(move |handle, _| {
-                            nested.lock().unwrap().insert(
-                                key.clone(),
-                                NestedSelection::Selectable {
-                                    handle: handle.clone(),
-                                    rendered: code_text.clone(),
-                                    raw_fallback: None,
-                                },
-                            );
-                        }),
+                    div()
+                        .id(SharedString::from(format!("mermaid-code:{}", data.key)))
+                        .w_full()
+                        .overflow_x_scroll()
+                        .px(px(14.))
+                        .py(px(12.))
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(cx.theme().mono_font_size)
+                        .line_height(cx.theme().mono_font_size * 1.375)
+                        .text_color(hsla(p.foreground))
+                        .child(
+                            SelectableText::new(SharedString::from(format!("mermaid-sel:{}", data.key)), data.code.clone())
+                                .on_state(move |handle, _| {
+                                    nested.lock().unwrap().insert(
+                                        key.clone(),
+                                        NestedSelection::Selectable {
+                                            handle: handle.clone(),
+                                            rendered: code_text.clone(),
+                                            raw_fallback: None,
+                                        },
+                                    );
+                                }),
+                        ),
                 )
                 .into_any_element()
         })
@@ -988,6 +1078,7 @@ fn render_table_block(
             code_meta.clone(),
             math_enabled.clone(),
             media.cloned(),
+            false,
             false,
             false,
         );
@@ -1032,11 +1123,64 @@ fn render_table_block(
         )
         .child(
             div()
+                .id(SharedString::from(format!("table-scroll-guard:{}", data.key)))
                 .w_full()
                 .min_w_0()
                 .border_color(hsla(p.border))
+                .on_scroll_wheel(stop_horizontal_wheel)
                 .child(table_view),
         )
+        .into_any_element()
+}
+
+fn render_code_block(
+    data: &CodeBlockNodeData,
+    env: RichBlockEnv<'_>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let RichBlockEnv { action_ctx, nested_views, code_meta, math_enabled, media } = env;
+    let raw = data.raw_markdown.clone();
+    let key = SharedString::from(format!("code-block:{}", data.key));
+    let state = window.use_keyed_state(key, cx, |_, cx| ChildTextState {
+        last_body: raw.clone(),
+        entity: cx.new(|cx| TextViewState::markdown(&raw, cx).selectable(true)),
+    });
+    let entity = state.update(cx, |s, cx| {
+        if s.last_body != raw {
+            s.last_body = raw.clone();
+            s.entity.update(cx, |tv, cx| tv.set_text(&raw, cx));
+        }
+        s.entity.clone()
+    });
+    nested_views
+        .lock()
+        .unwrap()
+        .insert(format!("code:{}", data.key), NestedSelection::Markdown(entity.clone()));
+
+    let child_ext = attach_extensions_inner(
+        MarkdownExtensions::default(),
+        action_ctx.clone(),
+        nested_views.clone(),
+        code_meta.clone(),
+        math_enabled.clone(),
+        media.cloned(),
+        false,
+        false,
+        false,
+    );
+    let code_view = super::style_markdown_internal(
+        TextView::new(&entity).markdown_extensions(child_ext),
+        action_ctx.lock().unwrap().clone(),
+        code_meta.clone(),
+        cx,
+    );
+    div()
+        .id(SharedString::from(format!("code-block-scroll-guard:{}", data.key)))
+        .w_full()
+        .min_w_0()
+        .on_scroll_wheel(stop_horizontal_wheel)
+        .child(code_view)
         .into_any_element()
 }
 
@@ -1086,6 +1230,7 @@ fn render_media_table_grid(
                 math_enabled.clone(),
                 media.cloned(),
                 false,
+                true,
                 false,
             );
             let cell_view = super::style_markdown_internal(
@@ -1136,4 +1281,103 @@ fn svg_data_url(svg: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod wheel_propagation_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use gpui::{Context, Render, TouchPhase, point, size};
+
+    use super::*;
+    use crate::transcript::markdown::{MarkdownState, MarkdownStore, markdown_view};
+
+    #[gpui::test]
+    fn code_blocks_and_tables_stop_horizontal_wheel_but_allow_vertical_scroll(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+        });
+
+        struct Harness {
+            state: MarkdownState,
+            bubbled_horizontal: Rc<Cell<usize>>,
+            bubbled_vertical: Rc<Cell<usize>>,
+        }
+
+        impl Render for Harness {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let h = self.bubbled_horizontal.clone();
+                let v = self.bubbled_vertical.clone();
+                div()
+                    .id("swipe-parent")
+                    .size_full()
+                    .on_scroll_wheel(move |event, _, _| {
+                        if is_horizontal_wheel(event) {
+                            h.set(h.get() + 1);
+                        } else {
+                            v.set(v.get() + 1);
+                        }
+                    })
+                    .child(markdown_view(&self.state, cx))
+            }
+        }
+
+        let source: Arc<str> = concat!(
+            "```rust\n",
+            "let very_long_identifier_for_horizontal_scrolling = \"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\";\n",
+            "```\n\n",
+            "| ColumnOneHeader | ColumnTwoHeader | ColumnThreeHeader | ColumnFourHeader |\n",
+            "| --- | --- | --- | --- |\n",
+            "| wide_cell_value_alpha | wide_cell_value_beta | wide_cell_value_gamma | wide_cell_value_delta |\n"
+        )
+        .into();
+
+        let bubbled_horizontal = Rc::new(Cell::new(0usize));
+        let bubbled_vertical = Rc::new(Cell::new(0usize));
+        let h_ref = bubbled_horizontal.clone();
+        let v_ref = bubbled_vertical.clone();
+
+        let (_view, vcx) = cx.add_window_view(|_, cx| {
+            let mut store = MarkdownStore::new(cx.entity_id());
+            let state = store.state("assistant:wheel-test", &source, cx);
+            Harness {
+                state,
+                bubbled_horizontal: h_ref,
+                bubbled_vertical: v_ref,
+            }
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.resize(size(px(420.), px(400.)));
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let wheel_event = |pos: gpui::Point<gpui::Pixels>, dx: f32, dy: f32| ScrollWheelEvent {
+            position: pos,
+            delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        };
+
+        // Hit inside the code block (near top of viewport).
+        let code_pos = point(px(120.), px(40.));
+        vcx.simulate_event(wheel_event(code_pos, 32.0, 0.0));
+        assert_eq!(bubbled_horizontal.get(), 0, "horizontal wheel inside code block must not bubble to swipe handler");
+        vcx.simulate_event(wheel_event(code_pos, 0.0, -24.0));
+        assert_eq!(bubbled_vertical.get(), 1, "vertical wheel inside code block must still bubble");
+
+        // Hit inside the table (below the code block).
+        let table_pos = point(px(120.), px(145.));
+        vcx.simulate_event(wheel_event(table_pos, -36.0, 1.0));
+        assert_eq!(bubbled_horizontal.get(), 0, "horizontal wheel inside table must not bubble to swipe handler");
+        vcx.simulate_event(wheel_event(table_pos, 0.0, -24.0));
+        assert_eq!(bubbled_vertical.get(), 2, "vertical wheel inside table must still bubble");
+    }
 }

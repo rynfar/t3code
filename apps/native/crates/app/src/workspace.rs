@@ -104,11 +104,13 @@ pub struct Workspace {
     git_dialogs: Entity<GitDialogs>,
     pull_requests: Entity<PullRequestsPage>,
     link_dialog: Entity<LinkPullRequestDialog>,
+    project_dialogs: Entity<crate::projects::ProjectDialogs>,
     device_setup: Entity<crate::device::DeviceSetupDialog>,
     ssh_prompt: Entity<crate::ssh_prompt::SshPromptDialog>,
     /// A rail drag is live; `has_active_drag` alone also matches row and tab drags.
     rail_dragging: bool,
     _save_sidebar_width: Option<Task<()>>,
+    _slow_rpc_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -153,6 +155,7 @@ impl Workspace {
         });
         let pull_requests = cx.new(|cx| PullRequestsPage::new(state.clone(), window, cx));
         let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
+        let project_dialogs = cx.new(|cx| crate::projects::ProjectDialogs::new(state.clone(), window, cx));
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
         let ssh_prompt = cx.new(|cx| crate::ssh_prompt::SshPromptDialog::new(state.clone(), window, cx));
         let focus_observer = cx.new(|cx| crate::announcements::FocusObserver::new(state.clone(), window, cx));
@@ -241,6 +244,24 @@ impl Workspace {
         ];
         #[cfg(all(target_os = "macos", not(test)))]
         register_macos_wake_observer();
+        let mut slow_rpc_rx = t3_client::session::subscribe_slow_rpc_requests();
+        let initial_slow_rpc = slow_rpc_rx.borrow_and_update().clone();
+        if !initial_slow_rpc.is_empty() {
+            state.update(cx, |state, cx| state.sync_slow_rpc_toast(&initial_slow_rpc, cx));
+        }
+        let slow_rpc_task = cx.spawn(async move |this, cx| {
+            while slow_rpc_rx.changed().await.is_ok() {
+                let requests = slow_rpc_rx.borrow_and_update().clone();
+                if this
+                    .update(cx, |ws, cx| {
+                        ws.state.update(cx, |state, cx| state.sync_slow_rpc_toast(&requests, cx));
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let mut workspace = Workspace {
             state,
             focus_observer,
@@ -288,10 +309,12 @@ impl Workspace {
             git_dialogs,
             pull_requests,
             link_dialog,
+            project_dialogs,
             device_setup,
             ssh_prompt,
             rail_dragging: false,
             _save_sidebar_width: None,
+            _slow_rpc_task: slow_rpc_task,
             _subscriptions: subscriptions,
         };
         workspace.handle_host_freeze_toasts(cx);
@@ -721,6 +744,7 @@ impl Render for Workspace {
                         || this.dialog.read(cx).is_open()
                         || this.snooze.read(cx).is_open()
                         || this.palette.read(cx).is_open()
+                        || this.project_dialogs.read(cx).is_open()
                         || crate::updates::overlay(cx).is_some()
                         || crate::voice::is_setup_modal_open(cx)
                         || this.welcome.read(cx).is_open()
@@ -746,6 +770,7 @@ impl Render for Workspace {
                         || this.dialog.read(cx).is_open()
                         || this.snooze.read(cx).is_open()
                         || this.palette.read(cx).is_open()
+                        || this.project_dialogs.read(cx).is_open()
                         || crate::updates::overlay(cx).is_some()
                         || crate::voice::is_setup_modal_open(cx)
                         || this.welcome.read(cx).is_open()
@@ -876,6 +901,7 @@ impl Render for Workspace {
             .child(self.snooze.clone())
             .child(self.palette.clone())
             .child(self.link_dialog.clone())
+            .child(self.project_dialogs.clone())
             .child(self.device_setup.clone())
             .child(self.ssh_prompt.clone())
             .child(self.welcome.clone())
@@ -1524,6 +1550,7 @@ impl Workspace {
             || self.dialog.read(cx).is_open()
             || self.snooze.read(cx).is_open()
             || self.palette.read(cx).is_open()
+            || self.project_dialogs.read(cx).is_open()
             || self.mcp.read(cx).is_open(cx)
             || crate::voice::is_setup_modal_open(cx)
             || self.welcome.read(cx).is_open()
@@ -2103,6 +2130,31 @@ mod tests {
             });
         })
         .unwrap();
+
+        // 8. SlowRpcRequestToastCoordinator (`AP-TOASTS`): surfaces warning toast when slow RPCs
+        // arrive and dismisses it automatically when all slow RPCs complete.
+        t3_client::session::publish_slow_rpc_requests_for_test(vec![t3_client::session::SlowRpcAckRequest {
+            request_id: "ws-slow-1".into(),
+            started_at_ms: 1_700_000_000_000,
+            tag: "orchestration.dispatchCommand · Local".into(),
+            threshold_ms: 15_000,
+        }]);
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            let latest = state.toasts.latest().expect("slow rpc warning toast");
+            assert_eq!(latest.kind, crate::toast::ToastKind::Warning);
+            assert_eq!(latest.title, "Some requests are slow");
+            assert_eq!(latest.description.as_deref(), Some("1 request waiting longer than 15s."));
+        });
+        t3_client::session::publish_slow_rpc_requests_for_test(Vec::new());
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_ne!(
+                state.toasts.latest().map(|t| t.title.as_ref()),
+                Some("Some requests are slow"),
+                "slow rpc toast must close once pending slow requests clear"
+            );
+        });
 
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {

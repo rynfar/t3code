@@ -146,12 +146,12 @@ pub struct LastTitleRegeneration {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "ThreadShellWire")]
 pub struct ThreadShell {
     pub id: String,
     pub project_id: String,
     pub title: String,
-    #[serde(default, deserialize_with = "stored_tags", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     pub provider_instance_id: String,
     /// Instances the thread ran on before, oldest first (`providerInstanceHistory`).
@@ -185,12 +185,12 @@ pub struct ThreadShell {
     pub latest_run_requested_at: Option<String>,
     #[serde(default)]
     pub latest_run_started_at: Option<String>,
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_run_completed_at: Option<Option<String>>,
     pub active_run_id: Option<String>,
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_run_started_at: Option<Option<String>>,
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_run_status: Option<Option<String>>,
     #[serde(default)]
     pub blocked_on_thread_wait: Option<bool>,
@@ -204,7 +204,7 @@ pub struct ThreadShell {
     pub pending_guest_message_count: Option<u64>,
     pub latest_visible_message: Option<LatestVisibleMessage>,
     pub latest_user_message_at: Option<String>,
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_user_authored_message_at: Option<Option<String>>,
     pub has_actionable_proposed_plan: bool,
     #[serde(default)]
@@ -240,12 +240,254 @@ pub struct ThreadShell {
     pub pin_order_key: Option<String>,
     #[serde(default)]
     pub active_order_key: Option<String>,
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_visited_at: Option<Option<String>>,
     pub deleted_at: Option<String>,
-    /// Linked pull requests; links that do not decode are dropped.
-    #[serde(default, deserialize_with = "crate::pull_requests::link::thread_links", skip_serializing)]
+    /// Linked pull requests; links that do not decode are dropped. Falls back to legacy single
+    /// `linkedPullRequest` only when `pullRequests` is absent (`threadPullRequestsOf`).
+    #[serde(default, skip_serializing)]
     pub pull_requests: Vec<crate::pull_requests::link::ThreadLink>,
+}
+
+/// Legacy single-link payload (`ThreadLinkedPullRequest` in `packages/contracts/src/threadPullRequest.ts`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyLinkedPullRequest {
+    repository: String,
+    number: u64,
+    url: String,
+}
+
+impl LegacyLinkedPullRequest {
+    /// Mirrors `legacyThreadPullRequestKey` + `threadPullRequestsOf`
+    /// (`packages/source-control-core/src/shared/threadPullRequests.ts`).
+    fn into_thread_link(self) -> Option<crate::pull_requests::link::ThreadLink> {
+        let repository = self.repository.trim();
+        let url = self.url.trim();
+        if repository.is_empty() || url.is_empty() || self.number == 0 {
+            return None;
+        }
+        let (host, repo, number) = match crate::pull_requests::link::parse_change_request_url(url) {
+            Some(parsed) if parsed.number == self.number => (parsed.host, parsed.repository, parsed.number),
+            _ => {
+                let host = url::Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.trim().to_ascii_lowercase()))
+                    .filter(|h| !h.is_empty())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                (host, repository.to_ascii_lowercase(), self.number)
+            }
+        };
+        Some(crate::pull_requests::link::ThreadLink {
+            host,
+            repository: repo,
+            number,
+            url: url.to_owned(),
+            source: "manual".to_owned(),
+            linked_at: "1970-01-01T00:00:00.000Z".to_owned(),
+            snapshot: None,
+            stack: None,
+            watch: None,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadShellWire {
+    id: String,
+    project_id: String,
+    title: String,
+    #[serde(default, deserialize_with = "stored_tags")]
+    tags: Vec<String>,
+    provider_instance_id: String,
+    #[serde(default)]
+    provider_instance_history: Vec<String>,
+    model_selection: ModelSelection,
+    runtime_mode: String,
+    interaction_mode: String,
+    branch: Option<String>,
+    worktree_path: Option<String>,
+    lineage: Lineage,
+    #[serde(default)]
+    forked_from: Option<serde_json::Value>,
+    #[serde(default)]
+    creation_source: Option<String>,
+    #[serde(default)]
+    delegated_from: Option<serde_json::Value>,
+    #[serde(default)]
+    link_origin: Option<LinkOrigin>,
+    #[serde(default)]
+    active_provider_thread_id: Option<String>,
+    latest_run_id: Option<String>,
+    #[serde(default)]
+    latest_run_stop_requested: Option<bool>,
+    #[serde(default)]
+    latest_run_background_wake: Option<bool>,
+    #[serde(default)]
+    latest_run_requested_at: Option<String>,
+    #[serde(default)]
+    latest_run_started_at: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    latest_run_completed_at: Option<Option<String>>,
+    active_run_id: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    activity_run_started_at: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    activity_run_status: Option<Option<String>>,
+    #[serde(default)]
+    blocked_on_thread_wait: Option<bool>,
+    status: String,
+    #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
+    last_error_class: Option<String>,
+    pending_runtime_request: Option<PendingRuntimeRequestSummary>,
+    #[serde(default)]
+    pending_guest_message_count: Option<u64>,
+    latest_visible_message: Option<LatestVisibleMessage>,
+    latest_user_message_at: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    latest_user_authored_message_at: Option<Option<String>>,
+    has_actionable_proposed_plan: bool,
+    #[serde(default)]
+    pending_background_tasks: Vec<PendingBackgroundTask>,
+    #[serde(default)]
+    goal: Option<serde_json::Value>,
+    #[serde(default)]
+    limit_recovery: Option<LimitRecovery>,
+    item_count: u64,
+    visible_item_count: u64,
+    created_at: String,
+    updated_at: String,
+    archived_at: Option<String>,
+    settled_override: Option<String>,
+    settled_at: Option<String>,
+    #[serde(default)]
+    unsettled_at: Option<String>,
+    #[serde(default)]
+    snoozed_until: Option<String>,
+    #[serde(default)]
+    snoozed_at: Option<String>,
+    #[serde(default)]
+    auto_settle_disabled_at: Option<String>,
+    #[serde(default)]
+    opens: Option<serde_json::Value>,
+    #[serde(default)]
+    title_regeneration: Option<serde_json::Value>,
+    #[serde(default)]
+    last_title_regeneration: Option<LastTitleRegeneration>,
+    #[serde(default)]
+    pinned_at: Option<String>,
+    #[serde(default)]
+    pin_order_key: Option<String>,
+    #[serde(default)]
+    active_order_key: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    last_visited_at: Option<Option<String>>,
+    deleted_at: Option<String>,
+    /// `Some(links)` when `pullRequests` was explicitly sent (even `[]`), `None` when omitted.
+    #[serde(default, deserialize_with = "present_thread_links")]
+    pull_requests: Option<Vec<crate::pull_requests::link::ThreadLink>>,
+    /// Legacy single `linkedPullRequest` from older V2 payloads.
+    #[serde(default, deserialize_with = "lenient_legacy_pull_request")]
+    linked_pull_request: Option<LegacyLinkedPullRequest>,
+}
+
+impl From<ThreadShellWire> for ThreadShell {
+    fn from(wire: ThreadShellWire) -> Self {
+        let pull_requests = match wire.pull_requests {
+            Some(links) => links,
+            None => wire
+                .linked_pull_request
+                .and_then(LegacyLinkedPullRequest::into_thread_link)
+                .into_iter()
+                .collect(),
+        };
+        ThreadShell {
+            id: wire.id,
+            project_id: wire.project_id,
+            title: wire.title,
+            tags: wire.tags,
+            provider_instance_id: wire.provider_instance_id,
+            provider_instance_history: wire.provider_instance_history,
+            model_selection: wire.model_selection,
+            runtime_mode: wire.runtime_mode,
+            interaction_mode: wire.interaction_mode,
+            branch: wire.branch,
+            worktree_path: wire.worktree_path,
+            lineage: wire.lineage,
+            forked_from: wire.forked_from,
+            creation_source: wire.creation_source,
+            delegated_from: wire.delegated_from,
+            link_origin: wire.link_origin,
+            active_provider_thread_id: wire.active_provider_thread_id,
+            latest_run_id: wire.latest_run_id,
+            latest_run_stop_requested: wire.latest_run_stop_requested,
+            latest_run_background_wake: wire.latest_run_background_wake,
+            latest_run_requested_at: wire.latest_run_requested_at,
+            latest_run_started_at: wire.latest_run_started_at,
+            latest_run_completed_at: wire.latest_run_completed_at,
+            active_run_id: wire.active_run_id,
+            activity_run_started_at: wire.activity_run_started_at,
+            activity_run_status: wire.activity_run_status,
+            blocked_on_thread_wait: wire.blocked_on_thread_wait,
+            status: wire.status,
+            last_error: wire.last_error,
+            last_error_class: wire.last_error_class,
+            pending_runtime_request: wire.pending_runtime_request,
+            pending_guest_message_count: wire.pending_guest_message_count,
+            latest_visible_message: wire.latest_visible_message,
+            latest_user_message_at: wire.latest_user_message_at,
+            latest_user_authored_message_at: wire.latest_user_authored_message_at,
+            has_actionable_proposed_plan: wire.has_actionable_proposed_plan,
+            pending_background_tasks: wire.pending_background_tasks,
+            goal: wire.goal,
+            limit_recovery: wire.limit_recovery,
+            item_count: wire.item_count,
+            visible_item_count: wire.visible_item_count,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+            archived_at: wire.archived_at,
+            settled_override: wire.settled_override,
+            settled_at: wire.settled_at,
+            unsettled_at: wire.unsettled_at,
+            snoozed_until: wire.snoozed_until,
+            snoozed_at: wire.snoozed_at,
+            auto_settle_disabled_at: wire.auto_settle_disabled_at,
+            opens: wire.opens,
+            title_regeneration: wire.title_regeneration,
+            last_title_regeneration: wire.last_title_regeneration,
+            pinned_at: wire.pinned_at,
+            pin_order_key: wire.pin_order_key,
+            active_order_key: wire.active_order_key,
+            last_visited_at: wire.last_visited_at,
+            deleted_at: wire.deleted_at,
+            pull_requests,
+        }
+    }
+}
+
+fn present_thread_links<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<crate::pull_requests::link::ThreadLink>>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let Some(items) = value.as_array() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        items
+            .iter()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect(),
+    ))
+}
+
+fn lenient_legacy_pull_request<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<LegacyLinkedPullRequest>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 impl ThreadShell {
@@ -521,4 +763,109 @@ mod tests;
 fn stored_tags<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
     let value = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod legacy_pr_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn base_thread(extra: serde_json::Map<String, serde_json::Value>) -> ThreadShell {
+        let mut obj = json!({
+            "id": "thr-1",
+            "projectId": "proj-1",
+            "title": "Fix bug",
+            "providerInstanceId": "codex",
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5.4" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "branch": "main",
+            "worktreePath": null,
+            "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "thr-1" },
+            "latestRunId": null,
+            "activeRunId": null,
+            "status": "idle",
+            "pendingRuntimeRequest": null,
+            "latestVisibleMessage": null,
+            "latestUserMessageAt": null,
+            "hasActionableProposedPlan": false,
+            "itemCount": 0,
+            "visibleItemCount": 0,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "archivedAt": null,
+            "settledOverride": null,
+            "settledAt": null,
+            "deletedAt": null
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        obj.extend(extra);
+        serde_json::from_value(serde_json::Value::Object(obj)).expect("valid ThreadShell")
+    }
+
+    #[test]
+    fn decodes_legacy_single_linked_pull_request_when_pull_requests_absent() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "linkedPullRequest".into(),
+            json!({
+                "projectId": "proj-1",
+                "repository": "PingDotGG/T3Code",
+                "number": 42,
+                "url": "https://github.com/PingDotGG/T3Code/pull/42"
+            }),
+        );
+        let thread = base_thread(extra);
+        assert_eq!(thread.pull_requests.len(), 1);
+        let link = &thread.pull_requests[0];
+        assert_eq!(link.host, "github.com");
+        assert_eq!(link.repository, "pingdotgg/t3code");
+        assert_eq!(link.number, 42);
+        assert_eq!(link.url, "https://github.com/PingDotGG/T3Code/pull/42");
+        assert_eq!(link.source, "manual");
+        assert_eq!(link.linked_at, "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn explicit_empty_pull_requests_array_overrides_legacy_linked_pull_request() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("pullRequests".into(), json!([]));
+        extra.insert(
+            "linkedPullRequest".into(),
+            json!({
+                "projectId": "proj-1",
+                "repository": "pingdotgg/t3code",
+                "number": 42,
+                "url": "https://github.com/pingdotgg/t3code/pull/42"
+            }),
+        );
+        let thread = base_thread(extra);
+        assert!(thread.pull_requests.is_empty(), "explicit empty pullRequests means unlinked");
+    }
+
+    #[test]
+    fn malformed_legacy_linked_pull_request_does_not_fail_shell_frame() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("linkedPullRequest".into(), json!({ "number": "not-a-number" }));
+        let thread = base_thread(extra);
+        assert!(thread.pull_requests.is_empty());
+
+        // Self-hosted / custom URL host falls back to hostname.
+        let mut custom = serde_json::Map::new();
+        custom.insert(
+            "linkedPullRequest".into(),
+            json!({
+                "projectId": "proj-1",
+                "repository": "Org/Repo",
+                "number": 9,
+                "url": "https://git.corp.example/custom/9"
+            }),
+        );
+        let thread = base_thread(custom);
+        assert_eq!(thread.pull_requests.len(), 1);
+        assert_eq!(thread.pull_requests[0].host, "git.corp.example");
+        assert_eq!(thread.pull_requests[0].repository, "org/repo");
+    }
 }

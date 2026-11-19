@@ -3,15 +3,17 @@
 //! path, Tab completes; and New project names a folder for `projects.createNew`.
 
 use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, Styled, Task, UniformListScrollHandle, div, prelude::*, px, uniform_list};
+use gpui_component::h_flex;
 use t3_core::projects::{
     BrowseResult, FILESYSTEM_BROWSE, add_target, append_browse_segment, browse_path, browse_request,
-    browse_tab_completion, filter_browse_entries, github_incomplete_owner_repository_message,
-    is_clone_query, normalize_pasted_clone_url,
+    browse_tab_completion, compute_clone_preview, extract_project_remote_url, filter_browse_entries,
+    github_incomplete_owner_repository_message, is_clone_query,
 };
 
 use super::CommandPalette;
 use crate::app_state::AppState;
 use crate::icons::Icon;
+use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
 
 const ROW_HEIGHT: f32 = 32.;
@@ -127,6 +129,57 @@ impl ProjectBrowse {
         Some(if complete { append_browse_segment(&self.query, &name) } else { format!("{}{name}", t3_core::projects::browse_directory_path(&self.query)) })
     }
 
+    fn render_footer_actions(&self, cx: &mut Context<CommandPalette>) -> AnyElement {
+        let p = palette(cx);
+        let add_to_machine_target: Option<(String, String, String)> = {
+            let app = cx.entity().read(cx).state.read(cx);
+            let active_saved = app.environments.active.clone().unwrap_or_default();
+            let project_id = crate::new_thread::default_project(app);
+            project_id.and_then(|pid| {
+                let project = app.shell.project(&pid)?;
+                extract_project_remote_url(project.repository_identity.as_ref())?;
+                let targets = app.add_project_to_machine_targets(&active_saved, &pid);
+                (!targets.is_empty()).then(|| (active_saved, pid, project.title.clone()))
+            })
+        };
+        let initial_clone = if is_clone_query(&self.query) {
+            self.query.trim().to_owned()
+        } else {
+            String::new()
+        };
+        h_flex()
+            .mt(px(8.))
+            .pt(px(8.))
+            .px(px(8.))
+            .border_t_1()
+            .border_color(hsla(p.border).opacity(0.6))
+            .justify_between()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                Button::new("palette-open-clone-modal", ButtonVariant::Ghost, ButtonSize::Xs)
+                    .label("Clone repository…")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let initial = initial_clone.clone();
+                        this.close(window, cx);
+                        this.state.update(cx, |state, cx| state.open_clone_project_modal(initial, cx));
+                    })),
+            )
+            .when_some(add_to_machine_target, |row, (saved_id, project_id, title)| {
+                row.child(
+                    Button::new("palette-open-add-to-machine", ButtonVariant::Ghost, ButtonSize::Xs)
+                        .label(format!("Add {title} to another machine…"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close(window, cx);
+                            this.state.update(cx, |state, cx| {
+                                state.open_add_project_to_machine(saved_id.clone(), project_id.clone(), None, cx);
+                            });
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
     pub fn render(&self, cx: &mut Context<CommandPalette>) -> AnyElement {
         let p = palette(cx);
         if is_clone_query(&self.query) {
@@ -136,19 +189,27 @@ impl ProjectBrowse {
                 .min_h_0()
                 .p(px(8.))
                 .child(self.render_row(0, cx))
+                .child(self.render_footer_actions(cx))
                 .into_any_element();
         }
         if browse_path(&self.query, self.windows).is_none() {
             let hint = github_incomplete_owner_repository_message("github", &self.query)
                 .unwrap_or("Enter project path (e.g. ~/projects/my-app) or repository URL (owner/repo)");
             return div()
-                .py(px(32.))
-                .px(px(24.))
                 .flex()
-                .justify_center()
-                .text_sm()
-                .text_color(hsla(p.muted_foreground))
-                .child(hint)
+                .flex_col()
+                .p(px(8.))
+                .child(
+                    div()
+                        .py(px(28.))
+                        .px(px(16.))
+                        .flex()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(hint),
+                )
+                .child(self.render_footer_actions(cx))
                 .into_any_element();
         }
         let count = self.row_count();
@@ -166,15 +227,37 @@ impl ProjectBrowse {
             .child(
                 uniform_list("palette-browse", count, cx.processor(|this, range: std::ops::Range<usize>, _, cx| range.map(|index| this.browse.render_row(index, cx)).collect::<Vec<_>>()))
                     .track_scroll(&self.scroll)
-                    .h(px((count as f32 * ROW_HEIGHT).min(420.))),
+                    .h(px((count as f32 * ROW_HEIGHT).min(380.))),
             )
+            .child(self.render_footer_actions(cx))
             .into_any_element()
     }
 
     fn render_row(&self, index: usize, cx: &mut Context<CommandPalette>) -> AnyElement {
         let p = palette(cx);
         let (icon, title, detail) = if index == 0 && is_clone_query(&self.query) {
-            (Icon::FolderTree, format!("Clone {}", self.query.trim()), normalize_pasted_clone_url(&self.query))
+            let (base_dir, fallback_root, ghq_layout) = {
+                let app = cx.entity().read(cx).state.read(cx);
+                let cfg = app.server_config.config.as_ref();
+                (
+                    cfg.map(|c| c.settings.threads.add_project_base_directory.clone())
+                        .filter(|s| !s.trim().is_empty()),
+                    cfg.and_then(|c| c.new_projects_root.clone()),
+                    cfg.is_some_and(|c| c.settings.threads.ghq_clone_layout),
+                )
+            };
+            let preview = compute_clone_preview(
+                &self.query,
+                base_dir.as_deref(),
+                fallback_root.as_deref(),
+                ghq_layout,
+                None,
+            );
+            (
+                Icon::FolderTree,
+                format!("Clone {}…", self.query.trim()),
+                format!("{} → {}", preview.remote_url, preview.destination_path),
+            )
         } else if index == 0 {
             let missing = self.result.as_ref().is_some_and(|r| r.path_missing);
             (

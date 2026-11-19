@@ -6,18 +6,211 @@
 //! reader never waits on a consumer and one slow stream cannot stall requests, other streams, or
 //! heartbeats.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use t3_core::rpc::{ClientMessage, RequestId, RpcFailure, ServerMessage, decode_server_frame, encode_client_message};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+/// `SLOW_RPC_ACK_THRESHOLD_MS` (`apps/web/src/rpc/requestLatencyState.ts`).
+pub const SLOW_RPC_ACK_THRESHOLD: Duration = Duration::from_secs(15);
+/// `LONG_RUNNING_RPC_ACK_THRESHOLD_MS` (`apps/web/src/rpc/requestLatencyState.ts`).
+pub const LONG_RUNNING_RPC_ACK_THRESHOLD: Duration = Duration::from_secs(120);
+/// `MAX_TRACKED_RPC_ACK_REQUESTS` (`apps/web/src/rpc/requestLatencyState.ts`).
+pub const MAX_TRACKED_RPC_ACK_REQUESTS: usize = 256;
+
+/// One RPC request that has waited past its latency threshold without completing
+/// (`SlowRpcAckRequest` in `apps/web/src/rpc/requestLatencyState.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowRpcAckRequest {
+    pub request_id: String,
+    pub started_at_ms: i64,
+    pub tag: String,
+    pub threshold_ms: u64,
+}
+
+/// `shouldTrackRpcAck` (`apps/web/src/rpc/requestLatencyState.ts`): excludes subscriptions,
+/// background pull-request fetches, usage/activity reports, and user-paced forge sign-in waits.
+pub fn should_track_rpc_ack(method: &str) -> bool {
+    !method.contains("subscribe")
+        && !method.starts_with("pullRequests.")
+        && !matches!(
+            method,
+            "server.getUsageSummary" | "server.reportClientActivity" | "sourceControl.signInWait"
+        )
+}
+
+/// `rpcAckThresholdMs` (`apps/web/src/rpc/requestLatencyState.ts`).
+pub fn rpc_ack_threshold_for(method: &str, base_threshold: Duration) -> Duration {
+    if matches!(
+        method,
+        "server.updateProvider"
+            | "server.refreshProviders"
+            | "server.updateServer"
+            | "vcs.refreshStatus"
+    ) {
+        base_threshold.max(LONG_RUNNING_RPC_ACK_THRESHOLD)
+    } else {
+        base_threshold
+    }
+}
+
+struct SlowRpcState {
+    pending: VecDeque<(String, JoinHandle<()>)>,
+    slow: Vec<SlowRpcAckRequest>,
+}
+
+/// Tracks pending RPC latency and publishes slow requests (`requestLatencyState.ts`).
+pub struct SlowRpcTracker {
+    base_threshold: Duration,
+    state: Mutex<SlowRpcState>,
+    tx: watch::Sender<Vec<SlowRpcAckRequest>>,
+}
+
+impl SlowRpcTracker {
+    pub fn new(base_threshold: Duration) -> Arc<Self> {
+        let (tx, _) = watch::channel(Vec::new());
+        Arc::new(Self {
+            base_threshold,
+            state: Mutex::new(SlowRpcState {
+                pending: VecDeque::new(),
+                slow: Vec::new(),
+            }),
+            tx,
+        })
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<Vec<SlowRpcAckRequest>> {
+        self.tx.subscribe()
+    }
+
+    pub fn snapshot(&self) -> Vec<SlowRpcAckRequest> {
+        self.tx.borrow().clone()
+    }
+
+    pub fn track(self: &Arc<Self>, request_id: String, method: &str, tag: String) -> Option<SlowRpcGuard> {
+        if !should_track_rpc_ack(method) {
+            return None;
+        }
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let threshold = rpc_ack_threshold_for(method, self.base_threshold);
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let entry = SlowRpcAckRequest {
+            request_id: request_id.clone(),
+            started_at_ms,
+            tag,
+            threshold_ms: threshold.as_millis().min(u64::MAX as u128) as u64,
+        };
+        let tracker = Arc::clone(self);
+        let timer_id = request_id.clone();
+        let timer = handle.spawn(async move {
+            tokio::time::sleep(threshold).await;
+            tracker.promote_slow(timer_id, entry);
+        });
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(pos) = state.pending.iter().position(|(id, _)| id == &request_id)
+                && let Some((_, prev)) = state.pending.remove(pos)
+            {
+                prev.abort();
+            }
+            while state.pending.len() >= MAX_TRACKED_RPC_ACK_REQUESTS {
+                if let Some((_, oldest)) = state.pending.pop_front() {
+                    oldest.abort();
+                }
+            }
+            state.pending.push_back((request_id.clone(), timer));
+        }
+        Some(SlowRpcGuard {
+            tracker: Arc::clone(self),
+            request_id,
+        })
+    }
+
+    fn promote_slow(&self, request_id: String, entry: SlowRpcAckRequest) {
+        let next = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(pos) = state.pending.iter().position(|(id, _)| id == &request_id) else {
+                return;
+            };
+            state.pending.remove(pos);
+            state.slow.push(entry);
+            if state.slow.len() > MAX_TRACKED_RPC_ACK_REQUESTS {
+                let overflow = state.slow.len() - MAX_TRACKED_RPC_ACK_REQUESTS;
+                state.slow.drain(..overflow);
+            }
+            state.slow.clone()
+        };
+        self.tx.send_replace(next);
+    }
+
+    pub fn acknowledge(&self, request_id: &str) {
+        let updated = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(pos) = state.pending.iter().position(|(id, _)| id == request_id)
+                && let Some((_, timer)) = state.pending.remove(pos)
+            {
+                timer.abort();
+            }
+            let before = state.slow.len();
+            state.slow.retain(|req| req.request_id != request_id);
+            (state.slow.len() != before).then(|| state.slow.clone())
+        };
+        if let Some(next) = updated {
+            self.tx.send_replace(next);
+        }
+    }
+}
+
+/// Drops the tracked request from pending/slow state when the RPC completes or is cancelled.
+pub struct SlowRpcGuard {
+    tracker: Arc<SlowRpcTracker>,
+    request_id: String,
+}
+
+impl Drop for SlowRpcGuard {
+    fn drop(&mut self) {
+        self.tracker.acknowledge(&self.request_id);
+    }
+}
+
+fn global_slow_rpc_tracker() -> &'static Arc<SlowRpcTracker> {
+    static TRACKER: OnceLock<Arc<SlowRpcTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| SlowRpcTracker::new(SLOW_RPC_ACK_THRESHOLD))
+}
+
+fn next_tracked_rpc_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Subscribes to the live set of slow pending RPC requests across all sessions
+/// (`subscribeSlowRpcAckRequests` in `apps/web/src/rpc/requestLatencyState.ts`).
+pub fn subscribe_slow_rpc_requests() -> watch::Receiver<Vec<SlowRpcAckRequest>> {
+    global_slow_rpc_tracker().subscribe()
+}
+
+/// Test helper: publishes a synthetic slow-RPC snapshot to `subscribe_slow_rpc_requests`.
+#[cfg(feature = "test-support")]
+pub fn publish_slow_rpc_requests_for_test(requests: Vec<SlowRpcAckRequest>) {
+    let tracker = global_slow_rpc_tracker();
+    {
+        let mut state = tracker.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.slow = requests.clone();
+    }
+    tracker.tx.send_replace(requests);
+}
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// Thread subscriptions ask for bounded snapshots, but older servers and other streams can still
@@ -333,9 +526,32 @@ impl Session {
 
     /// Sends the request now and returns its reply, so requests keep their call order.
     pub fn send_request(&self, tag: &str, payload: Value) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
+        self.send_request_labeled(tag, payload, None)
+    }
+
+    /// Sends a unary request and tracks its pending latency for `SlowRpcRequestToastCoordinator`.
+    pub(crate) fn send_request_labeled(
+        &self,
+        method: &str,
+        payload: Value,
+        environment_label: Option<&str>,
+    ) -> impl Future<Output = Result<Value, RpcError>> + Send + 'static {
         let (tx, rx) = oneshot::channel();
-        let started = self.start(tag, payload, Pending::Unary(tx)).map(|id| PendingRequest { id, outbound: self.outbound.clone(), pending: self.pending.clone() });
+        let started = self
+            .start(method, payload, Pending::Unary(tx))
+            .map(|id| PendingRequest { id, outbound: self.outbound.clone(), pending: self.pending.clone() });
+        let slow_guard = if started.is_ok() {
+            let display_tag = match environment_label.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(label) => format!("{method} \u{00b7} {label}"),
+                None => method.to_owned(),
+            };
+            let tracked_id = format!("rpc:{}", next_tracked_rpc_id());
+            global_slow_rpc_tracker().track(tracked_id, method, display_tag)
+        } else {
+            None
+        };
         async move {
+            let _slow_guard = slow_guard;
             let _pending = started?;
             rx.await.unwrap_or(Err(RpcError::Closed))
         }
@@ -531,5 +747,53 @@ mod frame_parts_tests {
         let reply = session.request("server.getConfig", serde_json::json!({})).await.unwrap();
         assert_eq!(reply["big"].as_str().map(str::len), Some(256));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn slow_rpc_filtering_and_thresholds_match_web() {
+        assert!(!should_track_rpc_ack("orchestration.subscribeShell"));
+        assert!(!should_track_rpc_ack("subscribeServerConfig"));
+        assert!(!should_track_rpc_ack("pullRequests.list"));
+        assert!(!should_track_rpc_ack("pullRequests.linkedThreads"));
+        assert!(!should_track_rpc_ack("server.getUsageSummary"));
+        assert!(!should_track_rpc_ack("server.reportClientActivity"));
+        assert!(!should_track_rpc_ack("sourceControl.signInWait"));
+        assert!(should_track_rpc_ack("orchestration.dispatchCommand"));
+        assert!(should_track_rpc_ack("projects.mutate"));
+        assert!(should_track_rpc_ack("vcs.refreshStatus"));
+
+        assert_eq!(rpc_ack_threshold_for("projects.mutate", SLOW_RPC_ACK_THRESHOLD), SLOW_RPC_ACK_THRESHOLD);
+        assert_eq!(rpc_ack_threshold_for("server.updateProvider", SLOW_RPC_ACK_THRESHOLD), LONG_RUNNING_RPC_ACK_THRESHOLD);
+        assert_eq!(rpc_ack_threshold_for("server.refreshProviders", SLOW_RPC_ACK_THRESHOLD), LONG_RUNNING_RPC_ACK_THRESHOLD);
+        assert_eq!(rpc_ack_threshold_for("server.updateServer", SLOW_RPC_ACK_THRESHOLD), LONG_RUNNING_RPC_ACK_THRESHOLD);
+        assert_eq!(rpc_ack_threshold_for("vcs.refreshStatus", SLOW_RPC_ACK_THRESHOLD), LONG_RUNNING_RPC_ACK_THRESHOLD);
+    }
+
+    #[tokio::test]
+    async fn slow_rpc_tracker_promotes_past_threshold_and_dismisses_on_drop() {
+        let tracker = SlowRpcTracker::new(Duration::from_millis(25));
+        let mut rx = tracker.subscribe();
+        assert!(rx.borrow().is_empty());
+
+        // Untracked method returns None.
+        assert!(tracker.track("u1".into(), "pullRequests.list", "pullRequests.list".into()).is_none());
+
+        // Fast request dropped before threshold never becomes slow.
+        let fast = tracker.track("r-fast".into(), "projects.mutate", "projects.mutate · Mac".into()).unwrap();
+        drop(fast);
+
+        // Slow request stays pending past threshold and publishes.
+        let slow = tracker.track("r-slow".into(), "orchestration.dispatchCommand", "orchestration.dispatchCommand · Mac".into()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), rx.changed()).await.unwrap().unwrap();
+        let list = rx.borrow().clone();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].request_id, "r-slow");
+        assert_eq!(list[0].tag, "orchestration.dispatchCommand · Mac");
+        assert_eq!(list[0].threshold_ms, 25);
+
+        // Dropping the guard acknowledges and clears the slow request.
+        drop(slow);
+        tokio::time::timeout(Duration::from_secs(2), rx.changed()).await.unwrap().unwrap();
+        assert!(rx.borrow().is_empty());
     }
 }

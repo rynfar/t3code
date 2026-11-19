@@ -19,9 +19,41 @@ use crate::theme::{hsla, palette};
 /// Base UI's default `limit`: toasts past it stay queued but hidden.
 const VISIBLE_LIMIT: usize = 3;
 const TIMEOUT: Duration = Duration::from_secs(4);
+/// `ANCHORED_COPY_TOAST_TIMEOUT_MS` (`apps/web/src/components/ui/anchoredCopyToast.ts`).
+pub const ANCHORED_COPY_TOAST_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Key for the singleton slow-RPC warning toast (`SlowRpcRequestToastCoordinator.tsx`).
+pub const SLOW_RPC_TOAST_KEY: &str = "slow-rpc-requests";
 const WIDTH: f32 = 360.;
+const ANCHORED_MAX_WIDTH: f32 = 256.;
+const ANCHORED_SIDE_OFFSET: f32 = 4.;
 /// Stacked toasts sit 12px apart and peek 12px.
 const GAP: f32 = 12.;
+
+/// One slow pending RPC entry rendered inside the expandable slow-RPC toast
+/// (`SlowRequestDetails` in `SlowRpcRequestToastCoordinator.tsx`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowRpcRequestItem {
+    pub request_id: String,
+    pub tag: String,
+    pub started_label: String,
+}
+
+/// `describeSlowRequests` (`SlowRpcRequestToastCoordinator.tsx`).
+pub fn describe_slow_rpc_requests(requests: &[t3_client::session::SlowRpcAckRequest]) -> String {
+    let count = requests.len();
+    let min_threshold_ms = requests.iter().map(|request| request.threshold_ms).min().unwrap_or(15_000);
+    let threshold_seconds = ((min_threshold_ms as f64) / 1000.0).round() as u64;
+    format!(
+        "{count} request{} waiting longer than {threshold_seconds}s.",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+fn format_started_time(started_at_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(started_at_ms)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "just now".to_owned())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
@@ -49,6 +81,8 @@ pub struct Toast {
     /// Legacy-permission re-pair notice (`PermissionUpdateNotice.ts`), carrying the environment
     /// dismissal key so dismissing via Close/Dismiss/Open persists across restarts.
     pub permission_update_env: Option<String>,
+    /// Expandable slow RPC request rows (`SlowRpcRequestToastCoordinator.tsx`).
+    pub slow_rpc_requests: Vec<SlowRpcRequestItem>,
     persistent: bool,
     github_star: bool,
     replace_linked_prompt: Option<crate::composer::prompt_links::ReplaceLinkedPrompt>,
@@ -66,6 +100,7 @@ impl Toast {
             hide_copy_button: false,
             key: None,
             permission_update_env: None,
+            slow_rpc_requests: Vec::new(),
             persistent: false,
             github_star: false,
             replace_linked_prompt: None,
@@ -113,6 +148,12 @@ impl Toast {
         self.persistent = true;
         self
     }
+
+    pub fn slow_rpc_requests(mut self, requests: Vec<SlowRpcRequestItem>) -> Self {
+        self.slow_rpc_requests = requests;
+        self
+    }
+
     pub fn replace_linked_prompt(mut self, replacement: crate::composer::prompt_links::ReplaceLinkedPrompt) -> Self {
         self.replace_linked_prompt = Some(replacement);
         self.persistent()
@@ -130,7 +171,7 @@ impl Toast {
         }
     }
 
-    fn render_content(&self, id: u64, copied: bool, state: &Entity<AppState>, cx: &App) -> AnyElement {
+    fn render_content(&self, id: u64, copied: bool, expanded: bool, anchored: bool, state: &Entity<AppState>, cx: &App) -> AnyElement {
         let p = palette(cx);
         let (icon, color) = if let Some(custom) = self.leading_icon {
             let color = match (self.kind, custom) {
@@ -154,6 +195,8 @@ impl Toast {
         let show_copy = self.kind == ToastKind::Error && !self.hide_copy_button;
         let copy_payload = show_copy.then(|| self.copy_text());
         let copy_state = state.clone();
+        let expand_state = state.clone();
+        let has_slow_details = !self.slow_rpc_requests.is_empty();
         div()
             .relative()
             .w_full()
@@ -180,9 +223,14 @@ impl Toast {
                             .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child(self.title.clone()))
                             .when_some(copy_payload, |this, payload| {
                                 let label = if copied { "Copied error" } else { "Copy error" };
+                                let copy_id = if anchored {
+                                    format!("anchored-toast-copy-error-{id}")
+                                } else {
+                                    format!("toast-copy-error-{id}")
+                                };
                                 this.child(
                                     div()
-                                        .id(SharedString::from(format!("toast-copy-error-{id}")))
+                                        .id(SharedString::from(copy_id))
                                         .flex_none()
                                         .size(px(20.))
                                         .flex()
@@ -193,21 +241,93 @@ impl Toast {
                                         .text_color(if copied { hsla(p.success) } else { hsla(p.muted_foreground).opacity(0.8) })
                                         .hover(|s| s.text_color(hsla(p.muted_foreground)))
                                         .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label).build(window, cx))
-                                        .on_click(move |_, _, cx| {
+                                        .on_click(move |event, _, cx| {
                                             cx.stop_propagation();
+                                            let pos = event.position();
+                                            if payload.trim().is_empty() {
+                                                copy_state.update(cx, |state, cx| {
+                                                    state.show_anchored_copy_error(pos, "Nothing to copy.", cx);
+                                                });
+                                                return;
+                                            }
                                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(payload.clone()));
-                                            copy_state.update(cx, |state, cx| state.mark_toast_copied(id, cx));
+                                            copy_state.update(cx, |state, cx| {
+                                                if anchored {
+                                                    state.mark_anchored_toast_copied(id, cx);
+                                                } else {
+                                                    state.mark_toast_copied(id, cx);
+                                                    state.show_anchored_copied(pos, "Copied", cx);
+                                                }
+                                            });
                                         })
                                         .child((if copied { Icon::Check } else { Icon::Copy }).sized(px(12.))),
                                 )
                             }),
                     )
                     .children(self.description.clone().map(|text| {
-                        div()
-                            .text_color(hsla(p.muted_foreground))
-                            .when(self.kind == ToastKind::Error && text.len() >= 180, |d| d.max_h(px(84.)).overflow_hidden())
-                            .child(text)
+                        if has_slow_details {
+                            let toggle_label = if expanded { "Hide requests" } else { "Show requests" };
+                            let chevron = if expanded { Icon::ChevronUp } else { Icon::ChevronDown };
+                            div()
+                                .id(SharedString::from(format!("toast-expand-{id}")))
+                                .flex()
+                                .items_start()
+                                .gap(px(6.))
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(hsla(p.muted).opacity(0.4)))
+                                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(toggle_label).build(window, cx))
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    expand_state.update(cx, |state, cx| state.toggle_toast_expanded(id, cx));
+                                })
+                                .child(div().flex_1().min_w_0().text_color(hsla(p.muted_foreground)).child(text))
+                                .child(div().pt(px(2.)).flex_none().child(chevron.sized(px(14.)).text_color(hsla(p.muted_foreground).opacity(0.8))))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_color(hsla(p.muted_foreground))
+                                .when(self.kind == ToastKind::Error && text.len() >= 180, |d| d.max_h(px(84.)).overflow_hidden())
+                                .child(text)
+                                .into_any_element()
+                        }
                     }))
+                    .when(has_slow_details && expanded, |this| {
+                        let count = self.slow_rpc_requests.len();
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("toast-slow-requests-{id}")))
+                                .mt(px(8.))
+                                .max_h(px(160.))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .children(self.slow_rpc_requests.iter().enumerate().map(|(ix, req)| {
+                                    div()
+                                        .min_w_0()
+                                        .when(ix + 1 < count, |row| {
+                                            row.pb(px(8.))
+                                                .border_b_1()
+                                                .border_color(hsla(p.border).opacity(0.5))
+                                        })
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(hsla(p.foreground))
+                                                .child(req.tag.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .mt(px(2.))
+                                                .text_size(px(10.))
+                                                .text_color(hsla(p.muted_foreground).opacity(0.75))
+                                                .child(format!("Started {}", req.started_label)),
+                                        )
+                                })),
+                        )
+                    })
                     .children(self.open_thread.as_ref().map(|_| div().pt(px(4.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.primary)).child("Open thread"))),
             )
             .into_any_element()
@@ -218,6 +338,17 @@ struct Entry {
     id: u64,
     toast: Toast,
     copied: bool,
+    expanded: bool,
+    _copy_reset: Option<Task<()>>,
+    _timer: Option<Task<()>>,
+}
+
+struct AnchoredEntry {
+    id: u64,
+    anchor: gpui::Point<gpui::Pixels>,
+    toast: Toast,
+    tooltip_style: bool,
+    copied: bool,
     _copy_reset: Option<Task<()>>,
     _timer: Option<Task<()>>,
 }
@@ -227,6 +358,7 @@ struct Entry {
 pub struct Toasts {
     next_id: u64,
     entries: Vec<Entry>,
+    anchored: Vec<AnchoredEntry>,
     hovered: bool,
 }
 
@@ -234,6 +366,14 @@ impl Toasts {
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn latest(&self) -> Option<&Toast> {
         self.entries.first().map(|entry| &entry.toast)
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn by_key(&self, key: &str) -> Option<&Toast> {
+        self.entries
+            .iter()
+            .find(|entry| entry.toast.key.as_deref() == Some(key))
+            .map(|entry| &entry.toast)
     }
 
     pub(crate) fn has_thread_notifications(&self) -> bool {
@@ -266,12 +406,131 @@ impl AppState {
             Entry {
                 id,
                 copied: false,
+                expanded: false,
                 _copy_reset: None,
                 _timer: (!toast.persistent).then(|| toast_timer(id, cx)),
                 toast,
             },
         );
         cx.emit(AppEvent::Notice);
+    }
+
+    /// `SlowRpcRequestToastCoordinator.tsx`: upserts or closes the singleton slow-RPC warning toast.
+    pub fn sync_slow_rpc_toast(
+        &mut self,
+        requests: &[t3_client::session::SlowRpcAckRequest],
+        cx: &mut Context<Self>,
+    ) {
+        if requests.is_empty() {
+            self.close_toast_by_key(SLOW_RPC_TOAST_KEY, cx);
+            return;
+        }
+        let items = requests
+            .iter()
+            .map(|request| SlowRpcRequestItem {
+                request_id: request.request_id.clone(),
+                tag: request.tag.clone(),
+                started_label: format_started_time(request.started_at_ms),
+            })
+            .collect();
+        self.show_toast(
+            Toast::new(ToastKind::Warning, "Some requests are slow")
+                .description(describe_slow_rpc_requests(requests))
+                .key(SLOW_RPC_TOAST_KEY)
+                .persistent()
+                .slow_rpc_requests(items),
+            cx,
+        );
+    }
+
+    pub(crate) fn toggle_toast_expanded(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(entry) = self.toasts.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.expanded = !entry.expanded;
+            cx.emit(AppEvent::Notice);
+        }
+    }
+
+    /// `AnchoredToasts` (`components/ui/toast.tsx`): displays a popover anchored near a trigger point.
+    pub fn show_anchored_toast(
+        &mut self,
+        anchor: gpui::Point<gpui::Pixels>,
+        toast: Toast,
+        tooltip_style: bool,
+        timeout: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        self.toasts.next_id += 1;
+        let id = self.toasts.next_id;
+        let timer = timeout.map(|duration| anchored_toast_timer(id, duration, cx));
+        self.toasts.anchored.push(AnchoredEntry {
+            id,
+            anchor,
+            toast,
+            tooltip_style,
+            copied: false,
+            _copy_reset: None,
+            _timer: timer,
+        });
+        cx.emit(AppEvent::Notice);
+        id
+    }
+
+    /// `showAnchoredCopyErrorToast` (`components/ui/anchoredCopyToast.ts`): shows an anchored error
+    /// popover with copy-error button and close orb beside a failed copy trigger.
+    pub fn show_anchored_copy_error(
+        &mut self,
+        anchor: gpui::Point<gpui::Pixels>,
+        error: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        self.show_anchored_toast(
+            anchor,
+            Toast::new(ToastKind::Error, "Failed to copy").description(error),
+            false,
+            Some(TIMEOUT),
+            cx,
+        )
+    }
+
+    /// Compact tooltip-style anchored copy confirmation (`ANCHORED_COPY_TOAST_TIMEOUT_MS`).
+    pub fn show_anchored_copied(
+        &mut self,
+        anchor: gpui::Point<gpui::Pixels>,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        self.show_anchored_toast(
+            anchor,
+            Toast::new(ToastKind::Info, label),
+            true,
+            Some(ANCHORED_COPY_TOAST_TIMEOUT),
+            cx,
+        )
+    }
+
+    pub fn dismiss_anchored_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        let before = self.toasts.anchored.len();
+        self.toasts.anchored.retain(|entry| entry.id != id);
+        if self.toasts.anchored.len() != before {
+            cx.emit(AppEvent::Notice);
+        }
+    }
+
+    pub(crate) fn mark_anchored_toast_copied(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(entry) = self.toasts.anchored.iter_mut().find(|entry| entry.id == id) {
+            entry.copied = true;
+            entry._copy_reset = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(1200)).await;
+                let _ = this.update(cx, |state, cx| {
+                    if let Some(entry) = state.toasts.anchored.iter_mut().find(|e| e.id == id) {
+                        entry.copied = false;
+                        entry._copy_reset = None;
+                        cx.emit(AppEvent::Notice);
+                    }
+                });
+            }));
+            cx.emit(AppEvent::Notice);
+        }
     }
 
     pub fn close_toast_by_key(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -424,6 +683,37 @@ fn toast_timer(id: u64, cx: &mut Context<AppState>) -> Task<()> {
     })
 }
 
+fn anchored_toast_timer(id: u64, duration: Duration, cx: &mut Context<AppState>) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(duration).await;
+        let _ = this.update(cx, |state, cx| state.dismiss_anchored_toast(id, cx));
+    })
+}
+
+/// Computes `(left, top, max_width)` for an anchored toast clamped inside the viewport
+/// (`Toast.Positioner` in `components/ui/toast.tsx`, `max-w-[min(--spacing(64),var(--available-width))]`).
+pub(crate) fn anchored_toast_position(
+    anchor: gpui::Point<gpui::Pixels>,
+    viewport: gpui::Size<gpui::Pixels>,
+    tooltip_style: bool,
+) -> (f32, f32, f32) {
+    let vw = f32::from(viewport.width).max(160.);
+    let vh = f32::from(viewport.height).max(120.);
+    let max_width = ANCHORED_MAX_WIDTH.min((vw - 16.).max(120.));
+    let ax = f32::from(anchor.x);
+    let ay = f32::from(anchor.y);
+    let estimated_w = if tooltip_style { 96.0_f32.min(max_width) } else { max_width };
+    let estimated_h = if tooltip_style { 30.0_f32 } else { 96.0_f32 };
+    let left = (ax - estimated_w * 0.5).clamp(8., (vw - estimated_w - 8.).max(8.));
+    let below = ay + ANCHORED_SIDE_OFFSET;
+    let top = if below + estimated_h <= vh - 8. {
+        below
+    } else {
+        (ay - estimated_h - ANCHORED_SIDE_OFFSET).max(8.)
+    };
+    (left, top, max_width)
+}
+
 /// A toast's surface: dropdown glass, radius 8, the toast shadow.
 fn surface(cx: &App) -> gpui::Div {
     let p = palette(cx);
@@ -438,15 +728,20 @@ fn surface(cx: &App) -> gpui::Div {
 }
 
 /// The close orb on a toast's corner: 24px, `border` at 60%, `popover` at 92%, the pill shadow.
-fn close_orb(id: u64, state: Entity<AppState>, cx: &App) -> AnyElement {
+fn close_orb(id: u64, anchored: bool, state: Entity<AppState>, cx: &App) -> AnyElement {
     let p = palette(cx);
+    let close_id = if anchored {
+        format!("anchored-toast-close-{id}")
+    } else {
+        format!("toast-close-{id}")
+    };
     div()
         .absolute()
         .top(px(-6.))
         .right(px(-6.))
         .child(
             div()
-                .id(SharedString::from(format!("toast-close-{id}")))
+                .id(SharedString::from(close_id))
                 .size(px(24.))
                 .flex()
                 .items_center()
@@ -464,18 +759,24 @@ fn close_orb(id: u64, state: Entity<AppState>, cx: &App) -> AnyElement {
                 .hover(|this| this.bg(hsla(p.popover)).text_color(hsla(p.foreground)))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
-                    state.update(cx, |state, cx| state.dismiss_toast(id, cx));
+                    state.update(cx, |state, cx| {
+                        if anchored {
+                            state.dismiss_anchored_toast(id, cx);
+                        } else {
+                            state.dismiss_toast(id, cx);
+                        }
+                    });
                 })
                 .child(Icon::X.sized(px(12.))),
         )
         .into_any_element()
 }
 
-fn render_toast(id: u64, toast_data: &Toast, copied: bool, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
+fn render_toast(id: u64, toast_data: &Toast, copied: bool, expanded: bool, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
     let toast = surface(cx)
         .w_full()
         .id(SharedString::from(format!("toast-{id}")))
-        .child(toast_data.render_content(id, copied, state, cx));
+        .child(toast_data.render_content(id, copied, expanded, false, state, cx));
     let toast = if toast_data.github_star {
         toast.children(crate::github_star_prompt::actions(id, state, window, cx))
     } else { toast };
@@ -596,51 +897,127 @@ fn render_toast(id: u64, toast_data: &Toast, copied: bool, state: &Entity<AppSta
         }
         None => toast.into_any_element(),
     };
-    div().relative().w_full().child(toast).child(close_orb(id, state.clone(), cx)).into_any_element()
+    div().relative().w_full().child(toast).child(close_orb(id, false, state.clone(), cx)).into_any_element()
 }
 
-/// The stack, positioned by the window: top-right, inset 32, below the 52px header. It paints over
-/// the settings modal and dialogs, as toasts sit above them on the web (layer 100).
+struct AnchoredToastSnapshot {
+    id: u64,
+    anchor: gpui::Point<gpui::Pixels>,
+    toast: Toast,
+    tooltip_style: bool,
+    copied: bool,
+}
+
+fn render_anchored_toast(
+    item: &AnchoredToastSnapshot,
+    state: &Entity<AppState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let p = palette(cx);
+    let (left, top, max_width) = anchored_toast_position(item.anchor, window.viewport_size(), item.tooltip_style);
+    if item.tooltip_style {
+        return div()
+            .id(SharedString::from(format!("anchored-toast-{}", item.id)))
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .max_w(px(max_width))
+            .child(
+                surface(cx)
+                    .rounded(px(6.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .text_xs()
+                    .text_color(hsla(p.popover_foreground))
+                    .child(item.toast.title.clone()),
+            )
+            .into_any_element();
+    }
+    let popup = surface(cx)
+        .w(px(max_width))
+        .id(SharedString::from(format!("anchored-toast-{}", item.id)))
+        .child(item.toast.render_content(item.id, item.copied, false, true, state, cx));
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .max_w(px(max_width))
+        .child(div().relative().w_full().child(popup).child(close_orb(item.id, true, state.clone(), cx)))
+        .into_any_element()
+}
+
+/// The stack, positioned by the window: top-right, inset 32, below the 52px header, plus any
+/// anchored copy-error / copy-confirmation popovers (`AnchoredToasts`). It paints over the
+/// settings modal and dialogs, as toasts sit above them on the web (layer 100).
 pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
-    let (visible, hovered) = {
+    let (visible, hovered, anchored) = {
         let toasts = &state.read(cx).toasts;
         (
             toasts
                 .entries
                 .iter()
                 .take(VISIBLE_LIMIT)
-                .map(|entry| (entry.id, entry.toast.clone(), entry.copied))
+                .map(|entry| (entry.id, entry.toast.clone(), entry.copied, entry.expanded))
                 .collect::<Vec<_>>(),
             toasts.hovered,
+            toasts
+                .anchored
+                .iter()
+                .map(|entry| AnchoredToastSnapshot {
+                    id: entry.id,
+                    anchor: entry.anchor,
+                    toast: entry.toast.clone(),
+                    tooltip_style: entry.tooltip_style,
+                    copied: entry.copied,
+                })
+                .collect::<Vec<_>>(),
         )
     };
-    let front = visible.first()?;
-    let expanded = hovered || visible.len() == 1;
-    let peeks = if expanded { 0 } else { visible.len() - 1 };
-    let hover_state = state.clone();
-    let container = div()
-        .id("toast-stack")
-        .absolute()
-        .top(px(32. + 52.))
-        .right(px(32.))
-        .w(px(WIDTH))
-        .flex()
-        .flex_col()
-        .gap(px(GAP))
-        .pb(px(GAP * peeks as f32))
-        .on_hover(move |hovered, _, cx| hover_state.update(cx, |state, cx| state.set_toasts_hovered(*hovered, cx)));
-    let container = if expanded {
-        container.children(visible.iter().map(|(id, toast, copied)| render_toast(*id, toast, *copied, state, window, cx)))
-    } else {
-        // Back toasts first so the front one paints over them; each peeks 12px lower, 10% narrower.
-        container
-            .children((1..=peeks).rev().map(|index| {
-                let inset = WIDTH * 0.05 * index as f32;
-                surface(cx).absolute().left(px(inset)).right(px(inset)).bottom(px(GAP * (peeks - index) as f32)).h(px(GAP * 2.)).into_any_element()
+    if visible.is_empty() && anchored.is_empty() {
+        return None;
+    }
+    let mut layer = div().absolute().inset_0();
+    if let Some(front) = visible.first() {
+        let expanded_stack = hovered || visible.len() == 1;
+        let peeks = if expanded_stack { 0 } else { visible.len() - 1 };
+        let hover_state = state.clone();
+        let container = div()
+            .id("toast-stack")
+            .absolute()
+            .top(px(32. + 52.))
+            .right(px(32.))
+            .w(px(WIDTH))
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .pb(px(GAP * peeks as f32))
+            .on_hover(move |hovered, _, cx| hover_state.update(cx, |state, cx| state.set_toasts_hovered(*hovered, cx)));
+        let container = if expanded_stack {
+            container.children(visible.iter().map(|(id, toast, copied, expanded)| {
+                render_toast(*id, toast, *copied, *expanded, state, window, cx)
             }))
-            .child(render_toast(front.0, &front.1, front.2, state, window, cx))
-    };
-    Some(gpui::deferred(container).with_priority(60).into_any_element())
+        } else {
+            // Back toasts first so the front one paints over them; each peeks 12px lower, 10% narrower.
+            container
+                .children((1..=peeks).rev().map(|index| {
+                    let inset = WIDTH * 0.05 * index as f32;
+                    surface(cx)
+                        .absolute()
+                        .left(px(inset))
+                        .right(px(inset))
+                        .bottom(px(GAP * (peeks - index) as f32))
+                        .h(px(GAP * 2.))
+                        .into_any_element()
+                }))
+                .child(render_toast(front.0, &front.1, front.2, front.3, state, window, cx))
+        };
+        layer = layer.child(container);
+    }
+    for item in &anchored {
+        layer = layer.child(render_anchored_toast(item, state, window, cx));
+    }
+    Some(gpui::deferred(layer).with_priority(60).into_any_element())
 }
 
 #[cfg(all(test, feature = "snapshot"))]
@@ -850,6 +1227,91 @@ mod tests {
             t3_client::store::load_ui_state(&format!("permission-update-dismissed-{env_key}")).and_then(|v| v.as_bool()),
             Some(true)
         );
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn slow_rpc_toast_coordinator_and_anchored_copy_error_popover(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        struct Root(Entity<AppState>);
+        impl Render for Root {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().children(stack(&self.0, window, cx))
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+
+        // 1. Slow RPC coordinator upserts a single persistent warning toast and preserves expanded state.
+        let req1 = t3_client::session::SlowRpcAckRequest {
+            request_id: "r1".into(),
+            started_at_ms: 1_700_000_000_000,
+            tag: "orchestration.dispatchCommand · Mac".into(),
+            threshold_ms: 15_000,
+        };
+        let req2 = t3_client::session::SlowRpcAckRequest {
+            request_id: "r2".into(),
+            started_at_ms: 1_700_000_005_000,
+            tag: "vcs.refreshStatus · Mac".into(),
+            threshold_ms: 120_000,
+        };
+        state.update(cx, |state, cx| state.sync_slow_rpc_toast(std::slice::from_ref(&req1), cx));
+        let slow_id = state.read_with(cx, |state, _| {
+            let entry = state.toasts.entries.first().expect("slow rpc toast");
+            assert_eq!(entry.toast.kind, ToastKind::Warning);
+            assert_eq!(entry.toast.title, "Some requests are slow");
+            assert_eq!(entry.toast.description.as_deref(), Some("1 request waiting longer than 15s."));
+            assert_eq!(entry.toast.slow_rpc_requests.len(), 1);
+            entry.id
+        });
+        state.update(cx, |state, cx| state.toggle_toast_expanded(slow_id, cx));
+        state.update(cx, |state, cx| state.sync_slow_rpc_toast(&[req1.clone(), req2.clone()], cx));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.toasts.entries.len(), 1);
+            let entry = &state.toasts.entries[0];
+            assert!(entry.expanded, "live slow-rpc update preserves expanded drawer");
+            assert_eq!(entry.toast.description.as_deref(), Some("2 requests waiting longer than 15s."));
+            assert_eq!(entry.toast.slow_rpc_requests.len(), 2);
+        });
+
+        // 2. Anchored copy-error popover & tooltip-style anchored copy toast clamp and render cleanly.
+        let anchored_err_id = state.update(cx, |state, cx| {
+            state.show_anchored_copy_error(point(px(790.), px(580.)), "Clipboard unavailable", cx)
+        });
+        let anchored_tip_id = state.update(cx, |state, cx| {
+            state.show_anchored_copied(point(px(10.), px(10.)), "Copied", cx)
+        });
+        let (left, top, max_w) = anchored_toast_position(point(px(790.), px(580.)), size(px(800.), px(600.)), false);
+        assert!(left + max_w <= 800.0 && left >= 8.0, "clamped horizontally: {left}, {max_w}");
+        assert!(top < 580.0 && top >= 8.0, "flipped above near bottom edge: {top}");
+
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| Root(state.clone()));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        state.update(cx, |state, cx| {
+            state.dismiss_anchored_toast(anchored_err_id, cx);
+            state.dismiss_anchored_toast(anchored_tip_id, cx);
+            state.sync_slow_rpc_toast(&[], cx);
+        });
+        state.read_with(cx, |state, _| {
+            assert!(state.toasts.entries.is_empty());
+            assert!(state.toasts.anchored.is_empty());
+        });
 
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
