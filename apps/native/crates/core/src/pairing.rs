@@ -1,11 +1,14 @@
 //! Pairing links (`https://host:port/pair#token=…`, hosted `https://app.t3.codes/pair?host=…#token=…`,
 //! `t3code://pair?u=…`), link-request machine resolution (`packages/client-runtime/src/linkRequest.ts`),
+//! one-use peer pairing & MCP approval codes (`packages/client-runtime/src/state/peerPairingCode.ts`),
+//! `LinkMachineSelect` presentation helpers (`apps/web/src/components/settings/LinkMachineSelect.tsx`),
 //! access environment selection (`apps/web/src/components/settings/ConnectionsSettings.logic.ts`),
 //! Tailscale Serve reachability (`pingdotgg/t3code#35543`), and legacy-permission detection
 //! (`packages/contracts/src/auth.ts`).
 
 use std::collections::HashSet;
 
+use serde_json::{Value, json};
 use url::Url;
 
 use crate::auth::AuthSessionState;
@@ -139,16 +142,142 @@ pub fn collect_known_machine_urls<'a>(candidates: impl IntoIterator<Item = &'a s
 
 /// The machine choice constant for linking by an address typed in (`ANOTHER_ADDRESS`).
 pub const ANOTHER_ADDRESS: &str = "another-address";
+/// `MINT_TIMEOUT_MS` in `packages/client-runtime/src/state/peerPairingCode.ts`.
+pub const MINT_PAIRING_CODE_TIMEOUT_MS: u64 = 8_000;
+/// `PEER_PAIRING_CODE_LABEL` in `packages/client-runtime/src/state/peerPairingCode.ts`.
+pub const PEER_PAIRING_CODE_LABEL: &str = "T3 Code link";
+/// `MCP_APPROVAL_CODE_LABEL` in `packages/client-runtime/src/state/peerPairingCode.ts`.
+pub const MCP_APPROVAL_CODE_LABEL: &str = "App sign-in";
+
+/// Why minting a one-use pairing code on a peer environment failed (`PeerPairingCodeError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerPairingCodeErrorReason {
+    NotAllowed,
+    Unavailable,
+}
+
+/// `PeerPairingCodeError` (`packages/client-runtime/src/state/peerPairingCode.ts`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", self.user_message())]
+pub struct PeerPairingCodeError {
+    pub reason: PeerPairingCodeErrorReason,
+    pub detail: Option<String>,
+}
+
+impl PeerPairingCodeError {
+    pub fn not_allowed(detail: impl Into<Option<String>>) -> Self {
+        Self { reason: PeerPairingCodeErrorReason::NotAllowed, detail: detail.into() }
+    }
+
+    pub fn unavailable(detail: impl Into<Option<String>>) -> Self {
+        Self { reason: PeerPairingCodeErrorReason::Unavailable, detail: detail.into() }
+    }
+
+    pub fn user_message(&self) -> &'static str {
+        match self.reason {
+            PeerPairingCodeErrorReason::NotAllowed => {
+                "Your session there cannot create pairing codes. Paste a code from there instead."
+            }
+            PeerPairingCodeErrorReason::Unavailable => {
+                "Could not get a pairing code from there. Paste a code from there instead."
+            }
+        }
+    }
+}
+
+/// Decoded `AuthPairingCredentialResult` from `POST /api/auth/pairing-token`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingCredentialResult {
+    pub id: Option<String>,
+    pub credential: String,
+    pub expires_at: Option<String>,
+    pub label: Option<String>,
+}
+
+/// Builds the `POST /api/auth/pairing-token` body for `createPeerPairingCodeCommand`.
+pub fn peer_pairing_code_request_body(access: &str) -> Value {
+    json!({
+        "label": PEER_PAIRING_CODE_LABEL,
+        "scopes": crate::settings::mcp_client_scopes(access),
+    })
+}
+
+/// Builds the `POST /api/auth/pairing-token` body for `createMcpApprovalCodeCommand`.
+pub fn mcp_approval_code_request_body(access: &str) -> Value {
+    json!({
+        "label": MCP_APPROVAL_CODE_LABEL,
+        "access": access,
+    })
+}
+
+/// Decodes a `POST /api/auth/pairing-token` JSON reply into `PairingCredentialResult`.
+pub fn decode_pairing_credential_result(value: &Value) -> Option<PairingCredentialResult> {
+    let credential = value
+        .get("credential")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    Some(PairingCredentialResult {
+        id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+        credential,
+        expires_at: value.get("expiresAt").and_then(Value::as_str).map(str::to_owned),
+        label: value.get("label").and_then(Value::as_str).map(str::to_owned),
+    })
+}
+
+/// Status badge shown beside a machine in `LinkMachineSelect` (`LinkMachineBadge`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkMachineBadge {
+    Linked,
+    T3Connect,
+    NotConnected,
+}
+
+impl LinkMachineBadge {
+    pub fn label(self) -> &'static str {
+        match self {
+            LinkMachineBadge::Linked => "Linked",
+            LinkMachineBadge::T3Connect => "T3 Connect",
+            LinkMachineBadge::NotConnected => "Not connected",
+        }
+    }
+}
 
 /// A machine the user could link a thread's environment to (`LinkableMachine`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkableMachine {
     pub environment_id: String,
     pub label: String,
+    pub machine: Option<String>,
     pub urls: Vec<String>,
     pub connected: bool,
     pub connect_only: bool,
     pub linked: bool,
+}
+
+/// `LinkMachineBadge` (`apps/web/src/components/settings/LinkMachineSelect.tsx`).
+pub fn link_machine_badge(machine: &LinkableMachine) -> Option<LinkMachineBadge> {
+    if machine.linked {
+        return Some(LinkMachineBadge::Linked);
+    }
+    if machine.connected {
+        return None;
+    }
+    Some(if machine.connect_only { LinkMachineBadge::T3Connect } else { LinkMachineBadge::NotConnected })
+}
+
+/// Trigger label for `LinkMachineSelect` (`apps/web/src/components/settings/LinkMachineSelect.tsx`).
+pub fn link_machine_select_label(machines: &[LinkableMachine], selected: Option<&str>) -> String {
+    match selected {
+        Some(ANOTHER_ADDRESS) => "Another address\u{2026}".to_owned(),
+        Some(id) => machines
+            .iter()
+            .find(|candidate| candidate.environment_id == id)
+            .map(|machine| machine.label.clone())
+            .unwrap_or_else(|| "Choose a machine".to_owned()),
+        None => "Choose a machine".to_owned(),
+    }
 }
 
 /// What a link request resolves to (`LinkRequestTarget` in `linkRequest.ts`).
@@ -346,6 +475,7 @@ mod tests {
             LinkableMachine {
                 environment_id: "env-a".into(),
                 label: "Studio".into(),
+                machine: Some("mac-studio".into()),
                 urls: vec!["https://studio.ts.net:3773".into(), "http://10.0.0.5:3773".into()],
                 connected: true,
                 connect_only: false,
@@ -354,6 +484,7 @@ mod tests {
             LinkableMachine {
                 environment_id: "env-b".into(),
                 label: "Lab".into(),
+                machine: Some("linux".into()),
                 urls: vec!["http://10.0.0.5:3773".into()],
                 connected: false,
                 connect_only: false,
@@ -419,5 +550,64 @@ mod tests {
         assert!(!session_has_legacy_permissions(&modern));
         let unauth = AuthSessionState { authenticated: false, ..legacy };
         assert!(!session_has_legacy_permissions(&unauth));
+    }
+
+    #[test]
+    fn peer_pairing_code_payloads_errors_and_link_machine_select_helpers_match_web() {
+        let peer_body = peer_pairing_code_request_body("read-only");
+        assert_eq!(peer_body["label"], PEER_PAIRING_CODE_LABEL);
+        assert_eq!(peer_body["scopes"], json!(["orchestration:read"]));
+
+        let full_body = peer_pairing_code_request_body("full-access");
+        assert_eq!(
+            full_body["scopes"],
+            json!(["orchestration:read", "orchestration:operate", "settings:write", "source-control:write"])
+        );
+
+        let approval_body = mcp_approval_code_request_body("approval-required");
+        assert_eq!(approval_body, json!({ "label": MCP_APPROVAL_CODE_LABEL, "access": "approval-required" }));
+
+        let decoded = decode_pairing_credential_result(&json!({
+            "id": "link-1",
+            "credential": "AUTO-abc123",
+            "expiresAt": "2026-11-19T10:00:00.000Z",
+            "label": "App sign-in"
+        }))
+        .expect("decoded credential");
+        assert_eq!(decoded.credential, "AUTO-abc123");
+        assert_eq!(decoded.id.as_deref(), Some("link-1"));
+        assert_eq!(decode_pairing_credential_result(&json!({ "credential": "   " })), None);
+
+        assert_eq!(
+            PeerPairingCodeError::not_allowed(None).to_string(),
+            "Your session there cannot create pairing codes. Paste a code from there instead."
+        );
+        assert_eq!(
+            PeerPairingCodeError::unavailable(None).to_string(),
+            "Could not get a pairing code from there. Paste a code from there instead."
+        );
+
+        let linked = LinkableMachine {
+            environment_id: "e1".into(),
+            label: "Studio".into(),
+            machine: Some("mac-studio".into()),
+            urls: vec!["https://studio.ts.net".into()],
+            connected: false,
+            connect_only: true,
+            linked: true,
+        };
+        let connected = LinkableMachine { environment_id: "e2".into(), label: "Mini".into(), linked: false, connected: true, connect_only: false, ..linked.clone() };
+        let connect_only = LinkableMachine { environment_id: "e3".into(), label: "Cloud".into(), linked: false, connected: false, connect_only: true, ..linked.clone() };
+        let offline = LinkableMachine { environment_id: "e4".into(), label: "Offline".into(), linked: false, connected: false, connect_only: false, ..linked.clone() };
+        assert_eq!(link_machine_badge(&linked), Some(LinkMachineBadge::Linked));
+        assert_eq!(link_machine_badge(&connected), None);
+        assert_eq!(link_machine_badge(&connect_only), Some(LinkMachineBadge::T3Connect));
+        assert_eq!(link_machine_badge(&offline), Some(LinkMachineBadge::NotConnected));
+
+        let all = [linked, connected, connect_only, offline];
+        assert_eq!(link_machine_select_label(&all, None), "Choose a machine");
+        assert_eq!(link_machine_select_label(&all, Some(ANOTHER_ADDRESS)), "Another address\u{2026}");
+        assert_eq!(link_machine_select_label(&all, Some("e2")), "Mini");
+        assert_eq!(link_machine_select_label(&all, Some("missing")), "Choose a machine");
     }
 }

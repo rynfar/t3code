@@ -3,11 +3,15 @@
 //! in `components/ui/sidebar.tsx`.
 
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use gpui::{ ClickEvent, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window, WindowControlArea, div, prelude::*, px};
+use gpui::{
+    ClickEvent, ClipboardItem, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton,
+    ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window, WindowControlArea, div,
+    prelude::*, px,
+};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
-use t3_client::status::host_freeze_notice;
+use t3_client::status::{HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::keybindings::{WorkspaceFocusArea, next_workspace_focus_area};
 use t3_core::pairing::session_has_legacy_permissions;
@@ -69,8 +73,10 @@ pub struct Workspace {
     keybindings_toast: KeybindingsUpdateToastController,
     seen_keybindings_updated_seq: u64,
     seen_keybindings_connection: Option<u64>,
-    shown_host_freezes: HashSet<(String, u64, Option<u64>, u32)>,
+    shown_host_freezes: HashSet<String>,
     shown_permission_notices: HashSet<String>,
+    connection_diagnosis_open: bool,
+    inactive_since: Option<Instant>,
     history_swipe: HistorySwipe,
     _swipe_clear: Option<Task<()>>,
     last_window_title: Option<String>,
@@ -169,10 +175,21 @@ impl Workspace {
                 if matches!(event, AppEvent::Selection) {
                     state.update(cx, |state, cx| state.close_sidebar_sheet(cx));
                 }
+                if matches!(event, AppEvent::Phase)
+                    && (matches!(state.read(cx).phase, Phase::Online(ConnectionStatus::Connected))
+                        || !matches!(state.read(cx).phase, Phase::Online(_)))
+                {
+                    this.connection_diagnosis_open = false;
+                }
                 if matches!(event, AppEvent::ServerConfig | AppEvent::Phase) {
                     this.handle_keybindings_config_toast(cx);
+                }
+                if matches!(event, AppEvent::ServerConfig | AppEvent::Phase | AppEvent::Shell) {
                     this.handle_host_freeze_toasts(cx);
                     this.handle_permission_update_toasts(cx);
+                    if matches!(event, AppEvent::ServerConfig) {
+                        state.read(cx).sync_learned_environment_routes();
+                    }
                 }
                 if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::Phase | AppEvent::ServerConfig) {
                     this.sync_window_title(window, cx);
@@ -198,15 +215,24 @@ impl Workspace {
                     cx.notify();
                 }
             }),
-            // Coming back to the app retires its delivered notifications, as the web's focus does.
+            // Coming back to the app retires its delivered notifications and signals connection
+            // supervisors (`wakeups.ts`: `application-focused` / `application-active-long`).
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.state.update(cx, |state, cx| state.clear_pending_notifications(cx));
+                    let wakeup = match this.inactive_since.take() {
+                        Some(since) => t3_client::wakeups::classify_app_resume(since.elapsed()),
+                        None => t3_client::wakeups::ConnectionWakeup::ApplicationFocused,
+                    };
+                    t3_client::wakeups::emit_wakeup(wakeup);
                 } else {
+                    this.inactive_since = Some(Instant::now());
                     crate::voice::handle_window_blur(cx);
                 }
             }),
         ];
+        #[cfg(all(target_os = "macos", not(test)))]
+        register_macos_wake_observer();
         let mut workspace = Workspace {
             state,
             focus_observer,
@@ -225,6 +251,8 @@ impl Workspace {
             seen_keybindings_connection: initial_kb_conn,
             shown_host_freezes: HashSet::new(),
             shown_permission_notices: HashSet::new(),
+            connection_diagnosis_open: false,
+            inactive_since: None,
             history_swipe: HistorySwipe::default(),
             _swipe_clear: None,
             last_window_title: None,
@@ -264,8 +292,8 @@ impl Workspace {
         workspace
     }
 
-    /// CN-STATUS: while not connected, a status dot and title with the diagnosis as a tooltip,
-    /// and Retry where it can do something.
+    /// CN-STATUS: while not connected, a clickable status dot and title with the diagnosis
+    /// popover (and tooltip while closed), plus Retry where it can do something.
     fn render_connection_status(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let state = self.state.read(cx);
         let Phase::Online(status) = &state.phase else { return None };
@@ -273,8 +301,10 @@ impl Workspace {
             return None;
         }
         let host = state.active_environment().map(|environment| environment.label.clone()).unwrap_or_default();
+        let has_diagnosis = diagnose(status, &host).is_some();
         let details: gpui::SharedString = status.details(&host).into();
         let error_tone = status.summary().1;
+        let open = self.connection_diagnosis_open && has_diagnosis;
         let p = palette(cx);
         Some(
             h_flex()
@@ -284,9 +314,29 @@ impl Workspace {
                     h_flex()
                         .id("connection-status")
                         .gap(px(4.))
+                        .px(px(6.))
+                        .py(px(3.))
+                        .rounded(px(6.))
+                        .items_center()
+                        .when(open, |this| this.bg(hsla(p.accent)))
+                        .when(has_diagnosis, |this| {
+                            this.cursor_pointer()
+                                .hover(|this| this.bg(hsla(p.accent)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.connection_diagnosis_open = !this.connection_diagnosis_open;
+                                    cx.notify();
+                                }))
+                        })
                         .child(crate::connect::status_dot(Some(status.dot()), cx))
-                        .child(div().text_xs().text_color(if error_tone { hsla(p.destructive_foreground) } else { hsla(p.muted_foreground) }).child(status.title()))
-                        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(details.clone()).build(window, cx)),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if error_tone { hsla(p.destructive_foreground) } else { hsla(p.muted_foreground) })
+                                .child(status.title()),
+                        )
+                        .when(!open, |this| {
+                            this.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(details.clone()).build(window, cx))
+                        }),
                 )
                 .when(status.can_retry(), |this| {
                     this.child(
@@ -298,6 +348,170 @@ impl Workspace {
                     )
                 })
                 .into_any_element(),
+        )
+    }
+
+    /// CN-STATUS: floating connection diagnosis popover (`ConnectionStatusDot.tsx` +
+    /// `ConnectionDiagnosisDetails.tsx`), anchored beneath the titlebar status dot.
+    fn render_connection_diagnosis_popover(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.connection_diagnosis_open {
+            return None;
+        }
+        let state = self.state.read(cx);
+        let Phase::Online(status) = &state.phase else { return None };
+        let host = state
+            .active_environment()
+            .map(|environment| environment.label.clone())
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| "this environment".to_owned());
+        let diag = diagnose(status, &host)?;
+        let copy_text = connection_diagnosis_text(&host, &diag);
+        let can_retry = status.can_retry();
+        let attempt = status.attempt();
+        let subtitle = if attempt > 0 { format!("{host} \u{00b7} Attempt {attempt}") } else { host };
+        let p = palette(cx);
+        let mono = cx.theme().mono_font_family.clone();
+        let panel = v_flex()
+            .id("connection-diagnosis-popover")
+            .absolute()
+            .top(px(TITLEBAR_HEIGHT + 4.))
+            .right(px(16.))
+            .w(px(360.))
+            .max_w(px(400.))
+            .rounded(px(12.))
+            .shadow_lg()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(crate::glass::backdrop(12., hsla(p.popover), hsla(p.border), cx))
+            .child(
+                v_flex()
+                    .relative()
+                    .p(px(14.))
+                    .gap(px(10.))
+                    .text_xs()
+                    .child(
+                        h_flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .child(div().pt(px(2.)).child(crate::connect::status_dot(Some(status.dot()), cx)))
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(hsla(p.destructive_foreground))
+                                            .child(diag.headline.clone()),
+                                    )
+                                    .child(div().text_color(hsla(p.muted_foreground)).child(subtitle)),
+                            )
+                            .child(
+                                crate::right_panel::Button::new("connection-diagnosis-close")
+                                    .variant(crate::right_panel::Variant::GhostMuted)
+                                    .size(crate::right_panel::Size::Xs)
+                                    .icon(Icon::X)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.connection_diagnosis_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(v_flex().gap(px(3.)).children(diag.hops.iter().map(|hop| {
+                        let color = match hop.result {
+                            HopResult::Failed => hsla(p.destructive_foreground),
+                            HopResult::Ok => hsla(p.foreground),
+                            HopResult::Unchecked => hsla(p.muted_foreground),
+                        };
+                        let note = hop.result.note();
+                        let line = if note.is_empty() {
+                            format!("{} {}", hop.result.mark(), hop.label)
+                        } else {
+                            format!("{} {} ({note})", hop.result.mark(), hop.label)
+                        };
+                        div().text_color(color).child(line)
+                    })))
+                    .when(!diag.steps.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .gap(px(3.))
+                                .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("What to try"))
+                                .children(
+                                    diag.steps
+                                        .iter()
+                                        .map(|step| div().text_color(hsla(p.muted_foreground)).child(format!("\u{2022} {step}"))),
+                                ),
+                        )
+                    })
+                    .when(!diag.facts.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .gap(px(2.))
+                                .px(px(8.))
+                                .py(px(6.))
+                                .rounded(px(6.))
+                                .bg(hsla(p.muted).opacity(0.45))
+                                .font_family(mono)
+                                .text_color(hsla(p.muted_foreground))
+                                .children(diag.facts.iter().map(|(k, v)| div().child(format!("{k}: {v}")))),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap(px(6.))
+                            .when(can_retry, |this| {
+                                this.child(
+                                    crate::right_panel::Button::new("connection-diagnosis-retry")
+                                        .variant(crate::right_panel::Variant::Ghost)
+                                        .size(crate::right_panel::Size::Xs)
+                                        .label("Retry now")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.connection_diagnosis_open = false;
+                                            this.state.read(cx).retry_connection();
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .child(
+                                crate::right_panel::Button::new("connection-diagnosis-copy")
+                                    .variant(crate::right_panel::Variant::GhostMuted)
+                                    .size(crate::right_panel::Size::Xs)
+                                    .label("Copy diagnostics")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                        this.state.update(cx, |state, cx| {
+                                            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Info, "Diagnostics copied"), cx);
+                                        });
+                                    })),
+                            )
+                            .child(
+                                crate::right_panel::Button::new("connection-diagnosis-switch")
+                                    .variant(crate::right_panel::Variant::GhostMuted)
+                                    .size(crate::right_panel::Size::Xs)
+                                    .label("Switch environment")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.connection_diagnosis_open = false;
+                                        this.state.update(cx, |state, cx| state.open_switcher(cx));
+                                    })),
+                            ),
+                    ),
+            );
+        Some(
+            gpui::deferred(
+                div()
+                    .id("connection-diagnosis-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                        this.connection_diagnosis_open = false;
+                        cx.notify();
+                    }))
+                    .child(panel),
+            )
+            .with_priority(50)
+            .into_any_element(),
         )
     }
 
@@ -489,6 +703,12 @@ impl Render for Workspace {
             }))
             .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
+                    if this.connection_diagnosis_open {
+                        this.connection_diagnosis_open = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
                     let overlay_open = this.menu.read(cx).is_open()
                         || this.dialog.read(cx).is_open()
                         || this.snooze.read(cx).is_open()
@@ -652,6 +872,7 @@ impl Render for Workspace {
             .child(self.ssh_prompt.clone())
             .child(self.welcome.clone())
             .children(crate::voice::render_active_voice_setup_modal(cx))
+            .children(self.render_connection_diagnosis_popover(cx))
             .children(crate::toast::stack(&self.state, window, cx))
             .children(crate::github_star_prompt::confetti_overlay(&self.state, cx))
             .children(crate::updates::overlay(cx))
@@ -1001,12 +1222,22 @@ impl Workspace {
         }
     }
 
-    /// `HostFreezeToastCoordinator.ts`: tells the user once per reported stall why a host stopped
-    /// answering when it reports `lastEventLoopStall` on connect/reconnect.
+    /// `HostFreezeToastCoordinator.ts`: tells the user once per reported stall (`envId:detectedAt`)
+    /// why any active or fleet host stopped answering when it reports `lastEventLoopStall`.
     fn handle_host_freeze_toasts(&mut self, cx: &mut Context<Self>) {
-        let notices: Vec<(String, String, String, u64, Option<u64>, u32)> = {
+        let notices: Vec<(String, String, String)> = {
             let state = self.state.read(cx);
             let mut out = Vec::new();
+            let mut seen_keys = HashSet::new();
+            let mut push_stall = |env_key: String, label: &str, stall: &t3_client::status::ServerEventLoopStall| {
+                let dedup = stall.dedup_key(&env_key);
+                if !seen_keys.insert(dedup.clone()) {
+                    return;
+                }
+                if let Some(notice) = host_freeze_notice(label, Some(stall)) {
+                    out.push((dedup, notice.title, notice.description));
+                }
+            };
             if let Some(client) = state.client_handle()
                 && let Some(stall) = client.server_config_extras().borrow().last_event_loop_stall.clone()
             {
@@ -1019,21 +1250,43 @@ impl Workspace {
                     .map(|e| e.label.clone())
                     .or_else(|| state.server_config.config.as_ref().map(|c| c.environment.label.clone()))
                     .unwrap_or_default();
-                if let Some(notice) = host_freeze_notice(&label, Some(&stall)) {
-                    out.push((
-                        env_key,
-                        notice.title,
-                        notice.description,
-                        stall.duration_ms.to_bits(),
-                        stall.load_average.map(f64::to_bits),
-                        stall.cpu_count,
-                    ));
+                push_stall(env_key, &label, &stall);
+            }
+            for env in &state.environments.environments {
+                let extras = t3_client::supervisor::server_config_extras_for(&env.http_base);
+                if let Some(stall) = extras.borrow().last_event_loop_stall.as_ref() {
+                    let env_key = env.environment_id.clone().unwrap_or_else(|| env.id.clone());
+                    push_stall(env_key, &env.label, stall);
+                }
+            }
+            for env in &state.fleet.environments {
+                let Some(saved) = state.environments.get(&env.summary.owner.saved_id) else { continue };
+                let extras = t3_client::supervisor::server_config_extras_for(&saved.http_base);
+                if let Some(stall) = extras.borrow().last_event_loop_stall.as_ref() {
+                    let env_key = env
+                        .config
+                        .config
+                        .as_ref()
+                        .map(|c| c.environment.environment_id.clone())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| saved.environment_id.clone())
+                        .unwrap_or_else(|| saved.id.clone());
+                    let label = if !saved.label.trim().is_empty() {
+                        saved.label.as_str()
+                    } else {
+                        env.config
+                            .config
+                            .as_ref()
+                            .map(|c| c.environment.label.as_str())
+                            .unwrap_or_default()
+                    };
+                    push_stall(env_key, label, stall);
                 }
             }
             out
         };
-        for (env_key, title, description, dur, load, cpus) in notices {
-            if self.shown_host_freezes.insert((env_key, dur, load, cpus)) {
+        for (dedup_key, title, description) in notices {
+            if self.shown_host_freezes.insert(dedup_key) {
                 self.state.update(cx, |state, cx| {
                     state.show_toast(
                         crate::toast::Toast::new(crate::toast::ToastKind::Warning, title).description(description),
@@ -1225,7 +1478,8 @@ impl Workspace {
     fn has_blocking_overlay(&self, window: &mut Window, cx: &mut gpui::App) -> bool {
         // Note: `updates::overlay(cx)` returns the persistent `UpdateDialog` entity whenever
         // `UpdateControl` is mounted (even while closed), so it cannot be checked with `.is_some()`.
-        self.menu.read(cx).is_open()
+        self.connection_diagnosis_open
+            || self.menu.read(cx).is_open()
             || self.dialog.read(cx).is_open()
             || self.snooze.read(cx).is_open()
             || self.palette.read(cx).is_open()
@@ -1395,6 +1649,46 @@ impl Workspace {
         }
         self.right_panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
     }
+}
+
+/// Registers a single process-wide macOS `NSWorkspaceDidWakeNotification` observer so returning
+/// from system sleep wakes every connection supervisor (`wakeups.ts`).
+#[cfg(all(target_os = "macos", not(test)))]
+fn register_macos_wake_observer() {
+    use std::sync::OnceLock;
+    use block2::RcBlock;
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2_foundation::NSString;
+
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    REGISTERED.get_or_init(|| unsafe {
+        let Some(ws_cls) = AnyClass::get(c"NSWorkspace") else {
+            return;
+        };
+        let workspace: Option<Retained<AnyObject>> = msg_send![ws_cls, sharedWorkspace];
+        let Some(workspace) = workspace else {
+            return;
+        };
+        let center: Option<Retained<AnyObject>> = msg_send![&*workspace, notificationCenter];
+        let Some(center) = center else {
+            return;
+        };
+        let name = NSString::from_str("NSWorkspaceDidWakeNotification");
+        let block = RcBlock::new(|_note: *mut AnyObject| {
+            t3_client::wakeups::emit_wakeup(t3_client::wakeups::ConnectionWakeup::ApplicationActiveLong);
+        });
+        let observer: Option<Retained<AnyObject>> = msg_send![
+            &*center,
+            addObserverForName: &*name,
+            object: std::ptr::null::<AnyObject>(),
+            queue: std::ptr::null::<AnyObject>(),
+            usingBlock: &*block,
+        ];
+        // Retain the observer token for the lifetime of the app process.
+        std::mem::forget(observer);
+    });
 }
 
 #[cfg(all(test, feature = "snapshot"))]
@@ -1612,6 +1906,130 @@ mod tests {
             assert_eq!(latest.title, "Permissions have changed for Studio");
             assert_eq!(latest.permission_update_env.as_deref(), Some("legacy-env-id"));
         });
+        // Upgrading to modern scopes closes the permission-update toast automatically.
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "role": "client",
+                    "permissions": ["orchestration:read", "orchestration:operate", "settings:write"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |_, cx| cx.emit(AppEvent::Phase));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_ne!(
+                state.toasts.latest().and_then(|t| t.permission_update_env.as_deref()),
+                Some("legacy-env-id"),
+                "upgraded session should close the legacy permission-update toast"
+            );
+        });
+
+        // 6. Host-freeze toast (`CN-STATUS`): fires across saved/fleet environments and deduplicates by `detectedAt`.
+        state.update(cx, |state, _| {
+            state.environments.environments.push(t3_client::store::SavedEnvironment {
+                id: "fleet-worker".into(),
+                environment_id: Some("fleet-env-1".into()),
+                label: "Build Box".into(),
+                http_base: "http://10.0.0.42:3773".into(),
+                access_token: Some("tok".into()),
+                local: false,
+                disabled: false,
+                ssh: None,
+                server_version: None,
+            });
+        });
+        t3_client::supervisor::set_server_config_extras_for(
+            "http://10.0.0.42:3773",
+            t3_client::supervisor::ServerConfigExtras {
+                last_event_loop_stall: Some(t3_client::status::ServerEventLoopStall {
+                    detected_at: Some("2026-11-19T01:00:00.000Z".into()),
+                    duration_ms: 8400.0,
+                    load_average: Some(12.0),
+                    cpu_count: 4,
+                }),
+                ..Default::default()
+            },
+        );
+        state.update(cx, |_, cx| cx.emit(AppEvent::ServerConfig));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            let latest = state.toasts.latest().expect("host freeze toast");
+            assert_eq!(latest.kind, crate::toast::ToastKind::Warning);
+            assert_eq!(latest.title, "Build Box froze for 8s");
+            assert!(latest.description.as_deref().unwrap_or_default().contains("load 12 on 4 cores"));
+        });
+        let shown_after_first = workspace.read_with(cx, |ws, _| ws.shown_host_freezes.len());
+        assert_eq!(shown_after_first, 1);
+        // Re-emitting with the same `detectedAt` must not duplicate the toast.
+        state.update(cx, |state, cx| {
+            state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Info, "sentinel"), cx);
+            cx.emit(AppEvent::ServerConfig);
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(
+                state.toasts.latest().map(|t| t.title.as_str()),
+                Some("sentinel"),
+                "same detectedAt must not re-fire host-freeze toast"
+            );
+        });
+        assert_eq!(workspace.read_with(cx, |ws, _| ws.shown_host_freezes.len()), 1);
+        // A newer `detectedAt` fires a fresh toast.
+        t3_client::supervisor::set_server_config_extras_for(
+            "http://10.0.0.42:3773",
+            t3_client::supervisor::ServerConfigExtras {
+                last_event_loop_stall: Some(t3_client::status::ServerEventLoopStall {
+                    detected_at: Some("2026-11-19T01:05:00.000Z".into()),
+                    duration_ms: 6100.0,
+                    load_average: None,
+                    cpu_count: 4,
+                }),
+                ..Default::default()
+            },
+        );
+        state.update(cx, |_, cx| cx.emit(AppEvent::ServerConfig));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.toasts.latest().map(|t| t.title.as_str()), Some("Build Box froze for 6s"));
+        });
+        assert_eq!(workspace.read_with(cx, |ws, _| ws.shown_host_freezes.len()), 2);
+        t3_client::supervisor::set_server_config_extras_for("http://10.0.0.42:3773", Default::default());
+
+        // 7. Connection status dot diagnosis popover (`CN-STATUS`): opens while reconnecting/errored
+        // and auto-closes once the phase returns to `Connected`.
+        state.update(cx, |state, cx| {
+            state.phase = Phase::Online(ConnectionStatus::Reconnecting {
+                attempt: 2,
+                reason: "dial tcp 127.0.0.1:3773: connection refused".into(),
+            });
+            cx.emit(AppEvent::Phase);
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                assert!(ws.render_connection_status(cx).is_some());
+                assert!(ws.render_connection_diagnosis_popover(cx).is_none());
+                ws.connection_diagnosis_open = true;
+                assert!(ws.has_blocking_overlay(window, cx));
+                assert!(ws.render_connection_diagnosis_popover(cx).is_some());
+            });
+        })
+        .unwrap();
+        state.update(cx, |state, cx| {
+            state.phase = Phase::Online(ConnectionStatus::Connected);
+            cx.emit(AppEvent::Phase);
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, _, cx| {
+            workspace.read_with(cx, |ws, _| {
+                assert!(!ws.connection_diagnosis_open, "popover must auto-close on Connected");
+            });
+        })
+        .unwrap();
 
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {

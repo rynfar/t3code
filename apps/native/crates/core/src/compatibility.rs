@@ -7,6 +7,45 @@ use crate::server_config::EnvironmentDescriptor;
 
 /// `ORCHESTRATION_PROTOCOL_VERSION` in `packages/contracts/src/environment.ts`.
 pub const ORCHESTRATION_PROTOCOL_VERSION: u32 = 2;
+/// `ORCHESTRATION_PROTOCOL_QUERY_PARAM` in `packages/contracts/src/environment.ts`.
+pub const ORCHESTRATION_PROTOCOL_QUERY_PARAM: &str = "orchestrationProtocol";
+/// `CLIENT_CAPABILITIES_QUERY_PARAM` in `packages/contracts/src/environment.ts`.
+pub const CLIENT_CAPABILITIES_QUERY_PARAM: &str = "clientCapabilities";
+/// `SETTINGS_SECRET_REFERENCES_CAPABILITY` in `packages/contracts/src/environment.ts`.
+pub const SETTINGS_SECRET_REFERENCES_CAPABILITY: &str = "settingsSecretReferences";
+
+/// `appendOrchestrationProtocol` (`packages/client-runtime/src/connection/compatibility.ts`):
+/// sets `orchestrationProtocol=2` and `clientCapabilities=settingsSecretReferences` on a socket URL.
+pub fn append_orchestration_protocol(socket_url: &str) -> Result<String, url::ParseError> {
+    append_orchestration_protocol_with_capabilities(socket_url, &[SETTINGS_SECRET_REFERENCES_CAPABILITY])
+}
+
+/// Sets `orchestrationProtocol=2` and comma-separated `clientCapabilities` (omitted when empty)
+/// on `socket_url`, replacing any prior values of those query parameters.
+pub fn append_orchestration_protocol_with_capabilities(
+    socket_url: &str,
+    capabilities: &[&str],
+) -> Result<String, url::ParseError> {
+    let mut url = url::Url::parse(socket_url)?;
+    let retained: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != ORCHESTRATION_PROTOCOL_QUERY_PARAM && k != CLIENT_CAPABILITIES_QUERY_PARAM)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.clear();
+        for (k, v) in retained {
+            pairs.append_pair(&k, &v);
+        }
+        pairs.append_pair(ORCHESTRATION_PROTOCOL_QUERY_PARAM, &ORCHESTRATION_PROTOCOL_VERSION.to_string());
+        let joined: Vec<&str> = capabilities.iter().copied().filter(|cap| !cap.is_empty()).collect();
+        if !joined.is_empty() {
+            pairs.append_pair(CLIENT_CAPABILITIES_QUERY_PARAM, &joined.join(","));
+        }
+    }
+    Ok(url.to_string())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolMismatch {
@@ -225,5 +264,24 @@ mod tests {
             "'/Users/me/.t3/bin/t3' update --base-dir '/Users/me/.t3' 0.1.8"
         );
         assert_eq!(manual_server_update_command("0.1.8", None), "npx t3@0.1.8");
+    }
+
+    #[test]
+    fn append_orchestration_protocol_negotiates_settings_secret_references_capability() {
+        let negotiated = append_orchestration_protocol("ws://127.0.0.1:3777/ws?wsTicket=abc&orchestrationProtocol=1").unwrap();
+        let parsed = url::Url::parse(&negotiated).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(params.get("wsTicket").map(String::as_str), Some("abc"));
+        assert_eq!(params.get(ORCHESTRATION_PROTOCOL_QUERY_PARAM).map(String::as_str), Some("2"));
+        assert_eq!(
+            params.get(CLIENT_CAPABILITIES_QUERY_PARAM).map(String::as_str),
+            Some(SETTINGS_SECRET_REFERENCES_CAPABILITY)
+        );
+        // No duplicate orchestrationProtocol params when replacing an older value.
+        assert_eq!(parsed.query_pairs().filter(|(k, _)| k == ORCHESTRATION_PROTOCOL_QUERY_PARAM).count(), 1);
+
+        let omitted = append_orchestration_protocol_with_capabilities("ws://127.0.0.1:3777/ws", &[]).unwrap();
+        let omitted_url = url::Url::parse(&omitted).unwrap();
+        assert!(omitted_url.query_pairs().all(|(k, _)| k != CLIENT_CAPABILITIES_QUERY_PARAM));
     }
 }

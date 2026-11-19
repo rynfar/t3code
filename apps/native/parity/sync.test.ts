@@ -1,4 +1,8 @@
 import * as NodeAssert from "node:assert/strict";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeTest from "node:test";
 
 import {
@@ -9,6 +13,8 @@ import {
   fitIssueBody,
   groupCommits,
   isNoiseFile,
+  makeGit,
+  mergeUpstream,
   parseGitLog,
   parseLedger,
   parseSubject,
@@ -389,5 +395,227 @@ NodeTest.describe("digest", () => {
     const body = fitIssueBody(many);
     NodeAssert.ok(body.length <= 60_000);
     NodeAssert.match(body, /Truncated to fit/);
+  });
+});
+
+function initMergeFixture(
+  setupUpstream: (repoRoot: string, git: ReturnType<typeof makeGit>) => void,
+) {
+  const repoRoot = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-parity-merge-"));
+  const git = makeGit(repoRoot);
+  git(["init", "--initial-branch=main"]);
+  git(["config", "user.email", "test@example.com"]);
+  git(["config", "user.name", "Test"]);
+  git(["config", "commit.gpgsign", "false"]);
+  NodeFS.writeFileSync(NodePath.join(repoRoot, "shared.txt"), "base\n");
+  git(["add", "shared.txt"]);
+  git(["commit", "-m", "base"]);
+
+  git(["checkout", "-b", "native"]);
+  NodeFS.writeFileSync(NodePath.join(repoRoot, "native-only.txt"), "native\n");
+  git(["add", "native-only.txt"]);
+  git(["commit", "-m", "native commit"]);
+  const nativeHead = git(["rev-parse", "HEAD"]).trim();
+
+  git(["checkout", "main"]);
+  setupUpstream(repoRoot, git);
+  const upstreamHead = git(["rev-parse", "HEAD"]).trim();
+  git(["update-ref", "refs/remotes/origin/main", upstreamHead]);
+
+  git(["checkout", "native"]);
+  return { repoRoot, git, nativeHead, upstreamHead };
+}
+
+function addManyFilesViaFastImport(repoRoot: string, count: number) {
+  const lines: string[] = [
+    "commit refs/heads/main",
+    "committer Test <test@example.com> 1700000000 +0000",
+    "data 22",
+    "large upstream release",
+    "from refs/heads/main^0",
+  ];
+  const segment = "a".repeat(60);
+  for (let i = 0; i < count; i++) {
+    lines.push(`M 100644 inline dir-${i % 20}/${segment}/file-${String(i).padStart(5, "0")}.txt`);
+    lines.push("data 2");
+    lines.push("x");
+  }
+  const importResult = NodeChildProcess.spawnSync(
+    "git",
+    ["-C", repoRoot, "fast-import", "--quiet"],
+    {
+      input: `${lines.join("\n")}\n`,
+      encoding: "utf8",
+      maxBuffer: 1 << 28,
+    },
+  );
+  NodeAssert.equal(importResult.status, 0, importResult.stderr);
+  NodeChildProcess.execFileSync("git", ["-C", repoRoot, "reset", "--hard", "HEAD"]);
+}
+
+NodeTest.describe("mergeUpstream", () => {
+  NodeTest.it("merges an oversized diffstat (>1 MiB) cleanly with bounded output (#253)", () => {
+    const fixture = initMergeFixture((repoRoot) => {
+      // ~14,000 long paths produce >1.2 MiB of `git diff --stat` output.
+      addManyFilesViaFastImport(repoRoot, 14_000);
+    });
+    try {
+      const stat = fixture.git(["diff", "--stat=120", "native", "origin/main"]);
+      NodeAssert.ok(
+        stat.length > 1024 * 1024,
+        `expected fixture diffstat > 1 MiB, got ${stat.length} bytes`,
+      );
+      const result = mergeUpstream(fixture.git, fixture.repoRoot, fixture.upstreamHead);
+      NodeAssert.equal(result.status, "merged", JSON.stringify(result));
+      NodeAssert.ok(result.detail.length <= 4_000);
+      NodeAssert.equal(fixture.git(["status", "--porcelain", "--untracked-files=no"]).trim(), "");
+      const parents = fixture
+        .git(["rev-list", "--parents", "-n", "1", "HEAD"])
+        .trim()
+        .split(/\s+/)
+        .slice(1);
+      NodeAssert.deepEqual(parents, [fixture.nativeHead, fixture.upstreamHead]);
+      const mergeHead = NodeChildProcess.spawnSync("git", [
+        "-C",
+        fixture.repoRoot,
+        "rev-parse",
+        "-q",
+        "--verify",
+        "MERGE_HEAD",
+      ]);
+      NodeAssert.notEqual(mergeHead.status, 0);
+    } finally {
+      NodeFS.rmSync(fixture.repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  NodeTest.it("recognizes a clean committed merge even when spawnSync overflows maxBuffer", () => {
+    const fixture = initMergeFixture((repoRoot) => {
+      addManyFilesViaFastImport(repoRoot, 2_000);
+    });
+    try {
+      // Force `--stat` with a tiny maxBuffer so git commits the merge while stdout overflows Node's buffer.
+      const result = mergeUpstream(fixture.git, fixture.repoRoot, fixture.upstreamHead, {
+        mergeFlags: ["--no-edit", "--stat"],
+        maxBuffer: 1024,
+      });
+      NodeAssert.equal(result.status, "merged", JSON.stringify(result));
+      NodeAssert.ok(result.detail.length <= 4_000);
+      NodeAssert.ok(
+        result.error !== undefined ||
+          result.signal !== undefined ||
+          result.exitStatus !== undefined,
+        `expected child diagnostic preserved, got ${JSON.stringify(result)}`,
+      );
+      const parents = fixture
+        .git(["rev-list", "--parents", "-n", "1", "HEAD"])
+        .trim()
+        .split(/\s+/)
+        .slice(1);
+      NodeAssert.deepEqual(parents, [fixture.nativeHead, fixture.upstreamHead]);
+      NodeAssert.equal(fixture.git(["status", "--porcelain", "--untracked-files=no"]).trim(), "");
+      const mergeHead = NodeChildProcess.spawnSync("git", [
+        "-C",
+        fixture.repoRoot,
+        "rev-parse",
+        "-q",
+        "--verify",
+        "MERGE_HEAD",
+      ]);
+      NodeAssert.notEqual(mergeHead.status, 0);
+    } finally {
+      NodeFS.rmSync(fixture.repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  NodeTest.it("aborts cleanly and reports conflicts without altering native HEAD", () => {
+    const fixture = initMergeFixture((repoRoot, git) => {
+      NodeFS.writeFileSync(NodePath.join(repoRoot, "shared.txt"), "upstream change\n");
+      git(["add", "shared.txt"]);
+      git(["commit", "-m", "upstream conflict"]);
+    });
+    try {
+      NodeFS.writeFileSync(NodePath.join(fixture.repoRoot, "shared.txt"), "native change\n");
+      fixture.git(["add", "shared.txt"]);
+      fixture.git(["commit", "-m", "native conflict"]);
+      const headBefore = fixture.git(["rev-parse", "HEAD"]).trim();
+
+      const result = mergeUpstream(fixture.git, fixture.repoRoot, fixture.upstreamHead);
+      NodeAssert.equal(result.status, "conflict");
+      NodeAssert.deepEqual(result.conflicts, ["shared.txt"]);
+      NodeAssert.equal(result.exitStatus, 1);
+      NodeAssert.equal(fixture.git(["rev-parse", "HEAD"]).trim(), headBefore);
+      NodeAssert.equal(fixture.git(["status", "--porcelain", "--untracked-files=no"]).trim(), "");
+      const mergeHead = NodeChildProcess.spawnSync("git", [
+        "-C",
+        fixture.repoRoot,
+        "rev-parse",
+        "-q",
+        "--verify",
+        "MERGE_HEAD",
+      ]);
+      NodeAssert.notEqual(mergeHead.status, 0);
+    } finally {
+      NodeFS.rmSync(fixture.repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  NodeTest.it("aborts an in-progress non-conflict merge failure and preserves diagnostics", () => {
+    const fixture = initMergeFixture((repoRoot, git) => {
+      NodeFS.writeFileSync(NodePath.join(repoRoot, "upstream.txt"), "upstream\n");
+      git(["add", "upstream.txt"]);
+      git(["commit", "-m", "upstream clean change"]);
+    });
+    try {
+      // A failing pre-merge-commit hook leaves MERGE_HEAD active with no unmerged paths.
+      const hookPath = NodePath.join(fixture.repoRoot, ".git", "hooks", "pre-merge-commit");
+      NodeFS.writeFileSync(hookPath, "#!/bin/sh\necho 'blocked by hook' >&2\nexit 1\n", {
+        mode: 0o755,
+      });
+
+      const result = mergeUpstream(fixture.git, fixture.repoRoot, fixture.upstreamHead);
+      NodeAssert.equal(result.status, "failed");
+      NodeAssert.equal(result.exitStatus, 1);
+      NodeAssert.match(result.detail, /blocked by hook/);
+      NodeAssert.equal(fixture.git(["rev-parse", "HEAD"]).trim(), fixture.nativeHead);
+      NodeAssert.equal(fixture.git(["status", "--porcelain", "--untracked-files=no"]).trim(), "");
+      const mergeHead = NodeChildProcess.spawnSync("git", [
+        "-C",
+        fixture.repoRoot,
+        "rev-parse",
+        "-q",
+        "--verify",
+        "MERGE_HEAD",
+      ]);
+      NodeAssert.notEqual(mergeHead.status, 0);
+    } finally {
+      NodeFS.rmSync(fixture.repoRoot, { recursive: true, force: true });
+    }
+  });
+
+  NodeTest.it("skips when not on native branch, tree is dirty, or origin/main moved", () => {
+    const fixture = initMergeFixture((repoRoot, git) => {
+      NodeFS.writeFileSync(NodePath.join(repoRoot, "upstream.txt"), "upstream\n");
+      git(["add", "upstream.txt"]);
+      git(["commit", "-m", "upstream change"]);
+    });
+    try {
+      const moved = mergeUpstream(fixture.git, fixture.repoRoot, "0".repeat(40));
+      NodeAssert.equal(moved.status, "skipped");
+      NodeAssert.match(moved.detail, /origin\/main moved/);
+
+      NodeFS.writeFileSync(NodePath.join(fixture.repoRoot, "native-only.txt"), "dirty\n");
+      const dirty = mergeUpstream(fixture.git, fixture.repoRoot, fixture.upstreamHead);
+      NodeAssert.equal(dirty.status, "skipped");
+      NodeAssert.match(dirty.detail, /uncommitted changes/);
+      fixture.git(["checkout", "--", "native-only.txt"]);
+
+      fixture.git(["checkout", "main"]);
+      const wrongBranch = mergeUpstream(fixture.git, fixture.repoRoot, fixture.upstreamHead);
+      NodeAssert.equal(wrongBranch.status, "skipped");
+      NodeAssert.match(wrongBranch.detail, /not native/);
+    } finally {
+      NodeFS.rmSync(fixture.repoRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -21,7 +21,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::auth::{self, AuthError, Credentials};
+use crate::routes::{
+    CandidateRoute, ROUTE_CHECK_HEAD_START, ROUTE_CHECK_TIMEOUT, ReportedEndpoint, RouteAttemptError,
+    RouteCheck, connect_over_routes, merge_learned_routes, normalize_http_base,
+};
 use crate::session::{OpenError, RpcError, Session, StreamHandle};
+use crate::wakeups::{
+    self, ConnectionWakeup, probe_timeout_for, reaches_connection_supervisor, resets_retry_backoff,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -48,7 +55,9 @@ pub struct ServerConfigExtras {
     pub require_connect_device_approval: Option<bool>,
     pub auth_policy: Option<String>,
     pub direct_endpoints: Vec<String>,
+    pub direct_endpoint_entries: Vec<ReportedEndpoint>,
     pub thread_snapshot_pagination: bool,
+    pub secret_references: bool,
     pub last_event_loop_stall: Option<crate::status::ServerEventLoopStall>,
     /// Accurate `subscribeServerConfig`-scoped clock sample `(server_time_ms, requested_at_ms, received_at_ms)` (`#36420`).
     pub clock_sample: Option<(Option<i64>, i64, i64)>,
@@ -101,6 +110,7 @@ enum Command {
     CloseAllThreads,
     RefreshSessionState,
     RetryNow,
+    Wakeup(ConnectionWakeup),
     Request { method: &'static str, payload: Value, reply: oneshot::Sender<Result<Value, RpcError>>, settled: Option<crate::vcs::OnSettled> },
     Stream { method: &'static str, payload: Value, reply: oneshot::Sender<Result<StreamHandle, RpcError>>, settled: Option<crate::vcs::OnSettled> },
 }
@@ -125,6 +135,12 @@ fn extras_sender(http_base: &str) -> Arc<watch::Sender<ServerConfigExtras>> {
 /// Live extras decoded from `subscribeServerConfig` for `http_base`.
 pub fn server_config_extras_for(http_base: &str) -> watch::Receiver<ServerConfigExtras> {
     extras_sender(http_base).subscribe()
+}
+
+/// Test helper: publishes synthetic `ServerConfigExtras` for `http_base`.
+#[cfg(feature = "test-support")]
+pub fn set_server_config_extras_for(http_base: &str, extras: ServerConfigExtras) {
+    extras_sender(http_base).send_replace(extras);
 }
 
 #[derive(Clone)]
@@ -219,6 +235,7 @@ impl ClientFixture {
                 Command::CloseAllThreads => "close-all-threads",
                 Command::RefreshSessionState => "refresh-session",
                 Command::RetryNow => "retry",
+                Command::Wakeup(_) => "wakeup",
                 Command::Request { method, .. } | Command::Stream { method, .. } => method,
             });
         }
@@ -232,7 +249,7 @@ impl ClientFixture {
             match command {
                 Command::Request { method, payload, reply, .. } => requests.push((method, payload, reply)),
                 Command::Stream { method, reply, .. } => streams.push((method, reply)),
-                Command::OpenThread(_) | Command::CloseThread(_) | Command::CloseAllThreads | Command::RefreshSessionState | Command::RetryNow => {}
+                Command::OpenThread(_) | Command::CloseThread(_) | Command::CloseAllThreads | Command::RefreshSessionState | Command::RetryNow | Command::Wakeup(_) => {}
             }
         }
         (requests, streams)
@@ -272,6 +289,11 @@ impl ClientHandle {
     /// Reconnects now instead of waiting out the backoff, or checks a blocked server again.
     pub fn retry_now(&self) {
         let _ = self.commands.send(Command::RetryNow);
+    }
+
+    /// Delivers an OS/application wakeup directly to this supervisor (`wakeups.ts`).
+    pub fn notify_wakeup(&self, reason: ConnectionWakeup) {
+        let _ = self.commands.send(Command::Wakeup(reason));
     }
 
     /// Sends an orchestration command. Resolves with the committed sequence or the server's error.
@@ -382,6 +404,19 @@ pub fn start(runtime: &tokio::runtime::Handle, credentials: Credentials) -> (Cli
 
 /// `start`, running `prepare` before every connection attempt.
 pub fn start_prepared(runtime: &tokio::runtime::Handle, credentials: Credentials, prepare: Option<Prepare>) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
+    start_with_routes(runtime, credentials, Vec::new(), None, prepare)
+}
+
+/// `start_prepared` with alternate candidate routes and expected `environmentId` for multi-route
+/// candidate fallback (`packages/client-runtime/src/connection/{routes,resolver,driver}.ts`).
+pub fn start_with_routes(
+    runtime: &tokio::runtime::Handle,
+    credentials: Credentials,
+    alternate_routes: Vec<CandidateRoute>,
+    expected_environment_id: Option<String>,
+    prepare: Option<Prepare>,
+) -> (ClientHandle, mpsc::Receiver<ClientEvent>) {
+    wakeups::ensure_clock_jump_watcher(runtime);
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (events, event_rx) = mpsc::channel(EVENT_QUEUE);
     let (grants, session_state) = watch::channel(None);
@@ -397,7 +432,17 @@ pub fn start_prepared(runtime: &tokio::runtime::Handle, credentials: Credentials
     runtime.spawn(async move {
         tokio::select! {
             _ = events.closed() => {},
-            _ = supervise(credentials, prepare, command_rx, events.clone(), grants, generations, config_extras_tx) => {},
+            _ = supervise(
+                credentials,
+                alternate_routes,
+                expected_environment_id,
+                prepare,
+                command_rx,
+                events.clone(),
+                grants,
+                generations,
+                config_extras_tx,
+            ) => {},
         }
     });
     (handle, event_rx)
@@ -410,8 +455,38 @@ struct Resume {
     threads: HashMap<String, Option<u64>>,
 }
 
+async fn next_wakeup(rx: &mut tokio::sync::broadcast::Receiver<ConnectionWakeup>) -> ConnectionWakeup {
+    loop {
+        match rx.recv().await {
+            Ok(reason) if reaches_connection_supervisor(reason) => return reason,
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => std::future::pending().await,
+        }
+    }
+}
+
+fn initial_candidate_routes(
+    credentials: &Credentials,
+    alternate_routes: Vec<CandidateRoute>,
+    ssh: bool,
+) -> Vec<CandidateRoute> {
+    let primary = CandidateRoute::primary(&credentials.http_base, ssh);
+    let mut routes = vec![primary.clone()];
+    for candidate in alternate_routes {
+        if normalize_http_base(&candidate.http_base) != primary.http_base
+            && !routes.iter().any(|existing| normalize_http_base(&existing.http_base) == normalize_http_base(&candidate.http_base))
+        {
+            routes.push(candidate);
+        }
+    }
+    routes
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn supervise(
     credentials: Credentials,
+    alternate_routes: Vec<CandidateRoute>,
+    mut expected_environment_id: Option<String>,
     prepare: Option<Prepare>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: Events,
@@ -419,6 +494,8 @@ async fn supervise(
     generations: watch::Sender<u64>,
     config_extras: Arc<watch::Sender<ServerConfigExtras>>,
 ) {
+    let mut routes = initial_candidate_routes(&credentials, alternate_routes, prepare.is_some());
+    let mut wakeup_rx = wakeups::subscribe();
     let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
     let mut attempt: u32 = 0;
     let mut last_failure = String::new();
@@ -433,7 +510,7 @@ async fn supervise(
             ConnectionStatus::Reconnecting { reason: last_failure.clone(), attempt }
         })).await;
         let prepared = match &prepare {
-            Some(prepare) => match prepare_draining(prepare, &mut commands, &mut resume).await {
+            Some(prepare) => match prepare_draining(prepare, &mut commands, &mut wakeup_rx, &mut resume).await {
                 PrepareOutcome::Done(prepared) => prepared,
                 PrepareOutcome::RetryNow => {
                     attempt = 0;
@@ -445,7 +522,7 @@ async fn supervise(
             None => Ok(()),
         };
         let outcome = match prepared {
-            Ok(()) => match connect_draining(&credentials, &mut commands, &mut resume).await {
+            Ok(()) => match connect_draining(&credentials, &routes, expected_environment_id.as_deref(), &mut commands, &mut wakeup_rx, &mut resume).await {
                 ConnectOutcome::Done(result) => result,
                 ConnectOutcome::RetryNow => {
                     attempt = 0;
@@ -462,13 +539,29 @@ async fn supervise(
             Err(PrepareError::Blocked(reason)) => Err(ConnectError::Blocked(reason)),
         };
         let (reason, is_approval) = match outcome {
-            Ok(session) => {
+            Ok((active_route, session)) => {
+                let active_credentials = Credentials {
+                    http_base: active_route.http_base.clone(),
+                    access_token: credentials.access_token.clone(),
+                };
                 generations.send_modify(|generation| *generation += 1);
                 attempt = 0;
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Connected)).await;
-                let mut fetch = SessionStateFetch::new(&credentials, &grants);
+                let mut fetch = SessionStateFetch::new(&active_credentials, &grants);
                 fetch.start();
-                let end = run_session(&session, &mut resume, &mut commands, &events, &mut fetch, &config_extras).await;
+                let end = run_session(
+                    &session,
+                    &active_route,
+                    &mut routes,
+                    &mut expected_environment_id,
+                    &mut resume,
+                    &mut commands,
+                    &mut wakeup_rx,
+                    &events,
+                    &mut fetch,
+                    &config_extras,
+                )
+                .await;
                 fetch.stop();
                 match end {
                     SessionEnd::Closed(reason) => (reason, false),
@@ -482,7 +575,7 @@ async fn supervise(
             Err(ConnectError::ApprovalPending(reason)) => (reason, true),
             Err(ConnectError::Unsupported { reason, server_outdated }) => {
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Unsupported { reason: reason.clone(), server_outdated })).await;
-                match wait_draining(None, &mut commands, &mut resume).await {
+                match wait_draining(None, &mut commands, &mut wakeup_rx, &mut resume).await {
                     WaitOutcome::Elapsed | WaitOutcome::RetryNow => {
                         attempt += 1;
                         last_failure = reason;
@@ -494,7 +587,7 @@ async fn supervise(
             }
             Err(ConnectError::Blocked(reason)) => {
                 let _ = events.send(ClientEvent::Status(ConnectionStatus::Blocked { reason: reason.clone() })).await;
-                match wait_draining(None, &mut commands, &mut resume).await {
+                match wait_draining(None, &mut commands, &mut wakeup_rx, &mut resume).await {
                     WaitOutcome::Elapsed | WaitOutcome::RetryNow => {
                         attempt += 1;
                         last_failure = reason;
@@ -515,7 +608,7 @@ async fn supervise(
             ConnectionStatus::Reconnecting { reason, attempt }
         })).await;
         let delay = Duration::from_millis((500u64 << attempt.min(5)).min(15_000));
-        match wait_draining(Some(delay), &mut commands, &mut resume).await {
+        match wait_draining(Some(delay), &mut commands, &mut wakeup_rx, &mut resume).await {
             WaitOutcome::Elapsed => {}
             WaitOutcome::RetryNow => {
                 // `pingdotgg/t3code#24932`: reset backoff on explicit retry while keeping the
@@ -542,7 +635,7 @@ enum PrepareOutcome {
 }
 
 enum ConnectOutcome {
-    Done(Result<Session, ConnectError>),
+    Done(Result<(CandidateRoute, Session), ConnectError>),
     RetryNow,
     Dropped,
 }
@@ -554,34 +647,58 @@ enum WaitOutcome {
 }
 
 /// Runs `prepare` while keeping track of threads opened or closed and failing dispatches.
-/// A `RetryNow` interrupts a stalled preparation so a dead route never holds reconnect
-/// (`pingdotgg/t3code#34623`, `pingdotgg/t3code#24932`).
-async fn prepare_draining(prepare: &Prepare, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> PrepareOutcome {
+/// A `RetryNow` or long OS wake interrupts a stalled preparation so a dead route never holds
+/// reconnect (`pingdotgg/t3code#34623`, `pingdotgg/t3code#24932`, `wakeups.ts`).
+async fn prepare_draining(
+    prepare: &Prepare,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    wakeup_rx: &mut tokio::sync::broadcast::Receiver<ConnectionWakeup>,
+    resume: &mut Resume,
+) -> PrepareOutcome {
     let preparation = prepare();
     tokio::pin!(preparation);
     loop {
         tokio::select! {
             prepared = &mut preparation => return PrepareOutcome::Done(prepared),
+            reason = next_wakeup(wakeup_rx) => {
+                if reason == ConnectionWakeup::ApplicationActiveLong {
+                    return PrepareOutcome::RetryNow;
+                }
+            }
             command = commands.recv() => match command {
                 None => return PrepareOutcome::Dropped,
                 Some(Command::RetryNow) => return PrepareOutcome::RetryNow,
+                Some(Command::Wakeup(ConnectionWakeup::ApplicationActiveLong)) => return PrepareOutcome::RetryNow,
                 Some(command) => drain_command(command, resume),
             }
         }
     }
 }
 
-/// Runs `connect` while listening for handle drop or `RetryNow` so a stalled ticket or dead route
-/// never blocks a user-requested retry (`pingdotgg/t3code#34623`, `pingdotgg/t3code#24932`).
-async fn connect_draining(credentials: &Credentials, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> ConnectOutcome {
-    let attempt = connect(credentials);
+/// Runs multi-route `connect` while listening for handle drop, `RetryNow`, or long OS wake so a
+/// stalled ticket or dead route never blocks recovery (`pingdotgg/t3code#34623`, `#24932`, `wakeups.ts`).
+async fn connect_draining(
+    credentials: &Credentials,
+    routes: &[CandidateRoute],
+    expected_environment_id: Option<&str>,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    wakeup_rx: &mut tokio::sync::broadcast::Receiver<ConnectionWakeup>,
+    resume: &mut Resume,
+) -> ConnectOutcome {
+    let attempt = connect_routes(credentials, routes, expected_environment_id);
     tokio::pin!(attempt);
     loop {
         tokio::select! {
             result = &mut attempt => return ConnectOutcome::Done(result),
+            reason = next_wakeup(wakeup_rx) => {
+                if reason == ConnectionWakeup::ApplicationActiveLong {
+                    return ConnectOutcome::RetryNow;
+                }
+            }
             command = commands.recv() => match command {
                 None => return ConnectOutcome::Dropped,
                 Some(Command::RetryNow) => return ConnectOutcome::RetryNow,
+                Some(Command::Wakeup(ConnectionWakeup::ApplicationActiveLong)) => return ConnectOutcome::RetryNow,
                 Some(command) => drain_command(command, resume),
             }
         }
@@ -598,7 +715,7 @@ fn drain_command(command: Command, resume: &mut Resume) {
         Command::CloseThread(id) => {
             resume.threads.remove(&id);
         }
-        Command::RefreshSessionState | Command::RetryNow => {}
+        Command::RefreshSessionState | Command::RetryNow | Command::Wakeup(_) => {}
         Command::Request { reply, settled, .. } => {
             drop(settled);
             let _ = reply.send(Err(RpcError::Closed));
@@ -610,14 +727,71 @@ fn drain_command(command: Command, resume: &mut Resume) {
     }
 }
 
-async fn connect(credentials: &Credentials) -> Result<Session, ConnectError> {
+async fn connect_routes(
+    credentials: &Credentials,
+    routes: &[CandidateRoute],
+    expected_environment_id: Option<&str>,
+) -> Result<(CandidateRoute, Session), ConnectError> {
+    let expected = expected_environment_id.map(str::to_owned);
+    let token = credentials.access_token.clone();
+    connect_over_routes(
+        routes,
+        ROUTE_CHECK_HEAD_START,
+        move |route| {
+            let expected = expected.clone();
+            async move {
+                match auth::fetch_descriptor_timeout(&route.http_base, ROUTE_CHECK_TIMEOUT).await {
+                    Ok(descriptor) => {
+                        if expected.as_deref().is_none_or(|wanted| descriptor.environment_id == wanted) {
+                            RouteCheck::Answered
+                        } else {
+                            RouteCheck::Silent
+                        }
+                    }
+                    Err(_) => RouteCheck::Silent,
+                }
+            }
+        },
+        move |route| {
+            let route_creds = Credentials { http_base: route.http_base.clone(), access_token: token.clone() };
+            async move {
+                match connect(&route_creds, expected_environment_id).await {
+                    Ok(session) => Ok(session),
+                    Err(err @ ConnectError::Unsupported { .. }) => Err(RouteAttemptError::Unsupported(err)),
+                    Err(err @ (ConnectError::Unauthorized(_) | ConnectError::Blocked(_))) => {
+                        Err(RouteAttemptError::Blocked(err))
+                    }
+                    Err(err @ (ConnectError::Transient(_) | ConnectError::ApprovalPending(_))) => {
+                        Err(RouteAttemptError::Transient(err))
+                    }
+                }
+            }
+        },
+    )
+    .await
+    .map_err(|err| err.unwrap_or_else(|| ConnectError::Transient("Environment did not answer on any saved route.".to_owned())))
+}
+
+async fn connect(
+    credentials: &Credentials,
+    expected_environment_id: Option<&str>,
+) -> Result<Session, ConnectError> {
     // `orchestrationProtocolCompatibilityError`: a server on another protocol is blocked, not
     // retried. One that can't describe itself is left to the socket to accept or refuse.
-    if let Ok(descriptor) = auth::fetch_descriptor(&credentials.http_base).await
-        && let Some(mismatch) = protocol_mismatch(&descriptor)
-    {
-        let server_outdated = mismatch == ProtocolMismatch::ServerOutdated;
-        return Err(ConnectError::Unsupported { reason: mismatch.message(&descriptor.label), server_outdated });
+    if let Ok(descriptor) = auth::fetch_descriptor(&credentials.http_base).await {
+        if let Some(expected) = expected_environment_id
+            && !descriptor.environment_id.is_empty()
+            && descriptor.environment_id != expected
+        {
+            return Err(ConnectError::Transient(format!(
+                "Another environment ({}) answered at {}.",
+                descriptor.label, credentials.http_base
+            )));
+        }
+        if let Some(mismatch) = protocol_mismatch(&descriptor) {
+            let server_outdated = mismatch == ProtocolMismatch::ServerOutdated;
+            return Err(ConnectError::Unsupported { reason: mismatch.message(&descriptor.label), server_outdated });
+        }
     }
     let ticket = auth::issue_rpc_ticket(credentials).await.map_err(|error| match error {
         AuthError::Unauthorized | AuthError::Rejected(_) => ConnectError::Unauthorized(error.to_string()),
@@ -635,9 +809,14 @@ async fn connect(credentials: &Credentials) -> Result<Session, ConnectError> {
     })
 }
 
-/// While waiting to reconnect (until `retry_now` when `delay` is `None`), keep track of threads
-/// opened or closed and fail dispatches.
-async fn wait_draining(delay: Option<Duration>, commands: &mut mpsc::UnboundedReceiver<Command>, resume: &mut Resume) -> WaitOutcome {
+/// While waiting to reconnect (until `retry_now` or a backoff-resetting wakeup when `delay` is `None`),
+/// keep track of threads opened or closed and fail dispatches.
+async fn wait_draining(
+    delay: Option<Duration>,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    wakeup_rx: &mut tokio::sync::broadcast::Receiver<ConnectionWakeup>,
+    resume: &mut Resume,
+) -> WaitOutcome {
     let sleep = async {
         match delay {
             Some(delay) => tokio::time::sleep(delay).await,
@@ -648,9 +827,19 @@ async fn wait_draining(delay: Option<Duration>, commands: &mut mpsc::UnboundedRe
     loop {
         tokio::select! {
             _ = &mut sleep => return WaitOutcome::Elapsed,
+            reason = next_wakeup(wakeup_rx) => {
+                if resets_retry_backoff(reason) {
+                    return WaitOutcome::RetryNow;
+                }
+            }
             command = commands.recv() => match command {
                 None => return WaitOutcome::Dropped,
                 Some(Command::RetryNow) => return WaitOutcome::RetryNow,
+                Some(Command::Wakeup(reason)) => {
+                    if reaches_connection_supervisor(reason) && resets_retry_backoff(reason) {
+                        return WaitOutcome::RetryNow;
+                    }
+                }
                 Some(command) => drain_command(command, resume),
             }
         }
@@ -794,18 +983,30 @@ fn extract_server_config_extras(config: &Value) -> ServerConfigExtras {
         .pointer("/settings/requireConnectDeviceApproval")
         .and_then(Value::as_bool);
     let auth_policy = config.pointer("/auth/policy").and_then(Value::as_str).map(str::to_owned);
-    let direct_endpoints = config
+    let direct_endpoint_entries: Vec<ReportedEndpoint> = config
         .get("directEndpoints")
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| item.get("url").and_then(Value::as_str).or_else(|| item.as_str()))
-                .map(str::to_owned)
+                .filter_map(|item| {
+                    let url = item
+                        .get("httpBaseUrl")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("url").and_then(Value::as_str))
+                        .or_else(|| item.as_str())?;
+                    let kind = item.get("kind").and_then(Value::as_str).map(str::to_owned);
+                    Some(ReportedEndpoint { http_base_url: url.to_owned(), kind })
+                })
                 .collect()
         })
         .unwrap_or_default();
+    let direct_endpoints = direct_endpoint_entries
+        .iter()
+        .map(|entry| entry.http_base_url.clone())
+        .collect();
     let thread_snapshot_pagination = config.get("threadSnapshotPagination").and_then(Value::as_bool).unwrap_or(false);
+    let secret_references = config.get("secretReferences").and_then(Value::as_bool).unwrap_or(false);
     let last_event_loop_stall = config
         .get("lastEventLoopStall")
         .cloned()
@@ -814,16 +1015,45 @@ fn extract_server_config_extras(config: &Value) -> ServerConfigExtras {
         require_connect_device_approval,
         auth_policy,
         direct_endpoints,
+        direct_endpoint_entries,
         thread_snapshot_pagination,
+        secret_references,
         last_event_loop_stall,
         clock_sample: None,
     }
 }
 
+fn absorb_learned_routes(
+    active_route: &CandidateRoute,
+    routes: &mut Vec<CandidateRoute>,
+    expected_environment_id: &mut Option<String>,
+    config_extras: &watch::Sender<ServerConfigExtras>,
+    event: &ServerConfigStreamEvent,
+) {
+    if let ServerConfigStreamEvent::Snapshot { config } = event {
+        let env_id = config.environment.environment_id.trim();
+        if !env_id.is_empty() {
+            *expected_environment_id = Some(env_id.to_owned());
+        }
+        let reported = config_extras.borrow().direct_endpoint_entries.clone();
+        if !reported.is_empty() {
+            let env_key = expected_environment_id.as_deref().unwrap_or("env");
+            if let Some(updated) = merge_learned_routes(env_key, routes, &active_route.id, &reported, true) {
+                *routes = updated;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     session: &Session,
+    active_route: &CandidateRoute,
+    routes: &mut Vec<CandidateRoute>,
+    expected_environment_id: &mut Option<String>,
     resume: &mut Resume,
     commands: &mut mpsc::UnboundedReceiver<Command>,
+    wakeup_rx: &mut tokio::sync::broadcast::Receiver<ConnectionWakeup>,
     events: &Events,
     fetch: &mut SessionStateFetch<'_>,
     config_extras: &watch::Sender<ServerConfigExtras>,
@@ -831,7 +1061,17 @@ async fn run_session(
     let config_requested_at_ms = wall_now_ms();
     let mut preprocessor = ServerConfigPreprocessor::default();
     let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, subscribe_server_config_payload()).ok();
-    let options = initial_shell_options(&mut server_config, events, &mut preprocessor, config_requested_at_ms, config_extras).await;
+    let options = initial_shell_options(
+        &mut server_config,
+        active_route,
+        routes,
+        expected_environment_id,
+        events,
+        &mut preprocessor,
+        config_requested_at_ms,
+        config_extras,
+    )
+    .await;
     // Deltas never restore rows trimmed under other options (nor trim them), so the shell starts
     // over from an authoritative snapshot, as `shell.ts` does for every new session.
     if resume.shell_options.replace(options) != Some(options) {
@@ -845,6 +1085,7 @@ async fn run_session(
     for (thread_id, sequence) in resume.threads.clone() {
         forwarders.insert(thread_id.clone(), forward_thread(session, &thread_id, sequence, thread_tx.clone()));
     }
+    let nearby = active_route.kind().is_nearby();
     let end = loop {
         tokio::select! {
             value = shell.receiver.recv() => match value {
@@ -876,7 +1117,10 @@ async fn run_session(
                 Some(Ok(value)) => {
                     let value = preprocessor.preprocess(value, config_requested_at_ms, config_extras);
                     match serde_json::from_value::<ServerConfigStreamEvent>(value) {
-                        Ok(event) => { let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await; }
+                        Ok(event) => {
+                            absorb_learned_routes(active_route, routes, expected_environment_id, config_extras, &event);
+                            let _ = events.send(ClientEvent::ServerConfig(Box::new(event.prepare()))).await;
+                        }
                         Err(error) => report(events, "server config", error.to_string()).await,
                     }
                 }
@@ -904,6 +1148,13 @@ async fn run_session(
                     ThreadDelivery::RpcError(error) => report(events, &format!("thread {thread_id}"), error.to_string()).await,
                 }
             }
+            reason = next_wakeup(wakeup_rx) => {
+                if let Some(timeout) = probe_timeout_for(reason, nearby)
+                    && !session.probe(timeout).await
+                {
+                    break SessionEnd::Closed("Connection did not respond after system wake.".into());
+                }
+            }
             command = commands.recv() => match command {
                 None => break SessionEnd::Dropped,
                 Some(Command::OpenThread(thread_id)) => {
@@ -922,6 +1173,14 @@ async fn run_session(
                 }
                 Some(Command::RefreshSessionState) => fetch.start(),
                 Some(Command::RetryNow) => {}
+                Some(Command::Wakeup(reason)) => {
+                    if reaches_connection_supervisor(reason)
+                        && let Some(timeout) = probe_timeout_for(reason, nearby)
+                        && !session.probe(timeout).await
+                    {
+                        break SessionEnd::Closed("Connection did not respond after system wake.".into());
+                    }
+                }
                 Some(Command::Request { method, payload, mut reply, settled }) => {
                     if !reply.is_closed() {
                         let response = session.send_request(method, payload);
@@ -955,8 +1214,12 @@ const CONFIG_WAIT: Duration = Duration::from_secs(10);
 
 /// `shell.ts` builds the shell input from `session.initialConfig`: the first config snapshot,
 /// forwarded like any other. Without one the shell asks for every row, as a config failure does.
+#[allow(clippy::too_many_arguments)]
 async fn initial_shell_options(
     stream: &mut Option<StreamHandle>,
+    active_route: &CandidateRoute,
+    routes: &mut Vec<CandidateRoute>,
+    expected_environment_id: &mut Option<String>,
     events: &Events,
     preprocessor: &mut ServerConfigPreprocessor,
     config_requested_at_ms: i64,
@@ -969,6 +1232,7 @@ async fn initial_shell_options(
                     let value = preprocessor.preprocess(value, config_requested_at_ms, config_extras);
                     match serde_json::from_value::<ServerConfigStreamEvent>(value) {
                         Ok(event) => {
+                            absorb_learned_routes(active_route, routes, expected_environment_id, config_extras, &event);
                             let options = match &event {
                                 ServerConfigStreamEvent::Snapshot { config } => {
                                     Some(ShellOptions::for_server(config.shell_thread_families, config.shell_older_settled))
@@ -1262,13 +1526,76 @@ mod parity_tests {
     #[tokio::test]
     async fn retry_now_interrupts_stalled_preparation_immediately() {
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut wakeup_rx = wakeups::subscribe();
         let mut resume = Resume { shell: None, shell_options: None, threads: HashMap::new() };
         let prepare: Prepare = Arc::new(|| Box::pin(std::future::pending()));
         tx.send(Command::RetryNow).unwrap();
-        let outcome = tokio::time::timeout(Duration::from_millis(200), prepare_draining(&prepare, &mut rx, &mut resume))
-            .await
-            .expect("retry_now must interrupt stalled prepare immediately");
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            prepare_draining(&prepare, &mut rx, &mut wakeup_rx, &mut resume),
+        )
+        .await
+        .expect("retry_now must interrupt stalled prepare immediately");
         assert!(matches!(outcome, PrepareOutcome::RetryNow));
+    }
+
+    #[tokio::test]
+    async fn supervisor_negotiates_secret_references_falls_back_across_routes_and_wakes() {
+        let mut live = crate::test_server::FakeServer::start().await;
+        live.set_descriptor(Some(json!({
+            "environmentId": "env-multi",
+            "label": "Studio",
+            "serverVersion": "0.1.9",
+            "orchestrationProtocolVersion": 2
+        })));
+        let dead_creds = Credentials { http_base: "http://127.0.0.1:1".into(), access_token: "token".into() };
+        let fallback = CandidateRoute::saved(live.credentials().http_base);
+        let (client, mut events) = start_with_routes(
+            &tokio::runtime::Handle::current(),
+            dead_creds,
+            vec![fallback],
+            Some("env-multi".into()),
+            None,
+        );
+        let mut conn = tokio::time::timeout(Duration::from_secs(10), live.connection())
+            .await
+            .expect("fallback route connects");
+        assert!(
+            conn.path.contains("clientCapabilities=settingsSecretReferences"),
+            "socket URL must advertise settingsSecretReferences: {}",
+            conn.path
+        );
+        let config_req = conn.request(method::SUBSCRIBE_SERVER_CONFIG).await;
+        conn.chunk(
+            &config_req,
+            json!([{
+                "type": "snapshot",
+                "config": {
+                    "environment": { "environmentId": "env-multi", "label": "Studio", "serverVersion": "0.1.9" },
+                    "secretReferences": true
+                }
+            }]),
+        )
+        .await;
+        let _shell = conn.request(method::SUBSCRIBE_SHELL).await;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("event")
+                .expect("open");
+            if matches!(event, ClientEvent::ServerConfig(_)) {
+                break;
+            }
+        }
+        assert!(client.server_config_extras().borrow().secret_references);
+
+        // Sending a long-resume wakeup while the server ignores Ping closes the stale session and reconnects.
+        client.notify_wakeup(ConnectionWakeup::ApplicationActiveLong);
+        let mut second = tokio::time::timeout(Duration::from_secs(10), live.connection())
+            .await
+            .expect("wakeup probe failure triggers reconnect");
+        assert!(second.path.contains("clientCapabilities=settingsSecretReferences"));
+        let _ = second.request(method::SUBSCRIBE_SERVER_CONFIG).await;
     }
 }
 
