@@ -334,11 +334,13 @@ pub struct SelectOption {
     /// A group heading shown above the first option of each group.
     pub group: Option<SharedString>,
     pub icon: Option<Icon>,
+    /// When set, the option cannot be selected and shows this tooltip (`useScopedModelDisabledReason`).
+    pub disabled_reason: Option<SharedString>,
 }
 
 impl SelectOption {
     pub fn new(value: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
-        SelectOption { value: value.into(), label: label.into(), description: None, group: None, icon: None }
+        SelectOption { value: value.into(), label: label.into(), description: None, group: None, icon: None, disabled_reason: None }
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Self {
@@ -353,6 +355,11 @@ impl SelectOption {
 
     pub fn icon(mut self, icon: Icon) -> Self {
         self.icon = Some(icon);
+        self
+    }
+
+    pub fn disabled_reason(mut self, reason: Option<impl Into<SharedString>>) -> Self {
+        self.disabled_reason = reason.map(Into::into);
         self
     }
 }
@@ -465,11 +472,15 @@ impl RenderOnce for Select {
         let pick = {
             let (state, options, on_change) = (state.clone(), options.clone(), on_change.clone());
             Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                let Some(option) = options.get(index) else { return };
+                if option.disabled_reason.is_some() {
+                    return;
+                }
                 state.update(cx, |state, cx| {
                     state.open = false;
                     cx.notify();
                 });
-                if let (Some(option), Some(handler)) = (options.get(index), on_change.as_ref()) {
+                if let Some(handler) = on_change.as_ref() {
                     handler(option.value.clone(), window, cx);
                 }
             })
@@ -586,9 +597,11 @@ impl RenderOnce for Select {
                     );
                 }
                 let is_selected = selected_index == Some(index);
-                let is_highlighted = highlighted == Some(index);
+                let option_disabled = option.disabled_reason.is_some();
+                let is_highlighted = !option_disabled && highlighted == Some(index);
                 let pick = pick.clone();
                 let hover_state = state.clone();
+                let disabled_tip = option.disabled_reason.clone();
                 list = list.child(
                     h_flex()
                         .id(("option", index))
@@ -598,19 +611,23 @@ impl RenderOnce for Select {
                         .gap(r(8.))
                         .rounded(r(4.))
                         .text_sm()
-                        .cursor_pointer()
+                        .when(!option_disabled, |this| this.cursor_pointer())
+                        .when(option_disabled, |this| this.opacity(0.5))
                         .text_color(hsla(p.foreground))
                         .when(is_selected, |this| this.bg(hsla(p.foreground).opacity(0.08)))
                         .when(is_highlighted, |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
-                        .on_mouse_move(move |_, _, cx| {
-                            hover_state.update(cx, |state, cx| {
-                                if state.highlighted != Some(index) {
-                                    state.highlighted = Some(index);
-                                    cx.notify();
-                                }
-                            });
+                        .when_some(disabled_tip, |this, tip| this.tooltip(tooltip(tip)))
+                        .when(!option_disabled, |this| {
+                            this.on_mouse_move(move |_, _, cx| {
+                                hover_state.update(cx, |state, cx| {
+                                    if state.highlighted != Some(index) {
+                                        state.highlighted = Some(index);
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .on_click(move |_, window, cx| pick(index, window, cx))
                         })
-                        .on_click(move |_, window, cx| pick(index, window, cx))
                         .child(
                             v_flex()
                                 .flex_1()

@@ -16,6 +16,7 @@ mod files;
 mod git;
 mod glass;
 mod home;
+mod i18n;
 mod icons;
 mod keymap;
 mod mcp;

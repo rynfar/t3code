@@ -17,12 +17,16 @@ use crate::app_state::{AppEvent, AppState};
 use crate::terminal;
 use crate::theme::{self, Preferences};
 
-type OnFailed = Box<dyn FnOnce(&mut App)>;
+pub(super) type OnFailed = Box<dyn FnOnce(&mut App)>;
 /// Told when a save settles: `None` once saved, else why it was not.
 type OnDone = Box<dyn FnOnce(Option<String>, &mut App)>;
 
 enum SaveTarget {
     Active(ServerSettingChange),
+    ScopedEnvironments {
+        owners: Vec<t3_core::sidebar::grouping::EnvironmentOwner>,
+        change: ServerSettingChange,
+    },
     Projects { members: Vec<t3_core::sidebar::grouping::ScopedProject>, edit: t3_core::settings::projects::OverrideEdit },
 }
 
@@ -242,6 +246,9 @@ fn send_next(cx: &mut App) {
     prefs.saving = true;
     let change = match target {
         SaveTarget::Active(change) => change,
+        SaveTarget::ScopedEnvironments { owners, change } => {
+            return send_scoped_environments(state, owners, change, on_done, cx);
+        }
         SaveTarget::Projects { members, edit } => return send_projects(state, members, edit, on_done, cx),
     };
     let Some(payload) = change.payload_for(state.read(cx).server_config.config.as_ref().map(|config| &config.settings)) else {
@@ -284,6 +291,203 @@ fn send_next(cx: &mut App) {
                     }
                     cx.refresh_windows();
                 }
+            }
+            send_next(cx);
+        });
+    })
+    .detach();
+}
+
+/// Fans out a server setting patch across every environment in the active settings scope
+/// (`useUpdateScopedSettings` / `writeScopedSettings` in `useScopedSettings.ts`).
+pub(super) fn update_scoped_environments(
+    state: &Entity<AppState>,
+    owners: Vec<t3_core::sidebar::grouping::EnvironmentOwner>,
+    change: ServerSettingChange,
+    on_failed: Option<OnFailed>,
+    cx: &mut App,
+) {
+    let on_done = on_failed.map(|on_failed| -> OnDone {
+        Box::new(move |error, cx| {
+            if error.is_some() {
+                on_failed(cx);
+            }
+        })
+    });
+    enqueue_scoped_environments(state, owners, change, on_done, cx);
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+fn update_scoped_environments_then(
+    state: &Entity<AppState>,
+    owners: Vec<t3_core::sidebar::grouping::EnvironmentOwner>,
+    change: ServerSettingChange,
+    on_done: impl FnOnce(Option<String>, &mut App) + 'static,
+    cx: &mut App,
+) {
+    enqueue_scoped_environments(state, owners, change, Some(Box::new(on_done)), cx);
+}
+
+fn enqueue_scoped_environments(
+    state: &Entity<AppState>,
+    owners: Vec<t3_core::sidebar::grouping::EnvironmentOwner>,
+    change: ServerSettingChange,
+    on_done: Option<OnDone>,
+    cx: &mut App,
+) {
+    let prefs = cx.global_mut::<ClientPrefs>();
+    prefs.error = None;
+    prefs.queue.push_back(PendingSave {
+        state: state.clone(),
+        target: SaveTarget::ScopedEnvironments { owners, change },
+        on_done,
+    });
+    if !prefs.saving {
+        send_next(cx);
+    }
+}
+
+fn send_scoped_environments(
+    state: Entity<AppState>,
+    owners: Vec<t3_core::sidebar::grouping::EnvironmentOwner>,
+    change: ServerSettingChange,
+    on_done: Option<OnDone>,
+    cx: &mut App,
+) {
+    const SCOPE: &str = "settings:write";
+    if owners.is_empty() {
+        let message = "Reconnect to save this setting.".to_owned();
+        show_error(message.clone(), cx);
+        if let Some(done) = on_done {
+            done(Some(message), cx);
+        }
+        return send_next(cx);
+    }
+    let lookups: Vec<(t3_core::sidebar::grouping::EnvironmentOwner, String, _)> = {
+        let app = state.read(cx);
+        let view = app.connections.view();
+        let view = view.borrow();
+        owners
+            .into_iter()
+            .map(|owner| {
+                let label = view
+                    .environment(&owner.saved_id)
+                    .and_then(|e| e.config.config.as_ref())
+                    .map(|c| c.environment.label.clone())
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or_else(|| owner.saved_id.clone());
+                let lookup = app.connections.destination(&owner, SCOPE);
+                (owner, label, lookup)
+            })
+            .collect()
+    };
+    cx.spawn(async move |cx| {
+        let mut saved_labels: Vec<String> = Vec::new();
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for (_owner, label, lookup) in lookups {
+            let destination = match lookup.await {
+                Ok(dest) => dest,
+                Err(error) => {
+                    let msg = match error {
+                        t3_client::environments::DestinationError::Denied => {
+                            "This connection lacks permission to change these settings.".to_owned()
+                        }
+                        other => format!("{other:?}"),
+                    };
+                    failed.push((label, msg));
+                    continue;
+                }
+            };
+            let prepared = cx.update(|cx| {
+                let app = state.read(cx);
+                let view = app.connections.view();
+                let view = view.borrow();
+                if !destination.is_current(&view) {
+                    return Err("Environment connection changed.".to_owned());
+                }
+                if !destination
+                    .client
+                    .session_state()
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| session.grants(SCOPE))
+                {
+                    return Err("This connection lacks permission to change these settings.".to_owned());
+                }
+                let entry = view
+                    .environment(&destination.owner.saved_id)
+                    .ok_or_else(|| "Environment is no longer available.".to_owned())?;
+                let config = entry
+                    .config
+                    .config
+                    .as_ref()
+                    .ok_or_else(|| "Reconnect to save this setting.".to_owned())?;
+                let payload = change
+                    .payload_for(Some(&config.settings))
+                    .ok_or_else(|| "Reconnect to save this setting.".to_owned())?;
+                Ok((payload, entry.settings_revision, app.runtime().clone()))
+            });
+            let (payload, settings_revision, runtime) = match prepared {
+                Ok(tuple) => tuple,
+                Err(msg) => {
+                    failed.push((label, msg));
+                    continue;
+                }
+            };
+            let client = destination.client.clone();
+            let reply = match runtime
+                .spawn(async move { client.request(method::SERVER_UPDATE_SETTINGS, payload).await })
+                .await
+            {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(err)) => {
+                    failed.push((label, err.to_string()));
+                    continue;
+                }
+                Err(err) => {
+                    failed.push((label, err.to_string()));
+                    continue;
+                }
+            };
+            if let Some(settings) = decode_update_reply(reply) {
+                let apply = cx.update(|cx| {
+                    state.read(cx).connections.apply_settings_reply(
+                        &destination.owner,
+                        settings.clone(),
+                        settings_revision,
+                    )
+                });
+                let _ = apply.await;
+                cx.update(|cx| {
+                    state.update(cx, |app, cx| {
+                        if destination.is_current(&app.connections.view().borrow())
+                            && app.environments.active.as_deref() == Some(&destination.owner.saved_id)
+                        {
+                            app.server_config.apply_settings_reply(settings, settings_revision);
+                        }
+                        cx.emit(AppEvent::ServerConfig);
+                    });
+                });
+            }
+            saved_labels.push(label);
+        }
+        cx.update(|cx| {
+            let error = if failed.is_empty() {
+                None
+            } else {
+                let mut lines: Vec<String> = failed
+                    .into_iter()
+                    .map(|(label, msg)| format!("Could not save on {label}: {msg}"))
+                    .collect();
+                if !saved_labels.is_empty() {
+                    lines.push(format!("Saved on {}.", saved_labels.join(", ")));
+                }
+                let summary = lines.join("\n");
+                show_error(summary.clone(), cx);
+                Some(summary)
+            };
+            if let Some(done) = on_done {
+                done(error, cx);
             }
             send_next(cx);
         });
@@ -897,6 +1101,116 @@ mod tests {
             assert_eq!(payload["patch"]["projectSettingsOverrides"]["same"]["defaultThreadEnvMode"], "worktree", "next save keeps the acknowledged first override");
             reply.send(Ok(payload["patch"].clone())).unwrap();
             assert!(done.await.unwrap().is_none());
+            drop(events);
+        }
+    }
+
+    #[gpui::test]
+    async fn scoped_environment_fanout_saves_all_targets_and_reports_partial_failures(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        for partial in [false, true] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (state, _active_fixture) =
+                cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+            let (ready, loaded) = tokio::sync::oneshot::channel();
+            let mut ready = Some(ready);
+            let _subscription = state.update(cx, |_, cx| {
+                cx.subscribe(&state, move |state, _, event, _| {
+                    if *event == AppEvent::Shell
+                        && state.fleet.environments.len() == 2
+                        && let Some(ready) = ready.take()
+                    {
+                        let _ = ready.send(());
+                    }
+                })
+            });
+            let mut fixtures = Vec::new();
+            let mut events = Vec::new();
+            for (saved, label) in [("env-a", "Mac Studio"), ("env-b", "Build VPS")] {
+                let session = serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["settings:write"]
+                }))
+                .unwrap();
+                let (client, fixture) = ClientFixture::handle(session);
+                let mut shell = ShellState::default();
+                shell.apply(
+                    serde_json::from_value(json!({
+                        "kind": "snapshot",
+                        "snapshot": { "snapshotSequence": 1, "projects": [], "threads": [] }
+                    }))
+                    .unwrap(),
+                );
+                shell.synchronized = true;
+                let mut config = ServerConfigState::default();
+                config.apply(
+                    serde_json::from_value(json!({
+                        "type": "snapshot",
+                        "config": {
+                            "environment": { "environmentId": saved, "label": label },
+                            "settings": {}
+                        }
+                    }))
+                    .unwrap(),
+                );
+                let install = state.update(cx, |state, _| {
+                    state.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected)
+                });
+                events.push(runtime.spawn(install).await.unwrap());
+                fixtures.push(fixture);
+            }
+            loaded.await.unwrap();
+            let owners = state.read_with(cx, |state, _| {
+                state.fleet.environments.iter().map(|entry| entry.summary.owner.clone()).collect::<Vec<_>>()
+            });
+            assert_eq!(owners.len(), 2);
+
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+            cx.update(|cx| {
+                update_scoped_environments_then(
+                    &state,
+                    owners.clone(),
+                    ServerSettingChange::DefaultThreadEnvMode(Some(t3_core::server_config::ThreadEnvMode::Worktree)),
+                    move |failure, _| {
+                        let _ = finished_tx.send(failure);
+                    },
+                    cx,
+                );
+            });
+
+            for (index, fixture) in fixtures.iter_mut().enumerate() {
+                let (rpc, payload, reply) = fixture.next_request().await;
+                assert_eq!(rpc, method::SERVER_UPDATE_SETTINGS);
+                assert_eq!(payload["patch"]["defaultThreadEnvMode"], "worktree");
+                if partial && index == 1 {
+                    reply.send(Err(RpcError::Closed)).unwrap();
+                } else {
+                    reply.send(Ok(payload["patch"].clone())).unwrap();
+                }
+            }
+
+            let failure = finished_rx.await.unwrap();
+            if partial {
+                let message = failure.expect("partial fan-out returns error summary");
+                assert!(message.contains("Could not save on Build VPS"), "got: {message}");
+                assert!(message.contains("Saved on Mac Studio"), "got: {message}");
+                cx.update(|cx| assert_eq!(error(cx).as_deref(), Some(message.as_str())));
+            } else {
+                assert!(failure.is_none(), "unexpected failure: {failure:?}");
+                for id in ["env-a", "env-b"] {
+                    let mode = state.read_with(cx, |state, _| {
+                        state
+                            .connections
+                            .view()
+                            .borrow()
+                            .environment(id)
+                            .and_then(|entry| entry.config.config.as_ref())
+                            .and_then(|cfg| cfg.settings.default_thread_env_mode)
+                    });
+                    assert_eq!(mode, Some(t3_core::server_config::ThreadEnvMode::Worktree));
+                }
+                cx.update(|cx| assert!(error(cx).is_none()));
+            }
             drop(events);
         }
     }

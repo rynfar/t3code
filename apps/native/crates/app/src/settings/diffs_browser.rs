@@ -24,7 +24,6 @@ use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
 const BROWSER_UNAVAILABLE: &str = "Browser profiles and cookie import, floating previews, viewport, zoom, appearance, and recordings require the Electron desktop app. They aren't available in the native client yet.";
-const PR_UNAVAILABLE: &str = "Proactive panels aren't available in the native client yet.";
 const SNAPSHOTS_UNAVAILABLE: &str = "SnapShots capture requires the Electron desktop app. The native client doesn't have window capture or global capture shortcuts yet.";
 const ADVANCED: &[&str] = &[
     "browser-default-viewport",
@@ -173,11 +172,14 @@ impl SettingsView {
                         .popup_width(208.)
                 }).into_any_element(),
         ], cx);
+        let proactive_state = state.clone();
         let pr_links_state = state.clone();
         let prs = section("Pull requests", vec![
-            unavailable_group(PR_UNAVAILABLE, vec![
-                unavailable("proactive-panels", "Open pull requests and changes panels proactively", "Open linked pull requests first. Otherwise, open Changes for edits to at least 3 files or 50 lines.", "Unavailable", self.is_target("proactive-panels"), cx),
-            ], cx).into_any_element(),
+            Row::new("proactive-panels", "Open pull requests and changes panels proactively")
+                .description("Open linked pull requests first. Otherwise, open Changes for edits to at least 3 files or 50 lines.")
+                .highlighted(self.is_target("proactive-panels"))
+                .reset(doc.proactive_panels_enabled(), reset(&state, ClientSettingChange::ProactivePanelsEnabled(false)))
+                .control(Switch::new("proactive-panels-switch", doc.proactive_panels_enabled()).on_change(move |on, _, cx| store::update_client(&proactive_state, ClientSettingChange::ProactivePanelsEnabled(on), cx))).into_any_element(),
             Row::new("pull-request-links-open-in-app", "Open pull requests in T3 Code")
                 .description("Clicking a pull request link opens it in T3 Code. Turn off to open pull request links like any other link, on your git host.")
                 .highlighted(self.is_target("pull-request-links-open-in-app"))
@@ -211,13 +213,14 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Block> {
-        let config = self.state.read(cx).server_config.config.as_ref();
+        let config = self.scoped_representative_config(cx);
         let enabled = config
+            .as_ref()
             .and_then(|config| config.settings.enable_agent_browser_access)
             .unwrap_or(true);
         let available = config.is_some() && self.may("settings:write", cx);
-        let state = self.state.clone();
-        let reset_state = state.clone();
+        let reset_view = cx.entity().downgrade();
+        let switch_view = cx.entity().downgrade();
         let access = section(
             "Agent access",
             vec![
@@ -230,21 +233,17 @@ impl SettingsView {
                         "Reconnect with settings write access to change agent browser access.",
                     ))
                     .reset(!enabled, move |_, _, cx| {
-                        store::update_server(
-                            &reset_state,
-                            ServerSettingChange::AgentBrowserAccess(true),
-                            cx,
-                        )
+                        let _ = reset_view.update(cx, |this, cx| {
+                            this.update_scoped_server(ServerSettingChange::AgentBrowserAccess(true), cx);
+                        });
                     })
                     .control(
                         Switch::new("agent-browser-access-switch", enabled)
                             .disabled(!available)
                             .on_change(move |on, _, cx| {
-                                store::update_server(
-                                    &state,
-                                    ServerSettingChange::AgentBrowserAccess(on),
-                                    cx,
-                                )
+                                let _ = switch_view.update(cx, |this, cx| {
+                                    this.update_scoped_server(ServerSettingChange::AgentBrowserAccess(on), cx);
+                                });
                             }),
                     )
                     .into_any_element(),

@@ -401,6 +401,8 @@ pub fn cleared_override(settings: &ServerSettings, project_id: &str, keys: &[&st
 pub enum OverrideEdit {
     /// `planScopedSettingsPatch` for one key: null removes a key that cannot hold null.
     Set { key: String, value: Value },
+    /// `planScopedSettingsPatch` for multiple project-scoped keys in one atomic patch.
+    SetMap(Map<String, Value>),
     /// `planScopedSettingsClear`: "Reset to inherited value".
     Clear { keys: Vec<String> },
     /// The members' actions (`useProjectScriptSettings`).
@@ -420,6 +422,17 @@ pub fn override_patch(settings: &ServerSettings, members: &[Member], edit: &Over
                         entry.remove(key);
                     } else {
                         entry.insert(key.clone(), value.clone());
+                    }
+                    Value::Object(entry)
+                }
+                OverrideEdit::SetMap(patch) => {
+                    let mut entry = override_entry(settings, id).unwrap_or_default();
+                    for (key, value) in patch {
+                        if value.is_null() && !nullable_override(key) {
+                            entry.remove(key);
+                        } else {
+                            entry.insert(key.clone(), value.clone());
+                        }
                     }
                     Value::Object(entry)
                 }

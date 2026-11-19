@@ -15,7 +15,7 @@ use t3_core::settings::maintenance::{RetentionCommit, RetentionDraft, RetentionT
 use t3_core::settings::worktrees::{BranchNaming, CleanupRule, DEFAULT_BRANCH_PREFIX, KeepWhen, Submodules, WorktreeChange};
 
 use super::controls::{Row, Select, SelectOption, Switch, group, icon, muted_text, r, section, section_title};
-use super::{Block, SettingsView, store};
+use super::{Block, SettingsView};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -194,7 +194,7 @@ pub(super) fn disclosure(
 
 impl SettingsView {
     fn save_worktree(&self, change: WorktreeChange, cx: &mut App) {
-        store::update_server(&self.state, change.into_server(), cx);
+        self.update_scoped_server(change.into_server(), cx);
     }
 
     fn commit_worktree_directory(&mut self, cx: &mut Context<Self>) {
@@ -330,7 +330,7 @@ impl SettingsView {
                             cx.notify();
                         }
                         RetentionToggle::SaveOff => {
-                            store::update_server(&this.state, field.change(None).into_server(), cx);
+                            this.update_scoped_server(field.change(None).into_server(), cx);
                             cx.notify();
                         }
                         RetentionToggle::DiscardDraft => {
@@ -343,18 +343,22 @@ impl SettingsView {
             ))
     }
 
-    fn worktree_switch(&self, id: &'static str, checked: bool, change: impl Fn(bool) -> WorktreeChange + 'static) -> Switch {
-        let state = self.state.clone();
-        Switch::new(id, checked).on_change(move |checked, _, cx| store::update_server(&state, change(checked).into_server(), cx))
+    fn worktree_switch(&self, id: &'static str, checked: bool, change: impl Fn(bool) -> WorktreeChange + 'static, cx: &Context<Self>) -> Switch {
+        let view = cx.entity().downgrade();
+        Switch::new(id, checked).on_change(move |checked, _, cx| {
+            let _ = view.update(cx, |this, cx| this.update_scoped_server(change(checked).into_server(), cx));
+        })
     }
 
-    fn worktree_reset(&self, change: WorktreeChange) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
-        let state = self.state.clone();
-        move |_, _, cx| store::update_server(&state, change.clone().into_server(), cx)
+    fn worktree_reset(&self, change: WorktreeChange, cx: &Context<Self>) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        let view = cx.entity().downgrade();
+        move |_, _, cx| {
+            let _ = view.update(cx, |this, cx| this.update_scoped_server(change.clone().into_server(), cx));
+        }
     }
 
     pub(super) fn worktrees_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
-        let Some(config) = self.thread_settings(cx).cloned() else {
+        let Some(config) = self.scoped_representative_config(cx) else {
             return vec![Block::new(&[], muted_text("Reconnect to change this environment's settings.", cx))];
         };
         let settings = &config.settings.worktrees;
@@ -376,7 +380,7 @@ impl SettingsView {
                 Row::new("storage-worktrees-location", "Worktree location")
                     .description("Folder where new worktrees are created, on any drive, such as D:\\worktrees or ~/worktrees. Existing worktrees stay where they are. Leave empty to use the T3 home folder.")
                     .highlighted(self.is_target("storage-worktrees-location"))
-                    .reset(!settings.worktrees_directory.is_empty(), self.worktree_reset(WorktreeChange::Directory(String::new())))
+                    .reset(!settings.worktrees_directory.is_empty(), self.worktree_reset(WorktreeChange::Directory(String::new()), cx))
                     .control(div().w(r(288.)).child(Input::new(&self.worktrees.directory).small()))
                     .into_any_element(),
             );
@@ -386,22 +390,24 @@ impl SettingsView {
             Row::new("start-from-origin", "Start from remote")
                 .description("Uses the latest commit of the base branch\u{2019}s tracked remote branch, even if its name differs. Otherwise uses the same-named branch on origin. Uses your local branch if that remote branch is missing.")
                 .highlighted(self.is_target("start-from-origin"))
-                .reset(!start_from_origin, self.worktree_reset(WorktreeChange::StartFromOrigin(true)))
-                .control(self.worktree_switch("start-from-origin-switch", start_from_origin, WorktreeChange::StartFromOrigin))
+                .reset(!start_from_origin, self.worktree_reset(WorktreeChange::StartFromOrigin(true), cx))
+                .control(self.worktree_switch("start-from-origin-switch", start_from_origin, WorktreeChange::StartFromOrigin, cx))
                 .into_any_element(),
         );
-        let submodules_state = self.state.clone();
+        let submodules_view = cx.entity().downgrade();
         let submodules = Row::new("worktree-submodules", "Submodules")
             .description("How new worktrees populate git submodules. Projects and their t3.json can override it.")
             .highlighted(self.is_target("worktree-submodules"))
-            .reset(settings.worktree_submodules.is_some(), self.worktree_reset(WorktreeChange::Submodules(None)))
+            .reset(settings.worktree_submodules.is_some(), self.worktree_reset(WorktreeChange::Submodules(None), cx))
             .control(
                 Select::new("worktree-submodules-select", Submodules::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                     .selected(settings.effective_submodules().as_str())
                     .width(176.)
                     .on_change(move |value, _, cx| {
                         if let Some(mode) = Submodules::parse(&value) {
-                            store::update_server(&submodules_state, WorktreeChange::Submodules(Some(mode)).into_server(), cx);
+                            let _ = submodules_view.update(cx, |this, cx| {
+                                this.update_scoped_server(WorktreeChange::Submodules(Some(mode)).into_server(), cx);
+                            });
                         }
                     }),
             )
@@ -414,7 +420,7 @@ impl SettingsView {
         let creation = section("Creation", creation, cx);
 
         let mode = settings.branch_naming_mode;
-        let naming_state = self.state.clone();
+        let naming_view = cx.entity().downgrade();
         let mut branches = vec![
             Row::new("worktree-branch-naming", "Worktree branch naming")
                 .description("Choose how new worktree branches are named from your first message.")
@@ -422,14 +428,16 @@ impl SettingsView {
                     row.status("The model chooses a prefix that describes the work, such as feat/add-search, fix/login-timeout, or refactor/auth.")
                 })
                 .highlighted(self.is_target("worktree-branch-naming"))
-                .reset(mode != BranchNaming::default(), self.worktree_reset(WorktreeChange::BranchNaming(BranchNaming::default())))
+                .reset(mode != BranchNaming::default(), self.worktree_reset(WorktreeChange::BranchNaming(BranchNaming::default()), cx))
                 .control(
                     Select::new("worktree-branch-naming-select", BranchNaming::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                         .selected(mode.as_str())
                         .width(196.)
                         .on_change(move |value, _, cx| {
                             if let Some(mode) = BranchNaming::parse(&value) {
-                                store::update_server(&naming_state, WorktreeChange::BranchNaming(mode).into_server(), cx);
+                                let _ = naming_view.update(cx, |this, cx| {
+                                    this.update_scoped_server(WorktreeChange::BranchNaming(mode).into_server(), cx);
+                                });
                             }
                         }),
                 )
@@ -439,14 +447,14 @@ impl SettingsView {
             BranchNaming::Static => branches.push(
                 Row::new("worktree-branch-prefix", "Branch prefix")
                     .description("For example, t3 or t3/ produces t3/add-search. Leave empty for no prefix.")
-                    .reset(settings.branch_name_prefix != DEFAULT_BRANCH_PREFIX, self.worktree_reset(WorktreeChange::BranchPrefix(DEFAULT_BRANCH_PREFIX.to_owned())))
+                    .reset(settings.branch_name_prefix != DEFAULT_BRANCH_PREFIX, self.worktree_reset(WorktreeChange::BranchPrefix(DEFAULT_BRANCH_PREFIX.to_owned()), cx))
                     .control(div().w(r(176.)).child(Input::new(&self.worktrees.prefix).small()))
                     .into_any_element(),
             ),
             BranchNaming::Custom => branches.push(
                 Row::new("worktree-branch-instructions", "Branch naming instructions")
                     .description("Appended to the naming prompt. The model returns the complete branch name; no prefix or suffix is added.")
-                    .reset(!settings.branch_name_instructions.is_empty(), self.worktree_reset(WorktreeChange::BranchInstructions(String::new())))
+                    .reset(!settings.branch_name_instructions.is_empty(), self.worktree_reset(WorktreeChange::BranchInstructions(String::new()), cx))
                     .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.worktrees.instructions)))
                     .into_any_element(),
             ),
@@ -478,11 +486,11 @@ impl SettingsView {
         let rows = vec![
             Row::new("worktree-on-delete", "Delete worktrees with deleted threads")
                 .description("Remove unused worktrees when active or archived threads are deleted. Worktrees with local changes are kept.")
-                .control(self.worktree_switch("worktree-on-delete-switch", rules.worktree_on_delete, rule(CleanupRule::OnDelete)))
+                .control(self.worktree_switch("worktree-on-delete-switch", rules.worktree_on_delete, rule(CleanupRule::OnDelete), cx))
                 .into_any_element(),
             Row::new("worktree-on-merge", "Delete merged worktrees")
                 .description("Remove worktrees whose pull request is merged and whose commits are included in the default branch.")
-                .control(self.worktree_switch("worktree-on-merge-switch", rules.worktree_on_merge, rule(CleanupRule::OnMerge)))
+                .control(self.worktree_switch("worktree-on-merge-switch", rules.worktree_on_merge, rule(CleanupRule::OnMerge), cx))
                 .into_any_element(),
             Row::new("worktree-after-days", "Delete inactive worktrees")
                 .description("Remove worktrees after their threads have been inactive for this many days. Branches and thread history are kept.")
@@ -501,11 +509,11 @@ impl SettingsView {
         advanced_rows.push(
             Row::new("worktree-unchanged", "Delete unchanged worktrees")
                 .description("Remove worktrees with no commits beyond the default branch.")
-                .control(self.worktree_switch("worktree-unchanged-switch", rules.worktree_unchanged, rule(CleanupRule::Unchanged)))
+                .control(self.worktree_switch("worktree-unchanged-switch", rules.worktree_unchanged, rule(CleanupRule::Unchanged), cx))
                 .into_any_element(),
         );
         if capabilities.storage_cleanup_run == Some(true) {
-            let keep_state = self.state.clone();
+            let keep_view = cx.entity().downgrade();
             advanced_rows.push(
                 Row::new("storage-worktree-keep-when", "Keep worktrees with local changes")
                     .description(rules.worktree_keep_when.description())
@@ -516,7 +524,9 @@ impl SettingsView {
                             .width(196.)
                             .on_change(move |value, _, cx| {
                                 if let Some(mode) = KeepWhen::parse(&value) {
-                                    store::update_server(&keep_state, WorktreeChange::Cleanup(CleanupRule::KeepWhen(mode)).into_server(), cx);
+                                    let _ = keep_view.update(cx, |this, cx| {
+                                        this.update_scoped_server(WorktreeChange::Cleanup(CleanupRule::KeepWhen(mode)).into_server(), cx);
+                                    });
                                 }
                             }),
                     )

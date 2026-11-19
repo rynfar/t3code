@@ -26,7 +26,7 @@ use t3_core::settings::search::Section;
 
 use super::controls::{Button, ButtonSize, ButtonVariant, DialogFrame, Row, Select, SelectOption, Switch, dialog_footer, group, icon, muted_text, r, section, section_title};
 use super::providers::{Stream, failure_text};
-use super::{Block, SettingsView, store};
+use super::{Block, SettingsView};
 use crate::app_state::Phase;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -196,8 +196,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         let view = cx.entity().downgrade();
-        store::update_server_with(
-            &self.state,
+        self.update_scoped_server_with(
             change,
             Some(Box::new(move |cx| {
                 cx.spawn(async move |cx| {
@@ -253,13 +252,9 @@ impl SettingsView {
             .into_any_element()
     }
 
-    /// Built when the save queue sends it, from the settings every earlier save left.
-    fn save_background(state: &Entity<crate::app_state::AppState>, edit: BackgroundEdit, cx: &mut App) {
-        store::update_server(state, ServerSettingChange::BackgroundActivity(edit), cx);
-    }
-
+    #[cfg(all(test, feature = "snapshot"))]
     fn save_prepared(state: &Entity<crate::app_state::AppState>, payload: serde_json::Value, cx: &mut App) {
-        store::update_server(state, ServerSettingChange::Prepared(payload), cx);
+        super::store::update_server(state, ServerSettingChange::Prepared(payload), cx);
     }
 
     /// Follows the last cleanup report and the database's reclaimable space while the page shows.
@@ -372,7 +367,7 @@ impl SettingsView {
         let seconds = field.normalize(&input.read(cx).value()).unwrap_or(saved);
         input.update(cx, |input, cx| input.set_value(seconds.to_string(), window, cx));
         if seconds != saved && self.may(SETTINGS_WRITE_SCOPE, cx) {
-            Self::save_background(&self.state, BackgroundEdit::Override(field.change(seconds)), cx);
+            self.update_scoped_server(ServerSettingChange::BackgroundActivity(BackgroundEdit::Override(field.change(seconds))), cx);
         }
     }
 
@@ -390,14 +385,14 @@ impl SettingsView {
     }
 
     pub(super) fn maintenance_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
-        let Some(config) = self.thread_settings(cx).cloned() else {
+        let Some(config) = self.scoped_representative_config(cx) else {
             return vec![Block::new(&[], muted_text("Reconnect to change this environment's settings.", cx))];
         };
         self.ensure_maintenance_streams(&config, cx);
         let settings = &config.settings;
         let unavailable = self.settings_unavailable(cx);
         let connected = self.connected_now(cx);
-        let state = self.state.clone();
+        let view = cx.entity().downgrade();
         let updates = section(
             "Updates",
             vec![
@@ -406,12 +401,20 @@ impl SettingsView {
                     .highlighted(self.is_target("provider-update-checks"))
                     .unavailable(unavailable.clone())
                     .reset(!settings.maintenance.enable_provider_update_checks, {
-                        let state = state.clone();
-                        move |_, _, cx| Self::save_prepared(&state, MaintenanceChange::ProviderUpdateChecks(true).payload(), cx)
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ProviderUpdateChecks(true).payload()), cx);
+                            });
+                        }
                     })
                     .control(Switch::new("provider-update-checks-switch", settings.maintenance.enable_provider_update_checks).on_change({
-                        let state = state.clone();
-                        move |on, _, cx| Self::save_prepared(&state, MaintenanceChange::ProviderUpdateChecks(on).payload(), cx)
+                        let view = view.clone();
+                        move |on, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ProviderUpdateChecks(on).payload()), cx);
+                            });
+                        }
                     }))
                     .into_any_element(),
                 Row::new("continue-threads-after-server-update", "Continue threads after restarts")
@@ -420,12 +423,20 @@ impl SettingsView {
                     .highlighted(self.is_target("continue-threads-after-server-update"))
                     .unavailable(unavailable.clone())
                     .reset(connected && !settings.maintenance.continue_threads_after_server_update, {
-                        let state = state.clone();
-                        move |_, _, cx| Self::save_prepared(&state, MaintenanceChange::ContinueThreads(true).payload(), cx)
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(true).payload()), cx);
+                            });
+                        }
                     })
                     .control(Switch::new("continue-threads-switch", settings.maintenance.continue_threads_after_server_update).disabled(!connected).on_change({
-                        let state = state.clone();
-                        move |on, _, cx| Self::save_prepared(&state, MaintenanceChange::ContinueThreads(on).payload(), cx)
+                        let view = view.clone();
+                        move |on, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(on).payload()), cx);
+                            });
+                        }
                     }))
                     .into_any_element(),
             ],
@@ -440,13 +451,21 @@ impl SettingsView {
                     .highlighted(self.is_target("keep-awake-while-agents-work"))
                     .unavailable(unavailable.clone())
                     .reset(!settings.maintenance.keep_awake_while_agents_work, {
-                        let state = state.clone();
-                        move |_, _, cx| Self::save_prepared(&state, MaintenanceChange::KeepAwakeWhileAgentsWork(true).payload(), cx)
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::KeepAwakeWhileAgentsWork(true).payload()), cx);
+                            });
+                        }
                     })
                     .control(
                         Switch::new("keep-awake-while-agents-work-switch", settings.maintenance.keep_awake_while_agents_work).on_change({
-                            let state = state.clone();
-                            move |on, _, cx| Self::save_prepared(&state, MaintenanceChange::KeepAwakeWhileAgentsWork(on).payload(), cx)
+                            let view = view.clone();
+                            move |on, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::KeepAwakeWhileAgentsWork(on).payload()), cx);
+                                });
+                            }
                         }),
                     )
                     .into_any_element(),
@@ -491,13 +510,15 @@ impl SettingsView {
         };
         let mut options: Vec<SelectOption> = PROFILES.iter().map(|profile| SelectOption::new(profile.as_str(), model::profile_label(*profile))).collect();
         options.push(SelectOption::new(model::ADVANCED_OPTION, "Advanced"));
-        let state = self.state.clone();
         let view = cx.entity().downgrade();
+        let select_view = view.clone();
         let select = Select::new("background-activity-select", options).selected(selected).width(160.).on_change(move |value, window, cx| {
             if value.as_ref() == model::ADVANCED_OPTION {
-                let _ = view.update(cx, |this, cx| this.open_background_dialog(window, cx));
+                let _ = select_view.update(cx, |this, cx| this.open_background_dialog(window, cx));
             } else if let Some(profile) = model::parse_profile(&value) {
-                Self::save_prepared(&state, model::background_profile_payload(profile), cx);
+                let _ = select_view.update(cx, |this, cx| {
+                    this.update_scoped_server(ServerSettingChange::Prepared(model::background_profile_payload(profile)), cx);
+                });
             }
         });
         let configure = (option == ProfileOption::Advanced).then(|| {
@@ -506,13 +527,17 @@ impl SettingsView {
                 .tooltip("Configure background activity")
                 .on_click(cx.listener(|this, _, window, cx| this.open_background_dialog(window, cx)))
         });
-        let reset_state = self.state.clone();
+        let reset_view = view.clone();
         Row::new("background-activity", "Background activity")
             .title_tooltip(model::POLICY_TOOLTIP)
             .description(model::background_description(settings))
             .highlighted(self.is_target("background-activity") || self.is_target("git-fetch-interval"))
             .unavailable(unavailable)
-            .reset(model::background_customized(settings), move |_, _, cx| Self::save_prepared(&reset_state, model::background_reset_payload(), cx))
+            .reset(model::background_customized(settings), move |_, _, cx| {
+                let _ = reset_view.update(cx, |this, cx| {
+                    this.update_scoped_server(ServerSettingChange::Prepared(model::background_reset_payload()), cx);
+                });
+            })
             .control(h_flex().gap(r(8.)).child(select).children(configure))
             .into_any_element()
     }
@@ -559,14 +584,16 @@ impl SettingsView {
                 .child(div().text_xs().line_height(r(18.)).text_color(hsla(p.muted_foreground)).child(description))
         };
         let row = |content: gpui::Div| content.px(r(16.)).py(r(12.)).gap(r(12.)).items_center();
-        let state = self.state.clone();
+        let policy_view = cx.entity().downgrade();
         let policy = row(h_flex()).child(text_block("Shared policy", "Controls whether background work may run after a subscribed interval fires.")).child(
             Select::new("background-shared-policy", PROFILES.iter().map(|profile| SelectOption::new(profile.as_str(), model::profile_label(*profile))).collect())
                 .selected(resolved.profile.as_str())
                 .width(160.)
                 .on_change(move |value, _, cx| {
                     if let Some(profile) = model::parse_profile(&value) {
-                        Self::save_background(&state, BackgroundEdit::SharedPolicy(profile), cx);
+                        let _ = policy_view.update(cx, |this, cx| {
+                            this.update_scoped_server(ServerSettingChange::BackgroundActivity(BackgroundEdit::SharedPolicy(profile)), cx);
+                        });
                     }
                 }),
         );
@@ -583,7 +610,7 @@ impl SettingsView {
             );
         }
         let switches = PauseKey::ALL.map(|key| {
-            let state = self.state.clone();
+            let switch_view = cx.entity().downgrade();
             h_flex()
                 .flex_1()
                 .justify_between()
@@ -592,7 +619,9 @@ impl SettingsView {
                 .py(r(12.))
                 .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(key.label()))
                 .child(Switch::new(SharedString::from(format!("background-{}", key.label())), key.value(&resolved)).disabled(!can_write).on_change(move |on, _, cx| {
-                    Self::save_background(&state, BackgroundEdit::Override(Override::Pause(key, on)), cx);
+                    let _ = switch_view.update(cx, |this, cx| {
+                        this.update_scoped_server(ServerSettingChange::BackgroundActivity(BackgroundEdit::Override(Override::Pause(key, on))), cx);
+                    });
                 }))
                 .into_any_element()
         });
@@ -600,14 +629,18 @@ impl SettingsView {
         card = card
             .child(h_flex().border_t_1().border_color(divider).child(div().flex_1().border_r_1().border_color(divider).child(a)).child(div().flex_1().child(b)))
             .child(h_flex().border_t_1().border_color(divider).child(div().flex_1().border_r_1().border_color(divider).child(c)).child(div().flex_1().child(d)));
-        let reset_state = self.state.clone();
+        let reset_view = cx.entity().downgrade();
         let footer = dialog_footer(
             false,
             vec![
                 Button::new("background-reset-all", ButtonVariant::Outline, ButtonSize::Default)
                     .label("Reset all")
                     .disabled(!can_write)
-                    .on_click(move |_, _, cx| Self::save_prepared(&reset_state, model::background_reset_payload(), cx))
+                    .on_click(move |_, _, cx| {
+                        let _ = reset_view.update(cx, |this, cx| {
+                            this.update_scoped_server(ServerSettingChange::Prepared(model::background_reset_payload()), cx);
+                        });
+                    })
                     .into_any_element(),
                 Button::new("background-done", ButtonVariant::Default, ButtonSize::Default)
                     .label("Done")
@@ -670,7 +703,7 @@ impl SettingsView {
                             cx.notify();
                         }
                         RetentionToggle::SaveOff => {
-                            store::update_server(&this.state, ServerSettingChange::Prepared(field.change(None).payload()), cx);
+                            this.update_scoped_server(ServerSettingChange::Prepared(field.change(None).payload()), cx);
                             cx.notify();
                         }
                         RetentionToggle::DiscardDraft => {

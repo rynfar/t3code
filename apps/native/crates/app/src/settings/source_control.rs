@@ -260,7 +260,7 @@ fn build_generic_host_patch(
 
 impl SettingsView {
     fn save_source_control(&self, change: SourceControlChange, cx: &mut App) {
-        store::update_server(&self.state, change.into_server(), cx);
+        self.update_scoped_server(change.into_server(), cx);
     }
 
     fn save_source_control_and_rescan(&self, change: SourceControlChange, on_settled: impl FnOnce(&mut Self, Option<String>, &mut Context<Self>) + 'static, cx: &mut Context<Self>) {
@@ -517,7 +517,7 @@ impl SettingsView {
     }
 
     pub(super) fn source_control_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
-        let Some(config) = self.thread_settings(cx).cloned() else {
+        let Some(config) = self.scoped_representative_config(cx) else {
             return vec![Block::new(
                 &["source-control"],
                 section(
@@ -557,15 +557,20 @@ impl SettingsView {
 
     fn repositories_section(&self, config: &ServerConfig, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = &config.settings.source_control;
+        let view = cx.entity().downgrade();
         let switch = |id: &'static str, checked: bool, change: fn(bool) -> SourceControlChange| {
-            let state = self.state.clone();
-            Switch::new(id, checked).on_change(move |checked, _, cx| store::update_server(&state, change(checked).into_server(), cx))
+            let view = view.clone();
+            Switch::new(id, checked).on_change(move |checked, _, cx| {
+                let _ = view.update(cx, |this, cx| this.update_scoped_server(change(checked).into_server(), cx));
+            })
         };
         let reset = |change: SourceControlChange| {
-            let state = self.state.clone();
-            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| store::update_server(&state, change.clone().into_server(), cx)
+            let view = view.clone();
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| this.update_scoped_server(change.clone().into_server(), cx));
+            }
         };
-        let merge_state = self.state.clone();
+        let merge_view = view.clone();
         let method = config.settings.pull_request_merge_method;
         section(
             "Repositories",
@@ -592,7 +597,9 @@ impl SettingsView {
                             .width(196.)
                             .on_change(move |value, _, cx| {
                                 if let Some(method) = parse_merge_method(&value) {
-                                    store::update_server(&merge_state, SourceControlChange::MergeMethod(method).into_server(), cx);
+                                    let _ = merge_view.update(cx, |this, cx| {
+                                        this.update_scoped_server(SourceControlChange::MergeMethod(method).into_server(), cx);
+                                    });
                                 }
                             }),
                     )
@@ -1590,17 +1597,37 @@ impl SettingsView {
     }
 
     fn writing_section(&mut self, config: &ServerConfig, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_text_generator_models(config, cx);
         let settings = &config.settings.source_control;
         let style = &settings.source_control_writing_style;
-        let options = model_options(config, None);
-        let mode_state = self.state.clone();
+        let writer = source_control::writer_model(&config.settings);
+        let writer_seed = writer
+            .clone()
+            .or_else(|| t3_core::settings::resolve_default_text_generation_selection(config, None, &self.threads.text_gen_models));
+        let review_options = self.apply_scoped_model_availability(config, model_options(config, None), false, cx);
+        let writer_options = self.apply_scoped_model_availability(
+            config,
+            self.text_gen_select_options(
+                config,
+                None,
+                &[settings.source_control_writer_model_selection.as_ref(), writer_seed.as_ref()],
+            ),
+            true,
+            cx,
+        );
+        let view = cx.entity().downgrade();
+        let mode_view = view.clone();
         let custom = style.mode == WritingMode::Custom;
         let instructions = self.source_control.custom_instructions.clone();
-        let reset_state = self.state.clone();
+        let reset_view = view.clone();
         let writing = Row::new("source-control-writing-style", "Source control writing style")
             .description(style.mode.description())
             .highlighted(self.is_target("source-control-writing-style"))
-            .reset(!style.is_default_style(), move |_, _, cx| store::update_server(&reset_state, SourceControlChange::ResetWritingStyle.into_server(), cx))
+            .reset(!style.is_default_style(), move |_, _, cx| {
+                let _ = reset_view.update(cx, |this, cx| {
+                    this.update_scoped_server(SourceControlChange::ResetWritingStyle.into_server(), cx);
+                });
+            })
             .control(
                 Select::new("source-control-writing-style-select", WritingMode::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                     .selected(style.mode.as_str())
@@ -1608,23 +1635,26 @@ impl SettingsView {
                     .on_change(move |value, _, cx| {
                         let Some(mode) = WritingMode::parse(&value) else { return };
                         let custom_instructions = custom.then(|| instructions.read(cx).value().trim().to_owned());
-                        store::update_server(&mode_state, SourceControlChange::WritingMode { mode, custom_instructions }.into_server(), cx);
+                        let _ = mode_view.update(cx, |this, cx| {
+                            this.update_scoped_server(SourceControlChange::WritingMode { mode, custom_instructions }.into_server(), cx);
+                        });
                     }),
             )
             .when(custom, |row| row.below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.source_control.custom_instructions))));
 
-        let guides_state = self.state.clone();
+        let guides_view = view.clone();
         let mut rows = vec![
             writing.into_any_element(),
             Row::new("review-guides", "Review guides (beta)")
                 .description("Add a Guide tab to pull requests. An agent explains the changes and points out decisions that need review.")
                 .highlighted(self.is_target("review-guides"))
                 .control(Switch::new("review-guides-switch", settings.review_guides_enabled).on_change(move |on, _, cx| {
-                    store::update_server(&guides_state, SourceControlChange::ReviewGuides(on).into_server(), cx)
+                    let _ = guides_view.update(cx, |this, cx| {
+                        this.update_scoped_server(SourceControlChange::ReviewGuides(on).into_server(), cx);
+                    });
                 }))
                 .into_any_element(),
         ];
-        let writer = source_control::writer_model(&config.settings);
         if settings.review_guides_enabled {
             rows.push(
                 self.model_row(
@@ -1635,33 +1665,41 @@ impl SettingsView {
                         description: "Model that reads a pull request to write its review guide. It reads the change itself over many steps, so a stronger model helps. Off uses the source control writer model.",
                         selection: settings.review_guide_model_selection.clone(),
                         seed: writer.clone(),
+                        allow_text_generators: false,
                         change: SourceControlChange::ReviewGuideModel,
                     },
-                    &options,
+                    &review_options,
+                    cx,
                 ),
             );
-            let reset_state = self.state.clone();
+            let reset_view = view.clone();
             rows.push(
                 Row::new("review-guide-instructions", "Review guide instructions")
                     .description("Your preferences for review guides: what to show first, dwell on, or skip. The guide's format and coverage stay the same.")
                     .reset(!settings.review_guide_instructions.is_empty(), move |_, _, cx| {
-                        store::update_server(&reset_state, SourceControlChange::ReviewGuideInstructions(String::new()).into_server(), cx)
+                        let _ = reset_view.update(cx, |this, cx| {
+                            this.update_scoped_server(SourceControlChange::ReviewGuideInstructions(String::new()).into_server(), cx);
+                        });
                     })
                     .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.source_control.review_instructions)))
                     .into_any_element(),
             );
         }
-        let templates_state = self.state.clone();
-        let reset_templates = self.state.clone();
+        let templates_view = view.clone();
+        let reset_templates = view.clone();
         let advanced_rows = vec![
             Row::new("follow-change-request-templates", "Follow change request templates")
                 .description("Use the repository's template for change request descriptions when available.")
                 .highlighted(self.is_target("follow-change-request-templates"))
                 .reset(!style.follow_change_request_templates, move |_, _, cx| {
-                    store::update_server(&reset_templates, SourceControlChange::FollowTemplates(true).into_server(), cx)
+                    let _ = reset_templates.update(cx, |this, cx| {
+                        this.update_scoped_server(SourceControlChange::FollowTemplates(true).into_server(), cx);
+                    });
                 })
                 .control(Switch::new("follow-change-request-templates-switch", style.follow_change_request_templates).on_change(move |on, _, cx| {
-                    store::update_server(&templates_state, SourceControlChange::FollowTemplates(on).into_server(), cx)
+                    let _ = templates_view.update(cx, |this, cx| {
+                        this.update_scoped_server(SourceControlChange::FollowTemplates(on).into_server(), cx);
+                    });
                 }))
                 .into_any_element(),
             self.model_row(
@@ -1671,10 +1709,12 @@ impl SettingsView {
                     title: "Source control writer model",
                     description: "Model for source control text and branch or bookmark names. When disabled, use the text generation model configured for this environment.",
                     selection: settings.source_control_writer_model_selection.clone(),
-                    seed: writer,
+                    seed: writer_seed,
+                    allow_text_generators: true,
                     change: SourceControlChange::WriterModel,
                 },
-                &options,
+                &writer_options,
+                cx,
             ),
         ];
         let toggle = cx.listener(|this, _, _, cx| {
@@ -1686,38 +1726,52 @@ impl SettingsView {
     }
 
     /// A "use a separate model" switch with the model select beside it while on.
-    fn model_row(&self, config: &ServerConfig, row: ModelRow, options: &[SelectOption]) -> AnyElement {
-        let ModelRow { id, title, description, selection, seed, change } = row;
-        let switch_state = self.state.clone();
+    fn model_row(&self, config: &ServerConfig, row: ModelRow, options: &[SelectOption], cx: &Context<Self>) -> AnyElement {
+        let ModelRow { id, title, description, selection, seed, allow_text_generators, change } = row;
+        let switch_view = cx.entity().downgrade();
         let on = selection.is_some();
+        let disabled_reason = selection.as_ref().and_then(|sel| {
+            self.scoped_model_disabled_reason(config, &sel.instance_id, &sel.model, allow_text_generators, cx)
+        });
         let toggle = Switch::new(SharedString::from(format!("{id}-switch")), on).on_change(move |on, _, cx| {
             let next = if on { seed.clone() } else { None };
             if on && next.is_none() {
                 return;
             }
-            store::update_server(&switch_state, change(next).into_server(), cx);
+            let _ = switch_view.update(cx, |this, cx| {
+                this.update_scoped_server(change(next).into_server(), cx);
+            });
         });
         let picker = selection.filter(|_| !options.is_empty()).map(|selection| {
-            let select_state = self.state.clone();
+            let select_view = cx.entity().downgrade();
+            let label = if allow_text_generators {
+                self.text_gen_selection_label(config, &selection)
+            } else {
+                selection_label(config, &selection)
+            };
             Select::new(SharedString::from(format!("{id}-select")), options.to_vec())
                 .selected(selection_value(&selection))
-                .label(selection_label(config, &selection))
+                .label(label)
                 .width(200.)
                 .popup_width(260.)
                 .show_check()
                 .on_change(move |value, _, cx| {
                     if let Some(selection) = parse_selection(&value) {
-                        store::update_server(&select_state, change(Some(selection)).into_server(), cx);
+                        let _ = select_view.update(cx, |this, cx| {
+                            this.update_scoped_server(change(Some(selection)).into_server(), cx);
+                        });
                     }
                 })
         });
         let empty = on && options.is_empty();
-        Row::new(id, title)
+        let mut row = Row::new(id, title)
             .description(description)
             .highlighted(self.is_target(id))
-            .when(empty, |row| row.status("No text generation providers available."))
-            .control(h_flex().gap(r(8.)).children(picker).child(toggle))
-            .into_any_element()
+            .when(empty, |row| row.status("No text generation providers available."));
+        if !empty && let Some(reason) = disabled_reason {
+            row = row.status(reason);
+        }
+        row.control(h_flex().gap(r(8.)).children(picker).child(toggle)).into_any_element()
     }
 }
 
@@ -1728,6 +1782,8 @@ struct ModelRow {
     selection: Option<t3_core::model::ModelSelection>,
     /// What turning the switch on saves: the writer model in use.
     seed: Option<t3_core::model::ModelSelection>,
+    /// Whether direct text-generation providers (configured under `textGenerators`) are allowed.
+    allow_text_generators: bool,
     change: fn(Option<t3_core::model::ModelSelection>) -> SourceControlChange,
 }
 

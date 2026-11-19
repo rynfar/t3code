@@ -17,6 +17,7 @@ pub mod history;
 pub mod json_text;
 pub mod home;
 pub mod html_render;
+pub mod i18n;
 pub mod keybindings;
 pub mod lineage;
 pub mod lists;

@@ -11,6 +11,7 @@ use typography::{FontRole, ADVANCED_KEY};
 use serde_json::{Map, Value};
 
 use crate::composer::ClientSettings;
+pub use crate::announcements::ScreenReaderAnnouncements;
 pub use crate::notifications::NotificationMode;
 
 macro_rules! literal_enum {
@@ -156,6 +157,31 @@ literal_enum!(
 pub const NOTIFICATION_MODES: [NotificationMode; 4] =
     [NotificationMode::Off, NotificationMode::Notifications, NotificationMode::Sound, NotificationMode::NotificationsAndSound];
 
+/// Every `ScreenReaderAnnouncements` mode in the web's select order (`SettingsPanels.tsx`).
+pub const SCREEN_READER_ANNOUNCEMENTS_MODES: [ScreenReaderAnnouncements; 3] = [
+    ScreenReaderAnnouncements::Status,
+    ScreenReaderAnnouncements::Messages,
+    ScreenReaderAnnouncements::Everything,
+];
+
+/// Wire value for `ScreenReaderAnnouncements`.
+pub fn screen_reader_announcements_value(mode: ScreenReaderAnnouncements) -> &'static str {
+    match mode {
+        ScreenReaderAnnouncements::Status => "status",
+        ScreenReaderAnnouncements::Messages => "messages",
+        ScreenReaderAnnouncements::Everything => "everything",
+    }
+}
+
+/// UI label for `ScreenReaderAnnouncements` (`SCREEN_READER_ANNOUNCEMENTS_LABELS`).
+pub fn screen_reader_announcements_label(mode: ScreenReaderAnnouncements) -> &'static str {
+    match mode {
+        ScreenReaderAnnouncements::Status => "Status only",
+        ScreenReaderAnnouncements::Messages => "Status and messages",
+        ScreenReaderAnnouncements::Everything => "Everything",
+    }
+}
+
 /// The wire value of a notification mode.
 pub fn notification_mode_value(mode: NotificationMode) -> &'static str {
     match mode {
@@ -261,6 +287,10 @@ pub enum ClientSettingChange {
     SpeechCustomWords(Vec<crate::voice_input::SpeechCustomWordEntry>),
     SpeechPostProcessingPrompt(crate::voice_input::SpeechPostProcessingPromptSettings),
     SpeechCorrectionWord(String),
+    Language(String),
+    ProactivePanelsEnabled(bool),
+    ScreenReaderAnnouncements(ScreenReaderAnnouncements),
+    ScreenReaderWindowTitle(bool),
 }
 
 impl ClientSettingChange {
@@ -355,6 +385,13 @@ impl ClientSettingChange {
                 serde_json::to_value(prompt).unwrap_or(Value::Null),
             ),
             ClientSettingChange::SpeechCorrectionWord(word) => ("speechCorrectionWord", text(word)),
+            ClientSettingChange::Language(language) => ("language", text(language)),
+            ClientSettingChange::ProactivePanelsEnabled(on) => ("proactivePanelsEnabled", Value::Bool(*on)),
+            ClientSettingChange::ScreenReaderAnnouncements(mode) => (
+                "screenReaderAnnouncements",
+                text(screen_reader_announcements_value(*mode)),
+            ),
+            ClientSettingChange::ScreenReaderWindowTitle(on) => ("screenReaderWindowTitle", Value::Bool(*on)),
         }
     }
 }
@@ -699,6 +736,26 @@ impl ClientSettingsDoc {
 
     pub fn speech_correction_word(&self) -> &str {
         self.text("speechCorrectionWord").unwrap_or("")
+    }
+
+    /// UI language (`language` in `packages/contracts/src/settings.ts:583`, default `"en"`).
+    pub fn language(&self) -> &str {
+        self.text("language").unwrap_or(crate::i18n::DEFAULT_LOCALE)
+    }
+
+    /// Proactively open linked PR or Changes panels (`proactivePanelsEnabled`, default `false`).
+    pub fn proactive_panels_enabled(&self) -> bool {
+        self.flag("proactivePanelsEnabled", false)
+    }
+
+    /// Open-thread screen reader verbosity (`screenReaderAnnouncements`, default `"status"`).
+    pub fn screen_reader_announcements(&self) -> ScreenReaderAnnouncements {
+        crate::announcements::screen_reader_announcements_setting(&self.entries)
+    }
+
+    /// Lead window title with thread status for screen readers (`screenReaderWindowTitle`, default `false`).
+    pub fn screen_reader_window_title(&self) -> bool {
+        crate::announcements::screen_reader_window_title_setting(&self.entries)
     }
 }
 

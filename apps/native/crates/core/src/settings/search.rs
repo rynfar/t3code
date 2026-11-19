@@ -374,6 +374,12 @@ pub fn items(features: Features) -> Vec<SearchItem> {
             .requires_thread_auto_settlement(),
         SearchItem::new("thread-notifications", "Thread notifications", General, &["notification sound alert completion input approval desktop"]),
         SearchItem::new("in-app-notifications", "In-app notifications", General, &["notification toast popup completion input approval failure"]),
+        SearchItem::new(
+            "language",
+            "Language",
+            General,
+            &["locale translation english deutsch german español spanish français french português portuguese brasil brazilian chinese 中文 japanese 日本語 korean 한국어 russian русский sprache idioma langue 语言 言語 언어 язык"],
+        ),
         SearchItem::new("time-format", "Time format", General, &["timestamp clock locale system browser os 12 hour 24 hour"]),
         SearchItem::new("response-streaming", "Response streaming", Threads, &["output token paragraph buffered wait turn legacy"]).scope(ProjectDefaults),
         SearchItem::new("skills-in-slash-menu", "Show skills in slash menu", Chat, &["command menu dollar $ slash /"]),
@@ -381,6 +387,18 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("send-shortcut", "Send shortcut", Chat, &["enter return command ctrl multiline prompt new line composer"]),
         SearchItem::new("follow-up-behavior", "Follow-up behavior", Chat, &["queue steer running turn send default behavior composer"]),
         SearchItem::new("tool-call-visibility", "Tool calls in chat", Chat, &["activity work log tool calls show all hide successful hide all zen"]),
+        SearchItem::new(
+            "screen-reader-announcements",
+            "Screen reader announcements",
+            Chat,
+            &["accessibility a11y screen reader nvda jaws voiceover orca narrator speech announce read aloud messages activity steps"],
+        ),
+        SearchItem::new(
+            "screen-reader-window-title",
+            "Screen reader window title",
+            Chat,
+            &["accessibility a11y screen reader nvda jaws voiceover orca narrator window title tab title alt tab taskbar thread status order working approval"],
+        ),
         SearchItem::new("provider-update-checks", "Provider update checks", Maintenance, &["installed cli versions newer available codex claude cursor grok fx kiro opencode"]).scope(EnvironmentDefaults),
         SearchItem::new("continue-threads-after-server-update", "Continue threads after restarts", Maintenance, &["resume running active interrupted work restart reboot machine crash desktop update automatically"]).scope(ProjectDefaults),
         SearchItem::new("keep-awake-while-agents-work", "Keep awake while agents work", Maintenance, &["caffeinate sleep prevent stay awake power laptop lid inhibit"]).scope(EnvironmentDefaults),
@@ -500,10 +518,15 @@ pub fn normalize(value: &str) -> String {
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `searchSettings`: every query token must appear in the title, the section label, or a term.
-/// Primary results first, then by rank (exact title, title prefix, title phrase, title tokens,
-/// any phrase), then list order.
+/// `searchSettings`: every query token must appear in the title, the section label, or a term
+/// (matching both English and active-locale labels). Primary results first, then by rank
+/// (exact title, title prefix, title phrase, title tokens, any phrase), then list order.
 pub fn search<'a>(query: &str, items: &'a [SearchItem]) -> Vec<&'a SearchItem> {
+    search_with_locale(query, items, crate::i18n::DEFAULT_LOCALE)
+}
+
+/// `searchSettings` with localized title/section matching (`settingsSearch.ts:1547-1591`).
+pub fn search_with_locale<'a>(query: &str, items: &'a [SearchItem], locale: &str) -> Vec<&'a SearchItem> {
     let query = normalize(query);
     if query.is_empty() {
         return Vec::new();
@@ -514,7 +537,14 @@ pub fn search<'a>(query: &str, items: &'a [SearchItem]) -> Vec<&'a SearchItem> {
         .enumerate()
         .filter_map(|(index, item)| {
             let title = normalize(&item.title);
-            let mut fields = vec![title.clone(), normalize(item.section.label())];
+            let translated_title = normalize(crate::i18n::translate(locale, &item.title));
+            let translated_section = normalize(crate::i18n::translate(locale, item.section.label()));
+            let mut fields = vec![
+                title.clone(),
+                normalize(item.section.label()),
+                translated_title,
+                translated_section,
+            ];
             fields.extend(item.terms.iter().map(|term| normalize(term)));
             if !tokens.iter().all(|token| fields.iter().any(|field| field.contains(token))) {
                 return None;
@@ -617,5 +647,20 @@ mod search_parity_tests {
         assert!(is_search_scope_available(Some(SearchScope::Project), super::super::ResolvedScopeKind::Project));
         assert!(!is_search_scope_available(Some(SearchScope::Project), super::super::ResolvedScopeKind::All));
         assert!(is_search_scope_available(Some(SearchScope::ProjectDefaults), super::super::ResolvedScopeKind::All));
+
+        // Language and Screen reader items are searchable in English and active locales.
+        assert!(all.iter().any(|item| item.id == "language"));
+        assert!(all.iter().any(|item| item.id == "screen-reader-announcements"));
+        assert!(all.iter().any(|item| item.id == "screen-reader-window-title"));
+
+        // Localized search matches both translated and English titles/sections.
+        let de_section_hits = search_with_locale("Allgemein", &all, "de");
+        assert!(de_section_hits.iter().any(|item| item.id == "language"));
+        let de_en_hits = search_with_locale("Time format", &all, "de");
+        assert!(de_en_hits.iter().any(|item| item.id == "time-format"));
+        let ja_hits = search_with_locale("時刻の形式", &all, "ja");
+        assert!(ja_hits.iter().any(|item| item.id == "time-format"));
+        let zh_hits = search_with_locale("语言", &all, "zh");
+        assert!(zh_hits.iter().any(|item| item.id == "language"));
     }
 }

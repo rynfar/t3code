@@ -864,6 +864,71 @@ pub fn settings_scope_checkout_label(checkout: &ScopeCheckout, all: &[&ScopeChec
     if count > 1 { checkout.workspace_root.clone() } else { name.to_owned() }
 }
 
+/// `PROJECT_SCOPED_SERVER_SETTING_KEYS` (`packages/contracts/src/settings.ts:1171-1199`).
+pub const PROJECT_SCOPED_SERVER_SETTING_KEYS: &[&str] = &[
+    "worktreeCleanup",
+    "defaultModelSelection",
+    "defaultRuntimeMode",
+    "defaultThreadEnvMode",
+    "newWorktreesStartFromOrigin",
+    "worktreeSubmodules",
+    "defaultAutoPull",
+    "defaultProjectScripts",
+    "enableAgentBrowserAccess",
+    "enableAgentDeviceAccess",
+    "textGenerationModelSelection",
+    "threadTitleInstructions",
+    "sourceControlWriterModelSelection",
+    "reviewGuideModelSelection",
+    "reviewGuideInstructions",
+    "sourceControlWritingStyle",
+    "removeAgentCreditsOnMerge",
+    "branchNamingMode",
+    "branchNamePrefix",
+    "branchNameInstructions",
+    "pullRequestMergeMethod",
+    "sidebarAutoSettleOnMerge",
+    "sidebarAutoSettleAfterDays",
+    "sidebarAutoSettleKeepPullRequests",
+    "continueThreadsAfterServerUpdate",
+    "responseStreamingMode",
+    "speechProjectCustomWords",
+];
+
+pub fn is_project_scoped_setting_key(key: &str) -> bool {
+    PROJECT_SCOPED_SERVER_SETTING_KEYS.contains(&key)
+}
+
+/// Converts a server setting change into a project-override edit when every key in its patch is
+/// project-scoped (`planScopedSettingsPatch` in `scopedSettings.ts`). Returns `None` for
+/// environment-only settings that cannot be overridden per project.
+pub fn server_change_to_override_edit(change: &ServerSettingChange) -> Option<projects::OverrideEdit> {
+    match change {
+        ServerSettingChange::ProviderInstance { .. }
+        | ServerSettingChange::ProjectOverride { .. }
+        | ServerSettingChange::BackgroundActivity(_) => None,
+        ServerSettingChange::Prepared(payload) => {
+            let patch = payload.get("patch")?.as_object()?;
+            if patch.is_empty() || !patch.keys().all(|k| is_project_scoped_setting_key(k)) {
+                return None;
+            }
+            if patch.len() == 1 {
+                let (key, value) = patch.iter().next()?;
+                Some(projects::OverrideEdit::Set { key: key.clone(), value: value.clone() })
+            } else {
+                Some(projects::OverrideEdit::SetMap(patch.clone()))
+            }
+        }
+        other => {
+            let key = other.key();
+            if key.is_empty() || !is_project_scoped_setting_key(key) {
+                return None;
+            }
+            Some(projects::OverrideEdit::Set { key: key.to_owned(), value: other.value() })
+        }
+    }
+}
+
 /// Checks whether `(instance_id, model)` is available across every target environment in scope
 /// (`useScopedModelDisabledReason` in `useScopedModelAvailability.ts`).
 pub fn scoped_model_disabled_reason(
@@ -1586,5 +1651,94 @@ mod panel_tests {
         let choices = settings_scope_checkout_choices(&group, &SettingsScopeSearch::default());
         assert_eq!(choices.len(), 2);
         assert_eq!(settings_scope_checkout_label(choices[0], &choices), "/a/t3code");
+    }
+
+    #[test]
+    fn server_change_to_override_edit_routes_project_scoped_keys_and_refuses_env_only_keys() {
+        assert_eq!(
+            server_change_to_override_edit(&ServerSettingChange::AgentBrowserAccess(false)),
+            Some(projects::OverrideEdit::Set {
+                key: "enableAgentBrowserAccess".into(),
+                value: json!(false),
+            })
+        );
+        assert_eq!(
+            server_change_to_override_edit(&ServerSettingChange::AutoSettleAfterDays(None)),
+            Some(projects::OverrideEdit::Set {
+                key: "sidebarAutoSettleAfterDays".into(),
+                value: Value::Null,
+            })
+        );
+        // Environment-only keys cannot be overridden per project.
+        assert_eq!(
+            server_change_to_override_edit(&ServerSettingChange::AddProjectBaseDirectory("~/dev".into())),
+            None
+        );
+        assert_eq!(
+            server_change_to_override_edit(&ServerSettingChange::GhqCloneLayout(true)),
+            None
+        );
+        assert_eq!(
+            server_change_to_override_edit(&ServerSettingChange::FastWorktreeCheckout(true)),
+            None
+        );
+        // Multi-key prepared patch with all project-scoped keys succeeds.
+        let prepared = ServerSettingChange::Prepared(json!({
+            "patch": {
+                "branchNamingMode": "prefix",
+                "branchNamePrefix": "feat/"
+            }
+        }));
+        assert!(matches!(
+            server_change_to_override_edit(&prepared),
+            Some(projects::OverrideEdit::SetMap(ref map)) if map.len() == 2
+        ));
+        // Prepared patch containing an env-only key is refused.
+        let env_prepared = ServerSettingChange::Prepared(json!({
+            "patch": { "addProjectBaseDirectory": "~/x" }
+        }));
+        assert_eq!(server_change_to_override_edit(&env_prepared), None);
+    }
+
+    #[test]
+    fn scoped_model_disabled_reason_reports_unavailable_target_environment() {
+        let mac: crate::server_config::ServerConfig = serde_json::from_value(json!({
+            "environment": { "environmentId": "mac", "label": "Mac" },
+            "providers": [{
+                "instanceId": "codex",
+                "driver": "codex",
+                "displayName": "Codex",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "models": [{ "slug": "gpt-5", "name": "GPT-5" }]
+            }],
+            "settings": { "providerInstances": { "codex": { "driver": "codex", "enabled": true } } }
+        }))
+        .unwrap();
+        let vps: crate::server_config::ServerConfig = serde_json::from_value(json!({
+            "environment": { "environmentId": "vps", "label": "Build VPS" },
+            "providers": [{
+                "instanceId": "codex",
+                "driver": "codex",
+                "displayName": "Codex",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "models": [{ "slug": "gpt-4.1", "name": "GPT-4.1" }]
+            }],
+            "settings": { "providerInstances": { "codex": { "driver": "codex", "enabled": true } } }
+        }))
+        .unwrap();
+
+        let targets = [("Mac", &mac, None), ("Build VPS", &vps, None)];
+        assert_eq!(
+            scoped_model_disabled_reason(&mac.settings, Some("codex"), &targets, "codex", "gpt-5", false),
+            Some("This model is unavailable on Build VPS. Select that environment to choose its model separately.".into())
+        );
+        assert_eq!(
+            scoped_model_disabled_reason(&mac.settings, Some("codex"), &[("Mac", &mac, None)], "codex", "gpt-5", false),
+            None
+        );
     }
 }

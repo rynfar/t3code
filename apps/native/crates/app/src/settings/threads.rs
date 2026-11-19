@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveTime, Timelike, TimeZone};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled,
-    Subscription, Window, div,
+    Subscription, WeakEntity, Window, div,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{Sizable, h_flex, v_flex};
@@ -180,7 +180,7 @@ pub(super) fn model_trait_controls(
     id_prefix: &'static str,
     config: &ServerConfig,
     selection: &ModelSelection,
-    state: &gpui::Entity<crate::app_state::AppState>,
+    view: WeakEntity<SettingsView>,
     change: fn(Option<ModelSelection>) -> ServerSettingChange,
 ) -> Vec<AnyElement> {
     let Some(provider) = config.provider(&selection.instance_id) else {
@@ -216,7 +216,7 @@ pub(super) fn model_trait_controls(
         let option_id = select.id.clone();
         let instance_id = selection.instance_id.clone();
         let model_slug = selection.model.clone();
-        let state = state.clone();
+        let view = view.clone();
         controls.push(
             Select::new(SharedString::from(format!("{id_prefix}-trait-{}", select.id)), options)
                 .selected(selected)
@@ -228,7 +228,9 @@ pub(super) fn model_trait_controls(
                         traits::with_value(&all_descriptors, &option_id, OptionValue::Str(value.to_string()))
                     {
                         let next = traits::model_selection(&instance_id, &model_slug, &next_selections);
-                        store::update_server(&state, change(Some(next)), cx);
+                        let _ = view.update(cx, |this, cx| {
+                            this.update_scoped_server(change(Some(next)), cx);
+                        });
                     }
                 })
                 .into_any_element(),
@@ -306,6 +308,26 @@ impl SettingsView {
         }
     }
 
+    /// Annotates each model option with `scoped_model_disabled_reason` when multiple environments
+    /// or project checkouts are in scope (`useScopedModelDisabledReason`).
+    pub(super) fn apply_scoped_model_availability(
+        &self,
+        config: &ServerConfig,
+        options: Vec<SelectOption>,
+        text_generation: bool,
+        cx: &App,
+    ) -> Vec<SelectOption> {
+        options
+            .into_iter()
+            .map(|option| {
+                let reason = parse_selection(&option.value).and_then(|sel| {
+                    self.scoped_model_disabled_reason(config, &sel.instance_id, &sel.model, text_generation, cx)
+                });
+                option.disabled_reason(reason)
+            })
+            .collect()
+    }
+
     pub(super) fn text_gen_select_options(
         &self,
         config: &ServerConfig,
@@ -336,22 +358,24 @@ impl SettingsView {
     }
 
     pub(super) fn threads_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
-        let Some(config) = self.thread_settings(cx).cloned() else {
+        let Some(config) = self.scoped_representative_config(cx) else {
             return vec![Block::new(&[], muted_text("Reconnect to change this environment's settings.", cx))];
         };
         let settings = &config.settings;
         let threads = &settings.threads;
-        let state = self.state.clone();
+        let view = cx.entity().downgrade();
         let update = move |change: ServerSettingChange| {
-            let state = state.clone();
-            move |cx: &mut App| store::update_server(&state, change.clone(), cx)
+            let view = view.clone();
+            move |cx: &mut App| {
+                let _ = view.update(cx, |this, cx| this.update_scoped_server(change.clone(), cx));
+            }
         };
 
         Self::sync_input(&self.threads.base_directory, &threads.add_project_base_directory, window, cx);
         self.sync_auto_settle_days(threads.sidebar_auto_settle_after_days, window, cx);
         self.sync_title_instructions(&threads.thread_title_instructions, window, cx);
 
-        let ghq_state = self.state.clone();
+        let ghq_view = cx.entity().downgrade();
         let new_projects = section(
             "New projects",
             vec![
@@ -372,22 +396,25 @@ impl SettingsView {
                         move |_, _, cx| reset(cx)
                     })
                     .control(Switch::new("ghq-clone-layout-switch", threads.ghq_clone_layout).on_change(move |checked, _, cx| {
-                        store::update_server(&ghq_state, ServerSettingChange::GhqCloneLayout(checked), cx);
+                        let _ = ghq_view.update(cx, |this, cx| this.update_scoped_server(ServerSettingChange::GhqCloneLayout(checked), cx));
                     }))
                     .into_any_element(),
             ],
             cx,
         );
 
-        let options = model_options(&config, None);
+        let options = self.apply_scoped_model_availability(&config, model_options(&config, None), false, cx);
         let selection = settings
             .default_model_selection
             .clone()
             .filter(|selection| providers::instance_enabled(settings, None, &selection.instance_id))
             .or_else(|| providers::project_default_selection(&providers::entries(&config, None)));
         let automatic = settings.default_model_selection.is_none();
-        let model_state = self.state.clone();
-        let model_row = Row::new("default-model", "Model")
+        let model_view = cx.entity().downgrade();
+        let model_disabled_reason = selection.as_ref().and_then(|sel| {
+            self.scoped_model_disabled_reason(&config, &sel.instance_id, &sel.model, false, cx)
+        });
+        let mut model_row = Row::new("default-model", "Model")
             .description(if automatic {
                 "Default model for new threads, selected automatically. Projects can override it."
             } else {
@@ -398,13 +425,16 @@ impl SettingsView {
                 let reset = update(ServerSettingChange::DefaultModelSelection(None));
                 move |_, _, cx| reset(cx)
             });
+        if let Some(reason) = model_disabled_reason {
+            model_row = model_row.status(reason);
+        }
         let model_row = match &selection {
             Some(selection) if !options.is_empty() => {
                 let trait_pickers = model_trait_controls(
                     "default-model",
                     &config,
                     selection,
-                    &self.state,
+                    cx.entity().downgrade(),
                     ServerSettingChange::DefaultModelSelection,
                 );
                 model_row.control(
@@ -421,7 +451,9 @@ impl SettingsView {
                                 .show_check()
                                 .on_change(move |value, _, cx| {
                                     if let Some(selection) = parse_selection(&value) {
-                                        store::update_server(&model_state, ServerSettingChange::DefaultModelSelection(Some(selection)), cx);
+                                        let _ = model_view.update(cx, |this, cx| {
+                                            this.update_scoped_server(ServerSettingChange::DefaultModelSelection(Some(selection)), cx);
+                                        });
                                     }
                                 }),
                         )
@@ -431,15 +463,21 @@ impl SettingsView {
             _ => model_row.control(muted_text("No providers available", cx)),
         };
 
-        let fallback_state = self.state.clone();
+        let fallback_view = cx.entity().downgrade();
         let fallback = settings.fallback_model_selection.clone().or(selection.clone());
-        let fallback_row = Row::new("fallback-model", "Fallback model")
+        let fallback_disabled_reason = settings.fallback_model_selection.as_ref().and_then(|sel| {
+            self.scoped_model_disabled_reason(&config, &sel.instance_id, &sel.model, false, cx)
+        });
+        let mut fallback_row = Row::new("fallback-model", "Fallback model")
             .description("Used for new threads when the default model's provider is out of usage.")
             .highlighted(self.is_target("fallback-model"))
             .reset(settings.fallback_model_selection.is_some(), {
                 let reset = update(ServerSettingChange::FallbackModelSelection(None));
                 move |_, _, cx| reset(cx)
             });
+        if let Some(reason) = fallback_disabled_reason {
+            fallback_row = fallback_row.status(reason);
+        }
         let fallback_row = match &fallback {
             Some(shown) if !options.is_empty() => {
                 let trait_pickers = settings
@@ -450,7 +488,7 @@ impl SettingsView {
                             "fallback-model",
                             &config,
                             explicit,
-                            &self.state,
+                            cx.entity().downgrade(),
                             ServerSettingChange::FallbackModelSelection,
                         )
                     })
@@ -469,7 +507,9 @@ impl SettingsView {
                                 .show_check()
                                 .on_change(move |value, _, cx| {
                                     if let Some(selection) = parse_selection(&value) {
-                                        store::update_server(&fallback_state, ServerSettingChange::FallbackModelSelection(Some(selection)), cx);
+                                        let _ = fallback_view.update(cx, |this, cx| {
+                                            this.update_scoped_server(ServerSettingChange::FallbackModelSelection(Some(selection)), cx);
+                                        });
                                     }
                                 }),
                         )
@@ -479,7 +519,7 @@ impl SettingsView {
             _ => fallback_row.control(muted_text("No providers available", cx)),
         };
 
-        let mode_state = self.state.clone();
+        let mode_view = cx.entity().downgrade();
         let permissions_row = Row::new("default-permissions", "Permissions")
             .description("Default permissions for new threads. Projects can override them.")
             .highlighted(self.is_target("default-permissions"))
@@ -503,12 +543,14 @@ impl SettingsView {
                 .popup_width(256.)
                 .on_change(move |value, _, cx| {
                     if let Some(mode) = RuntimeMode::parse(&value) {
-                        store::update_server(&mode_state, ServerSettingChange::DefaultRuntimeMode(mode), cx);
+                        let _ = mode_view.update(cx, |this, cx| {
+                            this.update_scoped_server(ServerSettingChange::DefaultRuntimeMode(mode), cx);
+                        });
                     }
                 }),
             );
 
-        let workspace_state = self.state.clone();
+        let workspace_view = cx.entity().downgrade();
         let workspace_row = Row::new("new-threads", "Workspace")
             .description("Where new threads start. Projects and their t3.json can override it.")
             .highlighted(self.is_target("new-threads"))
@@ -526,7 +568,9 @@ impl SettingsView {
                             "worktree" => ThreadEnvMode::Worktree,
                             _ => return,
                         };
-                        store::update_server(&workspace_state, ServerSettingChange::DefaultThreadEnvMode(Some(mode)), cx);
+                        let _ = workspace_view.update(cx, |this, cx| {
+                            this.update_scoped_server(ServerSettingChange::DefaultThreadEnvMode(Some(mode)), cx);
+                        });
                     }),
             );
 
@@ -538,9 +582,12 @@ impl SettingsView {
 
         let snooze_section = section("Snooze", vec![self.snooze_row(&threads.snooze_presets, window, cx).into_any_element()], cx);
 
+        let switch_view = cx.entity().downgrade();
         let switch = |id: &'static str, checked: bool, change: fn(bool) -> ServerSettingChange| {
-            let state = self.state.clone();
-            Switch::new(id, checked).on_change(move |checked, _, cx| store::update_server(&state, change(checked), cx))
+            let view = switch_view.clone();
+            Switch::new(id, checked).on_change(move |checked, _, cx| {
+                let _ = view.update(cx, |this, cx| this.update_scoped_server(change(checked), cx));
+            })
         };
         let usage_limits = section(
             "Usage limits",
@@ -604,23 +651,33 @@ impl SettingsView {
         let saved_text_gen = t3_core::settings::text_generation_model_selection(settings);
         let text_gen_selection =
             resolve_default_text_generation_selection(&config, None, &self.threads.text_gen_models);
-        let text_gen_options =
-            self.text_gen_select_options(&config, None, &[saved_text_gen.as_ref(), text_gen_selection.as_ref()]);
-        let text_gen_state = self.state.clone();
-        let text_gen_row = Row::new("text-generation-model", "Text generation model")
+        let text_gen_options = self.apply_scoped_model_availability(
+            &config,
+            self.text_gen_select_options(&config, None, &[saved_text_gen.as_ref(), text_gen_selection.as_ref()]),
+            true,
+            cx,
+        );
+        let text_gen_view = cx.entity().downgrade();
+        let text_gen_disabled_reason = text_gen_selection.as_ref().and_then(|sel| {
+            self.scoped_model_disabled_reason(&config, &sel.instance_id, &sel.model, true, cx)
+        });
+        let mut text_gen_row = Row::new("text-generation-model", "Text generation model")
             .description("For thread titles and other generated text. Source control has its own setting.")
             .highlighted(self.is_target("text-generation-model"))
             .reset(saved_text_gen.is_some(), {
                 let reset = update(ServerSettingChange::TextGenerationModelSelection(None));
                 move |_, _, cx| reset(cx)
             });
+        if let Some(reason) = text_gen_disabled_reason {
+            text_gen_row = text_gen_row.status(reason);
+        }
         let text_gen_row = match &text_gen_selection {
             Some(shown) if !text_gen_options.is_empty() => {
                 let trait_pickers = model_trait_controls(
                     "text-generation-model",
                     &config,
                     shown,
-                    &self.state,
+                    cx.entity().downgrade(),
                     ServerSettingChange::TextGenerationModelSelection,
                 );
                 let label = self.text_gen_selection_label(&config, shown);
@@ -638,11 +695,12 @@ impl SettingsView {
                                 .show_check()
                                 .on_change(move |value, _, cx| {
                                     if let Some(selection) = parse_selection(&value) {
-                                        store::update_server(
-                                            &text_gen_state,
-                                            ServerSettingChange::TextGenerationModelSelection(Some(selection)),
-                                            cx,
-                                        );
+                                        let _ = text_gen_view.update(cx, |this, cx| {
+                                            this.update_scoped_server(
+                                                ServerSettingChange::TextGenerationModelSelection(Some(selection)),
+                                                cx,
+                                            );
+                                        });
                                     }
                                 }),
                         )
@@ -679,7 +737,7 @@ impl SettingsView {
         ];
         if text_gen_advanced {
             let streaming = threads.response_streaming_mode;
-            let streaming_state = self.state.clone();
+            let streaming_view = cx.entity().downgrade();
             let reset_instructions_view = cx.entity().downgrade();
             text_gen_rows.push(
                 Row::new("thread-title-instructions", "Thread title instructions")
@@ -725,7 +783,9 @@ impl SettingsView {
                                 "paragraph" => ResponseStreamingMode::Paragraph,
                                 _ => return,
                             };
-                            store::update_server(&streaming_state, ServerSettingChange::ResponseStreamingMode(mode), cx);
+                            let _ = streaming_view.update(cx, |this, cx| {
+                                this.update_scoped_server(ServerSettingChange::ResponseStreamingMode(mode), cx);
+                            });
                         }),
                     )
                     .into_any_element(),
@@ -754,9 +814,9 @@ impl SettingsView {
 
     fn commit_base_directory(&mut self, cx: &mut Context<Self>) {
         let value = self.threads.base_directory.read(cx).value().trim().to_owned();
-        let saved = self.thread_settings(cx).map(|config| config.settings.threads.add_project_base_directory.clone());
+        let saved = self.scoped_representative_config(cx).map(|config| config.settings.threads.add_project_base_directory);
         if saved.as_deref() != Some(value.as_str()) {
-            store::update_server(&self.state, ServerSettingChange::AddProjectBaseDirectory(value), cx);
+            self.update_scoped_server(ServerSettingChange::AddProjectBaseDirectory(value), cx);
         }
     }
 
@@ -806,7 +866,7 @@ impl SettingsView {
                 }
             });
         });
-        store::update_server_with(&self.state, ServerSettingChange::ThreadTitleInstructions(value), Some(on_failed), cx);
+        self.update_scoped_server_with(ServerSettingChange::ThreadTitleInstructions(value), Some(on_failed), cx);
     }
 
     fn sync_auto_settle_days(&mut self, saved: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
@@ -837,7 +897,7 @@ impl SettingsView {
                 cx.notify();
             });
         });
-        store::update_server_with(&self.state, ServerSettingChange::AutoSettleAfterDays(Some(days)), Some(on_failed), cx);
+        self.update_scoped_server_with(ServerSettingChange::AutoSettleAfterDays(Some(days)), Some(on_failed), cx);
     }
 
     /// Escape while editing auto-settle days cancels the dirty draft without closing Settings.
@@ -903,7 +963,7 @@ impl SettingsView {
                 cx.notify();
             });
         });
-        store::update_server_with(&self.state, ServerSettingChange::SnoozePresets(next), Some(on_failed), cx);
+        self.update_scoped_server_with(ServerSettingChange::SnoozePresets(next), Some(on_failed), cx);
         cx.notify();
     }
 

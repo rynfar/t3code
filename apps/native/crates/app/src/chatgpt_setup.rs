@@ -741,8 +741,13 @@ impl ChatGptSetup {
             .into_any_element()
     }
     fn render_picker(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let p = palette(cx);
         let profiles = self.profiles();
         let selected = model::picker_selection(&profiles, &self.selection);
+        let busy = self.state.busy();
+        let can_manage = self.allowed(cx);
+        let disabled = !can_manage || busy;
+        let selected_removable = picker_selected_removable(&profiles, &selected);
         let mut body = v_flex().gap(r(8.));
         for (id, label) in profiles.into_iter().map(|m| (m.id, m.name)).chain(std::iter::once(("chatgpt-change-account".into(), "Use a different account".into()))) {
             let checked = selected == id;
@@ -750,30 +755,50 @@ impl ChatGptSetup {
                 Button::new(SharedString::from(format!("chatgpt-profile-{id}")), ButtonVariant::Outline, ButtonSize::Default)
                     .icon(if checked { Icon::CircleDot } else { Icon::WorkCircle })
                     .label(label)
+                    .disabled(disabled)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selection = id.clone();
                         cx.notify();
                     })),
             );
         }
+        if let Some(error) = &self.state.error {
+            body = body.child(div().text_sm().text_color(hsla(p.destructive_foreground)).child(error.clone()));
+        }
+        let remove_id = selected.clone();
         let footer = h_flex()
             .gap(r(8.))
+            .when(selected_removable, |this| {
+                this.child(
+                    Button::new("chatgpt-picker-remove", ButtonVariant::Ghost, ButtonSize::Sm)
+                        .label("Remove connection")
+                        .disabled(disabled)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.state.error = None;
+                            this.command(auth::AUTH_REMOVE_METHOD, auth::remove_method_payload(&this.instance, &remove_id), cx);
+                        })),
+                )
+            })
             .child(Button::new("chatgpt-picker-close", ButtonVariant::Outline, ButtonSize::Sm).label("Cancel").on_click(cx.listener(|this, _, _, cx| {
                 this.picker = false;
                 cx.notify();
             })))
-            .child(Button::new("chatgpt-picker-continue", ButtonVariant::Default, ButtonSize::Sm).icon(Icon::OpenAi).label("Continue with ChatGPT").on_click(cx.listener(
-                move |this, _, _, cx| {
-                    this.picker = false;
-                    let method = if this.state.auth.as_ref().and_then(|a| a.methods.as_ref()).is_some_and(|methods| methods.iter().any(|m| m.id == selected)) {
-                        selected.clone()
-                    } else {
-                        "chatgpt-change-account".into()
-                    };
-                    this.start(method, cx);
-                    cx.notify();
-                },
-            )));
+            .child(
+                Button::new("chatgpt-picker-continue", ButtonVariant::Default, ButtonSize::Sm)
+                    .icon(Icon::OpenAi)
+                    .label("Continue with ChatGPT")
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.picker = false;
+                        let method = if this.state.auth.as_ref().and_then(|a| a.methods.as_ref()).is_some_and(|methods| methods.iter().any(|m| m.id == selected)) {
+                            selected.clone()
+                        } else {
+                            "chatgpt-change-account".into()
+                        };
+                        this.start(method, cx);
+                        cx.notify();
+                    })),
+            );
         self.render_dialog("Reconnect ChatGPT".into(), "On OpenAI, sign in with the account you choose here.", body.into_any_element(), footer.into_any_element(), window, cx)
     }
     fn render_add(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1036,5 +1061,49 @@ impl Render for ChatGptSetup {
             None
         };
         content.children(dialog)
+    }
+}
+
+/// Whether the currently chosen option in `ChatGptAccountPicker` exposes the `"Remove connection"`
+/// action (`ChatGptAccountPicker.tsx:84`).
+fn picker_selected_removable(profiles: &[auth::AuthMethod], selected_id: &str) -> bool {
+    profiles
+        .iter()
+        .find(|profile| profile.id == selected_id)
+        .is_some_and(auth::AuthMethod::is_removable)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use t3_core::settings::providers::auth;
+
+    use super::picker_selected_removable;
+
+    fn profile(id: &str, can_remove: Option<bool>) -> auth::AuthMethod {
+        auth::AuthMethod {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            account_email: None,
+            can_remove,
+        }
+    }
+
+    #[test]
+    fn account_picker_remove_connection_matches_selected_profile_can_remove() {
+        let profiles = vec![
+            profile("chatgpt-profile:work", Some(true)),
+            profile("chatgpt-profile:personal", Some(false)),
+            profile("chatgpt-profile:legacy", None),
+        ];
+        assert!(picker_selected_removable(&profiles, "chatgpt-profile:work"));
+        assert!(!picker_selected_removable(&profiles, "chatgpt-profile:personal"));
+        assert!(!picker_selected_removable(&profiles, "chatgpt-profile:legacy"));
+        assert!(!picker_selected_removable(&profiles, "chatgpt-change-account"));
+        assert_eq!(
+            auth::remove_method_payload("codex", "chatgpt-profile:work"),
+            json!({ "instanceId": "codex", "methodId": "chatgpt-profile:work" })
+        );
     }
 }

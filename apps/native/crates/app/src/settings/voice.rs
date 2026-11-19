@@ -2534,7 +2534,7 @@ impl SettingsView {
     }
 
     fn render_cleanup_model_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(config) = self.state.read(cx).server_config.config.clone() else {
+        let Some(config) = self.scoped_representative_config(cx) else {
             return Row::new("speech-post-processing-model", "Cleanup model")
                 .description(
                     "Model for transcript cleanup, such as a cheaper or faster one. When disabled, use the text generation model configured for this environment.",
@@ -2549,15 +2549,19 @@ impl SettingsView {
         let fallback_text_gen =
             resolve_default_text_generation_selection(&config, None, &self.threads.text_gen_models);
         let shown = saved_cleanup.clone().or_else(|| fallback_text_gen.clone());
-        let options = self.text_gen_select_options(
+        let options = self.apply_scoped_model_availability(
             &config,
-            None,
-            &[saved_cleanup.as_ref(), fallback_text_gen.as_ref()],
+            self.text_gen_select_options(&config, None, &[saved_cleanup.as_ref(), fallback_text_gen.as_ref()]),
+            true,
+            cx,
         );
+        let disabled_reason = saved_cleanup.as_ref().and_then(|sel| {
+            self.scoped_model_disabled_reason(&config, &sel.instance_id, &sel.model, true, cx)
+        });
         let has_provider = !options.is_empty();
-        let switch_state = self.state.clone();
+        let switch_view = cx.entity().downgrade();
         let switch_default = fallback_text_gen.clone();
-        let select_state = self.state.clone();
+        let select_view = cx.entity().downgrade();
 
         let mut control = h_flex().flex_wrap().justify_end().gap(r(8.));
         if dedicated {
@@ -2569,7 +2573,7 @@ impl SettingsView {
                     "speech-cleanup-model",
                     &config,
                     sel,
-                    &self.state,
+                    cx.entity().downgrade(),
                     ServerSettingChange::SpeechPostProcessingModelSelection,
                 );
                 control = control
@@ -2582,11 +2586,12 @@ impl SettingsView {
                             .show_check()
                             .on_change(move |value, _, cx| {
                                 if let Some(next) = parse_selection(&value) {
-                                    store::update_server(
-                                        &select_state,
-                                        ServerSettingChange::SpeechPostProcessingModelSelection(Some(next)),
-                                        cx,
-                                    );
+                                    let _ = select_view.update(cx, |this, cx| {
+                                        this.update_scoped_server(
+                                            ServerSettingChange::SpeechPostProcessingModelSelection(Some(next)),
+                                            cx,
+                                        );
+                                    });
                                 }
                             }),
                     )
@@ -2600,21 +2605,24 @@ impl SettingsView {
                 .disabled(!dedicated && !has_provider)
                 .on_change(move |checked, _, cx| {
                     let next = if checked { switch_default.clone() } else { None };
-                    store::update_server(
-                        &switch_state,
-                        ServerSettingChange::SpeechPostProcessingModelSelection(next),
-                        cx,
-                    );
+                    let _ = switch_view.update(cx, |this, cx| {
+                        this.update_scoped_server(
+                            ServerSettingChange::SpeechPostProcessingModelSelection(next),
+                            cx,
+                        );
+                    });
                 }),
         );
 
-        Row::new("speech-post-processing-model", "Cleanup model")
+        let mut row = Row::new("speech-post-processing-model", "Cleanup model")
             .description(
                 "Model for transcript cleanup, such as a cheaper or faster one. When disabled, use the text generation model configured for this environment.",
             )
-            .highlighted(self.is_target("speech-post-processing-model"))
-            .control(control)
-            .into_any_element()
+            .highlighted(self.is_target("speech-post-processing-model"));
+        if let Some(reason) = disabled_reason {
+            row = row.status(reason);
+        }
+        row.control(control).into_any_element()
     }
 
     fn render_speech_model_browser(

@@ -1,10 +1,9 @@
 //! Settings → Projects: `ProjectsSettings` and `ProjectSettingsPanel` in
 //! `web/src/components/settings/`. Without a chosen project the page lists them
-//! (`SettingsScopeNotice`); a chosen one shows its name, icon, pin and archive, its New threads
-//! overrides (`ProjectDefaultsSettings` at project scope), its actions (`project_actions.rs`), its
-//! checkouts and removal. The project picker follows the watched environments' scoped groups.
-//! Not ported: the info alert about keeping the project picked on other pages, which other
-//! native pages do not scope by project.
+//! (`SettingsScopeNotice`); a chosen one shows the cross-page project-scope notice, its name,
+//! icon, pin and archive, its New threads overrides (`ProjectDefaultsSettings` at project scope),
+//! its actions (`project_actions.rs`), its checkouts and removal. The project picker follows the
+//! watched environments' scoped groups and stays synced with `SettingsScopeSentence`.
 
 use std::rc::Rc;
 
@@ -174,6 +173,8 @@ impl SettingsView {
 
     pub(super) fn select_project(&mut self, key: Option<String>, cx: &mut Context<Self>) {
         self.projects.pending_project = None;
+        self.scope.project = key.clone();
+        self.scope.checkout = None;
         if self.projects.selected == key {
             return;
         }
@@ -351,8 +352,25 @@ impl SettingsView {
         self.open_pending_action_editor(window, cx);
         self.ensure_project_file(&shown.targets[0], cx);
         Self::sync_input(&self.projects.name, shown.display_name(), window, cx);
+        let p = palette(cx);
+        let scope_notice = h_flex()
+            .id("project-cross-page-scope-notice")
+            .debug_selector(|| "project-cross-page-scope-notice".to_owned())
+            .px(r(14.))
+            .py(r(12.))
+            .gap(r(10.))
+            .items_center()
+            .rounded(r(12.))
+            .border_1()
+            .border_color(hsla(p.info).opacity(0.32))
+            .bg(hsla(p.info).opacity(0.08))
+            .text_sm()
+            .text_color(hsla(p.info_foreground))
+            .child(icon(Icon::Info, 16., hsla(p.info_foreground)))
+            .child(div().flex_1().child("Can't find a setting? Keep this project picked above and hop to any other settings page."));
         let mut blocks = vec![
             Block::new(&[], picker),
+            Block::new(&[], scope_notice),
             Block::new(&["project-overview"], self.project_overview(&shown, &config, cx)),
             Block::new(&["project-defaults"], self.project_new_threads(&shown, &config, cx)),
             Block::new(&["project-actions"], self.project_actions_section(&shown, &config, window, cx)),
