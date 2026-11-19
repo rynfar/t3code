@@ -1,7 +1,9 @@
-//! A confirm dialog (design-system §6.4): scrim, dialog glass, title, description, and a footer
-//! with Cancel and a destructive action. Escape cancels, Enter confirms. The thread actions the
-//! General settings can ask to confirm (unpin, archive) go through here from every entry point
-//! (`useThreadActions.ts` `confirmAndUnpinThread`, `useThreadActionMenu.ts` archive).
+//! A confirm dialog (design-system §6.4, `ConfirmDialogHost.tsx`, `confirmDialog.ts`): scrim,
+//! dialog glass, title (`leading-snug`), description, FIFO queueing, `default`/`destructive`
+//! variants, keyboard focus navigation (`Tab`/arrows/`Enter`/`Space`/`Escape`), and a footer with
+//! Cancel and Confirm actions.
+
+use std::collections::VecDeque;
 
 use gpui::{
     App, BoxShadow, Context, Entity, FocusHandle, Focusable, FontWeight, Global, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
@@ -16,8 +18,57 @@ struct Host(WeakEntity<ConfirmDialog>);
 
 impl Global for Host {}
 
+/// Confirm button visual variant (`ConfirmDialogVariant`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConfirmVariant {
+    Default,
+    #[default]
+    Destructive,
+}
+
+/// Which button starts focused (`ConfirmDialogOptions["initialFocus"]`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InitialFocus {
+    Cancel,
+    #[default]
+    Confirm,
+}
+
+/// Splits a single confirmation message into `(title, description)` (`resolveConfirmDialogCopy`
+/// in `ConfirmDialogHost.tsx`).
+pub fn resolve_confirm_dialog_copy(message: &str) -> (String, String) {
+    let normalized = message.trim();
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    if let Some(question_index) = lines.iter().position(|line| line.trim().ends_with('?')) {
+        let title = lines[question_index].trim().to_owned();
+        let description = lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != question_index)
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_owned();
+        return (title, description);
+    }
+    if let Some(question_mark) = normalized.find('?') {
+        let title = normalized[..=question_mark].trim().to_owned();
+        let description = normalized[question_mark + 1..].trim().to_owned();
+        return (title, description);
+    }
+    let description = if normalized.is_empty() {
+        "This action requires your confirmation.".to_owned()
+    } else {
+        normalized.to_owned()
+    };
+    ("Confirm action".to_owned(), description)
+}
+
 /// Asks before running `on_confirm`, from code that has no window at hand. Without a dialog
-/// nothing runs: a confirmation that cannot be shown is a "no".
+/// nothing runs: a confirmation that cannot be shown is a "no". Multiple concurrent requests
+/// queue in FIFO order (`confirmDialog.ts`).
 pub(crate) fn ask(
     title: impl Into<SharedString>,
     description: impl Into<SharedString>,
@@ -25,29 +76,64 @@ pub(crate) fn ask(
     on_confirm: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
     cx: &mut App,
 ) {
-    ask_inner(title, description, confirm_label, on_confirm, None, cx);
+    ask_inner(
+        title,
+        description,
+        confirm_label,
+        ConfirmVariant::Destructive,
+        InitialFocus::Confirm,
+        on_confirm,
+        None,
+        cx,
+    );
 }
 
+#[allow(dead_code)]
+pub(crate) fn ask_with_options(
+    message: &str,
+    confirm_label: impl Into<SharedString>,
+    variant: ConfirmVariant,
+    initial_focus: InitialFocus,
+    on_confirm: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
+    on_cancel: Option<OnConfirm>,
+    cx: &mut App,
+) {
+    let (title, description) = resolve_confirm_dialog_copy(message);
+    ask_inner(title, description, confirm_label, variant, initial_focus, on_confirm, on_cancel, cx);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ask_inner(
     title: impl Into<SharedString>,
     description: impl Into<SharedString>,
     confirm_label: impl Into<SharedString>,
+    variant: ConfirmVariant,
+    initial_focus: InitialFocus,
     on_confirm: impl FnOnce(&mut AppState, &mut Context<AppState>) + 'static,
     on_cancel: Option<OnConfirm>,
     cx: &mut App,
 ) {
     let Some(dialog) = cx.try_global::<Host>().and_then(|host| host.0.upgrade()) else { return };
+    let entry = Pending {
+        title: title.into(),
+        description: description.into(),
+        confirm_label: confirm_label.into(),
+        variant,
+        initial_focus,
+        on_confirm: Box::new(on_confirm),
+        on_cancel,
+    };
     let focus = dialog.update(cx, |dialog, cx| {
-        dialog.pending = Some(Pending {
-            title: title.into(),
-            description: description.into(),
-            confirm_label: confirm_label.into(),
-            on_confirm: Box::new(on_confirm),
-            on_cancel,
-        });
+        if dialog.pending.is_some() {
+            dialog.queued.push_back(entry);
+            return None;
+        }
+        dialog.focused_button = entry.initial_focus;
+        dialog.pending = Some(entry);
         cx.notify();
-        dialog.focus.clone()
+        Some(dialog.focus.clone())
     });
+    let Some(focus) = focus else { return };
     // The caller may be inside a window update; focus once it returns.
     cx.defer(move |cx| {
         if let Some(window) = cx.active_window() {
@@ -69,7 +155,7 @@ pub(crate) fn ask_available(
 ) -> bool {
     let Some(dialog) = cx.try_global::<Host>().and_then(|host| host.0.upgrade()) else { return false; };
     if dialog.read(cx).pending.is_some() { return false; }
-    ask_inner(title, description, confirm_label, on_confirm, None, cx);
+    ask_inner(title, description, confirm_label, ConfirmVariant::Destructive, InitialFocus::Confirm, on_confirm, None, cx);
     true
 }
 
@@ -83,7 +169,16 @@ pub(crate) fn ask_available_cancellable(
 ) -> bool {
     let Some(dialog) = cx.try_global::<Host>().and_then(|host| host.0.upgrade()) else { return false; };
     if dialog.read(cx).pending.is_some() { return false; }
-    ask_inner(title, description, confirm_label, on_confirm, Some(Box::new(on_cancel)), cx);
+    ask_inner(
+        title,
+        description,
+        confirm_label,
+        ConfirmVariant::Destructive,
+        InitialFocus::Confirm,
+        on_confirm,
+        Some(Box::new(on_cancel)),
+        cx,
+    );
     true
 }
 
@@ -144,6 +239,8 @@ struct Pending {
     title: SharedString,
     description: SharedString,
     confirm_label: SharedString,
+    variant: ConfirmVariant,
+    initial_focus: InitialFocus,
     on_confirm: OnConfirm,
     on_cancel: Option<OnConfirm>,
 }
@@ -151,6 +248,8 @@ struct Pending {
 pub struct ConfirmDialog {
     state: Entity<AppState>,
     pending: Option<Pending>,
+    queued: VecDeque<Pending>,
+    focused_button: InitialFocus,
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
 }
@@ -164,7 +263,14 @@ impl Focusable for ConfirmDialog {
 impl ConfirmDialog {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         cx.set_global(Host(cx.weak_entity()));
-        ConfirmDialog { state, pending: None, focus: cx.focus_handle(), previous_focus: None }
+        ConfirmDialog {
+            state,
+            pending: None,
+            queued: VecDeque::new(),
+            focused_button: InitialFocus::Confirm,
+            focus: cx.focus_handle(),
+            previous_focus: None,
+        }
     }
 
     pub fn confirm(
@@ -176,13 +282,21 @@ impl ConfirmDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.pending = Some(Pending {
+        let entry = Pending {
             title: title.into(),
             description: description.into(),
             confirm_label: confirm_label.into(),
+            variant: ConfirmVariant::Destructive,
+            initial_focus: InitialFocus::Confirm,
             on_confirm: Box::new(on_confirm),
             on_cancel: None,
-        });
+        };
+        if self.pending.is_some() {
+            self.queued.push_back(entry);
+            return;
+        }
+        self.focused_button = entry.initial_focus;
+        self.pending = Some(entry);
         self.previous_focus = window.focused(cx);
         window.focus(&self.focus, cx);
         cx.notify();
@@ -190,7 +304,7 @@ impl ConfirmDialog {
 
     pub(crate) fn set_previous_focus(&mut self, focus: Option<FocusHandle>) { self.previous_focus = focus; }
 
-    pub(crate) fn is_open(&self) -> bool { self.pending.is_some() }
+    pub(crate) fn is_open(&self) -> bool { self.pending.is_some() || !self.queued.is_empty() }
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn resolve_for_test(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -199,11 +313,19 @@ impl ConfirmDialog {
 
     fn resolve(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.pending.take() else { return };
-        if self.focus.is_focused(window) && let Some(focus) = self.previous_focus.take() { window.focus(&focus, cx); }
         if confirmed {
             self.state.update(cx, |state, cx| (pending.on_confirm)(state, cx));
         } else if let Some(on_cancel) = pending.on_cancel {
             self.state.update(cx, |state, cx| on_cancel(state, cx));
+        }
+        if let Some(next) = self.queued.pop_front() {
+            self.focused_button = next.initial_focus;
+            self.pending = Some(next);
+            window.focus(&self.focus, cx);
+        } else if self.focus.is_focused(window)
+            && let Some(focus) = self.previous_focus.take()
+        {
+            window.focus(&focus, cx);
         }
         cx.notify();
     }
@@ -213,8 +335,16 @@ impl Render for ConfirmDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(pending) = self.pending.as_ref() else { return div().into_any_element() };
         let p = palette(cx);
-        let button = |id: &'static str, label: SharedString, destructive: bool| {
-            let (fill, text, border) = if destructive { (p.destructive, WHITE, p.destructive) } else { (p.popover, p.foreground, p.input) };
+        let ring = hsla(p.ring);
+        let focused_button = self.focused_button;
+        let confirm_variant = pending.variant;
+        let button = |id: &'static str, label: SharedString, role: InitialFocus| {
+            let (fill, text, border) = match (role, confirm_variant) {
+                (InitialFocus::Cancel, _) => (p.popover, p.foreground, p.input),
+                (InitialFocus::Confirm, ConfirmVariant::Destructive) => (p.destructive, WHITE, p.destructive),
+                (InitialFocus::Confirm, ConfirmVariant::Default) => (p.primary, p.primary_foreground, p.primary),
+            };
+            let is_focused = focused_button == role;
             div()
                 .id(id)
                 .h(px(32.))
@@ -229,6 +359,15 @@ impl Render for ConfirmDialog {
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(hsla(text))
                 .cursor_pointer()
+                .when(is_focused, |this| {
+                    this.shadow(vec![BoxShadow {
+                        color: ring,
+                        offset: point(px(0.), px(0.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(2.),
+                        inset: false,
+                    }])
+                })
                 .hover(|this| this.opacity(0.9))
                 .child(label)
         };
@@ -253,7 +392,19 @@ impl Render for ConfirmDialog {
                                 cx.stop_propagation();
                                 this.resolve(false, window, cx);
                             }
-                            "enter" => this.resolve(true, window, cx),
+                            "tab" | "left" | "right" => {
+                                cx.stop_propagation();
+                                this.focused_button = match this.focused_button {
+                                    InitialFocus::Cancel => InitialFocus::Confirm,
+                                    InitialFocus::Confirm => InitialFocus::Cancel,
+                                };
+                                cx.notify();
+                            }
+                            "enter" | "space" => {
+                                cx.stop_propagation();
+                                let confirmed = this.focused_button == InitialFocus::Confirm;
+                                this.resolve(confirmed, window, cx);
+                            }
                             _ => {}
                         }))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -275,7 +426,8 @@ impl Render for ConfirmDialog {
                                 .flex()
                                 .flex_col()
                                 .gap(px(8.))
-                                .child(div().text_xl().line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(pending.title.clone()))
+                                // `leading-snug` (`pingdotgg/t3code#30527`): keeps multi-line titles readable.
+                                .child(div().text_xl().line_height(px(27.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(pending.title.clone()))
                                 .when(!pending.description.is_empty(), |this| {
                                     this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(pending.description.clone()))
                                 }),
@@ -291,12 +443,100 @@ impl Render for ConfirmDialog {
                                 .border_color(hsla(p.border))
                                 .rounded_b(px(15.))
                                 .bg(hsla(p.muted))
-                                .child(button("confirm-dialog-cancel", "Cancel".into(), false).on_click(cx.listener(|this, _, window, cx| this.resolve(false, window, cx))))
-                                .child(button("confirm-dialog-confirm", pending.confirm_label.clone(), true).on_click(cx.listener(|this, _, window, cx| this.resolve(true, window, cx)))),
+                                .child(button("confirm-dialog-cancel", "Cancel".into(), InitialFocus::Cancel).on_click(cx.listener(|this, _, window, cx| this.resolve(false, window, cx))))
+                                .child(button("confirm-dialog-confirm", pending.confirm_label.clone(), InitialFocus::Confirm).on_click(cx.listener(|this, _, window, cx| this.resolve(true, window, cx)))),
                         ),
                 ),
         )
         .with_priority(50)
         .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+    use std::cell::RefCell;
+
+    #[test]
+    fn resolves_confirm_dialog_copy_from_single_message() {
+        assert_eq!(
+            resolve_confirm_dialog_copy("Delete thread?\nThis cannot be undone."),
+            ("Delete thread?".to_owned(), "This cannot be undone.".to_owned())
+        );
+        assert_eq!(
+            resolve_confirm_dialog_copy("Remove environment? It will disconnect."),
+            ("Remove environment?".to_owned(), "It will disconnect.".to_owned())
+        );
+        assert_eq!(
+            resolve_confirm_dialog_copy("Archive this item"),
+            ("Confirm action".to_owned(), "Archive this item".to_owned())
+        );
+    }
+
+    #[gpui::test]
+    async fn confirm_dialog_queues_in_fifo_order_and_supports_initial_focus(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        let window = cx.open_window(gpui::size(px(800.), px(600.)), |_, cx| ConfirmDialog::new(state.clone(), cx));
+        let dialog = window.entity(cx).unwrap();
+        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+
+        let l1 = log.clone();
+        let l1_cancel = log.clone();
+        let l2 = log.clone();
+        cx.update(|cx| {
+            ask_with_options(
+                "First question?\nDetails 1",
+                "Confirm",
+                ConfirmVariant::Default,
+                InitialFocus::Cancel,
+                move |_, _| l1.borrow_mut().push("first-confirm"),
+                Some(Box::new(move |_, _| l1_cancel.borrow_mut().push("first-cancel"))),
+                cx,
+            );
+            ask(
+                "Second question?",
+                "Details 2",
+                "Delete",
+                move |_, _| l2.borrow_mut().push("second-confirm"),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // First dialog is shown with initial focus on Cancel; second is queued.
+        cx.update_window(window.into(), |_, window, cx| {
+            dialog.update(cx, |d, cx| {
+                assert!(d.is_open());
+                assert_eq!(d.focused_button, InitialFocus::Cancel);
+                assert_eq!(d.pending.as_ref().unwrap().title.as_ref(), "First question?");
+                assert_eq!(d.queued.len(), 1);
+                d.resolve(false, window, cx);
+                // Second dialog opens immediately with focus on Confirm.
+                assert!(d.is_open());
+                assert_eq!(d.focused_button, InitialFocus::Confirm);
+                assert_eq!(d.pending.as_ref().unwrap().title.as_ref(), "Second question?");
+                d.resolve(true, window, cx);
+                assert!(!d.is_open());
+            });
+        })
+        .unwrap();
+
+        assert_eq!(*log.borrow(), vec!["first-cancel", "second-confirm"]);
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
     }
 }

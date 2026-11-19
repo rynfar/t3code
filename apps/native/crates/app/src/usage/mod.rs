@@ -11,6 +11,7 @@ mod dialog;
 mod header;
 mod limits;
 mod overview;
+mod prices;
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, Global, IntoElement, KeyBinding, MouseButton, ParentElement, Render,
@@ -153,6 +154,7 @@ pub struct UsageView {
     hover: Option<usize>,
     selected_model: Option<String>,
     dialog_hover: Option<usize>,
+    prices: Option<prices::PriceOverridesDialog>,
     segment: Option<SegmentKey>,
     confirm_reset: Option<Redeem>,
     /// The account a reset credit is being used for, and what came of it.
@@ -196,6 +198,7 @@ impl UsageView {
             hover: None,
             selected_model: None,
             dialog_hover: None,
+            prices: None,
             segment: None,
             confirm_reset: None,
             reset_status: None,
@@ -265,7 +268,7 @@ impl UsageView {
 
     /// Shortcuts stand down while a dialog or menu inside the page has the keys.
     fn shortcut_blocked(&self) -> bool {
-        self.selected_model.is_some() || self.menu.is_some() || self.confirm_reset.is_some()
+        self.prices.is_some() || self.selected_model.is_some() || self.menu.is_some() || self.confirm_reset.is_some()
     }
 
     fn on_metric_key(&mut self, metric: UsageMetric, cx: &mut Context<Self>) {
@@ -280,9 +283,25 @@ impl UsageView {
         }
     }
 
-    /// Esc peels one layer: the confirm, a menu or popover, the model dialog, then the page.
+    /// Esc peels one layer: the confirm, prices dialog (unless saving), a menu or popover, the model dialog, then the page.
     fn escape(&mut self, cx: &mut Context<Self>) {
-        if self.confirm_reset.take().is_some() || self.menu.take().is_some() || self.segment.take().is_some() || self.selected_model.take().is_some() {
+        if self.confirm_reset.take().is_some() {
+            self.dialog_hover = None;
+            cx.notify();
+            return;
+        }
+        if let Some(dialog) = self.prices.as_ref() {
+            if !dialog.is_saving() {
+                self.prices = None;
+                self.dialog_hover = None;
+                cx.notify();
+            }
+            return;
+        }
+        if self.menu.take().is_some()
+            || self.segment.take().is_some()
+            || self.selected_model.take().is_some()
+        {
             self.dialog_hover = None;
             cx.notify();
             return;
@@ -335,6 +354,7 @@ impl Render for UsageView {
                     .child(self.render_body(window, cx)),
             )
             .children(self.render_model_dialog(window, cx))
+            .children(self.render_price_overrides_dialog(window, cx))
             .children(self.render_reset_confirm(window, cx))
             .text_color(hsla(p.foreground))
     }

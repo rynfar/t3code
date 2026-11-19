@@ -159,5 +159,49 @@ pub fn hint(cx: &mut App) -> Option<impl IntoElement> {
                 .child(visible.message(shortcut)),
         ),
     )
-    .with_priority(3))
+    .with_priority(70))
+}
+
+/// Renders the peeking edge swipe indicator (`SwipeIndicator` in `HistorySwipeNavigation.tsx`)
+/// inside the main content pane.
+pub fn swipe_indicator(
+    indicator: t3_core::settings::quit_hold::swipe::SwipeIndicator,
+    pane_height: f32,
+    cx: &App,
+) -> gpui::AnyElement {
+    use gpui::prelude::*;
+    use gpui_component::ActiveTheme;
+    use t3_core::settings::quit_hold::swipe::HistoryDirection;
+
+    let size = 56.0_f32;
+    let half = size / 2.0;
+    let p = palette(cx);
+    let dark = cx.theme().is_dark();
+    let armed = indicator.armed();
+    let is_back = indicator.direction == HistoryDirection::Back;
+    let icon = if is_back { crate::icons::Icon::ArrowLeft } else { crate::icons::Icon::ArrowRight };
+    // Peeks in up to half its width (`hidden = 100 - progress * 50`%).
+    let hidden_px = size * (1.0 - indicator.progress * 0.5);
+    let top_px = (indicator.y - half).clamp(0.0, (pane_height - size).max(0.0));
+    let bg = if dark { gpui::black() } else { hsla(p.muted) };
+    let fg = if dark { gpui::white() } else { hsla(p.foreground) };
+    let circle = div()
+        .absolute()
+        .top(px(top_px))
+        .when(is_back, |d| d.left(px(-hidden_px)).justify_end().pr(px(8.)))
+        .when(!is_back, |d| d.right(px(-hidden_px)).justify_start().pl(px(8.)))
+        .size(px(size))
+        .flex()
+        .items_center()
+        .rounded_full()
+        .bg(bg)
+        .text_color(fg)
+        .opacity(indicator.opacity)
+        .child(icon.sized(px(16.)).opacity(if armed { 1.0 } else { 0.4 }));
+    div()
+        .absolute()
+        .inset_0()
+        .overflow_hidden()
+        .child(circle)
+        .into_any_element()
 }

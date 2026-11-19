@@ -390,6 +390,7 @@ impl UsageView {
         let models = if metric == ChartMetric::Tokens { merge::sort_models_by_tokens(&merged.models) } else { merged.models.clone() };
         let peak = models.iter().map(|model| if metric == ChartMetric::Tokens { model.total_tokens as f64 } else { model.cost_usd }).fold(0., f64::max);
         let header = h_flex()
+            .px(r(8.))
             .py(r(8.))
             .border_b_1()
             .border_color(hsla(p.border))
@@ -421,6 +422,7 @@ impl UsageView {
                     focusable(div().id(id.clone()), id.into(), true, window, cx)
                         .flex()
                         .items_center()
+                        .px(r(8.))
                         .py(r(10.))
                         .border_b_1()
                         .border_color(hsla(p.border).opacity(0.5))
@@ -536,6 +538,7 @@ fn render_time_table(merged: &MergedUsage, hourly: bool, hour12: bool, active: &
     let periods: Vec<&merge::PeriodTotals> = if hourly { merged.hourly.iter().rev().collect() } else { merged.daily.iter().rev().collect() };
     let cell = || div().flex_1().min_w(r(72.)).pl(r(16.)).text_right();
     let header = h_flex()
+        .px(r(8.))
         .py(r(8.))
         .border_b_1()
         .border_color(hsla(p.border))
@@ -557,6 +560,7 @@ fn render_time_table(merged: &MergedUsage, hourly: bool, hour12: bool, active: &
                 };
                 h_flex()
                     .id(SharedString::from(format!("usage-period-row-{}", period.key())))
+                    .px(r(8.))
                     .py(r(8.))
                     .border_b_1()
                     .border_color(hsla(p.border).opacity(0.5))

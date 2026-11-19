@@ -237,7 +237,9 @@ impl UsageView {
     }
 
     /// Asks for the current window. A refresh first asks the server to refresh model prices.
-    /// A reply that is still rescanning shows at once, then settles with `awaitRefresh`.
+    /// When nothing is loaded yet for this window, asks with `provisional: true` first
+    /// (`pingdotgg/t3code#33993`) so cached totals appear at once, then settles with a plain read
+    /// and (if still refreshing) `awaitRefresh: true`.
     pub(super) fn load(&mut self, refresh: bool, cx: &mut Context<Self>) {
         if !self.data.access.can_read_diagnostics || !self.data.selected {
             return;
@@ -248,6 +250,7 @@ impl UsageView {
             self.data.pending = false;
             return;
         }
+        let has_previous = self.data.summary.is_some();
         let state = self.state.read(cx);
         let filter = state.server_config.config.as_ref().and_then(|config| config.settings.usage_model_filter.clone());
         let window = self.data.window.clone();
@@ -260,18 +263,54 @@ impl UsageView {
             if let Some(rates) = rates {
                 let _ = rates.await;
             }
-            for (attempt, payload) in [input.payload(), input.awaiting_refresh().payload()].into_iter().enumerate() {
-                let request = this.update(cx, |view, cx| view.state.read(cx).request(method::GET_USAGE_SUMMARY, payload, decode_summary));
-                let reply = match request {
-                    Ok(Some(task)) => task.await.unwrap_or_else(|_| Err("closed".to_owned())),
-                    Ok(None) => Err("not connected".to_owned()),
-                    Err(_) => return,
-                };
-                let settling = attempt == 0 && matches!(&reply, Ok(summary) if summary.is_refreshing());
-                if this.update(cx, |view, cx| view.apply(&window, reply, settling, cx)).is_err() || !settling {
-                    return;
+            if !refresh && !has_previous {
+                let prov_req = this.update(cx, |view, cx| {
+                    view.state.read(cx).request(method::GET_USAGE_SUMMARY, input.provisional_payload(), decode_summary)
+                });
+                if let Ok(Some(task)) = prov_req
+                    && let Ok(Ok(saved)) = task.await
+                {
+                    let settling = saved.is_refreshing();
+                    if this.update(cx, |view, cx| view.apply(&window, Ok(saved), settling, cx)).is_err() || !settling {
+                        return;
+                    }
                 }
             }
+            let plain_req = this.update(cx, |view, cx| {
+                view.state.read(cx).request(method::GET_USAGE_SUMMARY, input.payload(), decode_summary)
+            });
+            let plain_reply = match plain_req {
+                Ok(Some(task)) => task.await.unwrap_or_else(|_| Err("closed".to_owned())),
+                Ok(None) => Err("not connected".to_owned()),
+                Err(_) => return,
+            };
+            let settling = matches!(&plain_reply, Ok(summary) if summary.is_refreshing());
+            if this.update(cx, |view, cx| view.apply(&window, plain_reply, settling, cx)).is_err() || !settling {
+                return;
+            }
+            let await_req = this.update(cx, |view, cx| {
+                view.state.read(cx).request(method::GET_USAGE_SUMMARY, input.awaiting_refresh().payload(), decode_summary)
+            });
+            let await_reply = match await_req {
+                Ok(Some(task)) => task.await.unwrap_or_else(|_| Err("closed".to_owned())),
+                Ok(None) => Err("not connected".to_owned()),
+                Err(_) => return,
+            };
+            // On slow-refresh failure, preserve and settle on the already-displayed summary rather than wiping it.
+            let _ = this.update(cx, |view, cx| match await_reply {
+                Ok(summary) => view.apply(&window, Ok(summary), false, cx),
+                Err(error) => {
+                    tracing::warn!(%error, "could not refresh slow usage sources");
+                    if view.data.window.same_window(&window) {
+                        if let Some(summary) = view.data.summary.clone() {
+                            view.data.remember(&window, summary);
+                        }
+                        view.data.pending = false;
+                        view.data.refreshing = false;
+                        cx.notify();
+                    }
+                }
+            });
         }));
     }
 
@@ -282,7 +321,10 @@ impl UsageView {
         match reply {
             Ok(summary) => {
                 let summary = Arc::new(summary);
-                self.data.remember(window, summary.clone());
+                // Provisional / still-refreshing summaries emit without populating the 60s settled cache.
+                if !settling {
+                    self.data.remember(window, summary.clone());
+                }
                 self.data.summary = Some(summary);
                 self.data.error = None;
             }

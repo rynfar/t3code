@@ -1,6 +1,5 @@
 //! One model's breakdown (`UsageModelDialog.tsx`): cost, tokens, cost per million and cache hit,
-//! its own trend, and its cost and token mix. An unpriced model's trend shows tokens, since its
-//! cost is unknown rather than zero. Setting a price (`UsagePriceOverrides`) is not ported.
+//! its own trend, cost and token mix, and a `"Set price"` shortcut into `UsagePriceOverrides`.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -14,7 +13,7 @@ use t3_core::usage::{USAGE_CONTRACT_VERSION, UsageMetric};
 
 use super::UsageView;
 use super::chart::provider_chart;
-use super::controls::{brand_mark, r};
+use super::controls::{ActionButton, ButtonSize, ButtonVariant, brand_mark, r};
 use super::overview::{chart_data, share_bar, speed_premium};
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
@@ -77,6 +76,8 @@ impl UsageView {
             ));
         }
         let narrow = Self::page_width(window) < 640.;
+        let model_for_price = model.model.clone();
+        let can_set_price = self.data.phase == t3_core::usage::ConnectionPhase::Connected;
         let dialog = v_flex()
             .id("usage-model-dialog")
             .relative()
@@ -95,13 +96,27 @@ impl UsageView {
             }])
             .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
             .child(
-                div().absolute().top(r(8.)).right(r(8.)).child(
-                    Button::new("usage-model-close").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::X).tooltip("Close").on_click(cx.listener(|this, _, _, cx| {
-                        this.selected_model = None;
-                        this.dialog_hover = None;
-                        cx.notify();
-                    })),
-                ),
+                h_flex()
+                    .absolute()
+                    .top(r(8.))
+                    .right(r(8.))
+                    .gap(r(4.))
+                    .when(can_set_price, |this| {
+                        let seed = model_for_price.clone();
+                        this.child(
+                            ActionButton::new("usage-model-set-price", "Set price", ButtonVariant::Outline, ButtonSize::Xs)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_price_overrides(Some(seed.clone()), window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("usage-model-close").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::X).tooltip("Close").on_click(cx.listener(|this, _, _, cx| {
+                            this.selected_model = None;
+                            this.dialog_hover = None;
+                            cx.notify();
+                        })),
+                    ),
             )
             .child(
                 v_flex()
