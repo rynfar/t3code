@@ -1432,13 +1432,14 @@ impl SidebarPane {
         self.empty_state_copy(synchronized, 0, cx).0
     }
 
-    /// `SidebarChromeFooter`: a row of 32px utility buttons (Settings, Pull requests, Usage), or
-    /// Back while the pull requests page is open, then the Undo notice in the space left.
+    /// `SidebarChromeFooter`: a row of 32px utility buttons (Settings, Pull requests, Issues, Usage),
+    /// or Back while a utility page is open, then the Undo notice in the space left.
     fn render_footer(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let (on_pull_requests, show_pull_requests) = {
+        let (on_utility_page, show_pull_requests, show_issues) = {
             let state = self.state.read(cx);
-            (state.pull_requests_open, pull_requests_supported(state))
+            let supported = pull_requests_supported(state);
+            (state.pull_requests_open || state.issues_open, supported, supported)
         };
         let utility = |id: &'static str, glyph: Icon, label: &'static str| {
             div()
@@ -1458,7 +1459,7 @@ impl SidebarPane {
         };
         let state = self.state.clone();
         let mut row = div().w_full().flex().items_center().gap(px(4.));
-        if on_pull_requests {
+        if on_utility_page {
             row = row.child(
                 div()
                     .id("sidebar-back")
@@ -1477,7 +1478,12 @@ impl SidebarPane {
                     .hover(|this| this.bg(hsla(p.sidebar_row_hover)).text_color(hsla(p.sidebar_foreground)))
                     .child(Icon::ArrowLeft.sized(px(16.)).text_color(hsla(p.sidebar_icon)))
                     .child("Back")
-                    .on_click(move |_, _, cx| state.update(cx, |state, cx| state.set_pull_requests_open(false, cx))),
+                    .on_click(move |_, _, cx| {
+                        state.update(cx, |state, cx| {
+                            state.set_pull_requests_open(false, cx);
+                            state.set_issues_open(false, cx);
+                        })
+                    }),
             );
         } else {
             row = row
@@ -1487,7 +1493,16 @@ impl SidebarPane {
                     utility("sidebar-pull-requests", Icon::GitPullRequestArrow, "Pull requests")
                         .on_click(move |_, _, cx| state.update(cx, |state, cx| {
                             state.close_sidebar_sheet(cx);
+                            state.set_issues_open(false, cx);
                             state.set_pull_requests_open(true, cx);
+                        }))
+                }))
+                .children(show_issues.then(|| {
+                    let state = state.clone();
+                    utility("sidebar-issues", Icon::CircleDot, "Issues")
+                        .on_click(move |_, _, cx| state.update(cx, |state, cx| {
+                            state.close_sidebar_sheet(cx);
+                            state.set_issues_open(true, cx);
                         }))
                 }))
                 .child(

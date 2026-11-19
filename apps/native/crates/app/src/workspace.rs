@@ -35,6 +35,7 @@ use crate::keymap::{
 };
 use crate::palette::{CommandPalette, Mode as PaletteMode};
 use crate::right_panel::RightPanelView;
+use crate::issues::{CopyIssueKey, IssuesPage};
 use crate::pull_requests::{CopyPullRequestNumber, LinkPullRequest, LinkPullRequestDialog, PullRequestsPage, ShowLinkedPullRequests};
 use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
@@ -103,6 +104,7 @@ pub struct Workspace {
     details: Entity<DetailsView>,
     git_dialogs: Entity<GitDialogs>,
     pull_requests: Entity<PullRequestsPage>,
+    issues: Entity<IssuesPage>,
     link_dialog: Entity<LinkPullRequestDialog>,
     project_dialogs: Entity<crate::projects::ProjectDialogs>,
     device_setup: Entity<crate::device::DeviceSetupDialog>,
@@ -154,6 +156,7 @@ impl Workspace {
             )
         });
         let pull_requests = cx.new(|cx| PullRequestsPage::new(state.clone(), window, cx));
+        let issues = cx.new(|cx| IssuesPage::new(state.clone(), window, cx));
         let link_dialog = cx.new(|cx| LinkPullRequestDialog::new(state.clone(), window, cx));
         let project_dialogs = cx.new(|cx| crate::projects::ProjectDialogs::new(state.clone(), window, cx));
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
@@ -308,6 +311,7 @@ impl Workspace {
             details,
             git_dialogs,
             pull_requests,
+            issues,
             link_dialog,
             project_dialogs,
             device_setup,
@@ -624,6 +628,8 @@ impl Render for Workspace {
         let drawer = self.terminal.clone();
         let details_layout = thread_details::layout(&self.state, window, cx);
         let on_pull_requests = state.pull_requests_open;
+        let on_issues = state.issues_open && !on_pull_requests;
+        let on_utility_page = on_pull_requests || on_issues;
         let composer_replaced = self.composer_replaced;
         h_flex()
             .track_focus(&focus)
@@ -728,6 +734,11 @@ impl Render for Workspace {
                     cx.propagate();
                 }
             }))
+            .on_action(cx.listener(|this, _: &CopyIssueKey, _, cx| {
+                if !this.issues.update(cx, |page, cx| page.copy_selected_key(cx)) {
+                    cx.propagate();
+                }
+            }))
             .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
                 this.sidebar.update(cx, |sidebar, cx| sidebar.set_modifiers(event.modifiers, cx));
                 this.pull_requests.update(cx, |page, cx| page.set_modifiers(event.modifiers, cx));
@@ -818,7 +829,8 @@ impl Render for Workspace {
                 )
             })
             .when(on_pull_requests, |this| this.child(div().flex_1().h_full().min_w_0().child(self.pull_requests.clone())))
-            .when(!maximized && !on_pull_requests, |this| {
+            .when(on_issues, |this| this.child(div().flex_1().h_full().min_w_0().child(self.issues.clone())))
+            .when(!maximized && !on_utility_page, |this| {
                 this.child(
                 v_flex()
                     .relative()
@@ -889,7 +901,7 @@ impl Render for Workspace {
                     }),
                 )
             })
-            .when(!on_pull_requests, |this| this.child(div().track_focus(&self.area_focus.right_panel).h_full().child(self.right_panel.clone())))
+            .when(!on_utility_page, |this| this.child(div().track_focus(&self.area_focus.right_panel).h_full().child(self.right_panel.clone())))
             .when(sidebar_width > 0., |this| this.child(self.render_sidebar_rail(sidebar_width, cx)))
             .when_some(sheet, |this, width| this.child(self.render_sidebar_sheet(width, cx)))
             .child(self.render_sidebar_toggle(cx))
@@ -1573,6 +1585,8 @@ impl Workspace {
         let viewport = f32::from(window.viewport_size().width);
         let sidebar_visible = sidebar_inline_width(state, viewport) > 0. || state.sidebar_sheet.is_open();
         let on_pull_requests = state.pull_requests_open;
+        let on_issues = state.issues_open && !on_pull_requests;
+        let on_utility_page = on_pull_requests || on_issues;
         let has_thread = state.selected_thread.is_some();
         let has_draft = !has_thread && state.draft_project.is_some();
         let panel = state.panel_thread().as_deref().map(|thread| state.panels.panels.panel(thread));
@@ -1584,7 +1598,7 @@ impl Workspace {
         if sidebar_visible {
             visible.push(WorkspaceFocusArea::Sidebar);
         }
-        if on_pull_requests {
+        if on_utility_page {
             visible.push(WorkspaceFocusArea::PullRequests);
         } else if !maximized {
             if has_thread {
@@ -1601,7 +1615,7 @@ impl Workspace {
                 visible.push(WorkspaceFocusArea::Terminal);
             }
         }
-        if !on_pull_requests && right_panel_open {
+        if !on_utility_page && right_panel_open {
             visible.push(WorkspaceFocusArea::RightPanel);
         }
 
@@ -1611,7 +1625,13 @@ impl Workspace {
             WorkspaceFocusArea::Composer => self.area_focus.composer.contains_focused(window, cx),
             WorkspaceFocusArea::Terminal => self.area_focus.terminal.contains_focused(window, cx),
             WorkspaceFocusArea::RightPanel => self.area_focus.right_panel.contains_focused(window, cx),
-            WorkspaceFocusArea::PullRequests => self.pull_requests.read(cx).focus_handle(cx).contains_focused(window, cx),
+            WorkspaceFocusArea::PullRequests => {
+                if on_issues {
+                    self.issues.read(cx).focus_handle(cx).contains_focused(window, cx)
+                } else {
+                    self.pull_requests.read(cx).focus_handle(cx).contains_focused(window, cx)
+                }
+            }
             WorkspaceFocusArea::Home => self.area_focus.home.contains_focused(window, cx),
         });
         let Some(next) = next_workspace_focus_area(&visible, current.or(self.area_focus.last_area), forward) else {
@@ -1625,7 +1645,11 @@ impl Workspace {
             WorkspaceFocusArea::Terminal => window.focus(&self.area_focus.terminal, cx),
             WorkspaceFocusArea::RightPanel => window.focus(&self.area_focus.right_panel, cx),
             WorkspaceFocusArea::PullRequests => {
-                let handle = self.pull_requests.read(cx).focus_handle(cx);
+                let handle = if on_issues {
+                    self.issues.read(cx).focus_handle(cx)
+                } else {
+                    self.pull_requests.read(cx).focus_handle(cx)
+                };
                 window.focus(&handle, cx);
             }
             WorkspaceFocusArea::Home => window.focus(&self.area_focus.home, cx),
@@ -1638,7 +1662,10 @@ impl Workspace {
             return false;
         }
         let state = self.state.read(cx);
-        if state.pull_requests_open || (state.selected_thread.is_none() && state.draft_project.is_none()) {
+        if state.pull_requests_open
+            || state.issues_open
+            || (state.selected_thread.is_none() && state.draft_project.is_none())
+        {
             return false;
         }
         let maximized = state
@@ -1917,10 +1944,14 @@ mod tests {
                 assert!(ws.right_panel.read(cx).is_add_menu_open());
                 ws.right_panel.update(cx, |panel, cx| panel.close_add_surface_menu(cx));
 
-                // Pull Requests page hides composer.
+                // Pull Requests and Issues pages hide composer and are mutually exclusive.
                 ws.state.update(cx, |state, _| state.pull_requests_open = true);
                 assert!(!ws.composer_visible(window, cx));
-                ws.state.update(cx, |state, _| state.pull_requests_open = false);
+                ws.state.update(cx, |state, cx| state.set_issues_open(true, cx));
+                assert!(ws.state.read(cx).issues_open);
+                assert!(!ws.state.read(cx).pull_requests_open);
+                assert!(!ws.composer_visible(window, cx));
+                ws.state.update(cx, |state, cx| state.set_issues_open(false, cx));
 
                 // Maximized right panel hides composer.
                 ws.state.update(cx, |state, cx| state.toggle_right_panel_maximized(cx));

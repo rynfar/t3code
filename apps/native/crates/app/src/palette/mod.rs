@@ -232,6 +232,7 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     items.push(action("action:toggle-sidebar", "Toggle sidebar", &["hide", "show", "panel"], Some("sidebar.toggle")));
     if state.server_config.config.is_some() {
         items.push(action("action:pull-requests", "Open pull requests", &["pull requests", "prs", "pr", "github", "review", "merge", "branch"], None));
+        items.push(action("action:issues", "Open issues", &["issues", "issue", "bugs", "tracker", "github", "triage"], None));
     }
     items.push(action(
         "action:use-in-another-app",
@@ -1233,7 +1234,11 @@ impl CommandPalette {
                 "next-thread" => keymap::action_for("thread.next"),
                 "link-pull-request" => Box::new(crate::pull_requests::LinkPullRequest),
                 "open-thread-pull-requests" => Box::new(crate::pull_requests::ShowLinkedPullRequests),
-                "pull-requests" => Box::new(crate::pull_requests::OpenPullRequests),
+                "pull-requests" => {
+                    self.state.update(cx, |state, cx| state.set_issues_open(false, cx));
+                    Box::new(crate::pull_requests::OpenPullRequests)
+                }
+                "issues" => Box::new(crate::issues::OpenIssues),
                 "use-in-another-app" => {
                     let env_id = {
                         let state = self.state.read(cx);
@@ -1352,6 +1357,7 @@ impl CommandPalette {
             let thread_id = thread_id.to_owned();
             self.state.update(cx, |state, cx| {
                 state.set_pull_requests_open(false, cx);
+                state.set_issues_open(false, cx);
                 state.select_thread(&thread_id, cx);
             });
         } else if let Some(rest) = value.strip_prefix("new-thread-in:") {

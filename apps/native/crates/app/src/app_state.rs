@@ -145,6 +145,8 @@ pub struct AppState {
     pub panels: crate::right_panel::PanelState,
     /// The pull requests page replaces the thread area while open (`/pull-requests`).
     pub pull_requests_open: bool,
+    /// The issues page replaces the thread area while open (`/issues`), mutually exclusive with PRs.
+    pub issues_open: bool,
     restore_thread: Option<String>,
     /// The restored thread's family is being read, so home waits before opening a draft.
     pub(crate) restoring_thread: bool,
@@ -280,6 +282,7 @@ impl AppState {
             branch_draft: None,
             panels: Default::default(),
             pull_requests_open: false,
+            issues_open: false,
             restore_thread: store::load_last_thread(),
             restoring_thread: false,
             omitted: Default::default(),
@@ -398,6 +401,7 @@ impl AppState {
         self.draft_project = None;
         self.branch_draft = None;
         self.pull_requests_open = false;
+        self.issues_open = false;
         self.composer_mentions.clear();
         self.composer_terminal_context = None;
         self.composer_citation = None;
@@ -773,7 +777,13 @@ impl AppState {
     /// With nothing open, the home page opens a draft in the most recent project, as the web's
     /// index route does (`_chat.index.tsx`). It waits while a thread is about to be selected.
     pub(crate) fn land_home(&mut self, cx: &mut Context<Self>) {
-        let idle = self.selected_thread.is_none() && self.draft_project.is_none() && !self.pull_requests_open;
+        if self.pull_requests_open && self.issues_open {
+            self.issues_open = false;
+        }
+        let idle = self.selected_thread.is_none()
+            && self.draft_project.is_none()
+            && !self.pull_requests_open
+            && !self.issues_open;
         let waiting = self.notification_route.is_some() || self.restore_thread.is_some() || self.select_when_listed.is_some() || self.restoring_thread;
         if !idle || waiting || !self.shell.synchronized {
             return;
@@ -878,9 +888,11 @@ impl AppState {
         }
         self.retire_thread_notifications(thread_id, cx);
         if self.selected_thread.as_deref() == Some(thread_id) {
+            self.set_issues_open(false, cx);
             return self.set_pull_requests_open(false, cx);
         }
         self.pull_requests_open = false;
+        self.issues_open = false;
         self.draft_project = None;
         self.branch_draft = None;
         if let (Some(client), Some(previous)) = (&self.client, &self.selected_thread) {
@@ -974,9 +986,11 @@ impl AppState {
         self.pending_composer_file_drop = None;
         self.citation_source = None;
         if self.draft_project.as_deref() == Some(project_id) && self.selected_thread.is_none() {
+            self.set_issues_open(false, cx);
             return self.set_pull_requests_open(false, cx);
         }
         self.pull_requests_open = false;
+        self.issues_open = false;
         if let (Some(client), Some(previous)) = (&self.client, self.selected_thread.take()) {
             client.close_thread(&previous);
         }
