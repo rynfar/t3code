@@ -18,6 +18,8 @@ pub struct Session {
     pub name: String,
     pub dark: bool,
     pub advanced: bool,
+    pub css: String,
+    pub css_open: bool,
     pub error: Option<String>,
     editing: Option<ThemeDefinition>,
     draft: Draft,
@@ -58,10 +60,14 @@ impl Session {
         }
         let dark = source.filter(|t| t.half(dark).is_none()).map_or(dark, |t| t.appearance == "dark");
         let advanced = source.is_some_and(|t| !t.managed);
+        let css = source.and_then(|t| t.css.clone()).unwrap_or_default();
+        let css_open = !css.is_empty();
         Self {
             name: editing.as_ref().map(|t| t.label.clone()).or(name).unwrap_or_default(),
             dark,
             advanced,
+            css,
+            css_open,
             error: None,
             draft: Draft {
                 colors,
@@ -71,6 +77,20 @@ impl Session {
             editing,
             color_snapshot: None,
             merge_key: None,
+        }
+    }
+    pub fn set_css(&mut self, css: String) {
+        self.css = css;
+        self.error = None;
+    }
+    /// A merge keeps the target's CSS when this draft has none (`ThemeEditorPanel.tsx` `cssForSave`).
+    pub fn effective_css(&self, doc: &ClientSettingsDoc) -> String {
+        if !self.css.trim().is_empty() {
+            self.css.clone()
+        } else {
+            self.merge_target(doc)
+                .and_then(|t| t.css)
+                .unwrap_or_default()
         }
     }
     pub fn is_editing(&self) -> bool {
@@ -187,6 +207,20 @@ impl Session {
             }
         }
         let target = self.merge_target(doc);
+        if let Some(target) = &target
+            && let Some(target_css) = target.css.as_deref().filter(|s| !s.is_empty())
+            && !self.css.trim().is_empty()
+            && target_css != self.css
+        {
+            return Err(format!(
+                "“{}” has different custom CSS. Use the same CSS or pick another name.",
+                target.label
+            ));
+        }
+        let css_for_save = {
+            let effective = self.effective_css(doc);
+            (!effective.is_empty()).then_some(effective)
+        };
         let mut retired = None;
         let mut merged_dark = None;
         let mut theme = if let Some(target) = &target {
@@ -206,6 +240,7 @@ impl Session {
                 t.variants.insert(mode(*d).into(), colors[usize::from(*d)].clone());
             }
             t.managed = t.managed && !self.advanced;
+            t.css = css_for_save;
             merged_dark = modes.first().copied();
             retired = self.editing.as_ref().map(|t| t.id.clone());
             t
@@ -220,6 +255,7 @@ impl Session {
                 *c = colors[usize::from(m == "dark")].clone();
             }
             t.managed = !self.advanced;
+            t.css = css_for_save;
             t
         } else {
             ThemeDefinition {
@@ -230,6 +266,7 @@ impl Session {
                 variants: Default::default(),
                 collection: None,
                 managed: !self.advanced,
+                css: css_for_save,
             }
         };
         let mut file = serde_json::to_value(&theme).expect("theme");
@@ -283,17 +320,30 @@ impl Session {
 pub struct Preview {
     pub dark: bool,
     pub colors: Colors,
+    pub css: Option<String>,
 }
 impl Preview {
     pub fn new(dark: bool, colors: &Colors) -> Self {
+        Self::new_with_css(dark, colors, None)
+    }
+    pub fn new_with_css(dark: bool, colors: &Colors, css: Option<&str>) -> Self {
         Self {
             dark,
             colors: colors.clone(),
+            css: css.filter(|s| !s.trim().is_empty()).map(str::to_owned),
         }
     }
     pub fn update(&mut self, dark: bool, colors: &Colors) -> bool {
+        self.update_with_css(dark, colors, self.css.clone().as_deref())
+    }
+    pub fn update_with_css(&mut self, dark: bool, colors: &Colors, css: Option<&str>) -> bool {
         let mut changed = self.dark != dark;
         self.dark = dark;
+        let next_css = css.filter(|s| !s.trim().is_empty()).map(str::to_owned);
+        if self.css != next_css {
+            self.css = next_css;
+            changed = true;
+        }
         for (role, value) in colors {
             if self.colors.get(role) != Some(value) && color::parse(value).is_ok() {
                 self.colors.insert(role.clone(), value.clone());

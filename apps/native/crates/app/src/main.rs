@@ -140,6 +140,7 @@ fn main() {
 fn boot(runtime: tokio::runtime::Handle, cx: &mut App) -> Entity<app_state::AppState> {
     gpui_component::init(cx);
     theme::init(cx);
+    theme::boot_saved(cx);
     composer::init(cx);
     keymap::init(cx);
     let state = cx.new(|cx| app_state::AppState::new(runtime, cx));

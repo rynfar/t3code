@@ -11,13 +11,16 @@ use crate::{
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Sizable, h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Textarea, TextareaState},
     v_flex,
 };
 use std::collections::BTreeMap;
-use t3_core::themes::{
-    self, ThemeDefinition,
-    editor::{FAMILIES, Session, picker},
+use t3_core::{
+    client_settings::typography::FontRole,
+    themes::{
+        self, ThemeDefinition, css,
+        editor::{FAMILIES, Session, picker},
+    },
 };
 mod color_picker;
 
@@ -87,6 +90,8 @@ struct Editor {
     session: Session,
     name: Entity<InputState>,
     query: Entity<InputState>,
+    css_input: Entity<TextareaState>,
+    css_tab_indents: bool,
     fields: BTreeMap<&'static str, Entity<InputState>>,
     subscriptions: Vec<Subscription>,
     syncing: bool,
@@ -110,6 +115,16 @@ impl Editor {
                 .default_value(session.name.clone())
         });
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Filter colors"));
+        let initial_css = session.css.clone();
+        let css_input = cx.new(|cx| {
+            let mut input = TextareaState::new(window, cx)
+                .placeholder(":root {\n  --primary: #346bf1;\n}")
+                .auto_grow(6, 12);
+            if !initial_css.is_empty() {
+                input.set_value(initial_css, window, cx);
+            }
+            input
+        });
         let mut subscriptions = vec![
             cx.subscribe_in(&name, window, |this, input, event: &InputEvent, window, cx| {
                 if this.syncing || this.saving {
@@ -121,6 +136,28 @@ impl Editor {
                 }
             }),
             cx.subscribe(&query, |_, _, _: &InputEvent, cx| cx.notify()),
+            cx.subscribe_in(&css_input, window, |this, input, event: &InputEvent, _, cx| {
+                match event {
+                    InputEvent::Focus => {
+                        this.css_tab_indents = true;
+                        cx.notify();
+                    }
+                    InputEvent::Change => {
+                        if this.syncing || this.saving {
+                            return;
+                        }
+                        this.session.set_css(input.read(cx).value().to_string());
+                        this.apply_preview(cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            }),
+            cx.observe(&css_input, |this, _, cx| {
+                if this.session.css_open {
+                    cx.notify();
+                }
+            }),
         ];
         subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
@@ -148,13 +185,16 @@ impl Editor {
                 (role, input)
             })
             .collect();
-        let preview = themes::editor::Preview::new(session.dark, session.colors());
-        theme::preview(Some((&preview.colors, session.dark)), cx);
+        let effective_css = session.effective_css(store::client(cx));
+        let preview = themes::editor::Preview::new_with_css(session.dark, session.colors(), Some(&effective_css));
+        theme::preview_with_css(Some((&preview.colors, preview.css.as_deref(), session.dark)), cx);
         Self {
             state,
             session,
             name,
             query,
+            css_input,
+            css_tab_indents: true,
             fields,
             subscriptions,
             syncing: false,
@@ -172,9 +212,26 @@ impl Editor {
         }
     }
     fn apply_preview(&mut self, cx: &mut Context<Self>) {
-        if is_current_editor(cx.entity().entity_id(), cx) && self.preview.update(self.session.dark, self.session.colors()) {
-            theme::preview(Some((&self.preview.colors, self.preview.dark)), cx);
+        let effective_css = self.session.effective_css(store::client(cx));
+        if is_current_editor(cx.entity().entity_id(), cx)
+            && self.preview.update_with_css(self.session.dark, self.session.colors(), Some(&effective_css))
+        {
+            theme::preview_with_css(
+                Some((&self.preview.colors, self.preview.css.as_deref(), self.preview.dark)),
+                cx,
+            );
         }
+    }
+    fn apply_css_edit(&mut self, edit: css::EditResult, window: &mut Window, cx: &mut Context<Self>) {
+        self.syncing = true;
+        self.css_input.update(cx, |input, cx| {
+            input.set_value(edit.text.clone(), window, cx);
+            input.set_selected_range(edit.selection, cx);
+        });
+        self.syncing = false;
+        self.session.set_css(edit.text);
+        self.apply_preview(cx);
+        cx.notify();
     }
 
     fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -431,6 +488,138 @@ impl Render for Editor {
         if !found {
             body = body.child(div().text_xs().child("No matches."));
         }
+        let css_toggle = Button::new("toggle-theme-css", ButtonVariant::Ghost, ButtonSize::Xs)
+            .icon(if self.session.css_open { Icon::ChevronDown } else { Icon::ChevronRight })
+            .label("Custom CSS")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.session.css_open = !this.session.css_open;
+                cx.notify();
+            }));
+        let mut css_section = v_flex().gap(r(8.)).child(h_flex().child(css_toggle));
+        if self.session.css_open {
+            let css_value = self.css_input.read(cx).value().to_string();
+            let css_range = self.css_input.read(cx).selected_range();
+            let (line, col) = css::line_and_column(&css_value, css_range.start);
+            let diag = css::summarize_diagnostics(&css_value);
+            let code_font = theme::font_family(FontRole::Code, cx);
+            let status_note = if diag.exceeds_max_length {
+                Some(("Exceeds 20,000 char limit", hsla(p.destructive)))
+            } else if diag.loads_remote_files {
+                Some(("Remote fetches ignored", hsla(p.warning_foreground)))
+            } else {
+                None
+            };
+            let editor_box = v_flex()
+                .rounded(r(8.))
+                .border_1()
+                .border_color(if diag.exceeds_max_length { hsla(p.destructive) } else { hsla(p.input) })
+                .bg(hsla(p.code_background))
+                .overflow_hidden()
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if this.saving
+                        || event.keystroke.modifiers.control
+                        || event.keystroke.modifiers.platform
+                        || event.keystroke.modifiers.alt
+                    {
+                        return;
+                    }
+                    match event.keystroke.key.as_str() {
+                        "escape" if this.css_tab_indents => {
+                            this.css_tab_indents = false;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                        "tab" if this.css_tab_indents => {
+                            let value = this.css_input.read(cx).value().to_string();
+                            let range = this.css_input.read(cx).selected_range();
+                            if let Some(edit) = css::indent_selection(&value, range, event.keystroke.modifiers.shift) {
+                                this.apply_css_edit(edit, window, cx);
+                            }
+                            cx.stop_propagation();
+                        }
+                        "enter" => {
+                            let range = this.css_input.read(cx).selected_range();
+                            if range.start == range.end {
+                                let value = this.css_input.read(cx).value().to_string();
+                                let edit = css::newline_with_indent(&value, range.start);
+                                this.apply_css_edit(edit, window, cx);
+                                cx.stop_propagation();
+                            }
+                        }
+                        _ => {}
+                    }
+                }))
+                .child(
+                    div()
+                        .h(r(180.))
+                        .p(r(8.))
+                        .font_family(code_font.clone())
+                        .text_xs()
+                        .text_color(hsla(p.code_foreground))
+                        .child(Textarea::new(&self.css_input).appearance(false).bordered(false).disabled(self.saving)),
+                )
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .gap(r(8.))
+                        .border_t_1()
+                        .border_color(hsla(p.input))
+                        .px(r(12.))
+                        .py(r(4.))
+                        .font_family(code_font)
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(
+                            h_flex()
+                                .gap(r(8.))
+                                .child("CSS")
+                                .when_some(status_note, |d, (msg, color)| d.child(div().text_color(color).child(msg))),
+                        )
+                        .child(format!("Ln {line}, Col {col}")),
+                );
+            css_section = css_section
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child("Saved with this theme and included when you export it. Custom properties apply live here; DOM selectors apply on web and desktop. Rules that load remote files are ignored."),
+                )
+                .child(editor_box)
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .items_start()
+                        .gap(r(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(hsla(p.muted_foreground))
+                                .child(if self.css_tab_indents {
+                                    "Tab indents. Shift+Tab unindents. Press Escape, then Tab to leave."
+                                } else {
+                                    "Tab moves to the next control."
+                                }),
+                        )
+                        .child(
+                            Button::new("clear-theme-css", ButtonVariant::Ghost, ButtonSize::Xs)
+                                .label("Clear CSS")
+                                .disabled(self.session.css.is_empty() || self.saving)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_css_edit(
+                                        css::EditResult {
+                                            text: String::new(),
+                                            selection: 0..0,
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                );
+        }
+        body = body.child(css_section);
         let header = h_flex()
             .gap(r(8.))
             .px(r(12.))
@@ -529,9 +718,14 @@ impl Render for Editor {
                     )
             })
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
-                if e.keystroke.key == "escape" && this.picker.is_some() {
-                    this.end_picker(true, window, cx);
-                    cx.stop_propagation();
+                if e.keystroke.key == "escape" {
+                    if this.picker.is_some() {
+                        this.end_picker(true, window, cx);
+                        cx.stop_propagation();
+                    } else if !this.saving {
+                        close(cx);
+                        cx.stop_propagation();
+                    }
                 }
             }));
         div()
@@ -596,6 +790,10 @@ pub fn fixture(value: serde_json::Value, window: &mut Window, cx: &mut App) {
             }
         }
     }
+    if let Some(raw_css) = value.get("css").and_then(serde_json::Value::as_str) {
+        session.set_css(raw_css.into());
+        session.css_open = !raw_css.is_empty();
+    }
     let state = cx.global::<Host>().state.clone();
     let view = cx.new(|cx| Editor::new(state, session, window, cx));
     view.update(cx, |this, cx| {
@@ -646,4 +844,89 @@ pub fn verify_pending_exit_retired(exit: &str, cx: &App) -> Result<(), String> {
         return Err("The editor did not close before the queued frame.".into());
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::{Editor, Host, Session, close, init};
+    use crate::{
+        app_state::AppState,
+        settings::store,
+        theme::{self, palette},
+    };
+    use gpui::AppContext;
+    use serde_json::json;
+    use t3_core::themes::{self, css};
+
+    #[gpui::test]
+    fn custom_css_editor_previews_live_and_restores_on_close(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::init(cx);
+            store::init(cx);
+            cx.set_global(
+                serde_json::from_value::<crate::chatgpt_setup::Fixture>(json!({
+                    "provider": {"instanceId":"test","driver":"test","enabled":false,"installed":false,"status":"unavailable"},
+                    "auth": {"phase":"idle"},
+                    "install": {"phase":"idle"}
+                }))
+                .unwrap(),
+            );
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            init(state.clone(), cx);
+            state
+        });
+        let saved_bg = cx.update(|cx| palette(cx).background);
+        let seed = themes::decode(
+            &json!({
+                "version": 1,
+                "name": "Styled",
+                "appearance": "dark",
+                "colors": {"canvas": "#111111"},
+                "css": ".dark { --background: #141820; --primary: #33ddaa; }"
+            }),
+            false,
+        )
+        .unwrap();
+        let session = Session::new(Some(seed), None, None, true);
+        assert!(session.css_open, "themes with CSS open the Custom CSS editor automatically");
+
+        let window = cx.add_window(|window, cx| {
+            let editor = Editor::new(state.clone(), session, window, cx);
+            cx.global_mut::<Host>().view = Some(cx.entity());
+            editor
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(palette(cx).background, 0x1418_20ff);
+            assert_eq!(palette(cx).primary, 0x33dd_aaff);
+        });
+
+        window
+            .update(cx, |editor, window, cx| {
+                editor.apply_css_edit(
+                    css::EditResult {
+                        text: ".dark { --background: #201424; --primary: #ff6688; }".into(),
+                        selection: 0..0,
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(palette(cx).background, 0x2014_24ff);
+            assert_eq!(palette(cx).primary, 0xff66_88ff);
+            close(cx);
+            assert_eq!(palette(cx).background, saved_bg);
+        });
+        std::mem::forget(runtime);
+    }
 }
