@@ -148,7 +148,14 @@ pub fn filter_names<'a>(query: &str, available: &'a [&'a str]) -> Vec<&'a str> {
     ];
     let normalized = query.split_whitespace().collect::<Vec<_>>().join("-").to_lowercase();
     if normalized.is_empty() {
-        POPULAR.iter().copied().filter(|name| available.contains(name)).collect()
+        POPULAR
+            .iter()
+            .copied()
+            .filter(|name| {
+                available.contains(name)
+                    || super::lucide::resolve_canonical(name).is_some_and(|canonical| available.contains(&canonical))
+            })
+            .collect()
     } else {
         available.iter().copied().filter(|name| name.contains(&normalized)).take(60).collect()
     }

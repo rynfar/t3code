@@ -508,6 +508,23 @@ impl AppState {
         }
         self.sync_scoped_omitted_rows(cx);
         self.ensure_scoped_favicons(cx);
+        // `createShortcutKeybindingsAtom` (`apps/web/src/state/server.ts`): without a primary
+        // config yet, global shortcuts fall back to the first connected environment with config.
+        if self.server_config.config.is_none()
+            && self.environments.active.is_none()
+            && let Some(keybindings) = t3_core::server_config::resolve_shortcut_keybindings(
+                false,
+                None,
+                self.fleet
+                    .environments
+                    .iter()
+                    .filter(|entry| entry.status == ConnectionStatus::Connected)
+                    .filter_map(|entry| entry.config.config.as_ref()),
+            )
+            .cloned()
+        {
+            crate::keymap::install(&keybindings, cx);
+        }
         self.rebuild_sidebar(cx);
         self.finish_scoped_route(cx);
         cx.emit(AppEvent::Shell);
@@ -521,6 +538,29 @@ impl AppState {
 
     pub(crate) fn active_thread_key(&self, id: &str) -> Option<t3_core::sidebar::tag_filter::ThreadKey> {
         Some(t3_core::sidebar::tag_filter::ThreadKey::new(self.environments.active.as_deref()?, id))
+    }
+
+    /// Invalidates cached project favicon requests so re-picking an image path or resetting to
+    /// Automatic fetches fresh bytes from the server (`refreshProjectFaviconUrl` in `state/assets.ts`).
+    pub(crate) fn invalidate_project_favicons(
+        &mut self,
+        members: &[t3_core::sidebar::grouping::ScopedProject],
+        cx: &mut Context<Self>,
+    ) {
+        let mut invalidated_active = false;
+        let active_id = self.environments.active.as_deref();
+        for member in members {
+            self.sidebar.owner_favicons.remove(&member.owner);
+            if active_id == Some(member.owner.saved_id.as_str()) {
+                invalidated_active = true;
+            }
+        }
+        if invalidated_active {
+            self.sidebar.favicons = Default::default();
+            self.ensure_favicons(cx);
+        }
+        self.ensure_scoped_favicons(cx);
+        cx.emit(AppEvent::SidebarSelection);
     }
 
     pub(crate) fn scoped_environment(&self, saved: &str) -> Option<&t3_client::environments::EnvironmentView> {
@@ -590,7 +630,9 @@ impl AppState {
             },
             ScopedRouteAction::Draft(id) => self.start_draft(&id, cx),
             ScopedRouteAction::Branch(id) => self.start_branch_draft(&id, cx),
-            ScopedRouteAction::ProjectSettings(id) => crate::settings::open_project(&id, cx),
+            ScopedRouteAction::ProjectSettings(id) => {
+                crate::settings::open_scoped_project(Some(&route.owner.saved_id), &id, cx)
+            }
             ScopedRouteAction::Project { group, action } => self.finish_scoped_project_action(&group, action, cx),
         }
     }

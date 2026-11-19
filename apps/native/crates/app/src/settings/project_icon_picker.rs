@@ -20,6 +20,7 @@ use gpui_component::{
 use t3_core::settings::projects::{
     self as model, ProjectIcon, ProjectUpdate,
     icon::{self as project_icon, COLORS},
+    lucide,
     picker::{self, Draft, Mode},
 };
 
@@ -75,7 +76,7 @@ impl SettingsView {
         let current = ProjectIcon::decode(shown.members[0].project_icon.as_ref());
         let draft = Draft::new(current.as_ref(), &shown.members[0].title);
         let target = self.icon_target(cx);
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search available Lucide icons"));
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search all Lucide icons"));
         let letters = cx.new(|cx| InputState::new(window, cx).default_value(draft.letters.clone()));
         let custom = cx.new(|cx| InputState::new(window, cx).placeholder("Paste an emoji"));
         #[cfg(feature = "snapshot")]
@@ -140,8 +141,20 @@ impl SettingsView {
         let target = self.icon_target(cx);
         let workspace_root = shown.targets[0].project.workspace_root.clone();
         let selected = shown.members[0].favicon_path.clone();
-        let can_browse_local = target.members.len() == 1 && std::path::Path::new(&workspace_root).is_dir();
-        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Filter project image files"));
+        let can_browse_local = {
+            let app = self.state.read(cx);
+            let primary_env_id = app.primary_environment_id();
+            target.members.len() == 1
+                && app
+                    .environments
+                    .get(&target.members[0].owner.saved_id)
+                    .is_some_and(|env| {
+                        env.local
+                            || primary_env_id.is_some_and(|primary| env.environment_id.as_deref() == Some(primary))
+                    })
+                && std::path::Path::new(&workspace_root).is_dir()
+        };
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search image files\u{2026}"));
         let subscriptions = vec![cx.subscribe(&query, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.search_project_favicon_files(cx);
@@ -388,18 +401,13 @@ impl SettingsView {
                 let PickerKind::Icon(icon_picker) = &self.projects.picker.as_ref()?.kind else { return None };
                 match mode {
                     Mode::Lucide => {
-                        let names = picker::filter_names(&icon_picker.query.read(cx).value(), CATALOG);
+                        let names = picker::filter_names(&icon_picker.query.read(cx).value(), lucide::all_names());
                         let color = icon_picker.draft.color.clone();
                         let chosen = icon_picker.draft.icon_name.clone();
-                        body = body.child(Input::new(&icon_picker.query)).child(
-                            div()
-                                .text_xs()
-                                .text_color(hsla(p.muted_foreground))
-                                .child(format!("{} Lucide icons available in native.", CATALOG.len())),
-                        );
-                        if !CATALOG.contains(&chosen.as_str()) {
+                        body = body.child(Input::new(&icon_picker.query));
+                        if !lucide::contains(&chosen) {
                             body = body.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(format!(
-                                "Saved icon “{chosen}” is outside the native catalog. It is preserved until you choose another icon."
+                                "Saved icon \u{201c}{chosen}\u{201d} is not in this version\u{2019}s Lucide catalog. It is preserved until you choose another icon."
                             )));
                         }
                         let mut grid = v_flex().gap(r(4.));
@@ -413,7 +421,9 @@ impl SettingsView {
                                     name: name.into(),
                                     color: color.clone(),
                                 };
-                                cell(format!("project-icon-{name}"), name == chosen, name, window, cx)
+                                let is_selected = name == chosen
+                                    || lucide::resolve_canonical(name).is_some_and(|c| Some(c) == lucide::resolve_canonical(&chosen));
+                                cell(format!("project-icon-{name}"), is_selected, name, window, cx)
                                     .child(crate::project_icon::preview(&icon, crate::project_icon::size(20., cx), cx))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(Picker { kind: PickerKind::Icon(icon), .. }) = &mut this.projects.picker {
@@ -482,20 +492,32 @@ impl SettingsView {
                 let selected = file_picker.selected.clone();
                 let mut header = h_flex().gap(r(8.)).child(div().flex_1().child(Input::new(&file_picker.query)));
                 if file_picker.can_browse_local {
+                    let browse_label = if cfg!(target_os = "macos") {
+                        "Open in Finder"
+                    } else if cfg!(target_os = "windows") {
+                        "Open in File Explorer"
+                    } else {
+                        "Open in Files"
+                    };
                     header = header.child(
                         Button::new("project-favicon-browse", ButtonVariant::Outline, ButtonSize::Sm)
-                            .label("Browse…")
+                            .label(browse_label)
                             .on_click(cx.listener(|this, _, _, cx| this.browse_local_favicon_file(cx))),
                     );
                 }
                 let mut list = v_flex().gap(r(2.));
                 if file_picker.loading {
-                    list = list.child(div().py(r(24.)).text_sm().text_color(hsla(p.muted_foreground)).child("Searching project image files…"));
+                    let pending_msg = if query_text.trim().is_empty() {
+                        "Indexing project files\u{2026}"
+                    } else {
+                        "Searching project files\u{2026}"
+                    };
+                    list = list.child(div().py(r(24.)).text_sm().text_color(hsla(p.muted_foreground)).child(pending_msg));
                 } else if let Some(err) = &file_picker.error {
                     list = list.child(div().py(r(12.)).text_sm().text_color(hsla(p.error_foreground)).child(err.clone()));
                 } else if file_picker.entries.is_empty() {
                     let empty = if query_text.trim().is_empty() {
-                        "No image files found in this project."
+                        "No image files found."
                     } else {
                         "No matching image files."
                     };
@@ -629,176 +651,3 @@ fn cell(id: String, selected: bool, label: &str, window: &mut Window, cx: &mut A
         .when(focused, |v| v.shadow(focus_ring(hsla(p.ring))))
         .tooltip(tooltip(label.to_owned().into()))
 }
-
-const CATALOG: &[&str] = &[
-    "alarm-clock",
-    "alarm-clock-off",
-    "archive",
-    "archive-x",
-    "arrow-down",
-    "arrow-down-up",
-    "arrow-left",
-    "arrow-right",
-    "arrow-right-left",
-    "arrow-up",
-    "arrow-up-left",
-    "arrow-up-right",
-    "blocks",
-    "bookmark",
-    "bot",
-    "bug",
-    "building",
-    "calendar-clock",
-    "chart-no-axes-column",
-    "check",
-    "chevron-down",
-    "chevron-left",
-    "chevron-right",
-    "chevron-up",
-    "chevrons-down-up",
-    "chevrons-left-right-ellipsis",
-    "chevrons-up-down",
-    "circle-alert",
-    "circle-arrow-up",
-    "circle-check",
-    "circle-dashed",
-    "circle-dot",
-    "circle-dot-dashed",
-    "circle-slash",
-    "circle-stop",
-    "circle-x",
-    "clock",
-    "cloud",
-    "cloud-download",
-    "cloud-upload",
-    "code-xml",
-    "columns-2",
-    "copy",
-    "corner-left-up",
-    "corner-up-right",
-    "download",
-    "earth",
-    "ellipsis",
-    "external-link",
-    "eye",
-    "file",
-    "file-braces",
-    "file-diff",
-    "file-minus",
-    "file-plus",
-    "file-symlink",
-    "file-text",
-    "files",
-    "flask-conical",
-    "folder",
-    "folder-code",
-    "folder-git",
-    "folder-git-2",
-    "folder-open",
-    "folder-plus",
-    "folder-tree",
-    "gauge",
-    "git-branch",
-    "git-branch-plus",
-    "git-commit-horizontal",
-    "git-fork",
-    "git-merge",
-    "git-pull-request",
-    "git-pull-request-arrow",
-    "git-pull-request-closed",
-    "git-pull-request-draft",
-    "globe",
-    "hammer",
-    "hash",
-    "history",
-    "house",
-    "image",
-    "info",
-    "key-round",
-    "keyboard",
-    "laptop",
-    "link",
-    "link-2",
-    "list-checks",
-    "list-filter",
-    "list-plus",
-    "list-tree",
-    "loader-circle",
-    "lock",
-    "lock-open",
-    "mail-open",
-    "maximize-2",
-    "message-circle",
-    "message-circle-question-mark",
-    "message-square",
-    "message-square-dashed",
-    "message-square-plus",
-    "message-square-text",
-    "messages-square",
-    "minimize-2",
-    "minus",
-    "monitor",
-    "mouse-pointer-click",
-    "package",
-    "palette",
-    "panel-left",
-    "panel-right",
-    "panels-top-left",
-    "paperclip",
-    "pen-line",
-    "pencil",
-    "pencil-ruler",
-    "pilcrow",
-    "pin",
-    "pin-off",
-    "play",
-    "plus",
-    "power",
-    "qr-code",
-    "quote",
-    "radio-tower",
-    "redo-2",
-    "refresh-cw",
-    "rocket",
-    "rotate-ccw",
-    "rows-3",
-    "search",
-    "server",
-    "settings",
-    "settings-2",
-    "shield",
-    "shield-check",
-    "shield-off",
-    "shield-question-mark",
-    "sliders-horizontal",
-    "smartphone",
-    "sparkles",
-    "square",
-    "square-arrow-out-up-right",
-    "square-menu",
-    "square-pen",
-    "square-split-horizontal",
-    "square-split-vertical",
-    "square-terminal",
-    "star",
-    "tag",
-    "target",
-    "terminal",
-    "text-search",
-    "text-wrap",
-    "ticket",
-    "timer",
-    "trash",
-    "trash-2",
-    "trending-down",
-    "trending-up",
-    "triangle-alert",
-    "undo-2",
-    "unlink-2",
-    "user-check",
-    "user-round",
-    "user-round-x",
-    "users",
-    "wrench",
-    "x",
-];

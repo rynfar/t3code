@@ -337,6 +337,12 @@ pub struct ServerProvider {
     pub slash_commands: Vec<ProviderSlashCommand>,
     #[serde(default, deserialize_with = "lenient_vec")]
     pub skills: Vec<ProviderSkill>,
+    /// Digest of the machine's slash commands and skills when sent on demand (`serverConfigProjection.ts`).
+    #[serde(default)]
+    pub catalog_digest: Option<String>,
+    /// Digest of the `slash_commands` and `skills` currently loaded on this provider entry.
+    #[serde(default)]
+    pub loaded_catalog_digest: Option<String>,
     /// Per-cwd commands and skills. Left out for clients that fetch them on demand.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub workspace_snapshots: Vec<WorkspaceSnapshot>,
@@ -534,9 +540,15 @@ pub struct EnvironmentCapabilities {
     #[serde(default)]
     pub server_self_update: Option<String>,
     #[serde(default)]
+    pub server_self_update_progress: Option<bool>,
+    #[serde(default)]
     pub desktop_app_update: Option<bool>,
     #[serde(default)]
     pub desktop_app_channel_switch: Option<bool>,
+    #[serde(default)]
+    pub environment_themes: Option<bool>,
+    #[serde(default)]
+    pub provider_workspace_snapshots_on_demand: Option<bool>,
     /// File attachments and the largest upload the server takes; absent when it takes none.
     #[serde(default, deserialize_with = "lenient_option")]
     pub file_attachments: Option<FileAttachmentsCapability>,
@@ -720,6 +732,14 @@ pub struct ProjectSettingsOverrides {
 pub struct ServerSettings {
     #[serde(default, deserialize_with = "lenient_option")]
     pub guest_sharing_enabled: Option<bool>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub default_theme: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub default_theme_set_at: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub default_appearance: String,
+    #[serde(default, deserialize_with = "lenient")]
+    pub default_appearance_set_at: String,
     #[serde(default, deserialize_with = "lenient_option")]
     pub environment_icon: Option<String>,
     #[serde(default, deserialize_with = "lenient_option")]
@@ -890,6 +910,10 @@ pub struct ServerConfig {
     pub environment_themes: Vec<Value>,
     #[serde(skip)]
     pub environment_theme_definitions: Vec<crate::themes::ThemeDefinition>,
+    /// `true` once an authoritative `environmentThemesUpdated` event has arrived on this stream
+    /// (`serverConfigProjection.ts`: distinguishes "not arrived yet" from an explicit empty set).
+    #[serde(skip)]
+    pub environment_themes_received: bool,
     #[serde(default)]
     pub environment: EnvironmentDescriptor,
     #[serde(default)]
@@ -966,6 +990,212 @@ impl ServerConfig {
             .find(|issue| issue.kind.starts_with("keybindings."))
             .map(|issue| issue.message.as_str())
     }
+
+    /// `withoutEnvironmentThemes` (`packages/client-runtime/src/state/serverConfigProjection.ts`):
+    /// scrubs machine-ephemeral `environmentThemes` and `usageLimitSources` so cached configs
+    /// cannot restore state the machine no longer publishes.
+    pub fn without_environment_themes(mut self) -> Self {
+        self.environment_themes.clear();
+        self.environment_theme_definitions.clear();
+        self.environment_themes_received = false;
+        self.usage_limit_sources.clear();
+        self
+    }
+}
+
+/// `withoutEnvironmentThemes` (`packages/client-runtime/src/state/serverConfigProjection.ts`).
+pub fn without_environment_themes(config: ServerConfig) -> ServerConfig {
+    config.without_environment_themes()
+}
+
+/// `createShortcutKeybindingsAtom` (`apps/web/src/state/server.ts`):
+/// when a primary environment exists, its keybindings stay authoritative (even while loading);
+/// without a primary, global shortcuts fall back to the first connected environment with config.
+pub fn resolve_shortcut_keybindings<'a>(
+    has_primary: bool,
+    primary_config: Option<&'a ServerConfig>,
+    connected_configs: impl IntoIterator<Item = &'a ServerConfig>,
+) -> Option<&'a Value> {
+    if has_primary {
+        primary_config.map(|config| &config.keybindings)
+    } else {
+        connected_configs.into_iter().next().map(|config| &config.keybindings)
+    }
+}
+
+/// `FetchedMachineCatalog` (`packages/client-runtime/src/state/server.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchedMachineCatalog {
+    pub instance_id: String,
+    pub digest: String,
+    pub slash_commands: Vec<ProviderSlashCommand>,
+    pub skills: Vec<ProviderSkill>,
+}
+
+/// `withHeldProviderCatalogs` (`packages/client-runtime/src/state/serverConfigProjection.ts`):
+/// a provider sent with a `catalogDigest` comes without its slash commands and skills. Keep the
+/// lists this client already holds (stale ones too) until it loads the lists the digest names.
+pub fn with_held_provider_catalogs(
+    previous: &[ServerProvider],
+    next: Vec<ServerProvider>,
+) -> Vec<ServerProvider> {
+    if previous.is_empty() {
+        return next;
+    }
+    next.into_iter()
+        .map(|mut provider| {
+            if provider.catalog_digest.is_none() || provider.loaded_catalog_digest.is_some() {
+                return provider;
+            }
+            let Some(held) = previous.iter().find(|candidate| candidate.instance_id == provider.instance_id) else {
+                return provider;
+            };
+            provider.slash_commands = held.slash_commands.clone();
+            provider.skills = held.skills.clone();
+            if let Some(loaded) = &held.loaded_catalog_digest {
+                provider.loaded_catalog_digest = Some(loaded.clone());
+            }
+            provider
+        })
+        .collect()
+}
+
+/// `withFetchedMachineCatalogs` (`packages/client-runtime/src/state/server.ts`):
+/// merges machine slash commands and skills into providers whose live `catalogDigest` matches
+/// and has not yet been loaded. Returns `true` if any provider changed.
+pub fn apply_fetched_machine_catalogs(
+    providers: &mut [ServerProvider],
+    catalogs: &[FetchedMachineCatalog],
+) -> bool {
+    let mut changed = false;
+    for provider in providers {
+        let Some(catalog) = catalogs.iter().find(|entry| entry.instance_id == provider.instance_id) else {
+            continue;
+        };
+        if provider.catalog_digest.as_deref() != Some(catalog.digest.as_str())
+            || provider.loaded_catalog_digest.as_deref() == Some(catalog.digest.as_str())
+        {
+            continue;
+        }
+        provider.slash_commands = catalog.slash_commands.clone();
+        provider.skills = catalog.skills.clone();
+        provider.loaded_catalog_digest = Some(catalog.digest.clone());
+        changed = true;
+    }
+    changed
+}
+
+/// `ServerProviderDelta` (`packages/contracts/src/server.ts`):
+/// identical to `ServerProvider`, except `models`, `slashCommands`, and `skills` may be omitted
+/// when unchanged from the previously delivered provider list.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerProviderDelta {
+    pub instance_id: String,
+    pub driver: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub accent_color: Option<String>,
+    #[serde(default)]
+    pub badge_label: Option<String>,
+    #[serde(default)]
+    pub show_interaction_mode_toggle: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_option_vec")]
+    pub supported_runtime_modes: Option<Vec<RuntimeMode>>,
+    pub enabled: bool,
+    pub installed: bool,
+    pub status: String,
+    #[serde(default)]
+    pub auth: ProviderAuth,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub availability: Option<String>,
+    #[serde(default)]
+    pub supports_text_generation: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_option_vec")]
+    pub models: Option<Vec<ProviderModel>>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub usage_limits: Option<UsageLimits>,
+    #[serde(default)]
+    pub supports_conversation_rollback: Option<bool>,
+    #[serde(default, deserialize_with = "lenient_option_vec")]
+    pub slash_commands: Option<Vec<ProviderSlashCommand>>,
+    #[serde(default, deserialize_with = "lenient_option_vec")]
+    pub skills: Option<Vec<ProviderSkill>>,
+    #[serde(default)]
+    pub catalog_digest: Option<String>,
+    #[serde(default)]
+    pub loaded_catalog_digest: Option<String>,
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub workspace_snapshots: Vec<WorkspaceSnapshot>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub version_advisory: Option<VersionAdvisory>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub compatibility_advisory: Option<CompatibilityAdvisory>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub update_state: Option<UpdateState>,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub setup: Option<ProviderSetup>,
+    #[serde(default)]
+    pub runtime_paths: Option<Value>,
+    #[serde(default)]
+    pub checked_at: CheckedAt,
+    #[serde(default, deserialize_with = "lenient_option")]
+    pub continuation: Option<ProviderContinuation>,
+}
+
+/// `applyServerProviderDeltas` (`packages/contracts/src/server.ts`):
+/// rebuilds full `ServerProvider` entries by inheriting omitted `models`, `slashCommands`, and
+/// `skills` from `previous`. Deltas whose omitted lists cannot be rebuilt are dropped.
+pub fn apply_server_provider_deltas(
+    previous: &[ServerProvider],
+    deltas: Vec<ServerProviderDelta>,
+) -> Vec<ServerProvider> {
+    deltas
+        .into_iter()
+        .filter_map(|delta| {
+            let base = previous.iter().find(|provider| provider.instance_id == delta.instance_id);
+            let models = delta.models.or_else(|| base.map(|b| b.models.clone()))?;
+            let slash_commands = delta.slash_commands.or_else(|| base.map(|b| b.slash_commands.clone()))?;
+            let skills = delta.skills.or_else(|| base.map(|b| b.skills.clone()))?;
+            Some(ServerProvider {
+                instance_id: delta.instance_id,
+                driver: delta.driver,
+                display_name: delta.display_name,
+                accent_color: delta.accent_color,
+                badge_label: delta.badge_label,
+                show_interaction_mode_toggle: delta.show_interaction_mode_toggle,
+                supported_runtime_modes: delta.supported_runtime_modes,
+                enabled: delta.enabled,
+                installed: delta.installed,
+                status: delta.status,
+                auth: delta.auth,
+                message: delta.message,
+                availability: delta.availability,
+                supports_text_generation: delta.supports_text_generation,
+                models,
+                usage_limits: delta.usage_limits,
+                supports_conversation_rollback: delta.supports_conversation_rollback,
+                slash_commands,
+                skills,
+                catalog_digest: delta.catalog_digest,
+                loaded_catalog_digest: delta.loaded_catalog_digest,
+                workspace_snapshots: delta.workspace_snapshots,
+                version: delta.version,
+                version_advisory: delta.version_advisory,
+                compatibility_advisory: delta.compatibility_advisory,
+                update_state: delta.update_state,
+                setup: delta.setup,
+                runtime_paths: delta.runtime_paths,
+                checked_at: delta.checked_at,
+                continuation: delta.continuation,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -981,6 +1211,12 @@ pub struct KeybindingsPayload {
 pub struct ProvidersPayload {
     #[serde(default, deserialize_with = "lenient_vec")]
     pub providers: Vec<ServerProvider>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderDeltasPayload {
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub providers: Vec<ServerProviderDelta>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1004,6 +1240,8 @@ pub enum ServerConfigStreamEvent {
     KeybindingsUpdated { payload: KeybindingsPayload },
     #[serde(rename = "providerStatuses")]
     ProviderStatuses { payload: ProvidersPayload },
+    #[serde(rename = "providerStatusDeltas")]
+    ProviderStatusDeltas { payload: ProviderDeltasPayload },
     #[serde(rename = "settingsUpdated")]
     SettingsUpdated { payload: Box<SettingsPayload> },
     #[serde(rename = "usageLimitSourcesUpdated")]
@@ -1034,10 +1272,19 @@ impl ServerConfigStreamEvent {
     }
 }
 
+/// Where the held config came from (`ServerConfigProjection.source`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConfigSource {
+    Cache,
+    #[default]
+    Live,
+}
+
 /// Client-side config. Events before the first snapshot are dropped, as `Option.map` drops them.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfigState {
     pub config: Option<ServerConfig>,
+    source: ConfigSource,
     /// Counts settings the stream delivered. The protocol carries no revision, so an
     /// `updateSettings` reply applies only while nothing has streamed since it was sent.
     settings_revision: u64,
@@ -1048,6 +1295,20 @@ pub struct ServerConfigState {
 }
 
 impl ServerConfigState {
+    /// Hydrates a persisted cached `ServerConfig`, scrubbing machine-ephemeral
+    /// `environmentThemes` and `usageLimitSources` (`withoutEnvironmentThemes`).
+    pub fn from_cached(config: ServerConfig) -> Self {
+        Self {
+            config: Some(without_environment_themes(config)),
+            source: ConfigSource::Cache,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.config.is_some() && self.source == ConfigSource::Live
+    }
+
     /// Returns true when the config changed. Reconnects resend unchanged data, so equal values
     /// are reported as unchanged and views stay quiet.
     pub fn apply(&mut self, event: ServerConfigStreamEvent) -> bool {
@@ -1055,18 +1316,29 @@ impl ServerConfigState {
             ServerConfigStreamEvent::Snapshot { mut config } => {
                 self.settings_revision += 1;
                 self.keybindings_revision += 1;
-                // `serverConfigProjection.ts`: sources follow their own event once known.
-                if let Some(current) = self.config.as_ref().filter(|current| !current.usage_limit_sources.is_empty()) {
-                    config.usage_limit_sources = current.usage_limit_sources.clone();
+                let was_cache = self.source == ConfigSource::Cache;
+                self.source = ConfigSource::Live;
+                // `serverConfigProjection.ts`: sources and themes follow their own events once known.
+                if let Some(current) = self.config.as_ref() {
+                    if !current.usage_limit_sources.is_empty() {
+                        config.usage_limit_sources = current.usage_limit_sources.clone();
+                    }
+                    if current.environment_themes_received || !current.environment_themes.is_empty() {
+                        config.environment_themes = current.environment_themes.clone();
+                        config.environment_theme_definitions = current.environment_theme_definitions.clone();
+                        config.environment_themes_received = current.environment_themes_received;
+                    }
+                    config.providers = with_held_provider_catalogs(&current.providers, config.providers);
                 }
-                if let Some(current) = self.config.as_ref() { config.environment_themes = current.environment_themes.clone();config.environment_theme_definitions=current.environment_theme_definitions.clone(); }
-                if self.config.as_ref().is_some_and(|current| {
-                    *current == *config
-                        && crate::updates::same_one_click_representatives(
-                            &current.providers,
-                            &config.providers,
-                        )
-                }) {
+                if !was_cache
+                    && self.config.as_ref().is_some_and(|current| {
+                        *current == *config
+                            && crate::updates::same_one_click_representatives(
+                                &current.providers,
+                                &config.providers,
+                            )
+                    })
+                {
                     return false;
                 }
                 self.config = Some(*config);
@@ -1075,6 +1347,7 @@ impl ServerConfigState {
             ServerConfigStreamEvent::KeybindingsUpdated { payload } => {
                 self.keybindings_revision += 1;
                 self.keybindings_updated_seq += 1;
+                self.source = ConfigSource::Live;
                 self.update(|config| {
                     let keys = replace(&mut config.keybindings, payload.keybindings);
                     let issues = replace(&mut config.issues, payload.issues);
@@ -1082,19 +1355,37 @@ impl ServerConfigState {
                     keys || issues || has_issue
                 })
             }
-            ServerConfigStreamEvent::ProviderStatuses { payload } => self.apply_providers(payload.providers),
+            ServerConfigStreamEvent::ProviderStatuses { payload } => {
+                self.source = ConfigSource::Live;
+                self.apply_providers(payload.providers)
+            }
+            ServerConfigStreamEvent::ProviderStatusDeltas { payload } => {
+                self.source = ConfigSource::Live;
+                let Some(previous) = self.config.as_ref().map(|config| config.providers.as_slice()) else {
+                    return false;
+                };
+                let rebuilt = apply_server_provider_deltas(previous, payload.providers);
+                self.apply_providers(rebuilt)
+            }
             ServerConfigStreamEvent::SettingsUpdated { payload } => {
                 self.settings_revision += 1;
+                self.source = ConfigSource::Live;
                 self.update(|config| replace(&mut config.settings, payload.settings))
             }
             ServerConfigStreamEvent::UsageLimitSourcesUpdated { payload } => {
+                self.source = ConfigSource::Live;
                 self.update(|config| replace(&mut config.usage_limit_sources, payload.sources))
             }
-            ServerConfigStreamEvent::EnvironmentThemesUpdated { payload } => self.update(|config| {
-                let raw=replace(&mut config.environment_themes,payload.themes);
-                let prepared=replace(&mut config.environment_theme_definitions,payload.definitions);
-                raw||prepared
-            }),
+            ServerConfigStreamEvent::EnvironmentThemesUpdated { payload } => {
+                self.source = ConfigSource::Live;
+                self.update(|config| {
+                    let first_arrival = !config.environment_themes_received;
+                    config.environment_themes_received = true;
+                    let raw = replace(&mut config.environment_themes, payload.themes);
+                    let prepared = replace(&mut config.environment_theme_definitions, payload.definitions);
+                    first_arrival || raw || prepared
+                })
+            }
             ServerConfigStreamEvent::Unknown => false,
         }
     }
@@ -1103,10 +1394,16 @@ impl ServerConfigState {
         self.settings_revision
     }
 
+    /// Merges machine slash commands and skills fetched for matching `catalogDigest`s.
+    pub fn apply_fetched_machine_catalogs(&mut self, catalogs: &[FetchedMachineCatalog]) -> bool {
+        self.update(|config| apply_fetched_machine_catalogs(&mut config.providers, catalogs))
+    }
+
     /// Takes a provider list from the stream or a `server.refreshProviders` reply. The fresh
     /// `checkedAt` stamps are kept even when nothing else changed, which reports no change.
     pub fn apply_providers(&mut self, providers: Vec<ServerProvider>) -> bool {
         self.update(|config| {
+            let providers = with_held_provider_catalogs(&config.providers, providers);
             let changed = config.providers != providers
                 || !crate::updates::same_one_click_representatives(&config.providers, &providers);
             config.providers = providers;

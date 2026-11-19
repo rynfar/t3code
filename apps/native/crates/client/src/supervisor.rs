@@ -1201,7 +1201,7 @@ fn apply_provider_status_deltas(held: &HashMap<String, Value>, deltas: &[Value])
             let id = next.get("instanceId")?.as_str()?;
             let base = held.get(id).and_then(Value::as_object);
             for field in ["models", "slashCommands", "skills"] {
-                if !next.contains_key(field) {
+                if next.get(field).is_none_or(Value::is_null) {
                     let inherited = base.and_then(|base| base.get(field)).cloned()?;
                     next.insert(field.to_owned(), inherited);
                 }
@@ -2027,6 +2027,40 @@ mod parity_tests {
             .await
             .expect("better-route probe completes");
         assert_eq!(winner.as_deref(), Some(local_better.id.as_str()));
+    }
+
+    #[test]
+    fn provider_status_deltas_inherit_omitted_and_null_lists_and_drop_unrebuildable() {
+        let mut held = HashMap::new();
+        held.insert(
+            "codex".to_owned(),
+            json!({
+                "instanceId": "codex",
+                "driver": "codex",
+                "models": [{"slug": "gpt-5.4", "name": "GPT-5.4"}],
+                "slashCommands": [{"name": "review"}],
+                "skills": [{"name": "rust", "enabled": true}]
+            }),
+        );
+        let deltas = vec![
+            json!({
+                "instanceId": "codex",
+                "driver": "codex",
+                "status": "warning",
+                "models": null
+            }),
+            json!({
+                "instanceId": "brand-new-missing-lists",
+                "driver": "codex",
+                "status": "ready"
+            }),
+        ];
+        let rebuilt = apply_provider_status_deltas(&held, &deltas);
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0]["status"], "warning");
+        assert_eq!(rebuilt[0]["models"][0]["slug"], "gpt-5.4");
+        assert_eq!(rebuilt[0]["slashCommands"][0]["name"], "review");
+        assert_eq!(rebuilt[0]["skills"][0]["name"], "rust");
     }
 }
 

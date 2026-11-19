@@ -144,3 +144,157 @@ fn keybindings_update_replaces_the_raw_payload() {
     assert!(!state.apply_keybindings_reply(&stale, sent_at));
     assert_eq!(state.config.unwrap().keybindings[0]["key"], "mod+l");
 }
+
+#[test]
+fn without_environment_themes_scrubs_cached_state_and_tracks_arrival() {
+    let cached: ServerConfig = serde_json::from_value(json!({
+        "environment": { "environmentId": "e1", "label": "Mac", "serverVersion": "0.1.0", "capabilities": { "environmentThemes": true } },
+        "providers": [provider("devReplay", "acp")],
+        "environmentThemes": [{"id": "stale", "name": "Stale"}],
+        "usageLimitSources": [{"id": "src-1", "label": "Proxy", "accounts": []}],
+        "settings": {
+            "defaultTheme": "ocean",
+            "defaultThemeSetAt": "2026-11-19T00:00:00Z",
+            "defaultAppearance": "dark",
+            "defaultAppearanceSetAt": "2026-11-19T00:00:01Z"
+        }
+    }))
+    .unwrap();
+
+    let mut state = ServerConfigState::from_cached(cached);
+    assert!(!state.is_live());
+    let cfg = state.config.as_ref().unwrap();
+    assert!(cfg.environment_themes.is_empty(), "cached environmentThemes must be scrubbed");
+    assert!(cfg.usage_limit_sources.is_empty(), "cached usageLimitSources must be scrubbed");
+    assert!(!cfg.environment_themes_received, "cached state has not received live themes");
+    assert_eq!(cfg.environment.capabilities.environment_themes, Some(true));
+    assert_eq!(cfg.settings.default_theme, "ocean");
+    assert_eq!(cfg.settings.default_theme_set_at, "2026-11-19T00:00:00Z");
+    assert_eq!(cfg.settings.default_appearance, "dark");
+    assert_eq!(cfg.settings.default_appearance_set_at, "2026-11-19T00:00:01Z");
+
+    // First live snapshot transitions source to live and leaves environment_themes_received false.
+    assert!(state.apply(snapshot(json!({}))));
+    assert!(state.is_live());
+    assert!(!state.config.as_ref().unwrap().environment_themes_received);
+
+    // An authoritative empty EnvironmentThemesUpdated flips environment_themes_received to true
+    // and reports a change so subscribers can clear any persisted theme cache.
+    let empty_themes: ServerConfigStreamEvent = serde_json::from_value(json!({
+        "version": 1, "type": "environmentThemesUpdated", "payload": { "themes": [] }
+    }))
+    .unwrap();
+    assert!(state.apply(empty_themes.clone()));
+    assert!(state.config.as_ref().unwrap().environment_themes_received);
+    assert!(state.config.as_ref().unwrap().environment_themes.is_empty());
+    // Repeating the same empty set reports unchanged.
+    assert!(!state.apply(empty_themes));
+    // Reconnect snapshot preserves environment_themes_received.
+    assert!(!state.apply(snapshot(json!({}))));
+    assert!(state.config.as_ref().unwrap().environment_themes_received);
+}
+
+#[test]
+fn applies_provider_status_deltas_and_holds_on_demand_catalogs() {
+    let mut state = ServerConfigState::default();
+    let initial: ServerConfigStreamEvent = serde_json::from_value(json!({
+        "version": 1,
+        "type": "snapshot",
+        "config": {
+            "environment": { "environmentId": "e1", "label": "Mac", "serverVersion": "0.1.0" },
+            "providers": [{
+                "instanceId": "codex",
+                "driver": "codex",
+                "enabled": true,
+                "installed": true,
+                "status": "ready",
+                "catalogDigest": "dig-1",
+                "loadedCatalogDigest": "dig-1",
+                "models": [{"slug": "gpt-5.4", "name": "GPT-5.4"}],
+                "slashCommands": [{"name": "review", "description": "Review"}],
+                "skills": [{"name": "rust", "enabled": true}]
+            }]
+        }
+    }))
+    .unwrap();
+    assert!(state.apply(initial));
+
+    // ProviderStatusDeltas omits models/slashCommands/skills (and sends null for one),
+    // updating only status while inheriting held lists + dropping unrebuildable new providers.
+    let delta: ServerConfigStreamEvent = serde_json::from_value(json!({
+        "version": 1,
+        "type": "providerStatusDeltas",
+        "payload": {
+            "providers": [
+                {
+                    "instanceId": "codex",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "warning",
+                    "catalogDigest": "dig-2",
+                    "slashCommands": null
+                },
+                {
+                    "instanceId": "unknown-partial",
+                    "driver": "codex",
+                    "enabled": true,
+                    "installed": true,
+                    "status": "ready"
+                }
+            ]
+        }
+    }))
+    .unwrap();
+    assert!(state.apply(delta));
+    let providers = &state.config.as_ref().unwrap().providers;
+    assert_eq!(providers.len(), 1, "delta without prior models/commands/skills is dropped");
+    assert_eq!(providers[0].status, "warning");
+    assert_eq!(providers[0].models.len(), 1);
+    assert_eq!(providers[0].slash_commands.len(), 1, "held slash commands survive digest bump");
+    assert_eq!(providers[0].skills.len(), 1, "held skills survive digest bump");
+    assert_eq!(providers[0].catalog_digest.as_deref(), Some("dig-2"));
+    assert_eq!(providers[0].loaded_catalog_digest.as_deref(), Some("dig-1"));
+
+    // Stale catalog reply for dig-1 is ignored; live dig-2 reply replaces lists and updates digest.
+    assert!(!state.apply_fetched_machine_catalogs(&[FetchedMachineCatalog {
+        instance_id: "codex".into(),
+        digest: "dig-1".into(),
+        slash_commands: vec![],
+        skills: vec![],
+    }]));
+    assert!(state.apply_fetched_machine_catalogs(&[FetchedMachineCatalog {
+        instance_id: "codex".into(),
+        digest: "dig-2".into(),
+        slash_commands: vec![ProviderSlashCommand { name: "plan".into(), description: None, input: None }],
+        skills: vec![],
+    }]));
+    let p = &state.config.as_ref().unwrap().providers[0];
+    assert_eq!(p.loaded_catalog_digest.as_deref(), Some("dig-2"));
+    assert_eq!(p.slash_commands[0].name, "plan");
+    assert!(p.skills.is_empty());
+}
+
+#[test]
+fn resolves_shortcut_keybindings_with_primary_authority_and_connected_fallback() {
+    let primary: ServerConfig = serde_json::from_value(json!({
+        "keybindings": [{"key": "mod+k", "command": "primary.cmd"}]
+    }))
+    .unwrap();
+    let secondary: ServerConfig = serde_json::from_value(json!({
+        "keybindings": [{"key": "mod+k", "command": "secondary.cmd"}]
+    }))
+    .unwrap();
+
+    // Primary stays authoritative even while its config is still loading.
+    assert_eq!(resolve_shortcut_keybindings(true, None, [&secondary]), None);
+    assert_eq!(
+        resolve_shortcut_keybindings(true, Some(&primary), [&secondary]).unwrap()[0]["command"],
+        "primary.cmd"
+    );
+    // Without a primary, falls back to first connected config.
+    assert_eq!(
+        resolve_shortcut_keybindings(false, None, [&secondary]).unwrap()[0]["command"],
+        "secondary.cmd"
+    );
+}

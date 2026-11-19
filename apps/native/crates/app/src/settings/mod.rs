@@ -65,8 +65,8 @@ struct Host {
     state: Entity<AppState>,
     view: Option<Entity<SettingsView>>,
     pending: Option<(Section, Option<String>)>,
-    /// The project a "Project settings" entry point opens the Projects page on.
-    pending_project: Option<String>,
+    /// The project (and optional saved environment id) a "Project settings" entry point opens on.
+    pending_project: Option<(Option<String>, String)>,
     /// The scheduled task an "Edit automation" / "Open automation" link opens the editor for once tasks load.
     pending_scheduled_task: Option<String>,
     pending_provider: Option<providers::ProviderSettingsTarget>,
@@ -155,6 +155,30 @@ pub(crate) fn setup_selection_for_test(window: &mut Window, cx: &mut App) -> Opt
         view.invalidate_provider_setup(cx);
         view.selected_instance_id(cx)
     })
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) fn project_selection_for_test(window: &mut Window, cx: &mut App) -> Option<(String, Vec<(String, String)>)> {
+    apply_pending(window, cx);
+    let view = cx.global::<Host>().view.clone()?;
+    view.read_with(cx, |view, cx| {
+        if view.section != Section::Projects {
+            return None;
+        }
+        let shown = view.shown_project(cx)?;
+        let targets = shown
+            .targets
+            .iter()
+            .map(|p| (p.owner.saved_id.clone(), p.project.id.clone()))
+            .collect();
+        Some((shown.group.key, targets))
+    })
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+pub(crate) fn settings_view_for_test(window: &mut Window, cx: &mut App) -> Option<Entity<SettingsView>> {
+    apply_pending(window, cx);
+    cx.global::<Host>().view.clone()
 }
 
 #[cfg(all(test, feature = "snapshot"))]
@@ -347,9 +371,16 @@ pub fn open_voice(cx: &mut App) {
 }
 
 /// Opens Settings → Projects on the project holding `project_id`, from every "Project settings"
-/// entry point (`openProjectSettings` in `Sidebar.tsx`, the command palette).
+/// entry point (`openProjectSettings` in `Sidebar.tsx`, the command palette, `ChatHeader`, `DraftHero`).
 pub fn open_project(project_id: &str, cx: &mut App) {
-    cx.global_mut::<Host>().pending_project = Some(project_id.to_owned());
+    open_scoped_project(None, project_id, cx);
+}
+
+/// Opens Settings → Projects on `(environment_id, project_id)`, disambiguating projects across
+/// active and non-active environments when the caller knows the owning environment.
+pub fn open_scoped_project(environment_id: Option<&str>, project_id: &str, cx: &mut App) {
+    cx.global_mut::<Host>().pending_project =
+        Some((environment_id.map(str::to_owned), project_id.to_owned()));
     open_at(Section::Projects, None, cx);
 }
 
@@ -502,8 +533,10 @@ fn apply_pending(window: &mut Window, cx: &mut App) {
                 view.select_provider_setup(provider, window, cx)
             });
         }
-        if let Some(project_id) = cx.global_mut::<Host>().pending_project.take() {
-            view.update(cx, |view, cx| view.select_project_id(&project_id, cx));
+        if let Some((environment_id, project_id)) = cx.global_mut::<Host>().pending_project.take() {
+            view.update(cx, |view, cx| {
+                view.select_project_id(environment_id.as_deref(), &project_id, cx)
+            });
         }
         if let Some(task_id) = cx.global_mut::<Host>().pending_scheduled_task.take() {
             view.update(cx, |view, cx| view.select_scheduled_task(&task_id, window, cx));

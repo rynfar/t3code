@@ -47,8 +47,8 @@ pub(crate) struct ProjectsState {
     pub(super) selected: Option<String>,
     /// The members the page last showed, so a grouping change follows the project.
     last_members: Vec<ProjectRef>,
-    /// A project an entry point asked for before the shell listed it.
-    pending_project: Option<String>,
+    /// A project (and optional saved environment id) an entry point asked for before the shell listed it.
+    pending_project: Option<(Option<String>, String)>,
     /// The project list, virtualized: a header entry, then one per project.
     list: ListState,
     choices: Rc<Vec<Choice>>,
@@ -103,11 +103,14 @@ pub(super) struct Choice {
     representative: ProjectRef,
 }
 
-/// One project group with its members, as the page reads it.
+/// One project group with its scoped members (`ProjectSettingsPanel.tsx`).
 pub(super) struct Shown {
     pub(super) group: ScopedProjectGroup,
     pub(super) members: Vec<ProjectShell>,
     pub(super) targets: Vec<ScopedProject>,
+    /// Pin and archive belong to the whole project, even when one machine or checkout is scoped.
+    pub(super) all_targets: Vec<ScopedProject>,
+    pub(super) has_other_members: bool,
 }
 
 impl Shown {
@@ -145,10 +148,21 @@ impl SettingsView {
         let group = groups.iter().find(|group| group.key == key)
             .or_else(|| groups.iter().find(|group| group.member_refs.iter().any(|reference| self.projects.last_members.contains(reference))))?.clone();
         let state = self.state.read(cx);
-        let mut targets = group.mutation_refs().iter().map(|reference| state.scoped_project(reference).cloned()).collect::<Option<Vec<_>>>()?;
-        targets.sort_by_key(|project| project.reference() != group.representative);
+        let mut all_targets = group.mutation_refs().iter().map(|reference| state.scoped_project(reference).cloned()).collect::<Option<Vec<_>>>()?;
+        all_targets.sort_by_key(|project| project.reference() != group.representative);
+        let machine = self.scope.machine.as_deref();
+        let checkout = self.scope.checkout.as_deref();
+        let targets: Vec<ScopedProject> = all_targets
+            .iter()
+            .filter(|project| {
+                machine.is_none_or(|env_id| project.owner.saved_id == env_id)
+                    && checkout.is_none_or(|phys| project.physical_key() == phys)
+            })
+            .cloned()
+            .collect();
+        let has_other_members = targets.len() < all_targets.len();
         let members = targets.iter().map(|project| project.project.clone()).collect();
-        (!targets.is_empty()).then_some(Shown { group, members, targets })
+        (!targets.is_empty()).then_some(Shown { group, members, targets, all_targets, has_other_members })
     }
 
     pub(super) fn project_targets(&self, cx: &App) -> Vec<ScopedProject> {
@@ -164,14 +178,23 @@ impl SettingsView {
         self.state.read(cx).scoped_environment(&project.owner.saved_id)?.config.config.as_ref()
     }
 
-    pub(super) fn select_project_id(&mut self, project_id: &str, cx: &mut Context<Self>) {
+    pub(super) fn select_project_id(&mut self, environment_id: Option<&str>, project_id: &str, cx: &mut Context<Self>) {
         let active = self.state.read(cx).environments.active.as_deref();
         let groups = self.project_groups(cx);
-        let key = groups
-            .iter()
-            .find(|group| {
-                group.member_refs.iter().any(|reference| {
-                    Some(reference.environment_id.as_str()) == active && reference.project_id == project_id
+        let key = environment_id
+            .and_then(|env_id| {
+                groups.iter().find(|group| {
+                    group
+                        .member_refs
+                        .iter()
+                        .any(|reference| reference.environment_id == env_id && reference.project_id == project_id)
+                })
+            })
+            .or_else(|| {
+                groups.iter().find(|group| {
+                    group.member_refs.iter().any(|reference| {
+                        Some(reference.environment_id.as_str()) == active && reference.project_id == project_id
+                    })
                 })
             })
             .or_else(|| {
@@ -180,8 +203,10 @@ impl SettingsView {
                     .find(|group| group.member_refs.iter().any(|reference| reference.project_id == project_id))
             })
             .map(|group| group.key.clone());
-        self.projects.pending_project = key.is_none().then(|| project_id.to_owned());
-        if let Some(key) = key { self.select_project(Some(key), cx); }
+        self.projects.pending_project = key.is_none().then(|| (environment_id.map(str::to_owned), project_id.to_owned()));
+        if let Some(key) = key {
+            self.select_project(Some(key), cx);
+        }
     }
 
     pub(super) fn select_project(&mut self, key: Option<String>, cx: &mut Context<Self>) {
@@ -260,6 +285,7 @@ impl SettingsView {
                     && destination.client.session_state().borrow().as_ref().is_some_and(|session| session.grants(ORCHESTRATION_OPERATE_SCOPE)))) {
                 failure = Some("A checkout or permission changed; nothing was sent.".to_owned());
             }
+            let mut refreshed_favicons = Vec::new();
             if failure.is_none() {
                 for (changed, ((project, update), destination)) in updates.into_iter().zip(destinations).enumerate() {
                     let valid = state.read_with(cx, |state, _| store::project_current(state, &project, ORCHESTRATION_OPERATE_SCOPE) && destination.is_current(&state.fleet))
@@ -267,9 +293,22 @@ impl SettingsView {
                     if !valid { failure = Some(format!("{changed} checkout(s) changed; destination unavailable.")); break; }
                     let runtime = state.read_with(cx, |state, _| state.runtime().clone());
                     let payload = update.payload(&uuid(), &project.project.id);
+                    let wants_favicon_refresh = update.favicon_path.is_some()
+                        && !update.project_icon.as_ref().is_some_and(|icon| icon.is_some());
                     let reply = runtime.spawn(async move { destination.client.request(PROJECTS_MUTATE, payload).await }).await;
-                    match reply { Ok(Ok(_)) => {}, Ok(Err(error)) => { failure = Some(format!("{changed} checkout(s) changed; {}: {error}", project.environment_label)); break; }, Err(error) => { failure = Some(error.to_string()); break; } }
+                    match reply {
+                        Ok(Ok(_)) => {
+                            if wants_favicon_refresh {
+                                refreshed_favicons.push(project);
+                            }
+                        }
+                        Ok(Err(error)) => { failure = Some(format!("{changed} checkout(s) changed; {}: {error}", project.environment_label)); break; }
+                        Err(error) => { failure = Some(error.to_string()); break; }
+                    }
                 }
+            }
+            if !refreshed_favicons.is_empty() {
+                state.update(cx, |state, cx| state.invalidate_project_favicons(&refreshed_favicons, cx));
             }
             let _ = this.update(cx, |this, cx| {
                 this.projects.organizing = false;
@@ -281,10 +320,10 @@ impl SettingsView {
     }
 
     fn organize(&mut self, update: ProjectUpdate, failure_title: &'static str, cx: &mut Context<Self>) {
-        let members = self.project_targets(cx);
+        let Some(shown) = self.shown_project(cx) else { return };
         self.projects.organizing = true;
         cx.notify();
-        self.update_project_group(&members, update, failure_title, cx);
+        self.update_project_group(&shown.all_targets, update, failure_title, cx);
     }
 
     fn reset_project_icon(&mut self, cx: &mut Context<Self>) {
@@ -339,15 +378,15 @@ impl SettingsView {
             }
         }
         let removal = members.iter().map(|member| RemovalMember { title: &member.project.title, workspace_root: &member.project.workspace_root, environment_label: Some(&member.environment_label) }).collect::<Vec<_>>();
-        let plan = plan_removal(&removal, shown.targets.len(), false, shown.display_name(), thread_count);
+        let plan = plan_removal(&removal, shown.targets.len(), shown.has_other_members, shown.display_name(), thread_count);
         let (title, description) = model::confirm_copy(&plan.confirmation);
-        let back_to_list = plan.is_whole_group;
+        let back_to_list = plan.is_whole_group && !shown.has_other_members;
         crate::dialog::ask(title, description.unwrap_or_default(), "Confirm", move |state, cx| state.remove_scoped_projects(members, back_to_list, cx), cx);
     }
 
     pub(super) fn projects_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
-        if let Some(project_id) = self.projects.pending_project.clone() {
-            self.select_project_id(&project_id, cx);
+        if let Some((environment_id, project_id)) = self.projects.pending_project.clone() {
+            self.select_project_id(environment_id.as_deref(), &project_id, cx);
         }
         if self.projects.selected != self.scope.project {
             self.projects.selected = self.scope.project.clone();
@@ -361,6 +400,32 @@ impl SettingsView {
         let groups = self.project_groups(cx);
         let picker = self.project_picker(&groups, cx);
         let Some(shown) = self.shown_project(cx) else {
+            let group_exists = self.projects.selected.as_deref().is_some_and(|key| {
+                groups.iter().any(|group| {
+                    group.key == key
+                        || group.member_refs.iter().any(|reference| self.projects.last_members.contains(reference))
+                })
+            });
+            let has_env_filter = self.scope.machine.is_some() || self.scope.checkout.is_some();
+            if group_exists && has_env_filter {
+                let message = "This checkout is no longer available in the selected project and environment.";
+                let show_all = v_flex()
+                    .px(r(16.))
+                    .gap(r(12.))
+                    .items_start()
+                    .child(muted_text(message, cx))
+                    .child(
+                        Button::new("project-show-all-environments", ButtonVariant::Outline, ButtonSize::Xs)
+                            .label("Show all environments")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.scope.machine = None;
+                                this.scope.checkout = None;
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element();
+                return vec![Block::new(&[], picker), Block::new(&[], show_all)];
+            }
             let message = if groups.is_empty() { NO_PROJECTS } else { "This project is no longer available." };
             return vec![Block::new(&[], picker), Block::new(&[], muted_text(message, cx))];
         };
@@ -654,7 +719,12 @@ impl SettingsView {
                 .into_any_element(),
         );
 
-        let organize = can_edit && shown.targets.iter().all(|project| self.project_config(project, cx).is_some_and(|config| config.environment.capabilities.project_organization == Some(true)));
+        let organize = shown.all_targets.iter().all(|project| {
+            store::project_current(self.state.read(cx), project, ORCHESTRATION_OPERATE_SCOPE)
+                && self
+                    .project_config(project, cx)
+                    .is_some_and(|config| config.environment.capabilities.project_organization == Some(true))
+        });
         if organize {
             let organizing = self.projects.organizing;
             let view = cx.entity().downgrade();
@@ -743,10 +813,19 @@ impl SettingsView {
             .filter(|option| parse_selection(&option.value).is_some_and(|selection| self.project_model_unavailable(&selection, cx).is_none()))
             .collect();
         let model_reset = can_write && models.iter().any(|model| model.source == Source::Project);
+        let automatic_model = models.iter().all(|candidate| candidate.automatic);
         let unavailable = model.shown.as_ref().filter(|_| !mixed_model).and_then(|selection| self.project_model_unavailable(selection, cx));
+        let model_status = if mixed_model {
+            Some(format!(
+                "{} Select one environment or choose a shared model to edit effort.",
+                if automatic_model { "Automatic defaults differ." } else { "Defaults differ." }
+            ))
+        } else {
+            unavailable.clone()
+        };
         let model_row = Row::new("project-default-model", "Model")
             .description("Model for new threads in this project.")
-            .when_some(unavailable, |row, reason| row.status(reason))
+            .when_some(model_status, |row, reason| row.status(reason))
             .reset_tooltip("Reset to inherited value")
             .reset(model_reset, {
                 let view = cx.entity().downgrade();
@@ -757,14 +836,26 @@ impl SettingsView {
         let model_row = match &model.shown {
             Some(selection) if !options.is_empty() => {
                 let view = cx.entity().downgrade();
-                let trigger = if mixed_model { if model.automatic { "Automatic (mixed)".to_owned() } else { "Mixed".to_owned() } } else { selection_label(config, selection) };
+                let trigger = if mixed_model { if automatic_model { "Automatic (mixed)".to_owned() } else { "Mixed".to_owned() } } else { selection_label(config, selection) };
                 let select = Select::new("project-default-model-select", options).selected(selection_value(selection)).label(trigger).width(220.).popup_width(260.).show_check().on_change(
                     move |value, _, cx| {
                         let Some(selection) = parse_selection(&value) else { return };
                         let _ = view.update(cx, |this, cx| this.set_project_model(selection, cx));
                     },
                 );
-                model_row.control(self.inert_unless(can_write, "project-default-model-inert", select, cx))
+                let traits = if !mixed_model && unavailable.is_none() {
+                    super::threads::model_trait_controls(
+                        "project-default-model",
+                        config,
+                        selection,
+                        cx.entity().downgrade(),
+                        t3_core::settings::ServerSettingChange::DefaultModelSelection,
+                    )
+                } else {
+                    Vec::new()
+                };
+                let control = h_flex().flex_wrap().justify_end().gap(r(6.)).child(select).children(traits);
+                model_row.control(self.inert_unless(can_write, "project-default-model-inert", control, cx))
             }
             _ => model_row.control(muted_text(if mixed_model { "Mixed" } else { "No providers available" }, cx)),
         };
@@ -804,7 +895,15 @@ impl SettingsView {
         let can_edit = self.can_edit_projects(cx);
         let doc = store::client(cx);
         let grouping = doc.project_grouping_settings();
-        let has_multiple = shown.group.members.len() > 1;
+        let scoped_refs: std::collections::HashSet<ProjectRef> = shown.targets.iter().map(ScopedProject::reference).collect();
+        let visible_checkouts: Vec<_> = shown
+            .group
+            .members
+            .iter()
+            .filter(|checkout| scoped_refs.contains(&checkout.project.reference()))
+            .collect();
+        let has_multiple = visible_checkouts.len() > 1;
+        let all_scope_envs = self.scope_environments(cx);
         let mut rows = vec![
             div()
                 .px(r(16.))
@@ -814,7 +913,7 @@ impl SettingsView {
                 .child("Grouping rule decides how each checkout joins project groups in the sidebar. Changing it can move a checkout to a different project.")
                 .into_any_element(),
         ];
-        for checkout in &shown.group.members {
+        for checkout in visible_checkouts {
             let project = &checkout.project;
             let member = &project.project;
             let key = checkout.physical_key.clone();
@@ -850,8 +949,13 @@ impl SettingsView {
                         .on_click(cx.listener(move |this, _, _, cx| this.remove_members(ids.clone(), cx))),
                 )
             });
+            let env_title = all_scope_envs
+                .iter()
+                .find(|env| env.environment_id == project.owner.saved_id)
+                .map(|env| t3_core::settings::settings_scope_environment_label(env, &all_scope_envs))
+                .unwrap_or_else(|| project.environment_label.clone());
             rows.push(
-                Row::new(SharedString::from(format!("project-checkout-{}", checkout.physical_key)), project.environment_label.clone())
+                Row::new(SharedString::from(format!("project-checkout-{}", checkout.physical_key)), env_title)
                     .description(member.workspace_root.clone())
                     .control(controls)
                     .into_any_element(),
@@ -861,7 +965,7 @@ impl SettingsView {
     }
 
     fn project_danger(&self, shown: &Shown, cx: &mut Context<Self>) -> AnyElement {
-        let copy = danger_copy(false, shown.members.len());
+        let copy = danger_copy(shown.has_other_members, shown.members.len());
         let ids = shown.targets.iter().map(ScopedProject::reference).collect::<Vec<_>>();
         let row = Row::new("project-remove", copy.title).description(copy.description).control(
             Button::new("project-remove-button", ButtonVariant::DestructiveOutline, ButtonSize::Sm)
@@ -906,5 +1010,139 @@ mod tests {
         let mut current = captured.clone();
         current.members[1].project.workspace_root = "/replacement".into();
         assert!(!captured.allows(&current, true, false));
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn machine_scoped_project_panel_filters_targets_and_marks_other_members(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            let installed = crate::context_menu::project_filter_tests::install_state(
+                cx,
+                runtime.handle().clone(),
+            );
+            crate::settings::init(installed.0.clone(), cx);
+            installed
+        });
+        let (connections, _output) =
+            t3_client::environments::Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+        });
+
+        let grants: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["settings:write", "orchestration:operate"]
+        }))
+        .unwrap();
+        let (client_a, _fx_a) = t3_client::supervisor::ClientFixture::handle(grants.clone());
+        let (client_b, _fx_b) = t3_client::supervisor::ClientFixture::handle(grants);
+        let identity = json!({
+            "canonicalKey": "github.com/acme/shared-app",
+            "locator": { "source": "git-remote", "remoteName": "origin", "remoteUrl": "https://github.com/acme/shared-app.git" }
+        });
+        let make_shell = |id: &str, root: &str| {
+            let mut shell = t3_core::shell::ShellState::default();
+            shell.synchronized = true;
+            shell.generation = 1;
+            shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                projects: vec![t3_core::shell::ProjectShell {
+                    id: id.into(),
+                    title: "Shared App".into(),
+                    has_custom_title: None,
+                    workspace_root: root.into(),
+                    repository_identity: Some(identity.clone()),
+                    default_model_selection: None,
+                    pinned_at: None,
+                    archived_at: None,
+                    favicon_path: None,
+                    project_icon: None,
+                    scripts: Vec::new(),
+                    created_at: "2026-04-01T00:00:00.000Z".into(),
+                    updated_at: "2026-04-01T00:00:00.000Z".into(),
+                }],
+                ..Default::default()
+            });
+            shell
+        };
+        let make_cfg = |env_id: &str, label: &str| {
+            let mut cfg = t3_core::server_config::ServerConfigState::default();
+            cfg.apply(
+                serde_json::from_value(json!({
+                    "type": "snapshot",
+                    "config": {
+                        "environment": { "environmentId": env_id, "label": label },
+                        "settings": {}
+                    }
+                }))
+                .unwrap(),
+            );
+            cfg
+        };
+        let mut view = state.read_with(cx, |s, _| s.connections.view());
+        let ia = state.update(cx, |s, _| {
+            s.connections.install_fixture(
+                "env-a",
+                client_a.clone(),
+                make_shell("p-a", "/Users/me/shared-app"),
+                make_cfg("env-a", "MacBook"),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let ib = state.update(cx, |s, _| {
+            s.connections.install_fixture(
+                "env-b",
+                client_b,
+                make_shell("p-b", "/home/me/shared-app"),
+                make_cfg("env-b", "Build VPS"),
+                t3_client::supervisor::ConnectionStatus::Connected,
+            )
+        });
+        let _ea = runtime.spawn(ia).await.unwrap();
+        let _eb = runtime.spawn(ib).await.unwrap();
+        let fleet = view.borrow_and_update().clone();
+        state.update(cx, |s, cx| {
+            s.environments.active = Some("env-a".into());
+            s.apply_fleet_view(fleet, cx);
+        });
+
+        let (_, vcx) = cx.add_window_view(|_, _| gpui::Empty);
+        vcx.update(|window, cx| {
+            crate::settings::open_scoped_project(Some("env-a"), "p-a", cx);
+            let settings_view = crate::settings::settings_view_for_test(window, cx).expect("settings view");
+
+            // Unscoped: both checkouts are targets, has_other_members is false.
+            let shown_all = settings_view.read(cx).shown_project(cx).expect("shown project");
+            assert_eq!(shown_all.targets.len(), 2);
+            assert_eq!(shown_all.all_targets.len(), 2);
+            assert!(!shown_all.has_other_members);
+            assert_eq!(danger_copy(shown_all.has_other_members, shown_all.members.len()).button, "Remove all entries");
+
+            // Scoped to env-a: targets has only env-a, all_targets retains both, has_other_members is true.
+            settings_view.update(cx, |view, _| view.scope.machine = Some("env-a".into()));
+            let shown_scoped = settings_view.read(cx).shown_project(cx).expect("machine-scoped project");
+            assert_eq!(shown_scoped.targets.len(), 1);
+            assert_eq!(shown_scoped.targets[0].owner.saved_id, "env-a");
+            assert_eq!(shown_scoped.all_targets.len(), 2);
+            assert!(shown_scoped.has_other_members);
+            assert_eq!(danger_copy(shown_scoped.has_other_members, shown_scoped.members.len()).button, "Remove checkout");
+        });
+
+        let _ = vcx;
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
+        cx.run_until_parked();
     }
 }
