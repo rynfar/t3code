@@ -134,6 +134,8 @@ pub struct ListEntry {
     pub deletions: u64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub observed_at: Option<serde_json::Number>,
     pub viewer_review_requested: bool,
     #[serde(default, deserialize_with = "lenient")]
     pub labels: Vec<Label>,
@@ -209,6 +211,25 @@ pub struct FilterOptions {
     pub truncated: bool,
 }
 
+/// `PullRequestEditCapabilities`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditCapabilities {
+    #[serde(default)]
+    pub change_request: bool,
+    #[serde(default)]
+    pub comment: bool,
+    #[serde(default)]
+    pub maintainer_edits: Option<bool>,
+}
+
+/// The part of `PullRequestReviewCapabilities` the native client reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ReviewCapabilities {
+    #[serde(default)]
+    pub resolve: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
@@ -226,6 +247,10 @@ pub struct Capabilities {
     pub stacks: Option<bool>,
     #[serde(default)]
     pub stack_actions: Option<bool>,
+    #[serde(default)]
+    pub edit: Option<EditCapabilities>,
+    #[serde(default)]
+    pub review: ReviewCapabilities,
 }
 
 /// Unreported host permissions are granted.
@@ -236,6 +261,102 @@ pub struct ViewerPermissions {
     pub actions: Vec<Action>,
     #[serde(default)]
     pub comment: bool,
+    #[serde(default)]
+    pub resolve: bool,
+    #[serde(default)]
+    pub labels: Option<bool>,
+    #[serde(default)]
+    pub edit_change_request: Option<bool>,
+}
+
+/// `PullRequestMergeQueueRemoval`: the host's merge queue letting go of a pull request without
+/// merging it. Decoded so the detail keeps it; the web client does not show it either.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeQueueRemoval {
+    pub id: String,
+    pub removed_at: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `PullRequestLabelCandidate`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelCandidate {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_applied: bool,
+}
+
+/// `PullRequestLabelCandidateList`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct LabelCandidates {
+    #[serde(default, deserialize_with = "lenient")]
+    pub candidates: Vec<LabelCandidate>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// A field that is either absent (`None`), null (`Some(None)`) or set, as `pickDefined` tells
+/// `undefined` from `null`.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// `PullRequestSummary`: what `pullRequests.runAction` replies with when asked
+/// (`replyWithSummary`). Absent fields were not in the host's reply.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Summary {
+    pub state: PrState,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub author: Option<Option<Actor>>,
+    #[serde(default)]
+    pub is_draft: Option<bool>,
+    #[serde(default)]
+    pub head_branch: Option<String>,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub closed_at: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    pub merged_at: Option<Option<String>>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<f64>,
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
+    #[serde(default)]
+    pub changed_files: Option<u64>,
+    #[serde(default)]
+    pub mergeability: Option<Mergeability>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    #[serde(default)]
+    pub auto_merge_enabled: Option<bool>,
+    #[serde(default)]
+    pub auto_merge_method: Option<MergeMethod>,
+}
+
+/// `runAction`'s reply: a summary when the host's reply carried one, else nothing.
+pub fn decode_summary(value: Value) -> Result<Option<Summary>, String> {
+    if value.is_null() { Ok(None) } else { Ok(serde_json::from_value(value).ok()) }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -313,9 +434,24 @@ pub struct Detail {
     pub auto_merge_enabled: Option<bool>,
     #[serde(default)]
     pub workflow_approvals_required: Option<u64>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    #[serde(default)]
+    pub auto_merge_method: Option<MergeMethod>,
+    /// When the server read this from the host, in epoch milliseconds; kept as the wire number
+    /// so equal readings compare equal. Absent from servers that predate it.
+    #[serde(default)]
+    pub observed_at: Option<serde_json::Number>,
+    #[serde(default)]
+    pub merge_queue_removal: Option<MergeQueueRemoval>,
+    #[serde(default)]
+    pub maintainer_can_modify: Option<bool>,
 }
 
 impl Detail {
+    pub fn observed_at_ms(&self) -> Option<f64> {
+        self.observed_at.as_ref().and_then(serde_json::Number::as_f64)
+    }
     /// `canPerformPullRequestAction`: the host offers it and the viewer may run it.
     pub fn can(&self, action: Action) -> bool {
         self.capabilities.actions.contains(&action) && self.viewer_permissions.actions.contains(&action)
@@ -387,15 +523,23 @@ pub struct ThreadComment {
     pub created_at: String,
     #[serde(default)]
     pub url: Option<String>,
+    /// The review that posted the comment, so a link to a review with no text finds its comments.
+    #[serde(default)]
+    pub review_url: Option<String>,
 }
 
+/// `PullRequestReviewThread`, or an overview thread (`PullRequestOverviewThread`) on the change
+/// request as a whole, which has no path or line.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewThread {
     pub id: String,
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub line: Option<u64>,
+    #[serde(default)]
+    pub side: Option<String>,
     #[serde(default)]
     pub is_resolved: bool,
     #[serde(default)]
@@ -406,6 +550,9 @@ pub struct ReviewThread {
     pub comment_count: Option<u64>,
     #[serde(default)]
     pub next_comments_cursor: Option<String>,
+    /// Can only narrow repository-wide resolve permission. Absent when unreported.
+    #[serde(default)]
+    pub can_resolve: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -435,6 +582,9 @@ pub struct Activity {
     pub comments_truncated: bool,
     #[serde(default, deserialize_with = "lenient")]
     pub review_threads: Vec<ReviewThread>,
+    /// Apart from `review_threads` on the wire so clients that require a path still decode.
+    #[serde(default, deserialize_with = "lenient")]
+    pub overview_threads: Vec<ReviewThread>,
     #[serde(default, deserialize_with = "lenient")]
     pub commits: Vec<Commit>,
 }

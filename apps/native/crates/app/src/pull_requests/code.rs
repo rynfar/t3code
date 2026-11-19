@@ -1,13 +1,17 @@
 //! The Code tab (`PullRequestCodeTab.tsx`): the patch from `POST /api/pull-requests/diff`, read in
 //! slices (`nextCursor`) as the reader nears the end of what is loaded, each slice parsed once on
-//! the network runtime (`sliceParses`) and the parses joined there for the diff panel.
+//! the network runtime (`sliceParses`) and the parses joined there for the diff panel. A link
+//! naming a file's diff, by the host's digest of its path, reveals that file and its lines once
+//! a loaded slice holds it (`useCodeViewFileReveal`).
 
 use std::sync::Arc;
 
 use gpui::{Context, Entity, IntoElement, ParentElement, Render, Styled, Task, Window, div, prelude::*, px};
 use gpui_component::{h_flex, v_flex};
 use serde_json::json;
-use t3_core::diff::{FileDiff, ParsedPatch};
+use t3_core::composer::review::Side as DiffSide;
+use t3_core::diff::{FileDiff, FileRevealTarget, ParsedPatch};
+use t3_core::pull_requests::anchor::{Range, Side, diff_path_matches};
 use t3_core::pull_requests::wire::{DiffResult, decode};
 use t3_core::pull_requests::{PrRef, failure_message};
 
@@ -32,6 +36,11 @@ pub struct CodeTab {
     /// Counts reloads, so a slice read before one is dropped.
     generation: u64,
     near_end_check: bool,
+    /// Optional single-commit filter when opened from a PR commit link (`pullRequestLinkCommit`).
+    commit: Option<String>,
+    /// A linked file's digest and lines, until a loaded slice has the file.
+    reveal: Option<(String, Option<Range>)>,
+    reveals: u64,
     _fetch: Option<Task<()>>,
 }
 
@@ -50,9 +59,16 @@ impl CodeTab {
                 }
             });
         });
-        let mut tab = CodeTab { state, reference, panel, slices: Vec::new(), next_cursor: None, pending: false, error: None, generation: 0, near_end_check: false, _fetch: None };
+        let mut tab = CodeTab { state, reference, panel, slices: Vec::new(), next_cursor: None, pending: false, error: None, generation: 0, near_end_check: false, commit: None, reveal: None, reveals: 0, _fetch: None };
         tab.fetch(None, cx);
         tab
+    }
+
+    pub fn set_commit(&mut self, commit: Option<String>, cx: &mut Context<Self>) {
+        if self.commit != commit {
+            self.commit = commit;
+            self.reload(cx);
+        }
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -83,6 +99,9 @@ impl CodeTab {
         if let Some(cursor) = &cursor {
             payload["cursor"] = json!(cursor);
         }
+        if let Some(commit) = &self.commit {
+            payload["commit"] = json!(commit);
+        }
         let held = self.slices.clone();
         let task = self.state.read(cx).runtime().spawn(async move {
             let value = client.pull_request_diff(payload).await.map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
@@ -107,6 +126,7 @@ impl CodeTab {
                         this.slices.push(slice);
                         this.next_cursor = next_cursor;
                         this.show_parsed(joined, cx);
+                        this.try_reveal(cx);
                     }
                     Err(error) => {
                         this.error = Some(error);
@@ -118,8 +138,37 @@ impl CodeTab {
         }));
     }
 
+    /// Reveals the file whose path the host's `digest` names, at `range` when given.
+    pub fn reveal_diff(&mut self, digest: String, range: Option<Range>, cx: &mut Context<Self>) {
+        self.reveal = Some((digest, range));
+        self.try_reveal(cx);
+    }
+
+    fn try_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some((digest, range)) = &self.reveal else { return };
+        let path = self.slices.iter().flat_map(|slice| slice.files().iter()).map(|file| file.path().to_owned()).find(|path| diff_path_matches(digest, path));
+        let Some(path) = path else { return };
+        let target = match range {
+            Some(range) => {
+                let side = match range.side {
+                    Side::Left => DiffSide::Deletions,
+                    Side::Right => DiffSide::Additions,
+                };
+                FileRevealTarget::range(path, range.start.min(u32::MAX as u64) as u32, Some(range.end.min(u32::MAX as u64) as u32), Some(side), true)
+            }
+            None => FileRevealTarget::file(path),
+        };
+        self.reveal = None;
+        self.reveals += 1;
+        let request = self.reveals;
+        self.panel.update(cx, |panel, cx| panel.reveal_file_path(request, target, cx));
+    }
+
     fn key(&self) -> String {
-        format!("pull-request:{}", self.reference.key())
+        match &self.commit {
+            Some(commit) => format!("pull-request:{}:commit:{commit}", self.reference.key()),
+            None => format!("pull-request:{}", self.reference.key()),
+        }
     }
 
     fn show_parsed(&mut self, parsed: Arc<Parsed>, cx: &mut Context<Self>) {
@@ -179,9 +228,26 @@ impl Render for CodeTab {
         let failed = self.error.is_some();
         let first = self.slices.is_empty();
         let partial = (!first && self.pending) || failed;
+        let commit_banner = self.commit.as_deref().map(|sha| {
+            let short = t3_core::pull_requests::detail::short_sha(sha).to_owned();
+            h_flex()
+                .flex_none()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .px(px(16.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(hsla(p.border))
+                .text_xs()
+                .text_color(hsla(p.muted_foreground))
+                .child(format!("Showing commit {short}"))
+                .child(Button::new("pr-code-all-commits", Variant::Ghost, Size::Xs).label("Show full diff").on_click(cx.listener(|this, _, _, cx| this.set_commit(None, cx))))
+        });
         v_flex()
             .size_full()
             .min_h_0()
+            .children(commit_banner)
             .pt(px(12.))
             .child(div().flex_1().min_h_0().child(self.panel.clone()))
             .when(partial, |this| {

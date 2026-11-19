@@ -95,7 +95,7 @@ pub(crate) fn link_projects(state: &AppState) -> Vec<t3_core::pull_requests::tar
 
 pub(crate) fn open_resolved_link(state: &Entity<AppState>, target: t3_core::pull_requests::target::Target, cx: &mut App) {
     if state.read(cx).environment() != Some(target.environment.as_str()) { return; }
-    cx.set_global(thread_panel::PendingSelection(Some(target.reference)));
+    cx.set_global(thread_panel::PendingSelection(Some((target.reference, Some(target.url)))));
     state.update(cx, |state, cx| {
         state.set_pull_requests_open(true, cx);
         cx.emit(AppEvent::Selection);

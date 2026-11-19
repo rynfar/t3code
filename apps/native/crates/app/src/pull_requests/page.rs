@@ -16,9 +16,10 @@ use gpui_component::{h_flex, v_flex};
 use t3_client::store;
 use t3_core::pull_requests::list::{Group, Shown, entry_key, needs_stats, shown_groups};
 use t3_core::pull_requests::query::parse_query;
-use t3_core::pull_requests::wire::{Action, FilterOptions, ListResult, ListStats, MergeMethod, PrState, decode};
+use t3_core::pull_requests::editing::patch_list_entry;
+use t3_core::pull_requests::wire::{Action, FilterOptions, ListResult, ListStats, MergeMethod, PrState, Summary, decode};
 use t3_core::pull_requests::{
-    ListPreferences, MAX_PAGE_SIZE, PAGE_SIZE, PREFERENCES_KEY, PrRef, SEARCH_DEBOUNCE_MS, action_done_label, action_failed_label, action_input, list_input, method, project_default_merge_method,
+    ListPreferences, MAX_PAGE_SIZE, PAGE_SIZE, PREFERENCES_KEY, PrRef, SEARCH_DEBOUNCE_MS, action_done_label, action_failed_label, action_input, list_accepts, list_input, method, project_default_merge_method,
     stats_inputs,
 };
 
@@ -62,9 +63,9 @@ pub(super) struct ListData {
 }
 
 /// Follows the refresh signal on the network runtime; dropping it unsubscribes.
-struct Refreshes {
-    net: tokio::task::JoinHandle<()>,
-    _ui: Task<()>,
+pub(super) struct Refreshes {
+    pub(super) net: tokio::task::JoinHandle<()>,
+    pub(super) _ui: Task<()>,
 }
 
 impl Drop for Refreshes {
@@ -169,9 +170,12 @@ impl PullRequestsPage {
         let connected = state.client_handle().is_some() && matches!(state.phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected));
         let open = state.pull_requests_open;
         let returned = connected && open && (!self.connected || !self.open);
-        if open && let Some(reference) = cx.try_global::<PendingSelection>().and_then(|pending| pending.0.clone()) {
+        if open && let Some((reference, url)) = cx.try_global::<PendingSelection>().and_then(|pending| pending.0.clone()) {
             cx.set_global(PendingSelection(None));
             self.select(reference, cx);
+            if let (Some(url), Some(detail)) = (url, &self.detail) {
+                detail.update(cx, |detail, cx| detail.reveal(&url, cx));
+            }
         }
         self.connected = connected;
         self.open = open;
@@ -551,19 +555,28 @@ impl PullRequestsPage {
         cx.notify();
     }
 
-    /// A finished action: the row shows its new state, and leaves a listing of another state,
-    /// until the next host read.
-    pub(super) fn acted(&mut self, reference: &PrRef, action: Action, cx: &mut Context<Self>) {
+    /// A finished action. With the host's reply the row shows what the host said, and leaves a
+    /// listing that no longer takes it (`patchPullRequestListEntries`); without one, what the
+    /// action implies, until the next host read.
+    pub(super) fn acted(&mut self, reference: &PrRef, action: Action, reply: Option<&Summary>, cx: &mut Context<Self>) {
         let Some(result) = self.data.result.as_mut() else { return };
-        if let Some(entry) = result.entries.iter_mut().find(|entry| PrRef::of(entry) == *reference) {
-            match action {
+        let Some(index) = result.entries.iter().position(|entry| PrRef::of(entry) == *reference) else { return };
+        let entry = &mut result.entries[index];
+        match reply {
+            Some(reply) => {
+                let (prefs, sent) = (&self.prefs, self.sent.as_str());
+                if !patch_list_entry(entry, reply, |state, is_draft| list_accepts(prefs, sent, state, is_draft)) {
+                    result.entries.remove(index);
+                }
+            }
+            None => match action {
                 Action::Close => entry.state = PrState::Closed,
                 Action::Reopen => entry.state = PrState::Open,
                 Action::Ready => entry.is_draft = false,
                 Action::Draft => entry.is_draft = true,
                 Action::Merge => entry.state = PrState::Merged,
                 _ => {}
-            }
+            },
         }
         self.rebuild(cx);
     }
@@ -602,11 +615,32 @@ impl PullRequestsPage {
             let _ = this.update(cx, |this, cx| {
                 mutations::finish(&reference, cx);
                 let toast = match &result {
-                    Ok(()) => Toast::new(ToastKind::Success, action_done_label(action, term)),
+                    Ok(_) => Toast::new(ToastKind::Success, action_done_label(action, term)),
                     Err(error) => Toast::new(ToastKind::Error, action_failed_label(action, term)).description(error.clone()),
                 };
-                if result.is_ok() && action != Action::Merge {
-                    this.acted(&reference, action, cx);
+                match &result {
+                    // The host's reply says whether a merge landed or was only accepted.
+                    Ok(Some(reply)) => {
+                        this.acted(&reference, action, Some(reply), cx);
+                        if this.selected.as_ref() == Some(&reference)
+                            && let Some(detail) = this.detail.clone()
+                        {
+                            detail.update(cx, |detail, cx| {
+                                if detail.apply_reply(Some(reply), cx) {
+                                    detail.refresh(cx);
+                                }
+                            });
+                        }
+                    }
+                    Ok(None) if action != Action::Merge => {
+                        this.acted(&reference, action, None, cx);
+                        if this.selected.as_ref() == Some(&reference)
+                            && let Some(detail) = this.detail.clone()
+                        {
+                            detail.update(cx, |detail, cx| detail.refresh(cx));
+                        }
+                    }
+                    _ => {}
                 }
                 this.state.update(cx, |state, cx| state.show_toast(toast, cx));
             });

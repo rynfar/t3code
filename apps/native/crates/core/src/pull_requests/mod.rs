@@ -4,11 +4,15 @@
 //! `pullRequestListPreferences.ts`, `pullRequestDetail.logic.ts` and
 //! `client-runtime/src/pullRequestLinkInput.ts` and `changeRequestLinks.ts`.
 
+pub mod anchor;
+pub mod chat_context;
 pub mod detail;
+pub mod editing;
 pub mod link;
 pub mod target;
 pub mod list;
 pub mod query;
+pub mod tasks;
 pub mod thread_badge;
 pub mod wire;
 
@@ -161,6 +165,19 @@ pub fn list_input(preferences: &ListPreferences, sent_query: &str, limit: u32, c
     Value::Object(input)
 }
 
+/// `listAccepts`: whether a listing read with these preferences and query takes a pull request
+/// in `state`, draft or not, so an action's reply can move a row out of it.
+pub fn list_accepts(preferences: &ListPreferences, sent_query: &str, state: PrState, is_draft: bool) -> bool {
+    let draft = query::parse_query(sent_query).filters.draft.or(preferences.draft);
+    let state_matches = match preferences.state {
+        ListState::All => true,
+        ListState::Open => state == PrState::Open,
+        ListState::Closed => state == PrState::Closed,
+        ListState::Merged => state == PrState::Merged,
+    };
+    state_matches && (draft != Some(DraftFilter::Only) || is_draft) && (draft != Some(DraftFilter::Hide) || !is_draft)
+}
+
 /// `pullRequests.listStats` inputs for the rows still without line counts, in batches the
 /// contract accepts (`pullRequestStatsBatches`).
 pub fn stats_inputs<'a>(entries: impl IntoIterator<Item = &'a ListEntry>) -> Vec<Value> {
@@ -210,10 +227,13 @@ pub fn stack_merge(stack: &Stack, reference: &PrRef, method: MergeMethod) -> Opt
     Some(StackMerge { count: layers.len(), input })
 }
 
-/// `PullRequestActionInput`.
+/// `PullRequestActionInput`. Asks for the host's reply (`replyWithSummary`) so the action
+/// updates what is shown without a re-read; servers that predate it ignore the field and reply
+/// with nothing.
 pub fn action_input(reference: &PrRef, action: Action, merge_method: Option<MergeMethod>) -> Value {
     let mut payload = reference.payload();
     payload["action"] = json!(action.as_str());
+    payload["replyWithSummary"] = json!(true);
     if let Some(method) = merge_method.filter(|_| action == Action::Merge || action == Action::EnableAutoMerge) {
         payload["mergeMethod"] = json!(method.as_str());
     }
@@ -302,6 +322,17 @@ mod tests {
     }
 
     #[test]
+    fn listings_take_only_their_state_and_draft_filter() {
+        let open = ListPreferences::default();
+        assert!(list_accepts(&open, "", PrState::Open, true));
+        assert!(!list_accepts(&open, "", PrState::Closed, false));
+        assert!(!list_accepts(&open, "draft:false", PrState::Open, true), "the typed filter counts");
+        let drafts = ListPreferences { state: ListState::All, draft: Some(DraftFilter::Only), ..Default::default() };
+        assert!(list_accepts(&drafts, "", PrState::Merged, true));
+        assert!(!list_accepts(&drafts, "", PrState::Merged, false));
+    }
+
+    #[test]
     fn preferences_round_trip_and_count_filters() {
         let preferences = ListPreferences { state: ListState::Merged, labels: vec!["a".into(), "b".into()], sort: Sort::Largest, ..Default::default() };
         let decoded: ListPreferences = serde_json::from_value(serde_json::to_value(&preferences).unwrap()).unwrap();
@@ -369,7 +400,7 @@ mod tests {
         assert_eq!(
             merge.input,
             json!({
-                "projectId": "p", "host": "git.cafe", "repository": "acme/app", "number": 3, "action": "merge", "mergeMethod": "squash",
+                "projectId": "p", "host": "git.cafe", "repository": "acme/app", "number": 3, "action": "merge", "mergeMethod": "squash", "replyWithSummary": true,
                 "stackNumber": 9, "expectedStackHeads": [{ "number": 2, "headSha": "s2" }, { "number": 3, "headSha": "s3" }]
             })
         );
@@ -393,7 +424,7 @@ mod tests {
     fn action_input_carries_merge_method_only_for_merges() {
         let reference = PrRef { project_id: "p".into(), host: Some("github.com".into()), repository: "a/b".into(), number: 3 };
         let merge = action_input(&reference, Action::Merge, Some(MergeMethod::Squash));
-        assert_eq!((merge["action"].as_str(), merge["mergeMethod"].as_str()), (Some("merge"), Some("squash")));
+        assert_eq!((merge["action"].as_str(), merge["mergeMethod"].as_str(), merge["replyWithSummary"].as_bool()), (Some("merge"), Some("squash"), Some(true)));
         assert!(action_input(&reference, Action::Close, Some(MergeMethod::Squash)).get("mergeMethod").is_none());
     }
 }

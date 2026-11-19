@@ -24,6 +24,7 @@ fn entry(number: u64, title: &str) -> ListEntry {
         deletions: 0,
         created_at: "2026-01-01T00:00:00Z".into(),
         updated_at: "2026-01-02T00:00:00Z".into(),
+        observed_at: None,
         viewer_review_requested: false,
         labels: Vec::new(),
         review_decision: None,

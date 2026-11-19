@@ -2,23 +2,37 @@
 //! primary control and the actions menu (`PullRequestDetailActions.tsx`,
 //! `PullRequestActionsMenu.tsx`) with the web's two-step confirmations
 //! (`useInlineActionConfirm.ts`), the stack merge where the host runs stack actions
-//! (`PullRequestStackMenu.tsx`), and the Summary, Timeline and Code tabs.
+//! (`PullRequestStackMenu.tsx`), and the Summary, Timeline and Code tabs. It paints at once
+//! from what was last read for the pull request (`usePullRequestDetail`'s held answers), applies
+//! an action's reply without a re-read, writes the description's task checkboxes back, resolves
+//! conversation threads, edits labels, and goes where a link's fragment points.
 
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FontWeight, Global, IntoElement, ParentElement, Render, ScrollHandle, SharedString, Styled, Subscription, Task, WeakEntity, Window, div,
+    prelude::*, px,
 };
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 use t3_core::pull_requests::detail::{MergeGate, PrimaryControl, StateKind, change_request_term, host_label, merge_gate, merge_method_label, primary_control, resolve_merge_method};
-use t3_core::pull_requests::wire::{Action, Activity, Detail, ListEntry, MergeMethod, PrState, Stack, decode};
+use t3_core::pull_requests::anchor::{Anchor, LinkedTab, anchor_matches_url, link_commit, parse_anchor, resolve_review_anchor};
+use t3_core::pull_requests::chat_context::{ChatSubject, build_comment_context, build_pull_request_context};
+use t3_core::pull_requests::detail::EventKind;
+use t3_core::pull_requests::link::{LINKED_THREADS, LINKED_THREADS_POLL_SECONDS, LinkedThread, LinkedThreads, SUBSCRIBE_LINKED_THREAD_REFRESHES, linked_threads_input, linked_threads_label};
+use t3_core::pull_requests::editing::{
+    self, DescriptionDraft, SOURCE_CONTROL_WRITE_SCOPE, apply_label_change, can_edit_change_request, description_draft_in_force, label_change_input, patch_detail, settle_description_save,
+    start_description_save, thread_resolution_input, update_body_input,
+};
+use t3_core::pull_requests::tasks::set_task_checked;
+use t3_core::pull_requests::wire::{Action, Activity, Detail, LabelCandidates, ListEntry, MergeMethod, PrState, Stack, Summary, decode};
 use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, invalidate_input, method, stack_merge};
 
 use super::code::CodeTab;
 use super::controls::{BadgeKind, Button, Size, Variant, badge, diff_stat, state_glyph};
 use super::mutations::{self, MergePicks, Mutations};
-use super::page::PullRequestsPage;
+use super::page::{PullRequestsPage, Refreshes};
 use super::{read, settle};
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
@@ -33,6 +47,28 @@ type ViewAction = Box<dyn Fn(&mut DetailView, &mut Context<DetailView>)>;
 const CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 /// The confirmation a menu item arms, shown beside the primary control.
 const INLINE_CONFIRM: &str = "pr-confirm-inline";
+/// How many pull requests' last reads are kept to paint from.
+const HELD_LIMIT: usize = 32;
+
+/// The last detail and activity read for each recently opened pull request, so reopening one
+/// paints at once while it is read again (`pingdotgg/t3code#27798`). Bounded, least recent out.
+#[derive(Default)]
+struct Held(VecDeque<(String, Option<Detail>, Option<Activity>)>);
+
+impl Global for Held {}
+
+fn held(key: &str, cx: &App) -> (Option<Detail>, Option<Activity>) {
+    cx.try_global::<Held>().and_then(|held| held.0.iter().find(|(held, ..)| held == key)).map(|(_, detail, activity)| (detail.clone(), activity.clone())).unwrap_or_default()
+}
+
+fn hold(key: String, detail: Option<&Detail>, activity: Option<&Activity>, cx: &mut App) {
+    let held = cx.default_global::<Held>();
+    let (_, kept_detail, kept_activity) = held.0.iter().position(|(held, ..)| *held == key).and_then(|index| held.0.remove(index)).unwrap_or_default();
+    held.0.push_back((key, detail.cloned().or(kept_detail), activity.cloned().or(kept_activity)));
+    while held.0.len() > HELD_LIMIT {
+        held.0.pop_front();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
@@ -72,6 +108,23 @@ pub struct DetailView {
     stack_pending: bool,
     refreshing: bool,
     armed: Option<Armed>,
+    /// A description written from here, shown until a host reading after its saves.
+    description_draft: Option<DescriptionDraft>,
+    description_saves: u32,
+    /// `pullRequests.labelCandidates`, read once the label picker can show.
+    pub(super) label_candidates: Option<Result<LabelCandidates, String>>,
+    pub(super) label_pending: bool,
+    /// Threads whose resolution is being written.
+    pub(super) resolving: HashSet<String>,
+    /// Where a link points, still to reach once its tab holds what it names.
+    reveal: Option<Anchor>,
+    pub(super) summary_scroll: ScrollHandle,
+    /// Threads linking this pull request, kept while re-read so the count does not flicker.
+    linked_threads: Option<Vec<LinkedThread>>,
+    _linked_signal: Option<Refreshes>,
+    _linked_read: Option<Task<()>>,
+    /// Opens the description's and comments' media full size.
+    viewer: Entity<crate::media::MediaViewer>,
     pub(super) markdown: MarkdownStore,
     pub(super) timeline: Vec<t3_core::pull_requests::detail::TimelineEvent>,
     pub(super) timeline_list: gpui::ListState,
@@ -79,6 +132,7 @@ pub struct DetailView {
     _detail: Option<Task<()>>,
     _activity: Option<Task<()>>,
     _stack: Option<Task<()>>,
+    _labels: Option<Task<()>>,
     _disarm: Option<Task<()>>,
     _escape: Option<Subscription>,
     _activation: Option<Subscription>,
@@ -95,13 +149,16 @@ impl DetailView {
             }),
             cx.observe_global::<Mutations>(|_, cx| cx.notify()),
         ];
+        let (detail, activity) = held(&reference.key(), cx);
+        crate::media::cache(&state, cx);
+        let viewer = cx.new(crate::media::MediaViewer::new);
         let mut view = DetailView {
             state,
             page,
             reference,
             entry,
-            detail: None,
-            activity: None,
+            detail,
+            activity,
             error: None,
             activity_error: None,
             checks_open: false,
@@ -111,6 +168,17 @@ impl DetailView {
             stack_pending: false,
             refreshing: false,
             armed: None,
+            description_draft: None,
+            description_saves: 0,
+            label_candidates: None,
+            label_pending: false,
+            resolving: HashSet::new(),
+            reveal: None,
+            summary_scroll: ScrollHandle::new(),
+            linked_threads: None,
+            _linked_signal: None,
+            _linked_read: None,
+            viewer,
             markdown: MarkdownStore::new(cx.entity_id()),
             timeline: Vec::new(),
             timeline_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(600.)),
@@ -118,13 +186,132 @@ impl DetailView {
             _detail: None,
             _activity: None,
             _stack: None,
+            _labels: None,
             _disarm: None,
             _escape: None,
             _activation: None,
             _subscriptions: subscriptions,
         };
+        view.rebuild_timeline();
         view.refresh(cx);
+        view.follow_linked_threads(cx);
         view
+    }
+
+    /// Re-reads the linked threads whenever a link changes
+    /// (`pullRequests.subscribeLinkedThreadRefreshes`), or every ten seconds from a server that
+    /// predates the signal. Dropping the view unsubscribes.
+    fn follow_linked_threads(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else { return };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let net = state.runtime().spawn(async move {
+            if tx.send(()).is_err() {
+                return;
+            }
+            let mut delay = Duration::from_secs(1);
+            loop {
+                match client.stream(SUBSCRIBE_LINKED_THREAD_REFRESHES, serde_json::json!({})).await {
+                    Ok(mut stream) => {
+                        delay = Duration::from_secs(1);
+                        while let Some(item) = stream.receiver.recv().await {
+                            match item {
+                                Ok(_) => {
+                                    if tx.send(()).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(t3_client::session::RpcError::Failure(failure)) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") => return,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(t3_client::session::RpcError::Failure(failure)) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") => return,
+                    Err(t3_client::session::RpcError::Failure(_)) => {
+                        // Older servers reject `subscribeLinkedThreadRefreshes`; fall back to 10s polling.
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(LINKED_THREADS_POLL_SECONDS)).await;
+                            if tx.send(()).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(t3_client::session::RpcError::Closed) => {}
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+            }
+        });
+        let ui = cx.spawn(async move |this, cx| {
+            while rx.recv().await.is_some() {
+                while rx.try_recv().is_ok() {}
+                if this.update(cx, |this, cx| this.read_linked_threads(cx)).is_err() {
+                    return;
+                }
+            }
+        });
+        self._linked_signal = Some(Refreshes { net, _ui: ui });
+    }
+
+    fn read_linked_threads(&mut self, cx: &mut Context<Self>) {
+        let url = self.detail.as_ref().map(|detail| detail.url.clone()).or(self.entry.as_ref().map(|entry| entry.url.clone())).unwrap_or_default();
+        let task = read(self.state.read(cx), LINKED_THREADS, linked_threads_input(&self.reference, &url), decode::<LinkedThreads>);
+        self._linked_read = Some(cx.spawn(async move |this, cx| {
+            let Ok(linked) = settle(task).await else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.linked_threads.as_ref() != Some(&linked.threads) {
+                    this.linked_threads = Some(linked.threads);
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// The header's "Linked from N threads" (`PullRequestThreadLinks`'s count): each thread
+    /// opens from its menu.
+    fn render_linked_threads(&self) -> Option<AnyElement> {
+        let threads = self.linked_threads.clone().filter(|threads| !threads.is_empty())?;
+        let label = linked_threads_label(threads.len());
+        let state = self.state.clone();
+        Some(
+            Button::new("pr-linked-threads", Variant::GhostMuted, Size::Xs)
+                .icon(Icon::MessageSquare)
+                .label(threads.len().to_string())
+                .tooltip(label)
+                .dropdown_menu(move |mut menu, _, _| {
+                    for thread in &threads {
+                        let (id, state) = (thread.id.clone(), state.clone());
+                        let title = if thread.title.trim().is_empty() { "Untitled thread".to_owned() } else { thread.title.clone() };
+                        menu = menu.item(PopupMenuItem::new(title).on_click(move |_, _, cx| {
+                            state.update(cx, |state, cx| {
+                                state.set_pull_requests_open(false, cx);
+                                state.select_thread(&id, cx);
+                            });
+                        }));
+                    }
+                    menu
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// Media in the description and comments: a private host serves it only with a credential,
+    /// so it is read through the server for the checkout, naming the pull request's own
+    /// repository, which can differ from the checkout's (`pingdotgg/t3code#21631`).
+    pub(super) fn media_scope(&self, detail: &Detail, cx: &Context<Self>) -> crate::media::MediaScope {
+        crate::media::MediaScope {
+            owner: cx.entity_id(),
+            thread_id: None,
+            workspace_root: Some(detail.workspace_root.clone()).filter(|root| !root.trim().is_empty()),
+            workspace_mutation_id: None,
+            source_control_media: true,
+            source_control_media_repository: Some(detail.repository.clone()),
+            viewer: self.viewer.downgrade(),
+        }
+    }
+
+    fn hold(&self, cx: &mut App) {
+        hold(self.reference.key(), self.detail.as_ref(), self.activity.as_ref(), cx);
     }
 
     /// Re-reads the detail, its activity and stack membership, and the patch if it was read.
@@ -137,13 +324,19 @@ impl DetailView {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(detail) => {
+                        let first_detail = this.detail.is_none();
                         this.detail = Some(detail);
                         this.error = None;
+                        this.hold(cx);
                         this.refresh_stack(cx);
+                        if first_detail && this.entry.is_none() {
+                            this.read_linked_threads(cx);
+                        }
                     }
                     Err(error) => this.error = Some(error),
                 }
                 this.rebuild_timeline();
+                this.try_reveal();
                 cx.notify();
             });
         }));
@@ -154,10 +347,12 @@ impl DetailView {
                     Ok(activity) => {
                         this.activity = Some(activity);
                         this.activity_error = None;
+                        this.hold(cx);
                     }
                     Err(error) => this.activity_error = Some(error),
                 }
                 this.rebuild_timeline();
+                this.try_reveal();
                 cx.notify();
             });
         }));
@@ -171,6 +366,8 @@ impl DetailView {
     pub(super) fn refresh_from_host(&mut self, cx: &mut Context<Self>) {
         let task = read(self.state.read(cx), method::INVALIDATE, invalidate_input(Some(&self.reference)), |_| Ok(()));
         self.refreshing = true;
+        self._labels = None;
+        self.label_candidates = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let _ = settle(task).await;
@@ -310,13 +507,15 @@ impl DetailView {
                     this.state.update(cx, |state, cx| state.show_toast(toast, cx));
                     return;
                 }
+                let reply = result.ok().flatten();
+                let reread = this.apply_reply(reply.as_ref(), cx);
                 let reference = this.reference.clone();
                 if let Some(page) = this.page.upgrade() {
-                    page.update(cx, |page, cx| page.acted(&reference, action, cx));
+                    page.update(cx, |page, cx| page.acted(&reference, action, reply.as_ref(), cx));
                 }
                 if action_needs_host_refresh(action) {
                     this.refresh_from_host(cx);
-                } else {
+                } else if reread {
                     this.refresh(cx);
                 }
             });
@@ -343,7 +542,7 @@ impl DetailView {
                 mutations::finish(&this.reference, cx);
                 this.stack_pending = false;
                 let toast = match &result {
-                    Ok(()) => Toast::new(ToastKind::Success, "Stack merge request completed").description(format!("{host} merged the stack or added it to its merge queue.")),
+                    Ok(_) => Toast::new(ToastKind::Success, "Stack merge request completed").description(format!("{host} merged the stack or added it to its merge queue.")),
                     Err(error) => Toast::new(ToastKind::Error, "Could not merge the stack").description(error.clone()),
                 };
                 this.state.update(cx, |state, cx| state.show_toast(toast, cx));
@@ -354,6 +553,255 @@ impl DetailView {
             });
         })
         .detach();
+    }
+
+    /// An action's reply shown at once (the detail's `patch`). True when the detail must still be
+    /// read: the server sent no reply, or the reply changes what it lacks.
+    pub(super) fn apply_reply(&mut self, reply: Option<&Summary>, cx: &mut Context<Self>) -> bool {
+        let (Some(reply), Some(detail)) = (reply, self.detail.as_ref()) else { return true };
+        let Some((next, reread)) = patch_detail(detail, reply) else { return false };
+        self.detail = Some(next);
+        self.hold(cx);
+        self.rebuild_timeline();
+        cx.notify();
+        reread
+    }
+
+    /// Whether this connection holds `source-control:write` (`usePullRequestDetail`'s
+    /// `canWriteSourceControl`); unknown grants leave the server to decide.
+    pub(super) fn can_write_source_control(&self, cx: &App) -> bool {
+        self.state.read(cx).client_handle().and_then(|handle| handle.session_state().borrow().clone()).is_none_or(|session| session.grants(SOURCE_CONTROL_WRITE_SCOPE))
+    }
+
+    /// The description shown: this client's draft while it is in force, else the host's.
+    pub(super) fn description(&mut self) -> Option<String> {
+        let detail = self.detail.as_ref()?;
+        self.description_draft = description_draft_in_force(self.description_draft.take(), &detail.url, detail.observed_at_ms());
+        Some(self.description_draft.as_ref().and_then(|draft| draft.body.clone()).unwrap_or_else(|| detail.body.clone()))
+    }
+
+    /// The host lets this viewer rewrite the description, and this connection may write
+    /// (`pullRequestEnvironment.update.permissionAtom`).
+    pub(super) fn can_edit_description(&self, cx: &App) -> bool {
+        self.can_write_source_control(cx) && self.detail.as_ref().is_some_and(can_edit_change_request)
+    }
+
+    /// Whether there is an active thread composer to receive a PR comment (`pingdotgg/t3code#30579`).
+    pub(super) fn has_chat_target(&self, cx: &App) -> bool {
+        self.state.read(cx).selected_thread.is_some()
+    }
+
+    /// Brings a comment or review/overview thread into the active thread's composer alongside the
+    /// pull request context chip (`addCommentToChat` in `PullRequestDetailPanel.tsx`).
+    pub(super) fn add_comment_to_chat(&mut self, thread_id: Option<&str>, comment_id: &str, cx: &mut Context<Self>) {
+        let (Some(detail), Some(activity)) = (self.detail.as_ref(), self.activity.as_ref()) else { return };
+        let Some(target_thread) = self.state.read(cx).selected_thread.clone() else { return };
+        let thread = thread_id
+            .and_then(|id| activity.review_threads.iter().chain(&activity.overview_threads).find(|candidate| candidate.id == id))
+            .or_else(|| {
+                activity
+                    .review_threads
+                    .iter()
+                    .chain(&activity.overview_threads)
+                    .find(|candidate| candidate.comments.iter().any(|comment| comment.id == comment_id))
+            });
+        let comment_chip = match thread {
+            Some(thread) => build_comment_context(detail, ChatSubject::Thread(thread)),
+            None => activity.comments.iter().find(|comment| comment.id == comment_id).and_then(|comment| build_comment_context(detail, ChatSubject::Comment(comment))),
+        };
+        let Some(comment_chip) = comment_chip else { return };
+        let pr_chip = build_pull_request_context(detail);
+        let has_reference = self.state.read(cx).review_comments.get(&target_thread).is_some_and(|held| held.iter().any(|existing| existing.id == pr_chip.id));
+        if has_reference {
+            self.state.update(cx, |state, cx| {
+                state.add_review_comment(&target_thread, comment_chip, cx);
+                state.show_toast(Toast::new(ToastKind::Success, "Added to the composer"), cx);
+            });
+        } else {
+            let state = self.state.clone();
+            state.update(cx, |state, cx| state.add_review_comment(&target_thread, pr_chip, cx));
+            // Defer the second chip so `Composer` consumes the PR chip before the slot is reused.
+            cx.defer(move |cx| {
+                state.update(cx, |state, cx| {
+                    state.add_review_comment(&target_thread, comment_chip, cx);
+                    state.show_toast(Toast::new(ToastKind::Success, "Added to the composer"), cx);
+                });
+            });
+        }
+    }
+
+    /// A task checkbox: its marker rewritten in the latest description, then saved.
+    pub(super) fn toggle_task(&mut self, marker: usize, checked: bool, cx: &mut Context<Self>) {
+        let Some(description) = self.description() else { return };
+        let body = set_task_checked(&description, marker, checked);
+        if body != description {
+            self.save_description(body, cx);
+        }
+    }
+
+    /// `saveDescription`: checkbox ticks share one draft, so each starts from the latest body.
+    /// Readers refresh once the last save settles.
+    fn save_description(&mut self, body: String, cx: &mut Context<Self>) {
+        let Some(detail) = self.detail.as_ref() else { return };
+        let key = detail.url.clone();
+        self.description_draft = Some(start_description_save(self.description_draft.take(), &key, detail.observed_at_ms(), body.clone()));
+        self.description_saves += 1;
+        let task = mutations::write(self.state.read(cx), editing::method::UPDATE, update_body_input(&self.reference, &body), cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let saved = settle(task).await.is_ok();
+            let _ = this.update(cx, |this, cx| {
+                this.description_saves = this.description_saves.saturating_sub(1);
+                this.description_draft = settle_description_save(this.description_draft.take(), &key, saved);
+                if !saved {
+                    this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not save the description"), cx));
+                }
+                if this.description_saves == 0 {
+                    this.refresh(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `PullRequestResolveThreadButton`: resolves or reopens a thread, review or overview.
+    pub(super) fn set_thread_resolution(&mut self, thread_id: String, resolved: bool, cx: &mut Context<Self>) {
+        if !self.resolving.insert(thread_id.clone()) {
+            return;
+        }
+        let task = mutations::write(self.state.read(cx), editing::method::SET_THREAD_RESOLUTION, thread_resolution_input(&self.reference, &thread_id, resolved), cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.resolving.remove(&thread_id);
+                match result {
+                    Ok(()) => this.refresh(cx),
+                    Err(_) => this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "The conversation could not be updated"), cx)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `labelCandidates`, read once for the label picker.
+    pub(super) fn load_label_candidates(&mut self, cx: &mut Context<Self>) {
+        if self._labels.is_some() {
+            return;
+        }
+        let task = read(self.state.read(cx), editing::method::LABEL_CANDIDATES, self.reference.payload(), decode::<LabelCandidates>);
+        self._labels = Some(cx.spawn(async move |this, cx| {
+            let result = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.label_candidates = Some(result);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// `PullRequestLabelPicker`'s toggle: one label on or off, shown on the detail once written.
+    pub(super) fn toggle_label(&mut self, name: String, applied: bool, cx: &mut Context<Self>) {
+        if self.label_pending {
+            return;
+        }
+        self.label_pending = true;
+        let task = mutations::write(self.state.read(cx), editing::method::SET_LABELS, label_change_input(&self.reference, &name, !applied), cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = settle(task).await;
+            let _ = this.update(cx, |this, cx| {
+                this.label_pending = false;
+                match result {
+                    Ok(()) => {
+                        let mut candidates = this.label_candidates.take();
+                        let held: &mut [_] = match candidates.as_mut() {
+                            Some(Ok(list)) => &mut list.candidates,
+                            _ => &mut [],
+                        };
+                        if let Some(detail) = this.detail.as_mut() {
+                            apply_label_change(&mut detail.labels, held, &name, !applied);
+                        }
+                        this.label_candidates = candidates;
+                        this.hold(cx);
+                    }
+                    Err(error) => {
+                        let title = if applied { format!("Could not take {name} off") } else { format!("Could not put {name} on") };
+                        let description = if error.trim().is_empty() { "The host refused it. Check that you have triage access on this repository.".to_owned() } else { error };
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, title).description(description), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Goes where a pull request link points (`linkedTab` and the tabs' reveals): its tab, then
+    /// the checks, a commit or comment in the timeline, or a file and lines in the code.
+    pub fn reveal(&mut self, url: &str, cx: &mut Context<Self>) {
+        let Some(anchor) = parse_anchor(url) else { return };
+        let tab = match anchor.tab() {
+            LinkedTab::Summary => Tab::Summary,
+            LinkedTab::Timeline => Tab::Timeline,
+            LinkedTab::Code => Tab::Code,
+        };
+        self.set_tab(tab, cx);
+        if tab == Tab::Code
+            && let Some(code) = &self.code
+        {
+            let commit = link_commit(url);
+            code.update(cx, |code, cx| code.set_commit(commit, cx));
+        }
+        match anchor {
+            Anchor::Checks => {
+                self.checks_open = true;
+                self.reveal = Some(Anchor::Checks);
+            }
+            Anchor::Diff { digest, range } => {
+                if let Some(code) = &self.code {
+                    code.update(cx, |code, cx| code.reveal_diff(digest, range, cx));
+                }
+            }
+            Anchor::Commits | Anchor::Timeline(_) | Anchor::Summary(_) => self.reveal = Some(anchor),
+            Anchor::Code => self.reveal = None,
+        }
+        self.try_reveal();
+        cx.notify();
+    }
+
+    /// Reaches a pending reveal once its tab holds the place; a place the loaded activity does
+    /// not have is given up.
+    fn try_reveal(&mut self) {
+        match &self.reveal {
+            Some(Anchor::Checks) if self.detail.is_some() => {
+                // Summary child 3 is the Checks section heading.
+                self.summary_scroll.scroll_to_top_of_item(3);
+                self.reveal = None;
+            }
+            Some(Anchor::Summary(anchor)) if self.detail.is_some() => {
+                // Summary child 0 is top metadata, child 1 is the Description section heading.
+                self.summary_scroll.scroll_to_top_of_item(if anchor == "top" { 0 } else { 1 });
+                self.reveal = None;
+            }
+            Some(Anchor::Commits) if self.activity.is_some() => {
+                if let Some(index) = self.timeline.iter().position(|event| event.kind == EventKind::Commit) {
+                    self.timeline_list.scroll_to_reveal_item(index);
+                }
+                self.reveal = None;
+            }
+            Some(Anchor::Timeline(anchor)) if self.activity.is_some() => {
+                let resolved = self.activity.as_ref().map_or_else(|| anchor.clone(), |activity| resolve_review_anchor(anchor, &activity.comments, &activity.review_threads));
+                let names = |event: &t3_core::pull_requests::detail::TimelineEvent| anchor_matches_url(&resolved, event.url.as_deref());
+                let index = self.timeline.iter().position(|event| names(event) || event.thread.as_ref().is_some_and(|thread| thread.replies.iter().any(names)));
+                if let Some(index) = index {
+                    self.timeline_list.scroll_to_reveal_item(index);
+                }
+                self.reveal = None;
+            }
+            _ => {}
+        }
     }
 
     fn select_merge_method(&mut self, method: MergeMethod, cx: &mut Context<Self>) {
@@ -435,6 +883,7 @@ impl DetailView {
                             .child(diff_stat(additions, deletions, cx))
                             .child(div().flex_none().child(format!("{files} {}", if files == 1 { "file" } else { "files" })))
                     }))
+                    .children(self.render_linked_threads())
                     .children(url.map(|url| {
                         Button::new("pr-open-host", Variant::GhostMuted, Size::IconSm).icon(Icon::ExternalLink).tooltip("Open on the host").on_click(move |_, _, cx| cx.open_url(&url))
                     })),
@@ -683,10 +1132,132 @@ impl Render for DetailView {
         }
         v_flex()
             .id("pr-detail")
+            .relative()
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
             .child(self.render_header(window, cx))
             .child(div().flex_1().min_h_0().flex().flex_col().child(body))
+            .child(self.viewer.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use t3_core::pull_requests::wire::{Activity, Detail, Summary, decode};
+
+    use super::*;
+
+    fn sample_ref() -> PrRef {
+        PrRef { project_id: "p1".into(), host: Some("github.com".into()), repository: "upstream/repo".into(), number: 42 }
+    }
+
+    fn sample_detail() -> Detail {
+        decode(json!({
+            "provider": "github",
+            "capabilities": { "actions": ["merge", "close"], "mergeMethods": ["merge"], "edit": { "changeRequest": true, "comment": true }, "review": { "resolve": true }, "labels": true },
+            "viewerPermissions": { "actions": ["merge", "close"], "comment": true, "resolve": true, "labels": true },
+            "projectId": "p1", "projectTitle": "Local Fork", "workspaceRoot": "/tmp/fork-checkout", "repository": "upstream/repo", "number": 42,
+            "title": "PR Title", "body": "- [ ] Ship it", "url": "https://github.com/upstream/repo/pull/42", "author": { "login": "alice" },
+            "viewer": "alice", "state": "open", "isDraft": true, "mergeability": "mergeable", "additions": 5, "deletions": 2, "changedFiles": 1,
+            "headBranch": "feat", "baseBranch": "main", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+            "observedAt": 100, "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+            "mergeCapabilities": { "merge": true, "squash": false, "rebase": false }
+        }))
+        .unwrap()
+    }
+
+    fn sample_activity() -> Activity {
+        decode(json!({
+            "comments": [{
+                "id": "c1", "kind": "issue-comment", "author": { "login": "bob" },
+                "body": "Please rename this helper", "createdAt": "2026-01-02T01:00:00Z",
+                "url": "https://github.com/upstream/repo/pull/42#issuecomment-1"
+            }],
+            "commentCount": 1, "commentsTruncated": false, "reviewThreads": [], "overviewThreads": [], "commits": []
+        }))
+        .unwrap()
+    }
+
+    #[gpui::test]
+    fn held_cache_paints_immediately_and_media_scope_preserves_pr_repository(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let detail = sample_detail();
+        let activity = sample_activity();
+        let reference = sample_ref();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            hold(reference.key(), Some(&detail), Some(&activity), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let view = cx.new(|cx| DetailView::new(state, WeakEntity::new_invalid(), reference.clone(), None, cx));
+            view.update(cx, |view, cx| {
+                // Reopening paints immediately from held detail & activity without waiting on RPC.
+                assert_eq!(view.detail.as_ref().map(|d| d.title.as_str()), Some("PR Title"));
+                assert_eq!(view.activity.as_ref().map(|a| a.comments.len()), Some(1));
+                assert!(!view.timeline.is_empty());
+                // Media scope preserves the PR's own repository (`upstream/repo`), distinct from the local checkout.
+                let scope = view.media_scope(&detail, cx);
+                assert!(scope.source_control_media);
+                assert_eq!(scope.source_control_media_repository.as_deref(), Some("upstream/repo"));
+                assert_eq!(scope.workspace_root.as_deref(), Some("/tmp/fork-checkout"));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn action_reply_reveal_anchors_and_add_comment_to_chat_work_end_to_end(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let detail = sample_detail();
+        let activity = sample_activity();
+        let reference = sample_ref();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            hold(reference.key(), Some(&detail), Some(&activity), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| state.selected_thread = Some("thread-1".into()));
+            let view = cx.new(|cx| DetailView::new(state.clone(), WeakEntity::new_invalid(), reference.clone(), None, cx));
+
+            // Action reply patches the shown detail immediately without requiring a re-read.
+            let reply: Summary = serde_json::from_value(json!({
+                "state": "open", "isDraft": false, "updatedAt": "2026-01-03T00:00:00Z"
+            }))
+            .unwrap();
+            let reread = view.update(cx, |view, cx| view.apply_reply(Some(&reply), cx));
+            assert!(!reread);
+            assert_eq!(view.read(cx).detail.as_ref().map(|d| d.is_draft), Some(false));
+
+            // Link navigation routes checks -> Summary (checks open), comment -> Timeline, diff -> Code.
+            view.update(cx, |view, cx| view.reveal("https://github.com/upstream/repo/pull/42/checks", cx));
+            assert_eq!(view.read(cx).tab, Tab::Summary);
+            assert!(view.read(cx).checks_open);
+
+            view.update(cx, |view, cx| view.reveal("https://github.com/upstream/repo/pull/42#issuecomment-1", cx));
+            assert_eq!(view.read(cx).tab, Tab::Timeline);
+
+            view.update(cx, |view, cx| view.reveal("https://github.com/upstream/repo/pull/42/files", cx));
+            assert_eq!(view.read(cx).tab, Tab::Code);
+            assert!(view.read(cx).code.is_some());
+
+            // Adding a PR comment to chat queues the PR context chip first and then the comment chip.
+            let pr_chip = view.update(cx, |view, cx| {
+                view.add_comment_to_chat(None, "c1", cx);
+                state.update(cx, |state, _| state.take_review_comment("thread-1"))
+            });
+            assert_eq!(pr_chip.as_ref().map(|chip| chip.id.as_str()), Some("pull-request-context:https://github.com/upstream/repo/pull/42"));
+            state
+        });
+        // Deferred comment chip flushes at the end of the previous `cx.update`.
+        cx.update(|cx| {
+            let comment_chip = state.update(cx, |state, _| state.take_review_comment("thread-1"));
+            assert_eq!(comment_chip.as_ref().map(|chip| chip.id.as_str()), Some("pr-comment:https://github.com/upstream/repo/pull/42:comment:c1"));
+            assert_eq!(comment_chip.as_ref().map(|chip| &*chip.text), Some("bob: Please rename this helper"));
+        });
     }
 }

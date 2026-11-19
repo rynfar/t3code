@@ -308,7 +308,10 @@ pub enum EventKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineThread {
-    pub path: String,
+    pub id: String,
+    /// `None` for an overview thread, which is on the change request as a whole.
+    pub path: Option<String>,
+    pub can_resolve: Option<bool>,
     pub line: Option<u64>,
     pub is_resolved: bool,
     pub is_outdated: bool,
@@ -343,7 +346,7 @@ fn thread_comment(thread: &ReviewThread, comment: &super::wire::ThreadComment) -
         body: comment.body.clone(),
         created_at: comment.created_at.clone(),
         url: comment.url.clone(),
-        path: Some(thread.path.clone()),
+        path: thread.path.clone(),
         review_state: None,
     }
 }
@@ -353,7 +356,7 @@ fn thread_comment(thread: &ReviewThread, comment: &super::wire::ThreadComment) -
 fn conversation_events(activity: &Activity) -> Vec<TimelineEvent> {
     let mut claimed = HashSet::new();
     let mut threads: Vec<TimelineEvent> = Vec::new();
-    for thread in &activity.review_threads {
+    for thread in activity.review_threads.iter().chain(&activity.overview_threads) {
         let mut ordered: Vec<Comment> = thread
             .comments
             .iter()
@@ -365,7 +368,9 @@ fn conversation_events(activity: &Activity) -> Vec<TimelineEvent> {
         let more = thread.comment_count.unwrap_or(ordered.len() as u64).saturating_sub(ordered.len() as u64);
         let mut event = comment_event(root);
         event.thread = Some(TimelineThread {
+            id: thread.id.clone(),
             path: thread.path.clone(),
+            can_resolve: thread.can_resolve,
             line: thread.line,
             is_resolved: thread.is_resolved,
             is_outdated: thread.is_outdated,
