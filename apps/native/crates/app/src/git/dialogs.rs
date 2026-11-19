@@ -139,7 +139,13 @@ impl GitDialogs {
                     this.on_pr_reference_changed(&value, cx);
                 }
                 InputEvent::PressEnter { .. } if this.checkout_pr.is_some() => {
-                    this.confirm_checkout_pr(PullRequestCheckoutMode::Worktree, window, cx);
+                    let is_draft = this.git.read(cx).target.as_ref().is_some_and(|t| t.is_draft);
+                    let mode = if is_draft {
+                        PullRequestCheckoutMode::Local
+                    } else {
+                        PullRequestCheckoutMode::Worktree
+                    };
+                    this.confirm_checkout_pr(mode, window, cx);
                 }
                 _ => {}
             }),
@@ -399,7 +405,10 @@ impl GitDialogs {
             return;
         }
         let git = self.git.read(cx);
-        if !git.can_write_source_control() || (mode == PullRequestCheckoutMode::Worktree && !git.can_operate_thread()) {
+        let is_draft = git.target.as_ref().is_some_and(|t| t.is_draft);
+        if !git.can_write_source_control()
+            || (mode == PullRequestCheckoutMode::Worktree && (is_draft || !git.can_operate_thread()))
+        {
             return;
         }
         let Some((origin, task)) = git.prepare_pull_request_thread(&reference, mode, cx) else { return };
@@ -1035,8 +1044,9 @@ impl GitDialogs {
         let can_write = store.can_write_source_control();
         let can_operate = store.can_operate_thread();
         let has_cwd = store.target.is_some();
+        let is_draft = store.target.as_ref().is_some_and(|t| t.is_draft);
         let can_local = can_write && has_cwd && draft.resolved.is_some() && !draft.resolving && !pending;
-        let can_worktree = can_local && can_operate;
+        let can_worktree = can_local && can_operate && !is_draft;
 
         let body = v_flex()
             .gap(px(12.))
@@ -1081,6 +1091,14 @@ impl GitDialogs {
                         .child(format!("Resolving {}...", terms.singular)),
                 )
             })
+            .when(is_draft, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child("Worktree checkout requires an existing thread; use Local on a draft."),
+                )
+            })
             .children(error_message.map(|err| div().text_xs().text_color(hsla(p.destructive_foreground)).child(err)));
 
         let footer = h_flex()
@@ -1091,7 +1109,7 @@ impl GitDialogs {
                 DialogButton::new(
                     "checkout-pr-local",
                     if draft.preparing == Some(PullRequestCheckoutMode::Local) { "Preparing local..." } else { "Local" },
-                    false,
+                    is_draft,
                 )
                 .disabled(!can_local)
                 .on_click(cx.listener(|this, _, window, cx| this.confirm_checkout_pr(PullRequestCheckoutMode::Local, window, cx))),
@@ -1100,7 +1118,7 @@ impl GitDialogs {
                 DialogButton::new(
                     "checkout-pr-worktree",
                     if draft.preparing == Some(PullRequestCheckoutMode::Worktree) { "Preparing worktree..." } else { "Worktree" },
-                    true,
+                    !is_draft,
                 )
                 .disabled(!can_worktree)
                 .on_click(cx.listener(|this, _, window, cx| this.confirm_checkout_pr(PullRequestCheckoutMode::Worktree, window, cx))),

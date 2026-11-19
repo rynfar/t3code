@@ -1261,6 +1261,7 @@ impl DiffPanel {
     }
 
     /// Configures revision-tracked PR viewed state on this panel (`pingdotgg/t3code#35114`).
+    /// Flushes any pending debounced Viewed presses for the previous target before switching scopes.
     #[allow(dead_code)]
     pub fn set_viewed_target(
         &mut self,
@@ -1269,6 +1270,19 @@ impl DiffPanel {
         cx: &mut Context<Self>,
     ) {
         if self.viewed_target != target {
+            if let Some(prev) = self.viewed_target.take()
+                && prev.enabled
+                && let Some((_, batch)) = self.viewed_tracker.take_batch()
+            {
+                let (method, payload) = set_files_viewed_payload(
+                    &prev.project_id,
+                    prev.number,
+                    prev.host.as_deref(),
+                    prev.repository.as_deref(),
+                    batch,
+                );
+                let _ = self.state.read(cx).request(method, payload, |_| Ok(()));
+            }
             self.viewed_target = target;
             self.viewed_tracker = FilesViewedTracker::default();
             self.last_viewed_file_key = None;

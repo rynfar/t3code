@@ -429,3 +429,60 @@ index 3333333..bbbbbbb 100644
     // Re-draw after expansion, avatar toggle, and viewed fold to confirm no layout panics.
     cx.draw(point(px(0.), px(0.)), size(px(800.), px(320.)), |_, _| panel.clone().into_any_element());
 }
+
+#[cfg(feature = "snapshot")]
+#[gpui::test]
+fn switching_viewed_target_flushes_pending_debounced_presses_before_reset(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, mut fixture) = cx.update(|cx| {
+        crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+    });
+    let (panel, vcx) = cx.add_window_view(|_, cx| DiffPanel::detached(state.clone(), cx));
+    let parsed = Parsed::new(SAMPLE_PATCH, false, None, None, None);
+
+    panel.update(vcx, |panel, cx| {
+        panel.show_external(
+            External { key: "pr:77".into(), parsed: Some(parsed), pending: false, error: None },
+            cx,
+        );
+        panel.set_viewed_target(
+            Some(ViewedTarget {
+                project_id: "proj-1".into(),
+                number: 77,
+                host: Some("github.com".into()),
+                repository: Some("org/repo".into()),
+                commit: None,
+                enabled: true,
+            }),
+            HashMap::new(),
+            cx,
+        );
+        panel.toggle_file_viewed(0, false, cx);
+        // Switch PR scope immediately within the debounce window — must flush PR #77's press.
+        panel.set_viewed_target(
+            Some(ViewedTarget {
+                project_id: "proj-1".into(),
+                number: 78,
+                host: Some("github.com".into()),
+                repository: Some("org/repo".into()),
+                commit: None,
+                enabled: true,
+            }),
+            HashMap::new(),
+            cx,
+        );
+    });
+
+    vcx.run_until_parked();
+    let (method, payload, reply) = runtime.block_on(fixture.next_request());
+    assert_eq!(method, t3_core::diff::SET_FILES_VIEWED_METHOD);
+    assert_eq!(payload["projectId"], "proj-1");
+    assert_eq!(payload["number"], 77);
+    assert_eq!(payload["files"][0]["path"], "src/alpha.rs");
+    assert_eq!(payload["files"][0]["viewed"], true);
+    assert_eq!(payload["files"][0]["revision"], "2222222");
+    let _ = reply.send(Ok(serde_json::json!({})));
+}

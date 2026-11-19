@@ -699,6 +699,8 @@ impl GitStore {
     }
 
     /// Prepares a local or worktree checkout for a pull/merge request (`git.preparePullRequestThread`).
+    /// Drafts only allow `Local` checkout here because attaching a new worktree to a draft lives
+    /// under `PR-DETAIL`'s `usePullRequestDraftThread` flow (`composer/`).
     pub fn prepare_pull_request_thread(
         &self,
         reference: &str,
@@ -706,6 +708,9 @@ impl GitStore {
         cx: &App,
     ) -> Option<(Target, tokio::task::JoinHandle<Result<vcs::PreparePullRequestThreadResult, String>>)> {
         let target = self.target.clone()?;
+        if target.is_draft && mode == vcs::PullRequestCheckoutMode::Worktree {
+            return None;
+        }
         let thread_id = (!target.is_draft).then_some(target.thread_id.as_str());
         let payload = vcs::prepare_pull_request_thread(&target.project_cwd, reference, mode, thread_id);
         let task = self
@@ -717,6 +722,9 @@ impl GitStore {
 
     /// Applies the prepared PR checkout to the active thread/checkout (`handlePreparedPullRequestThread`).
     pub fn apply_prepared_pull_request(&mut self, origin: &Target, result: &vcs::PreparePullRequestThreadResult, cx: &mut Context<Self>) {
+        if origin.is_draft && result.worktree_path.is_some() {
+            return;
+        }
         if !origin.is_draft {
             self.set_thread_branch(origin, Some(&result.branch), result.worktree_path.as_deref(), cx);
         }
@@ -1136,4 +1144,65 @@ pub fn open_script_editor_request(project_id: &str, request: EditorRequest, cx: 
 
 pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<GitStore> {
     cx.new(|cx| GitStore::new(state, cx))
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn draft_pr_checkout_blocks_worktree_mode_and_ignores_worktree_results(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        let store = cx.update(|cx| cx.new(|cx| GitStore::new(state.clone(), cx)));
+        let draft_target = Target {
+            thread_id: "draft:proj-1".into(),
+            project_id: "proj-1".into(),
+            is_draft: true,
+            cwd: "/repo".into(),
+            project_cwd: "/repo".into(),
+            worktree_path: None,
+            branch: Some("main".into()),
+        };
+
+        store.update(cx, |store, cx| {
+            store.target = Some(draft_target.clone());
+            assert!(
+                store.prepare_pull_request_thread("#42", vcs::PullRequestCheckoutMode::Worktree, cx).is_none(),
+                "Worktree PR checkout must be refused on drafts"
+            );
+            assert!(
+                store.prepare_pull_request_thread("#42", vcs::PullRequestCheckoutMode::Local, cx).is_some(),
+                "Local PR checkout remains allowed on drafts"
+            );
+
+            // Defensive guard: a worktree result on a draft must never corrupt optimistic_branch.
+            let orphan_result = vcs::PreparePullRequestThreadResult {
+                pull_request: vcs::ResolvedPullRequest {
+                    number: 42,
+                    title: "Test PR".into(),
+                    url: "https://github.com/org/repo/pull/42".into(),
+                    base_branch: "main".into(),
+                    head_branch: "feat/pr-42".into(),
+                    state: "open".into(),
+                },
+                branch: "feat/pr-42".into(),
+                worktree_path: Some("/repo-wt/pr-42".into()),
+                is_on_pull_request_head: true,
+            };
+            store.apply_prepared_pull_request(&draft_target, &orphan_result, cx);
+            assert_eq!(store.optimistic_branch, None);
+
+            // Local result on a draft updates optimistic_branch cleanly.
+            let local_result = vcs::PreparePullRequestThreadResult {
+                worktree_path: None,
+                ..orphan_result
+            };
+            store.apply_prepared_pull_request(&draft_target, &local_result, cx);
+            assert_eq!(store.optimistic_branch, Some(Some("feat/pr-42".into())));
+        });
+    }
 }

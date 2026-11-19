@@ -123,13 +123,21 @@ pub fn file_rows_with_trailing(
 fn hunk_end(hunk: &Hunk) -> u32 {
     if hunk.new_count == 0 && hunk.new_start == 0 {
         hunk.old_start + hunk.old_count
+    } else if hunk.new_count == 0 {
+        hunk.new_start + 1
     } else {
         hunk.new_start + hunk.new_count
     }
 }
 
 fn hidden_before(hunk: &Hunk, previous_end: Option<u32>) -> u32 {
-    let start = if hunk.new_count == 0 && hunk.new_start == 0 { hunk.old_start } else { hunk.new_start };
+    let start = if hunk.new_count == 0 && hunk.new_start == 0 {
+        hunk.old_start
+    } else if hunk.new_count == 0 {
+        hunk.new_start + 1
+    } else {
+        hunk.new_start
+    };
     match previous_end {
         Some(end) => start.saturating_sub(end),
         None => start.saturating_sub(1),

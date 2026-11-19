@@ -102,6 +102,17 @@ fn same_line_ignoring_whitespace(patch_line: &str, file_line: &str) -> bool {
     }
 }
 
+/// 1-based line number of the first line inside a hunk, or the first line *after* the insertion
+/// point when `count == 0` (in unified diffs `@@ -5,0 +6,3 @@` means "after old line 5", so old
+/// lines `1..=5` precede the hunk and line `6` is the first line after it).
+fn hunk_side_start(start: u32, count: u32) -> u32 {
+    if count == 0 {
+        start.saturating_add(1)
+    } else {
+        start
+    }
+}
+
 fn hunk_side_end(start: u32, count: u32) -> usize {
     if count == 0 {
         start as usize
@@ -212,13 +223,15 @@ pub fn expand_hunk_context(
 
     if hunk_index == 0 {
         let first = &mut hunks[0];
-        let hidden = first.new_start.saturating_sub(1).min(first.old_start.saturating_sub(1));
+        let first_old_start = hunk_side_start(first.old_start, first.old_count);
+        let first_new_start = hunk_side_start(first.new_start, first.new_count);
+        let hidden = first_new_start.saturating_sub(1).min(first_old_start.saturating_sub(1));
         if hidden == 0 {
             return Ok(file.clone());
         }
         let take = if direction == ExpandDirection::All { hidden } else { count.min(hidden) };
-        let start_old = first.old_start - take;
-        let start_new = first.new_start - take;
+        let start_old = first_old_start - take;
+        let start_new = first_new_start - take;
         let mut prefix = Vec::with_capacity(take as usize + first.lines.len());
         for offset in 0..take {
             let old_no = start_old + offset;
@@ -245,6 +258,12 @@ pub fn expand_hunk_context(
             return Ok(file.clone());
         }
         let take = if direction == ExpandDirection::All { hidden } else { count.min(hidden) };
+        if last.old_count == 0 {
+            last.old_start = after_old as u32 + 1;
+        }
+        if last.new_count == 0 {
+            last.new_start = after_new as u32 + 1;
+        }
         for offset in 0..take {
             let old_no = after_old as u32 + 1 + offset;
             let new_no = after_new as u32 + 1 + offset;
@@ -256,8 +275,8 @@ pub fn expand_hunk_context(
     } else {
         let prev_old_end = hunk_side_end(hunks[hunk_index - 1].old_start, hunks[hunk_index - 1].old_count) as u32;
         let prev_new_end = hunk_side_end(hunks[hunk_index - 1].new_start, hunks[hunk_index - 1].new_count) as u32;
-        let next_old_start = hunks[hunk_index].old_start;
-        let next_new_start = hunks[hunk_index].new_start;
+        let next_old_start = hunk_side_start(hunks[hunk_index].old_start, hunks[hunk_index].old_count);
+        let next_new_start = hunk_side_start(hunks[hunk_index].new_start, hunks[hunk_index].new_count);
         let gap_old = next_old_start.saturating_sub(prev_old_end + 1);
         let gap_new = next_new_start.saturating_sub(prev_new_end + 1);
         let hidden = gap_old.min(gap_new);
@@ -275,6 +294,12 @@ pub fn expand_hunk_context(
             }
             let next_hunk = hunks.remove(hunk_index);
             let prev_hunk = &mut hunks[hunk_index - 1];
+            if prev_hunk.old_count == 0 {
+                prev_hunk.old_start = prev_old_end + 1;
+            }
+            if prev_hunk.new_count == 0 {
+                prev_hunk.new_start = prev_new_end + 1;
+            }
             prev_hunk.lines.extend(bridge);
             prev_hunk.lines.extend(next_hunk.lines);
             prev_hunk.old_count += hidden + next_hunk.old_count;
@@ -283,6 +308,12 @@ pub fn expand_hunk_context(
             match direction {
                 ExpandDirection::Down => {
                     let prev_hunk = &mut hunks[hunk_index - 1];
+                    if prev_hunk.old_count == 0 {
+                        prev_hunk.old_start = prev_old_end + 1;
+                    }
+                    if prev_hunk.new_count == 0 {
+                        prev_hunk.new_start = prev_new_end + 1;
+                    }
                     for offset in 0..take {
                         let old_no = prev_old_end + 1 + offset;
                         let new_no = prev_new_end + 1 + offset;
@@ -338,9 +369,11 @@ pub fn expand_file_to_line(
     }
     let range_of = |hunk: &Hunk| -> (u32, u32) {
         if use_old {
-            (hunk.old_start, hunk.old_start.saturating_add(hunk.old_count))
+            let start = hunk_side_start(hunk.old_start, hunk.old_count);
+            (start, start.saturating_add(hunk.old_count))
         } else {
-            (hunk.new_start, hunk.new_start.saturating_add(hunk.new_count))
+            let start = hunk_side_start(hunk.new_start, hunk.new_count);
+            (start, start.saturating_add(hunk.new_count))
         }
     };
     for (idx, hunk) in file.hunks.iter().enumerate() {
@@ -444,5 +477,104 @@ index 1111111..2222222 100644
         let (file, contents) = sample_patch_and_contents();
         let expanded = expand_file_to_line(&file, &contents, 14, Some(Side::Additions)).unwrap();
         assert!(expanded.hunks.iter().flat_map(|h| &h.lines).any(|l| l.new_line == Some(14)));
+    }
+
+    #[test]
+    fn zero_count_pure_addition_and_deletion_hunks_expand_and_merge_without_off_by_one() {
+        // Pure addition hunk @@ -5,0 +6,3 @@ followed by a second pure addition hunk @@ -10,0 +14,2 @@.
+        let old_lines: Vec<String> = (1..=14).map(|i| format!("old {i}\n")).collect();
+        let mut new_lines: Vec<String> = Vec::new();
+        for i in 1..=5 {
+            new_lines.push(format!("old {i}\n"));
+        }
+        new_lines.push("added a\n".into());
+        new_lines.push("added b\n".into());
+        new_lines.push("added c\n".into());
+        for i in 6..=10 {
+            new_lines.push(format!("old {i}\n"));
+        }
+        new_lines.push("added d\n".into());
+        new_lines.push("added e\n".into());
+        for i in 11..=14 {
+            new_lines.push(format!("old {i}\n"));
+        }
+        let add_patch = "\
+diff --git a/add.txt b/add.txt
+index 1111111..2222222 100644
+--- a/add.txt
++++ b/add.txt
+@@ -5,0 +6,3 @@
++added a
++added b
++added c
+@@ -10,0 +14,2 @@
++added d
++added e
+";
+        let ParsedPatch::Files(mut files) = parse_patch(add_patch) else { panic!("files") };
+        let add_file = files.remove(0);
+        let add_contents = DiffFileContents { old_contents: old_lines.concat(), new_contents: new_lines.concat() };
+        assert!(reproduces_patch(&add_file, &add_contents));
+
+        // Incremental expand above hunk 0: line 5 must pair (old 5, new 5) and still reproduce_patch.
+        let step1 = expand_hunk_context(&add_file, &add_contents, 0, ExpandDirection::Up, 1).unwrap();
+        assert_eq!((step1.hunks[0].old_start, step1.hunks[0].old_count), (5, 1));
+        assert_eq!((step1.hunks[0].new_start, step1.hunks[0].new_count), (5, 4));
+        assert_eq!((step1.hunks[0].lines[0].old_line, step1.hunks[0].lines[0].new_line), (Some(5), Some(5)));
+        assert!(reproduces_patch(&step1, &add_contents));
+        let step2 = expand_hunk_context(&step1, &add_contents, 0, ExpandDirection::All, 20).unwrap();
+        assert_eq!((step2.hunks[0].old_start, step2.hunks[0].old_count), (1, 5));
+        assert_eq!((step2.hunks[0].new_start, step2.hunks[0].new_count), (1, 8));
+        assert!(reproduces_patch(&step2, &add_contents));
+
+        // Incremental Up from second zero-count hunk, then merge across the gap, then trailing.
+        let mid_up = expand_hunk_context(&step2, &add_contents, 1, ExpandDirection::Up, 1).unwrap();
+        assert_eq!((mid_up.hunks[1].old_start, mid_up.hunks[1].old_count), (10, 1));
+        assert_eq!((mid_up.hunks[1].new_start, mid_up.hunks[1].new_count), (13, 3));
+        assert!(reproduces_patch(&mid_up, &add_contents));
+        let merged = expand_hunk_context(&mid_up, &add_contents, 1, ExpandDirection::All, 20).unwrap();
+        assert_eq!(merged.hunks.len(), 1);
+        assert_eq!((merged.hunks[0].old_start, merged.hunks[0].old_count), (1, 10));
+        assert_eq!((merged.hunks[0].new_start, merged.hunks[0].new_count), (1, 15));
+        assert!(reproduces_patch(&merged, &add_contents));
+
+        // Trailing down from an unexpanded pure-addition hunk also advances old_start from 10 to 11.
+        let tail_direct = expand_hunk_context(&add_file, &add_contents, 2, ExpandDirection::Down, 2).unwrap();
+        assert_eq!((tail_direct.hunks[1].old_start, tail_direct.hunks[1].old_count), (11, 2));
+        assert!(reproduces_patch(&tail_direct, &add_contents));
+
+        // Pure deletion hunk @@ -6,3 +5,0 @@ (old lines 6..=8 removed after new line 5).
+        let del_old: Vec<String> = (1..=12).map(|i| format!("line {i}\n")).collect();
+        let mut del_new: Vec<String> = (1..=5).map(|i| format!("line {i}\n")).collect();
+        del_new.extend((9..=12).map(|i| format!("line {i}\n")));
+        let del_patch = "\
+diff --git a/del.txt b/del.txt
+index 1111111..2222222 100644
+--- a/del.txt
++++ b/del.txt
+@@ -6,3 +5,0 @@
+-line 6
+-line 7
+-line 8
+";
+        let ParsedPatch::Files(mut files) = parse_patch(del_patch) else { panic!("files") };
+        let del_file = files.remove(0);
+        let del_contents = DiffFileContents { old_contents: del_old.concat(), new_contents: del_new.concat() };
+        assert!(reproduces_patch(&del_file, &del_contents));
+
+        let del_up = expand_hunk_context(&del_file, &del_contents, 0, ExpandDirection::Up, 1).unwrap();
+        assert_eq!((del_up.hunks[0].old_start, del_up.hunks[0].old_count), (5, 4));
+        assert_eq!((del_up.hunks[0].new_start, del_up.hunks[0].new_count), (5, 1));
+        assert!(reproduces_patch(&del_up, &del_contents));
+
+        let del_down = expand_hunk_context(&del_file, &del_contents, 1, ExpandDirection::Down, 2).unwrap();
+        assert_eq!((del_down.hunks[0].old_start, del_down.hunks[0].old_count), (6, 5));
+        assert_eq!((del_down.hunks[0].new_start, del_down.hunks[0].new_count), (6, 2));
+        assert!(reproduces_patch(&del_down, &del_contents));
+
+        // expand_file_to_line on old line 5 (above @@ -5,0 +6,3 @@) reaches line 5 without off-by-one.
+        let revealed = expand_file_to_line(&add_file, &add_contents, 5, Some(Side::Deletions)).unwrap();
+        assert!(revealed.hunks[0].lines.iter().any(|l| l.old_line == Some(5) && l.new_line == Some(5)));
+        assert!(reproduces_patch(&revealed, &add_contents));
     }
 }
