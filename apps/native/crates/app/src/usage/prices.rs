@@ -43,6 +43,7 @@ pub(super) struct PriceOverridesDialog {
     rows: Vec<PriceRowInputs>,
     next_row_id: usize,
     seed_model: Option<String>,
+    target_saved_ids: Vec<String>,
 }
 
 impl PriceOverridesDialog {
@@ -50,7 +51,7 @@ impl PriceOverridesDialog {
         self.saving
     }
 
-    fn new(seed_model: Option<String>) -> Self {
+    fn new(seed_model: Option<String>, target_saved_ids: Vec<String>) -> Self {
         Self {
             loading: true,
             saving: false,
@@ -60,6 +61,7 @@ impl PriceOverridesDialog {
             rows: Vec::new(),
             next_row_id: 1,
             seed_model,
+            target_saved_ids,
         }
     }
 
@@ -128,10 +130,33 @@ impl PriceOverridesDialog {
 impl UsageView {
     pub(super) fn open_price_overrides(&mut self, seed_model: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
-        self.prices = Some(PriceOverridesDialog::new(seed_model));
-        let request = self.state.read(cx).rpc(GET_CONFIG, serde_json::json!({}));
+        let targets: Vec<String> = self
+            .data
+            .selected_envs()
+            .into_iter()
+            .filter(|env| env.phase == t3_core::usage::ConnectionPhase::Connected)
+            .map(|env| env.saved_id.clone())
+            .collect();
+        let primary_saved = targets.first().cloned();
+        self.prices = Some(PriceOverridesDialog::new(seed_model, targets));
+        let state = self.state.read(cx);
+        let runtime = state.runtime().clone();
+        let client_fut = primary_saved.as_deref().map(|id| super::data::client_future(state, id));
+        let fallback_rpc = client_fut.is_none().then(|| state.rpc(GET_CONFIG, serde_json::json!({})));
         cx.spawn_in(window, async move |this, cx| {
-            let reply = request.await;
+            let reply = if let Some(client_fut) = client_fut {
+                match client_fut.await {
+                    Some(client) => runtime
+                        .spawn(async move { client.request(GET_CONFIG, serde_json::json!({})).await })
+                        .await
+                        .unwrap_or(Err(t3_client::session::RpcError::Closed)),
+                    None => Err(t3_client::session::RpcError::Closed),
+                }
+            } else if let Some(rpc) = fallback_rpc {
+                rpc.await
+            } else {
+                Err(t3_client::session::RpcError::Closed)
+            };
             let _ = this.update_in(cx, |view, window, cx| {
                 let Some(mut dialog) = view.prices.take() else { return };
                 dialog.loading = false;
@@ -180,7 +205,7 @@ impl UsageView {
     }
 
     fn save_price_overrides(&mut self, cx: &mut Context<Self>) {
-        let label = self.data.label.clone();
+        let label = self.data.primary_label();
         let (changes, errors, aliases_supported) = {
             let Some(dialog) = self.prices.as_ref() else { return };
             if dialog.saving || dialog.loading {
@@ -210,16 +235,54 @@ impl UsageView {
             cx.notify();
             return;
         };
-        if let Some(dialog) = self.prices.as_mut() {
+        let targets = if let Some(dialog) = self.prices.as_mut() {
             dialog.saving = true;
             dialog.error = None;
             dialog.row_errors.clear();
-        }
-        let request = self.state.read(cx).rpc(SERVER_UPDATE_SETTINGS, payload);
+            dialog.target_saved_ids.clone()
+        } else {
+            Vec::new()
+        };
+        let state = self.state.read(cx);
+        let runtime = state.runtime().clone();
+        let jobs: Vec<_> = targets
+            .into_iter()
+            .map(|id| super::data::client_future(state, &id))
+            .collect();
+        let fallback_rpc = jobs.is_empty().then(|| state.rpc(SERVER_UPDATE_SETTINGS, payload.clone()));
         cx.spawn(async move |this, cx| {
-            let result = request.await;
+            let result: Result<(), String> = if !jobs.is_empty() {
+                let outcomes = futures::future::join_all(jobs.into_iter().map(|client_fut| {
+                    let runtime = runtime.clone();
+                    let payload = payload.clone();
+                    async move {
+                        let Some(client) = client_fut.await else {
+                            return Err("not connected".to_owned());
+                        };
+                        runtime
+                            .spawn(async move { client.request(SERVER_UPDATE_SETTINGS, payload).await })
+                            .await
+                            .unwrap_or(Err(t3_client::session::RpcError::Closed))
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }
+                }))
+                .await;
+                if outcomes.iter().any(Result::is_ok) {
+                    Ok(())
+                } else {
+                    Err(outcomes
+                        .into_iter()
+                        .find_map(Result::err)
+                        .unwrap_or_else(|| "Could not save".to_owned()))
+                }
+            } else if let Some(rpc) = fallback_rpc {
+                rpc.await.map(|_| ()).map_err(|e| e.to_string())
+            } else {
+                Err("not connected".to_owned())
+            };
             let _ = this.update(cx, |view, cx| match result {
-                Ok(_) => {
+                Ok(()) => {
                     view.prices = None;
                     view.load(true, cx);
                     cx.notify();

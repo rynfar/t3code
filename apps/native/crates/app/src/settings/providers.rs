@@ -14,6 +14,7 @@ mod editor;
 mod removal;
 mod form;
 mod text_generators;
+mod usage_sources;
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -188,6 +189,7 @@ pub(crate) struct ProvidersState {
     setup_unavailable: bool,
     dialog: Option<dialog::AddDialog>,
     text_generators: text_generators::TextGeneratorsState,
+    usage_sources: usage_sources::UsageSourcesState,
     /// Redraws once when the "Checked …" label would next read differently.
     label_timer: Option<(i64, Task<()>)>,
     _subscriptions: Vec<Subscription>,
@@ -203,6 +205,7 @@ impl ProvidersState {
         self.removal.model.cancel();
         self.dialog=None;
         self.text_generators.clear();
+        self.usage_sources.clear();
         self.chatgpt=None;
         self.auth=None;
         self.install=None;
@@ -293,6 +296,7 @@ impl ProvidersState {
             setup_unavailable: false,
             dialog: None,
             text_generators: text_generators::TextGeneratorsState::default(),
+            usage_sources: usage_sources::UsageSourcesState::default(),
             label_timer: None,
             _subscriptions: subscriptions,
         }
@@ -307,6 +311,7 @@ impl ProvidersState {
             inputs.extend(dialog.inputs());
         }
         inputs.extend(self.text_generators.inputs());
+        inputs.extend(self.usage_sources.inputs());
         inputs
     }
 }
@@ -475,6 +480,7 @@ impl SettingsView {
     pub(super) fn providers_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<Block> {
         self.invalidate_provider_setup(cx);
         if self.providers.dialog.as_ref().is_some_and(|d|d.connection!=self.state.read(cx).connection_id()) { self.providers.dialog=None; self.providers.auth=None; }
+        self.sync_usage_sources(cx);
         self.sync_provider_removal(window, cx);
         let Some(data) = self.page_data(cx) else {
             self.providers.auth = None;
@@ -488,13 +494,17 @@ impl SettingsView {
         self.sync_health_interval(&data.panel, window, cx);
 
         let providers = self.render_providers_section(&data, window, cx);
+        let usage_sources = self.render_usage_sources_section(&data.environment_label, cx);
         let text_generators = self.render_text_generators_section(cx);
         let advanced = self.render_advanced(&data.panel, cx);
         let dialog = self.render_add_dialog(window, cx);
         let removal = self.render_provider_removal(window, cx);
+        let usage_source_dialog = self.render_usage_source_dialog(window, cx);
+        let usage_source_removal = self.render_usage_source_removal(window, cx);
         let notice = self.render_notice(cx);
         vec![
             Block::new(&["providers"], v_flex().gap(r(16.)).children(notice).child(providers).children(dialog).children(removal)),
+            Block::new(&["usage-providers"], v_flex().child(usage_sources).children(usage_source_dialog).children(usage_source_removal)),
             Block::new(&["text-generators"], text_generators),
             Block::new(&["provider-health-check-interval", "compact-idle-threads"], advanced),
         ]

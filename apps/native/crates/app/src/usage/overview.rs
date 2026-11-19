@@ -9,8 +9,8 @@ use std::sync::Arc;
 use gpui::{AnyElement, App, Context, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px, relative};
 use gpui_component::{h_flex, v_flex};
 use t3_core::usage::format::{
-    format_count, format_day_short, format_hour_short, format_percent, format_relative_hour_short, format_tokens, format_usd, usage_source_messages,
-    window_periods,
+    format_count, format_day_short, format_hour_short_in_zone, format_percent, format_relative_hour_short_in_zone, format_tokens, format_usd,
+    usage_source_messages, window_periods,
 };
 use t3_core::usage::merge::{self, ChartMetric, Ink, MergedUsage, ShareSegment};
 use t3_core::usage::{self, LoadingState, UsageMetric, UsageProvider, UsageResolution, UsageSummaryInput};
@@ -61,9 +61,10 @@ pub(super) fn chart_data(
     let hourly = window.resolution == UsageResolution::Hour;
     let periods = window_periods(window);
     let reference = window.until_time.clone();
-    let label = |period: &str| if hourly { format_hour_short(period, &SystemZone, hour12) } else { format_day_short(period) };
+    let tz = Some(window.time_zone.as_str());
+    let label = |period: &str| if hourly { format_hour_short_in_zone(period, tz, &SystemZone, hour12) } else { format_day_short(period) };
     let tooltip = |period: &str| match (&reference, hourly) {
-        (Some(reference), true) => format_relative_hour_short(period, reference, &SystemZone, hour12),
+        (Some(reference), true) => format_relative_hour_short_in_zone(period, reference, tz, &SystemZone, hour12),
         _ => label(period),
     };
     let totals = if hourly { &merged.hourly } else { &merged.daily };
@@ -142,16 +143,32 @@ impl UsageView {
         let p = palette(cx);
         let limits = self.data.preferences.metric == UsageMetric::Limits;
         let noun = if limits { "limits" } else { "usage" };
-        let content: AnyElement = if !self.data.selected {
-            div().text_size(r(14.)).text_color(hsla(p.muted_foreground)).child(format!("Select an environment to see {noun}.")).into_any_element()
+        let selected = self.data.selected_environment_usages();
+        let content: AnyElement = if selected.is_empty() {
+            let message = if self.data.envs.is_empty() {
+                format!("Connect an environment to see {noun}.")
+            } else {
+                format!("Select an environment to see {noun}.")
+            };
+            div().text_size(r(14.)).text_color(hsla(p.muted_foreground)).child(message).into_any_element()
         } else if limits {
             self.render_limits(window, cx).into_any_element()
         } else {
             match self.data.shown() {
                 None => self.render_skeleton(cx).into_any_element(),
-                Some(_) if !self.data.access.can_read_diagnostics => {
-                    let error = self.data.environment(self.state.read(cx)).error.unwrap_or_default();
-                    v_flex().py(r(48.)).items_center().text_size(r(14.)).text_color(hsla(p.muted_foreground)).child(error).into_any_element()
+                Some(_) if !self.data.any_can_read_diagnostics() => {
+                    let multiple = selected.len() > 1;
+                    v_flex()
+                        .py(r(48.))
+                        .gap(r(8.))
+                        .items_center()
+                        .text_size(r(14.))
+                        .text_color(hsla(p.muted_foreground))
+                        .children(selected.into_iter().filter_map(move |env| {
+                            let error = env.error?;
+                            Some(div().child(if multiple { format!("{}: {error}", env.label) } else { error }))
+                        }))
+                        .into_any_element()
                 }
                 Some((window_shown, merged, kept)) => self.render_overview(window_shown, merged, kept, window, cx).into_any_element(),
             }
@@ -163,15 +180,18 @@ impl UsageView {
         let p = palette(cx);
         let metric = chart_metric(self.data.preferences.metric);
         let hourly = shown.resolution == UsageResolution::Hour;
-        let environment = self.data.environment(self.state.read(cx));
-        let loading: LoadingState = usage::loading_state(std::slice::from_ref(&environment), self.data.refreshing, kept, self.data.hidden());
+        let environments = self.data.selected_environment_usages();
+        let loading: LoadingState = usage::loading_state(&environments, self.data.refreshing, kept, self.data.hidden());
         let with_data = usage::providers_with_usage(&merged.providers);
         let active: Vec<UsageProvider> =
             UsageProvider::ORDER.into_iter().filter(|provider| with_data.contains(provider) || loading.providers.contains(provider)).collect();
         let chart_loading: BTreeSet<UsageProvider> = active.iter().copied().filter(|provider| loading.is_loading(*provider)).collect();
         let hidden = self.data.hidden();
         let messages = usage_source_messages(
-            environment.summary.iter().flat_map(|summary| summary.sources.iter()).filter(|source| !hidden.contains(&source.fingerprint.provider)),
+            environments
+                .iter()
+                .flat_map(|env| env.summary.iter().flat_map(|summary| summary.sources.iter()))
+                .filter(|source| !hidden.contains(&source.fingerprint.provider)),
         );
         let wide = f32::from(window.viewport_size().width) >= 1024.;
         let chart = Rc::new(chart_data(&shown, &merged, metric, active.clone(), chart_loading, self.data.hour12));
@@ -260,9 +280,7 @@ impl UsageView {
         let headline = if metric == ChartMetric::Cost { format_usd(merged.cost_usd) } else { format_tokens(merged.total_tokens as f64) };
         let unpriced = merged.cost_quality.unpriced_share;
         let with_data = usage::providers_with_usage(&merged.providers);
-        let state = self.state.read(cx);
-        let chatgpt = !self.data.hidden().contains(&UsageProvider::Codex)
-            && state.server_config.config.as_ref().is_some_and(|config| config.providers.iter().any(t3_core::usage::limits::uses_chatgpt_sharing));
+        let chatgpt = self.data.any_chatgpt_sharing();
         let rows: Vec<AnyElement> = active
             .iter()
             .map(|provider| self.render_provider_row(merged, *provider, metric, loading.is_loading(*provider), !with_data.contains(provider), cx))
@@ -380,7 +398,7 @@ impl UsageView {
         }));
         let table = match current {
             Breakdown::Model => self.render_model_table(merged, metric, loading, window, cx).into_any_element(),
-            Breakdown::Time => render_time_table(merged, hourly, self.data.hour12, active, loading, cx).into_any_element(),
+            Breakdown::Time => render_time_table(merged, hourly, &shown.time_zone, self.data.hour12, active, loading, cx).into_any_element(),
         };
         v_flex().gap(r(12.)).child(h_flex().items_center().justify_between().gap(r(12.)).child(heading("Breakdown", cx)).child(toggles)).child(table)
     }
@@ -533,7 +551,7 @@ impl UsageView {
     }
 }
 
-fn render_time_table(merged: &MergedUsage, hourly: bool, hour12: bool, active: &[UsageProvider], loading: &LoadingState, cx: &App) -> impl IntoElement {
+fn render_time_table(merged: &MergedUsage, hourly: bool, time_zone: &str, hour12: bool, active: &[UsageProvider], loading: &LoadingState, cx: &App) -> impl IntoElement {
     let p = palette(cx);
     let periods: Vec<&merge::PeriodTotals> = if hourly { merged.hourly.iter().rev().collect() } else { merged.daily.iter().rev().collect() };
     let cell = || div().flex_1().min_w(r(72.)).pl(r(16.)).text_right();
@@ -555,7 +573,7 @@ fn render_time_table(merged: &MergedUsage, hourly: bool, hour12: bool, active: &
             .into_iter()
             .map(|period| {
                 let label = match &period.hour_start {
-                    Some(hour) => format_hour_short(hour, &SystemZone, hour12),
+                    Some(hour) => format_hour_short_in_zone(hour, Some(time_zone), &SystemZone, hour12),
                     None => format_day_short(&period.day),
                 };
                 h_flex()

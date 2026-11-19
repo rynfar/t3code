@@ -13,6 +13,8 @@ mod limits;
 mod overview;
 mod prices;
 
+use std::collections::HashMap;
+
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, Global, IntoElement, KeyBinding, MouseButton, ParentElement, Render,
     Styled, Subscription, Task, Window, actions, div, point, prelude::*, px,
@@ -31,8 +33,8 @@ struct Host {
     state: Entity<AppState>,
     view: Option<Entity<UsageView>>,
     pending: bool,
-    /// When Limits may ask providers again on its own (`refreshUsageLimits`, five minutes).
-    limits_refresh_after: i64,
+    /// When Limits may ask each environment's providers again on its own (`refreshUsageLimits`, five minutes).
+    limits_refresh_after: HashMap<String, i64>,
     /// Never asks providers to refresh, for the snapshot tool, which must not write.
     read_only: bool,
     /// The metric, period and whether to open the top model that the next view starts on.
@@ -42,7 +44,7 @@ struct Host {
 impl Global for Host {}
 
 pub fn init(state: Entity<AppState>, cx: &mut App) {
-    cx.set_global(Host { state, view: None, pending: false, limits_refresh_after: 0, read_only: false, initial: None });
+    cx.set_global(Host { state, view: None, pending: false, limits_refresh_after: HashMap::new(), read_only: false, initial: None });
     cx.on_action(|_: &OpenUsage, cx| open(cx));
     cx.bind_keys([KeyBinding::new("escape", CloseUsage, Some("UsageModal"))]);
 }
@@ -68,7 +70,7 @@ pub fn is_settled(cx: &mut App) -> bool {
     let Some(view) = cx.global::<Host>().view.clone() else { return false };
     let view = view.read(cx);
     let limits = view.data.preferences.metric == UsageMetric::Limits;
-    limits || (!view.data.pending && (view.data.summary.is_some() || view.data.error.is_some()) && !view.open_top_model)
+    limits || (view.data.is_settled() && !view.open_top_model)
 }
 
 fn close(cx: &mut App) {
@@ -148,6 +150,7 @@ struct SegmentKey {
 pub struct UsageView {
     state: Entity<AppState>,
     focus: FocusHandle,
+    refresh_spinner: Entity<header::RefreshSpinner>,
     data: UsageData,
     menu: Option<MenuKind>,
     breakdown: Breakdown,
@@ -163,7 +166,7 @@ pub struct UsageView {
     open_top_model: bool,
     _subscriptions: Vec<Subscription>,
     _grants: Option<Task<()>>,
-    /// The connection it reads from; another one closes it.
+    /// The active connection whose grants stream `_grants` is watching.
     connection: Option<u64>,
 }
 
@@ -176,15 +179,22 @@ impl Focusable for UsageView {
 impl UsageView {
     fn new(state: Entity<AppState>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let connection = state.read(cx).connection_id();
+        let refresh_spinner = cx.new(|_| header::RefreshSpinner::new());
         let subscriptions = vec![cx.subscribe(&state, |this, _, event: &AppEvent, cx| match event {
-            AppEvent::ServerConfig => {
+            AppEvent::ServerConfig | AppEvent::Shell => {
                 this.data.config_changed();
+                this.sync_access(cx);
                 this.auto_refresh_limits(cx);
                 cx.notify();
             }
-            AppEvent::Phase if this.state.read(cx).connection_id() != this.connection => close(cx),
             AppEvent::Phase => {
+                let next_connection = this.state.read(cx).connection_id();
+                if next_connection != this.connection {
+                    this.connection = next_connection;
+                    this.watch_grants(cx);
+                }
                 this.sync_access(cx);
+                this.auto_refresh_limits(cx);
                 cx.notify();
             }
             _ => {}
@@ -192,6 +202,7 @@ impl UsageView {
         let mut view = UsageView {
             state,
             focus: cx.focus_handle(),
+            refresh_spinner,
             data: UsageData::new(),
             menu: None,
             breakdown: Breakdown::Model,
@@ -221,11 +232,24 @@ impl UsageView {
         view
     }
 
-    /// Follows this device's grants, which decide whether usage is readable at all.
+    pub(super) fn set_refreshing(&mut self, refreshing: bool, cx: &mut Context<Self>) {
+        if self.data.refreshing == refreshing {
+            return;
+        }
+        self.data.refreshing = refreshing;
+        self.refresh_spinner.update(cx, |spinner, cx| spinner.set_spinning(refreshing, cx));
+        cx.notify();
+    }
+
+    /// Follows the active connection's grants (fallback when fleet grants are absent).
     fn watch_grants(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.state.read(cx).client_handle() else { return };
+        let Some(client) = self.state.read(cx).client_handle() else {
+            self.data.active_session = None;
+            self._grants = None;
+            return;
+        };
         let mut grants = client.session_state();
-        self.data.session = grants.borrow_and_update().clone();
+        self.data.active_session = grants.borrow_and_update().clone();
         self._grants = Some(cx.spawn(async move |this, cx| {
             while grants.changed().await.is_ok() {
                 let session = grants.borrow_and_update().clone();
@@ -237,8 +261,8 @@ impl UsageView {
     }
 
     fn set_session(&mut self, session: Option<t3_core::auth::AuthSessionState>, cx: &mut Context<Self>) {
-        if self.data.session != session {
-            self.data.session = session;
+        if self.data.active_session != session {
+            self.data.active_session = session;
             self.sync_access(cx);
             cx.notify();
         }
@@ -313,7 +337,7 @@ impl UsageView {
 impl Render for UsageView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.data.prepare(&self.state, cx);
-        if self.open_top_model && self.data.summary.is_some() && !self.data.pending {
+        if self.open_top_model && self.data.answered_count() > 0 && self.data.is_settled() {
             self.open_top_model = false;
             self.selected_model = self.data.merged.models.first().map(|model| model.key());
         }
@@ -357,5 +381,218 @@ impl Render for UsageView {
             .children(self.render_price_overrides_dialog(window, cx))
             .children(self.render_reset_confirm(window, cx))
             .text_color(hsla(p.foreground))
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use t3_client::environments::Environments;
+    use t3_client::supervisor::{ClientFixture, ConnectionStatus};
+    use t3_core::server_config::ServerConfigState;
+    use t3_core::shell::ShellState;
+
+    fn sample_summary(host: &str, model: &str, cost_usd: f64, tokens: u64) -> serde_json::Value {
+        json!({
+            "contractVersion": t3_core::usage::USAGE_CONTRACT_VERSION,
+            "readAt": "2026-11-02T12:00:00.000Z",
+            "timeZone": "UTC",
+            "sinceDay": "2026-11-01",
+            "untilDay": "2026-11-02",
+            "pricing": { "status": "fresh", "source": "litellm", "fetchedAt": null, "knownModels": 10 },
+            "scanDurationMs": 1,
+            "sources": [{
+                "fingerprint": {
+                    "hostId": host,
+                    "provider": "claude",
+                    "resolvedHomePath": format!("/{host}/.claude"),
+                    "volumeId": host
+                },
+                "status": "ok",
+                "scannedFiles": 1,
+                "skippedFiles": 0,
+                "malformedRecords": 0,
+                "distinctSessions": 2,
+                "message": null
+            }],
+            "buckets": [{
+                "day": "2026-11-02",
+                "provider": "claude",
+                "model": model,
+                "totals": {
+                    "uncachedInputTokens": tokens,
+                    "cachedInputTokens": 0,
+                    "cacheCreationTokens": 0,
+                    "outputTokens": 0,
+                    "reasoningTokens": 0
+                },
+                "costUsd": cost_usd,
+                "costSource": "modelPriced",
+                "records": 1,
+                "unpricedRecords": 0,
+                "sessions": 2,
+                "cacheSavingsUsd": 0.0
+            }]
+        })
+    }
+
+    fn server_config_for(env_id: &str, label: &str) -> ServerConfigState {
+        let config: t3_core::server_config::ServerConfig = serde_json::from_value(json!({
+            "environment": { "environmentId": env_id, "label": label },
+            "settings": {},
+            "providers": []
+        }))
+        .unwrap();
+        let mut state = ServerConfigState::default();
+        state.config = Some(config);
+        state
+    }
+
+    #[gpui::test]
+    async fn multi_environment_usage_fans_out_merges_filters_and_spins_during_refresh(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _orig) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.update(|cx| init(state.clone(), cx));
+
+        let (connections, _output) = Environments::start(runtime.handle(), false);
+        state.update(cx, |state, _| {
+            state.stop_pump();
+            state.connections = connections;
+            state.environments.active = Some("env-mac".into());
+            state.environments.environments = serde_json::from_value(json!([
+                {
+                    "id": "env-mac", "environmentId": "env-mac-id", "label": "Mac Studio",
+                    "httpBase": "http://mac.invalid", "accessToken": "", "disabled": false
+                },
+                {
+                    "id": "env-linux", "environmentId": "env-linux-id", "label": "Linux Box",
+                    "httpBase": "http://linux.invalid", "accessToken": "", "disabled": false
+                }
+            ]))
+            .unwrap();
+        });
+        let mut fleet_rx = state.read_with(cx, |state, _| state.connections.view());
+        let grants: t3_core::auth::AuthSessionState = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["diagnostics:read", "providers:manage"]
+        }))
+        .unwrap();
+        let (client_a, mut fixture_a) = ClientFixture::handle(grants.clone());
+        let (client_b, mut fixture_b) = ClientFixture::handle(grants);
+        state.update(cx, |state, cx| {
+            state.install_active_environment(
+                client_a.clone(),
+                ShellState::default(),
+                server_config_for("env-mac-id", "Mac Studio"),
+                ConnectionStatus::Connected,
+                cx,
+            );
+        });
+        let install_a = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "env-mac",
+                client_a,
+                ShellState::default(),
+                server_config_for("env-mac-id", "Mac Studio"),
+                ConnectionStatus::Connected,
+            )
+        });
+        let install_b = state.update(cx, |state, _| {
+            state.connections.install_fixture(
+                "env-linux",
+                client_b,
+                ShellState::default(),
+                server_config_for("env-linux-id", "Linux Box"),
+                ConnectionStatus::Connected,
+            )
+        });
+        let _events_a = runtime.spawn(install_a).await.unwrap();
+        let _events_b = runtime.spawn(install_b).await.unwrap();
+        let fleet = fleet_rx.borrow_and_update().clone();
+        state.update(cx, |state, cx| state.apply_fleet_view(fleet, cx));
+
+        let (view, vcx) = cx.add_window_view(|window, cx| UsageView::new(state.clone(), window, cx));
+        vcx.run_until_parked();
+
+        // Observe `view` until both environments finish decoding and applying their summaries.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let done_tx = std::rc::Rc::new(std::cell::RefCell::new(Some(done_tx)));
+        let _settled_obs = vcx.update(|_, cx| {
+            let done_tx = done_tx.clone();
+            cx.observe(&view, move |view, cx| {
+                if view.read(cx).data.answered_count() == 2
+                    && let Some(tx) = done_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+
+        // Both environments receive provisional `server.getUsageSummary` requests in parallel.
+        let ((method_a, _, reply_a), (method_b, _, reply_b)) = runtime
+            .spawn(async move { futures::future::join(fixture_a.next_request(), fixture_b.next_request()).await })
+            .await
+            .unwrap();
+        assert_eq!(method_a, t3_core::usage::method::GET_USAGE_SUMMARY);
+        assert_eq!(method_b, t3_core::usage::method::GET_USAGE_SUMMARY);
+        let _ = reply_a.send(Ok(sample_summary("host-mac", "claude-sonnet-4", 12.5, 1_000)));
+        let _ = reply_b.send(Ok(sample_summary("host-linux", "claude-opus-4", 7.5, 2_000)));
+        done_rx.await.expect("both environments settled");
+        vcx.run_until_parked();
+
+        // Trigger prepare/render and assert merged totals across both environments.
+        view.update(vcx, |view, cx| view.data.prepare(&view.state, cx));
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.data.envs.len(), 2);
+            assert_eq!(view.data.environment_filter_label(), "All environments");
+            assert!((view.data.merged.cost_usd - 20.0).abs() < 1e-6);
+            assert_eq!(view.data.merged.total_tokens, 3_000);
+            assert_eq!(view.data.merged.sessions, 4);
+            assert_eq!(view.data.merged.models.len(), 2);
+        });
+
+        // Unchecking Linux Box filters totals down to Mac Studio only.
+        view.update(vcx, |view, cx| {
+            view.toggle_environment("env-linux", cx);
+            view.data.prepare(&view.state, cx);
+        });
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.data.environment_filter_label(), "Mac Studio");
+            assert!((view.data.merged.cost_usd - 12.5).abs() < 1e-6);
+            assert_eq!(view.data.merged.total_tokens, 1_000);
+        });
+
+        // Unchecking all shows "0 environments" and clears merged totals.
+        view.update(vcx, |view, cx| {
+            view.set_all_environments(false, cx);
+            view.data.prepare(&view.state, cx);
+        });
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.data.environment_filter_label(), "0 environments");
+            assert_eq!(view.data.merged.total_tokens, 0);
+        });
+
+        // Stepped refresh spinner starts when refreshing=true, steps, and resets when refreshing=false.
+        view.update(vcx, |view, cx| view.set_refreshing(true, cx));
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(view.refresh_spinner.read(cx).state_for_test().0, true);
+        });
+        vcx.executor().advance_clock(std::time::Duration::from_millis(260));
+        vcx.run_until_parked();
+        view.read_with(vcx, |view, cx| {
+            let (spinning, step) = view.refresh_spinner.read(cx).state_for_test();
+            assert!(spinning);
+            assert!(step >= 1, "spinner should advance steps while refreshing");
+        });
+        view.update(vcx, |view, cx| view.set_refreshing(false, cx));
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(view.refresh_spinner.read(cx).state_for_test(), (false, 0));
+        });
+
+        state.update(vcx, |state, _| state.stop_pump());
+        runtime.shutdown_background();
     }
 }
