@@ -23,6 +23,7 @@ pub mod lists;
 pub mod local_server;
 pub mod markdown;
 pub mod media;
+pub mod mcp;
 pub mod mcp_apps;
 pub mod model;
 pub mod notifications;
