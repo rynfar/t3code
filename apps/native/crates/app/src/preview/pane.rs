@@ -34,7 +34,7 @@ use super::annotation::{AnnotationEditor, AnnotationEditorEvent};
 use super::device_toolbar::{DeviceToolbar, DeviceToolbarEvent};
 use super::frame::{CONTROL_BAR_HEIGHT, FrameEvent, FrameView};
 use super::{
-    AUTHORIZATION_ERROR, Abort, Availability, FocusUrl, Previews, PreviewsEvent, Refresh, ResetZoom, ZoomIn, ZoomOut,
+    AUTHORIZATION_ERROR, Abort, Availability, Find, FocusUrl, Previews, PreviewsEvent, Refresh, ResetZoom, ZoomIn, ZoomOut,
 };
 use crate::app_state::{AppState, RestoredAttachment};
 use crate::composer::controls::{MenuItem, popup_surface};
@@ -1202,6 +1202,13 @@ impl Render for PreviewPane {
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1, cx)))
             .on_action(cx.listener(|this, _: &ResetZoom, _, cx| this.zoom(0, cx)))
+            .on_action(cx.listener(|this, _: &Find, _, cx| {
+                // Server-streamed browser tabs do not expose Electron's `previewBridge.findInPage`;
+                // match `PreviewView.tsx::handleFind` when `!canFindInPage`.
+                this.state.update(cx, |state, cx| {
+                    state.show_toast(Toast::new(ToastKind::Info, "Find on page isn't available for this page"), cx);
+                });
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     if this.more_menu_open {

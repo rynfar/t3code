@@ -21,12 +21,13 @@ pub(crate) mod clipboard;
 pub(crate) mod controls;
 pub(crate) mod drafts;
 mod menu;
-mod model_picker;
+pub(crate) mod model_picker;
 mod pending;
 pub(crate) mod prompt_links;
 mod queue;
 mod rich_text;
 mod send;
+pub(crate) use send::SendAndNewThreadCompleted;
 mod stash;
 pub(crate) use pending::{banner_surface, banner_surface_card};
 mod view;
@@ -68,9 +69,12 @@ actions!(
         StashPrompt,
         FocusPrompt,
         OpenWorkspace,
+        OpenBranch,
         OpenHost,
         CycleHost,
         UsePreviousWorktree,
+        IncreaseEffort,
+        DecreaseEffort,
         SendAlternate,
         SteerQueuedMessage,
         EditQueuedMessage,
@@ -96,6 +100,87 @@ pub(crate) fn runtime_mode_icon(mode: RuntimeMode) -> Icon {
         RuntimeMode::Auto => Icon::Sparkles,
         RuntimeMode::FullAccess => Icon::ShieldOff,
     }
+}
+
+fn contains_ultrathink_keyword(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let needle = b"ultrathink";
+    if bytes.len() < needle.len() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for start in 0..=bytes.len() - needle.len() {
+        if bytes[start..start + needle.len()].eq_ignore_ascii_case(needle) {
+            let before_ok = start == 0 || !is_word(bytes[start - 1]);
+            let after_ok = start + needle.len() == bytes.len() || !is_word(bytes[start + needle.len()]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn strip_ultrathink_prefix(prompt: &str) -> Option<&str> {
+    let prefix = prompt.get(..11)?;
+    if prefix.eq_ignore_ascii_case("ultrathink:") {
+        Some(prompt[11..].trim_start())
+    } else {
+        None
+    }
+}
+
+/// Pure step computation matching `getComposerReasoningStep` / `getReasoningTraitStep`.
+fn compute_reasoning_effort_step(
+    descriptors: &[OptionDescriptor],
+    prompt: &str,
+    direction: isize,
+) -> Option<(Vec<OptionSelection>, Option<String>)> {
+    let primary_select_id = descriptors.iter().find_map(|d| match d {
+        OptionDescriptor::Select(select) => Some(select.id.as_str()),
+        OptionDescriptor::Boolean(_) => None,
+    });
+    let select = descriptors.iter().find_map(|d| match d {
+        OptionDescriptor::Select(select) if traits::is_reasoning_control(d) => Some(select),
+        _ => None,
+    })?;
+    let selectable: Vec<&str> = traits::selectable_choices(select).map(|choice| choice.id.as_str()).collect();
+    if selectable.len() < 2 {
+        return None;
+    }
+    let is_primary = primary_select_id == Some(select.id.as_str());
+    let ultrathink_prompt_controlled = is_primary
+        && !select.prompt_injected_values.is_empty()
+        && contains_ultrathink_keyword(prompt);
+    let stripped = strip_ultrathink_prefix(prompt);
+    let ultrathink_in_body_text = ultrathink_prompt_controlled
+        && contains_ultrathink_keyword(stripped.unwrap_or(prompt));
+    if ultrathink_in_body_text {
+        return None;
+    }
+    let current = if ultrathink_prompt_controlled {
+        Some("ultrathink".to_owned())
+    } else {
+        traits::select_value(select)
+    };
+    let ordered: Vec<&str> = if direction > 0 {
+        select.options.iter().map(|o| o.id.as_str()).collect()
+    } else {
+        select.options.iter().rev().map(|o| o.id.as_str()).collect()
+    };
+    let default_id = select.options.iter().find(|o| o.is_default).map(|o| o.id.as_str());
+    let position = current
+        .as_deref()
+        .and_then(|value| ordered.iter().position(|id| *id == value))
+        .or_else(|| default_id.and_then(|value| ordered.iter().position(|id| *id == value)));
+    let candidates = match position {
+        Some(pos) => ordered[pos + 1..].iter().chain(ordered[..pos].iter()),
+        None => ordered[..].iter().chain(ordered[..0].iter()),
+    };
+    let next = candidates.copied().find(|id| selectable.contains(id))?;
+    let selections = traits::with_value(descriptors, &select.id, traits::OptionValue::Str(next.to_owned()))?;
+    let next_prompt = ultrathink_prompt_controlled.then(|| stripped.unwrap_or(prompt).to_owned());
+    Some((selections, next_prompt))
 }
 
 /// What the composer writes to: an existing thread or the new-thread draft of a project.
@@ -1175,6 +1260,32 @@ impl Composer {
         if let Some(choices) = self.choices_mut() {
             choices.model = Some(traits::model_selection(&model.instance_id, &model.model, selections));
         }
+    }
+
+    /// `composer.increaseEffort` / `composer.decreaseEffort` (`ChatComposer.tsx::stepReasoningEffort`).
+    pub(crate) fn step_reasoning_effort(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_rewinding(cx) || !self.snapshot.pending.user_inputs.is_empty() || self.editing_queued().is_some() {
+            return;
+        }
+        let resolved = self.resolve(cx);
+        if resolved.model.is_none() {
+            return;
+        }
+        let prompt = self.prompt(cx);
+        let Some((selections, next_prompt)) = compute_reasoning_effort_step(&resolved.descriptors, &prompt, direction) else {
+            return;
+        };
+        if let Some(next_prompt) = next_prompt
+            && next_prompt != prompt
+        {
+            let range = self.input.read(cx).selected_range();
+            let removed = prompt.len().saturating_sub(next_prompt.len());
+            let start = range.start.saturating_sub(removed).min(next_prompt.len());
+            let end = range.end.saturating_sub(removed).min(next_prompt.len());
+            self.set_prompt(&next_prompt, window, cx);
+            self.input.update(cx, |input, cx| input.set_selected_range(start..end, cx));
+        }
+        self.on_picker(&PickerEvent::Options(selections), window, cx);
     }
 
     fn set_runtime_mode(&mut self, mode: RuntimeMode, cx: &mut Context<Self>) {
@@ -4020,6 +4131,324 @@ mod stream_error_tests {
             assert_eq!(state.read(cx).environments.active.as_deref(), Some("remote-1"));
         });
 
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn compute_reasoning_effort_step_wraps_skips_prompt_injected_and_strips_ultrathink_prefix() {
+        use serde_json::json;
+        let descriptors: Vec<OptionDescriptor> = serde_json::from_value(json!([
+            {
+                "id": "effort",
+                "label": "Effort",
+                "type": "select",
+                "promptInjectedValues": ["ultrathink"],
+                "options": [
+                    { "id": "low", "label": "Low" },
+                    { "id": "medium", "label": "Medium", "isDefault": true },
+                    { "id": "high", "label": "High" },
+                    { "id": "ultrathink", "label": "Ultrathink" }
+                ]
+            }
+        ]))
+        .unwrap();
+        let resolved = traits::resolve_descriptors(&descriptors, &[]);
+
+        // Default is medium -> +1 moves to high.
+        let (next, prompt) = compute_reasoning_effort_step(&resolved, "hello", 1).expect("step forward");
+        assert_eq!(next, vec![traits::OptionSelection { id: "effort".into(), value: traits::OptionValue::Str("high".into()) }]);
+        assert_eq!(prompt, None);
+
+        // From high -> +1 skips prompt-injected `ultrathink` and wraps to `low`.
+        let at_high = traits::resolve_descriptors(&descriptors, &next);
+        let (wrapped, _) = compute_reasoning_effort_step(&at_high, "hello", 1).expect("wrap past ultrathink");
+        assert_eq!(wrapped, vec![traits::OptionSelection { id: "effort".into(), value: traits::OptionValue::Str("low".into()) }]);
+
+        // From low -> -1 skips `ultrathink` and lands on `high`.
+        let at_low = traits::resolve_descriptors(&descriptors, &wrapped);
+        let (back, _) = compute_reasoning_effort_step(&at_low, "hello", -1).expect("step backward");
+        assert_eq!(back, vec![traits::OptionSelection { id: "effort".into(), value: traits::OptionValue::Str("high".into()) }]);
+
+        // Typed `Ultrathink:` prefix steps from `ultrathink` -> `high` (backward) and strips the prefix.
+        let (from_ultra, stripped) = compute_reasoning_effort_step(&resolved, "Ultrathink: solve this", -1).expect("step from prefix");
+        assert_eq!(from_ultra, vec![traits::OptionSelection { id: "effort".into(), value: traits::OptionValue::Str("high".into()) }]);
+        assert_eq!(stripped.as_deref(), Some("solve this"));
+
+        // `ultrathink` inside the prompt body suppresses stepping.
+        assert!(compute_reasoning_effort_step(&resolved, "please ultrathink about this", 1).is_none());
+    }
+
+    #[gpui::test]
+    async fn composer_effort_branch_send_and_new_thread_and_model_picker_shortcuts(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::keymap::init(cx);
+            crate::voice::install_audio_platform(std::sync::Arc::new(crate::voice::MockAudioPlatform::default()), cx);
+            crate::voice::install_memory_voice_consent(t3_core::voice_input::SavedAudioChoice::Unset, false, cx);
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::store::init(cx);
+            installed
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |state, cx| {
+            state.phase = crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected);
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.environment.capabilities.fresh_context = Some(true);
+                config.settings = serde_json::from_value(json!({
+                    "favoriteModels": [
+                        { "provider": "claudeAgent", "model": "claude-sonnet" }
+                    ]
+                }))
+                .unwrap();
+                config.providers = serde_json::from_value(json!([
+                    {
+                        "driver": "claudeAgent",
+                        "instanceId": "claudeAgent",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "auth": { "status": "authenticated" },
+                        "models": [
+                            {
+                                "slug": "claude-sonnet",
+                                "name": "Claude Sonnet",
+                                "isCustom": false,
+                                "capabilities": {
+                                    "optionDescriptors": [{
+                                        "id": "effort",
+                                        "label": "Effort",
+                                        "type": "select",
+                                        "options": [
+                                            { "id": "low", "label": "Low" },
+                                            { "id": "medium", "label": "Medium", "isDefault": true },
+                                            { "id": "high", "label": "High" }
+                                        ]
+                                    }]
+                                }
+                            },
+                            { "slug": "claude-opus", "name": "Claude Opus", "isCustom": false }
+                        ]
+                    },
+                    {
+                        "driver": "codex",
+                        "instanceId": "codex",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "auth": { "status": "authenticated" },
+                        "models": [
+                            { "slug": "gpt-5", "name": "GPT-5", "isCustom": false },
+                            { "slug": "gpt-5-mini", "name": "GPT-5 Mini", "isCustom": false }
+                        ]
+                    }
+                ]))
+                .unwrap();
+            }
+            state.select_thread("menu-thread", cx);
+        });
+
+        let window = cx.open_window(gpui::size(px(900.), px(700.)), |_, _| gpui::EmptyView);
+        let composer = cx
+            .update_window(window.into(), |_, window, cx| cx.new(|cx| Composer::new(state.clone(), window, cx)))
+            .unwrap();
+        let completed_threads: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::default();
+        let completed_ref = completed_threads.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&composer, move |_, event: &SendAndNewThreadCompleted, _| {
+                completed_ref.borrow_mut().push(event.thread_id.clone());
+            })
+        });
+
+        // 1. `composer.increaseEffort` / `composer.decreaseEffort` step reasoning effort levels cleanly.
+        cx.update_window(window.into(), |_, window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.on_picker(
+                    &PickerEvent::Model { instance_id: "claudeAgent".into(), model: "claude-sonnet".into() },
+                    window,
+                    cx,
+                );
+                let effort_of = |c: &Composer, cx: &App| {
+                    c.resolve(cx)
+                        .descriptors
+                        .iter()
+                        .find_map(|d| match d {
+                            OptionDescriptor::Select(select) if select.id == "effort" => traits::select_value(select),
+                            _ => None,
+                        })
+                };
+                assert_eq!(effort_of(composer, cx).as_deref(), Some("medium"));
+                composer.step_reasoning_effort(1, window, cx);
+                assert_eq!(effort_of(composer, cx).as_deref(), Some("high"));
+                composer.step_reasoning_effort(-1, window, cx);
+                assert_eq!(effort_of(composer, cx).as_deref(), Some("medium"));
+            });
+        })
+        .unwrap();
+
+        // 2. `composer.sendAndNewThread` ignores `/clear` (does not emit SendAndNewThreadCompleted).
+        cx.update_window(window.into(), |_, window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("/clear", window, cx);
+                composer.send_and_new_thread(window, cx);
+                assert!(composer.prompt(cx).is_empty());
+            });
+        })
+        .unwrap();
+        assert!(completed_threads.borrow().is_empty(), "/clear must not trigger SendAndNewThreadCompleted");
+
+        // 3. `composer.sendAndNewThread` on failed RPC restores draft and does NOT emit completion.
+        cx.update_window(window.into(), |_, window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("will fail", window, cx);
+                composer.send_and_new_thread(window, cx);
+            });
+        })
+        .unwrap();
+        let (_, _, reply) = loop {
+            let (method, payload, reply) = fixture.next_request().await;
+            if method == t3_core::commands::method::DISPATCH_COMMAND && payload["type"] == "message.dispatch" {
+                break (method, payload, reply);
+            }
+            let _ = reply.send(Ok(json!({})));
+        };
+        let (fail_tx, fail_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut fail_tx = Some(fail_tx);
+        let _fail_obs = cx.update(|cx| {
+            cx.observe(&composer, move |composer, cx| {
+                if !composer.read(cx).sending
+                    && composer.read(cx).error.is_some()
+                    && let Some(tx) = fail_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        reply
+            .send(Err(t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure {
+                tag: None,
+                message: "dispatch rejected".into(),
+                error: serde_json::Value::Null,
+            })))
+            .unwrap();
+        fail_rx.await.unwrap();
+        drop(_fail_obs);
+        cx.run_until_parked();
+        assert!(completed_threads.borrow().is_empty(), "failed RPC must not trigger SendAndNewThreadCompleted");
+        cx.update(|cx| {
+            assert_eq!(composer.read(cx).prompt(cx), "will fail", "failed send restores prompt");
+        });
+
+        // 4. Attachment-only `composer.sendAndNewThread` emits SendAndNewThreadCompleted ONLY after RPC succeeds.
+        cx.update_window(window.into(), |_, window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("", window, cx);
+                let target = Target::Thread("menu-thread".into());
+                composer.seed_attachments(
+                    &target,
+                    vec![t3_core::composer::attachments::Attachment {
+                        id: "att-1".into(),
+                        kind: t3_core::composer::attachments::AttachmentKind::Image,
+                        name: "shot.png".into(),
+                        mime_type: "image/png".into(),
+                        size_bytes: 128,
+                        pasted_text: false,
+                        upload: t3_core::composer::attachments::Upload::Ready { attachment_id: "upload-1".into() },
+                    }],
+                    false,
+                    cx,
+                );
+                composer.send_and_new_thread(window, cx);
+            });
+        })
+        .unwrap();
+        assert!(completed_threads.borrow().is_empty(), "must wait for RPC completion");
+        let (_, payload, reply) = loop {
+            let (method, payload, reply) = fixture.next_request().await;
+            if method == t3_core::commands::method::DISPATCH_COMMAND && payload["type"] == "message.dispatch" {
+                break (method, payload, reply);
+            }
+            let _ = reply.send(Ok(json!({})));
+        };
+        assert_eq!(payload["threadId"], "menu-thread");
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut done_tx = Some(done_tx);
+        let _done_sub = cx.update(|cx| {
+            cx.subscribe(&composer, move |_, _: &SendAndNewThreadCompleted, _| {
+                if let Some(tx) = done_tx.take() {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        reply.send(Ok(json!({}))).unwrap();
+        done_rx.await.unwrap();
+        drop(_done_sub);
+        cx.run_until_parked();
+        assert_eq!(*completed_threads.borrow(), vec!["menu-thread".to_owned()]);
+
+        // 5. `modelPicker.previousProvider`, `modelPicker.nextProvider`, and `modelPicker.jump.1..9`.
+        // Open on a fresh draft (unlocked providers) so both providers are selectable in the rail.
+        let project_id = state.read_with(cx, |state, _| {
+            state.thread_shell("menu-thread").expect("fixture thread").project_id.clone()
+        });
+        state.update(cx, |state, cx| state.start_draft(&project_id, cx));
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.toggle_picker(window, cx);
+                assert!(composer.picker_open);
+                composer.picker.update(cx, |picker, cx| {
+                    // Starts on Favorites; step next twice then back once -> lands on first provider tab (`codex`).
+                    picker.step_provider(1, window, cx);
+                    picker.step_provider(1, window, cx);
+                    picker.step_provider(-1, window, cx);
+                    // Jump to 2nd model in `codex` (`gpt-5-mini`).
+                    picker.jump_to_model(1, cx);
+                });
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let selected = composer.read(cx).resolve(cx).model.expect("model selected via jump");
+            assert_eq!(selected.instance_id, "codex");
+            assert_eq!(selected.model, "gpt-5-mini");
+        });
+
+        // 6. `composer.branch` opens and closes the worktree base branch picker on a Git worktree draft.
+        cx.update_window(window.into(), |_, window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.sync_workspace(false, cx);
+                composer.workspace.is_repo = true;
+                composer.mutate_draft_workspace(cx, |w| w.mode = t3_core::server_config::ThreadEnvMode::Worktree);
+                assert!(!composer.workspace.branch_open);
+                composer.open_base_branch_picker(window, cx);
+                assert!(composer.workspace.branch_open, "composer.branch opens base branch picker");
+                composer.open_base_branch_picker(window, cx);
+                assert!(!composer.workspace.branch_open, "toggling composer.branch closes it");
+            });
+        })
+        .unwrap();
+
+        drop(_sub);
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
             cx.shutdown();

@@ -2,7 +2,7 @@
 //! "Open a surface" launcher (`RightPanelEmptyState`) from `components/RightPanelTabs.tsx`.
 
 use gpui::{AnyElement, App, ElementId, Entity, FontWeight, IntoElement, MouseButton, ParentElement, SharedString, Styled, Window, WindowControlArea, div, prelude::*, px};
-use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
 use t3_core::right_panel::{Surface, SurfaceKind, ThreadPanel};
 
@@ -108,7 +108,46 @@ fn open_side_chat(state: &mut AppState, cx: &mut gpui::Context<AppState>) {
     state.open_side_chat(None, cx);
 }
 
-pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: bool, window: &mut Window, cx: &mut App) -> AnyElement {
+pub(super) struct AddMenuEntry {
+    pub label: &'static str,
+    pub icon: Icon,
+    pub shortcut: &'static str,
+    pub open: fn(&mut AppState, &mut gpui::Context<AppState>),
+    pub unavailable: Option<&'static str>,
+}
+
+pub(super) fn add_menu_entries(state: &AppState, cx: &App) -> Vec<AddMenuEntry> {
+    let mut entries: Vec<AddMenuEntry> = SURFACE_ACTIONS
+        .iter()
+        .map(|action| AddMenuEntry {
+            label: action.label,
+            icon: action.icon,
+            shortcut: action.shortcut,
+            open: action.open,
+            unavailable: (action.unavailable)(state, cx),
+        })
+        .collect();
+    if let Some(reason) = side_chat_entry(state) {
+        entries.push(AddMenuEntry {
+            label: "Side chat",
+            icon: Icon::MessagesSquare,
+            shortcut: "S",
+            open: open_side_chat,
+            unavailable: reason,
+        });
+    }
+    entries
+}
+
+pub fn tab_bar(
+    state: Entity<AppState>,
+    panel: &ThreadPanel,
+    titlebar_inset: bool,
+    add_menu_open: bool,
+    on_toggle_add: impl Fn(&mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let count = panel.surfaces.len();
     let tabs: Vec<_> = panel
         .surfaces
@@ -119,9 +158,8 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
             tab(state.clone(), surface, index, count, active, window, cx)
         })
         .collect();
-    let add_state = state.clone();
-    let side_chat = side_chat_entry(state.read(cx));
-    let unavailable: Vec<Option<&'static str>> = SURFACE_ACTIONS.iter().map(|action| (action.unavailable)(state.read(cx), cx)).collect();
+    let add_tooltip = crate::keymap::label("rightPanel.new", cx)
+        .map_or_else(|| "Add panel surface".to_owned(), |key| format!("Add panel surface ({key})"));
     h_flex()
         .h(px(TITLEBAR_HEIGHT))
         .flex_none()
@@ -138,32 +176,78 @@ pub fn tab_bar(state: Entity<AppState>, panel: &ThreadPanel, titlebar_inset: boo
                 .children(tabs)
                 .child(
                     Button::new("right-panel-add")
-                        .variant(Variant::GhostMuted)
+                        .variant(if add_menu_open { Variant::Toggle } else { Variant::GhostMuted })
                         .size(Size::IconXs)
+                        .pressed(add_menu_open)
                         .icon(Icon::Plus)
-                        .tooltip("Add panel surface")
-                        .dropdown_menu(move |menu, _, _| {
-                            let menu = SURFACE_ACTIONS.iter().zip(unavailable.iter()).fold(menu, |menu, (action, unavailable)| {
-                                let state = add_state.clone();
-                                let open = action.open;
-                                menu.item(
-                                    PopupMenuItem::new(action.label)
-                                        .disabled(unavailable.is_some())
-                                        .on_click(move |_, _, cx| state.update(cx, open)),
-                                )
-                            });
-                            match side_chat {
-                                Some(reason) => {
-                                    let state = add_state.clone();
-                                    menu.item(PopupMenuItem::new("Side chat").disabled(reason.is_some()).on_click(move |_, _, cx| state.update(cx, open_side_chat)))
-                                }
-                                None => menu,
-                            }
-                        }),
+                        .tooltip(add_tooltip)
+                        .on_click(move |_, window, cx| on_toggle_add(window, cx)),
                 ),
         )
         .child(header_controls(&state, cx))
         .into_any_element()
+}
+
+pub(super) fn render_add_menu(
+    state: Entity<AppState>,
+    entries: &[AddMenuEntry],
+    highlighted: usize,
+    focus: &gpui::FocusHandle,
+    on_dismiss: impl Fn(bool, &mut App) + Clone + 'static,
+    on_key_down: impl Fn(&gpui::KeyDownEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let p = palette(cx);
+    let dismiss_out = on_dismiss.clone();
+    let rows = entries.iter().enumerate().map(|(index, entry)| {
+        let state = state.clone();
+        let open = entry.open;
+        let dismiss = on_dismiss.clone();
+        let active = index == highlighted && entry.unavailable.is_none();
+        h_flex()
+            .id(("right-panel-add-item", index))
+            .h(px(30.))
+            .w_full()
+            .px(px(8.))
+            .gap(px(8.))
+            .rounded(px(6.))
+            .text_xs()
+            .text_color(hsla(p.foreground))
+            .when(active, |this| this.bg(hsla(p.accent)))
+            .when(entry.unavailable.is_some(), |this| this.opacity(0.5))
+            .when(entry.unavailable.is_none(), |this| {
+                this.cursor_pointer()
+                    .hover(|style| style.bg(hsla(p.accent)))
+                    .on_click(move |_, _, cx| {
+                        dismiss(false, cx);
+                        state.update(cx, open);
+                    })
+            })
+            .when_some(entry.unavailable, |this, reason| {
+                this.tooltip(move |window, cx| super::tooltip_view(reason.into(), window, cx))
+            })
+            .child(entry.icon.svg().size(px(14.)).text_color(hsla(p.foreground)))
+            .child(div().flex_1().min_w_0().truncate().child(entry.label))
+            .child(kbd(entry.shortcut, cx))
+    });
+    let menu = crate::composer::controls::popup_surface(cx)
+        .id("right-panel-add-menu")
+        .track_focus(focus)
+        .occlude()
+        .w(px(216.))
+        .p(px(4.))
+        .on_mouse_down_out(move |_, _, cx| dismiss_out(true, cx))
+        .on_key_down(move |event, window, cx| on_key_down(event, window, cx))
+        .child(v_flex().gap(px(2.)).children(rows));
+    gpui::deferred(
+        div()
+            .absolute()
+            .top(px(TITLEBAR_HEIGHT))
+            .left(px(8.))
+            .child(menu),
+    )
+    .with_priority(50)
+    .into_any_element()
 }
 
 fn tab(state: Entity<AppState>, surface: &Surface, index: usize, count: usize, active: bool, window: &mut Window, cx: &mut App) -> AnyElement {

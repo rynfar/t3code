@@ -622,7 +622,7 @@ impl Composer {
         }
     }
 
-    pub(super) fn open_base_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_base_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.base_branch_picker_visible(cx) || self.is_rewinding(cx) {
             self.close_base_branch_picker(false, window, cx);
             cx.notify();

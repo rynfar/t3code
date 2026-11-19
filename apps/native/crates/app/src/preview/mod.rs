@@ -33,7 +33,7 @@ pub use pane::PreviewPane;
 use crate::app_state::{AppEvent, AppState};
 use crate::toast::{Toast, ToastKind};
 
-actions!(preview, [TogglePreview, Refresh, FocusUrl, ZoomIn, ZoomOut, ResetZoom]);
+actions!(preview, [TogglePreview, Refresh, FocusUrl, ZoomIn, ZoomOut, ResetZoom, Find]);
 
 const AUTHORIZATION_ERROR: &str = "EnvironmentAuthorizationError";
 

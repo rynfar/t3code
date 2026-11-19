@@ -235,6 +235,18 @@ fn action_items(state: &AppState) -> Vec<CommandPaletteItem> {
     items.push(action("action:next-thread", "Next thread", &["navigate"], Some("thread.next")));
     items.push(action("action:settings", "Open settings", &["settings", "preferences", "configuration", "keybindings"], None));
     items.push(action("action:usage", "Open usage", &["usage", "use", "tokens", "cost", "spend", "limits", "stats", "analytics"], Some("usage.open")));
+    items.push(action(
+        "action:workspace-focus:1",
+        "Focus Next Workspace Area",
+        &["Focus Next Workspace Area", "accessibility", "navigation", "focus", "F6"],
+        Some("workspace.focusNext"),
+    ));
+    items.push(action(
+        "action:workspace-focus:-1",
+        "Focus Previous Workspace Area",
+        &["Focus Previous Workspace Area", "accessibility", "navigation", "focus", "F6"],
+        Some("workspace.focusPrevious"),
+    ));
     items.push(action("action:switch-environment", "Switch environment...", &["environment", "server", "connect", "pair", "machine", "disconnect"], None));
     items
 }
@@ -1090,6 +1102,16 @@ impl CommandPalette {
                 "pull-requests" => Box::new(crate::pull_requests::OpenPullRequests),
                 "switch-environment" => Box::new(crate::menus::SwitchEnvironment),
                 "usage" => keymap::action_for("usage.open"),
+                "workspace-focus:1" => {
+                    let action = keymap::action_for("workspace.focusNext");
+                    window.defer(cx, move |window, cx| window.dispatch_action(action, cx));
+                    return;
+                }
+                "workspace-focus:-1" => {
+                    let action = keymap::action_for("workspace.focusPrevious");
+                    window.defer(cx, move |window, cx| window.dispatch_action(action, cx));
+                    return;
+                }
                 "theme-editor" => keymap::action_for("themeEditor.toggle"),
                 "project-pin" => {
                     self.state.update(cx, |state, cx| {
@@ -2256,6 +2278,18 @@ mod visit_recency_tests {
                 assert!(actions.iter().any(|item| item.value == "action:triage"));
                 assert!(actions.iter().any(|item| item.value == "action:share-thread-with-guest"));
                 assert!(actions.iter().any(|item| item.value == "action:restart-agent-session"));
+                let focus_next = actions
+                    .iter()
+                    .find(|item| item.value == "action:workspace-focus:1")
+                    .expect("workspace focus next");
+                assert_eq!(focus_next.title, "Focus Next Workspace Area");
+                assert_eq!(focus_next.shortcut_command.as_deref(), Some("workspace.focusNext"));
+                let focus_prev = actions
+                    .iter()
+                    .find(|item| item.value == "action:workspace-focus:-1")
+                    .expect("workspace focus prev");
+                assert_eq!(focus_prev.title, "Focus Previous Workspace Area");
+                assert_eq!(focus_prev.shortcut_command.as_deref(), Some("workspace.focusPrevious"));
 
                 // Without `filesystem:read`, both Files and Content modes disable the search input,
                 // and `open_target` refuses to open or close the palette if permission was revoked.

@@ -6,10 +6,13 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, BoxShadow, Context, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, div, hsla as gpui_hsla, point, px,
+    StatefulInteractiveElement, Styled, Task, Window, div, hsla as gpui_hsla, point, prelude::*, px,
 };
+use t3_client::supervisor::ConnectionStatus;
+use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
+use t3_core::project_search::{OPEN_IN_EDITOR, open_in_editor_request, preferred_editor};
 
-use crate::app_state::{AppEvent, AppState};
+use crate::app_state::{AppEvent, AppState, Phase};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -35,6 +38,8 @@ pub struct Toast {
     pub description: Option<SharedString>,
     /// Clicking the toast opens this thread ("Open thread" on the web's thread notifications).
     pub open_thread: Option<t3_core::sidebar::tag_filter::ThreadKey>,
+    /// Renders an inline `"Open keybindings.json"` action (`KeybindingsConfigWarning.tsx`).
+    pub open_keybindings_config: bool,
     persistent: bool,
     github_star: bool,
     replace_linked_prompt: Option<crate::composer::prompt_links::ReplaceLinkedPrompt>,
@@ -42,7 +47,16 @@ pub struct Toast {
 
 impl Toast {
     pub fn new(kind: ToastKind, title: impl Into<SharedString>) -> Toast {
-        Toast { kind, title: title.into(), description: None, open_thread: None, persistent: false, github_star: false, replace_linked_prompt: None }
+        Toast {
+            kind,
+            title: title.into(),
+            description: None,
+            open_thread: None,
+            open_keybindings_config: false,
+            persistent: false,
+            github_star: false,
+            replace_linked_prompt: None,
+        }
     }
 
     pub fn description(mut self, description: impl Into<SharedString>) -> Toast {
@@ -52,6 +66,11 @@ impl Toast {
 
     pub fn open_environment_thread(mut self, target: t3_core::sidebar::tag_filter::ThreadKey) -> Toast {
         self.open_thread = Some(target);
+        self
+    }
+
+    pub fn open_keybindings_config(mut self) -> Toast {
+        self.open_keybindings_config = true;
         self
     }
 
@@ -199,6 +218,49 @@ impl AppState {
             cx.emit(AppEvent::Notice);
         }
     }
+
+    /// `KeybindingsConfigWarning`: opening `keybindings.json` requires an online connection with
+    /// `orchestration:operate`, a non-empty `keybindingsConfigPath`, and an available editor.
+    pub(crate) fn keybindings_config_open_target(&self) -> Option<(String, &'static str)> {
+        if !matches!(self.phase, Phase::Online(ConnectionStatus::Connected)) {
+            return None;
+        }
+        let allowed = self
+            .client_handle()
+            .and_then(|client| client.session_state().borrow().clone())
+            .is_none_or(|session| session.grants(ORCHESTRATION_OPERATE_SCOPE));
+        if !allowed {
+            return None;
+        }
+        let config = self.server_config.config.as_ref()?;
+        let path = config.keybindings_config_path.clone().filter(|path| !path.is_empty())?;
+        preferred_editor(&config.available_editors, None).map(|(editor, _)| (path, editor))
+    }
+
+    pub(crate) fn can_open_keybindings_config(&self) -> bool {
+        self.keybindings_config_open_target().is_some()
+    }
+
+    /// Opens the server's `keybindings.json` in the preferred editor (`KeybindingsConfigWarning`).
+    /// On RPC failure, shows an error toast matching the web warning action.
+    pub(crate) fn open_keybindings_config(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((path, editor)) = self.keybindings_config_open_target() else {
+            return false;
+        };
+        let task = self.rpc(OPEN_IN_EDITOR, open_in_editor_request(&path, editor));
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                let _ = this.update(cx, |state, cx| {
+                    state.show_toast(
+                        Toast::new(ToastKind::Error, "Unable to open keybindings file").description(error.to_string()),
+                        cx,
+                    );
+                });
+            }
+        })
+        .detach();
+        true
+    }
 }
 
 fn toast_timer(id: u64, cx: &mut Context<AppState>) -> Task<()> {
@@ -260,6 +322,43 @@ fn render_toast(id: u64, toast_data: &Toast, state: &Entity<AppState>, window: &
     let toast = if toast_data.github_star {
         toast.children(crate::github_star_prompt::actions(id, state, window, cx))
     } else { toast };
+    let toast = if toast_data.open_keybindings_config {
+        let p = palette(cx);
+        let can_open = state.read(cx).can_open_keybindings_config();
+        let open_state = state.clone();
+        toast.child(
+            div().px(px(14.)).pb(px(12.)).flex().justify_end().child(
+                div()
+                    .id(SharedString::from(format!("toast-open-keybindings-{id}")))
+                    .h(px(24.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(hsla(p.border))
+                    .bg(hsla(p.background))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(hsla(p.foreground))
+                    .when(can_open, |this| {
+                        this.cursor_pointer()
+                            .hover(|this| this.bg(hsla(p.accent)))
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                open_state.update(cx, |state, cx| {
+                                    state.open_keybindings_config(cx);
+                                });
+                            })
+                    })
+                    .when(!can_open, |this| this.opacity(0.5))
+                    .child("Open keybindings.json"),
+            ),
+        )
+    } else {
+        toast
+    };
     let toast = if let Some(action) = toast_data.replace_linked_prompt.clone() {
         toast.child(div().px(px(14.)).pb(px(12.)).child(
             div().id(SharedString::from(format!("replace-linked-{id}"))).cursor_pointer().text_sm().text_color(hsla(palette(cx).primary)).child("Replace draft").on_click({
@@ -323,4 +422,157 @@ pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Opt
             .child(render_toast(front.0, &front.1, state, window, cx))
     };
     Some(gpui::deferred(container).with_priority(60).into_any_element())
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use gpui::{Render, size};
+    use serde_json::json;
+
+    #[gpui::test]
+    async fn keybindings_toast_gates_open_action_and_handles_rpc_errors(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        struct Root(Entity<AppState>);
+        impl Render for Root {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().children(stack(&self.0, window, cx))
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+
+        // 1. Offline -> disabled even with configPath + editors + operate scope.
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({"authenticated": true, "permissions": ["orchestration:read", "orchestration:operate"]}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |state, _| {
+            state.phase = Phase::Unpaired;
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.keybindings_config_path = Some("/tmp/keybindings.json".to_owned());
+                config.available_editors = vec!["vscode".to_owned()];
+            }
+        });
+        assert!(!state.read_with(cx, |state, _| state.can_open_keybindings_config()));
+
+        // 2. Online without `orchestration:operate` -> disabled.
+        fixture
+            .grants
+            .send(Some(serde_json::from_value(json!({"authenticated": true, "permissions": ["orchestration:read"]})).unwrap()))
+            .unwrap();
+        state.update(cx, |state, _| {
+            state.phase = Phase::Online(ConnectionStatus::Connected);
+        });
+        assert!(!state.read_with(cx, |state, _| state.can_open_keybindings_config()));
+
+        // 3. Online + `orchestration:operate`, but missing `configPath` -> disabled.
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({"authenticated": true, "permissions": ["orchestration:read", "orchestration:operate"]}))
+                    .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |state, _| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.keybindings_config_path = Some(String::new());
+                config.available_editors = vec!["vscode".to_owned()];
+            }
+        });
+        assert!(!state.read_with(cx, |state, _| state.can_open_keybindings_config()));
+
+        // 4. Online + `orchestration:operate` + `configPath`, but empty `availableEditors` -> disabled.
+        state.update(cx, |state, _| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.keybindings_config_path = Some("/tmp/keybindings.json".to_owned());
+                config.available_editors.clear();
+            }
+        });
+        assert!(!state.read_with(cx, |state, _| state.can_open_keybindings_config()));
+
+        // 5. All gates met -> enabled and resolves target.
+        state.update(cx, |state, _| {
+            if let Some(config) = state.server_config.config.as_mut() {
+                config.available_editors = vec!["vscode".to_owned()];
+            }
+        });
+        assert_eq!(
+            state.read_with(cx, |state, _| state.keybindings_config_open_target()),
+            Some(("/tmp/keybindings.json".to_owned(), "vscode"))
+        );
+
+        // Render warning toast with inline action button in both enabled & disabled states.
+        state.update(cx, |state, cx| {
+            state.show_toast(
+                Toast::new(ToastKind::Warning, "Invalid keybindings configuration")
+                    .description("Bad entry at index 0")
+                    .open_keybindings_config(),
+                cx,
+            );
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| Root(state.clone()));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        // Triggering open sends `shell.openInEditor` and surfaces an error toast on failure.
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut err_tx = Some(err_tx);
+        let _notice_sub = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event: &AppEvent, _| {
+                if *event == AppEvent::Notice
+                    && state.toasts.latest().is_some_and(|t| t.kind == ToastKind::Error)
+                    && let Some(tx) = err_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        let started = state.update(cx, |state, cx| state.open_keybindings_config(cx));
+        assert!(started);
+        let (method, payload, reply) = loop {
+            let (method, payload, reply) = fixture.next_request().await;
+            if method == OPEN_IN_EDITOR {
+                break (method, payload, reply);
+            }
+            let _ = reply.send(Ok(json!({})));
+        };
+        assert_eq!(method, OPEN_IN_EDITOR);
+        assert_eq!(payload["cwd"], "/tmp/keybindings.json");
+        assert_eq!(payload["editor"], "vscode");
+        reply
+            .send(Err(t3_client::session::RpcError::Failure(t3_core::rpc::RpcFailure {
+                tag: None,
+                message: "editor binary not found".into(),
+                error: serde_json::Value::Null,
+            })))
+            .unwrap();
+        err_rx.await.unwrap();
+        drop(_notice_sub);
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            let latest = state.toasts.latest().expect("error toast on open failure");
+            assert_eq!(latest.kind, ToastKind::Error);
+            assert_eq!(latest.title, "Unable to open keybindings file");
+            assert!(latest.description.as_deref().is_some_and(|d| d.contains("editor binary not found")));
+        });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
 }
