@@ -14,7 +14,8 @@ use gpui::Context;
 use t3_client::auth::{self, Credentials, Paired};
 use t3_client::load_balancing::{
     CandidateProvider, DEFAULT_LOAD_BALANCING_WEIGHT, DraftEnvironmentCandidate,
-    attachments_block_auto_routing_warning, eligible_load_balancing_candidates,
+    HostResourcesSnapshot, attachments_block_auto_routing_warning,
+    eligible_load_balancing_candidates, fetch_candidate_host_resources,
     load_balancing_send_warning, refresh_load_balanced_selection,
 };
 use t3_client::local::{self, LocalServer};
@@ -409,6 +410,12 @@ impl AppState {
         Err(PeerPairingCodeError::unavailable(Some("The environment is not connected.".to_owned())))
     }
 
+    /// Whether this client is currently connected to `environment_id` with a session authorized to
+    /// mint one-use pairing codes (`access:write`).
+    pub fn can_mint_pairing_code_on(&self, environment_id: &str) -> bool {
+        self.peer_pairing_credentials(environment_id).is_ok()
+    }
+
     /// `mintPairingCodeOn` (`apps/web/src/state/peerPairingCode.ts`):
     /// mints a fresh one-use pairing code on `environment_id` using this client's session there.
     pub fn mint_pairing_code_on(
@@ -430,7 +437,6 @@ impl AppState {
 
     /// `mintMcpApprovalCodeOn` (`apps/web/src/state/peerPairingCode.ts`):
     /// mints a fresh one-use code on `environment_id` that approves one app's sign-in at `access`.
-    #[allow(dead_code)]
     pub fn mint_mcp_approval_code_on(
         &self,
         environment_id: &str,
@@ -445,6 +451,146 @@ impl AppState {
                 .spawn(async move { auth::mint_mcp_approval_code(&credentials, &access).await })
                 .await
                 .map_err(|error| PeerPairingCodeError::unavailable(Some(error.to_string())))?
+        }
+    }
+
+    /// Collects connected fleet environments hosting a logical project's `(saved_id, project_id)`
+    /// registrations that are eligible for automatic load balancing (`useDraftEnvironmentRouting.ts`).
+    pub fn load_balancing_candidates_for_project_envs(
+        &self,
+        project_envs: &[(String, String)],
+        selected_provider_driver: Option<&str>,
+        active_provider_instance_id: Option<&str>,
+        referenced_thread_environment_ids: &[String],
+        weights: &HashMap<String, f64>,
+    ) -> Vec<DraftEnvironmentCandidate> {
+        let mut raw = Vec::new();
+        for (saved_id, project_id) in project_envs {
+            let Some(view) = self.fleet.environment(saved_id) else {
+                continue;
+            };
+            let canonical_id = view
+                .config
+                .config
+                .as_ref()
+                .map(|c| c.environment.environment_id.clone())
+                .filter(|id| !id.is_empty())
+                .or_else(|| {
+                    self.environments
+                        .get(saved_id)
+                        .and_then(|saved| saved.environment_id.clone())
+                })
+                .unwrap_or_else(|| saved_id.clone());
+            let weight = weights
+                .get(&canonical_id)
+                .or_else(|| weights.get(saved_id))
+                .copied()
+                .unwrap_or(DEFAULT_LOAD_BALANCING_WEIGHT);
+            let providers = view
+                .config
+                .config
+                .as_ref()
+                .map(|cfg| {
+                    cfg.providers
+                        .iter()
+                        .map(|provider| CandidateProvider {
+                            instance_id: provider.instance_id.clone(),
+                            driver: provider.driver.clone(),
+                            enabled: t3_core::providers::instance_enabled(
+                                &cfg.settings,
+                                Some(project_id.as_str()),
+                                &provider.instance_id,
+                            ),
+                            installed: provider.installed,
+                            status: provider.status.clone(),
+                            auth_status: (!provider.auth.status.is_empty())
+                                .then(|| provider.auth.status.clone()),
+                            availability: provider.availability.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            raw.push(DraftEnvironmentCandidate {
+                saved_id: saved_id.clone(),
+                environment_id: canonical_id,
+                project_id: Some(project_id.clone()),
+                connected: view.status == ConnectionStatus::Connected,
+                weight,
+                providers,
+            });
+        }
+        match selected_provider_driver {
+            Some(driver) if !driver.trim().is_empty() => eligible_load_balancing_candidates(
+                &raw,
+                referenced_thread_environment_ids,
+                driver,
+                active_provider_instance_id,
+            ),
+            _ => raw
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.connected
+                        && candidate.project_id.is_some()
+                        && candidate.weight.is_finite()
+                        && candidate.weight > 0.0
+                        && referenced_thread_environment_ids
+                            .iter()
+                            .all(|env_id| env_id == &candidate.environment_id)
+                })
+                .collect(),
+        }
+    }
+
+    /// Concurrently queries `server.getHostResources` across `candidates` on the network runtime.
+    /// Candidates whose supervisor client is unavailable settle with `None` so callers record the
+    /// failure instead of staying pending indefinitely.
+    pub fn fetch_load_balancing_resources(
+        &self,
+        candidates: &[DraftEnvironmentCandidate],
+    ) -> impl Future<Output = Vec<(String, Option<HostResourcesSnapshot>, i64)>> + Send + 'static + use<> {
+        let active_id = self.environments.active.clone();
+        let active_client = self.client_handle();
+        let lookups: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                let immediate = (active_id.as_deref() == Some(candidate.saved_id.as_str()))
+                    .then(|| active_client.clone())
+                    .flatten();
+                let lookup = immediate.is_none().then(|| self.connections.client(&candidate.saved_id));
+                (candidate.environment_id.clone(), immediate, lookup)
+            })
+            .collect();
+        let runtime = self.runtime().clone();
+        async move {
+            runtime
+                .spawn(async move {
+                    let mut ready = Vec::with_capacity(lookups.len());
+                    let mut missing = Vec::new();
+                    for (env_id, immediate, lookup) in lookups {
+                        let client = match immediate {
+                            Some(handle) => Some(handle),
+                            None => match lookup {
+                                Some(fut) => fut.await,
+                                None => None,
+                            },
+                        };
+                        match client {
+                            Some(handle) => ready.push((env_id, handle)),
+                            None => missing.push(env_id),
+                        }
+                    }
+                    let mut out = fetch_candidate_host_resources(ready).await;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    for env_id in missing {
+                        out.push((env_id, None, now_ms));
+                    }
+                    out
+                })
+                .await
+                .unwrap_or_default()
         }
     }
 

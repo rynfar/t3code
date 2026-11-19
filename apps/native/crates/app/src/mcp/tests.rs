@@ -143,7 +143,7 @@ async fn palette_action_opens_use_in_another_app_wizard_and_walks_steps_and_mint
                 }
             }),
         ),
-        // 4. POST /api/auth/pairing-token
+        // 4. POST /api/auth/pairing-token (success)
         (
             200,
             json!({
@@ -153,6 +153,16 @@ async fn palette_action_opens_use_in_another_app_wizard_and_walks_steps_and_mint
                 "expiresAt": "2099-01-01T00:00:00.000Z",
                 "access": "auto"
             }),
+        ),
+        // 5. POST /api/auth/pairing-token (403 -> NotAllowed)
+        (
+            403,
+            json!({ "error": "access:write required" }),
+        ),
+        // 6. POST /api/auth/pairing-token (500 -> Unavailable)
+        (
+            500,
+            json!({ "error": "server unavailable" }),
         ),
     ]));
 
@@ -343,6 +353,70 @@ async fn palette_action_opens_use_in_another_app_wizard_and_walks_steps_and_mint
         assert_eq!(
             dialogs.read(cx).wizard.read(cx).test_minted_credential(),
             Some("AUTO-Q8RZ3NWD5KTC")
+        );
+        assert_eq!(dialogs.read(cx).wizard.read(cx).test_mint_error(), None);
+    });
+
+    // Verify `mint_mcp_approval_code_on` classifies HTTP 403 (`NotAllowed`) and HTTP 500 (`Unavailable`).
+    let wizard_entity = cx.update(|cx| dialogs.read(cx).wizard.clone());
+    let (err403_tx, err403_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut err403_tx = Some(err403_tx);
+    let _err403_obs = cx.update(|cx| {
+        cx.observe(&wizard_entity, move |wizard, cx| {
+            if wizard.read(cx).test_mint_error().is_some()
+                && let Some(tx) = err403_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        })
+    });
+    cx.update_window(window.into(), |_, _, cx| {
+        wizard_entity.update(cx, |wizard, cx| {
+            wizard.test_mint_code(McpClientAccess::FullAccess, cx);
+        });
+    })
+    .unwrap();
+    err403_rx.await.unwrap();
+    drop(_err403_obs);
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let err = wizard_entity
+            .read(cx)
+            .test_mint_error()
+            .expect("403 mint error");
+        assert!(
+            err.contains("cannot create pairing codes"),
+            "403 should map to PeerPairingCodeError::NotAllowed, got: {err}"
+        );
+    });
+
+    let (err500_tx, err500_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut err500_tx = Some(err500_tx);
+    let _err500_obs = cx.update(|cx| {
+        cx.observe(&wizard_entity, move |wizard, cx| {
+            if wizard
+                .read(cx)
+                .test_mint_error()
+                .is_some_and(|msg| msg.contains("Could not get a code from Mac Studio"))
+                && let Some(tx) = err500_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        })
+    });
+    cx.update_window(window.into(), |_, _, cx| {
+        wizard_entity.update(cx, |wizard, cx| {
+            wizard.test_mint_code(McpClientAccess::ReadOnly, cx);
+        });
+    })
+    .unwrap();
+    err500_rx.await.unwrap();
+    drop(_err500_obs);
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            wizard_entity.read(cx).test_mint_error(),
+            Some("Could not get a code from Mac Studio. Try again.")
         );
     });
 

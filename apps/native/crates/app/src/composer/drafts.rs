@@ -392,6 +392,49 @@ impl Composer {
         cx.notify();
         true
     }
+
+    /// Retargets a draft across machines while preserving multi-model fan-out selections
+    /// (`useDraftEnvironmentRouting.ts:177-188`) and clearing stale source-machine workspace
+    /// bindings even when both machines share the same `project_id`.
+    pub(super) fn retarget_draft_for_routing(
+        &mut self,
+        from_project: &str,
+        to_project: &str,
+        same_env: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let from = Target::Draft(from_project.to_owned());
+        let to = Target::Draft(to_project.to_owned());
+        let multi_models = self
+            .choices
+            .get(&from)
+            .map(|c| c.multi_models.clone())
+            .unwrap_or_default();
+        if from_project != to_project {
+            self.retarget_draft(from_project, to_project, same_env, window, cx);
+        } else if !same_env {
+            self.clear_draft_workspace(to_project, cx);
+        }
+        if !multi_models.is_empty() {
+            self.choices.entry(to).or_default().multi_models = multi_models;
+        }
+    }
+
+    /// Clears a draft's stored `DraftWorkspace` (for example when switching machines or enabling
+    /// automatic routing).
+    pub(super) fn clear_draft_workspace(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let target = Target::Draft(project_id.to_owned());
+        let storage_key = key(&target);
+        if let Some(mut draft) = self.drafts.store.get(&storage_key).cloned()
+            && draft.workspace.is_some()
+        {
+            draft.workspace = None;
+            if self.mutate_drafts(cx, |store| store.set(&storage_key, draft)) {
+                self.schedule_draft_save(&target, cx);
+            }
+        }
+    }
 }
 
 impl Composer {
@@ -520,8 +563,7 @@ impl Composer {
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn set_test_prompt(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_prompt(text, window, cx);
-        self.draft_changed(cx);
+        self.replace_prompt_text(text, window, cx);
     }
 
     #[cfg(all(test, feature = "snapshot"))]

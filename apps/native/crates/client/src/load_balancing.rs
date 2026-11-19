@@ -297,6 +297,19 @@ pub async fn fetch_host_resources(client: &ClientHandle) -> Option<HostResources
     serde_json::from_value(reply).ok()
 }
 
+/// Concurrently fetches `server.getHostResources` across `(environment_id, client)` pairs,
+/// returning `(environment_id, resources, received_at_ms)` tuples for callers that maintain their
+/// own `HostResourcesCache` (`useLoadBalancedEnvironment.ts`).
+pub async fn fetch_candidate_host_resources(
+    candidates: Vec<(String, ClientHandle)>,
+) -> Vec<(String, Option<HostResourcesSnapshot>, i64)> {
+    let futures = candidates.into_iter().map(|(environment_id, client)| async move {
+        let resources = fetch_host_resources(&client).await;
+        (environment_id, resources, wall_now_ms())
+    });
+    futures::future::join_all(futures).await
+}
+
 /// Concurrently refreshes host resources across all `candidates` `(environment_id, client, weight)`
 /// through the shared `HostResourcesCache` and selects the best environment
 /// (`refreshSelection` in `useLoadBalancedEnvironment.ts`).
@@ -310,20 +323,18 @@ pub async fn refresh_load_balanced_selection(
 
     let mut env_ids = Vec::with_capacity(candidates.len());
     let mut weights = HashMap::with_capacity(candidates.len());
+    let mut fetch_inputs = Vec::with_capacity(candidates.len());
     {
         let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (environment_id, _, weight) in &candidates {
-            guard.mark_pending(environment_id);
+        for (environment_id, client, weight) in candidates {
+            guard.mark_pending(&environment_id);
             env_ids.push(environment_id.clone());
-            weights.insert(environment_id.clone(), *weight);
+            weights.insert(environment_id.clone(), weight);
+            fetch_inputs.push((environment_id, client));
         }
     }
 
-    let futures = candidates.into_iter().map(|(environment_id, client, _weight)| async move {
-        let resources = fetch_host_resources(&client).await;
-        (environment_id, resources, wall_now_ms())
-    });
-    let resolved = futures::future::join_all(futures).await;
+    let resolved = fetch_candidate_host_resources(fetch_inputs).await;
     let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     for (environment_id, resources, received_at_ms) in resolved {
         guard.record(&environment_id, resources, received_at_ms);

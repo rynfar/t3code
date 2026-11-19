@@ -26,8 +26,8 @@ use t3_core::mcp::gate::{
     is_managed_tunnel_active, resolve_mcp_gate, resolve_t3_connect_turn_on,
 };
 use t3_core::mcp::{
-    AccessEnvironmentCandidate, McpClientAccess, MintedApprovalCode, PeerLinkEntry,
-    RELAY_READ_SCOPE, RELAY_WRITE_SCOPE, approval_code_request_body, default_wizard_access,
+    AccessEnvironmentCandidate, McpClientAccess, PeerLinkEntry,
+    RELAY_READ_SCOPE, RELAY_WRITE_SCOPE, default_wizard_access,
     format_code_expiry, format_linked_line, resolve_access_environment_id, ungrantable_levels,
 };
 use t3_core::settings::search::Section;
@@ -688,29 +688,24 @@ impl UseInAnotherAppDialog {
         }));
     }
 
-    fn mint_approval_code(&mut self, access: McpClientAccess, env_name: String, cx: &mut Context<Self>) {
-        let Some(client) = self.active_client.clone() else {
-            return;
-        };
+    fn mint_approval_code(
+        &mut self,
+        env_id: String,
+        access: McpClientAccess,
+        env_name: String,
+        cx: &mut Context<Self>,
+    ) {
         let generation = self.generation;
         self.mint_pending = true;
         self.mint_error = None;
         cx.notify();
 
-        let body = approval_code_request_body(access);
-        let runtime = self.state.read(cx).runtime().clone();
+        let mint = self
+            .state
+            .read(cx)
+            .mint_mcp_approval_code_on(&env_id, access.as_str());
         self._mint_task = Some(cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move {
-                    client
-                        .post_access("/api/auth/pairing-token", Some(body))
-                        .await
-                        .and_then(|v| {
-                            serde_json::from_value::<MintedApprovalCode>(v)
-                                .map_err(|_| "Invalid pairing code response.".to_owned())
-                        })
-                })
-                .await;
+            let result = mint.await;
             let _ = this.update(cx, |this, cx| {
                 if !this.open || this.generation != generation {
                     return;
@@ -718,8 +713,11 @@ impl UseInAnotherAppDialog {
                 this.mint_pending = false;
                 this._mint_task = None;
                 match result {
-                    Ok(Ok(minted)) => {
-                        let expires_at_ms = parse_iso(&minted.expires_at)
+                    Ok(minted) => {
+                        let expires_at_ms = minted
+                            .expires_at
+                            .as_deref()
+                            .and_then(parse_iso)
                             .unwrap_or_else(|| now_ms() + 5 * 60 * 1000);
                         this.minted_code = Some(MintedCode {
                             credential: minted.credential,
@@ -728,9 +726,15 @@ impl UseInAnotherAppDialog {
                         this.mint_error = None;
                         this.ensure_code_ticker(cx);
                     }
-                    _ => {
-                        this.mint_error =
-                            Some(format!("Could not get a code from {env_name}. Try again."));
+                    Err(error) => {
+                        this.mint_error = Some(match error.reason {
+                            t3_core::pairing::PeerPairingCodeErrorReason::NotAllowed => {
+                                error.to_string()
+                            }
+                            t3_core::pairing::PeerPairingCodeErrorReason::Unavailable => {
+                                format!("Could not get a code from {env_name}. Try again.")
+                            }
+                        });
                     }
                 }
                 cx.notify();
@@ -1321,6 +1325,7 @@ impl UseInAnotherAppDialog {
 
     fn render_approval_code_section(
         &self,
+        env_id: &str,
         env_name: &str,
         app_name: &str,
         access: Option<McpClientAccess>,
@@ -1345,6 +1350,7 @@ impl UseInAnotherAppDialog {
         let remaining_secs = live_code
             .map(|code| ((code.expires_at_ms - now).max(0) / 1000) as u64)
             .unwrap_or(0);
+        let env_id_owned = env_id.to_owned();
         let env_label = env_name.to_owned();
         let copied = self.copied_key.as_deref() == Some("code");
         let view = cx.entity().clone();
@@ -1377,7 +1383,12 @@ impl UseInAnotherAppDialog {
                                 .label(label)
                                 .disabled(self.mint_pending)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.mint_approval_code(access, env_label.clone(), cx);
+                                    this.mint_approval_code(
+                                        env_id_owned.clone(),
+                                        access,
+                                        env_label.clone(),
+                                        cx,
+                                    );
                                 })),
                         )
                     }),
@@ -1472,7 +1483,8 @@ impl UseInAnotherAppDialog {
             },
             cx,
         );
-        let code_section = self.render_approval_code_section(&env.label, app_name, access, cx);
+        let code_section =
+            self.render_approval_code_section(&env.saved_id, &env.label, app_name, access, cx);
         let linked = self.render_linked_line(access, cx);
 
         if self.another_way || app.is_none() {
@@ -1911,11 +1923,15 @@ impl UseInAnotherAppDialog {
 
     pub(crate) fn test_mint_code(&mut self, access: McpClientAccess, cx: &mut Context<Self>) {
         if let Some(env) = self.resolve_environment(cx) {
-            self.mint_approval_code(access, env.label, cx);
+            self.mint_approval_code(env.saved_id, access, env.label, cx);
         }
     }
 
     pub(crate) fn test_minted_credential(&self) -> Option<&str> {
         self.minted_code.as_ref().map(|c| c.credential.as_str())
+    }
+
+    pub(crate) fn test_mint_error(&self) -> Option<&str> {
+        self.mint_error.as_deref()
     }
 }

@@ -1,13 +1,19 @@
-//! Draft workspace menu and previous entry from `BranchToolbar.tsx`,
-//! `BranchToolbarEnvModeSelector.tsx` and `PreviousWorktreeItemContent.tsx`.
+//! Draft workspace menu, previous worktree entry, and automatic draft environment routing from
+//! `BranchToolbar.tsx`, `BranchToolbarEnvironmentSelector.tsx`, `BranchToolbarEnvModeSelector.tsx`,
+//! `PreviousWorktreeItemContent.tsx`, `useLoadBalancedEnvironment.ts`, and
+//! `useDraftEnvironmentRouting.ts`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui::{AnyElement, App, Context, Entity, IntoElement, ParentElement, ScrollHandle, Styled, Subscription, Task, Window, div, prelude::*, px};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{h_flex, v_flex};
+use t3_client::load_balancing::{
+    DraftEnvironmentCandidate, HOST_RESOURCES_FRESH_MS, HostResourcesCache,
+    attachments_block_auto_routing_warning, auto_environment_label,
+};
 use t3_core::commands::method;
 use t3_core::server_config::ThreadEnvMode;
 use t3_core::sidebar::grouping::{EnvironmentOwner, GroupConsumer};
@@ -21,7 +27,9 @@ use super::menu::MenuKey;
 use crate::app_state::ScopedRouteAction;
 use crate::icons::Icon;
 use crate::new_thread::environment_machine_icon;
+use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
+use crate::toast::{Toast, ToastKind};
 
 const BASE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 const START_FROM_REMOTE_TOOLTIP: &str = "Uses the latest commit of the base branch’s tracked remote branch, even if its name differs. Otherwise uses the same-named branch on origin. Uses your local branch if that remote branch is missing.";
@@ -35,6 +43,39 @@ struct Scope {
     connection: u64,
     generation: u64,
     destination: (String, String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum DraftEnvSelection {
+    /// Follow load balancing when enabled and eligible; default for new drafts.
+    #[default]
+    Implicit,
+    /// User explicitly picked `"Auto balance"` in the Run-on menu (overrides a selected branch).
+    Auto,
+    /// User manually chose a specific machine.
+    Manual,
+}
+
+#[derive(Default)]
+pub(super) struct DraftRouting {
+    /// Logical project group key this draft routing state belongs to, so self-initiated
+    /// retargeting across machines in the same logical project preserves routing state.
+    pub(super) logical_project_key: Option<String>,
+    pub(super) selection: DraftEnvSelection,
+    /// Canonical `environment_id` picked by automatic load balancing (`loadBalancedEnvironmentId`).
+    pub(super) resolved_environment_id: Option<String>,
+    /// `(saved_id, project_id)` of an in-flight `navigate_scoped` initiated by auto-routing or
+    /// `refreshBeforeSend`, so the transient `clear_connection_state` gap before the target
+    /// environment activates does not wipe `selection` / `resolved_environment_id`.
+    pub(super) pending_navigation: Option<(String, String)>,
+    /// Bounded in-memory cache of `server.getHostResources` snapshots per canonical `environment_id`.
+    pub(super) cache: HostResourcesCache,
+    /// Generation counter guarding async host resource queries against stale replies.
+    generation: u64,
+    /// Canonical env IDs currently being queried to avoid duplicate concurrent fetches.
+    in_flight_ids: Vec<String>,
+    pub(super) task: Option<Task<()>>,
+    expiry_timer: Option<Task<()>>,
 }
 
 #[derive(Default)]
@@ -63,19 +104,22 @@ pub(super) struct Workspace {
     loading: bool,
     error: Option<String>,
     task: Option<Task<()>>,
+    pub(super) routing: DraftRouting,
 }
 
 #[derive(Clone)]
 pub(super) struct HostOption {
-    owner: Option<EnvironmentOwner>,
+    pub(super) owner: Option<EnvironmentOwner>,
     pub(super) saved_id: String,
-    project_id: String,
-    label: String,
+    pub(super) canonical_environment_id: String,
+    pub(super) project_id: String,
+    pub(super) label: String,
     is_primary: bool,
 }
 
 #[derive(Default)]
 pub(super) struct HostOptions {
+    pub(super) logical_project_key: Option<String>,
     pub(super) active: Option<HostOption>,
     pub(super) options: Vec<HostOption>,
     pub(super) add_targets: Vec<HostOption>,
@@ -116,10 +160,12 @@ impl Composer {
         })();
         let changed = scope != self.workspace.scope;
         if changed {
+            let routing = std::mem::take(&mut self.workspace.routing);
             self.workspace = Workspace {
                 scope: scope.clone(),
                 base_search: self.workspace.base_search.take(),
                 base_search_sub: self.workspace.base_search_sub.take(),
+                routing,
                 ..Default::default()
             };
         }
@@ -253,12 +299,19 @@ impl Composer {
         self.workspace.open = false;
         self.close_base_branch_picker(false, window, cx);
         if self.workspace.host_open {
-            let active = self.state.read(cx).environments.active.as_deref();
-            self.workspace.host_highlighted = host
-                .options
-                .iter()
-                .position(|opt| active == Some(opt.saved_id.as_str()))
-                .unwrap_or(0);
+            let offer_auto = self.can_offer_auto_balance(&host, cx);
+            let auto_active = self.draft_auto_environment_label(&host, cx).is_some();
+            if offer_auto && auto_active {
+                self.workspace.host_highlighted = 0;
+            } else {
+                let offset = usize::from(offer_auto);
+                let active = self.state.read(cx).environments.active.as_deref();
+                self.workspace.host_highlighted = host
+                    .options
+                    .iter()
+                    .position(|opt| active == Some(opt.saved_id.as_str()))
+                    .map_or(0, |idx| idx + offset);
+            }
         }
         self.focus(window, cx);
         cx.notify();
@@ -290,8 +343,10 @@ impl Composer {
                 cx.notify();
                 return false;
             }
+            let offer_auto = self.can_offer_auto_balance(&host, cx);
+            let auto_offset = usize::from(offer_auto);
             let has_add = !host.add_targets.is_empty();
-            let count = host.options.len() + usize::from(has_add);
+            let count = auto_offset + host.options.len() + usize::from(has_add);
             self.workspace.host_highlighted = self.workspace.host_highlighted.min(count - 1);
             match key {
                 MenuKey::Up => self.workspace.host_highlighted = (self.workspace.host_highlighted + count - 1) % count,
@@ -301,9 +356,17 @@ impl Composer {
                     self.focus(window, cx);
                 }
                 MenuKey::Accept => {
-                    if let Some(option) = host.options.get(self.workspace.host_highlighted).cloned() {
+                    if offer_auto && self.workspace.host_highlighted == 0 {
+                        self.select_auto_host(window, cx);
+                    } else if let Some(option) = self
+                        .workspace
+                        .host_highlighted
+                        .checked_sub(auto_offset)
+                        .and_then(|idx| host.options.get(idx))
+                        .cloned()
+                    {
                         self.select_host(option, window, cx);
-                    } else if has_add && self.workspace.host_highlighted == host.options.len() {
+                    } else if has_add && self.workspace.host_highlighted == auto_offset + host.options.len() {
                         self.open_add_project_to_machine(window, cx);
                     }
                 }
@@ -728,6 +791,29 @@ impl Composer {
         cx.notify();
     }
 
+    fn canonical_env_id_for(state: &crate::app_state::AppState, saved_id: &str, owner: Option<&EnvironmentOwner>) -> String {
+        state
+            .scoped_environment(saved_id)
+            .and_then(|entry| entry.config.config.as_ref())
+            .map(|cfg| cfg.environment.environment_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| owner.and_then(|o| o.canonical_id.clone()).filter(|id| !id.is_empty()))
+            .or_else(|| {
+                state
+                    .environments
+                    .get(saved_id)
+                    .and_then(|saved| saved.environment_id.clone())
+                    .filter(|id| !id.is_empty())
+            })
+            .or_else(|| {
+                (state.environments.active.as_deref() == Some(saved_id))
+                    .then(|| state.server_config.config.as_ref().map(|cfg| cfg.environment.environment_id.clone()))
+                    .flatten()
+                    .filter(|id| !id.is_empty())
+            })
+            .unwrap_or_else(|| saved_id.to_owned())
+    }
+
     pub(super) fn host_options(&self, cx: &App) -> HostOptions {
         let state = self.state.read(cx);
         let active_env = state.environments.active.as_deref();
@@ -747,14 +833,22 @@ impl Composer {
                 let opt = HostOption {
                     owner: None,
                     saved_id: saved.id.clone(),
+                    canonical_environment_id: Self::canonical_env_id_for(state, &saved.id, None),
                     project_id: active_project.unwrap_or_default().to_owned(),
                     label: Self::resolved_host_label(is_primary, runtime_label, Some(&saved.label), &saved.id),
                     is_primary,
                 };
-                return HostOptions { active: Some(opt), options: Vec::new(), add_targets: Vec::new(), can_pick: false };
+                return HostOptions {
+                    logical_project_key: None,
+                    active: Some(opt),
+                    options: Vec::new(),
+                    add_targets: Vec::new(),
+                    can_pick: false,
+                };
             }
             return HostOptions::default();
         }
+        let mut logical_project_key: Option<String> = None;
         let mut group_options: Vec<HostOption> = Vec::new();
         let mut active_remote_url = false;
         if let Some(pid) = active_project {
@@ -776,6 +870,7 @@ impl Composer {
                 if !matches {
                     continue;
                 }
+                logical_project_key = Some(group.key.clone());
                 for reg in group.registrations {
                     if !active_remote_url {
                         active_remote_url = reg
@@ -795,9 +890,11 @@ impl Composer {
                         .map(|e| e.label.as_str());
                     let label = Self::resolved_host_label(is_primary, Some(&reg.environment_label), saved_label, &reg.owner.saved_id);
                     let saved_id = reg.owner.saved_id.clone();
+                    let canonical_environment_id = Self::canonical_env_id_for(state, &saved_id, Some(&reg.owner));
                     group_options.push(HostOption {
                         owner: Some(reg.owner),
                         saved_id,
+                        canonical_environment_id,
                         project_id: reg.project.id,
                         label,
                         is_primary,
@@ -815,9 +912,11 @@ impl Composer {
                 let is_primary = primary_id == Some(saved.id.as_str()) || saved.local;
                 let owner = state.scoped_environment(&saved.id).map(|entry| entry.summary.owner.clone());
                 let runtime_label = state.server_config.config.as_ref().map(|cfg| cfg.environment.label.as_str());
+                let canonical_environment_id = Self::canonical_env_id_for(state, &saved.id, owner.as_ref());
                 Some(HostOption {
                     owner,
                     saved_id: saved.id.clone(),
+                    canonical_environment_id,
                     project_id: active_project.unwrap_or_default().to_owned(),
                     label: Self::resolved_host_label(is_primary, runtime_label, Some(&saved.label), &saved.id),
                     is_primary,
@@ -846,9 +945,11 @@ impl Composer {
                     .map(|e| e.label.as_str());
                 let runtime_label = entry.config.config.as_ref().map(|cfg| cfg.environment.label.as_str());
                 let label = Self::resolved_host_label(is_primary, runtime_label, saved_label, &entry.summary.owner.saved_id);
+                let canonical_environment_id = Self::canonical_env_id_for(state, &entry.summary.owner.saved_id, Some(&entry.summary.owner));
                 add_targets.push(HostOption {
                     owner: Some(entry.summary.owner.clone()),
                     saved_id: entry.summary.owner.saved_id.clone(),
+                    canonical_environment_id,
                     project_id: String::new(),
                     label,
                     is_primary,
@@ -866,11 +967,415 @@ impl Composer {
         if !show {
             return HostOptions::default();
         }
-        HostOptions { active, options: group_options, add_targets, can_pick }
+        HostOptions { logical_project_key, active, options: group_options, add_targets, can_pick }
     }
 
-    fn select_host(&mut self, option: HostOption, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn load_balancing_enabled(&self, cx: &App) -> bool {
+        crate::settings::store::try_client(cx)
+            .is_some_and(t3_core::settings::read_load_balancing_enabled)
+    }
+
+    pub(super) fn load_balancing_weights(&self, cx: &App) -> HashMap<String, f64> {
+        crate::settings::store::try_client(cx)
+            .map(t3_core::settings::read_load_balancing_weights)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k, f64::from(v)))
+            .collect()
+    }
+
+    /// Environment IDs of `@thread` contexts currently referenced in the draft prompt
+    /// (`referencedThreadContexts` in `composerSend.logic.ts`).
+    pub(super) fn referenced_thread_environment_ids(&self, cx: &App) -> Vec<String> {
+        let Some(target) = self.snapshot.target.as_ref() else {
+            return Vec::new();
+        };
+        let prompt = self.draft_prompt(cx);
+        let referenced = t3_core::composer::menu::referenced_context_ids(&prompt);
+        if referenced.is_empty() {
+            return Vec::new();
+        }
+        let mut ids = Vec::new();
+        for mention in self.mentions(target) {
+            if referenced.contains(&mention.context_id.as_str())
+                && !mention.environment_id.is_empty()
+                && !ids.contains(&mention.environment_id)
+            {
+                ids.push(mention.environment_id.clone());
+            }
+        }
+        for record in self.records_for(target) {
+            if t3_core::composer::records::field(record, "kind") != "thread" {
+                continue;
+            }
+            let cid = t3_core::composer::records::field(record, "contextId");
+            if !referenced.contains(&cid) {
+                continue;
+            }
+            let env_id = t3_core::composer::records::field(record, "environmentId");
+            if !env_id.is_empty() && !ids.iter().any(|existing| existing == env_id) {
+                ids.push(env_id.to_owned());
+            }
+        }
+        ids
+    }
+
+    /// Whether the Run-on menu offers `"Auto balance"` (`ChatView.tsx:3822-3828`).
+    pub(super) fn can_offer_auto_balance(&self, host: &HostOptions, cx: &App) -> bool {
+        if self.fixed.is_some() || self.is_rewinding(cx) || host.options.len() <= 1 {
+            return false;
+        }
+        let Some(Target::Draft(project_id)) = self.snapshot.target.as_ref() else {
+            return false;
+        };
+        !self.state.read(cx).is_scratch_project(project_id) && self.load_balancing_enabled(cx)
+    }
+
+    /// Whether this unsent draft currently runs in automatic load-balancing mode
+    /// (`automaticEnvironment` in `ChatView.tsx:1315-1325`).
+    pub(super) fn automatic_environment(&self, host: &HostOptions, cx: &App) -> bool {
+        if !self.can_offer_auto_balance(host, cx) {
+            return false;
+        }
+        if self.workspace.routing.selection == DraftEnvSelection::Manual {
+            return false;
+        }
+        let has_attachments = !self.staged_attachments().is_empty();
+        if has_attachments && self.workspace.routing.resolved_environment_id.is_none() {
+            return false;
+        }
+        let choice = self.workspace_choice();
+        if choice.and_then(|c| c.previous.as_ref()).is_some() {
+            return false;
+        }
+        if choice.and_then(|c| c.branch.as_ref()).is_some()
+            && self.workspace.routing.selection != DraftEnvSelection::Auto
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Eligible load-balancing candidates for the current draft's logical project group
+    /// (`loadBalancingCandidates` in `useDraftEnvironmentRouting.ts:97-129`).
+    pub(super) fn draft_load_balancing_candidates(
+        &self,
+        host: &HostOptions,
+        cx: &App,
+    ) -> (Vec<DraftEnvironmentCandidate>, HashMap<String, f64>, Vec<String>) {
+        let weights = self.load_balancing_weights(cx);
+        let referenced_threads = self.referenced_thread_environment_ids(cx);
+        let project_envs: Vec<(String, String)> = host
+            .options
+            .iter()
+            .map(|opt| (opt.saved_id.clone(), opt.project_id.clone()))
+            .collect();
+        let resolved = self.resolve(cx);
+        let selected_driver = (!resolved.driver.is_empty()).then_some(resolved.driver.as_str());
+        let active_instance = resolved.model.as_ref().map(|m| m.instance_id.as_str());
+        let candidates = self.state.read(cx).load_balancing_candidates_for_project_envs(
+            &project_envs,
+            selected_driver,
+            active_instance,
+            &referenced_threads,
+            &weights,
+        );
+        (candidates, weights, referenced_threads)
+    }
+
+    /// `autoEnvironmentLabel` (`useDraftEnvironmentRouting.ts:245-253`).
+    pub(super) fn draft_auto_environment_label(&self, host: &HostOptions, cx: &App) -> Option<&'static str> {
+        let automatic = self.automatic_environment(host, cx);
+        if !automatic {
+            return None;
+        }
+        let resolved = self.workspace.routing.resolved_environment_id.as_deref();
+        let (pending, failed) = if resolved.is_some() {
+            (false, false)
+        } else {
+            let (candidates, weights, _) = self.draft_load_balancing_candidates(host, cx);
+            let ids: Vec<String> = candidates.iter().map(|c| c.environment_id.clone()).collect();
+            let eval = self.workspace.routing.cache.evaluate(&ids, &weights, now_ms());
+            (eval.pending || self.workspace.routing.task.is_some(), eval.failed)
+        };
+        auto_environment_label(automatic, resolved, pending, failed)
+    }
+
+    /// Schedules a single-shot timer when the earliest fresh host-resource snapshot expires
+    /// (`useLoadBalancedEnvironment.ts:30-38`).
+    fn schedule_host_resources_expiry(
+        &mut self,
+        next_expiry_ms: Option<i64>,
+        current_ms: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(expiry) = next_expiry_ms else {
+            self.workspace.routing.expiry_timer = None;
+            return;
+        };
+        let wait_ms = (expiry.saturating_sub(current_ms) + 1).max(1) as u64;
+        self.workspace.routing.expiry_timer = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(wait_ms))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.workspace.routing.expiry_timer = None;
+                this.sync_draft_routing(window, cx);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn apply_auto_routed_winner(
+        &mut self,
+        winner_env_id: &str,
+        host: &HostOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = host
+            .options
+            .iter()
+            .find(|opt| opt.canonical_environment_id == winner_env_id || opt.saved_id == winner_env_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.workspace.routing.resolved_environment_id = Some(target.canonical_environment_id.clone());
+        let (from_project, same_env) = {
+            let state = self.state.read(cx);
+            (
+                state.draft_project.clone(),
+                state.environments.active.as_deref() == Some(target.saved_id.as_str()),
+            )
+        };
+        if same_env && from_project.as_deref() == Some(target.project_id.as_str()) {
+            cx.notify();
+            return;
+        }
+        if let Some(from) = from_project {
+            self.retarget_draft_for_routing(&from, &target.project_id, same_env, window, cx);
+        }
+        if let Some(owner) = target.owner
+            && self
+                .state
+                .read(cx)
+                .scoped_ready(&owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+        {
+            if !same_env {
+                self.workspace.routing.pending_navigation =
+                    Some((target.saved_id.clone(), target.project_id.clone()));
+            }
+            self.state.update(cx, |state, cx| {
+                state.navigate_scoped(owner, ScopedRouteAction::Draft(target.project_id), cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Synchronizes automatic draft environment routing on draft open / state updates
+    /// (`useLoadBalancedEnvironment.ts` + `useDraftEnvironmentRouting.ts`).
+    pub(super) fn sync_draft_routing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.try_finish_pending_routed_send(window, cx);
+        if self.fixed.is_some() {
+            return;
+        }
+        let Some(Target::Draft(current_project)) = self.snapshot.target.clone() else {
+            let waiting_on_routed_switch = {
+                let state = self.state.read(cx);
+                state.selected_thread.is_none()
+                    && state.has_pending_scoped_route()
+                    && self.workspace.routing.pending_navigation.as_ref().is_some_and(
+                        |(saved_id, _)| state.environments.active.as_deref() == Some(saved_id.as_str()),
+                    )
+            };
+            if waiting_on_routed_switch {
+                return;
+            }
+            self.workspace.routing.logical_project_key = None;
+            self.workspace.routing.selection = DraftEnvSelection::Implicit;
+            self.workspace.routing.resolved_environment_id = None;
+            self.workspace.routing.pending_navigation = None;
+            self.workspace.routing.task = None;
+            self.workspace.routing.expiry_timer = None;
+            self.workspace.routing.in_flight_ids.clear();
+            return;
+        };
+        if self.workspace.routing.pending_navigation.as_ref().is_some_and(
+            |(saved_id, project_id)| {
+                self.state.read(cx).environments.active.as_deref() == Some(saved_id.as_str())
+                    && project_id == &current_project
+            },
+        ) {
+            self.workspace.routing.pending_navigation = None;
+        }
+        let host = self.host_options(cx);
+        let logical_key = host.logical_project_key.clone().or_else(|| {
+            if let Some(Target::Draft(pid)) = self.snapshot.target.as_ref() {
+                Some(pid.clone())
+            } else {
+                None
+            }
+        });
+        if logical_key != self.workspace.routing.logical_project_key {
+            self.workspace.routing.logical_project_key = logical_key;
+            self.workspace.routing.selection = DraftEnvSelection::Implicit;
+            self.workspace.routing.resolved_environment_id = None;
+            self.workspace.routing.generation = self.workspace.routing.generation.wrapping_add(1);
+            self.workspace.routing.task = None;
+            self.workspace.routing.expiry_timer = None;
+            self.workspace.routing.in_flight_ids.clear();
+        }
+        let automatic = self.automatic_environment(&host, cx);
+        let needs_load_balancing = automatic && self.workspace.routing.resolved_environment_id.is_none();
+        if !needs_load_balancing || self.sending {
+            if !needs_load_balancing {
+                self.workspace.routing.task = None;
+                self.workspace.routing.in_flight_ids.clear();
+            }
+            return;
+        }
+        let (candidates, weights, _) = self.draft_load_balancing_candidates(&host, cx);
+        if candidates.is_empty() {
+            self.workspace.routing.task = None;
+            self.workspace.routing.in_flight_ids.clear();
+            return;
+        }
+        let candidate_ids: Vec<String> = candidates.iter().map(|c| c.environment_id.clone()).collect();
+        let current_ms = now_ms();
+        let eval = self.workspace.routing.cache.evaluate(&candidate_ids, &weights, current_ms);
+        self.schedule_host_resources_expiry(eval.next_expiry_ms, current_ms, window, cx);
+        if !eval.pending
+            && let Some(winner) = eval.environment_id
+        {
+            self.apply_auto_routed_winner(&winner, &host, window, cx);
+            return;
+        }
+        let needs_fetch = candidate_ids.iter().any(|env_id| {
+            match self.workspace.routing.cache.get(env_id) {
+                None => true,
+                Some(entry) => {
+                    !entry.pending
+                        && current_ms.saturating_sub(entry.received_at_ms) > HOST_RESOURCES_FRESH_MS
+                }
+            }
+        });
+        if !needs_fetch {
+            return;
+        }
+        if self.workspace.routing.task.is_some() && self.workspace.routing.in_flight_ids == candidate_ids {
+            return;
+        }
+        self.workspace.routing.generation = self.workspace.routing.generation.wrapping_add(1);
+        let generation = self.workspace.routing.generation;
+        for env_id in &candidate_ids {
+            self.workspace.routing.cache.mark_pending(env_id);
+        }
+        self.workspace.routing.in_flight_ids = candidate_ids.clone();
+        let fetch = self.state.read(cx).fetch_load_balancing_resources(&candidates);
+        let ids_for_eval = candidate_ids;
+        self.workspace.routing.task = Some(cx.spawn_in(window, async move |this, cx| {
+            let samples = fetch.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.workspace.routing.generation != generation {
+                    return;
+                }
+                this.workspace.routing.task = None;
+                this.workspace.routing.in_flight_ids.clear();
+                for (env_id, resources, received_at_ms) in samples {
+                    this.workspace.routing.cache.record(&env_id, resources, received_at_ms);
+                }
+                let host = this.host_options(cx);
+                let weights = this.load_balancing_weights(cx);
+                let now = now_ms();
+                let eval = this.workspace.routing.cache.evaluate(&ids_for_eval, &weights, now);
+                this.schedule_host_resources_expiry(eval.next_expiry_ms, now, window, cx);
+                if !this.sending
+                    && this.automatic_environment(&host, cx)
+                    && this.workspace.routing.resolved_environment_id.is_none()
+                    && !eval.pending
+                    && let Some(winner) = eval.environment_id
+                {
+                    this.apply_auto_routed_winner(&winner, &host, window, cx);
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Triggered when the user selects `"Auto balance"` in the Run-on selector
+    /// (`onAutoEnvironment` in `useDraftEnvironmentRouting.ts:222-243`).
+    pub(super) fn select_auto_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.workspace.host_open = false;
+        if self.is_rewinding(cx) || self.sending || !matches!(self.snapshot.target, Some(Target::Draft(_))) {
+            return;
+        }
+        if !self.staged_attachments().is_empty() {
+            let warn = attachments_block_auto_routing_warning();
+            self.state.update(cx, |state, cx| {
+                state.show_toast(
+                    Toast::new(ToastKind::Warning, warn.title)
+                        .description(warn.description)
+                        .key("load-balancing-attachments"),
+                    cx,
+                );
+            });
+            self.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        if let Some(Target::Draft(project_id)) = self.snapshot.target.clone() {
+            let target = Target::Draft(project_id);
+            let storage_key = drafts::key(&target);
+            if let Some(mut draft) = self.drafts.store.get(&storage_key).cloned()
+                && let Some(ws) = draft.workspace.as_mut()
+                && (ws.branch.is_some() || ws.previous.is_some())
+            {
+                ws.branch = None;
+                ws.previous = None;
+                if self.mutate_drafts(cx, |store| store.set(&storage_key, draft)) {
+                    self.schedule_draft_save(&target, cx);
+                }
+            }
+        }
+        let host = self.host_options(cx);
+        for opt in &host.options {
+            self.workspace.routing.cache.record(&opt.canonical_environment_id, None, 0);
+        }
+        self.workspace.routing.selection = DraftEnvSelection::Auto;
+        self.workspace.routing.resolved_environment_id = None;
+        self.workspace.routing.generation = self.workspace.routing.generation.wrapping_add(1);
+        self.workspace.routing.task = None;
+        self.workspace.routing.in_flight_ids.clear();
+        self.sync_draft_routing(window, cx);
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Resets manual machine pinning when the user chooses a project in `DraftHero`
+    /// so automatic load balancing evaluates the newly picked project.
+    pub(crate) fn prepare_draft_routing_on_project_pick(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workspace.routing.selection = DraftEnvSelection::Implicit;
+        self.workspace.routing.resolved_environment_id = None;
+        self.workspace.routing.generation = self.workspace.routing.generation.wrapping_add(1);
+        self.workspace.routing.task = None;
+        self.workspace.routing.in_flight_ids.clear();
+        self.sync_draft_routing(window, cx);
+    }
+
+    pub(super) fn select_host(&mut self, option: HostOption, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.host_open = false;
+        self.workspace.routing.selection = DraftEnvSelection::Manual;
+        self.workspace.routing.resolved_environment_id = None;
+        self.workspace.routing.generation = self.workspace.routing.generation.wrapping_add(1);
+        self.workspace.routing.task = None;
+        self.workspace.routing.in_flight_ids.clear();
         let Some(owner) = option.owner else {
             self.focus(window, cx);
             cx.notify();
@@ -886,7 +1391,7 @@ impl Composer {
             return;
         }
         if let Some(from) = from_project {
-            self.retarget_draft(&from, &option.project_id, same_env, window, cx);
+            self.retarget_draft_for_routing(&from, &option.project_id, same_env, window, cx);
         }
         self.state.update(cx, |state, cx| {
             state.navigate_scoped(owner, ScopedRouteAction::Draft(option.project_id), cx);
@@ -897,11 +1402,18 @@ impl Composer {
 
     fn render_host_selector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let host = self.host_options(cx);
-        let active = host.active?;
+        let active = host.active.clone()?;
         let p = palette(cx);
         let state = self.state.read(cx);
-        let icon = environment_machine_icon(state, &active.saved_id);
         let is_draft = matches!(self.snapshot.target, Some(Target::Draft(_)));
+        let offer_auto = self.can_offer_auto_balance(&host, cx);
+        let auto_label = self.draft_auto_environment_label(&host, cx);
+        let icon = if auto_label.is_some() {
+            Icon::Gauge
+        } else {
+            environment_machine_icon(state, &active.saved_id)
+        };
+        let trigger_label = auto_label.map_or_else(|| active.label.clone(), str::to_owned);
         let interactive = is_draft && host.can_pick && !self.is_rewinding(cx);
         if !interactive {
             let muted = hsla(p.muted_foreground).opacity(0.7);
@@ -922,8 +1434,13 @@ impl Composer {
                     .into_any_element(),
             );
         }
+        let tooltip_base = match (auto_label, self.workspace.routing.resolved_environment_id.as_deref()) {
+            (Some(label), Some(_)) => format!("{label} ({})", active.label),
+            (Some(label), None) => label.to_owned(),
+            (None, _) => active.label.clone(),
+        };
         let tooltip = crate::keymap::label("composer.host", cx)
-            .map_or_else(|| active.label.clone(), |shortcut| format!("{} · {}", active.label, shortcut));
+            .map_or_else(|| tooltip_base.clone(), |shortcut| format!("{tooltip_base} · {shortcut}"));
         let mut popup = menu_surface(cx)
             .w(px(260.))
             .occlude()
@@ -932,11 +1449,21 @@ impl Composer {
                 cx.notify();
             }))
             .child(div().px(px(8.)).py(px(6.)).text_xs().text_color(hsla(p.muted_foreground)).child("Run on"));
+        let auto_offset = usize::from(offer_auto);
+        if offer_auto {
+            popup = popup.child(
+                MenuItem::new("host-opt-auto", auto_label.unwrap_or("Auto balance"))
+                    .icon(Icon::Gauge, hsla(p.muted_foreground))
+                    .checked(auto_label.is_some())
+                    .highlighted(self.workspace.host_highlighted == 0)
+                    .on_click(cx.listener(|this, _, window, cx| this.select_auto_host(window, cx))),
+            );
+        }
         let active_env = state.environments.active.as_deref();
-        let add_index = host.options.len();
+        let add_index = auto_offset + host.options.len();
         for (index, option) in host.options.into_iter().enumerate() {
-            let checked = active_env == Some(option.saved_id.as_str());
-            let highlighted = self.workspace.host_highlighted == index;
+            let checked = auto_label.is_none() && active_env == Some(option.saved_id.as_str());
+            let highlighted = self.workspace.host_highlighted == index + auto_offset;
             let opt_icon = environment_machine_icon(state, &option.saved_id);
             let label = option.label.clone();
             popup = popup.child(
@@ -965,7 +1492,7 @@ impl Composer {
                 .child(
                     ComposerControl::new("composer-host")
                         .icon(icon)
-                        .label(active.label)
+                        .label(trigger_label)
                         .pressed(self.workspace.host_open)
                         .tooltip(tooltip)
                         .on_click(cx.listener(|this, _, window, cx| this.open_host(window, cx))),
