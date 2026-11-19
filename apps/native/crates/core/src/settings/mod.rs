@@ -899,6 +899,187 @@ pub fn is_project_scoped_setting_key(key: &str) -> bool {
     PROJECT_SCOPED_SERVER_SETTING_KEYS.contains(&key)
 }
 
+/// Resolves effective `ServerSettings` for `project_id` by overlaying any explicit entries in
+/// `projectSettingsOverrides[project_id]` onto the environment's `ServerSettings`
+/// (`resolveProjectSettings` in `packages/shared/src/projectSettings.ts`).
+pub fn resolve_project_settings(base: &ServerSettings, project_id: &str) -> ServerSettings {
+    let mut resolved = base.clone();
+    let Some(overrides) = base.project_settings_overrides.get(project_id) else {
+        return resolved;
+    };
+    let raw = &overrides.raw;
+    if let Some(val) = raw.get("defaultModelSelection") {
+        resolved.default_model_selection =
+            if val.is_null() { None } else { serde_json::from_value(val.clone()).ok() };
+    }
+    if let Some(val) = raw.get("defaultRuntimeMode")
+        && let Ok(mode) = serde_json::from_value(val.clone())
+    {
+        resolved.default_runtime_mode = mode;
+    }
+    if let Some(val) = raw.get("defaultThreadEnvMode") {
+        resolved.default_thread_env_mode =
+            if val.is_null() { None } else { serde_json::from_value(val.clone()).ok() };
+    }
+    if let Some(val) = raw.get("newWorktreesStartFromOrigin")
+        && let Some(flag) = val.as_bool()
+    {
+        resolved.new_worktrees_start_from_origin = Some(flag);
+    }
+    if let Some(val) = raw.get("worktreeSubmodules") {
+        resolved.worktrees.worktree_submodules =
+            val.as_str().and_then(worktrees::Submodules::parse);
+    }
+    if let Some(val) = raw.get("worktreeCleanup") {
+        resolved.worktrees.worktree_cleanup = if val.is_null() {
+            None
+        } else {
+            serde_json::from_value::<worktrees::WorktreeSettings>(json!({ "worktreeCleanup": val }))
+                .ok()
+                .and_then(|parsed| parsed.worktree_cleanup)
+        };
+    }
+    if let Some(val) = raw.get("branchNamingMode")
+        && let Some(mode) = val.as_str().and_then(worktrees::BranchNaming::parse)
+    {
+        resolved.worktrees.branch_naming_mode = mode;
+    }
+    if let Some(val) = raw.get("branchNamePrefix")
+        && let Some(text) = val.as_str()
+    {
+        resolved.worktrees.branch_name_prefix = text.trim().to_owned();
+    }
+    if let Some(val) = raw.get("branchNameInstructions")
+        && let Some(text) = val.as_str()
+    {
+        resolved.worktrees.branch_name_instructions = text.trim().to_owned();
+    }
+    if let Some(val) = raw.get("defaultAutoPull")
+        && let Some(flag) = val.as_bool()
+    {
+        resolved.source_control.default_auto_pull = flag;
+    }
+    if let Some(val) = raw.get("removeAgentCreditsOnMerge")
+        && let Some(flag) = val.as_bool()
+    {
+        resolved.source_control.remove_agent_credits_on_merge = flag;
+    }
+    if let Some(val) = raw.get("sourceControlWritingStyle")
+        && let Ok(parsed) = serde_json::from_value::<source_control::SourceControlSettings>(
+            json!({ "sourceControlWritingStyle": val }),
+        )
+    {
+        resolved.source_control.source_control_writing_style = parsed.source_control_writing_style;
+    }
+    if let Some(val) = raw.get("sourceControlWriterModelSelection") {
+        resolved.source_control.source_control_writer_model_selection =
+            if val.is_null() { None } else { serde_json::from_value(val.clone()).ok() };
+    }
+    if let Some(val) = raw.get("reviewGuideModelSelection") {
+        resolved.source_control.review_guide_model_selection =
+            if val.is_null() { None } else { serde_json::from_value(val.clone()).ok() };
+    }
+    if let Some(val) = raw.get("reviewGuideInstructions")
+        && let Some(text) = val.as_str()
+    {
+        resolved.source_control.review_guide_instructions = text.trim().to_owned();
+    }
+    if let Some(val) = raw.get("pullRequestMergeMethod") {
+        resolved.pull_request_merge_method =
+            if val.is_null() { None } else { serde_json::from_value(val.clone()).ok() };
+    }
+    if let Some(val) = raw.get("defaultProjectScripts")
+        && let Ok(scripts) = serde_json::from_value(val.clone())
+    {
+        resolved.default_project_scripts = scripts;
+    }
+    if let Some(val) = raw.get("enableAgentBrowserAccess")
+        && let Some(flag) = val.as_bool()
+    {
+        resolved.enable_agent_browser_access = Some(flag);
+    }
+    if let Some(val) = raw.get("textGenerationModelSelection") {
+        resolved.provider_panel.text_generation_model_selection =
+            if val.is_null() { None } else { Some(val.clone()) };
+    }
+    if let Some(val) = raw.get("threadTitleInstructions")
+        && let Some(text) = val.as_str()
+    {
+        resolved.threads.thread_title_instructions = text.trim().to_owned();
+    }
+    if let Some(val) = raw.get("sidebarAutoSettleOnMerge")
+        && let Some(flag) = val.as_bool()
+    {
+        resolved.threads.sidebar_auto_settle_on_merge = flag;
+    }
+    if let Some(val) = raw.get("sidebarAutoSettleAfterDays") {
+        resolved.threads.sidebar_auto_settle_after_days = if val.is_null() {
+            None
+        } else {
+            val.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|days| (1..=90).contains(days))
+                .or(resolved.threads.sidebar_auto_settle_after_days)
+        };
+    }
+    if let Some(val) = raw.get("sidebarAutoSettleKeepPullRequests")
+        && let Some(flag) = val.as_bool()
+    {
+        resolved.threads.sidebar_auto_settle_keep_pull_requests = flag;
+    }
+    if let Some(val) = raw.get("continueThreadsAfterServerUpdate")
+        && let Some(flag) = val.as_bool()
+    {
+        resolved.maintenance.continue_threads_after_server_update = flag;
+    }
+    if let Some(val) = raw.get("responseStreamingMode")
+        && let Ok(mode) = serde_json::from_value(val.clone())
+    {
+        resolved.threads.response_streaming_mode = mode;
+    }
+    if let Some(val) = raw.get("speechProjectCustomWords")
+        && let Ok(words) = serde_json::from_value(val.clone())
+    {
+        resolved.speech_project_custom_words = words;
+    }
+    resolved
+}
+
+/// Whether `project_id` has an explicit project-scoped override stored for any key in `keys`.
+pub fn project_override_present(settings: &ServerSettings, project_id: &str, keys: &[&str]) -> bool {
+    settings
+        .project_settings_overrides
+        .get(project_id)
+        .is_some_and(|entry| keys.iter().any(|key| entry.raw.contains_key(*key)))
+}
+
+/// Effective `enableAgentDeviceAccess` for a project scope (override when present, else host service state).
+pub fn effective_agent_device_access(
+    settings: &ServerSettings,
+    project_id: Option<&str>,
+    service_enabled: bool,
+) -> bool {
+    project_id
+        .and_then(|id| settings.project_settings_overrides.get(id))
+        .and_then(|entry| entry.raw.get("enableAgentDeviceAccess"))
+        .and_then(Value::as_bool)
+        .unwrap_or(service_enabled)
+}
+
+/// Effective enabled state of a provider instance under an optional project scope.
+pub fn effective_provider_enabled(
+    settings: &ServerSettings,
+    project_id: Option<&str>,
+    instance_id: &str,
+    base_enabled: bool,
+) -> bool {
+    project_id
+        .and_then(|id| settings.project_settings_overrides.get(id))
+        .and_then(|entry| entry.provider_instances.get(instance_id))
+        .and_then(|inst| inst.enabled)
+        .unwrap_or(base_enabled)
+}
+
 /// Converts a server setting change into a project-override edit when every key in its patch is
 /// project-scoped (`planScopedSettingsPatch` in `scopedSettings.ts`). Returns `None` for
 /// environment-only settings that cannot be overridden per project.
@@ -1740,5 +1921,61 @@ mod panel_tests {
             scoped_model_disabled_reason(&mac.settings, Some("codex"), &[("Mac", &mac, None)], "codex", "gpt-5", false),
             None
         );
+    }
+
+    #[test]
+    fn resolve_project_settings_overlays_project_overrides_and_tracks_presence() {
+        let base: crate::server_config::ServerSettings = serde_json::from_value(json!({
+            "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "defaultThreadEnvMode": "local",
+            "defaultAutoPull": false,
+            "sidebarAutoSettleAfterDays": 14,
+            "continueThreadsAfterServerUpdate": true,
+            "responseStreamingMode": "paragraph",
+            "enableAgentBrowserAccess": true,
+            "projectSettingsOverrides": {
+                "proj-1": {
+                    "defaultModelSelection": null,
+                    "defaultThreadEnvMode": "worktree",
+                    "defaultAutoPull": true,
+                    "sidebarAutoSettleAfterDays": null,
+                    "continueThreadsAfterServerUpdate": false,
+                    "responseStreamingMode": "turn",
+                    "enableAgentBrowserAccess": false,
+                    "enableAgentDeviceAccess": false,
+                    "branchNamingMode": "custom",
+                    "branchNameInstructions": "prefix with feat/",
+                    "providerInstances": { "codex": { "enabled": false } }
+                }
+            }
+        }))
+        .unwrap();
+
+        let resolved = resolve_project_settings(&base, "proj-1");
+        assert_eq!(resolved.default_model_selection, None);
+        assert_eq!(resolved.default_thread_env_mode, Some(ThreadEnvMode::Worktree));
+        assert!(resolved.source_control.default_auto_pull);
+        assert_eq!(resolved.threads.sidebar_auto_settle_after_days, None);
+        assert!(!resolved.maintenance.continue_threads_after_server_update);
+        assert_eq!(resolved.threads.response_streaming_mode, ResponseStreamingMode::Turn);
+        assert_eq!(resolved.enable_agent_browser_access, Some(false));
+        assert_eq!(resolved.worktrees.branch_naming_mode, worktrees::BranchNaming::Custom);
+        assert_eq!(resolved.worktrees.branch_name_instructions, "prefix with feat/");
+        assert!(project_override_present(&base, "proj-1", &["defaultAutoPull"]));
+        assert!(!project_override_present(&base, "proj-1", &["removeAgentCreditsOnMerge"]));
+        assert!(!effective_agent_device_access(&base, Some("proj-1"), true));
+        assert!(effective_agent_device_access(&base, Some("proj-other"), true));
+        assert!(!effective_provider_enabled(&base, Some("proj-1"), "codex", true));
+        assert!(effective_provider_enabled(&base, Some("proj-other"), "codex", true));
+
+        let patch = projects::override_patch(
+            &base,
+            &[project_actions::Member { id: "proj-1".into(), scripts: Vec::new() }],
+            &projects::OverrideEdit::ProviderInstanceEnabled {
+                instance_id: "codex".into(),
+                enabled: None,
+            },
+        );
+        assert!(patch["patch"]["projectSettingsOverrides"]["proj-1"].get("providerInstances").is_none());
     }
 }

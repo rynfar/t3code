@@ -198,8 +198,11 @@ impl SettingsView {
     }
 
     fn commit_worktree_directory(&mut self, cx: &mut Context<Self>) {
+        if self.is_project_scope(cx) {
+            return;
+        }
         let value = self.worktrees.directory.read(cx).value().trim().to_owned();
-        let saved = self.thread_settings(cx).map(|config| config.settings.worktrees.worktrees_directory.clone());
+        let saved = self.scoped_representative_config(cx).map(|config| config.settings.worktrees.worktrees_directory);
         if saved.is_some_and(|saved| saved != value) {
             self.save_worktree(WorktreeChange::Directory(value), cx);
         }
@@ -207,7 +210,7 @@ impl SettingsView {
 
     fn commit_branch_prefix(&mut self, cx: &mut Context<Self>) {
         let value = self.worktrees.prefix.read(cx).value().trim().to_owned();
-        let saved = self.thread_settings(cx).map(|config| config.settings.worktrees.branch_name_prefix.clone());
+        let saved = self.scoped_representative_config(cx).map(|config| config.settings.worktrees.branch_name_prefix);
         if saved.is_some_and(|saved| saved != value) {
             self.save_worktree(WorktreeChange::BranchPrefix(value), cx);
         }
@@ -215,7 +218,7 @@ impl SettingsView {
 
     fn commit_branch_instructions(&mut self, cx: &mut Context<Self>) {
         let value = self.worktrees.instructions.read(cx).value().trim().to_owned();
-        let saved = self.thread_settings(cx).map(|config| config.settings.worktrees.branch_name_instructions.clone());
+        let saved = self.scoped_representative_config(cx).map(|config| config.settings.worktrees.branch_name_instructions);
         if saved.is_some_and(|saved| saved != value) {
             self.save_worktree(WorktreeChange::BranchInstructions(value), cx);
         }
@@ -225,7 +228,7 @@ impl SettingsView {
     /// discards a draft without saving.
     fn commit_retention(&mut self, field: Retention, explicit: bool, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.worktrees.retention_input(field).clone();
-        let Some(saved) = self.thread_settings(cx).map(|config| field.saved(config)) else { return };
+        let Some(saved) = self.scoped_representative_config(cx).map(|config| field.saved(&config)) else { return };
         let text = input.read(cx).value().to_string();
         let idx = field.index();
         let next_seq = self.worktrees.retention_seq.wrapping_add(1);
@@ -261,7 +264,7 @@ impl SettingsView {
                 return true;
             }
             if input.focus_handle(cx).is_focused(window)
-                && let Some(saved) = self.thread_settings(cx).and_then(|config| field.saved(config))
+                && let Some(saved) = self.scoped_representative_config(cx).and_then(|config| field.saved(&config))
             {
                 input.update(cx, |input, cx| input.set_value(saved.to_string(), window, cx));
                 self.focus.focus(window, cx);
@@ -320,7 +323,7 @@ impl SettingsView {
                 on,
                 move |this, pressed| this.worktrees.retention_switch_pressed[idx] = pressed,
                 move |this, next, window, cx| {
-                    let saved = this.thread_settings(cx).and_then(|config| field.saved(config));
+                    let saved = this.scoped_representative_config(cx).and_then(|config| field.saved(&config));
                     match this.worktrees.retention_drafts[idx].toggle(saved, next) {
                         RetentionToggle::OpenDraft(days) => {
                             this.worktrees.retention_input(field).update(cx, |input, cx| {
@@ -374,31 +377,44 @@ impl SettingsView {
             }
         }
 
+        let env_only = self.env_only_unavailable(cx);
         let mut creation = Vec::new();
         if capabilities.worktrees_directory == Some(true) {
             creation.push(
                 Row::new("storage-worktrees-location", "Worktree location")
                     .description("Folder where new worktrees are created, on any drive, such as D:\\worktrees or ~/worktrees. Existing worktrees stay where they are. Leave empty to use the T3 home folder.")
                     .highlighted(self.is_target("storage-worktrees-location"))
+                    .unavailable(env_only.clone())
                     .reset(!settings.worktrees_directory.is_empty(), self.worktree_reset(WorktreeChange::Directory(String::new()), cx))
-                    .control(div().w(r(288.)).child(Input::new(&self.worktrees.directory).small()))
+                    .control(div().w(r(288.)).child(Input::new(&self.worktrees.directory).small().disabled(env_only.is_some())))
                     .into_any_element(),
             );
         }
         let start_from_origin = config.settings.new_worktrees_start_from_origin.unwrap_or(true);
         creation.push(
-            Row::new("start-from-origin", "Start from remote")
-                .description("Uses the latest commit of the base branch\u{2019}s tracked remote branch, even if its name differs. Otherwise uses the same-named branch on origin. Uses your local branch if that remote branch is missing.")
-                .highlighted(self.is_target("start-from-origin"))
-                .reset(!start_from_origin, self.worktree_reset(WorktreeChange::StartFromOrigin(true), cx))
-                .control(self.worktree_switch("start-from-origin-switch", start_from_origin, WorktreeChange::StartFromOrigin, cx))
-                .into_any_element(),
+            self.apply_scoped_reset(
+                Row::new("start-from-origin", "Start from remote")
+                    .description("Uses the latest commit of the base branch\u{2019}s tracked remote branch, even if its name differs. Otherwise uses the same-named branch on origin. Uses your local branch if that remote branch is missing.")
+                    .highlighted(self.is_target("start-from-origin")),
+                &["newWorktreesStartFromOrigin"],
+                !start_from_origin,
+                WorktreeChange::StartFromOrigin(true).into_server(),
+                cx,
+            )
+            .control(self.worktree_switch("start-from-origin-switch", start_from_origin, WorktreeChange::StartFromOrigin, cx))
+            .into_any_element(),
         );
         let submodules_view = cx.entity().downgrade();
-        let submodules = Row::new("worktree-submodules", "Submodules")
-            .description("How new worktrees populate git submodules. Projects and their t3.json can override it.")
-            .highlighted(self.is_target("worktree-submodules"))
-            .reset(settings.worktree_submodules.is_some(), self.worktree_reset(WorktreeChange::Submodules(None), cx))
+        let submodules = self
+            .apply_scoped_reset(
+                Row::new("worktree-submodules", "Submodules")
+                    .description("How new worktrees populate git submodules. Projects and their t3.json can override it.")
+                    .highlighted(self.is_target("worktree-submodules")),
+                &["worktreeSubmodules"],
+                settings.worktree_submodules.is_some(),
+                WorktreeChange::Submodules(None).into_server(),
+                cx,
+            )
             .control(
                 Select::new("worktree-submodules-select", Submodules::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                     .selected(settings.effective_submodules().as_str())
@@ -422,41 +438,56 @@ impl SettingsView {
         let mode = settings.branch_naming_mode;
         let naming_view = cx.entity().downgrade();
         let mut branches = vec![
-            Row::new("worktree-branch-naming", "Worktree branch naming")
-                .description("Choose how new worktree branches are named from your first message.")
-                .when(mode == BranchNaming::Semantic, |row| {
-                    row.status("The model chooses a prefix that describes the work, such as feat/add-search, fix/login-timeout, or refactor/auth.")
-                })
-                .highlighted(self.is_target("worktree-branch-naming"))
-                .reset(mode != BranchNaming::default(), self.worktree_reset(WorktreeChange::BranchNaming(BranchNaming::default()), cx))
-                .control(
-                    Select::new("worktree-branch-naming-select", BranchNaming::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
-                        .selected(mode.as_str())
-                        .width(196.)
-                        .on_change(move |value, _, cx| {
-                            if let Some(mode) = BranchNaming::parse(&value) {
-                                let _ = naming_view.update(cx, |this, cx| {
-                                    this.update_scoped_server(WorktreeChange::BranchNaming(mode).into_server(), cx);
-                                });
-                            }
-                        }),
-                )
-                .into_any_element(),
+            self.apply_scoped_reset(
+                Row::new("worktree-branch-naming", "Worktree branch naming")
+                    .description("Choose how new worktree branches are named from your first message.")
+                    .when(mode == BranchNaming::Semantic, |row| {
+                        row.status("The model chooses a prefix that describes the work, such as feat/add-search, fix/login-timeout, or refactor/auth.")
+                    })
+                    .highlighted(self.is_target("worktree-branch-naming")),
+                &["branchNamingMode"],
+                mode != BranchNaming::default(),
+                WorktreeChange::BranchNaming(BranchNaming::default()).into_server(),
+                cx,
+            )
+            .control(
+                Select::new("worktree-branch-naming-select", BranchNaming::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
+                    .selected(mode.as_str())
+                    .width(196.)
+                    .on_change(move |value, _, cx| {
+                        if let Some(mode) = BranchNaming::parse(&value) {
+                            let _ = naming_view.update(cx, |this, cx| {
+                                this.update_scoped_server(WorktreeChange::BranchNaming(mode).into_server(), cx);
+                            });
+                        }
+                    }),
+            )
+            .into_any_element(),
         ];
         match mode {
             BranchNaming::Static => branches.push(
-                Row::new("worktree-branch-prefix", "Branch prefix")
-                    .description("For example, t3 or t3/ produces t3/add-search. Leave empty for no prefix.")
-                    .reset(settings.branch_name_prefix != DEFAULT_BRANCH_PREFIX, self.worktree_reset(WorktreeChange::BranchPrefix(DEFAULT_BRANCH_PREFIX.to_owned()), cx))
-                    .control(div().w(r(176.)).child(Input::new(&self.worktrees.prefix).small()))
-                    .into_any_element(),
+                self.apply_scoped_reset(
+                    Row::new("worktree-branch-prefix", "Branch prefix")
+                        .description("For example, t3 or t3/ produces t3/add-search. Leave empty for no prefix."),
+                    &["branchNamePrefix"],
+                    settings.branch_name_prefix != DEFAULT_BRANCH_PREFIX,
+                    WorktreeChange::BranchPrefix(DEFAULT_BRANCH_PREFIX.to_owned()).into_server(),
+                    cx,
+                )
+                .control(div().w(r(176.)).child(Input::new(&self.worktrees.prefix).small()))
+                .into_any_element(),
             ),
             BranchNaming::Custom => branches.push(
-                Row::new("worktree-branch-instructions", "Branch naming instructions")
-                    .description("Appended to the naming prompt. The model returns the complete branch name; no prefix or suffix is added.")
-                    .reset(!settings.branch_name_instructions.is_empty(), self.worktree_reset(WorktreeChange::BranchInstructions(String::new()), cx))
-                    .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.worktrees.instructions)))
-                    .into_any_element(),
+                self.apply_scoped_reset(
+                    Row::new("worktree-branch-instructions", "Branch naming instructions")
+                        .description("Appended to the naming prompt. The model returns the complete branch name; no prefix or suffix is added."),
+                    &["branchNameInstructions"],
+                    !settings.branch_name_instructions.is_empty(),
+                    WorktreeChange::BranchInstructions(String::new()).into_server(),
+                    cx,
+                )
+                .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.worktrees.instructions)))
+                .into_any_element(),
             ),
             BranchNaming::Semantic => {}
         }

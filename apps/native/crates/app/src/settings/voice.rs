@@ -372,7 +372,7 @@ impl SettingsView {
             _ => (false, false),
         };
         let cleanup = voice_cleanup_granted(cx);
-        let has_scope = self.state.read(cx).server_config.config.is_some();
+        let has_scope = self.scoped_representative_config(cx).is_some();
         voice_search_target_fallback(
             target,
             has_local_prepared,
@@ -1245,7 +1245,7 @@ impl SettingsView {
     }
 
     fn current_project_dictionary_words(&self, cx: &App) -> Vec<SpeechCustomWordEntry> {
-        let Some(config) = self.state.read(cx).server_config.config.as_ref() else {
+        let Some(config) = self.scoped_raw_representative_config(cx) else {
             return Vec::new();
         };
         config
@@ -1254,30 +1254,7 @@ impl SettingsView {
     }
 
     fn save_project_dictionary_words(&self, words: Vec<SpeechCustomWordEntry>, cx: &mut App) {
-        if let Some(project_id) = self.scope_project_id(cx)
-            && let Some(config) = self.state.read(cx).server_config.config.as_ref()
-        {
-            let mut raw = config
-                .settings
-                .project_settings_overrides
-                .get(&project_id)
-                .map(|o| o.raw.clone())
-                .unwrap_or_default();
-            raw.insert(
-                "speechProjectCustomWords".to_owned(),
-                serde_json::to_value(&words).unwrap_or_default(),
-            );
-            let payload = serde_json::json!({
-                "patch": {
-                    "projectSettingsOverrides": {
-                        project_id: serde_json::Value::Object(raw),
-                    }
-                }
-            });
-            store::update_server(&self.state, ServerSettingChange::Prepared(payload), cx);
-        } else {
-            store::update_server(&self.state, ServerSettingChange::SpeechProjectCustomWords(words), cx);
-        }
+        self.update_scoped_server(ServerSettingChange::SpeechProjectCustomWords(words), cx);
     }
 
     fn commit_voice_custom_prompt(&mut self, cx: &mut Context<Self>) {
@@ -2358,7 +2335,7 @@ impl SettingsView {
                 .into_any_element(),
         ];
 
-        let has_server = self.state.read(cx).server_config.config.is_some();
+        let has_server = self.scoped_representative_config(cx).is_some();
         let scoped_project_label = self.scope_project_label(cx);
         let project_words = self.current_project_dictionary_words(cx);
         let project_editor = self.render_dictionary_editor(
@@ -2544,10 +2521,11 @@ impl SettingsView {
                 .into_any_element();
         };
         self.sync_text_generator_models(&config, cx);
+        let env_only = self.env_only_unavailable(cx);
         let saved_cleanup = speech_post_processing_model_selection(&config.settings);
         let dedicated = saved_cleanup.is_some();
         let fallback_text_gen =
-            resolve_default_text_generation_selection(&config, None, &self.threads.text_gen_models);
+            resolve_default_text_generation_selection(&config, None, self.text_gen_models_for(&config));
         let shown = saved_cleanup.clone().or_else(|| fallback_text_gen.clone());
         let options = self.apply_scoped_model_availability(
             &config,
@@ -2618,7 +2596,8 @@ impl SettingsView {
             .description(
                 "Model for transcript cleanup, such as a cheaper or faster one. When disabled, use the text generation model configured for this environment.",
             )
-            .highlighted(self.is_target("speech-post-processing-model"));
+            .highlighted(self.is_target("speech-post-processing-model"))
+            .unavailable(env_only);
         if let Some(reason) = disabled_reason {
             row = row.status(reason);
         }

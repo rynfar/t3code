@@ -363,7 +363,8 @@ fn card_height(window: &Window) -> gpui::Pixels {
 impl SettingsView {
     fn page_data(&self, cx: &App) -> Option<PageData> {
         let app = self.state.read(cx);
-        let config = app.server_config.config.as_ref()?;
+        let config = self.scoped_raw_representative_config(cx)?;
+        let scope_project = self.is_project_scope(cx).then(|| self.scope_project_id(cx)).flatten();
         let settings = &config.settings;
         let live = &config.providers;
         let rows = model::instance_rows(settings, live, self.providers.selected.as_deref());
@@ -371,7 +372,15 @@ impl SettingsView {
             .into_iter()
             .map(|row| {
                 let provider = live.iter().find(|provider| provider.instance_id == row.instance_id);
-                let view = model::instance_view(&row, provider, self.providers.dispatching.contains(&row.instance_id), false);
+                let mut view = model::instance_view(&row, provider, self.providers.dispatching.contains(&row.instance_id), false);
+                if scope_project.is_some() {
+                    view.enabled = t3_core::settings::effective_provider_enabled(
+                        settings,
+                        scope_project.as_deref(),
+                        &row.instance_id,
+                        view.enabled,
+                    );
+                }
                 let accent = row.explicit.as_ref().and_then(|instance| instance.accent_color.as_deref()).and_then(model::accent_rgba);
                 (row, view, accent)
             })
@@ -570,7 +579,15 @@ impl SettingsView {
                 None => view.headline.clone(),
             },
         };
-        let denial = if enabled { None } else { t3_core::managed_policy::driver_denial(self.state.read(cx).server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref()), &row.driver, model::find_driver(&row.driver).map_or(row.driver.as_str(), |d| d.label)) };
+        let denial = if enabled {
+            None
+        } else {
+            t3_core::managed_policy::driver_denial(
+                self.scoped_raw_representative_config(cx).as_ref().and_then(|c| c.managed_policy.as_ref()),
+                &row.driver,
+                model::find_driver(&row.driver).map_or(row.driver.as_str(), |d| d.label),
+            )
+        };
         let toggle = cx.listener(move |this, checked: &bool, _, cx| this.update_instance(&toggle_id, model::InstanceEdit::Enabled(*checked), cx));
         h_flex()
             .id(("provider-row", index))
@@ -784,33 +801,47 @@ impl SettingsView {
     fn render_advanced(&mut self, panel: &ProviderPanelSettings, cx: &mut Context<Self>) -> AnyElement {
         let current = panel.health_interval_seconds();
         let default = panel.default_health_interval_seconds();
-        let state = self.state.clone();
+        let env_only = self.env_only_unavailable(cx);
+        let view = cx.entity().downgrade();
+        let reset_view = view.clone();
         let reset_payload = panel.health_interval_payload(None);
         let interval = Row::new("provider-health-check-interval", "Health check interval")
             .description("Refresh provider status, versions, and models in the background. Set to 0 to disable.")
             .highlighted(self.is_target("provider-health-check-interval"))
-            .reset(current != default, move |_, _, cx| store::update_server(&state, ServerSettingChange::Prepared(reset_payload.clone()), cx))
+            .unavailable(env_only.clone())
+            .reset(current != default, move |_, _, cx| {
+                let _ = reset_view.update(cx, |this, cx| {
+                    this.update_scoped_single_env(ServerSettingChange::Prepared(reset_payload.clone()), cx);
+                });
+            })
             .control(
                 h_flex()
                     .gap(r(8.))
-                    .child(div().w(r(96.)).child(gpui_component::input::Input::new(&self.providers.health_interval).small()))
+                    .child(div().w(r(96.)).child(gpui_component::input::Input::new(&self.providers.health_interval).small().disabled(env_only.is_some())))
                     .child(div().text_xs().text_color(hsla(palette(cx).muted_foreground)).child("seconds")),
             );
         let mode = panel.idle_compaction();
         let options = IDLE_COMPACTION_MODES.iter().map(|(value, label)| SelectOption::new(*value, *label)).collect();
-        let state = self.state.clone();
+        let select_view = view.clone();
         let select_panel = panel.clone();
-        let reset_state = self.state.clone();
+        let reset_compact_view = view;
         let reset_payload = panel.idle_compaction_payload("onReturn");
         let compact = Row::new("compact-idle-threads", "Compact idle threads")
             .description(
                 "When to compact an idle Claude thread over 200,000 tokens: after you return, just before its prompt cache expires, or never. Each Claude provider can override this.",
             )
             .highlighted(self.is_target("compact-idle-threads"))
-            .reset(mode != "onReturn", move |_, _, cx| store::update_server(&reset_state, ServerSettingChange::Prepared(reset_payload.clone()), cx))
+            .unavailable(env_only)
+            .reset(mode != "onReturn", move |_, _, cx| {
+                let _ = reset_compact_view.update(cx, |this, cx| {
+                    this.update_scoped_single_env(ServerSettingChange::Prepared(reset_payload.clone()), cx);
+                });
+            })
             .control(Select::new("compact-idle-threads-select", options).selected(mode).width(224.).show_check().on_change(move |value, _, cx| {
                 if value.as_ref() != select_panel.idle_compaction() {
-                    store::update_server(&state, ServerSettingChange::Prepared(select_panel.idle_compaction_payload(&value)), cx);
+                    let _ = select_view.update(cx, |this, cx| {
+                        this.update_scoped_single_env(ServerSettingChange::Prepared(select_panel.idle_compaction_payload(&value)), cx);
+                    });
                 }
             }));
         section("Advanced", vec![interval.into_any_element(), compact.into_any_element()], cx).into_any_element()
@@ -1001,7 +1032,7 @@ impl SettingsView {
         }
         self.providers.refreshing = true;
         cx.notify();
-        let task = self.state.read(cx).rpc(model::SERVER_REFRESH_PROVIDERS, model::refresh_payload());
+        let task = self.scoped_rpc(t3_core::usage::PROVIDERS_MANAGE_SCOPE, model::SERVER_REFRESH_PROVIDERS, model::refresh_payload(), cx);
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -1018,17 +1049,21 @@ impl SettingsView {
 
     /// `runProviderUpdate`: one call per instance at a time.
     fn run_update(&mut self, instance_id: &str, target_version: Option<String>, cx: &mut Context<Self>) {
-        let driver = {
-            let app = self.state.read(cx);
-            app.server_config.config.as_ref().and_then(|config| config.provider(instance_id)).map(|provider| provider.driver.clone())
-        };
+        let driver = self
+            .scoped_raw_representative_config(cx)
+            .and_then(|config| config.provider(instance_id).map(|provider| provider.driver.clone()));
         let Some(driver) = driver else { return };
         if !self.providers.dispatching.insert(instance_id.to_owned()) {
             return;
         }
         self.providers.update_error = None;
         cx.notify();
-        let task = self.state.read(cx).rpc(model::SERVER_UPDATE_PROVIDER, model::update_payload(&driver, instance_id, target_version.as_deref()));
+        let task = self.scoped_rpc(
+            t3_core::usage::PROVIDERS_MANAGE_SCOPE,
+            model::SERVER_UPDATE_PROVIDER,
+            model::update_payload(&driver, instance_id, target_version.as_deref()),
+            cx,
+        );
         let id = instance_id.to_owned();
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -1048,17 +1083,35 @@ impl SettingsView {
         .detach();
     }
 
-    /// Saves an edit of one instance as an upsert.
+    /// Saves an edit of one instance as an upsert (or as a `projectSettingsOverrides[projectId].providerInstances[id].enabled`
+    /// override when toggling enabled at Project/Checkout scope).
     fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
         if !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE,cx) {return;}
-        if matches!(edit, model::InstanceEdit::Enabled(true)) {
-            let app = self.state.read(cx);
-            if let Some(c) = app.server_config.config.as_ref() {
-                let driver = c.provider(instance_id).map(|p| p.driver.as_str()).or_else(|| c.settings.provider_instances.get(instance_id).map(|i| i.driver.as_str())).unwrap_or(instance_id);
-                if t3_core::managed_policy::driver_denial(c.managed_policy.as_ref(), driver, driver).is_some() { return; }
+        if matches!(edit, model::InstanceEdit::Enabled(true))
+            && let Some(c) = self.scoped_raw_representative_config(cx)
+        {
+            let driver = c.provider(instance_id).map(|p| p.driver.as_str()).or_else(|| c.settings.provider_instances.get(instance_id).map(|i| i.driver.as_str())).unwrap_or(instance_id);
+            if t3_core::managed_policy::driver_denial(c.managed_policy.as_ref(), driver, driver).is_some() { return; }
+        }
+        if self.is_project_scope(cx)
+            && let model::InstanceEdit::Enabled(flag) = edit
+        {
+            let members = self.scoped_project_members(cx);
+            if !members.is_empty() {
+                store::update_projects(
+                    &self.state,
+                    members,
+                    t3_core::settings::projects::OverrideEdit::ProviderInstanceEnabled {
+                        instance_id: instance_id.to_owned(),
+                        enabled: Some(flag),
+                    },
+                    |_, _| {},
+                    cx,
+                );
+                return;
             }
         }
-        store::update_server(&self.state, ServerSettingChange::ProviderInstance { instance_id: instance_id.to_owned(), edit }, cx);
+        self.update_scoped_single_env(ServerSettingChange::ProviderInstance { instance_id: instance_id.to_owned(), edit }, cx);
     }
 
     pub(super) fn selected_instance_id(&self, cx: &App) -> Option<String> {
@@ -1072,7 +1125,7 @@ impl SettingsView {
         {
             return None;
         }
-        let config = app.server_config.config.as_ref()?;
+        let config = self.scoped_raw_representative_config(cx)?;
         let rows = model::instance_rows(&config.settings, &config.providers, self.providers.selected.as_deref());
         self.providers.selected.as_deref().and_then(|id| rows.iter().find(|row| row.instance_id == id))
             .or_else(|| self.providers.setup_target.is_none().then(|| rows.first()).flatten())
@@ -1197,11 +1250,9 @@ impl SettingsView {
         };
         let value = self.providers.accent.read(cx).value().trim().to_owned();
         if !value.is_empty() && model::normalize_accent(&value).is_none() {
-            let saved = {
-                let app = self.state.read(cx);
-                let config = app.server_config.config.as_ref();
-                config.and_then(|config| config.settings.provider_instances.get(&instance_id)).and_then(|instance| instance.accent_color.clone())
-            };
+            let saved = self
+                .scoped_raw_representative_config(cx)
+                .and_then(|config| config.settings.provider_instances.get(&instance_id).and_then(|instance| instance.accent_color.clone()));
             self.providers.accent.update(cx, |input, cx| input.set_value(saved.unwrap_or_default(), window, cx));
             return;
         }
@@ -1244,14 +1295,8 @@ impl SettingsView {
             return None;
         }
         let typed = self.providers.health_interval.read(cx).value();
-        let panel = &self
-            .state
-            .read(cx)
-            .server_config
-            .config
-            .as_ref()?
-            .settings
-            .provider_panel;
+        let config = self.scoped_raw_representative_config(cx)?;
+        let panel = &config.settings.provider_panel;
         match typed
             .trim()
             .parse::<f64>()
@@ -1288,7 +1333,7 @@ impl SettingsView {
     ) {
         match change {
             Some(Ok(payload)) => {
-                store::update_server(&self.state, ServerSettingChange::Prepared(payload), cx)
+                self.update_scoped_single_env(ServerSettingChange::Prepared(payload), cx)
             }
             Some(Err(saved)) => self
                 .providers

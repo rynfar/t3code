@@ -486,10 +486,14 @@ impl ChatGptSetup {
                             }
                         } else if let Some(auth) = auth::decode_auth_state(value) {
                             this.state.auth = Some(auth);
+                            if method == auth::AUTH_REMOVE_METHOD {
+                                let remaining = this.profiles();
+                                this.selection = model::picker_selection(&remaining, &this.selection);
+                            }
                         }
                         this.refresh(cx);
                     }
-                    Err(_) => this.state.error = Some("Codex setup failed. Try again.".into()),
+                    Err(error) => this.state.error = Some(command_error_message(&error.to_string())),
                 }
                 cx.notify();
             });
@@ -1073,12 +1077,21 @@ fn picker_selected_removable(profiles: &[auth::AuthMethod], selected_id: &str) -
         .is_some_and(auth::AuthMethod::is_removable)
 }
 
+fn command_error_message(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        "Codex setup failed. Try again.".into()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use t3_core::settings::providers::auth;
+    use t3_core::settings::providers::{auth, chatgpt as model};
 
-    use super::picker_selected_removable;
+    use super::{command_error_message, picker_selected_removable};
 
     fn profile(id: &str, can_remove: Option<bool>) -> auth::AuthMethod {
         auth::AuthMethod {
@@ -1104,6 +1117,25 @@ mod tests {
         assert_eq!(
             auth::remove_method_payload("codex", "chatgpt-profile:work"),
             json!({ "instanceId": "codex", "methodId": "chatgpt-profile:work" })
+        );
+    }
+
+    #[test]
+    fn command_error_surfaces_rpc_message_and_removal_advances_selection() {
+        assert_eq!(
+            command_error_message("Cannot remove active ChatGPT profile"),
+            "Cannot remove active ChatGPT profile"
+        );
+        assert_eq!(command_error_message("   "), "Codex setup failed. Try again.");
+
+        let after_remove = vec![profile("chatgpt-profile:personal", Some(true))];
+        assert_eq!(
+            model::picker_selection(&after_remove, "chatgpt-profile:work"),
+            "chatgpt-profile:personal"
+        );
+        assert_eq!(
+            model::picker_selection(&[], "chatgpt-profile:personal"),
+            "chatgpt-change-account"
         );
     }
 }

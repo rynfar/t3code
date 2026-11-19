@@ -265,8 +265,7 @@ impl SettingsView {
 
     fn save_source_control_and_rescan(&self, change: SourceControlChange, on_settled: impl FnOnce(&mut Self, Option<String>, &mut Context<Self>) + 'static, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
-        store::update_server_then(
-            &self.state,
+        self.update_scoped_single_env_then(
             change.into_server(),
             move |error, cx| {
                 cx.defer(move |cx| {
@@ -286,7 +285,7 @@ impl SettingsView {
 
     fn commit_custom_instructions(&mut self, cx: &mut Context<Self>) {
         let value = self.source_control.custom_instructions.read(cx).value().trim().to_owned();
-        let saved = self.thread_settings(cx).map(|config| config.settings.source_control.source_control_writing_style.custom_instructions.clone());
+        let saved = self.scoped_representative_config(cx).map(|config| config.settings.source_control.source_control_writing_style.custom_instructions);
         if saved.is_some_and(|saved| saved != value) {
             self.save_source_control(SourceControlChange::CustomInstructions(value), cx);
         }
@@ -294,7 +293,7 @@ impl SettingsView {
 
     fn commit_review_instructions(&mut self, cx: &mut Context<Self>) {
         let value = self.source_control.review_instructions.read(cx).value().trim().to_owned();
-        let saved = self.thread_settings(cx).map(|config| config.settings.source_control.review_guide_instructions.clone());
+        let saved = self.scoped_representative_config(cx).map(|config| config.settings.source_control.review_guide_instructions);
         if saved.is_some_and(|saved| saved != value) {
             self.save_source_control(SourceControlChange::ReviewGuideInstructions(value), cx);
         }
@@ -564,46 +563,55 @@ impl SettingsView {
                 let _ = view.update(cx, |this, cx| this.update_scoped_server(change(checked).into_server(), cx));
             })
         };
-        let reset = |change: SourceControlChange| {
-            let view = view.clone();
-            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-                let _ = view.update(cx, |this, cx| this.update_scoped_server(change.clone().into_server(), cx));
-            }
-        };
         let merge_view = view.clone();
         let method = config.settings.pull_request_merge_method;
         section(
             "Repositories",
             vec![
-                Row::new("automatic-pull", "Automatically pull")
-                    .description("Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.")
-                    .highlighted(self.is_target("automatic-pull"))
-                    .reset(settings.default_auto_pull, reset(SourceControlChange::AutoPull(false)))
-                    .control(switch("automatic-pull-switch", settings.default_auto_pull, SourceControlChange::AutoPull))
-                    .into_any_element(),
-                Row::new("remove-agent-credits-on-merge", "Remove agent credits when merging")
-                    .description("Remove recognized agent credit lines from merge and squash messages on hosts that support it, keeping human co-authors. Includes auto-merge. Excludes merge queues, stack merges, and existing commits.")
-                    .highlighted(self.is_target("remove-agent-credits-on-merge"))
-                    .reset(settings.remove_agent_credits_on_merge, reset(SourceControlChange::RemoveAgentCredits(false)))
-                    .control(switch("remove-agent-credits-switch", settings.remove_agent_credits_on_merge, SourceControlChange::RemoveAgentCredits))
-                    .into_any_element(),
-                Row::new("pull-request-merge-method", "Default merge method")
-                    .description("Pull requests start with this method. Last selected reuses whatever you chose most recently on this device.")
-                    .highlighted(self.is_target("pull-request-merge-method"))
-                    .reset(method.is_some(), reset(SourceControlChange::MergeMethod(None)))
-                    .control(
-                        Select::new("pull-request-merge-method-select", MERGE_METHODS.iter().map(|(value, label)| SelectOption::new(*value, *label)).collect())
-                            .selected(merge_method_value(method))
-                            .width(196.)
-                            .on_change(move |value, _, cx| {
-                                if let Some(method) = parse_merge_method(&value) {
-                                    let _ = merge_view.update(cx, |this, cx| {
-                                        this.update_scoped_server(SourceControlChange::MergeMethod(method).into_server(), cx);
-                                    });
-                                }
-                            }),
-                    )
-                    .into_any_element(),
+                self.apply_scoped_reset(
+                    Row::new("automatic-pull", "Automatically pull")
+                        .description("Keeps the default branch current when the checkout has no local changes or commits. Projects can override it.")
+                        .highlighted(self.is_target("automatic-pull")),
+                    &["defaultAutoPull"],
+                    settings.default_auto_pull,
+                    SourceControlChange::AutoPull(false).into_server(),
+                    cx,
+                )
+                .control(switch("automatic-pull-switch", settings.default_auto_pull, SourceControlChange::AutoPull))
+                .into_any_element(),
+                self.apply_scoped_reset(
+                    Row::new("remove-agent-credits-on-merge", "Remove agent credits when merging")
+                        .description("Remove recognized agent credit lines from merge and squash messages on hosts that support it, keeping human co-authors. Includes auto-merge. Excludes merge queues, stack merges, and existing commits.")
+                        .highlighted(self.is_target("remove-agent-credits-on-merge")),
+                    &["removeAgentCreditsOnMerge"],
+                    settings.remove_agent_credits_on_merge,
+                    SourceControlChange::RemoveAgentCredits(false).into_server(),
+                    cx,
+                )
+                .control(switch("remove-agent-credits-switch", settings.remove_agent_credits_on_merge, SourceControlChange::RemoveAgentCredits))
+                .into_any_element(),
+                self.apply_scoped_reset(
+                    Row::new("pull-request-merge-method", "Default merge method")
+                        .description("Pull requests start with this method. Last selected reuses whatever you chose most recently on this device.")
+                        .highlighted(self.is_target("pull-request-merge-method")),
+                    &["pullRequestMergeMethod"],
+                    method.is_some(),
+                    SourceControlChange::MergeMethod(None).into_server(),
+                    cx,
+                )
+                .control(
+                    Select::new("pull-request-merge-method-select", MERGE_METHODS.iter().map(|(value, label)| SelectOption::new(*value, *label)).collect())
+                        .selected(merge_method_value(method))
+                        .width(196.)
+                        .on_change(move |value, _, cx| {
+                            if let Some(method) = parse_merge_method(&value) {
+                                let _ = merge_view.update(cx, |this, cx| {
+                                    this.update_scoped_server(SourceControlChange::MergeMethod(method).into_server(), cx);
+                                });
+                            }
+                        }),
+                )
+                .into_any_element(),
             ],
             cx,
         )
@@ -730,20 +738,29 @@ impl SettingsView {
         if item.auth.is_some() {
             let offered = config.settings.source_control.is_provider_offered(&item.kind);
             let offer_kind = item.kind.clone();
-            let state = self.state.clone();
+            let offer_view = cx.entity().downgrade();
+            let offer_disabled = !can_write || self.is_project_scope(cx);
             right = right.child(
                 div()
                     .id(SharedString::from(format!("source-control-{}-offered-tip", item.kind)))
-                    .tooltip(tooltip("Offer when adding or publishing a project".into()))
+                    .tooltip(tooltip(
+                        if self.is_project_scope(cx) {
+                            "Environment-wide setting. Select an environment to change it."
+                        } else {
+                            "Offer when adding or publishing a project"
+                        }
+                        .into(),
+                    ))
                     .child(
                         Switch::new(SharedString::from(format!("source-control-{}-offered", item.kind)), offered)
-                            .disabled(!can_write)
+                            .disabled(offer_disabled)
                             .on_change(move |checked, _, cx| {
-                                store::update_server(
-                                    &state,
-                                    SourceControlChange::OfferProvider { kind: offer_kind.clone(), offered: checked }.into_server(),
-                                    cx,
-                                );
+                                let _ = offer_view.update(cx, |this, cx| {
+                                    this.update_scoped_single_env(
+                                        SourceControlChange::OfferProvider { kind: offer_kind.clone(), offered: checked }.into_server(),
+                                        cx,
+                                    );
+                                });
                             }),
                     ),
             );
@@ -1600,16 +1617,22 @@ impl SettingsView {
         self.sync_text_generator_models(config, cx);
         let settings = &config.settings.source_control;
         let style = &settings.source_control_writing_style;
+        let env_only = self.env_only_unavailable(cx);
+        let scope_project = self.is_project_scope(cx).then(|| self.scope_project_id(cx)).flatten();
         let writer = source_control::writer_model(&config.settings);
-        let writer_seed = writer
-            .clone()
-            .or_else(|| t3_core::settings::resolve_default_text_generation_selection(config, None, &self.threads.text_gen_models));
-        let review_options = self.apply_scoped_model_availability(config, model_options(config, None), false, cx);
+        let writer_seed = writer.clone().or_else(|| {
+            t3_core::settings::resolve_default_text_generation_selection(
+                config,
+                scope_project.as_deref(),
+                self.text_gen_models_for(config),
+            )
+        });
+        let review_options = self.apply_scoped_model_availability(config, model_options(config, scope_project.as_deref()), false, cx);
         let writer_options = self.apply_scoped_model_availability(
             config,
             self.text_gen_select_options(
                 config,
-                None,
+                scope_project.as_deref(),
                 &[settings.source_control_writer_model_selection.as_ref(), writer_seed.as_ref()],
             ),
             true,
@@ -1619,15 +1642,16 @@ impl SettingsView {
         let mode_view = view.clone();
         let custom = style.mode == WritingMode::Custom;
         let instructions = self.source_control.custom_instructions.clone();
-        let reset_view = view.clone();
-        let writing = Row::new("source-control-writing-style", "Source control writing style")
-            .description(style.mode.description())
-            .highlighted(self.is_target("source-control-writing-style"))
-            .reset(!style.is_default_style(), move |_, _, cx| {
-                let _ = reset_view.update(cx, |this, cx| {
-                    this.update_scoped_server(SourceControlChange::ResetWritingStyle.into_server(), cx);
-                });
-            })
+        let writing = self
+            .apply_scoped_reset(
+                Row::new("source-control-writing-style", "Source control writing style")
+                    .description(style.mode.description())
+                    .highlighted(self.is_target("source-control-writing-style")),
+                &["sourceControlWritingStyle"],
+                !style.is_default_style(),
+                SourceControlChange::ResetWritingStyle.into_server(),
+                cx,
+            )
             .control(
                 Select::new("source-control-writing-style-select", WritingMode::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                     .selected(style.mode.as_str())
@@ -1648,7 +1672,8 @@ impl SettingsView {
             Row::new("review-guides", "Review guides (beta)")
                 .description("Add a Guide tab to pull requests. An agent explains the changes and points out decisions that need review.")
                 .highlighted(self.is_target("review-guides"))
-                .control(Switch::new("review-guides-switch", settings.review_guides_enabled).on_change(move |on, _, cx| {
+                .unavailable(env_only.clone())
+                .control(Switch::new("review-guides-switch", settings.review_guides_enabled).disabled(env_only.is_some()).on_change(move |on, _, cx| {
                     let _ = guides_view.update(cx, |this, cx| {
                         this.update_scoped_server(SourceControlChange::ReviewGuides(on).into_server(), cx);
                     });
@@ -1672,36 +1697,36 @@ impl SettingsView {
                     cx,
                 ),
             );
-            let reset_view = view.clone();
             rows.push(
-                Row::new("review-guide-instructions", "Review guide instructions")
-                    .description("Your preferences for review guides: what to show first, dwell on, or skip. The guide's format and coverage stay the same.")
-                    .reset(!settings.review_guide_instructions.is_empty(), move |_, _, cx| {
-                        let _ = reset_view.update(cx, |this, cx| {
-                            this.update_scoped_server(SourceControlChange::ReviewGuideInstructions(String::new()).into_server(), cx);
-                        });
-                    })
-                    .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.source_control.review_instructions)))
-                    .into_any_element(),
+                self.apply_scoped_reset(
+                    Row::new("review-guide-instructions", "Review guide instructions")
+                        .description("Your preferences for review guides: what to show first, dwell on, or skip. The guide's format and coverage stay the same."),
+                    &["reviewGuideInstructions"],
+                    !settings.review_guide_instructions.is_empty(),
+                    SourceControlChange::ReviewGuideInstructions(String::new()).into_server(),
+                    cx,
+                )
+                .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.source_control.review_instructions)))
+                .into_any_element(),
             );
         }
         let templates_view = view.clone();
-        let reset_templates = view.clone();
         let advanced_rows = vec![
-            Row::new("follow-change-request-templates", "Follow change request templates")
-                .description("Use the repository's template for change request descriptions when available.")
-                .highlighted(self.is_target("follow-change-request-templates"))
-                .reset(!style.follow_change_request_templates, move |_, _, cx| {
-                    let _ = reset_templates.update(cx, |this, cx| {
-                        this.update_scoped_server(SourceControlChange::FollowTemplates(true).into_server(), cx);
-                    });
-                })
-                .control(Switch::new("follow-change-request-templates-switch", style.follow_change_request_templates).on_change(move |on, _, cx| {
-                    let _ = templates_view.update(cx, |this, cx| {
-                        this.update_scoped_server(SourceControlChange::FollowTemplates(on).into_server(), cx);
-                    });
-                }))
-                .into_any_element(),
+            self.apply_scoped_reset(
+                Row::new("follow-change-request-templates", "Follow change request templates")
+                    .description("Use the repository's template for change request descriptions when available.")
+                    .highlighted(self.is_target("follow-change-request-templates")),
+                &["sourceControlWritingStyle"],
+                !style.follow_change_request_templates,
+                SourceControlChange::FollowTemplates(true).into_server(),
+                cx,
+            )
+            .control(Switch::new("follow-change-request-templates-switch", style.follow_change_request_templates).on_change(move |on, _, cx| {
+                let _ = templates_view.update(cx, |this, cx| {
+                    this.update_scoped_server(SourceControlChange::FollowTemplates(on).into_server(), cx);
+                });
+            }))
+            .into_any_element(),
             self.model_row(
                 config,
                 ModelRow {

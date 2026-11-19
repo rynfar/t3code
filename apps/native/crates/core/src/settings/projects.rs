@@ -405,6 +405,8 @@ pub enum OverrideEdit {
     SetMap(Map<String, Value>),
     /// `planScopedSettingsClear`: "Reset to inherited value".
     Clear { keys: Vec<String> },
+    /// Project-level provider instance override (`providerInstances[instanceId].enabled`).
+    ProviderInstanceEnabled { instance_id: String, enabled: Option<bool> },
     /// The members' actions (`useProjectScriptSettings`).
     Scripts(ScriptsEdit),
 }
@@ -434,9 +436,46 @@ pub fn override_patch(settings: &ServerSettings, members: &[Member], edit: &Over
                             entry.insert(key.clone(), value.clone());
                         }
                     }
-                    Value::Object(entry)
+                    if entry.is_empty() { Value::Null } else { Value::Object(entry) }
                 }
                 OverrideEdit::Clear { keys } => cleared_override(settings, id, &keys.iter().map(String::as_str).collect::<Vec<_>>()),
+                OverrideEdit::ProviderInstanceEnabled { instance_id, enabled } => {
+                    let mut entry = override_entry(settings, id).unwrap_or_default();
+                    let mut instances = entry
+                        .get("providerInstances")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    match enabled {
+                        Some(flag) => {
+                            let mut inst = instances
+                                .get(instance_id)
+                                .and_then(Value::as_object)
+                                .cloned()
+                                .unwrap_or_default();
+                            inst.insert("enabled".to_owned(), Value::Bool(*flag));
+                            instances.insert(instance_id.clone(), Value::Object(inst));
+                        }
+                        None => {
+                            if let Some(mut inst) =
+                                instances.get(instance_id).and_then(Value::as_object).cloned()
+                            {
+                                inst.remove("enabled");
+                                if inst.is_empty() {
+                                    instances.remove(instance_id);
+                                } else {
+                                    instances.insert(instance_id.clone(), Value::Object(inst));
+                                }
+                            }
+                        }
+                    }
+                    if instances.is_empty() {
+                        entry.remove("providerInstances");
+                    } else {
+                        entry.insert("providerInstances".to_owned(), Value::Object(instances));
+                    }
+                    if entry.is_empty() { Value::Null } else { Value::Object(entry) }
+                }
                 OverrideEdit::Scripts(edit) => {
                     let current = resolve_project_scripts(settings, id, member.scripts.clone());
                     match edit.apply(&current) {

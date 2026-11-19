@@ -449,8 +449,12 @@ impl SettingsView {
         let p = palette(cx);
         let doc = self.doc(cx).clone();
         let config = self.scoped_representative_config(cx);
-        let can_write = config.is_some() && self.may("settings:write", cx);
-        let write_unavailable = (!can_write).then_some("Reconnect with settings write access to change this setting.");
+        let write_unavailable = if config.is_none() || !self.may("settings:write", cx) {
+            Some("Reconnect with settings write access to change this setting.".to_owned())
+        } else {
+            self.env_only_unavailable(cx)
+        };
+        let can_write = write_unavailable.is_none();
         let weak = cx.entity().downgrade();
         let server_switch = |id: &'static str, checked: bool, disabled: bool, change: fn(bool) -> ServerSettingChange| {
             let weak = weak.clone();
@@ -494,7 +498,7 @@ impl SettingsView {
         } else {
             managed_policy::capability_denial(config.as_ref().and_then(|c| c.managed_policy.as_ref()), Capability::Connect)
         };
-        let guest_unavailable = connect_denial.or_else(|| write_unavailable.map(str::to_owned));
+        let guest_unavailable = connect_denial.or_else(|| write_unavailable.clone());
         let access_link = cx.entity().downgrade();
         let guest_row = Row::new("guest-links", "Guest links")
             .description_content(
@@ -530,7 +534,7 @@ impl SettingsView {
                     .child("While off, nothing new starts over a link; running tasks finish."),
             )
             .highlighted(self.is_target("linked-environments-beta"))
-            .unavailable(write_unavailable)
+            .unavailable(write_unavailable.clone())
             .control(server_switch(
                 "linked-environments-switch",
                 linked_enabled,
@@ -542,7 +546,7 @@ impl SettingsView {
         let prompt_suggestions_row = Row::new("prompt-suggestions-beta", "Suggest next prompt")
             .description("Show a predicted next message in the empty composer after a Claude or Codex turn. Tab uses it. Each is an extra cached request on your plan. Needs Codex 0.165+. Claude threads update on restart.")
             .highlighted(self.is_target("prompt-suggestions-beta"))
-            .unavailable(write_unavailable)
+            .unavailable(write_unavailable.clone())
             .control(server_switch(
                 "prompt-suggestions-switch",
                 prompt_suggestions_enabled,
@@ -566,7 +570,7 @@ impl SettingsView {
                     .child("An alpha that may change or break. T3 Code never installs Simlock."),
             )
             .highlighted(self.is_target("simlock-hosts"))
-            .unavailable(write_unavailable)
+            .unavailable(write_unavailable.clone())
             .control(server_switch(
                 "simlock-hosts-switch",
                 simlock_enabled,

@@ -177,12 +177,12 @@ fn now_ms() -> i64 {
 }
 
 impl SettingsView {
-    fn connected_now(&self, cx: &App) -> bool {
+    pub(super) fn connected_now(&self, cx: &App) -> bool {
         matches!(self.state.read(cx).phase, Phase::Online(ConnectionStatus::Connected))
     }
 
     /// Why a server-backed row cannot change (`SettingsRow`'s inert control), if it cannot.
-    fn settings_unavailable(&self, cx: &App) -> Option<String> {
+    pub(super) fn settings_unavailable(&self, cx: &App) -> Option<String> {
         if !self.connected_now(cx) {
             return Some("Reconnect the selected environment to change this setting.".to_owned());
         }
@@ -304,7 +304,10 @@ impl SettingsView {
     /// `RetentionControl`'s commit: explicit Enter or edited blur saves clamped; untouched blur
     /// discards a draft without saving.
     fn commit_artifact_retention(&mut self, field: Field, explicit: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(saved) = self.thread_settings(cx).map(|config| field.saved(&Retention::of(&config.settings))) else {
+        if self.is_project_scope(cx) {
+            return;
+        }
+        let Some(saved) = self.scoped_representative_config(cx).map(|config| field.saved(&Retention::of(&config.settings))) else {
             return;
         };
         let input = self.maintenance.input(field).clone();
@@ -343,7 +346,7 @@ impl SettingsView {
                 return true;
             }
             if input.focus_handle(cx).is_focused(window)
-                && let Some(saved) = self.thread_settings(cx).and_then(|config| field.saved(&Retention::of(&config.settings)))
+                && let Some(saved) = self.scoped_representative_config(cx).and_then(|config| field.saved(&Retention::of(&config.settings)))
             {
                 input.update(cx, |input, cx| input.set_value(saved.to_string(), window, cx));
                 self.focus.focus(window, cx);
@@ -360,13 +363,13 @@ impl SettingsView {
             return;
         };
         let input = self.maintenance.intervals[index].clone();
-        let Some(settings) = self.thread_settings(cx).map(|config| config.settings.provider_panel.clone()) else {
+        let Some(settings) = self.scoped_representative_config(cx).map(|config| config.settings.provider_panel) else {
             return;
         };
         let saved = field.seconds(&settings.resolved_background_activity());
         let seconds = field.normalize(&input.read(cx).value()).unwrap_or(saved);
         input.update(cx, |input, cx| input.set_value(seconds.to_string(), window, cx));
-        if seconds != saved && self.may(SETTINGS_WRITE_SCOPE, cx) {
+        if seconds != saved && self.may(SETTINGS_WRITE_SCOPE, cx) && !self.is_project_scope(cx) {
             self.update_scoped_server(ServerSettingChange::BackgroundActivity(BackgroundEdit::Override(field.change(seconds))), cx);
         }
     }
@@ -391,7 +394,8 @@ impl SettingsView {
         self.ensure_maintenance_streams(&config, cx);
         let settings = &config.settings;
         let unavailable = self.settings_unavailable(cx);
-        let connected = self.connected_now(cx);
+        let env_only = self.env_only_unavailable(cx);
+        let connected = self.scoped_connected_now(cx);
         let view = cx.entity().downgrade();
         let updates = section(
             "Updates",
@@ -399,7 +403,7 @@ impl SettingsView {
                 Row::new("provider-update-checks", "Provider update checks")
                     .description("Check installed provider CLIs for newer available versions and fetch model catalog updates. When off, new models may not appear.")
                     .highlighted(self.is_target("provider-update-checks"))
-                    .unavailable(unavailable.clone())
+                    .unavailable(env_only.clone())
                     .reset(!settings.maintenance.enable_provider_update_checks, {
                         let view = view.clone();
                         move |_, _, cx| {
@@ -408,7 +412,7 @@ impl SettingsView {
                             });
                         }
                     })
-                    .control(Switch::new("provider-update-checks-switch", settings.maintenance.enable_provider_update_checks).on_change({
+                    .control(Switch::new("provider-update-checks-switch", settings.maintenance.enable_provider_update_checks).disabled(env_only.is_some()).on_change({
                         let view = view.clone();
                         move |on, _, cx| {
                             let _ = view.update(cx, |this, cx| {
@@ -417,39 +421,37 @@ impl SettingsView {
                         }
                     }))
                     .into_any_element(),
-                Row::new("continue-threads-after-server-update", "Continue threads after restarts")
-                    .description("Automatically resume interrupted threads after an update, crash, or machine restart on the selected environments.")
-                    .when(!connected, |row| row.status("All selected connected environments must support restart continuation."))
-                    .highlighted(self.is_target("continue-threads-after-server-update"))
-                    .unavailable(unavailable.clone())
-                    .reset(connected && !settings.maintenance.continue_threads_after_server_update, {
-                        let view = view.clone();
-                        move |_, _, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(true).payload()), cx);
-                            });
-                        }
-                    })
-                    .control(Switch::new("continue-threads-switch", settings.maintenance.continue_threads_after_server_update).disabled(!connected).on_change({
-                        let view = view.clone();
-                        move |on, _, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(on).payload()), cx);
-                            });
-                        }
-                    }))
-                    .into_any_element(),
+                self.apply_scoped_reset(
+                    Row::new("continue-threads-after-server-update", "Continue threads after restarts")
+                        .description("Automatically resume interrupted threads after an update, crash, or machine restart on the selected environments.")
+                        .when(!connected, |row| row.status("All selected connected environments must support restart continuation."))
+                        .highlighted(self.is_target("continue-threads-after-server-update"))
+                        .unavailable(unavailable.clone()),
+                    &["continueThreadsAfterServerUpdate"],
+                    connected && !settings.maintenance.continue_threads_after_server_update,
+                    ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(true).payload()),
+                    cx,
+                )
+                .control(Switch::new("continue-threads-switch", settings.maintenance.continue_threads_after_server_update).disabled(!connected).on_change({
+                    let view = view.clone();
+                    move |on, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.update_scoped_server(ServerSettingChange::Prepared(MaintenanceChange::ContinueThreads(on).payload()), cx);
+                        });
+                    }
+                }))
+                .into_any_element(),
             ],
             cx,
         );
         let background = section(
             "Background activity",
             vec![
-                self.background_row(&config, unavailable.clone(), cx),
+                self.background_row(&config, env_only.clone(), cx),
                 Row::new("keep-awake-while-agents-work", "Keep awake while agents work")
                     .description("Stop the computer from going to sleep while agents are working, and let it sleep once they finish. Closing a laptop lid still puts it to sleep.")
                     .highlighted(self.is_target("keep-awake-while-agents-work"))
-                    .unavailable(unavailable.clone())
+                    .unavailable(env_only.clone())
                     .reset(!settings.maintenance.keep_awake_while_agents_work, {
                         let view = view.clone();
                         move |_, _, cx| {
@@ -459,7 +461,7 @@ impl SettingsView {
                         }
                     })
                     .control(
-                        Switch::new("keep-awake-while-agents-work-switch", settings.maintenance.keep_awake_while_agents_work).on_change({
+                        Switch::new("keep-awake-while-agents-work-switch", settings.maintenance.keep_awake_while_agents_work).disabled(env_only.is_some()).on_change({
                             let view = view.clone();
                             move |on, _, cx| {
                                 let _ = view.update(cx, |this, cx| {
@@ -476,7 +478,7 @@ impl SettingsView {
             Block::new(&["provider-update-checks", "continue-threads-after-server-update"], updates),
             Block::new(&["background-activity", "git-fetch-interval", "keep-awake-while-agents-work"], background),
         ];
-        blocks.extend(self.storage_blocks(&config, unavailable, window, cx));
+        blocks.extend(self.storage_blocks(&config, env_only, window, cx));
         let diagnostics = section(
             "Diagnostics",
             vec![
@@ -566,7 +568,7 @@ impl SettingsView {
             return Some(overlay);
         }
         let focus = self.maintenance.background_dialog.clone()?;
-        let config = self.thread_settings(cx).cloned()?;
+        let config = self.scoped_representative_config(cx)?;
         let p = palette(cx);
         let settings = config.settings.provider_panel.clone();
         let resolved = settings.resolved_background_activity();
@@ -693,7 +695,7 @@ impl SettingsView {
                 on,
                 move |this, pressed| this.maintenance.retention_switch_pressed[idx] = pressed,
                 move |this, next, window, cx| {
-                    let saved = this.thread_settings(cx).and_then(|config| field.saved(&Retention::of(&config.settings)));
+                    let saved = this.scoped_representative_config(cx).and_then(|config| field.saved(&Retention::of(&config.settings)));
                     match this.maintenance.retention_drafts[idx].toggle(saved, next) {
                         RetentionToggle::OpenDraft(days) => {
                             this.maintenance.input(field).update(cx, |input, cx| {

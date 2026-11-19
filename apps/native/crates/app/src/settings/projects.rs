@@ -140,7 +140,7 @@ impl SettingsView {
     }
 
     pub(super) fn shown_project(&self, cx: &App) -> Option<Shown> {
-        let key = self.projects.selected.as_deref()?;
+        let key = self.scope.project.as_deref().or(self.projects.selected.as_deref())?;
         let groups = self.project_groups(cx);
         let group = groups.iter().find(|group| group.key == key)
             .or_else(|| groups.iter().find(|group| group.member_refs.iter().any(|reference| self.projects.last_members.contains(reference))))?.clone();
@@ -166,7 +166,20 @@ impl SettingsView {
 
     pub(super) fn select_project_id(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let active = self.state.read(cx).environments.active.as_deref();
-        let key = self.project_groups(cx).into_iter().find(|group| group.member_refs.iter().any(|reference| Some(reference.environment_id.as_str()) == active && reference.project_id == project_id)).map(|group| group.key);
+        let groups = self.project_groups(cx);
+        let key = groups
+            .iter()
+            .find(|group| {
+                group.member_refs.iter().any(|reference| {
+                    Some(reference.environment_id.as_str()) == active && reference.project_id == project_id
+                })
+            })
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|group| group.member_refs.iter().any(|reference| reference.project_id == project_id))
+            })
+            .map(|group| group.key.clone());
         self.projects.pending_project = key.is_none().then(|| project_id.to_owned());
         if let Some(key) = key { self.select_project(Some(key), cx); }
     }
@@ -336,6 +349,12 @@ impl SettingsView {
         if let Some(project_id) = self.projects.pending_project.clone() {
             self.select_project_id(&project_id, cx);
         }
+        if self.projects.selected != self.scope.project {
+            self.projects.selected = self.scope.project.clone();
+            self.projects.last_members.clear();
+            self.projects.name_edited = false;
+            self.projects.actions.close();
+        }
         if self.projects.selected.is_none() {
             return Vec::new();
         }
@@ -472,6 +491,9 @@ impl SettingsView {
     /// `SettingsScopeNotice` for a project, while none is chosen: the picker and status line,
     /// then one row per project, as a virtualized list over the page.
     pub(super) fn project_list_view(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.projects.selected != self.scope.project {
+            self.projects.selected = self.scope.project.clone();
+        }
         if self.projects.selected.is_some() {
             return None;
         }

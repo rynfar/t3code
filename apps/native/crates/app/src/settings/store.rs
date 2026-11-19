@@ -206,6 +206,7 @@ fn apply_client(
     cx.refresh_windows();
 }
 /// Saves one server setting. A failure keeps the saved value on screen and says why.
+#[cfg(all(test, feature = "snapshot"))]
 pub fn update_server(state: &Entity<AppState>, change: ServerSettingChange, cx: &mut App) {
     update_server_with(state, change, None, cx);
 }
@@ -317,8 +318,7 @@ pub(super) fn update_scoped_environments(
     enqueue_scoped_environments(state, owners, change, on_done, cx);
 }
 
-#[cfg(all(test, feature = "snapshot"))]
-fn update_scoped_environments_then(
+pub(super) fn update_scoped_environments_then(
     state: &Entity<AppState>,
     owners: Vec<t3_core::sidebar::grouping::EnvironmentOwner>,
     change: ServerSettingChange,

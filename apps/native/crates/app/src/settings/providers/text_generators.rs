@@ -23,7 +23,7 @@ use t3_core::settings::providers::text_generators::{
 use super::super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, group, muted_text, r, section, section_title};
 use super::super::projects::SETTINGS_WRITE_SCOPE;
 use super::super::source_control::{Tone, tone_badge};
-use super::super::{SettingsView, store};
+use super::super::SettingsView;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -149,7 +149,7 @@ fn use_it_test_disabled(testing_any: bool, test_model: Option<&str>) -> bool {
 
 impl SettingsView {
     fn open_text_generator_wizard(&mut self, existing: Option<(String, TextGeneratorConfig)>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(config) = self.thread_settings(cx).cloned() else { return };
+        let Some(config) = self.scoped_raw_representative_config(cx) else { return };
         let (is_new, id, preset_id, kind, enabled, saved_api_key, label_val, base_url_val) = match existing {
             Some((id, cfg)) => {
                 let preset_id = TEXT_GENERATOR_PRESETS
@@ -314,8 +314,7 @@ impl SettingsView {
         }
         cx.notify();
         let view = cx.entity().downgrade();
-        store::update_server_then(
-            &self.state,
+        self.update_scoped_single_env_then(
             ServerSettingChange::Prepared(upsert_text_generator_patch(&id, &cfg)),
             move |error, cx| {
                 cx.defer(move |cx| {
@@ -478,7 +477,7 @@ impl SettingsView {
             move |_, cx| {
                 let id = id.clone();
                 let _ = view.update(cx, |this, cx| {
-                    store::update_server(&this.state, ServerSettingChange::Prepared(remove_text_generator_patch(&id)), cx);
+                    this.update_scoped_single_env(ServerSettingChange::Prepared(remove_text_generator_patch(&id)), cx);
                 });
             },
             cx,
@@ -486,7 +485,7 @@ impl SettingsView {
     }
 
     pub(super) fn render_text_generators_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(config) = self.thread_settings(cx).cloned() else {
+        let Some(config) = self.scoped_raw_representative_config(cx) else {
             return div().into_any_element();
         };
         let can_write = self.may(SETTINGS_WRITE_SCOPE, cx);
@@ -531,7 +530,7 @@ impl SettingsView {
                     let desc = format!("{brand} · {}", cfg.base_url);
                     let toggle_id = id.clone();
                     let toggle_cfg = cfg.clone();
-                    let state_for_toggle = self.state.clone();
+                    let toggle_view = cx.entity().downgrade();
                     let models_id = id.clone();
                     let models_name = display.clone();
                     let edit_id = id.clone();
@@ -572,11 +571,12 @@ impl SettingsView {
                                         .disabled(!can_write)
                                         .on_change(move |enabled, _, cx| {
                                             let next = TextGeneratorConfig { enabled, ..toggle_cfg.clone() };
-                                            store::update_server(
-                                                &state_for_toggle,
-                                                ServerSettingChange::Prepared(upsert_text_generator_patch(&toggle_id, &next)),
-                                                cx,
-                                            );
+                                            let _ = toggle_view.update(cx, |this, cx| {
+                                                this.update_scoped_single_env(
+                                                    ServerSettingChange::Prepared(upsert_text_generator_patch(&toggle_id, &next)),
+                                                    cx,
+                                                );
+                                            });
                                         }),
                                 ),
                         )
@@ -607,7 +607,7 @@ impl SettingsView {
                     .label(preset.label)
                     .disabled(wizard.checking || wizard.saving)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        let Some(cfg) = this.thread_settings(cx).cloned() else { return };
+                        let Some(cfg) = this.scoped_raw_representative_config(cx) else { return };
                         if let Some(w) = this.providers.text_generators.wizard.as_mut() {
                             w.preset_id = preset.id;
                             w.kind = preset.kind;
@@ -724,7 +724,7 @@ impl SettingsView {
                     if selected_model != KEEP_EXISTING_MODEL && !options.iter().any(|o| o.value.as_ref() == selected_model) {
                         options.push(SelectOption::new(selected_model.clone(), selected_model.clone()));
                     }
-                    let state_for_task = self.state.clone();
+                    let task_view = cx.entity().downgrade();
                     let task_id = id.clone();
                     let current_for_change = current.clone();
                     let test_model = use_it_test_model(&selected_model);
@@ -750,11 +750,12 @@ impl SettingsView {
                                                 let Some(selection) = use_it_task_change(current_for_change.as_ref(), &task_id, value.as_ref()) else {
                                                     return;
                                                 };
-                                                store::update_server(
-                                                    &state_for_task,
-                                                    ServerSettingChange::Prepared(task.patch(selection.as_ref())),
-                                                    cx,
-                                                );
+                                                let _ = task_view.update(cx, |this, cx| {
+                                                    this.update_scoped_single_env(
+                                                        ServerSettingChange::Prepared(task.patch(selection.as_ref())),
+                                                        cx,
+                                                    );
+                                                });
                                             }),
                                     )
                                     .child(

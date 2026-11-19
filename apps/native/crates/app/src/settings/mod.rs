@@ -1374,27 +1374,227 @@ impl SettingsView {
             .collect()
     }
 
-    /// Representative `ServerConfig` for display in scoped panels (`selectScopedSettingsEnvironments`).
-    pub(super) fn scoped_representative_config(&self, cx: &App) -> Option<ServerConfig> {
+    pub(super) fn is_project_scope(&self, cx: &App) -> bool {
+        matches!(self.resolved_scope_kind(cx), ResolvedScopeKind::Project | ResolvedScopeKind::Checkout)
+    }
+
+    /// Inert notice for environment-wide settings when the user is viewing Project/Checkout scope
+    /// (`settingsLayout.tsx:371, 447-448`), or standard connection/permission unavailability.
+    pub(super) fn env_only_unavailable(&self, cx: &App) -> Option<String> {
+        if let Some(reason) = self.settings_unavailable(cx) {
+            return Some(reason);
+        }
+        self.is_project_scope(cx)
+            .then(|| "Environment-wide setting. Select an environment to change it.".to_owned())
+    }
+
+    /// Primary single environment owner for single-environment RPCs/pages (prefers selected
+    /// machine or active environment in scope).
+    pub(super) fn scoped_primary_owner(
+        &self,
+        cx: &App,
+    ) -> Option<t3_core::sidebar::grouping::EnvironmentOwner> {
         let state = self.state.read(cx);
         let owners = self.scoped_environment_owners(cx);
+        if owners.is_empty() {
+            return None;
+        }
         let active_saved = state.environments.active.as_deref();
-        if !owners.is_empty() {
-            let chosen = owners
+        let chosen = if self.scope.machine.is_some() {
+            &owners[0]
+        } else {
+            owners
                 .iter()
                 .find(|owner| active_saved.is_some_and(|id| owner.saved_id == id))
-                .unwrap_or(&owners[0]);
+                .unwrap_or(&owners[0])
+        };
+        Some(chosen.clone())
+    }
+
+    /// All `ServerConfig`s targeted by the current scope (for `.all(...)` capability checks).
+    pub(super) fn scoped_all_configs(&self, cx: &App) -> Vec<ServerConfig> {
+        let state = self.state.read(cx);
+        let owners = self.scoped_environment_owners(cx);
+        let mut out = Vec::new();
+        for owner in owners {
             if let Some(cfg) = state
                 .fleet
                 .environments
                 .iter()
-                .find(|e| e.summary.owner == *chosen)
+                .find(|e| e.summary.owner == owner)
                 .and_then(|e| e.config.config.clone())
             {
-                return Some(cfg);
+                out.push(cfg);
             }
         }
+        if out.is_empty()
+            && let Some(cfg) = state.server_config.config.clone()
+        {
+            out.push(cfg);
+        }
+        out
+    }
+
+    /// Raw representative `ServerConfig` for the current scope (without project override overlay).
+    pub(super) fn scoped_raw_representative_config(&self, cx: &App) -> Option<ServerConfig> {
+        let state = self.state.read(cx);
+        if let Some(chosen) = self.scoped_primary_owner(cx)
+            && let Some(cfg) = state
+                .fleet
+                .environments
+                .iter()
+                .find(|e| e.summary.owner == chosen)
+                .and_then(|e| e.config.config.clone())
+        {
+            return Some(cfg);
+        }
         state.server_config.config.clone()
+    }
+
+    /// Representative `ServerConfig` for display in scoped panels (`selectScopedSettingsEnvironments`),
+    /// resolving `projectSettingsOverrides[projectId]` when in Project/Checkout scope.
+    pub(super) fn scoped_representative_config(&self, cx: &App) -> Option<ServerConfig> {
+        let mut cfg = self.scoped_raw_representative_config(cx)?;
+        if self.is_project_scope(cx)
+            && let Some(project_id) = self.scope_project_id(cx)
+        {
+            cfg.settings = t3_core::settings::resolve_project_settings(&cfg.settings, &project_id);
+        }
+        Some(cfg)
+    }
+
+    /// Whether the active Project/Checkout scope has an explicit override stored for any of `keys`.
+    pub(super) fn has_project_override(&self, keys: &[&str], cx: &App) -> bool {
+        if !self.is_project_scope(cx) {
+            return false;
+        }
+        let state = self.state.read(cx);
+        let members = self.scoped_project_members(cx);
+        if !members.is_empty() {
+            return members.iter().any(|member| {
+                state
+                    .scoped_environment(&member.owner.saved_id)
+                    .and_then(|e| e.config.config.as_ref())
+                    .is_some_and(|cfg| {
+                        t3_core::settings::project_override_present(
+                            &cfg.settings,
+                            &member.project.id,
+                            keys,
+                        )
+                    })
+            });
+        }
+        if let Some(project_id) = self.scope_project_id(cx)
+            && let Some(cfg) = self.scoped_raw_representative_config(cx)
+        {
+            return t3_core::settings::project_override_present(&cfg.settings, &project_id, keys);
+        }
+        false
+    }
+
+    /// Clears `keys` from `projectSettingsOverrides` across every project member in scope
+    /// (`useClearScopedSettings` / "Reset to inherited value").
+    pub(super) fn clear_project_overrides(&self, keys: &[&str], cx: &mut App) {
+        let members = self.scoped_project_members(cx);
+        if members.is_empty() {
+            return;
+        }
+        let edit = t3_core::settings::projects::OverrideEdit::Clear {
+            keys: keys.iter().map(|k| (*k).to_owned()).collect(),
+        };
+        store::update_projects(&self.state, members, edit, |_, _| {}, cx);
+    }
+
+    /// Wires `Row`'s reset button for a project-scoped setting: in Project/Checkout scope it
+    /// appears when any of `keys` is explicitly overridden and clears the project override
+    /// ("Reset to inherited value"); otherwise it resets to the environment default.
+    pub(super) fn apply_scoped_reset(
+        &self,
+        row: controls::Row,
+        keys: &'static [&'static str],
+        env_customized: bool,
+        env_reset: ServerSettingChange,
+        cx: &Context<Self>,
+    ) -> controls::Row {
+        let view = cx.entity().downgrade();
+        if self.is_project_scope(cx) {
+            row.reset_tooltip("Reset to inherited value").reset(
+                self.has_project_override(keys, cx),
+                move |_, _, cx| {
+                    let _ = view.update(cx, |this, cx| this.clear_project_overrides(keys, cx));
+                },
+            )
+        } else {
+            row.reset(env_customized, move |_, _, cx| {
+                let _ = view.update(cx, |this, cx| this.update_scoped_server(env_reset.clone(), cx));
+            })
+        }
+    }
+
+    /// Sends a unary RPC to the single scoped environment (falling back to the active client).
+    pub(super) fn scoped_rpc(
+        &self,
+        scope: &'static str,
+        method: &'static str,
+        payload: serde_json::Value,
+        cx: &App,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, t3_client::session::RpcError>> + use<> {
+        let app = self.state.read(cx);
+        let owner = self.scoped_primary_owner(cx);
+        let active_id = app.environments.active.as_deref();
+        let use_fleet = owner
+            .as_ref()
+            .is_some_and(|o| active_id != Some(o.saved_id.as_str()));
+        let lookup = use_fleet
+            .then(|| owner.as_ref().map(|o| app.connections.destination(o, scope)))
+            .flatten();
+        let runtime = app.runtime().clone();
+        let fallback = lookup.is_none().then(|| app.rpc(method, payload.clone()));
+        async move {
+            if let Some(lookup) = lookup {
+                let dest = lookup.await.map_err(|_| t3_client::session::RpcError::Closed)?;
+                let client = dest.client;
+                runtime
+                    .spawn(async move { client.request(method, payload).await })
+                    .await
+                    .unwrap_or(Err(t3_client::session::RpcError::Closed))
+            } else if let Some(fallback) = fallback {
+                fallback.await
+            } else {
+                Err(t3_client::session::RpcError::Closed)
+            }
+        }
+    }
+
+    /// Session grants for the scoped primary environment (falls back to active session).
+    pub(super) fn scoped_session(&self, cx: &App) -> Option<t3_core::auth::AuthSessionState> {
+        let state = self.state.read(cx);
+        if let Some(chosen) = self.scoped_primary_owner(cx)
+            && let Some(grants) = state
+                .fleet
+                .environments
+                .iter()
+                .find(|e| e.summary.owner == chosen)
+                .and_then(|e| e.grants.clone())
+        {
+            return Some(grants);
+        }
+        self.session(cx)
+    }
+
+    /// Whether the scoped primary environment is currently connected.
+    pub(super) fn scoped_connected_now(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        if let Some(chosen) = self.scoped_primary_owner(cx)
+            && let Some(entry) = state
+                .fleet
+                .environments
+                .iter()
+                .find(|e| e.summary.owner == chosen)
+        {
+            return entry.status == ConnectionStatus::Connected && entry.config.config.is_some();
+        }
+        self.connected_now(cx)
     }
 
     /// All `(environment_label, ServerConfig, Option<project_id>)` targets currently in scope, for
@@ -1543,32 +1743,61 @@ impl SettingsView {
         }
     }
 
+    /// Saves a setting on the single scoped environment (for `Providers`, `Secrets`, `SourceControl`
+    /// host setup) and invokes `on_done` once settled.
+    pub(super) fn update_scoped_single_env(&self, change: ServerSettingChange, cx: &mut App) {
+        self.update_scoped_single_env_then(change, |_, _| {}, cx);
+    }
+
+    pub(super) fn update_scoped_single_env_then(
+        &self,
+        change: ServerSettingChange,
+        on_done: impl FnOnce(Option<String>, &mut App) + 'static,
+        cx: &mut App,
+    ) {
+        let active_saved = self.state.read(cx).environments.active.clone();
+        if let Some(owner) = self.scoped_primary_owner(cx)
+            && active_saved.as_deref() != Some(owner.saved_id.as_str())
+        {
+            store::update_scoped_environments_then(&self.state, vec![owner], change, on_done, cx);
+        } else {
+            store::update_server_then(&self.state, change, on_done, cx);
+        }
+    }
+
     pub(super) fn scope_project_id(&self, cx: &App) -> Option<String> {
         let project_key = self.scope.project.as_deref()?;
-        let state = self.state.read(cx);
-        let active_env_id = state
-            .server_config
-            .config
-            .as_ref()
-            .map(|c| c.environment.environment_id.as_str())
-            .filter(|id| !id.is_empty());
-        let active_saved_id = state.environments.active.as_deref();
         let groups = self.project_groups(cx);
         let group = groups.iter().find(|g| g.key == project_key)?;
-        let active_members = || {
-            group.members.iter().filter(|m| {
-                let owner = &m.project.owner;
-                active_env_id.is_some_and(|id| owner.identity() == id)
-                    || active_saved_id.is_some_and(|id| owner.saved_id == id)
-                    || (active_env_id.is_none() && active_saved_id.is_none())
-            })
-        };
         if let Some(checkout) = self.scope.checkout.as_deref()
-            && let Some(member) = active_members().find(|m| m.physical_key == checkout)
+            && let Some(member) = group.members.iter().find(|m| m.physical_key == checkout)
         {
             return Some(member.project.project.id.clone());
         }
-        active_members().next().map(|m| m.project.project.id.clone())
+        // Prefer the scoped primary machine (selected machine or active env), then any member.
+        if let Some(primary) = self.scoped_primary_owner(cx)
+            && let Some(member) = group
+                .members
+                .iter()
+                .find(|m| m.project.owner == primary || m.project.owner.saved_id == primary.saved_id)
+        {
+            return Some(member.project.project.id.clone());
+        }
+        if let Some(machine) = self.scope.machine.as_deref()
+            && let Some(member) = group.members.iter().find(|m| {
+                m.project.owner.identity() == machine || m.project.owner.saved_id == machine
+            })
+        {
+            return Some(member.project.project.id.clone());
+        }
+        let state = self.state.read(cx);
+        let active_saved_id = state.environments.active.as_deref();
+        if let Some(active) = active_saved_id
+            && let Some(member) = group.members.iter().find(|m| m.project.owner.saved_id == active)
+        {
+            return Some(member.project.project.id.clone());
+        }
+        group.members.first().map(|m| m.project.project.id.clone())
     }
 
     pub(super) fn scope_project_label(&self, cx: &App) -> Option<String> {
