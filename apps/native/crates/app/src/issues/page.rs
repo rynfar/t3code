@@ -143,6 +143,8 @@ impl IssuesPage {
                     AppEvent::Phase | AppEvent::Selection | AppEvent::Shell | AppEvent::ServerConfig
                 ) {
                     this.sync(cx);
+                } else if matches!(event, AppEvent::RightPanel) {
+                    this.sync_detail_from_panel(cx);
                 }
             }),
         ];
@@ -788,28 +790,17 @@ impl IssuesPage {
         cx.notify();
     }
 
-    pub(super) fn select(
+    fn open_detail_pane(
         &mut self,
+        env_id: Option<String>,
         reference: IssueRef,
-        entry: EnvironmentIssueEntry,
+        entry: Option<EnvironmentIssueEntry>,
         cx: &mut Context<Self>,
     ) {
-        let env_id = Some(entry.environment_id.clone());
-        if let Some(key) = HeldIssueKey::of(self.state.read(cx), env_id.as_deref(), &reference) {
-            hold_issue_seed(key, &entry.entry, cx);
-        }
-        let target = IssueTarget::from_ref(
-            env_id.clone(),
-            &reference,
-            Some(entry.entry.display_key.clone()),
-            Some(entry.entry.url.clone()),
-        );
-        self.state.update(cx, |state, cx| {
-            state.open_issue_surface_for_key(ISSUES_PANEL_THREAD_KEY, target, cx);
-        });
+        let seed = entry.as_ref().map(|e| e.entry.clone());
         if let Some(detail) = &self.detail {
             detail.update(cx, |panel, cx| {
-                panel.retarget(env_id, reference.clone(), Some(entry.entry.clone()), cx);
+                panel.retarget(env_id, reference.clone(), seed, cx);
             });
         } else {
             let page_weak = cx.entity().downgrade();
@@ -823,7 +814,6 @@ impl IssuesPage {
                 });
             });
             let state = self.state.clone();
-            let seed = Some(entry.entry.clone());
             let ref_clone = reference.clone();
             self.detail = Some(cx.new(|cx| {
                 IssueDetailPanel::new(
@@ -840,8 +830,70 @@ impl IssuesPage {
             }));
         }
         self.selected = Some(reference);
-        self.selected_entry = Some(entry);
+        self.selected_entry = entry;
         cx.notify();
+    }
+
+    fn sync_detail_from_panel(&mut self, cx: &mut Context<Self>) {
+        let active_target = {
+            let state = self.state.read(cx);
+            if !state.issues_open {
+                return;
+            }
+            let panel = state.panels.panels.panel(ISSUES_PANEL_THREAD_KEY);
+            if !panel.is_open {
+                return;
+            }
+            panel.active().and_then(|surface| match &surface.kind {
+                t3_core::right_panel::SurfaceKind::Issue(target) => Some(target.as_ref().clone()),
+                _ => None,
+            })
+        };
+        let Some(target) = active_target else {
+            return;
+        };
+        let reference = target.issue_ref();
+        let env_id = target.environment_id.clone();
+        if self.selected.as_ref() == Some(&reference)
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|panel| panel.read(cx).matches_target(env_id.as_deref(), &reference))
+        {
+            return;
+        }
+        let matched = self
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .find(|row| {
+                IssueRef::of(&row.entry) == reference
+                    && (env_id.is_none() || env_id.as_deref() == Some(row.environment_id.as_str()))
+            })
+            .cloned();
+        self.open_detail_pane(env_id, reference, matched, cx);
+    }
+
+    pub(super) fn select(
+        &mut self,
+        reference: IssueRef,
+        entry: EnvironmentIssueEntry,
+        cx: &mut Context<Self>,
+    ) {
+        let env_id = Some(entry.environment_id.clone());
+        if let Some(key) = HeldIssueKey::of(self.state.read(cx), env_id.as_deref(), &reference) {
+            hold_issue_seed(key, &entry.entry, cx);
+        }
+        let target = IssueTarget::from_ref(
+            env_id.clone(),
+            &reference,
+            Some(entry.entry.display_key.clone()),
+            Some(entry.entry.url.clone()),
+        );
+        self.open_detail_pane(env_id, reference, Some(entry), cx);
+        self.state.update(cx, |state, cx| {
+            state.open_issue_surface_for_key(ISSUES_PANEL_THREAD_KEY, target, cx);
+        });
     }
 
     pub(super) fn clear_selection(&mut self, cx: &mut Context<Self>) {
@@ -1447,6 +1499,31 @@ mod tests {
             page.sent = "old".into();
             page.send_query("after-close".into(), cx);
             assert_eq!(page.sent, "old", "send_query must not fetch after closing page");
+        });
+
+        // 4. Opening an issue via ISSUES_PANEL_THREAD_KEY while IssuesPage is active
+        // (e.g. clicking an inline issue link in an issue body/comment) visibly navigates
+        // IssuesPage's split detail pane.
+        let linked_target = IssueTarget {
+            environment_id: Some("saved-remote".into()),
+            project_id: "p-remote".into(),
+            tracker: t3_core::issues::wire::IssueTrackerKind::AzureDevOps,
+            host: Some("dev.azure.com".into()),
+            scope: "acme/Core".into(),
+            key: "77".into(),
+            display_key: Some("#77".into()),
+            url: Some("https://dev.azure.com/acme/Core/_workitems/edit/77".into()),
+        };
+        let expected_ref = linked_target.issue_ref();
+        state.update(cx, |app, cx| {
+            app.issues_open = true;
+            app.open_issue_surface_for_key(ISSUES_PANEL_THREAD_KEY, linked_target, cx);
+        });
+        cx.run_until_parked();
+        page.read_with(cx, |page, cx| {
+            assert_eq!(page.selected.as_ref(), Some(&expected_ref));
+            let detail = page.detail.as_ref().expect("detail pane opened from panel event");
+            assert!(detail.read(cx).matches_target(Some("saved-remote"), &expected_ref));
         });
     }
 }

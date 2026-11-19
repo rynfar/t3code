@@ -12,7 +12,7 @@ use url::Url;
 use super::list::{repository_change_request_host, repository_issue_scope};
 use super::wire::{
     IssueLinkedThread, IssueRef, IssueTrackerConnectionList, IssueTrackerKind, ThreadIssueKey,
-    ThreadIssueLink, ThreadIssueLinkSource, thread_issue_keys_equal,
+    ThreadIssueLinkSource, thread_issue_keys_equal,
 };
 use crate::shell::ThreadShell;
 
@@ -568,30 +568,6 @@ pub fn visible_issue_linked_threads<'a>(
             loaded_thread_ids.contains(&thread.id) && !hidden_thread_ids.contains(&thread.id)
         })
         .collect()
-}
-
-/// Decodes a `thread.issue-synced` orchestration V2 event JSON into `(thread_id, issues)`.
-pub fn decode_thread_issue_synced_event(event: &Value) -> Option<(String, Vec<ThreadIssueLink>)> {
-    if event.get("type").and_then(Value::as_str) != Some("thread.issue-synced") {
-        return None;
-    }
-    let payload = event.get("payload")?;
-    let thread_id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .or_else(|| event.get("threadId").and_then(Value::as_str))?
-        .to_owned();
-    let issues = payload
-        .get("issues")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| serde_json::from_value::<ThreadIssueLink>(item.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    Some((thread_id, issues))
 }
 
 /// Formats the linked-threads badge tooltip label (`IssueThreadLinks.tsx`).

@@ -119,10 +119,6 @@ impl LinkedIssuesFeed {
     }
 
     pub(super) fn detail_for(&self, link: &ThreadIssueLink, state: &AppState, cx: &App) -> Option<IssueDetail> {
-        let key = thread_issue_key_of(&link.issue_key());
-        if let Some(detail) = self.details.get(&key) {
-            return Some(detail.clone());
-        }
         let reference = IssueRef {
             project_id: link.project_id.clone(),
             tracker: link.tracker.clone(),
@@ -135,8 +131,13 @@ impl LinkedIssuesFeed {
             .active
             .as_deref()
             .or_else(|| state.environment());
-        HeldIssueKey::of(state, env_id, &reference)
+        if let Some(held) = HeldIssueKey::of(state, env_id, &reference)
             .and_then(|k| held_issue_detail(&k, cx))
+        {
+            return Some(held);
+        }
+        let key = thread_issue_key_of(&link.issue_key());
+        self.details.get(&key).cloned()
     }
 
     /// Renders the linked-issues section (`ThreadDetailsIssueRows`) when `links` is non-empty.
@@ -357,10 +358,19 @@ mod tests {
         assert!(vcx.debug_bounds("thread-details-issue-0").is_some());
 
         vcx.update(|_, cx| {
-            let feed = LinkedIssuesFeed::new();
+            let mut feed = LinkedIssuesFeed::new();
             assert!(feed.render(&state, &[], false, false, |_| {}, cx).is_none());
 
-            // Holding live detail surfaces updated title and comment count immediately.
+            // Seed local cache with an older detail first, then update HeldIssues and verify
+            // detail_for prefers fresher HeldIssues updates over the stale local snapshot.
+            let mut stale = detail.clone();
+            stale.title = "Stale cached title".into();
+            stale.comment_count = 1;
+            feed.details.insert(thread_issue_key_of(&link.issue_key()), stale);
+            let before = feed.detail_for(&link, state.read(cx), cx).unwrap();
+            assert_eq!(before.title, "Stale cached title");
+            assert_eq!(before.comment_count, 1);
+
             let reference = IssueRef {
                 project_id: link.project_id.clone(),
                 tracker: link.tracker.clone(),

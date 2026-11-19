@@ -792,12 +792,13 @@ impl RightPanelView {
         }
         let reference = target.issue_ref();
         let env_id = target.environment_id.clone();
+        let pr_env_id = env_id.clone();
         let state = self.state.clone();
         let state_select = self.state.clone();
         let on_select_pr = std::rc::Rc::new(move |pr_ref: PrRef, cx: &mut App| {
             state_select.update(cx, |state, cx| {
                 let target = PullRequestTarget {
-                    environment_id: state.environment().map(str::to_owned),
+                    environment_id: pr_env_id.clone().or_else(|| state.environment().map(str::to_owned)),
                     project_id: pr_ref.project_id,
                     host: pr_ref.host,
                     repository: pr_ref.repository,

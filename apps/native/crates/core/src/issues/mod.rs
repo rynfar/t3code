@@ -954,7 +954,7 @@ mod tests {
         use std::collections::HashSet;
 
         use super::links::{
-            IssueLinkProject, decode_thread_issue_synced_event, is_standalone_issue_link,
+            IssueLinkProject, is_standalone_issue_link,
             link_issue_command, linked_threads_label, may_contain_standalone_issue_link,
             resolve_issue_link_target, unlink_issue_command, visible_issue_linked_threads,
         };
@@ -1156,9 +1156,24 @@ mod tests {
         assert_eq!(unlink_cmd["type"], "thread.issue.unlink");
 
         let synced = json!({
+            "id": "evt-1",
+            "threadId": "thr-1",
+            "occurredAt": "2026-01-01T00:00:00Z",
             "type": "thread.issue-synced",
             "payload": {
                 "id": "thr-1",
+                "projectId": "p2",
+                "title": "Fix bug",
+                "providerInstanceId": "codex",
+                "modelSelection": { "provider": "codex", "model": "gpt-5.4" },
+                "runtimeMode": "full-access",
+                "interactionMode": "default",
+                "branch": null,
+                "worktreePath": null,
+                "lineage": { "rootThreadId": "thr-1" },
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:01Z",
+                "archivedAt": null,
                 "issues": [{
                     "tracker": "github", "host": "github.com", "scope": "acme/web", "key": "7",
                     "projectId": "p2", "url": "https://github.com/acme/web/issues/7",
@@ -1167,9 +1182,11 @@ mod tests {
                 }]
             }
         });
-        let (tid, links) = decode_thread_issue_synced_event(&synced).unwrap();
-        assert_eq!(tid, "thr-1");
-        assert_eq!(links.len(), 1);
+        let domain_event: crate::thread::DomainEvent = serde_json::from_value(synced).unwrap();
+        assert!(matches!(
+            domain_event.body,
+            crate::thread::EventBody::ThreadReplaced(ref thread) if thread.id == "thr-1"
+        ));
 
         let rows = vec![
             IssueLinkedThread { id: "t1".into(), project_id: "p1".into(), title: "A".into(), archived_at: None, settled: false },

@@ -2,6 +2,7 @@
 //! `pingdotgg/t3code#19270`, `pingdotgg/t3code#38771`).
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled,
@@ -128,27 +129,86 @@ impl IssueThreadLinksState {
         if self.unsupported || self._refresh_net.is_some() {
             return;
         }
-        let Some(client) = state.read(cx).client_handle() else {
-            return;
-        };
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let runtime = state.read(cx).runtime().clone();
-        let net = runtime.spawn(async move {
-            let Ok(mut stream) = client
-                .stream(method::SUBSCRIBE_LINKED_THREAD_REFRESHES, json!({}))
-                .await
-            else {
+        let app = state.read(cx);
+        let owner = environment_owner_for(app, environment_id.as_deref());
+        let dest_fut = owner.as_ref().map(|owner| {
+            app.connections
+                .destination(owner, t3_core::auth::ORCHESTRATION_READ_SCOPE)
+        });
+        let fallback_client = if dest_fut.is_none() {
+            let Some(client) = app.client_handle() else {
                 return;
             };
-            while let Some(item) = stream.receiver.recv().await {
-                if item.is_ok() && tx.send(()).is_err() {
-                    break;
+            Some(client)
+        } else {
+            None
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let runtime = app.runtime().clone();
+        let net = runtime.spawn(async move {
+            let client = match dest_fut {
+                Some(fut) => match fut.await {
+                    Ok(dest) => dest.client,
+                    Err(_) => return,
+                },
+                None => match fallback_client {
+                    Some(client) => client,
+                    None => return,
+                },
+            };
+            let mut delay = Duration::from_secs(1);
+            loop {
+                match client
+                    .stream(method::SUBSCRIBE_LINKED_THREAD_REFRESHES, json!({}))
+                    .await
+                {
+                    Ok(mut stream) => {
+                        while let Some(item) = stream.receiver.recv().await {
+                            match item {
+                                Ok(_) => {
+                                    delay = Duration::from_secs(1);
+                                    if tx.send(()).is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(t3_client::session::RpcError::Failure(failure))
+                                    if failure.tag.as_deref()
+                                        == Some("EnvironmentAuthorizationError") =>
+                                {
+                                    return;
+                                }
+                                Err(t3_client::session::RpcError::Closed) => return,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(t3_client::session::RpcError::Failure(failure))
+                        if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") =>
+                    {
+                        return;
+                    }
+                    Err(t3_client::session::RpcError::Closed) => return,
+                    Err(t3_client::session::RpcError::Failure(_)) => {
+                        // Older servers reject `subscribeLinkedThreadRefreshes`; fall back to 10s polling.
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(
+                                t3_core::pull_requests::link::LINKED_THREADS_POLL_SECONDS,
+                            ))
+                            .await;
+                            if tx.send(()).is_err() {
+                                return;
+                            }
+                        }
+                    }
                 }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
             }
         });
         let state_clone = state.clone();
         let ui = cx.spawn(async move |this, cx| {
             while rx.recv().await.is_some() {
+                while rx.try_recv().is_ok() {}
                 let keep = this.update(cx, |view, cx| {
                     get(view).fetch(&state_clone, environment_id.as_deref(), &key, get, cx);
                 });

@@ -74,16 +74,6 @@ pub struct ExternalWebLink {
     pub host: Option<String>,
 }
 
-/// Parses an inline Markdown URL as a known issue URL (GitHub/GHE/GitLab/Azure DevOps/Forgejo/Linear).
-pub fn parse_inline_issue_url(href: &str) -> Option<crate::issues::links::ParsedIssueUrl> {
-    crate::issues::links::parse_issue_url(href)
-}
-
-/// Cheap check for whether Markdown text may contain a standalone tracker issue link (`linear.app/`).
-pub fn markdown_may_contain_standalone_issue_link(text: &str) -> bool {
-    crate::issues::links::may_contain_standalone_issue_link(text)
-}
-
 /// High-level semantic kind of a link or inline-code candidate found in Markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkdownLinkKind {

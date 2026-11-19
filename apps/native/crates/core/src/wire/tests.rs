@@ -55,8 +55,9 @@ fn id_table_preserves_thread_issue_links_on_thread_issue_synced_payload() {
     let ids = take_id_table(&mut raw).unwrap();
     let Some(obj) = raw.as_object_mut() else { panic!() };
     expand_record_ids(obj, &ids);
-    let (thread_id, issues) = crate::issues::links::decode_thread_issue_synced_event(&raw).unwrap();
-    assert_eq!(thread_id, "thr-7");
+    assert_eq!(raw["payload"]["id"], "thr-7");
+    let issues: Vec<crate::issues::wire::ThreadIssueLink> =
+        serde_json::from_value(raw["payload"]["issues"].clone()).unwrap();
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0].display_key, "#42");
     assert_eq!(issues[0].project_id, "proj-1");

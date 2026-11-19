@@ -2,6 +2,7 @@
 //! `IssueCommentComposer.tsx`, `IssueDetailGhost.tsx`, `IssueThreadLinks.tsx`,
 //! `pingdotgg/t3code#19260`, `#19270`, `#37930`, `#38489`, `#38537`, `#38771`, `#39000`).
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -109,7 +110,8 @@ pub struct IssueDetailPanel {
     _fetch: Option<Task<()>>,
     _older: Option<Task<()>>,
     _candidates: Option<Task<()>>,
-    _mutate: Option<Task<()>>,
+    next_mutation_id: u64,
+    _mutations: HashMap<u64, Task<()>>,
     _subscription: Subscription,
 }
 
@@ -178,7 +180,8 @@ impl IssueDetailPanel {
             _fetch: None,
             _older: None,
             _candidates: None,
-            _mutate: None,
+            next_mutation_id: 0,
+            _mutations: HashMap::new(),
             _subscription: subscription,
         };
         panel.fetch_detail(false, cx);
@@ -186,6 +189,10 @@ impl IssueDetailPanel {
             panel.sync_linked_threads(&detail, cx);
         }
         panel
+    }
+
+    pub fn matches_target(&self, environment_id: Option<&str>, reference: &IssueRef) -> bool {
+        self.environment_id.as_deref() == environment_id && &self.reference == reference
     }
 
     pub fn retarget(
@@ -221,19 +228,26 @@ impl IssueDetailPanel {
         self.editing = None;
         self.title_input = None;
         self.body_input = None;
+        self._title_sub = None;
+        self.saving = false;
+        self.changing_state = false;
         self.picker = None;
         self.picker_input = None;
         self.picker_query.clear();
+        self._picker_sub = None;
         self.candidates = None;
+        self.candidates_pending = false;
         self.candidates_error = None;
         self.label_picks = IssuePicks::empty();
         self.assignee_picks = IssuePicks::empty();
         self.comment_draft.clear();
         self.comment_input = None;
+        self.comment_submitting = false;
         self._comment_sub = None;
         self._fetch = None;
         self._older = None;
         self._candidates = None;
+        self._mutations.clear();
         self.fetch_detail(false, cx);
         if let Some(detail) = self.detail.clone() {
             self.sync_linked_threads(&detail, cx);
@@ -372,10 +386,11 @@ impl IssueDetailPanel {
             decode::<IssueCommentsPage>,
         );
         let expected_ref = self.reference.clone();
+        let expected_env = self.environment_id.clone();
         self._older = Some(cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |panel, cx| {
-                if panel.reference != expected_ref {
+                if panel.reference != expected_ref || panel.environment_id != expected_env {
                     return;
                 }
                 match result {
@@ -399,6 +414,12 @@ impl IssueDetailPanel {
         cx.notify();
     }
 
+    fn alloc_mutation_id(&mut self) -> u64 {
+        let id = self.next_mutation_id;
+        self.next_mutation_id = self.next_mutation_id.wrapping_add(1);
+        id
+    }
+
     fn move_to_state(&mut self, next_state: String, cx: &mut Context<Self>) {
         if self.changing_state {
             return;
@@ -416,10 +437,17 @@ impl IssueDetailPanel {
             payload,
             Ok,
         );
+        let expected_ref = self.reference.clone();
+        let expected_env = self.environment_id.clone();
+        let mutation_id = self.alloc_mutation_id();
         self.changing_state = true;
-        self._mutate = Some(cx.spawn(async move |this, cx| {
+        let handle = cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |panel, cx| {
+                panel._mutations.remove(&mutation_id);
+                if panel.reference != expected_ref || panel.environment_id != expected_env {
+                    return;
+                }
                 panel.changing_state = false;
                 match result {
                     Ok(_) => {
@@ -438,7 +466,8 @@ impl IssueDetailPanel {
                 }
                 cx.notify();
             });
-        }));
+        });
+        self._mutations.insert(mutation_id, handle);
         cx.notify();
     }
 
@@ -538,10 +567,17 @@ impl IssueDetailPanel {
             payload,
             Ok,
         );
+        let expected_ref = self.reference.clone();
+        let expected_env = self.environment_id.clone();
+        let mutation_id = self.alloc_mutation_id();
         self.saving = true;
-        self._mutate = Some(cx.spawn(async move |this, cx| {
+        let handle = cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |panel, cx| {
+                panel._mutations.remove(&mutation_id);
+                if panel.reference != expected_ref || panel.environment_id != expected_env {
+                    return;
+                }
                 panel.saving = false;
                 match result {
                     Ok(_) => {
@@ -564,7 +600,8 @@ impl IssueDetailPanel {
                 }
                 cx.notify();
             });
-        }));
+        });
+        self._mutations.insert(mutation_id, handle);
         cx.notify();
     }
 
@@ -590,14 +627,22 @@ impl IssueDetailPanel {
             payload,
             Ok,
         );
-        self._mutate = Some(cx.spawn(async move |this, cx| {
+        let expected_ref = self.reference.clone();
+        let expected_env = self.environment_id.clone();
+        let mutation_id = self.alloc_mutation_id();
+        let handle = cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |panel, cx| {
+                panel._mutations.remove(&mutation_id);
+                if panel.reference != expected_ref || panel.environment_id != expected_env {
+                    return;
+                }
                 if result.is_ok() {
                     panel.fetch_detail(true, cx);
                 }
             });
-        }));
+        });
+        self._mutations.insert(mutation_id, handle);
     }
 
     fn open_candidate_picker(
@@ -651,11 +696,16 @@ impl IssueDetailPanel {
             scope_ref.payload(),
             decode::<IssueCandidates>,
         );
+        let expected_ref = self.reference.clone();
+        let expected_env = self.environment_id.clone();
         self.candidates_pending = true;
         self.candidates_error = None;
         self._candidates = Some(cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |panel, cx| {
+                if panel.reference != expected_ref || panel.environment_id != expected_env {
+                    return;
+                }
                 panel.candidates_pending = false;
                 match result {
                     Ok(data) => {
@@ -742,9 +792,16 @@ impl IssueDetailPanel {
             payload,
             Ok,
         );
-        self._mutate = Some(cx.spawn(async move |this, cx| {
+        let expected_ref = self.reference.clone();
+        let expected_env = self.environment_id.clone();
+        let mutation_id = self.alloc_mutation_id();
+        let handle = cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |panel, cx| {
+                panel._mutations.remove(&mutation_id);
+                if panel.reference != expected_ref || panel.environment_id != expected_env {
+                    return;
+                }
                 match result {
                     Ok(_) => {
                         panel.notify_mutated(cx);
@@ -774,7 +831,8 @@ impl IssueDetailPanel {
                 }
                 cx.notify();
             });
-        }));
+        });
+        self._mutations.insert(mutation_id, handle);
     }
 
     fn ensure_comment_input(
@@ -829,10 +887,17 @@ impl IssueDetailPanel {
             payload,
             Ok,
         );
+        let expected_ref = self.reference.clone();
+        let expected_env = self.environment_id.clone();
+        let mutation_id = self.alloc_mutation_id();
         self.comment_submitting = true;
-        self._mutate = Some(cx.spawn_in(window, async move |this, cx| {
+        let handle = cx.spawn_in(window, async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update_in(cx, |panel, window, cx| {
+                panel._mutations.remove(&mutation_id);
+                if panel.reference != expected_ref || panel.environment_id != expected_env {
+                    return;
+                }
                 panel.comment_submitting = false;
                 match result {
                     Ok(_) => {
@@ -855,7 +920,8 @@ impl IssueDetailPanel {
                 }
                 cx.notify();
             });
-        }));
+        });
+        self._mutations.insert(mutation_id, handle);
         cx.notify();
     }
 
@@ -2308,6 +2374,21 @@ mod tests {
             panel.apply_detail_result(true, Ok(detail), cx);
             assert!(panel.error.is_none());
             assert_eq!(panel.pager.view(panel.detail.as_ref(), false).comments.len(), 1);
+
+            // Retargeting mid-mutation resets in-flight flags & pending mutation tasks.
+            panel.candidates_pending = true;
+            panel.saving = true;
+            panel.changing_state = true;
+            panel.comment_submitting = true;
+            let mut next_ref = sample_ref();
+            next_ref.key = "43".into();
+            panel.retarget(Some("env-a".into()), next_ref.clone(), None, cx);
+            assert!(panel.matches_target(Some("env-a"), &next_ref));
+            assert!(!panel.candidates_pending);
+            assert!(!panel.saving);
+            assert!(!panel.changing_state);
+            assert!(!panel.comment_submitting);
+            assert!(panel._mutations.is_empty());
         });
     }
 }
