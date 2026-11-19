@@ -197,6 +197,7 @@ pub struct VoiceSpeechController {
     machine: VoiceInputControllerMachine,
     submission_gate: DictationSubmissionGate,
     setup: VoiceSetupState,
+    last_overlay_visible: bool,
     status: Option<EnvironmentSpeechStatus>,
     status_env_id: Option<String>,
     start_request_id: u64,
@@ -235,7 +236,7 @@ impl VoiceSpeechController {
         let app_sub = cx.subscribe(&config.app, |this, _, event, cx| {
             if matches!(event, AppEvent::Phase | AppEvent::ServerConfig) {
                 this.refresh_status_if_needed(cx);
-                cx.notify();
+                this.sync_overlay(cx);
             }
         });
 
@@ -254,6 +255,7 @@ impl VoiceSpeechController {
             machine: VoiceInputControllerMachine::new(true, true),
             submission_gate: DictationSubmissionGate::new(),
             setup: VoiceSetupState::default(),
+            last_overlay_visible: false,
             status: None,
             status_env_id: None,
             start_request_id: 0,
@@ -337,6 +339,24 @@ impl VoiceSpeechController {
         self.machine.state()
     }
 
+    /// True when the workspace overlay (`render_active_voice_setup_modal`) currently renders
+    /// either the voice setup modal or the floating `GlobalVoiceInputIndicator`.
+    fn overlay_visible(&self) -> bool {
+        self.setup.open || self.shows_floating_indicator()
+    }
+
+    /// Notifies observers of this controller and refreshes windows whenever the workspace
+    /// voice overlay is visible or just closed (since `Workspace` renders the overlay slot
+    /// without observing individual `VoiceSpeechController` entities).
+    fn sync_overlay(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        let visible = self.overlay_visible();
+        if visible || self.last_overlay_visible {
+            self.last_overlay_visible = visible;
+            cx.refresh_windows();
+        }
+    }
+
     pub fn set_owner_key(&mut self, next: impl Into<String>, cx: &mut Context<Self>) {
         let next = next.into();
         if self.owner_key == next {
@@ -353,7 +373,7 @@ impl VoiceSpeechController {
             self._setup_task = None;
             self._download_poll_task = None;
             self.submission_gate.clear();
-            cx.notify();
+            self.sync_overlay(cx);
             return;
         }
         self.start_request_id = self.start_request_id.wrapping_add(1);
@@ -366,7 +386,7 @@ impl VoiceSpeechController {
         self.submission_gate.clear();
         release_voice_session(cx.entity_id(), cx);
         self.apply_effects(effects, cx);
-        cx.notify();
+        self.sync_overlay(cx);
     }
 
     /// State scoped to the currently presented owner: returns idle when a background recording
@@ -444,10 +464,25 @@ impl VoiceSpeechController {
     }
 
     pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_inner(window, cx, false);
+    }
+
+    /// Retries a failed dictation for the currently active target, preserving an off-screen
+    /// background target when invoked from the floating `GlobalVoiceInputIndicator`.
+    pub fn retry_active_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_inner(window, cx, true);
+    }
+
+    fn start_inner(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        preserve_offscreen_target: bool,
+    ) {
         if self.setup.open && self.setup.downloading {
             return;
         }
-        if self.is_busy_elsewhere() {
+        if !preserve_offscreen_target && self.is_busy_elsewhere() {
             return;
         }
         if !matches!(
@@ -456,6 +491,19 @@ impl VoiceSpeechController {
         ) {
             return;
         }
+
+        // Starting dictation from the currently presented composer while an off-screen
+        // background thread holds a stale Error state must discard that off-screen target
+        // (and its retained failed audio) instead of dictating into the off-screen thread.
+        if !preserve_offscreen_target && !self.is_recording_owner_presented() {
+            self.start_request_id = self.start_request_id.wrapping_add(1);
+            self.submission_gate.clear();
+            self.setup = VoiceSetupState::default();
+            self.active_target = None;
+            let cancel_effects = self.machine.cancel();
+            self.apply_effects(cancel_effects, cx);
+        }
+
         let resolution = resolve_voice_destination(self.app.read(cx), cx);
         if resolution.active.is_none() {
             if resolution.offer_first_run_setup && self.offer_setup {
@@ -480,9 +528,9 @@ impl VoiceSpeechController {
 
         self.start_request_id = self.start_request_id.wrapping_add(1);
         self.setup = VoiceSetupState::default();
-        // Keep an existing off-screen retry target if retrying from the floating indicator,
-        // otherwise snapshot the current composer's metadata.
-        if self.is_recording_owner_presented() {
+        // Keep an existing off-screen retry target only when retrying from the floating
+        // indicator; otherwise snapshot the currently presented composer's metadata.
+        if !preserve_offscreen_target || self.is_recording_owner_presented() {
             self.active_target = self
                 .target_meta_reader
                 .as_ref()
@@ -523,7 +571,7 @@ impl VoiceSpeechController {
         release_voice_session(cx.entity_id(), cx);
         let effects = self.machine.cancel();
         self.apply_effects(effects, cx);
-        cx.notify();
+        self.sync_overlay(cx);
     }
 
     pub fn skip_post_processing(&mut self, cx: &mut Context<Self>) {
@@ -558,7 +606,7 @@ impl VoiceSpeechController {
         if !open && !self.setup.downloading {
             self._download_poll_task = None;
         }
-        cx.notify();
+        self.sync_overlay(cx);
     }
 
     pub fn setup_download(&mut self, cx: &mut Context<Self>) {
@@ -574,7 +622,7 @@ impl VoiceSpeechController {
         self.setup.error = None;
         self.setup.downloaded_bytes = Some(0);
         self.setup.total_bytes = Some(model.size as u64);
-        cx.notify();
+        self.sync_overlay(cx);
 
         let creds_for_poll = credentials.clone();
         let model_id_for_poll = model_id.clone();
@@ -596,7 +644,7 @@ impl VoiceSpeechController {
                         this.setup.downloaded_bytes = entry.downloaded.map(|d| d as u64);
                         this.setup.total_bytes = Some(entry.size as u64);
                         this.setup.model = Some(entry.clone());
-                        cx.notify();
+                        this.sync_overlay(cx);
                         entry.state == EnvironmentSpeechModelState::Installed
                     })
                     .unwrap_or(true);
@@ -651,7 +699,7 @@ impl VoiceSpeechController {
                         this.setup.error = Some(err.to_string());
                     }
                 }
-                cx.notify();
+                this.sync_overlay(cx);
             });
         }));
     }
@@ -662,7 +710,7 @@ impl VoiceSpeechController {
             (self.setup_credentials.clone(), self.setup.model.clone())
         else {
             self.setup.open = false;
-            cx.notify();
+            self.sync_overlay(cx);
             return;
         };
         let model_id = model.id;
@@ -670,7 +718,7 @@ impl VoiceSpeechController {
         self._download_poll_task = None;
         self.setup.downloading = false;
         self.setup.step = VoiceSetupStep::Confirm;
-        cx.notify();
+        self.sync_overlay(cx);
         self._setup_task = Some(cx.spawn(async move |this, cx| {
             let _ = runtime
                 .spawn(async move { VoiceClient::new(credentials)?.cancel_model_download(&model_id).await })
@@ -678,7 +726,7 @@ impl VoiceSpeechController {
             let _ = this.update(cx, |this, cx| {
                 this.setup.downloading = false;
                 this.setup.step = VoiceSetupStep::Confirm;
-                cx.notify();
+                this.sync_overlay(cx);
             });
         }));
     }
@@ -694,6 +742,7 @@ impl VoiceSpeechController {
     pub fn setup_start_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.setup.open = false;
         self.start(window, cx);
+        self.sync_overlay(cx);
     }
 
     #[cfg(feature = "snapshot")]
@@ -714,7 +763,7 @@ impl VoiceSpeechController {
             self.setup = setup;
         }
         self.machine.force_state_for_preview(state);
-        cx.notify();
+        self.sync_overlay(cx);
     }
 
     fn refresh_status_if_needed(&mut self, cx: &mut Context<Self>) {
@@ -744,7 +793,7 @@ impl VoiceSpeechController {
                 let _ = this.update(cx, |this, cx| {
                     if this.status_env_id.as_deref() == Some(env_id.as_str()) {
                         this.status = Some(status);
-                        cx.notify();
+                        this.sync_overlay(cx);
                     }
                 });
             }
@@ -770,7 +819,7 @@ impl VoiceSpeechController {
             step: VoiceSetupStep::Confirm,
             ..Default::default()
         };
-        cx.notify();
+        self.sync_overlay(cx);
 
         self.start_request_id = self.start_request_id.wrapping_add(1);
         let setup_token = self.start_request_id;
@@ -840,7 +889,7 @@ impl VoiceSpeechController {
                         };
                     }
                 }
-                cx.notify();
+                this.sync_overlay(cx);
             });
         }));
     }
@@ -1018,7 +1067,7 @@ impl VoiceSpeechController {
                     if let Some(text) = submit_text {
                         cx.emit(VoiceControllerEvent::SubmitAfterDictation { text });
                     }
-                    cx.notify();
+                    self.sync_overlay(cx);
                 }
             }
         }
@@ -1618,7 +1667,7 @@ impl VoiceSpeechController {
                     CaptureMsg::Level(level) => {
                         let _ = this.update(cx, |this, cx| {
                             this.audio_level = level;
-                            cx.notify();
+                            this.sync_overlay(cx);
                         });
                     }
                     CaptureMsg::Limit => {
@@ -1647,7 +1696,7 @@ impl VoiceSpeechController {
                         let secs = started.elapsed().as_secs();
                         if secs != this.elapsed_seconds {
                             this.elapsed_seconds = secs;
-                            cx.notify();
+                            this.sync_overlay(cx);
                         }
                         true
                     })

@@ -1239,3 +1239,389 @@ fn cleanup_routes_to_draft_environment_and_setup_download_respects_cancel(cx: &m
         super::controller::VoiceSetupStep::Confirm
     );
 }
+
+#[gpui::test]
+async fn workspace_overlay_repaints_on_floating_indicator_and_setup_modal_updates(
+    cx: &mut TestAppContext,
+) {
+    use std::sync::atomic::AtomicUsize;
+    use futures::StreamExt as _;
+    use gpui::ParentElement as _;
+    use super::controller::BackgroundVoiceTarget;
+    use super::shortcuts::{register_dictation_target, unregister_dictation_target};
+    use super::ui::render_active_voice_setup_modal;
+
+    struct OverlayHostView {
+        renders: Arc<AtomicUsize>,
+        overlay_present: Arc<AtomicBool>,
+    }
+
+    impl Render for OverlayHostView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            let overlay = render_active_voice_setup_modal(cx);
+            self.overlay_present.store(overlay.is_some(), Ordering::SeqCst);
+            div().children(overlay)
+        }
+    }
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fail = Arc::new(AtomicBool::new(false));
+    let base_url = runtime.block_on(spawn_mock_voice_server(&runtime, fail, "overlay ok"));
+    let platform = Arc::new(MockAudioPlatform::new());
+    let (_, harness, vcx, _) = setup_harness(
+        &base_url,
+        platform.clone(),
+        "thread-overlay-1",
+        VoiceDraftSnapshot {
+            owner_key: "thread-overlay-1".into(),
+            text: String::new(),
+            selection: VoiceSelection { start: 0, end: 0 },
+        },
+        runtime.handle().clone(),
+        cx,
+    );
+
+    let voice = vcx.read(|cx| harness.read(cx).voice.clone());
+    let (phase_tx, mut phase_rx) = futures::channel::mpsc::unbounded::<VoiceInputPhase>();
+    let _phase_sub = vcx.update(|_, cx| {
+        cx.subscribe(&voice, move |voice, event, cx| {
+            if matches!(event, VoiceControllerEvent::StateChanged) {
+                let _ = phase_tx.unbounded_send(voice.read(cx).session_state().phase);
+            }
+        })
+    });
+
+    // Mount a separate window view mimicking `Workspace::render` — it does NOT observe
+    // `VoiceSpeechController` and only invokes `render_active_voice_setup_modal(cx)`.
+    let renders = Arc::new(AtomicUsize::new(0));
+    let overlay_present = Arc::new(AtomicBool::new(false));
+    let renders_view = renders.clone();
+    let overlay_present_view = overlay_present.clone();
+    let (_host, host_vcx) = cx.add_window_view(|_, _| OverlayHostView {
+        renders: renders_view,
+        overlay_present: overlay_present_view,
+    });
+    let target_id = host_vcx.update(|_, cx| {
+        register_dictation_target(
+            &voice,
+            true,
+            Rc::new(|_, _| true),
+            Rc::new(|_| false),
+            cx,
+        )
+    });
+    host_vcx.run_until_parked();
+    assert!(!overlay_present.load(Ordering::SeqCst));
+
+    // Opening and closing the voice setup modal must repaint the non-observing host window.
+    let before_open = renders.load(Ordering::SeqCst);
+    host_vcx.update(|_, cx| voice.update(cx, |v, cx| v.setup_set_open(true, cx)));
+    host_vcx.run_until_parked();
+    assert!(
+        renders.load(Ordering::SeqCst) > before_open,
+        "opening setup modal must refresh host windows"
+    );
+    assert!(overlay_present.load(Ordering::SeqCst));
+
+    let before_close = renders.load(Ordering::SeqCst);
+    host_vcx.update(|_, cx| voice.update(cx, |v, cx| v.setup_set_open(false, cx)));
+    host_vcx.run_until_parked();
+    assert!(
+        renders.load(Ordering::SeqCst) > before_close,
+        "closing setup modal must refresh host windows"
+    );
+    assert!(!overlay_present.load(Ordering::SeqCst));
+
+    // Configure a persistent target, start recording on thread-overlay-1, then switch away so
+    // the floating indicator renders in the host window.
+    host_vcx.update(|_, cx| {
+        voice.update(cx, |v, _| {
+            v.set_target_meta_reader(Rc::new(|_| {
+                Some(BackgroundVoiceTarget {
+                    owner_key: "thread-overlay-1".into(),
+                    label: Some("Overlay thread".into()),
+                    persistent: true,
+                    open: None,
+                    read_stored_draft: Some(Rc::new(|_| {
+                        Some(VoiceDraftSnapshot {
+                            owner_key: "thread-overlay-1".into(),
+                            text: String::new(),
+                            selection: VoiceSelection { start: 0, end: 0 },
+                        })
+                    })),
+                    commit_stored_draft: Some(Rc::new(|_, _, _| {})),
+                })
+            }));
+        });
+    });
+    host_vcx.update(|window, cx| voice.update(cx, |v, cx| v.start(window, cx)));
+    while let Some(phase) = phase_rx.next().await {
+        if phase == VoiceInputPhase::Recording {
+            break;
+        }
+    }
+
+    let before_bg = renders.load(Ordering::SeqCst);
+    host_vcx.update(|_, cx| voice.update(cx, |v, cx| v.set_owner_key("thread-overlay-2", cx)));
+    host_vcx.run_until_parked();
+    assert!(
+        renders.load(Ordering::SeqCst) > before_bg,
+        "switching away from an active recording must repaint the floating indicator"
+    );
+    assert!(overlay_present.load(Ordering::SeqCst));
+
+    // Live audio level updates while backgrounded must also repaint the floating indicator.
+    let before_level = renders.load(Ordering::SeqCst);
+    platform.emit_level(0.8);
+    host_vcx.run_until_parked();
+    assert!(
+        host_vcx.read(|cx| voice.read(cx).level()) > 0.5,
+        "controller should have received emitted audio level"
+    );
+    assert!(
+        renders.load(Ordering::SeqCst) > before_level,
+        "audio level updates while backgrounded must repaint the floating indicator"
+    );
+
+    // Cancelling the background recording must clear the floating indicator and repaint.
+    let before_cancel = renders.load(Ordering::SeqCst);
+    host_vcx.update(|_, cx| voice.update(cx, |v, cx| v.cancel(cx)));
+    host_vcx.run_until_parked();
+    assert!(
+        renders.load(Ordering::SeqCst) > before_cancel,
+        "cancelling background dictation must refresh host windows"
+    );
+    assert!(!overlay_present.load(Ordering::SeqCst));
+
+    host_vcx.update(|_, cx| unregister_dictation_target(target_id, cx));
+}
+
+#[gpui::test]
+async fn starting_dictation_on_presented_thread_clears_offscreen_error_while_indicator_retry_targets_background(
+    cx: &mut TestAppContext,
+) {
+    use futures::StreamExt as _;
+    use super::controller::BackgroundVoiceTarget;
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fail = Arc::new(AtomicBool::new(true));
+    let base_url =
+        runtime.block_on(spawn_mock_voice_server(&runtime, fail.clone(), "captured speech"));
+    let platform = Arc::new(MockAudioPlatform::new());
+
+    let presented_owner = Arc::new(Mutex::new("thread-a".to_owned()));
+    let draft_a = Arc::new(Mutex::new(VoiceDraftSnapshot {
+        owner_key: "thread-a".into(),
+        text: "alpha ".into(),
+        selection: VoiceSelection { start: 6, end: 6 },
+    }));
+    let draft_b = Arc::new(Mutex::new(VoiceDraftSnapshot {
+        owner_key: "thread-b".into(),
+        text: "beta ".into(),
+        selection: VoiceSelection { start: 5, end: 5 },
+    }));
+    let stored_commits = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+
+    let (state, _, vcx, _) = setup_harness(
+        &base_url,
+        platform.clone(),
+        "unused",
+        VoiceDraftSnapshot {
+            owner_key: "unused".into(),
+            text: String::new(),
+            selection: VoiceSelection { start: 0, end: 0 },
+        },
+        runtime.handle().clone(),
+        cx,
+    );
+
+    let presented_commits = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let (phase_tx, mut phase_rx) = futures::channel::mpsc::unbounded::<VoiceInputPhase>();
+
+    let owner_for_draft = presented_owner.clone();
+    let draft_a_for_draft = draft_a.clone();
+    let draft_b_for_draft = draft_b.clone();
+    let owner_for_meta = presented_owner.clone();
+    let draft_a_for_meta = draft_a.clone();
+    let draft_b_for_meta = draft_b.clone();
+    let stored_commits_for_meta = stored_commits.clone();
+    let owner_for_sub = presented_owner.clone();
+    let draft_a_for_sub = draft_a.clone();
+    let draft_b_for_sub = draft_b.clone();
+    let presented_commits_for_sub = presented_commits.clone();
+
+    let voice = vcx.update(|_, cx| {
+        let voice = cx.new(|cx| {
+            let mut controller = VoiceSpeechController::new(
+                VoiceSpeechConfig {
+                    app: state.clone(),
+                    owner_key: "thread-a".into(),
+                    offer_setup: true,
+                    draft_reader: Rc::new(move |_| {
+                        let owner = owner_for_draft.lock().unwrap().clone();
+                        let snap = if owner == "thread-a" {
+                            draft_a_for_draft.lock().unwrap().clone()
+                        } else {
+                            draft_b_for_draft.lock().unwrap().clone()
+                        };
+                        Some(snap)
+                    }),
+                    hints_reader: Rc::new(|_| Vec::new()),
+                    project_id_reader: Rc::new(|_| None),
+                    environment_id_reader: Rc::new(|_| Some("env-1".to_owned())),
+                    on_open_voice_settings: Rc::new(|_, _| {}),
+                },
+                cx,
+            );
+            controller.set_target_meta_reader(Rc::new(move |_| {
+                let owner = owner_for_meta.lock().unwrap().clone();
+                let target_draft = if owner == "thread-a" {
+                    draft_a_for_meta.clone()
+                } else {
+                    draft_b_for_meta.clone()
+                };
+                let read_draft = target_draft.clone();
+                let write_draft = target_draft;
+                let commits = stored_commits_for_meta.clone();
+                let commit_owner = owner.clone();
+                Some(BackgroundVoiceTarget {
+                    owner_key: owner.clone(),
+                    label: Some(owner),
+                    persistent: true,
+                    open: None,
+                    read_stored_draft: Some(Rc::new(move |_| {
+                        Some(read_draft.lock().unwrap().clone())
+                    })),
+                    commit_stored_draft: Some(Rc::new(move |text, selection, _| {
+                        commits.lock().unwrap().push((commit_owner.clone(), text.clone()));
+                        let mut d = write_draft.lock().unwrap();
+                        d.text = text;
+                        d.selection = selection;
+                    })),
+                })
+            }));
+            controller
+        });
+        cx.subscribe(&voice, move |voice, event, cx| match event {
+            VoiceControllerEvent::CommitDraft { text, selection } => {
+                let owner = owner_for_sub.lock().unwrap().clone();
+                presented_commits_for_sub
+                    .lock()
+                    .unwrap()
+                    .push((owner.clone(), text.clone()));
+                let target = if owner == "thread-a" {
+                    &draft_a_for_sub
+                } else {
+                    &draft_b_for_sub
+                };
+                let mut d = target.lock().unwrap();
+                d.text = text.clone();
+                d.selection = *selection;
+            }
+            VoiceControllerEvent::StateChanged => {
+                let _ = phase_tx.unbounded_send(voice.read(cx).session_state().phase);
+            }
+            VoiceControllerEvent::SubmitAfterDictation { .. } => {}
+        })
+        .detach();
+        voice
+    });
+    vcx.run_until_parked();
+
+    // 1. Start recording on thread-a, then navigate to thread-b and fail transcription off-screen.
+    vcx.update(|window, cx| voice.update(cx, |v, cx| v.start(window, cx)));
+    while let Some(phase) = phase_rx.next().await {
+        if phase == VoiceInputPhase::Recording {
+            break;
+        }
+    }
+    platform.emit_pcm(vec![0.2; 480]);
+    *presented_owner.lock().unwrap() = "thread-b".to_owned();
+    vcx.update(|_, cx| voice.update(cx, |v, cx| v.set_owner_key("thread-b", cx)));
+    vcx.update(|_, cx| voice.update(cx, |v, cx| v.stop(cx)));
+    while let Some(phase) = phase_rx.next().await {
+        if phase == VoiceInputPhase::Error {
+            break;
+        }
+    }
+
+    vcx.read(|cx| {
+        let v = voice.read(cx);
+        assert!(v.shows_floating_indicator());
+        assert!(!v.is_busy_elsewhere());
+        assert_eq!(v.state().phase, VoiceInputPhase::Idle);
+        assert_eq!(v.session_state().phase, VoiceInputPhase::Error);
+    });
+
+    // 2. Clicking Retry on the floating indicator retries off-screen thread-a's recording.
+    fail.store(false, Ordering::SeqCst);
+    vcx.update(|window, cx| voice.update(cx, |v, cx| v.retry_active_target(window, cx)));
+    while let Some(phase) = phase_rx.next().await {
+        if phase == VoiceInputPhase::Idle {
+            break;
+        }
+    }
+    assert_eq!(
+        stored_commits.lock().unwrap().as_slice(),
+        &[("thread-a".to_owned(), "alpha captured speech".to_owned())]
+    );
+    assert!(presented_commits.lock().unwrap().is_empty());
+    assert_eq!(draft_b.lock().unwrap().text, "beta ");
+
+    // 3. Reproduce a second off-screen error on thread-a, then invoke `start()` from thread-b.
+    *presented_owner.lock().unwrap() = "thread-a".to_owned();
+    vcx.update(|_, cx| voice.update(cx, |v, cx| v.set_owner_key("thread-a", cx)));
+    fail.store(true, Ordering::SeqCst);
+    vcx.update(|window, cx| voice.update(cx, |v, cx| v.start(window, cx)));
+    while let Some(phase) = phase_rx.next().await {
+        if phase == VoiceInputPhase::Recording {
+            break;
+        }
+    }
+    platform.emit_pcm(vec![0.2; 480]);
+    *presented_owner.lock().unwrap() = "thread-b".to_owned();
+    vcx.update(|_, cx| voice.update(cx, |v, cx| v.set_owner_key("thread-b", cx)));
+    vcx.update(|_, cx| voice.update(cx, |v, cx| v.stop(cx)));
+    while let Some(phase) = phase_rx.next().await {
+        if phase == VoiceInputPhase::Error {
+            break;
+        }
+    }
+    assert!(vcx.read(|cx| voice.read(cx).shows_floating_indicator()));
+
+    // Starting on thread-b must dismiss thread-a's stale off-screen error and dictate into thread-b.
+    fail.store(false, Ordering::SeqCst);
+    vcx.update(|window, cx| voice.update(cx, |v, cx| v.start(window, cx)));
+    while let Some(phase) = phase_rx.next().await {
+        if phase == VoiceInputPhase::Recording {
+            break;
+        }
+    }
+    vcx.read(|cx| {
+        let v = voice.read(cx);
+        assert!(v.is_recording_owner_presented());
+        assert!(!v.shows_floating_indicator());
+        assert_eq!(v.state().phase, VoiceInputPhase::Recording);
+    });
+
+    platform.emit_pcm(vec![0.2; 480]);
+    vcx.update(|_, cx| voice.update(cx, |v, cx| v.stop(cx)));
+    while let Some(phase) = phase_rx.next().await {
+        if phase == VoiceInputPhase::Idle {
+            break;
+        }
+    }
+
+    assert_eq!(
+        presented_commits.lock().unwrap().as_slice(),
+        &[("thread-b".to_owned(), "beta captured speech".to_owned())]
+    );
+    assert_eq!(
+        stored_commits.lock().unwrap().len(),
+        1,
+        "thread-a must not receive a second commit when starting dictation on thread-b"
+    );
+    assert_eq!(draft_a.lock().unwrap().text, "alpha captured speech");
+    assert_eq!(draft_b.lock().unwrap().text, "beta captured speech");
+}

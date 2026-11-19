@@ -385,7 +385,13 @@ fn render_error_pill(
             hsla(p.error_foreground),
             disabled,
             move |_, window, cx| {
-                entity_retry.update(cx, |voice, cx| voice.start(window, cx));
+                entity_retry.update(cx, |voice, cx| {
+                    if use_session_state {
+                        voice.retry_active_target(window, cx);
+                    } else {
+                        voice.start(window, cx);
+                    }
+                });
             },
             cx,
         ));
