@@ -22,6 +22,8 @@ impl AppState {
     }
 }
 
+const PR_LINK_CHECKOUT_TOAST_KEY: &str = "pr-link-checkout";
+
 pub struct PromptLinks {
     state: Entity<AppState>,
     composer: Entity<Composer>,
@@ -32,11 +34,23 @@ pub struct PromptLinks {
     fallback: Option<NewThreadLink>,
     /// Repository missing on all connected environments, eligible for `"Clone repository"`.
     missing_repository: Option<rules::Repository>,
+    /// Unlinked PR confirmation & checkout handoff (`PullRequestLinkCheckout` in `NewThreadLinkView.tsx`).
+    pr_checkout: Option<PendingPrCheckout>,
     scratch: bool,
     cloning: bool,
     sequence: u64,
     connecting: Option<String>,
     _subscription: Subscription,
+}
+
+#[derive(Clone)]
+struct PendingPrCheckout {
+    saved_id: String,
+    project_id: String,
+    workspace_root: String,
+    pull_request: rules::PullRequest,
+    link: NewThreadLink,
+    checking_out: bool,
 }
 
 enum PendingTarget {
@@ -51,6 +65,7 @@ enum PendingTarget {
         project_id: String,
         link: NewThreadLink,
     },
+    PrCheckout(PendingPrCheckout),
 }
 
 impl PromptLinks {
@@ -68,6 +83,7 @@ impl PromptLinks {
             page: None,
             fallback: None,
             missing_repository: None,
+            pr_checkout: None,
             scratch: false,
             cloning: false,
             sequence: 0,
@@ -89,6 +105,7 @@ impl PromptLinks {
             self.scratch = false;
             self.cloning = false;
             self.missing_repository = None;
+            self.pr_checkout = None;
             self.pending = Some(url);
             self.page = Some(("Opening the link...".into(), String::new()));
             self.fallback = None;
@@ -103,6 +120,9 @@ impl PromptLinks {
                 match &target {
                     PendingTarget::Thread { saved_id, .. } | PendingTarget::Draft { saved_id, .. } => {
                         (saved_id.clone(), active_saved == Some(saved_id.as_str()) && ready)
+                    }
+                    PendingTarget::PrCheckout(checkout) => {
+                        (checkout.saved_id.clone(), active_saved == Some(checkout.saved_id.as_str()) && ready)
                     }
                 }
             };
@@ -121,6 +141,9 @@ impl PromptLinks {
                 }
                 PendingTarget::Draft { project_id, link, .. } => {
                     self.open_draft(&project_id, link, window, cx);
+                }
+                PendingTarget::PrCheckout(checkout) => {
+                    self.run_pr_checkout(checkout, window, cx);
                 }
             }
             cx.notify();
@@ -240,10 +263,32 @@ impl PromptLinks {
             let active_owned: Vec<_> = active_candidates.into_iter().cloned().collect();
             let active_best = t3_core::home::most_recent_project(&active_owned, &snapshot.threads).map(|p| p.id.clone());
 
-            let mut lookup_targets: Vec<(String, String, String)> = Vec::new();
+            let mut lookup_targets: Vec<(String, String, String, String)> = Vec::new();
+            let active_env_id = app
+                .active_environment()
+                .and_then(|e| e.environment_id.clone())
+                .unwrap_or_else(|| active_saved.clone());
+            // Put the most recently active project first so an unlinked PR checkout targets it.
+            if let Some(best_id) = active_best.as_deref()
+                && let Some(best_proj) = active_owned.iter().find(|p| p.id == best_id)
+            {
+                lookup_targets.push((
+                    active_saved.clone(),
+                    active_env_id.clone(),
+                    best_proj.id.clone(),
+                    best_proj.workspace_root.clone(),
+                ));
+            }
             for proj in &active_owned {
-                let env_id = app.active_environment().and_then(|e| e.environment_id.clone()).unwrap_or_else(|| active_saved.clone());
-                lookup_targets.push((active_saved.clone(), env_id, proj.id.clone()));
+                if active_best.as_deref() == Some(proj.id.as_str()) {
+                    continue;
+                }
+                lookup_targets.push((
+                    active_saved.clone(),
+                    active_env_id.clone(),
+                    proj.id.clone(),
+                    proj.workspace_root.clone(),
+                ));
             }
             let mut fleet_best: Option<(String, String)> = None;
             for env in app.fleet.environments.iter().filter(|e| e.summary.synchronized) {
@@ -259,7 +304,7 @@ impl PromptLinks {
                     repo,
                 )
                 .into_iter()
-                .map(|p| p.id.clone())
+                .map(|p| (p.id.clone(), p.workspace_root.clone()))
                 .collect();
                 let env_id = env
                     .config
@@ -267,13 +312,13 @@ impl PromptLinks {
                     .as_ref()
                     .map(|c| c.environment.environment_id.clone())
                     .unwrap_or_else(|| saved_id.clone());
-                for project_id in &matched {
-                    lookup_targets.push((saved_id.clone(), env_id.clone(), project_id.clone()));
+                for (project_id, workspace_root) in &matched {
+                    lookup_targets.push((saved_id.clone(), env_id.clone(), project_id.clone(), workspace_root.clone()));
                 }
                 if fleet_best.is_none()
-                    && let Some(first) = matched.into_iter().next()
+                    && let Some((first_id, _)) = matched.into_iter().next()
                 {
-                    fleet_best = Some((saved_id.clone(), first));
+                    fleet_best = Some((saved_id.clone(), first_id));
                 }
             }
 
@@ -310,20 +355,23 @@ impl PromptLinks {
 
     fn lookup_pr_threads(
         &mut self,
-        targets: Vec<(String, String, String)>,
+        targets: Vec<(String, String, String, String)>,
         pull_request: rules::PullRequest,
         link: NewThreadLink,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let sequence = self.sequence;
+        let checkout_target = targets.first().map(|(saved_id, _, project_id, workspace_root)| {
+            (saved_id.clone(), project_id.clone(), workspace_root.clone())
+        });
         let active_saved = self.state.read(cx).environments.active.clone().unwrap_or_default();
         let active_client = self.state.read(cx).client_handle();
         let client_futures: Vec<_> = {
             let app = self.state.read(cx);
             targets
                 .into_iter()
-                .map(|(saved_id, env_id, project_id)| {
+                .map(|(saved_id, env_id, project_id, _)| {
                     let fut = (saved_id != active_saved).then(|| app.connections.client(&saved_id));
                     (saved_id, env_id, project_id, fut)
                 })
@@ -378,14 +426,226 @@ impl PromptLinks {
                         });
                         this.process(window, cx);
                     }
+                } else if let Some((saved_id, project_id, workspace_root)) = checkout_target {
+                    // `PullRequestLinkCheckout`: warn once about hidden characters and require
+                    // explicit user confirmation before checking out PR code / running setup.
+                    if let Some(prompt) = link.prompt() {
+                        crate::composer::prompt_links::warn(&this.state, prompt, cx);
+                    }
+                    let title = rules::pull_request_checkout_title(&pull_request);
+                    this.page = Some((title, rules::PULL_REQUEST_CHECKOUT_DESCRIPTION.into()));
+                    this.pr_checkout = Some(PendingPrCheckout {
+                        saved_id,
+                        project_id,
+                        workspace_root,
+                        pull_request,
+                        link,
+                        checking_out: false,
+                    });
+                    this.fallback = None;
                 } else {
                     this.fail(
                         "Could not open the pull request",
-                        "This pull request has no linked thread yet. Pull request checkout from a link is not available yet.".into(),
+                        "No local project matches this pull request.".into(),
                         cx,
                     );
                     this.fallback = Some(link);
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_pr_checkout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(checkout) = self.pr_checkout.as_mut() else { return };
+        if checkout.checking_out {
+            return;
+        }
+        checkout.checking_out = true;
+        let checkout = checkout.clone();
+        let active_saved = self.state.read(cx).environments.active.clone().unwrap_or_default();
+        if !checkout.saved_id.is_empty() && checkout.saved_id != active_saved {
+            self.pending_target = Some(PendingTarget::PrCheckout(checkout));
+            self.process(window, cx);
+            return;
+        }
+        self.run_pr_checkout(checkout, window, cx);
+    }
+
+    fn run_pr_checkout(&mut self, checkout: PendingPrCheckout, window: &mut Window, cx: &mut Context<Self>) {
+        let sequence = self.sequence;
+        let thread_id = crate::sidebar::controller::uuid();
+        self.state.update(cx, |state, cx| {
+            state.show_toast(
+                Toast::new(ToastKind::Info, "Preparing the pull request checkout...")
+                    .key(PR_LINK_CHECKOUT_TOAST_KEY)
+                    .persistent(),
+                cx,
+            );
+        });
+        let prepare_payload = t3_core::vcs::prepare_pull_request_thread(
+            &checkout.workspace_root,
+            &checkout.pull_request.url(),
+            t3_core::vcs::PullRequestCheckoutMode::Worktree,
+            Some(&thread_id),
+        );
+        let prepare_req = self
+            .state
+            .read(cx)
+            .rpc(t3_core::vcs::method::GIT_PREPARE_PULL_REQUEST_THREAD, prepare_payload);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let prepared = prepare_req
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<t3_core::vcs::PreparePullRequestThreadResult>(value)
+                        .map_err(|error| error.to_string())
+                });
+            let prepared = match prepared {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.sequence != sequence {
+                            return;
+                        }
+                        if let Some(pending) = this.pr_checkout.as_mut() {
+                            pending.checking_out = false;
+                        }
+                        this.state.update(cx, |state, cx| {
+                            state.show_toast(
+                                Toast::new(ToastKind::Error, "Could not prepare the pull request checkout")
+                                    .description(error)
+                                    .key(PR_LINK_CHECKOUT_TOAST_KEY),
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            let dispatch_plan = this.read_with(cx, |this, cx| {
+                if this.sequence != sequence {
+                    return Err(None);
+                }
+                let app = this.state.read(cx);
+                let project_default = app
+                    .shell
+                    .project(&checkout.project_id)
+                    .and_then(|project| project.default_model_selection.as_ref());
+                let providers = app
+                    .server_config
+                    .config
+                    .as_ref()
+                    .map(|config| config.providers.as_slice())
+                    .unwrap_or(&[]);
+                let Some(model_selection) = rules::default_model_selection_for_project(project_default, providers) else {
+                    return Err(Some("No ready provider is configured to open the checked-out thread.".to_owned()));
+                };
+                let title = rules::pull_request_checkout_thread_title(
+                    &checkout.pull_request,
+                    Some(prepared.pull_request.title.as_str()),
+                );
+                let create_cmd = t3_core::commands::create_thread(
+                    &crate::sidebar::controller::uuid(),
+                    &thread_id,
+                    &checkout.project_id,
+                    &title,
+                    &model_selection,
+                    t3_core::server_config::RuntimeMode::FullAccess,
+                    t3_core::server_config::InteractionMode::Default,
+                    Some(&prepared.branch),
+                    prepared.worktree_path.as_deref(),
+                );
+                let pr_link = rules::pull_request_checkout_link(&checkout.pull_request, &prepared.pull_request.url);
+                let link_cmd = t3_core::pull_requests::link::link_command(
+                    &crate::sidebar::controller::uuid(),
+                    &thread_id,
+                    &pr_link,
+                );
+                let create_rpc = app.rpc(t3_core::commands::method::DISPATCH_COMMAND, create_cmd);
+                let link_rpc = app.rpc(t3_core::commands::method::DISPATCH_COMMAND, link_cmd);
+                Ok((create_rpc, link_rpc))
+            });
+
+            let (create_rpc, link_rpc) = match dispatch_plan {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(Some(reason))) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(pending) = this.pr_checkout.as_mut() {
+                            pending.checking_out = false;
+                        }
+                        this.state.update(cx, |state, cx| {
+                            state.show_toast(
+                                Toast::new(ToastKind::Error, "Could not open a thread for the checkout")
+                                    .description(reason)
+                                    .key(PR_LINK_CHECKOUT_TOAST_KEY),
+                                cx,
+                            );
+                        });
+                        cx.notify();
+                    });
+                    return;
+                }
+                _ => return,
+            };
+
+            if let Err(error) = create_rpc.await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.sequence != sequence {
+                        return;
+                    }
+                    if let Some(pending) = this.pr_checkout.as_mut() {
+                        pending.checking_out = false;
+                    }
+                    this.state.update(cx, |state, cx| {
+                        state.show_toast(
+                            Toast::new(ToastKind::Error, "Could not open a thread for the checkout")
+                                .description(error.to_string())
+                                .key(PR_LINK_CHECKOUT_TOAST_KEY),
+                            cx,
+                        );
+                    });
+                    cx.notify();
+                });
+                return;
+            }
+            let _ = link_rpc.await;
+
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.sequence != sequence {
+                    return;
+                }
+                this.pr_checkout = None;
+                this.page = None;
+                this.fallback = None;
+                this.state.update(cx, |state, cx| {
+                    state.select_thread(&thread_id, cx);
+                });
+                let has_prompt = checkout.link.prompt().is_some();
+                if let Some(prompt) = checkout.link.prompt() {
+                    // Hidden-character warning was already shown when the checkout page opened.
+                    let cleaned = rules::LinkedPrompt {
+                        text: prompt.text.clone(),
+                        hidden_characters: 0,
+                    };
+                    this.composer.update(cx, |composer, cx| {
+                        composer.place_linked_prompt(cleaned, vec![], window, cx);
+                    });
+                }
+                let (is_success, title, description) =
+                    rules::pull_request_checkout_toast(prepared.is_on_pull_request_head, has_prompt);
+                this.state.update(cx, |state, cx| {
+                    state.show_toast(
+                        Toast::new(if is_success { ToastKind::Success } else { ToastKind::Info }, title)
+                            .description(description)
+                            .key(PR_LINK_CHECKOUT_TOAST_KEY),
+                        cx,
+                    );
+                });
                 cx.notify();
             });
         })
@@ -451,7 +711,15 @@ impl PromptLinks {
                 match result {
                     Ok(started) => {
                         this.missing_repository = None;
-                        this.open_draft(&started.project_id, link, window, cx);
+                        if matches!(link, NewThreadLink::PullRequest { .. }) {
+                            this.fail(
+                                &format!("Cloning {}/{}", repository.owner, repository.name),
+                                "Open this link again when the clone finishes.".into(),
+                                cx,
+                            );
+                        } else {
+                            this.open_draft(&started.project_id, link, window, cx);
+                        }
                     }
                     Err(error) => {
                         this.state.update(cx, |s, cx| {
@@ -600,6 +868,17 @@ impl Render for PromptLinks {
                     .child(
                         h_flex()
                             .gap(px(8.))
+                            .when_some(self.pr_checkout.as_ref(), |row, checkout| {
+                                let label = if checkout.checking_out { "Checking out..." } else { "Check out" };
+                                row.child(
+                                    Button::new("link-checkout-pr", ButtonVariant::Default, ButtonSize::Sm)
+                                        .label(label)
+                                        .disabled(checkout.checking_out)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.start_pr_checkout(window, cx);
+                                        })),
+                                )
+                            })
                             .when(self.missing_repository.is_some() && self.fallback.is_some(), |row| {
                                 row.child(
                                     Button::new("link-clone-repository", ButtonVariant::Default, ButtonSize::Sm)
@@ -632,12 +911,218 @@ impl Render for PromptLinks {
                                         this.pending = None;
                                         this.pending_target = None;
                                         this.missing_repository = None;
+                                        this.pr_checkout = None;
                                         this.fallback = None;
+                                        this.state.update(cx, |s, cx| s.close_toast_by_key(PR_LINK_CHECKOUT_TOAST_KEY, cx));
                                         cx.notify();
                                     })),
                             ),
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+    use gpui::size;
+    use serde_json::json;
+
+    #[gpui::test]
+    async fn unlinked_pr_link_confirms_and_runs_worktree_checkout_handoff(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, mut fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+
+        // Seed active environment with a matching GitHub repository project and a ready provider.
+        state.update(cx, |s, cx| {
+            let mut snapshot = s.shell.snapshot.clone().unwrap_or_default();
+            snapshot.projects.push(serde_json::from_value(json!({
+                "id": "proj-t3",
+                "title": "t3code",
+                "workspaceRoot": "/repo/t3code",
+                "repositoryIdentity": { "canonicalKey": "github.com/pingdotgg/t3code" },
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-02T00:00:00Z"
+            })).unwrap());
+            s.shell.snapshot = Some(snapshot);
+            s.shell.synchronized = true;
+            s.server_config.config = Some(
+                serde_json::from_value(json!({
+                    "environment": { "environmentId": "fixture-env", "label": "Fixture", "capabilities": {} },
+                    "providers": [{
+                        "instanceId": "codex",
+                        "driver": "codex",
+                        "displayName": "Codex",
+                        "enabled": true,
+                        "installed": true,
+                        "status": "ready",
+                        "models": [{ "slug": "gpt-5.4", "name": "GPT-5.4", "isDefault": true }]
+                    }],
+                    "settings": {},
+                    "issues": [],
+                    "keybindings": []
+                }))
+                .unwrap(),
+            );
+            cx.emit(AppEvent::Shell);
+        });
+
+        let (prompt_links, vcx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
+            PromptLinks::new(state.clone(), composer, window, cx)
+        });
+        vcx.update(|window, cx| {
+            window.resize(size(px(900.), px(640.)));
+            window.draw(cx).clear();
+        });
+
+        // 1. Open an unlinked PR prompt link; server reports no existing linked threads.
+        vcx.update(|_, cx| {
+            state.update(cx, |s, cx| {
+                s.open_prompt_url("https://app.t3.codes/new?pr=pingdotgg/t3code%23111&prompt=Review+PR".into(), cx);
+            });
+        });
+        vcx.run_until_parked();
+        let (method, payload, reply) = loop {
+            let (m, p, r) = fixture.next_request().await;
+            if m == t3_core::pull_requests::link::LINKED_THREADS {
+                break (m, p, r);
+            }
+            let _ = r.send(Ok(json!({})));
+        };
+        assert_eq!(method, t3_core::pull_requests::link::LINKED_THREADS);
+        assert_eq!(payload["repository"], "pingdotgg/t3code");
+        assert_eq!(payload["number"], 111);
+        let (confirm_tx, confirm_rx) = futures::channel::oneshot::channel::<()>();
+        let confirm_tx = std::cell::RefCell::new(Some(confirm_tx));
+        let _confirm_sub = vcx.update(|_, cx| {
+            cx.observe(&prompt_links, move |view, cx| {
+                if view.read(cx).pr_checkout.is_some()
+                    && let Some(tx) = confirm_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        reply.send(Ok(json!({ "threads": [] }))).unwrap();
+        confirm_rx.await.unwrap();
+        vcx.run_until_parked();
+
+        // Confirmation page must be shown without auto-running checkout.
+        vcx.read_entity(&prompt_links, |view, _| {
+            assert_eq!(
+                view.page.as_ref().map(|(t, _)| t.as_str()),
+                Some("Check out pingdotgg/t3code#111?")
+            );
+            assert!(view.pr_checkout.is_some());
+        });
+
+        // 2. User clicks Check out -> sends git.preparePullRequestThread (worktree + threadId),
+        // then dispatches thread.create + thread.pull-request.link.
+        vcx.update(|window, cx| {
+            prompt_links.update(cx, |view, cx| view.start_pr_checkout(window, cx));
+        });
+        vcx.run_until_parked();
+
+        let (prep_method, prep_payload, prep_reply) = loop {
+            let (m, p, r) = fixture.next_request().await;
+            if m == t3_core::vcs::method::GIT_PREPARE_PULL_REQUEST_THREAD {
+                break (m, p, r);
+            }
+            let _ = r.send(Ok(json!({})));
+        };
+        assert_eq!(prep_method, t3_core::vcs::method::GIT_PREPARE_PULL_REQUEST_THREAD);
+        assert_eq!(prep_payload["cwd"], "/repo/t3code");
+        assert_eq!(prep_payload["mode"], "worktree");
+        assert_eq!(prep_payload["reference"], "https://github.com/pingdotgg/t3code/pull/111");
+        let generated_thread_id = prep_payload["threadId"].as_str().expect("threadId sent").to_owned();
+        let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+        let done_tx = std::cell::RefCell::new(Some(done_tx));
+        let expected_thread_id = generated_thread_id.clone();
+        let _done_sub = vcx.update(|_, cx| {
+            cx.subscribe(&state, move |s, _event: &AppEvent, cx| {
+                if s.read(cx).selected_thread.as_deref() == Some(expected_thread_id.as_str())
+                    && s.read(cx)
+                        .toasts
+                        .by_key(PR_LINK_CHECKOUT_TOAST_KEY)
+                        .is_some_and(|t| t.title == "Checkout ready")
+                    && let Some(tx) = done_tx.borrow_mut().take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        prep_reply
+            .send(Ok(json!({
+                "pullRequest": {
+                    "number": 111,
+                    "title": "Close prompt links parity",
+                    "url": "https://github.com/pingdotgg/t3code/pull/111",
+                    "baseBranch": "main",
+                    "headBranch": "feat/pr-111",
+                    "state": "open"
+                },
+                "branch": "feat/pr-111",
+                "worktreePath": "/repo/.worktrees/pr-111",
+                "isOnPullRequestHead": true
+            })))
+            .unwrap();
+
+        let mut saw_create = false;
+        let mut saw_link = false;
+        for _ in 0..4 {
+            if saw_create && saw_link {
+                break;
+            }
+            let (m, p, r) = fixture.next_request().await;
+            if m == t3_core::commands::method::DISPATCH_COMMAND {
+                match p["type"].as_str() {
+                    Some("thread.create") => {
+                        saw_create = true;
+                        assert_eq!(p["threadId"], generated_thread_id);
+                        assert_eq!(p["projectId"], "proj-t3");
+                        assert_eq!(p["branch"], "feat/pr-111");
+                        assert_eq!(p["worktreePath"], "/repo/.worktrees/pr-111");
+                    }
+                    Some("thread.pull-request.link") => {
+                        saw_link = true;
+                        assert_eq!(p["threadId"], generated_thread_id);
+                        assert_eq!(p["number"], 111);
+                        assert_eq!(p["repository"], "pingdotgg/t3code");
+                    }
+                    _ => {}
+                }
+            }
+            let _ = r.send(Ok(json!({ "sequence": 1 })));
+        }
+        assert!(saw_create && saw_link, "expected thread.create and thread.pull-request.link");
+        done_rx.await.unwrap();
+
+        vcx.read_entity(&prompt_links, |view, _| {
+            assert!(view.page.is_none(), "overlay closes after checkout completes");
+            assert!(view.pr_checkout.is_none());
+        });
+        vcx.read_entity(&state, |s, _| {
+            assert_eq!(s.selected_thread.as_deref(), Some(generated_thread_id.as_str()));
+            let checkout_toast = s
+                .toasts
+                .by_key(PR_LINK_CHECKOUT_TOAST_KEY)
+                .expect("checkout ready toast");
+            assert_eq!(checkout_toast.kind, ToastKind::Success);
+            assert_eq!(checkout_toast.title, "Checkout ready");
+        });
+
+        drop(_confirm_sub);
+        drop(_done_sub);
+        cx.update(|cx| {
+            state.update(cx, |s, _| s.stop_pump());
+        });
+        drop(fixture);
+        runtime.shutdown_background();
     }
 }

@@ -462,6 +462,85 @@ pub fn pull_request_linked_threads_input(project_id: &str, pr: &PullRequest) -> 
     })
 }
 
+/// Confirmation copy for checking out an unlinked PR from a prompt link (`NewThreadLinkView.tsx`).
+pub const PULL_REQUEST_CHECKOUT_DESCRIPTION: &str =
+    "This puts the pull request's code in a new worktree and runs your project's setup script on it.";
+
+pub fn pull_request_checkout_title(pr: &PullRequest) -> String {
+    format!("Check out {}/{}#{}?", pr.repository.owner, pr.repository.name, pr.number)
+}
+
+pub fn pull_request_checkout_thread_title(pr: &PullRequest, resolved_title: Option<&str>) -> String {
+    match resolved_title.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(title) => title.to_owned(),
+        None => format!("PR #{}: {}/{}", pr.number, pr.repository.owner, pr.repository.name),
+    }
+}
+
+/// Returns `(is_success, title, description)` for the post-checkout toast (`usePullRequestActions.ts`).
+pub fn pull_request_checkout_toast(is_on_head: bool, has_prompt: bool) -> (bool, &'static str, String) {
+    if !is_on_head {
+        let (title, desc) = crate::vcs::off_head_checkout_toast("pull request");
+        return (false, title, desc);
+    }
+    if has_prompt {
+        (
+            true,
+            "Checkout ready",
+            "The task is in the composer. Read it over, then send.".to_owned(),
+        )
+    } else {
+        (
+            true,
+            "Checked out",
+            "The pull request is in its own worktree, with a thread open on it.".to_owned(),
+        )
+    }
+}
+
+/// Resolves the `ChangeRequestLink` to attach to the thread created by a PR link checkout.
+pub fn pull_request_checkout_link(pr: &PullRequest, resolved_url: &str) -> crate::pull_requests::link::ChangeRequestLink {
+    crate::pull_requests::link::parse_change_request_url(resolved_url).unwrap_or_else(|| {
+        crate::pull_requests::link::ChangeRequestLink {
+            host: "github.com".to_owned(),
+            repository: format!("{}/{}", pr.repository.owner, pr.repository.name).to_ascii_lowercase(),
+            number: pr.number,
+            url: if resolved_url.trim().is_empty() {
+                pr.url()
+            } else {
+                resolved_url.trim().to_owned()
+            },
+        }
+    })
+}
+
+/// Fallback model selection for creating a thread when checking out an unlinked PR from a link.
+pub fn default_model_selection_for_project(
+    project_default: Option<&ModelSelection>,
+    providers: &[ServerProvider],
+) -> Option<ModelSelection> {
+    if let Some(selection) = project_default {
+        return Some(selection.clone());
+    }
+    let usable = |p: &&ServerProvider| p.enabled && p.availability.as_deref() != Some("unavailable");
+    let provider = providers
+        .iter()
+        .filter(usable)
+        .find(|p| p.status == "ready")
+        .or_else(|| providers.iter().filter(usable).find(|p| p.status == "warning"))
+        .or_else(|| providers.first())?;
+    let model = provider
+        .models
+        .iter()
+        .find(|m| m.is_default)
+        .or_else(|| provider.models.first())?;
+    Some(ModelSelection {
+        instance_id: provider.instance_id.clone(),
+        model: model.slug.clone(),
+        options: None,
+    })
+}
+
 #[cfg(test)]
 mod hosted_thread_link_tests {
     use super::*;
@@ -490,6 +569,71 @@ mod hosted_thread_link_tests {
             pull_request_linked_threads_input("proj-1", &pr),
             serde_json::json!({ "projectId": "proj-1", "repository": "pingdotgg/t3code", "number": 42 })
         );
+    }
+
+    #[test]
+    fn pr_checkout_handoff_helpers_and_legacy_linked_pr_matching() {
+        let pr = PullRequest {
+            repository: Repository { owner: "pingdotgg".into(), name: "t3code".into() },
+            number: 111,
+        };
+        assert_eq!(pull_request_checkout_title(&pr), "Check out pingdotgg/t3code#111?");
+        assert_eq!(
+            pull_request_checkout_thread_title(&pr, Some("  Fix prompt links  ")),
+            "Fix prompt links"
+        );
+        assert_eq!(
+            pull_request_checkout_thread_title(&pr, None),
+            "PR #111: pingdotgg/t3code"
+        );
+        let (ok, title, desc) = pull_request_checkout_toast(true, true);
+        assert!(ok && title == "Checkout ready" && desc.contains("composer"));
+        let (ok, title, _) = pull_request_checkout_toast(true, false);
+        assert!(ok && title == "Checked out");
+        let (ok, title, _) = pull_request_checkout_toast(false, true);
+        assert!(!ok && title.contains("not confirmed"));
+
+        let link = pull_request_checkout_link(&pr, "https://github.com/pingdotgg/t3code/pull/111");
+        assert_eq!((link.host.as_str(), link.repository.as_str(), link.number), ("github.com", "pingdotgg/t3code", 111));
+
+        // Legacy single `linkedPullRequest` shell payload matches `find_prompt_link_pull_request_thread`.
+        let legacy_thread: ThreadShell = serde_json::from_value(serde_json::json!({
+            "id": "thr-legacy",
+            "projectId": "proj-1",
+            "title": "Legacy PR",
+            "providerInstanceId": "codex",
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5.4" },
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+            "branch": "pr-111",
+            "worktreePath": null,
+            "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "thr-legacy" },
+            "latestRunId": null,
+            "activeRunId": null,
+            "status": "idle",
+            "pendingRuntimeRequest": null,
+            "latestVisibleMessage": null,
+            "latestUserMessageAt": null,
+            "hasActionableProposedPlan": false,
+            "itemCount": 1,
+            "visibleItemCount": 1,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "archivedAt": null,
+            "settledOverride": null,
+            "settledAt": null,
+            "deletedAt": null,
+            "linkedPullRequest": {
+                "projectId": "proj-1",
+                "repository": "pingdotgg/t3code",
+                "number": 111,
+                "url": "https://github.com/pingdotgg/t3code/pull/111"
+            }
+        }))
+        .expect("legacy shell thread");
+        let threads = [legacy_thread];
+        let matched = find_prompt_link_pull_request_thread(&threads, &pr).expect("matches legacy linkedPullRequest");
+        assert_eq!(matched.id, "thr-legacy");
     }
 }
 

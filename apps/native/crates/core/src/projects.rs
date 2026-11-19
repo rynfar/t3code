@@ -17,13 +17,311 @@ pub fn create_from_thread(thread_id: &str) -> Value { json!({"threadId":thread_i
 
 pub const PROJECTS_MUTATE: &str = "projects.mutate";
 pub const PROJECTS_CREATE_NEW: &str = "projects.createNew";
+pub const PROJECTS_LIST_IGNORED_FILES: &str = "projects.listIgnoredFiles";
+pub const PROJECTS_READ_FILE: &str = "projects.readFile";
+pub const PROJECTS_WRITE_FILE: &str = "projects.writeFile";
 pub const FILESYSTEM_BROWSE: &str = "filesystem.browse";
 pub const PROJECT_CLONE_START: &str = "projectClone.start";
+pub const PROJECT_CLONE_CANCEL: &str = "projectClone.cancel";
+pub const PROJECT_CLONE_RETRY: &str = "projectClone.retry";
+pub const SUBSCRIBE_PROJECT_CLONES: &str = "subscribeProjectClones";
 
 /// Matches the server's read cap (`addProjectToMachine.ts`): a larger file would arrive truncated.
 pub const COPYABLE_FILE_MAX_BYTES: u64 = 1024 * 1024;
 /// The server lists at most this many ignored files (`addProjectToMachine.ts`).
 pub const COPIED_FILES_MAX_COUNT: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectIgnoredFile {
+    pub path: String,
+    pub byte_length: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectListIgnoredFilesResult {
+    #[serde(default)]
+    pub files: Vec<ProjectIgnoredFile>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectReadFileResult {
+    pub relative_path: String,
+    pub contents: String,
+    #[serde(default)]
+    pub byte_length: u64,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectCloneStage {
+    Connecting,
+    Counting,
+    Receiving,
+    Resolving,
+    Checkout,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProjectCloneStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connecting | Self::Unknown => "Connecting",
+            Self::Counting => "Counting objects",
+            Self::Receiving => "Receiving objects",
+            Self::Resolving => "Resolving deltas",
+            Self::Checkout => "Checking out files",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectClonePhase {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCloneRepositoryInfo {
+    #[serde(default)]
+    pub name_with_owner: String,
+}
+
+/// `ProjectCloneSnapshot` (`packages/contracts/src/projectClone.ts`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCloneSnapshot {
+    pub project_id: String,
+    pub remote_url: String,
+    pub destination_path: String,
+    #[serde(default)]
+    pub repository: Option<ProjectCloneRepositoryInfo>,
+    pub phase: ProjectClonePhase,
+    pub stage: ProjectCloneStage,
+    #[serde(default)]
+    pub percent: Option<u8>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub stalled: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub sequence: u64,
+}
+
+/// `projectCloneDisplayName` (`packages/contracts/src/projectClone.ts`).
+pub fn project_clone_display_name(snapshot: &ProjectCloneSnapshot) -> String {
+    if let Some(repo) = snapshot.repository.as_ref()
+        && !repo.name_with_owner.trim().is_empty()
+    {
+        return repo.name_with_owner.clone();
+    }
+    snapshot
+        .destination_path
+        .split(['/', '\\'])
+        .rfind(|segment| !segment.is_empty())
+        .unwrap_or(&snapshot.destination_path)
+        .to_owned()
+}
+
+/// `projectCloneProgressSummary` (`packages/contracts/src/projectClone.ts`).
+pub fn project_clone_progress_summary(snapshot: &ProjectCloneSnapshot) -> String {
+    let mut parts = vec![snapshot.stage.label().to_owned()];
+    if let Some(percent) = snapshot.percent {
+        parts.push(format!("{percent}%"));
+    }
+    if snapshot.stalled {
+        parts.push("Stalled".to_owned());
+    } else if let Some(detail) = snapshot.detail.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(detail.to_owned());
+    }
+    parts.join(" \u{00b7} ")
+}
+
+/// Live preview of a repository clone's URL, host, protocol alternatives, and destination path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClonePreview {
+    pub remote_url: String,
+    pub host: Option<String>,
+    pub protocol: Option<CloneProtocol>,
+    pub ssh_url: Option<String>,
+    pub https_url: Option<String>,
+    pub directory_path: String,
+    pub destination_path: String,
+    pub title: String,
+    pub incomplete_hint: Option<&'static str>,
+}
+
+/// Computes URL normalization, host extraction, SSH/HTTPS conversion, and flat vs ghq
+/// `<host>/<owner>/<repo>` destination preview for the interactive clone modal.
+pub fn compute_clone_preview(
+    raw_input: &str,
+    base_directory: Option<&str>,
+    fallback_root: Option<&str>,
+    ghq_clone_layout: bool,
+    preferred_protocol: Option<CloneProtocol>,
+) -> ClonePreview {
+    let trimmed = raw_input.trim();
+    let incomplete_hint = github_incomplete_owner_repository_message("github", trimmed);
+    let normalized = if trimmed.is_empty() {
+        String::new()
+    } else {
+        normalize_pasted_clone_url(trimmed)
+    };
+    let ssh_url = clone_url_for_protocol(&normalized, CloneProtocol::Ssh);
+    let https_url = clone_url_for_protocol(&normalized, CloneProtocol::Https);
+    let detected_protocol = clone_url_protocol(&normalized);
+    let effective_protocol = preferred_protocol.or(detected_protocol);
+    let remote_url = match effective_protocol {
+        Some(CloneProtocol::Ssh) => ssh_url.clone().unwrap_or_else(|| normalized.clone()),
+        Some(CloneProtocol::Https) => https_url.clone().unwrap_or_else(|| normalized.clone()),
+        None => normalized.clone(),
+    };
+    let host = parse_clone_url(&remote_url).map(|parsed| parsed.host);
+    let title = clone_directory_name(&remote_url);
+    let root = if ghq_clone_layout {
+        add_project_initial_query(base_directory)
+    } else {
+        base_directory
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| fallback_root.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
+            .unwrap_or_else(|| add_project_initial_query(None))
+    };
+    let directory_path = if remote_url.is_empty() {
+        String::new()
+    } else {
+        clone_directory_path(&remote_url, ghq_clone_layout, None)
+    };
+    let destination_path = if directory_path.is_empty() {
+        root
+    } else {
+        clone_destination_path(&root, &directory_path)
+    };
+    ClonePreview {
+        remote_url,
+        host,
+        protocol: clone_url_protocol(&normalized).or(effective_protocol),
+        ssh_url,
+        https_url,
+        directory_path,
+        destination_path,
+        title,
+        incomplete_hint,
+    }
+}
+
+/// `projectSubdirectory` (`AddProjectToMachineDialog.tsx`): path of a project below its repo root.
+pub fn project_subdirectory(repository_root: Option<&str>, workspace_root: &str) -> String {
+    let Some(repo_root) = repository_root else {
+        return String::new();
+    };
+    let prefix = repo_root.trim_end_matches(['/', '\\']);
+    if prefix.is_empty() || !workspace_root.starts_with(prefix) {
+        return String::new();
+    }
+    let rest = &workspace_root[prefix.len()..];
+    if rest.starts_with('/') || rest.starts_with('\\') {
+        rest[1..].replace('\\', "/")
+    } else {
+        String::new()
+    }
+}
+
+/// Default ignored files pre-selected by `AddProjectToMachineDialog`: `.env*`, `.envrc`, `.dev.vars`
+/// within the 1 MB copy cap, bounded to `COPIED_FILES_MAX_COUNT`.
+pub fn default_selected_ignored_files(files: &[ProjectIgnoredFile]) -> Vec<ProjectIgnoredFile> {
+    files
+        .iter()
+        .filter(|file| file.byte_length <= COPYABLE_FILE_MAX_BYTES && is_default_copied_file(&file.path))
+        .take(COPIED_FILES_MAX_COUNT)
+        .cloned()
+        .collect()
+}
+
+/// Human-readable file size (`apps/web/src/lib/formatBytes.ts`).
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kb = bytes as f64 / 1024.0;
+    if kb < 1024.0 {
+        return if kb >= 10.0 {
+            format!("{kb:.0} KB")
+        } else {
+            format!("{kb:.1} KB")
+        };
+    }
+    let mb = kb / 1024.0;
+    format!("{mb:.1} MB")
+}
+
+pub fn extract_project_remote_url(repository_identity: Option<&Value>) -> Option<String> {
+    let id = repository_identity?;
+    id.pointer("/origin/remoteUrl")
+        .or_else(|| id.pointer("/locator/remoteUrl"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+pub fn extract_repository_root_path(repository_identity: Option<&Value>) -> Option<String> {
+    repository_identity?
+        .get("rootPath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+pub fn extract_repository_display_name(repository_identity: Option<&Value>) -> Option<String> {
+    repository_identity?
+        .get("displayName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+pub fn list_ignored_files_request(cwd: &str, query: Option<&str>) -> Value {
+    let mut payload = json!({ "cwd": cwd });
+    if let Some(q) = query.map(str::trim).filter(|s| !s.is_empty()) {
+        payload["query"] = json!(q);
+    }
+    payload
+}
+
+pub fn read_project_file_request(cwd: &str, relative_path: &str) -> Value {
+    json!({ "cwd": cwd, "relativePath": relative_path })
+}
+
+pub fn write_project_file_request(cwd: &str, relative_path: &str, contents: &str) -> Value {
+    json!({ "cwd": cwd, "relativePath": relative_path, "contents": contents })
+}
+
+pub fn cancel_project_clone_request(project_id: &str) -> Value {
+    json!({ "projectId": project_id })
+}
+
+pub fn retry_project_clone_request(project_id: &str) -> Value {
+    json!({ "projectId": project_id })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -873,5 +1171,73 @@ mod tests {
         }))
         .unwrap();
         assert!(browse.path_missing);
+    }
+
+    #[test]
+    fn clone_preview_progress_summary_and_ignored_file_relay_helpers() {
+        let ghq = compute_clone_preview("pingdotgg/t3code", Some("~/src"), Some("~/projects"), true, None);
+        assert_eq!(ghq.remote_url, "https://github.com/pingdotgg/t3code.git");
+        assert_eq!(ghq.host.as_deref(), Some("github.com"));
+        assert_eq!(ghq.ssh_url.as_deref(), Some("git@github.com:pingdotgg/t3code.git"));
+        assert_eq!(ghq.https_url.as_deref(), Some("https://github.com/pingdotgg/t3code.git"));
+        assert_eq!(ghq.directory_path, "github.com/pingdotgg/t3code");
+        assert_eq!(ghq.destination_path, "~/src/github.com/pingdotgg/t3code");
+        assert_eq!(ghq.title, "t3code");
+
+        let ssh_flat = compute_clone_preview(
+            "https://github.com/pingdotgg/t3code.git",
+            None,
+            Some("~/projects"),
+            false,
+            Some(CloneProtocol::Ssh),
+        );
+        assert_eq!(ssh_flat.remote_url, "git@github.com:pingdotgg/t3code.git");
+        assert_eq!(ssh_flat.destination_path, "~/projects/t3code");
+
+        let snap: ProjectCloneSnapshot = serde_json::from_value(json!({
+            "projectId": "p1",
+            "remoteUrl": "https://github.com/pingdotgg/t3code.git",
+            "destinationPath": "/src/github.com/pingdotgg/t3code",
+            "repository": { "nameWithOwner": "pingdotgg/t3code" },
+            "phase": "running",
+            "stage": "receiving",
+            "percent": 64,
+            "detail": "12.4 MiB/s",
+            "stalled": false,
+            "error": null,
+            "sequence": 3
+        }))
+        .unwrap();
+        assert_eq!(project_clone_display_name(&snap), "pingdotgg/t3code");
+        assert_eq!(project_clone_progress_summary(&snap), "Receiving objects · 64% · 12.4 MiB/s");
+
+        let mut stalled = snap.clone();
+        stalled.stalled = true;
+        assert_eq!(project_clone_progress_summary(&stalled), "Receiving objects · 64% · Stalled");
+
+        assert_eq!(project_subdirectory(Some("/repo"), "/repo/apps/web"), "apps/web");
+        assert_eq!(project_subdirectory(Some("/repo/"), "/repo"), "");
+        assert_eq!(project_subdirectory(Some("/repo"), "/other/apps/web"), "");
+
+        let files = vec![
+            ProjectIgnoredFile { path: ".env.local".into(), byte_length: 256 },
+            ProjectIgnoredFile { path: "apps/web/.env".into(), byte_length: COPYABLE_FILE_MAX_BYTES + 1 },
+            ProjectIgnoredFile { path: "notes.txt".into(), byte_length: 64 },
+            ProjectIgnoredFile { path: ".envrc".into(), byte_length: 32 },
+        ];
+        let defaults = default_selected_ignored_files(&files);
+        let paths: Vec<&str> = defaults.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec![".env.local", ".envrc"]);
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MB");
+        assert_eq!(
+            list_ignored_files_request("/repo", Some("env")),
+            json!({ "cwd": "/repo", "query": "env" })
+        );
+        assert_eq!(
+            write_project_file_request("/dst", "apps/web/.env", "KEY=1"),
+            json!({ "cwd": "/dst", "relativePath": "apps/web/.env", "contents": "KEY=1" })
+        );
     }
 }

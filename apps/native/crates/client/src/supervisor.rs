@@ -228,6 +228,23 @@ impl ClientFixture {
         }
     }
 
+    pub async fn next_stream(&mut self) -> (&'static str, oneshot::Sender<Result<StreamHandle, RpcError>>) {
+        loop {
+            match self.commands.recv().await.expect("fixture stream channel closed") {
+                Command::Stream { method, reply, .. } => return (method, reply),
+                Command::Request { reply, .. } => {
+                    let _ = reply.send(Ok(serde_json::json!({})));
+                }
+                Command::OpenThread(_)
+                | Command::CloseThread(_)
+                | Command::CloseAllThreads
+                | Command::RefreshSessionState
+                | Command::RetryNow
+                | Command::Wakeup(_) => {}
+            }
+        }
+    }
+
     pub fn take_commands(&mut self) -> Vec<&'static str> {
         let mut commands = Vec::new();
         while let Ok(command) = self.commands.try_recv() {
@@ -1277,12 +1294,14 @@ async fn run_session(
 ) -> SessionEnd {
     let config_requested_at_ms = wall_now_ms();
     let mut preprocessor = ServerConfigPreprocessor::default();
+    let mut environment_label: Option<String> = None;
     let mut server_config = session.stream(method::SUBSCRIBE_SERVER_CONFIG, subscribe_server_config_payload()).ok();
     let options = initial_shell_options(
         &mut server_config,
         active_route,
         routes,
         expected_environment_id,
+        &mut environment_label,
         events,
         &mut preprocessor,
         config_requested_at_ms,
@@ -1341,6 +1360,12 @@ async fn run_session(
                     let value = preprocessor.preprocess(value, config_requested_at_ms, config_extras);
                     match serde_json::from_value::<ServerConfigStreamEvent>(value) {
                         Ok(event) => {
+                            if let ServerConfigStreamEvent::Snapshot { config } = &event {
+                                let label = config.environment.label.trim();
+                                if !label.is_empty() {
+                                    environment_label = Some(label.to_owned());
+                                }
+                            }
                             absorb_learned_routes(active_route, routes, expected_environment_id, config_extras, &event);
                             if better_route_probe.is_none() && better_route_deadline.is_none() {
                                 better_route_deadline = next_better_route_deadline(
@@ -1478,7 +1503,7 @@ async fn run_session(
                 }
                 Some(Command::Request { method, payload, mut reply, settled }) => {
                     if !reply.is_closed() {
-                        let response = session.send_request(method, payload);
+                        let response = session.send_request_labeled(method, payload, environment_label.as_deref());
                         tokio::spawn(async move {
                             tokio::select! {
                                 _ = reply.closed() => {},
@@ -1521,6 +1546,7 @@ async fn initial_shell_options(
     active_route: &CandidateRoute,
     routes: &mut Vec<CandidateRoute>,
     expected_environment_id: &mut Option<String>,
+    environment_label: &mut Option<String>,
     events: &Events,
     preprocessor: &mut ServerConfigPreprocessor,
     config_requested_at_ms: i64,
@@ -1533,6 +1559,12 @@ async fn initial_shell_options(
                     let value = preprocessor.preprocess(value, config_requested_at_ms, config_extras);
                     match serde_json::from_value::<ServerConfigStreamEvent>(value) {
                         Ok(event) => {
+                            if let ServerConfigStreamEvent::Snapshot { config } = &event {
+                                let label = config.environment.label.trim();
+                                if !label.is_empty() {
+                                    *environment_label = Some(label.to_owned());
+                                }
+                            }
                             absorb_learned_routes(active_route, routes, expected_environment_id, config_extras, &event);
                             let options = match &event {
                                 ServerConfigStreamEvent::Snapshot { config } => {
