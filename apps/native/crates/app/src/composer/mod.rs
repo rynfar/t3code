@@ -5373,20 +5373,12 @@ mod stream_error_tests {
             cx.emit(crate::app_state::AppEvent::Selection);
             cx.emit(crate::app_state::AppEvent::ServerConfig);
         });
-        let (composer, vcx) = cx.add_window_view(|window, cx| {
-            let composer = cx.new(|cx| Composer::new(state.clone(), window, cx));
-            struct BannerHost(Entity<Composer>);
-            impl Render for BannerHost {
-                fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-                    let banner = self.0.update(cx, |composer, cx| composer.render_fresh_session_banner(cx));
-                    gpui::div().w(gpui::px(720.)).children(banner)
-                }
-            }
-            BannerHost(composer)
-        });
-        let composer = composer.read_with(vcx, |host, _| host.0.clone());
+        let (composer, vcx) = cx.add_window_view(|window, cx| Composer::new(state.clone(), window, cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.input.update(cx, |input, cx| input.set_value("blocked message", window, cx));
+            });
             window.refresh();
             window.draw(cx).clear();
         });
@@ -5398,6 +5390,17 @@ mod stream_error_tests {
         let switch_bounds = vcx
             .debug_bounds("managed-runtime-mode-switch")
             .expect("Switch to Auto-accept edits action must render");
+        let send_bounds = vcx
+            .debug_bounds("send")
+            .expect("Send button must render when composer has text");
+
+        // Clicking the disabled Send button above maxRuntimeMode must not send or clear the draft.
+        vcx.simulate_click(send_bounds.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        composer.read_with(vcx, |composer, cx| {
+            assert!(!composer.sending, "disabled Send button must not start sending above maxRuntimeMode");
+            assert_eq!(composer.input.read(cx).value().as_ref(), "blocked message");
+        });
 
         // Trying to pick an above-ceiling mode is rejected, and submitting while above ceiling is blocked.
         vcx.update(|window, cx| {
@@ -5411,7 +5414,6 @@ mod stream_error_tests {
                     composer.runtime_mode_ceiling_denial(&resolved, cx).is_some(),
                     "runtime_mode_ceiling_denial must report a denial above maxRuntimeMode"
                 );
-                composer.input.update(cx, |input, cx| input.set_value("blocked message", window, cx));
                 composer.submit(rules::SubmitIntent::Foreground, window, cx);
                 assert!(!composer.sending, "submit() must not start sending above maxRuntimeMode");
                 assert_eq!(
@@ -5422,7 +5424,7 @@ mod stream_error_tests {
             });
         });
 
-        // Clicking the Switch button clamps down to Auto-accept edits and clears the banner.
+        // Clicking the Switch button clamps down to Auto-accept edits and clears the banner & denial.
         vcx.simulate_click(switch_bounds.center(), gpui::Modifiers::none());
         vcx.run_until_parked();
         vcx.update(|window, cx| {
@@ -5430,7 +5432,12 @@ mod stream_error_tests {
             window.draw(cx).clear();
         });
         composer.read_with(vcx, |composer, cx| {
-            assert_eq!(composer.resolve(cx).runtime_mode, RuntimeMode::AutoAcceptEdits);
+            let resolved = composer.resolve(cx);
+            assert_eq!(resolved.runtime_mode, RuntimeMode::AutoAcceptEdits);
+            assert!(
+                composer.runtime_mode_ceiling_denial(&resolved, cx).is_none(),
+                "clamping to ceiling must clear runtime_mode_ceiling_denial"
+            );
         });
         assert!(
             vcx.debug_bounds("managed-runtime-mode-banner").is_none(),
