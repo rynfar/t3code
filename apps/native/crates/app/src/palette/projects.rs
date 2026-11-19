@@ -3,7 +3,11 @@
 //! path, Tab completes; and New project names a folder for `projects.createNew`.
 
 use gpui::{AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, Styled, Task, UniformListScrollHandle, div, prelude::*, px, uniform_list};
-use t3_core::projects::{BrowseResult, FILESYSTEM_BROWSE, add_target, append_browse_segment, browse_path, browse_request, browse_tab_completion, filter_browse_entries};
+use t3_core::projects::{
+    BrowseResult, FILESYSTEM_BROWSE, add_target, append_browse_segment, browse_path, browse_request,
+    browse_tab_completion, filter_browse_entries, github_incomplete_owner_repository_message,
+    is_clone_query, normalize_pasted_clone_url,
+};
 
 use super::CommandPalette;
 use crate::app_state::AppState;
@@ -15,11 +19,12 @@ const ROW_HEIGHT: f32 = 32.;
 #[derive(Default)]
 pub(super) struct ProjectBrowse {
     query: String,
+    windows: bool,
     loaded_directory: Option<String>,
     result: Option<BrowseResult>,
     pending: bool,
     error: Option<String>,
-    /// Row 0 adds the typed path; rows after it are folders.
+    /// Row 0 adds the typed path (or clones a pasted git URL / `owner/repo`); rows after it are folders.
     pub highlighted: usize,
     pub scroll: UniformListScrollHandle,
     request: Option<Task<()>>,
@@ -39,7 +44,14 @@ impl ProjectBrowse {
     pub fn set_query(&mut self, query: String, state: &Entity<AppState>, cx: &mut Context<CommandPalette>) {
         self.query = query;
         self.highlighted = 0;
-        let Some(path) = browse_path(&self.query, false) else {
+        self.windows = state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|config| config.environment.platform.as_ref())
+            .is_some_and(|platform| matches!(platform.os.as_str(), "windows" | "win32"));
+        let Some(path) = browse_path(&self.query, self.windows) else {
             self.result = None;
             self.loaded_directory = None;
             return;
@@ -69,7 +81,7 @@ impl ProjectBrowse {
     }
 
     fn filter(&self) -> String {
-        browse_path(&self.query, false).map(|path| path.filter).unwrap_or_default()
+        browse_path(&self.query, self.windows).map(|path| path.filter).unwrap_or_default()
     }
 
     fn visible_names(&self) -> Vec<(String, String)> {
@@ -78,7 +90,10 @@ impl ProjectBrowse {
     }
 
     fn row_count(&self) -> usize {
-        usize::from(browse_path(&self.query, false).is_some()) + self.visible_names().len()
+        if is_clone_query(&self.query) {
+            return 1;
+        }
+        usize::from(browse_path(&self.query, self.windows).is_some()) + self.visible_names().len()
     }
 
     pub fn move_highlight(&mut self, step: isize) {
@@ -89,10 +104,13 @@ impl ProjectBrowse {
         }
     }
 
-    /// Enter: add the typed path from the first row, else enter the highlighted folder.
+    /// Enter: add the typed path (or clone URL) from the first row, else enter the highlighted folder.
     /// With `add`, a folder row is added instead of entered.
     pub fn pick(&self, add: bool) -> Option<BrowsePick> {
-        browse_path(&self.query, false)?;
+        if is_clone_query(&self.query) {
+            return Some(BrowsePick::Add(self.query.trim().to_owned()));
+        }
+        browse_path(&self.query, self.windows)?;
         if self.highlighted == 0 {
             return Some(BrowsePick::Add(add_target(&self.query)));
         }
@@ -111,16 +129,39 @@ impl ProjectBrowse {
 
     pub fn render(&self, cx: &mut Context<CommandPalette>) -> AnyElement {
         let p = palette(cx);
-        if browse_path(&self.query, false).is_none() {
-            return div().py(px(32.)).px(px(24.)).flex().justify_center().text_sm().text_color(hsla(p.muted_foreground)).child("Enter project path (e.g. ~/projects/my-app)").into_any_element();
+        if is_clone_query(&self.query) {
+            return div()
+                .flex()
+                .flex_col()
+                .min_h_0()
+                .p(px(8.))
+                .child(self.render_row(0, cx))
+                .into_any_element();
+        }
+        if browse_path(&self.query, self.windows).is_none() {
+            let hint = github_incomplete_owner_repository_message("github", &self.query)
+                .unwrap_or("Enter project path (e.g. ~/projects/my-app) or repository URL (owner/repo)");
+            return div()
+                .py(px(32.))
+                .px(px(24.))
+                .flex()
+                .justify_center()
+                .text_sm()
+                .text_color(hsla(p.muted_foreground))
+                .child(hint)
+                .into_any_element();
         }
         let count = self.row_count();
+        let path_missing = self.result.as_ref().is_some_and(|r| r.path_missing);
         div()
             .flex()
             .flex_col()
             .min_h_0()
             .p(px(8.))
             .children(self.error.clone().map(|error| div().px(px(8.)).py(px(4.)).text_xs().text_color(hsla(p.destructive)).child(error)))
+            .when(path_missing && self.error.is_none(), |this| {
+                this.child(div().px(px(8.)).py(px(4.)).text_xs().text_color(hsla(p.muted_foreground)).child("Folder does not exist yet — it will be created."))
+            })
             .when(self.pending && self.result.is_none(), |this| this.child(div().px(px(8.)).py(px(4.)).text_xs().text_color(hsla(p.muted_foreground)).child("Loading folders…")))
             .child(
                 uniform_list("palette-browse", count, cx.processor(|this, range: std::ops::Range<usize>, _, cx| range.map(|index| this.browse.render_row(index, cx)).collect::<Vec<_>>()))
@@ -132,8 +173,15 @@ impl ProjectBrowse {
 
     fn render_row(&self, index: usize, cx: &mut Context<CommandPalette>) -> AnyElement {
         let p = palette(cx);
-        let (icon, title, detail) = if index == 0 {
-            (Icon::FolderTree, format!("Add {}", add_target(&self.query)), String::new())
+        let (icon, title, detail) = if index == 0 && is_clone_query(&self.query) {
+            (Icon::FolderTree, format!("Clone {}", self.query.trim()), normalize_pasted_clone_url(&self.query))
+        } else if index == 0 {
+            let missing = self.result.as_ref().is_some_and(|r| r.path_missing);
+            (
+                Icon::FolderTree,
+                format!("Add {}", add_target(&self.query)),
+                if missing { "Will create folder".to_owned() } else { String::new() },
+            )
         } else {
             let Some((name, full_path)) = self.visible_names().into_iter().nth(index - 1) else { return div().into_any_element() };
             (Icon::Folder, name, full_path)

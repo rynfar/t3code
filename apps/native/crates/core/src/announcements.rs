@@ -861,3 +861,469 @@ mod review_tests {
         assert_eq!(q.flush(450).unwrap().message, "Done");
     }
 }
+
+/// `ScreenReaderAnnouncements` (`packages/contracts/src/settings.ts`, `pingdotgg/t3code#33900`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScreenReaderAnnouncements {
+    #[default]
+    Status,
+    Messages,
+    Everything,
+}
+
+impl ScreenReaderAnnouncements {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "status" => Some(Self::Status),
+            "messages" => Some(Self::Messages),
+            "everything" => Some(Self::Everything),
+            _ => None,
+        }
+    }
+}
+
+pub fn screen_reader_announcements_setting(
+    entries: &serde_json::Map<String, serde_json::Value>,
+) -> ScreenReaderAnnouncements {
+    entries
+        .get("screenReaderAnnouncements")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ScreenReaderAnnouncements::parse)
+        .unwrap_or_default()
+}
+
+pub fn screen_reader_window_title_setting(
+    entries: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    entries
+        .get("screenReaderWindowTitle")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// `ThreadActivityAnnouncer.tsx` timing constants.
+pub const ACTIVITY_GAP_MS: u64 = 2_000;
+pub const MESSAGE_HOLD_MS_PER_CHARACTER: u64 = 50;
+pub const MESSAGE_HOLD_MAX_MS: u64 = 15_000;
+const ACTIVITY_MAX_LENGTH: usize = 120;
+const MESSAGE_MAX_LENGTH: usize = 2_000;
+const MESSAGE_AUTHOR: &str = "T3 Code";
+
+pub fn hold_after(text: &str) -> u64 {
+    let char_ms = (text.chars().count() as u64).saturating_mul(MESSAGE_HOLD_MS_PER_CHARACTER);
+    char_ms.clamp(ACTIVITY_GAP_MS, MESSAGE_HOLD_MAX_MS)
+}
+
+/// `asOneAnnouncement` (`ThreadActivityAnnouncer.tsx`).
+pub fn as_one_announcement(texts: &[String]) -> String {
+    texts
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            if index + 1 == texts.len() || text.ends_with(['.', '!', '?', ':', '…']) {
+                text.clone()
+            } else {
+                format!("{text}.")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// First `max_len` scalar values of `text`, or `None` when it fits.
+pub fn cut_text(text: &str, max_len: usize) -> Option<String> {
+    if text.len() <= max_len {
+        return None;
+    }
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max_len).collect();
+    chars.next().is_some().then_some(head)
+}
+
+/// `TurnMessage` (`turnDetailAnnouncement.ts`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnMessage {
+    pub id: String,
+    pub text: String,
+    pub finished: bool,
+    pub fresh: bool,
+}
+
+/// `TurnDetail` (`turnDetailAnnouncement.ts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnDetail {
+    pub activity: Option<String>,
+    pub messages: Vec<TurnMessage>,
+    pub tail_id: Option<String>,
+}
+
+/// `TurnDetailMemory` (`turnDetailAnnouncement.ts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnDetailMemory {
+    pub activity: Option<String>,
+    pub messages: HashMap<String, bool>,
+    pub tail_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnDetailAnnouncement {
+    pub memory: TurnDetailMemory,
+    pub messages: Vec<String>,
+    pub activity: Option<String>,
+}
+
+fn plain_markdown_text(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut prev_space = true;
+    for ch in markdown.chars() {
+        if matches!(ch, '`' | '*' | '_' | '#') {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_owned()
+}
+
+fn with_verb(item_type: &str, label: &str) -> String {
+    if item_type == "file_change" {
+        return format!("Editing {label}");
+    }
+    if item_type != "file_search" && item_type != "web_search" {
+        return label.to_owned();
+    }
+    let lower = label.to_ascii_lowercase();
+    if lower.starts_with("search ")
+        || lower.starts_with("searched ")
+        || lower.starts_with("searching ")
+    {
+        return label.to_owned();
+    }
+    if item_type == "web_search" {
+        format!("Searching the web for {label}")
+    } else {
+        format!("Searching for {label}")
+    }
+}
+
+/// Extracts `TurnDetail` for the latest turn directly from a `ThreadProjection`
+/// (`turnDetail` in `turnDetailAnnouncement.ts`).
+pub fn turn_detail_from_projection(
+    projection: &ThreadProjection,
+    known_tail_id: Option<&str>,
+) -> TurnDetail {
+    use crate::turn_item::TurnItemKind;
+    use std::collections::HashSet;
+
+    let mut messages = Vec::new();
+    let mut continued_runs: HashSet<Option<&str>> = HashSet::new();
+    let mut activity: Option<Option<String>> = None;
+    let mut fresh = true;
+    let items = &projection.visible_turn_items;
+    let mut idx = items.len();
+    while idx > 0 {
+        idx -= 1;
+        let row = &items[idx];
+        let item = &row.item;
+        let id = item.id.as_str();
+        if matches!(item.kind, TurnItemKind::UserMessage { .. }) {
+            break;
+        }
+        if known_tail_id == Some(id) {
+            fresh = false;
+        }
+        let run_id = item.run_id.as_deref();
+        match &item.kind {
+            TurnItemKind::AssistantMessage { message_id, text, streaming, .. } => {
+                activity.get_or_insert(None);
+                messages.push(TurnMessage {
+                    id: message_id.clone(),
+                    text: text.clone(),
+                    finished: !*streaming && continued_runs.contains(&run_id),
+                    fresh,
+                });
+                continued_runs.insert(run_id);
+            }
+            TurnItemKind::ProposedPlan { .. } => {
+                activity.get_or_insert(None);
+                continued_runs.insert(run_id);
+            }
+            TurnItemKind::Reasoning { .. } => {
+                continued_runs.insert(run_id);
+                if activity.is_none() {
+                    activity = Some(Some("Thinking".to_owned()));
+                }
+            }
+            TurnItemKind::Compaction { .. } => {
+                if activity.is_none() {
+                    let in_progress = matches!(item.status.as_str(), "pending" | "running" | "waiting" | "in_progress");
+                    let label = item.title.clone().unwrap_or_else(|| "Compacting context".to_owned());
+                    activity = Some(in_progress.then_some(label));
+                }
+            }
+            TurnItemKind::ApprovalRequest { .. } | TurnItemKind::UserInputRequest { .. } => {
+                continued_runs.insert(run_id);
+            }
+            TurnItemKind::FileChange { file_name, .. } => {
+                continued_runs.insert(run_id);
+                if activity.is_none() {
+                    let failed = matches!(item.status.as_str(), "failed" | "declined" | "stopped" | "cancelled");
+                    if failed {
+                        activity = Some(None);
+                    } else {
+                        let raw = item.title.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(file_name.as_str());
+                        let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                        activity = Some((!collapsed.is_empty()).then(|| {
+                            let spoken = with_verb("file_change", &collapsed);
+                            match cut_text(&spoken, ACTIVITY_MAX_LENGTH) {
+                                Some(head) => format!("{head}…"),
+                                None => spoken,
+                            }
+                        }));
+                    }
+                }
+            }
+            TurnItemKind::CommandExecution { input, .. } => {
+                continued_runs.insert(run_id);
+                if activity.is_none() {
+                    let failed = matches!(item.status.as_str(), "failed" | "declined" | "stopped" | "cancelled");
+                    if failed {
+                        activity = Some(None);
+                    } else {
+                        let raw = item.title.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(input.as_str());
+                        let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                        activity = Some((!collapsed.is_empty()).then(|| match cut_text(&collapsed, ACTIVITY_MAX_LENGTH) {
+                            Some(head) => format!("{head}…"),
+                            None => collapsed,
+                        }));
+                    }
+                }
+            }
+            TurnItemKind::FileSearch { pattern, .. } => {
+                continued_runs.insert(run_id);
+                if activity.is_none() {
+                    let failed = matches!(item.status.as_str(), "failed" | "declined" | "stopped" | "cancelled");
+                    if failed {
+                        activity = Some(None);
+                    } else {
+                        let raw = item
+                            .title
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .or(pattern.as_deref())
+                            .unwrap_or("");
+                        let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                        activity = Some((!collapsed.is_empty()).then(|| {
+                            let spoken = with_verb("file_search", &collapsed);
+                            match cut_text(&spoken, ACTIVITY_MAX_LENGTH) {
+                                Some(head) => format!("{head}…"),
+                                None => spoken,
+                            }
+                        }));
+                    }
+                }
+            }
+            TurnItemKind::WebSearch { patterns, .. } => {
+                continued_runs.insert(run_id);
+                if activity.is_none() {
+                    let failed = matches!(item.status.as_str(), "failed" | "declined" | "stopped" | "cancelled");
+                    if failed {
+                        activity = Some(None);
+                    } else {
+                        let first_pattern = patterns.as_ref().and_then(|p| p.first()).map(String::as_str);
+                        let raw = item
+                            .title
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .or(first_pattern)
+                            .unwrap_or("");
+                        let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                        activity = Some((!collapsed.is_empty()).then(|| {
+                            let spoken = with_verb("web_search", &collapsed);
+                            match cut_text(&spoken, ACTIVITY_MAX_LENGTH) {
+                                Some(head) => format!("{head}…"),
+                                None => spoken,
+                            }
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut tail_known = !fresh;
+    if let Some(known) = known_tail_id {
+        while !tail_known && idx > 0 {
+            idx -= 1;
+            if items[idx].item.id == known {
+                tail_known = true;
+            }
+        }
+    }
+    if !tail_known {
+        for m in &mut messages {
+            m.fresh = false;
+        }
+    }
+    messages.reverse();
+    TurnDetail {
+        activity: activity.flatten(),
+        messages,
+        tail_id: items.last().map(|e| e.item.id.clone()),
+    }
+}
+
+/// `nextTurnDetailAnnouncement` (`turnDetailAnnouncement.ts`).
+pub fn next_turn_detail_announcement(
+    previous: Option<&TurnDetailMemory>,
+    next: &TurnDetail,
+    level: ScreenReaderAnnouncements,
+    status: Status,
+) -> TurnDetailAnnouncement {
+    let memory = TurnDetailMemory {
+        activity: if status == Status::Working { next.activity.clone() } else { None },
+        messages: next.messages.iter().map(|m| (m.id.clone(), m.finished)).collect(),
+        tail_id: next.tail_id.clone(),
+    };
+    let Some(previous) = previous else {
+        return TurnDetailAnnouncement { memory, messages: Vec::new(), activity: None };
+    };
+    if level == ScreenReaderAnnouncements::Status || status == Status::Idle {
+        return TurnDetailAnnouncement { memory, messages: Vec::new(), activity: None };
+    }
+    let messages = next
+        .messages
+        .iter()
+        .filter(|m| {
+            m.finished
+                && previous.messages.get(&m.id) != Some(&true)
+                && (m.fresh || previous.messages.contains_key(&m.id))
+        })
+        .filter_map(|m| {
+            let spoken = match cut_text(&m.text, MESSAGE_MAX_LENGTH) {
+                Some(cut) => format!("{} More in the thread.", plain_markdown_text(&cut)),
+                None => plain_markdown_text(&m.text),
+            };
+            (!spoken.is_empty()).then(|| format!("{MESSAGE_AUTHOR}: {spoken}"))
+        })
+        .collect();
+    let activity = if level == ScreenReaderAnnouncements::Everything && memory.activity != previous.activity {
+        memory.activity.clone()
+    } else {
+        None
+    };
+    TurnDetailAnnouncement { memory, messages, activity }
+}
+
+/// `resolveWindowTitleThreadStatus` (`Sidebar.logic.ts`, `pingdotgg/t3code#34697`).
+pub fn resolve_window_title_thread_status(
+    thread: &crate::sidebar::thread::SidebarThread,
+) -> Option<&'static str> {
+    use crate::sidebar::status::{ThreadStatus, resolve_status};
+    let mut without_guest = thread.clone();
+    without_guest.pending_guest_message_count = 0;
+    match resolve_status(&without_guest) {
+        ThreadStatus::Approval => Some("Needs approval"),
+        ThreadStatus::Input => Some("Needs your input"),
+        ThreadStatus::Preparing | ThreadStatus::Working => Some("Working"),
+        ThreadStatus::Waiting => (thread.runtime.as_ref().map(|r| r.status.as_str()) == Some("running")).then_some("Working"),
+        _ => None,
+    }
+}
+
+/// `resolveWindowTitle` (`branding.logic.ts`, `pingdotgg/t3code#34697`).
+pub fn resolve_window_title(
+    app_display_name: &str,
+    project_title: Option<&str>,
+    thread_title: Option<&str>,
+    screen_reader_status: Option<Option<&str>>,
+    desktop: bool,
+) -> String {
+    let thread = thread_title.map(str::trim).unwrap_or("");
+    let status = screen_reader_status.flatten();
+    if thread.is_empty() {
+        return match status {
+            Some(s) => format!("{s}: {app_display_name}"),
+            None => app_display_name.to_owned(),
+        };
+    }
+    let project = project_title.map(str::trim).unwrap_or("");
+    let context = if project.is_empty() {
+        thread.to_owned()
+    } else if screen_reader_status.is_some() {
+        format!("{thread} - {project}")
+    } else {
+        format!("{project} / {thread}")
+    };
+    let title = match status {
+        Some(s) => format!("{s}: {context}"),
+        None => context,
+    };
+    if desktop { title } else { format!("{title} - {app_display_name}") }
+}
+
+#[cfg(test)]
+mod screen_reader_detail_tests {
+    use super::*;
+
+    #[test]
+    fn turn_detail_announces_finished_messages_and_steps_by_level() {
+        let baseline = TurnDetail {
+            activity: Some("Thinking".into()),
+            messages: vec![TurnMessage { id: "m1".into(), text: "Draft".into(), finished: false, fresh: false }],
+            tail_id: Some("m1".into()),
+        };
+        let first = next_turn_detail_announcement(None, &baseline, ScreenReaderAnnouncements::Everything, Status::Working);
+        assert!(first.messages.is_empty());
+        assert!(first.activity.is_none());
+
+        let next = TurnDetail {
+            activity: Some("Editing src/main.rs".into()),
+            messages: vec![TurnMessage { id: "m1".into(), text: "**Fixed** `bug`".into(), finished: true, fresh: false }],
+            tail_id: Some("w1".into()),
+        };
+        let out_messages = next_turn_detail_announcement(Some(&first.memory), &next, ScreenReaderAnnouncements::Messages, Status::Working);
+        assert_eq!(out_messages.messages, vec!["T3 Code: Fixed bug"]);
+        assert_eq!(out_messages.activity, None);
+
+        let out_everything = next_turn_detail_announcement(Some(&first.memory), &next, ScreenReaderAnnouncements::Everything, Status::Working);
+        assert_eq!(out_everything.messages, vec!["T3 Code: Fixed bug"]);
+        assert_eq!(out_everything.activity.as_deref(), Some("Editing src/main.rs"));
+
+        let out_status = next_turn_detail_announcement(Some(&first.memory), &next, ScreenReaderAnnouncements::Status, Status::Working);
+        assert!(out_status.messages.is_empty());
+        assert!(out_status.activity.is_none());
+    }
+
+    #[test]
+    fn window_title_leads_with_status_and_thread_when_screen_reader_enabled() {
+        assert_eq!(
+            resolve_window_title("T3 Code", Some("t3code"), Some("Fix bug"), None, true),
+            "t3code / Fix bug"
+        );
+        assert_eq!(
+            resolve_window_title("T3 Code", Some("t3code"), Some("Fix bug"), Some(Some("Working")), true),
+            "Working: Fix bug - t3code"
+        );
+        assert_eq!(
+            resolve_window_title("T3 Code", Some("t3code"), Some("Fix bug"), Some(None), true),
+            "Fix bug - t3code"
+        );
+        assert_eq!(
+            resolve_window_title("T3 Code", None, None, Some(None), true),
+            "T3 Code"
+        );
+        assert_eq!(
+            as_one_announcement(&["T3 Code: Ready".into(), "Needs approval".into()]),
+            "T3 Code: Ready. Needs approval"
+        );
+        assert_eq!(hold_after("Hi"), ACTIVITY_GAP_MS);
+    }
+}

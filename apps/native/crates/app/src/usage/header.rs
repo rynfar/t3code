@@ -215,6 +215,24 @@ impl UsageView {
                     check_item("usage-environment-this", selected, row.into_any_element(), cx)
                         .on_click(cx.listener(|this, _, _, cx| this.set_environment_selected(!this.data.selected, cx))),
                 )
+                .when(show_status && self.data.phase == usage::ConnectionPhase::Connected, |this| {
+                    this.child(menu_separator(cx)).child(
+                        div()
+                            .id("usage-environment-model-prices")
+                            .flex()
+                            .items_center()
+                            .gap(r(8.))
+                            .min_h(r(30.))
+                            .px(r(8.))
+                            .rounded(r(6.))
+                            .text_size(r(13.))
+                            .text_color(hsla(p.foreground))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hsla(p.accent)))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_price_overrides(None, window, cx)))
+                            .child("Model prices"),
+                    )
+                })
                 .when(show_status && !coverage.is_empty(), |this| {
                     this.child(
                         gpui_component::v_flex()

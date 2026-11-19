@@ -4,7 +4,12 @@
 //! palette's Add project flows, the project menu and the Projects settings page.
 
 use gpui::{ClipboardItem, Context};
-use t3_core::projects::{CreateNewResult, PROJECTS_CREATE_NEW, PROJECTS_MUTATE, add_target, create_new_project, create_project, find_project_by_path, infer_project_title, set_project_pinned};
+use t3_core::projects::{
+    CreateNewResult, PROJECT_CLONE_START, PROJECTS_CREATE_NEW, PROJECTS_MUTATE, ProjectCloneStartResult,
+    add_project_initial_query, clone_destination_path, clone_directory_name, clone_directory_path,
+    create_new_project, create_project, find_project_by_path, infer_project_title, is_clone_query,
+    normalize_pasted_clone_url, resolve_add_project_path, set_project_pinned, start_project_clone,
+};
 use t3_core::settings::projects::delete_project;
 
 use crate::app_state::AppState;
@@ -132,12 +137,34 @@ impl AppState {
         self.server_config.config.as_ref().is_some_and(|config| config.environment.capabilities.project_organization == Some(true))
     }
 
-    /// Adds the folder a browse query names, or opens a draft in the project already there.
+    /// Adds the folder a browse query names (or clones when given a repository URL / `owner/repo`),
+    /// or opens a draft in the project already there.
     pub fn add_project(&mut self, query: &str, cx: &mut Context<Self>) {
-        let path = add_target(query);
-        if path.is_empty() {
+        if is_clone_query(query) {
+            self.clone_project_from_input(query, cx);
             return;
         }
+        let platform = self
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|c| c.environment.platform.as_ref())
+            .map(|p| p.os.as_str())
+            .unwrap_or("darwin");
+        let current_cwd = self
+            .selected_thread
+            .as_deref()
+            .and_then(|id| self.thread_shell(id))
+            .and_then(|t| self.shell.project(&t.project_id))
+            .or_else(|| self.draft_project.as_deref().and_then(|id| self.shell.project(id)))
+            .map(|p| p.workspace_root.as_str());
+        let path = match resolve_add_project_path(query, current_cwd, platform) {
+            Ok(path) => path,
+            Err(error) => {
+                self.show_toast(Toast::new(ToastKind::Error, "Failed to add project").description(error), cx);
+                return;
+            }
+        };
         let existing = self.shell.snapshot.as_ref().and_then(|snapshot| find_project_by_path(&snapshot.projects, &path, |project| &project.workspace_root).map(|project| project.id.clone()));
         if let Some(project_id) = existing {
             self.show_toast(Toast::new(ToastKind::Warning, "Project already added").description(path), cx);
@@ -155,6 +182,64 @@ impl AppState {
                     state.start_draft(&project_id, cx);
                 }
                 Err(error) => state.show_toast(Toast::new(ToastKind::Error, "Failed to add project").description(error.to_string()), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Clones a git repository URL or `owner/repo` shorthand into either flat `<repo>` or
+    /// ghq-style `<host>/<owner>/<repo>` layout based on the environment's `ghqCloneLayout` setting.
+    pub fn clone_project_from_input(&mut self, input: &str, cx: &mut Context<Self>) {
+        let remote_url = normalize_pasted_clone_url(input);
+        let title = clone_directory_name(&remote_url);
+        if title.is_empty() {
+            self.show_toast(
+                Toast::new(ToastKind::Error, "Failed to clone repository")
+                    .description("Enter a valid repository URL or owner/repo."),
+                cx,
+            );
+            return;
+        }
+        let base_dir = self
+            .server_config
+            .config
+            .as_ref()
+            .map(|c| c.settings.threads.add_project_base_directory.clone())
+            .filter(|s| !s.trim().is_empty());
+        let fallback_root = self
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|c| c.new_projects_root.clone());
+        let ghq_layout = self
+            .server_config
+            .config
+            .as_ref()
+            .is_some_and(|c| c.settings.threads.ghq_clone_layout);
+        let root = if ghq_layout {
+            add_project_initial_query(base_dir.as_deref())
+        } else {
+            base_dir
+                .or(fallback_root)
+                .unwrap_or_else(|| add_project_initial_query(None))
+        };
+        let dir = clone_directory_path(&remote_url, ghq_layout, None);
+        let destination = clone_destination_path(&root, &dir);
+        let project_id = uuid();
+        let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let payload = start_project_clone(&project_id, &title, &created_at, &remote_url, &destination);
+        let req = self.rpc(PROJECT_CLONE_START, payload);
+        cx.spawn(async move |this, cx| {
+            let result = req
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| serde_json::from_value::<ProjectCloneStartResult>(value).map_err(|e| e.to_string()));
+            let _ = this.update(cx, |state, cx| match result {
+                Ok(started) => state.start_draft(&started.project_id, cx),
+                Err(error) => state.show_toast(
+                    Toast::new(ToastKind::Error, "Clone failed").description(error),
+                    cx,
+                ),
             });
         })
         .detach();

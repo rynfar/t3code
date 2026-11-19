@@ -46,7 +46,12 @@ impl AppState {
     }
 
     pub(crate) fn observe_notifications(&mut self, cx: &mut Context<Self>) {
-        self.connections.notifications_enabled(self.client_settings.notification_mode != t3_core::notifications::NotificationMode::Off || self.client_settings.in_app_notifications_enabled);
+        let enabled = self.client_settings.notification_mode != t3_core::notifications::NotificationMode::Off
+            || self.client_settings.in_app_notifications_enabled;
+        self.connections.notifications_enabled(enabled);
+        if !enabled && self.toasts.retire_environment_notifications(|_| false) {
+            cx.emit(crate::app_state::AppEvent::Notice);
+        }
         self.sync_notification_state(cx);
     }
 
@@ -63,12 +68,18 @@ impl AppState {
             platform::play_sound(notification.kind, self.client_settings.notification_mode);
         }
         if plan.toast {
-            let kind = match (notification.kind, notification.status) {
-                (NotificationKind::Completion, _) => ToastKind::Success,
-                (_, ThreadStatus::Failed) => ToastKind::Error,
-                _ => ToastKind::Warning,
+            let (kind, leading) = match (notification.kind, notification.status) {
+                (NotificationKind::Completion, _) => (ToastKind::Success, crate::icons::Icon::CircleCheck),
+                (_, ThreadStatus::Approval) => (ToastKind::Warning, crate::icons::Icon::ShieldQuestion),
+                (_, ThreadStatus::Limited) => (ToastKind::Warning, crate::icons::Icon::CircleAlert),
+                (_, ThreadStatus::Failed) => (ToastKind::Error, crate::icons::Icon::CircleAlert),
+                _ => (ToastKind::Warning, crate::icons::Icon::MessageCircleQuestion),
             };
-            let toast = Toast::new(kind, notification.title).description(notification.body).open_environment_thread(target.clone());
+            let toast = Toast::new(kind, notification.title)
+                .description(notification.body)
+                .leading_icon(leading)
+                .hide_copy_button()
+                .open_environment_thread(target.clone());
             self.show_toast(toast, cx);
             return;
         }
@@ -177,9 +188,13 @@ impl AppState {
         self.update_notification_badge();
     }
 
-    pub(crate) fn retire_thread_notifications(&mut self, thread_id: &str, cx: &mut App) {
-        for tag in self.notifications.pending.visit_target(&self.notification_target(thread_id)) {
+    pub(crate) fn retire_thread_notifications(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let target = self.notification_target(thread_id);
+        for tag in self.notifications.pending.visit_target(&target) {
             cx.dismiss_system_notification(&tag);
+        }
+        if self.toasts.retire_environment_notifications(|key| key != &target) {
+            cx.emit(crate::app_state::AppEvent::Notice);
         }
         self.update_notification_badge();
     }

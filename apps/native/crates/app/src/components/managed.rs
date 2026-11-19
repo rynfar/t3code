@@ -64,7 +64,8 @@ impl RenderOnce for ManagedControl {
                     .focus_visible(move |s| s.shadow(vec![gpui::BoxShadow { color: ring, offset: gpui::point(gpui::px(0.), gpui::px(0.)), blur_radius: gpui::px(0.), spread_radius: gpui::px(2.), inset: true }]))
             })
             .when_some(self.reason, |el, reason| {
-                el.role(gpui::Role::Group)
+                el.tab_index(0)
+                    .role(gpui::Role::Group)
                     .aria_label(reason.clone())
                     .aria_description("Managed by your organization")
                     .tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx))
@@ -98,13 +99,33 @@ pub fn attribution(policy: &serde_json::Value, _: &App) -> ManagedAttribution {
 }
 impl RenderOnce for ManagedAttribution {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        div().child(notice(self.text, cx)).children(self.support_url.map(|url| {
-            let focus = focus_handle(&"managed-support".into(), window, cx);
-            let keyboard_url = url.clone();
-            div().id("managed-support").track_focus(&focus).role(gpui::Role::Link).aria_label("Get help")
-                .text_xs().underline().cursor_pointer().child("Get help")
-                .on_click(move |_, _, cx| cx.open_url(&url))
-                .on_key_down(move |event, _, cx| { if crate::settings::controls::activates(event) { cx.stop_propagation(); cx.open_url(&keyboard_url); } })
-        }))
+        let fg = hsla(palette(cx).foreground);
+        h_flex()
+            .flex_wrap()
+            .items_start()
+            .gap(r(6.))
+            .child(notice(self.text, cx))
+            .children(self.support_url.map(|url| {
+                let focus = focus_handle(&"managed-support".into(), window, cx);
+                let keyboard_url = url.clone();
+                div()
+                    .id("managed-support")
+                    .track_focus(&focus)
+                    .role(gpui::Role::Link)
+                    .aria_label("Get help")
+                    .text_xs()
+                    .line_height(r(19.5))
+                    .text_color(fg)
+                    .underline()
+                    .cursor_pointer()
+                    .child("Get help")
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .on_key_down(move |event, _, cx| {
+                        if crate::settings::controls::activates(event) {
+                            cx.stop_propagation();
+                            cx.open_url(&keyboard_url);
+                        }
+                    })
+            }))
     }
 }

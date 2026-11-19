@@ -126,6 +126,103 @@ impl Prompt {
         self.due = None;
     }
 }
+
+/// One-burst confetti parameters matching `GitHubStarPrompt.tsx` (`pingdotgg/t3code#29987`).
+pub const CONFETTI_PARTICLE_COUNT: usize = 160;
+pub const CONFETTI_TICKS: u32 = 140;
+pub const CONFETTI_ORIGIN_X: f32 = 0.83;
+pub const CONFETTI_ORIGIN_Y: f32 = 0.15;
+
+pub fn should_celebrate(reduced_motion: bool) -> bool {
+    !reduced_motion
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConfettiParticle {
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub size: f32,
+    pub color_index: usize,
+    pub alpha: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfettiBurst {
+    pub particles: Vec<ConfettiParticle>,
+    pub tick: u32,
+    pub total_ticks: u32,
+}
+
+impl ConfettiBurst {
+    pub fn spawn(width: f32, height: f32) -> Self {
+        let origin_x = width * CONFETTI_ORIGIN_X;
+        let origin_y = height * CONFETTI_ORIGIN_Y;
+        let mut seed: u64 = 0x51a4_c0de_2998_7001;
+        let mut next_f32 = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32) / ((1u64 << 24) as f32)
+        };
+        let mut particles = Vec::with_capacity(CONFETTI_PARTICLE_COUNT);
+        for index in 0..CONFETTI_PARTICLE_COUNT {
+            let angle = next_f32() * std::f32::consts::TAU;
+            let speed = (0.35 + next_f32() * 0.65) * 14.0;
+            particles.push(ConfettiParticle {
+                x: origin_x,
+                y: origin_y,
+                vx: angle.cos() * speed,
+                vy: angle.sin() * speed - 3.5,
+                size: 4.0 + next_f32() * 4.0,
+                color_index: index % 6,
+                alpha: 1.0,
+            });
+        }
+        Self { particles, tick: 0, total_ticks: CONFETTI_TICKS }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.tick >= self.total_ticks
+    }
+
+    pub fn step(&mut self) -> bool {
+        if self.is_done() {
+            return false;
+        }
+        self.tick += 1;
+        let remaining = 1.0 - (self.tick as f32 / self.total_ticks as f32);
+        for particle in &mut self.particles {
+            particle.x += particle.vx;
+            particle.y += particle.vy;
+            particle.vx *= 0.94;
+            particle.vy = particle.vy * 0.94 + 0.55;
+            particle.alpha = remaining.clamp(0.0, 1.0);
+        }
+        !self.is_done()
+    }
+}
+
+#[cfg(test)]
+mod confetti_tests {
+    use super::*;
+
+    #[test]
+    fn confetti_respects_reduced_motion_and_terminates_cleanly() {
+        assert!(!should_celebrate(true));
+        assert!(should_celebrate(false));
+        let mut burst = ConfettiBurst::spawn(1200.0, 800.0);
+        assert_eq!(burst.particles.len(), CONFETTI_PARTICLE_COUNT);
+        assert!(!burst.is_done());
+        let mut steps = 0;
+        while burst.step() {
+            steps += 1;
+        }
+        assert_eq!(steps + 1, CONFETTI_TICKS);
+        assert!(burst.is_done());
+        assert!(!burst.step());
+        assert!(burst.particles.iter().all(|p| p.alpha == 0.0));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

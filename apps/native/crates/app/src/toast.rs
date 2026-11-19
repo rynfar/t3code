@@ -40,6 +40,15 @@ pub struct Toast {
     pub open_thread: Option<t3_core::sidebar::tag_filter::ThreadKey>,
     /// Renders an inline `"Open keybindings.json"` action (`KeybindingsConfigWarning.tsx`).
     pub open_keybindings_config: bool,
+    /// Optional status-specific leading icon override (`ThreadNotificationCoordinator.tsx`).
+    pub leading_icon: Option<Icon>,
+    /// Suppresses the error copy button (e.g. thread notification toasts).
+    pub hide_copy_button: bool,
+    /// Optional stable key for in-place upsert/close (`SlowRpcRequestToastCoordinator`, etc.).
+    pub key: Option<String>,
+    /// Legacy-permission re-pair notice (`PermissionUpdateNotice.ts`), carrying the environment
+    /// dismissal key so dismissing via Close/Dismiss/Open persists across restarts.
+    pub permission_update_env: Option<String>,
     persistent: bool,
     github_star: bool,
     replace_linked_prompt: Option<crate::composer::prompt_links::ReplaceLinkedPrompt>,
@@ -53,6 +62,10 @@ impl Toast {
             description: None,
             open_thread: None,
             open_keybindings_config: false,
+            leading_icon: None,
+            hide_copy_button: false,
+            key: None,
+            permission_update_env: None,
             persistent: false,
             github_star: false,
             replace_linked_prompt: None,
@@ -74,6 +87,28 @@ impl Toast {
         self
     }
 
+    pub fn leading_icon(mut self, icon: Icon) -> Self {
+        self.leading_icon = Some(icon);
+        self
+    }
+
+    pub fn hide_copy_button(mut self) -> Self {
+        self.hide_copy_button = true;
+        self
+    }
+
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    pub fn permission_update(mut self, env_key: impl Into<String>) -> Self {
+        let env_key = env_key.into();
+        let key = format!("permission-update:{env_key}");
+        self.permission_update_env = Some(env_key);
+        self.key(key).persistent()
+    }
+
     pub fn persistent(mut self) -> Self {
         self.persistent = true;
         self
@@ -88,14 +123,37 @@ impl Toast {
         self.persistent()
     }
 
-    fn render_content(&self, cx: &App) -> AnyElement {
+    fn copy_text(&self) -> String {
+        match &self.description {
+            Some(desc) if !desc.is_empty() => format!("{}\n{}", self.title, desc),
+            _ => self.title.to_string(),
+        }
+    }
+
+    fn render_content(&self, id: u64, copied: bool, state: &Entity<AppState>, cx: &App) -> AnyElement {
         let p = palette(cx);
-        let (icon, color) = if self.github_star && self.kind != ToastKind::Success { (Icon::Star, p.warning_foreground) } else { match self.kind {
-            ToastKind::Success => (Icon::CircleCheck, p.success),
-            ToastKind::Error => (Icon::CircleAlert, p.destructive),
-            ToastKind::Warning => (Icon::CircleAlert, p.warning),
-            ToastKind::Info => (Icon::Info, p.info),
-        }};
+        let (icon, color) = if let Some(custom) = self.leading_icon {
+            let color = match (self.kind, custom) {
+                (ToastKind::Success, _) => p.success,
+                (ToastKind::Error, _) => p.destructive,
+                (_, Icon::MessageCircleQuestion) => p.info,
+                (ToastKind::Warning, _) => p.warning,
+                (ToastKind::Info, _) => p.info,
+            };
+            (custom, color)
+        } else if self.github_star && self.kind != ToastKind::Success {
+            (Icon::Star, p.warning_foreground)
+        } else {
+            match self.kind {
+                ToastKind::Success => (Icon::CircleCheck, p.success),
+                ToastKind::Error => (Icon::CircleAlert, p.destructive),
+                ToastKind::Warning => (Icon::TriangleAlert, p.warning),
+                ToastKind::Info => (Icon::Info, p.info),
+            }
+        };
+        let show_copy = self.kind == ToastKind::Error && !self.hide_copy_button;
+        let copy_payload = show_copy.then(|| self.copy_text());
+        let copy_state = state.clone();
         div()
             .relative()
             .w_full()
@@ -111,9 +169,45 @@ impl Toast {
                 div()
                     .flex()
                     .flex_col()
+                    .flex_1()
                     .min_w_0()
-                    .child(div().font_weight(FontWeight::MEDIUM).child(self.title.clone()))
-                    .children(self.description.clone().map(|text| div().text_color(hsla(p.muted_foreground)).child(text)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap(px(6.))
+                            .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).child(self.title.clone()))
+                            .when_some(copy_payload, |this, payload| {
+                                let label = if copied { "Copied error" } else { "Copy error" };
+                                this.child(
+                                    div()
+                                        .id(SharedString::from(format!("toast-copy-error-{id}")))
+                                        .flex_none()
+                                        .size(px(20.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.))
+                                        .cursor_pointer()
+                                        .text_color(if copied { hsla(p.success) } else { hsla(p.muted_foreground).opacity(0.8) })
+                                        .hover(|s| s.text_color(hsla(p.muted_foreground)))
+                                        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label).build(window, cx))
+                                        .on_click(move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(payload.clone()));
+                                            copy_state.update(cx, |state, cx| state.mark_toast_copied(id, cx));
+                                        })
+                                        .child((if copied { Icon::Check } else { Icon::Copy }).sized(px(12.))),
+                                )
+                            }),
+                    )
+                    .children(self.description.clone().map(|text| {
+                        div()
+                            .text_color(hsla(p.muted_foreground))
+                            .when(self.kind == ToastKind::Error && text.len() >= 180, |d| d.max_h(px(84.)).overflow_hidden())
+                            .child(text)
+                    }))
                     .children(self.open_thread.as_ref().map(|_| div().pt(px(4.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.primary)).child("Open thread"))),
             )
             .into_any_element()
@@ -123,6 +217,8 @@ impl Toast {
 struct Entry {
     id: u64,
     toast: Toast,
+    copied: bool,
+    _copy_reset: Option<Task<()>>,
     _timer: Option<Task<()>>,
 }
 
@@ -154,15 +250,73 @@ impl Toasts {
 
 impl AppState {
     pub fn show_toast(&mut self, toast: Toast, cx: &mut Context<Self>) {
+        if let Some(key) = toast.key.as_deref()
+            && let Some(entry) = self.toasts.entries.iter_mut().find(|e| e.toast.key.as_deref() == Some(key))
+        {
+            let id = entry.id;
+            entry._timer = (!toast.persistent).then(|| toast_timer(id, cx));
+            entry.toast = toast;
+            cx.emit(AppEvent::Notice);
+            return;
+        }
         self.toasts.next_id += 1;
         let id = self.toasts.next_id;
-        self.toasts.entries.insert(0, Entry { id, _timer: (!toast.persistent).then(|| toast_timer(id, cx)), toast });
+        self.toasts.entries.insert(
+            0,
+            Entry {
+                id,
+                copied: false,
+                _copy_reset: None,
+                _timer: (!toast.persistent).then(|| toast_timer(id, cx)),
+                toast,
+            },
+        );
         cx.emit(AppEvent::Notice);
+    }
+
+    pub fn close_toast_by_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let ids: Vec<u64> = self
+            .toasts
+            .entries
+            .iter()
+            .filter(|e| e.toast.key.as_deref() == Some(key))
+            .map(|e| e.id)
+            .collect();
+        for id in ids {
+            self.dismiss_toast(id, cx);
+        }
+    }
+
+    pub(crate) fn mark_toast_copied(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(entry) = self.toasts.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.copied = true;
+            entry._copy_reset = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(1200)).await;
+                let _ = this.update(cx, |state, cx| {
+                    if let Some(entry) = state.toasts.entries.iter_mut().find(|e| e.id == id) {
+                        entry.copied = false;
+                        entry._copy_reset = None;
+                        cx.emit(AppEvent::Notice);
+                    }
+                });
+            }));
+            cx.emit(AppEvent::Notice);
+        }
     }
 
     pub fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         if self.toasts.entries.iter().any(|entry| entry.id == id && entry.toast.github_star) {
             self.close_star_prompt(cx);
+        }
+        if let Some(env_key) = self
+            .toasts
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.toast.permission_update_env.clone())
+        {
+            let ui_key = format!("permission-update-dismissed-{env_key}");
+            t3_client::store::save_ui_state(&ui_key, &serde_json::Value::Bool(true));
         }
         let before = self.toasts.entries.len();
         self.toasts.entries.retain(|entry| entry.id != id);
@@ -317,11 +471,68 @@ fn close_orb(id: u64, state: Entity<AppState>, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn render_toast(id: u64, toast_data: &Toast, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
-    let toast = surface(cx).w_full().id(SharedString::from(format!("toast-{id}"))).child(toast_data.render_content(cx));
+fn render_toast(id: u64, toast_data: &Toast, copied: bool, state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> AnyElement {
+    let toast = surface(cx)
+        .w_full()
+        .id(SharedString::from(format!("toast-{id}")))
+        .child(toast_data.render_content(id, copied, state, cx));
     let toast = if toast_data.github_star {
         toast.children(crate::github_star_prompt::actions(id, state, window, cx))
     } else { toast };
+    let toast = if toast_data.permission_update_env.is_some() {
+        let p = palette(cx);
+        let dismiss_state = state.clone();
+        let open_state = state.clone();
+        toast.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap(px(8.))
+                .px(px(14.))
+                .pb(px(12.))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("toast-perm-dismiss-{id}")))
+                        .h(px(24.))
+                        .px(px(7.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .text_xs()
+                        .text_color(hsla(p.foreground))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(hsla(p.accent)))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            dismiss_state.update(cx, |state, cx| state.dismiss_toast(id, cx));
+                        })
+                        .child("Dismiss"),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("toast-perm-open-access-{id}")))
+                        .h(px(24.))
+                        .px(px(8.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .bg(hsla(p.primary))
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.primary_foreground))
+                        .cursor_pointer()
+                        .hover(|this| this.opacity(0.9))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            open_state.update(cx, |state, cx| state.dismiss_toast(id, cx));
+                            crate::settings::open(t3_core::settings::search::Section::Access, cx);
+                        })
+                        .child("Open Sharing & access"),
+                ),
+        )
+    } else {
+        toast
+    };
     let toast = if toast_data.open_keybindings_config {
         let p = palette(cx);
         let can_open = state.read(cx).can_open_keybindings_config();
@@ -393,7 +604,15 @@ fn render_toast(id: u64, toast_data: &Toast, state: &Entity<AppState>, window: &
 pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     let (visible, hovered) = {
         let toasts = &state.read(cx).toasts;
-        (toasts.entries.iter().take(VISIBLE_LIMIT).map(|entry| (entry.id, entry.toast.clone())).collect::<Vec<_>>(), toasts.hovered)
+        (
+            toasts
+                .entries
+                .iter()
+                .take(VISIBLE_LIMIT)
+                .map(|entry| (entry.id, entry.toast.clone(), entry.copied))
+                .collect::<Vec<_>>(),
+            toasts.hovered,
+        )
     };
     let front = visible.first()?;
     let expanded = hovered || visible.len() == 1;
@@ -411,7 +630,7 @@ pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Opt
         .pb(px(GAP * peeks as f32))
         .on_hover(move |hovered, _, cx| hover_state.update(cx, |state, cx| state.set_toasts_hovered(*hovered, cx)));
     let container = if expanded {
-        container.children(visible.iter().map(|(id, toast)| render_toast(*id, toast, state, window, cx)))
+        container.children(visible.iter().map(|(id, toast, copied)| render_toast(*id, toast, *copied, state, window, cx)))
     } else {
         // Back toasts first so the front one paints over them; each peeks 12px lower, 10% narrower.
         container
@@ -419,7 +638,7 @@ pub fn stack(state: &Entity<AppState>, window: &mut Window, cx: &mut App) -> Opt
                 let inset = WIDTH * 0.05 * index as f32;
                 surface(cx).absolute().left(px(inset)).right(px(inset)).bottom(px(GAP * (peeks - index) as f32)).h(px(GAP * 2.)).into_any_element()
             }))
-            .child(render_toast(front.0, &front.1, state, window, cx))
+            .child(render_toast(front.0, &front.1, front.2, state, window, cx))
     };
     Some(gpui::deferred(container).with_priority(60).into_any_element())
 }
@@ -565,6 +784,72 @@ mod tests {
             assert_eq!(latest.title, "Unable to open keybindings file");
             assert!(latest.description.as_deref().is_some_and(|d| d.contains("editor binary not found")));
         });
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn keyed_upsert_and_permission_update_toast_persist_dismissal(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        struct Root(Entity<AppState>);
+        impl Render for Root {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().children(stack(&self.0, window, cx))
+            }
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+
+        // Keyed toast upserts in place instead of duplicating.
+        state.update(cx, |state, cx| {
+            state.show_toast(Toast::new(ToastKind::Warning, "Slow 1").key("slow-rpc").persistent(), cx);
+            state.show_toast(Toast::new(ToastKind::Warning, "Slow 2").key("slow-rpc").persistent(), cx);
+        });
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.toasts.entries.len(), 1);
+            assert_eq!(state.toasts.latest().unwrap().title, "Slow 2");
+        });
+        state.update(cx, |state, cx| state.close_toast_by_key("slow-rpc", cx));
+        state.read_with(cx, |state, _| assert!(state.toasts.entries.is_empty()));
+
+        // Permission-update toast persists dismissal on dismiss and renders cleanly alongside an error toast.
+        let env_key = "test-legacy-env-dismiss";
+        state.update(cx, |state, cx| {
+            state.show_toast(
+                Toast::new(ToastKind::Warning, "Permissions have changed for Local")
+                    .description("Pair again.")
+                    .permission_update(env_key),
+                cx,
+            );
+            state.show_toast(
+                Toast::new(ToastKind::Error, "Failed to sync").description("Network timeout"),
+                cx,
+            );
+        });
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| Root(state.clone()));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        state.update(cx, |state, cx| state.close_toast_by_key(&format!("permission-update:{env_key}"), cx));
+        // Flush the single-threaded UI-state writer deterministically before reading back.
+        let _ = t3_client::store::github_star_prompt(t3_client::store::StarPromptStorage::Read).await;
+        assert_eq!(
+            t3_client::store::load_ui_state(&format!("permission-update-dismissed-{env_key}")).and_then(|v| v.as_bool()),
+            Some(true)
+        );
 
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {

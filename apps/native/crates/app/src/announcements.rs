@@ -10,6 +10,10 @@ pub struct Announcements {
     timer: Option<Task<()>>,
     background: Background,
     thread: Option<(String, ThreadMemory)>,
+    detail: Option<(String, announcements::ScreenReaderAnnouncements, announcements::TurnDetailMemory)>,
+    step_quiet_until: u64,
+    step_waiting: Option<String>,
+    step_timer: Option<Task<()>>,
     activity: Activity,
     undo_notice: Option<t3_core::thread_actions::UndoNotice>,
     _events: Subscription,
@@ -30,6 +34,10 @@ impl Announcements {
             timer: None,
             background: Background::default(),
             thread: None,
+            detail: None,
+            step_quiet_until: 0,
+            step_waiting: None,
+            step_timer: None,
             activity: Activity::default(),
             undo_notice: None,
             _events: events,
@@ -113,6 +121,10 @@ impl AppState {
     pub(crate) fn reset_environment_announcements(&mut self) {
         self.announcements.background = Background::default();
         self.announcements.thread = None;
+        self.announcements.detail = None;
+        self.announcements.step_quiet_until = 0;
+        self.announcements.step_waiting = None;
+        self.announcements.step_timer = None;
         self.announcements.queue = Announcer::default();
         self.announcements.timer = None;
     }
@@ -150,11 +162,20 @@ impl AppState {
             .is_some_and(|(id, _)| Some(id) != self.selected_thread.as_ref())
         {
             self.announcements.thread = None;
+            self.announcements.detail = None;
+            self.announcements.step_waiting = None;
+            self.announcements.step_timer = None;
+            self.announcements.step_quiet_until = 0;
             self.cancel_announcement("thread-activity");
+            self.cancel_announcement("thread-detail");
         }
-        let Some(id) = self.selected_thread.as_deref() else {
+        let Some(id) = self.selected_thread.as_deref().map(str::to_owned) else {
             self.announcements.thread = None;
+            self.announcements.detail = None;
+            self.announcements.step_waiting = None;
+            self.announcements.step_timer = None;
             self.cancel_announcement("thread-activity");
+            self.cancel_announcement("thread-detail");
             return;
         };
         let Some(p) = self
@@ -165,49 +186,125 @@ impl AppState {
         else {
             return;
         };
+        let level = announcements::screen_reader_announcements_setting(
+            crate::settings::client_settings(cx).entries(),
+        );
         let child = self
             .sidebar
             .model
-            .thread(id)
+            .thread(&id)
             .and_then(|t| t.pending_subagent_request);
+        let waiting_label = self.announcements.step_waiting.take();
+        self.announcements.step_timer = None;
         let Some(announcements::ActivityRef {
             status,
             request_id,
             run_id,
             run_status,
-        }) = announcements::open_activity(p, self.shell.thread(id), child)
+        }) = announcements::open_activity(p, self.shell.thread(&id), child)
         else {
+            if waiting_label.is_some()
+                && let Some((_, _, memory)) = self.announcements.detail.as_mut()
+            {
+                memory.activity = None;
+            }
             return;
         };
-        let a = &mut self.announcements;
-        let switched = a.thread.as_ref().is_none_or(|(key, _)| key != id);
-        if !switched
-            && a.activity.status == status
-            && a.activity.request_id.as_deref() == request_id
-            && a.activity.run_id.as_deref() == run_id
-            && a.activity.run_status == run_status
-        {
-            return;
-        }
         let next = Activity {
             status,
             request_id: request_id.map(str::to_owned),
             run_id: run_id.map(str::to_owned),
             run_status: run_status.into(),
         };
+        let known_tail = self
+            .announcements
+            .detail
+            .as_ref()
+            .filter(|(key, prev_level, _)| key == &id && *prev_level == level)
+            .and_then(|(_, _, memory)| memory.tail_id.as_deref());
+        let turn_detail = if level == announcements::ScreenReaderAnnouncements::Status {
+            announcements::TurnDetail::default()
+        } else {
+            announcements::turn_detail_from_projection(p, known_tail)
+        };
+        let switched = self.announcements.thread.as_ref().is_none_or(|(key, _)| key != &id);
+        let status_same = !switched && self.announcements.activity.status == next.status
+            && self.announcements.activity.request_id == next.request_id
+            && self.announcements.activity.run_id == next.run_id
+            && self.announcements.activity.run_status == next.run_status;
+        if status_same && level == announcements::ScreenReaderAnnouncements::Status {
+            return;
+        }
+        let a = &mut self.announcements;
         a.activity = next.clone();
-        let previous = a
+        let previous_status = a
             .thread
             .take()
-            .filter(|(key, _)| key == id)
+            .filter(|(key, _)| key == &id)
             .map(|(_, memory)| memory);
-        let (memory, text) = announcements::next_thread(previous, next);
-        a.thread = Some((id.to_owned(), memory));
+        let (memory, status_text) = announcements::next_thread(previous_status, next);
+        a.thread = Some((id.clone(), memory));
+
+        let previous_detail = a
+            .detail
+            .take()
+            .filter(|(key, prev_level, _)| key == &id && *prev_level == level)
+            .map(|(_, _, memory)| memory);
+        let detail_out = announcements::next_turn_detail_announcement(
+            previous_detail.as_ref(),
+            &turn_detail,
+            level,
+            status,
+        );
+        let current_activity = detail_out.memory.activity.clone();
+        a.detail = Some((id, level, detail_out.memory));
+
         if switched {
+            a.step_quiet_until = 0;
             a.queue.cancel("thread-activity");
+            a.queue.cancel("thread-detail");
+            return;
         }
-        if let Some(text) = text {
+        let now = a.clock.elapsed().as_millis() as u64;
+        if !detail_out.messages.is_empty() {
+            let mut parts = detail_out.messages;
+            if let Some(status_text) = status_text {
+                parts.push(status_text.to_owned());
+            }
+            let combined = announcements::as_one_announcement(&parts);
+            let hold = announcements::hold_after(&combined);
+            a.step_quiet_until = now.saturating_add(hold);
+            self.announce(combined, Some("thread-detail"), cx);
+        } else if let Some(text) = status_text {
+            a.step_quiet_until = a.step_quiet_until.max(now.saturating_add(announcements::ACTIVITY_GAP_MS));
             self.announce(text, Some("thread-activity"), cx);
+        }
+
+        let step_label = if level != announcements::ScreenReaderAnnouncements::Everything || current_activity.is_none() {
+            None
+        } else {
+            detail_out.activity.or(waiting_label)
+        };
+        let Some(step_label) = step_label else {
+            return;
+        };
+        let now = self.announcements.clock.elapsed().as_millis() as u64;
+        let wait = self.announcements.step_quiet_until.saturating_sub(now);
+        if wait == 0 {
+            self.announcements.step_quiet_until = now.saturating_add(announcements::ACTIVITY_GAP_MS);
+            self.announce(step_label, Some("thread-detail"), cx);
+        } else {
+            self.announcements.step_waiting = Some(step_label.clone());
+            self.announcements.step_timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(wait)).await;
+                let _ = this.update(cx, |state, cx| {
+                    let Some(label) = state.announcements.step_waiting.take() else { return };
+                    state.announcements.step_timer = None;
+                    let now = state.announcements.clock.elapsed().as_millis() as u64;
+                    state.announcements.step_quiet_until = now.saturating_add(announcements::ACTIVITY_GAP_MS);
+                    state.announce(label, Some("thread-detail"), cx);
+                });
+            }));
         }
     }
 }

@@ -2,13 +2,17 @@
 //! resize rail and narrow-window sheet port `components/AppSidebarLayout.tsx` and `SidebarRail`
 //! in `components/ui/sidebar.tsx`.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
-use gpui::{ ClickEvent, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, Styled, Subscription, Task, Window, WindowControlArea, div, prelude::*, px};
+use gpui::{ ClickEvent, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window, WindowControlArea, div, prelude::*, px};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_client::status::host_freeze_notice;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::keybindings::{WorkspaceFocusArea, next_workspace_focus_area};
+use t3_core::pairing::session_has_legacy_permissions;
 use t3_core::settings::keybindings::{KeybindingsUpdateToastController, KeybindingsUpdateToastDecision};
+use t3_core::settings::quit_hold::swipe::{HistorySwipe, SwipeAction, SwipePhase, SwipeWheel};
 
 use crate::app_state::{AppEvent, AppState, Phase};
 use crate::chat_header::{self, ChatHeader};
@@ -65,6 +69,11 @@ pub struct Workspace {
     keybindings_toast: KeybindingsUpdateToastController,
     seen_keybindings_updated_seq: u64,
     seen_keybindings_connection: Option<u64>,
+    shown_host_freezes: HashSet<(String, u64, Option<u64>, u32)>,
+    shown_permission_notices: HashSet<String>,
+    history_swipe: HistorySwipe,
+    _swipe_clear: Option<Task<()>>,
+    last_window_title: Option<String>,
     sidebar: Entity<SidebarPane>,
     thread: Entity<ThreadView>,
     composer: Entity<Composer>,
@@ -152,13 +161,18 @@ impl Workspace {
             (s.server_config.keybindings_updated_seq(), s.connection_id())
         };
         let subscriptions = vec![
-            cx.subscribe(&state, |this, state, event: &AppEvent, cx| {
+            cx.subscribe_in(&state, window, |this, state, event: &AppEvent, window, cx| {
                 // Navigating from the sheet closes it, as the web's thread and project rows do.
                 if matches!(event, AppEvent::Selection) {
                     state.update(cx, |state, cx| state.close_sidebar_sheet(cx));
                 }
                 if matches!(event, AppEvent::ServerConfig | AppEvent::Phase) {
                     this.handle_keybindings_config_toast(cx);
+                    this.handle_host_freeze_toasts(cx);
+                    this.handle_permission_update_toasts(cx);
+                }
+                if matches!(event, AppEvent::Selection | AppEvent::Shell | AppEvent::Phase | AppEvent::ServerConfig) {
+                    this.sync_window_title(window, cx);
                 }
                 if matches!(event, AppEvent::Phase | AppEvent::Selection | AppEvent::Notice | AppEvent::RightPanel | AppEvent::SidebarVisibility) {
                     cx.notify();
@@ -190,7 +204,7 @@ impl Workspace {
                 }
             }),
         ];
-        Workspace {
+        let mut workspace = Workspace {
             state,
             focus_observer,
             _star_focus: star_focus,
@@ -206,6 +220,11 @@ impl Workspace {
             keybindings_toast: KeybindingsUpdateToastController::default(),
             seen_keybindings_updated_seq: initial_kb_seq,
             seen_keybindings_connection: initial_kb_conn,
+            shown_host_freezes: HashSet::new(),
+            shown_permission_notices: HashSet::new(),
+            history_swipe: HistorySwipe::default(),
+            _swipe_clear: None,
+            last_window_title: None,
             sidebar,
             thread,
             composer,
@@ -234,7 +253,11 @@ impl Workspace {
             rail_dragging: false,
             _save_sidebar_width: None,
             _subscriptions: subscriptions,
-        }
+        };
+        workspace.handle_host_freeze_toasts(cx);
+        workspace.handle_permission_update_toasts(cx);
+        workspace.sync_window_title(window, cx);
+        workspace
     }
 
     /// CN-STATUS: while not connected, a status dot and title with the diagnosis as a tooltip,
@@ -328,6 +351,9 @@ impl Render for Workspace {
         if !cx.has_active_drag() {
             self.rail_dragging = false;
         }
+        let swipe_indicator = self.history_swipe.indicator();
+        let pane_height = f32::from(window.viewport_size().height);
+        self.sync_window_title(window, cx);
         let theme = cx.theme();
         let state = self.state.read(cx);
         let has_thread = state.selected_thread.is_some();
@@ -534,9 +560,11 @@ impl Render for Workspace {
             .when(!maximized && !on_pull_requests, |this| {
                 this.child(
                 v_flex()
+                    .relative()
                     .flex_1()
                     .h_full()
                     .min_w_0()
+                    .on_scroll_wheel(cx.listener(Self::handle_history_swipe_wheel))
                     .child(self.render_titlebar(window, cx))
                     .when(has_thread, |this| {
                         // The inline details card sits over the canvas; the lane moves left to clear it.
@@ -582,6 +610,9 @@ impl Render for Workspace {
                     })
                     .when(!has_thread && !has_draft, |this| {
                         this.child(div().track_focus(&self.area_focus.home).flex_1().min_h_0().child(self.home.clone()))
+                    })
+                    .when_some(swipe_indicator, |this, indicator| {
+                        this.child(crate::quit_hold::swipe_indicator(indicator, pane_height, cx))
                     }),
                 )
             })
@@ -605,6 +636,7 @@ impl Render for Workspace {
             .child(self.welcome.clone())
             .children(crate::voice::render_active_voice_setup_modal(cx))
             .children(crate::toast::stack(&self.state, window, cx))
+            .children(crate::github_star_prompt::confetti_overlay(&self.state, cx))
             .children(crate::updates::overlay(cx))
             .children(settings)
             .children(theme_editor)
@@ -891,8 +923,7 @@ impl Workspace {
                     .and_then(|shell| t3_core::pull_requests::thread_badge::resolve_thread_current_pull_request_link(&shell.pull_requests).map(|link| link.url.clone()))
             };
             if let Some(url) = pr_url {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
-                state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Success, "PR link copied").description(url), cx);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
             } else if !state.fleet.environments.is_empty()
                 && let Some(key) = state.active_thread_key(&id)
             {
@@ -950,6 +981,216 @@ impl Workspace {
                     cx,
                 );
             });
+        }
+    }
+
+    /// `HostFreezeToastCoordinator.ts`: tells the user once per reported stall why a host stopped
+    /// answering when it reports `lastEventLoopStall` on connect/reconnect.
+    fn handle_host_freeze_toasts(&mut self, cx: &mut Context<Self>) {
+        let notices: Vec<(String, String, String, u64, Option<u64>, u32)> = {
+            let state = self.state.read(cx);
+            let mut out = Vec::new();
+            if let Some(client) = state.client_handle()
+                && let Some(stall) = client.server_config_extras().borrow().last_event_loop_stall.clone()
+            {
+                let env_key = state
+                    .active_environment()
+                    .and_then(|e| e.environment_id.clone().or_else(|| Some(e.id.clone())))
+                    .unwrap_or_else(|| "local".to_owned());
+                let label = state
+                    .active_environment()
+                    .map(|e| e.label.clone())
+                    .or_else(|| state.server_config.config.as_ref().map(|c| c.environment.label.clone()))
+                    .unwrap_or_default();
+                if let Some(notice) = host_freeze_notice(&label, Some(&stall)) {
+                    out.push((
+                        env_key,
+                        notice.title,
+                        notice.description,
+                        stall.duration_ms.to_bits(),
+                        stall.load_average.map(f64::to_bits),
+                        stall.cpu_count,
+                    ));
+                }
+            }
+            out
+        };
+        for (env_key, title, description, dur, load, cpus) in notices {
+            if self.shown_host_freezes.insert((env_key, dur, load, cpus)) {
+                self.state.update(cx, |state, cx| {
+                    state.show_toast(
+                        crate::toast::Toast::new(crate::toast::ToastKind::Warning, title).description(description),
+                        cx,
+                    );
+                });
+            }
+        }
+    }
+
+    /// `PermissionUpdateNotice.ts`: asks once per environment (until dismissed) to re-pair a
+    /// connection that still uses pre-scope legacy permissions, offering `"Open Sharing & access"`.
+    fn handle_permission_update_toasts(&mut self, cx: &mut Context<Self>) {
+        let (candidates, upgraded): (Vec<(String, String)>, Vec<String>) = {
+            let state = self.state.read(cx);
+            let mut out = Vec::new();
+            let mut upgraded = Vec::new();
+            let mut seen = HashSet::new();
+            for env in &state.fleet.environments {
+                let Some(session) = env.grants.as_ref() else { continue };
+                let env_key = env
+                    .config
+                    .config
+                    .as_ref()
+                    .map(|c| c.environment.environment_id.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(env.summary.owner.saved_id.as_str())
+                    .to_owned();
+                if !session_has_legacy_permissions(session) {
+                    if self.shown_permission_notices.contains(&env_key) {
+                        upgraded.push(env_key);
+                    }
+                    continue;
+                }
+                if seen.insert(env_key.clone()) {
+                    let label = state
+                        .environments
+                        .get(&env.summary.owner.saved_id)
+                        .map(|e| e.label.clone())
+                        .or_else(|| env.config.config.as_ref().map(|c| c.environment.label.clone()))
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "this machine".to_owned());
+                    out.push((env_key, label));
+                }
+            }
+            if let Some(env) = state.active_environment()
+                && let Some(session) = state.client_handle().and_then(|client| client.session_state().borrow().clone())
+            {
+                let env_key = env.environment_id.as_deref().unwrap_or(env.id.as_str()).to_owned();
+                if session_has_legacy_permissions(&session) {
+                    if seen.insert(env_key.clone()) {
+                        out.push((env_key, env.label.clone()));
+                    }
+                } else if self.shown_permission_notices.contains(&env_key) {
+                    upgraded.push(env_key);
+                }
+            }
+            (out, upgraded)
+        };
+        if !upgraded.is_empty() {
+            for env_key in &upgraded {
+                self.shown_permission_notices.remove(env_key);
+            }
+            self.state.update(cx, |state, cx| {
+                for env_key in upgraded {
+                    state.close_toast_by_key(&format!("permission-update:{env_key}"), cx);
+                }
+            });
+        }
+        for (env_key, label) in candidates {
+            if self.shown_permission_notices.contains(&env_key) {
+                continue;
+            }
+            let ui_key = format!("permission-update-dismissed-{env_key}");
+            if t3_client::store::load_ui_state(&ui_key).and_then(|v| v.as_bool()) == Some(true) {
+                self.shown_permission_notices.insert(env_key);
+                continue;
+            }
+            self.shown_permission_notices.insert(env_key.clone());
+            self.state.update(cx, |state, cx| {
+                state.show_toast(
+                    crate::toast::Toast::new(
+                        crate::toast::ToastKind::Warning,
+                        format!("Permissions have changed for {label}"),
+                    )
+                    .description("This connection still uses the old permissions, so some actions may no longer be available. Pair again using a new link with the permissions you need.")
+                    .permission_update(env_key),
+                    cx,
+                );
+            });
+        }
+    }
+
+    /// `HistorySwipeNavigation.tsx` (`AP-SWIPE`): macOS two-finger horizontal trackpad swipes go
+    /// back and forward in thread navigation history.
+    fn handle_history_swipe_wheel(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let blocked = self.has_blocking_overlay(window, cx);
+        let (is_pixel_delta, delta_x, delta_y) = match event.delta {
+            // GPUI's pixel delta has the opposite sign of DOM WheelEvent.deltaX/Y.
+            ScrollDelta::Pixels(p) => (true, -f32::from(p.x), -f32::from(p.y)),
+            ScrollDelta::Lines(l) => (false, -l.x, -l.y),
+        };
+        let phase = match event.touch_phase {
+            TouchPhase::Started => SwipePhase::Started,
+            TouchPhase::Moved => SwipePhase::Moved,
+            TouchPhase::Ended | TouchPhase::Cancelled => SwipePhase::Ended,
+        };
+        let wheel = SwipeWheel {
+            delta_x,
+            delta_y,
+            y: f32::from(event.position.y),
+            phase,
+            is_pixel_delta,
+            ctrl_key: event.modifiers.control,
+            blocked,
+        };
+        let before = self.history_swipe.indicator();
+        let action = {
+            let state = self.state.read(cx);
+            self.history_swipe.on_wheel(wheel, |dir| state.can_navigate(dir.is_back()))
+        };
+        if let SwipeAction::Navigate(dir) = action {
+            self.state.update(cx, |state, cx| state.navigate_history(dir.is_back(), cx));
+        }
+        let after = self.history_swipe.indicator();
+        if after.is_some_and(|i| !i.tracking) {
+            self._swipe_clear = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(200)).await;
+                let _ = this.update(cx, |ws, cx| {
+                    ws.history_swipe.clear_indicator();
+                    cx.notify();
+                });
+            }));
+        } else if after.is_some_and(|i| i.tracking) {
+            self._swipe_clear = None;
+        }
+        if before != after {
+            cx.notify();
+        }
+    }
+
+    /// `startDocumentTitle` (`appInit.tsx`, `pingdotgg/t3code#34697`): keeps the native window
+    /// title synced with the open thread/project, leading with status + thread name when
+    /// `screenReaderWindowTitle` is enabled.
+    fn sync_window_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sr_title = t3_core::announcements::screen_reader_window_title_setting(
+            crate::settings::client_settings(cx).entries(),
+        );
+        let state = self.state.read(cx);
+        let thread = state
+            .selected_thread
+            .as_deref()
+            .and_then(|id| state.sidebar.model.thread(id));
+        let project_title = thread
+            .and_then(|t| state.shell.project(&t.project_id))
+            .or_else(|| state.draft_project.as_deref().and_then(|id| state.shell.project(id)))
+            .map(|p| p.title.as_str());
+        let thread_title = thread.map(|t| t.title.as_str());
+        let screen_reader_status = sr_title.then(|| {
+            thread.and_then(t3_core::announcements::resolve_window_title_thread_status)
+        });
+        let next = t3_core::announcements::resolve_window_title(
+            "T3 Code",
+            project_title,
+            thread_title,
+            screen_reader_status,
+            true,
+        );
+        if self.last_window_title.as_deref() != Some(next.as_str()) {
+            window.set_window_title(&next);
+            self.last_window_title = Some(next);
         }
     }
 
@@ -1296,9 +1537,52 @@ mod tests {
                 ws.composer_replaced = true;
                 assert!(!ws.composer_visible(window, cx));
                 ws.composer_replaced = false;
+
+                // 4. `sync_window_title` tracks active thread & project title.
+                ws.sync_window_title(window, cx);
+                assert!(
+                    ws.last_window_title.as_deref().is_some_and(|t| t.contains('/')),
+                    "desktop window title should format `project / thread`, got {:?}",
+                    ws.last_window_title
+                );
             });
         })
         .unwrap();
+
+        // 5. Legacy-permissions session triggers a deduplicated persistent permission-update toast.
+        state.update(cx, |state, _| {
+            state.environments.environments.push(t3_client::store::SavedEnvironment {
+                id: "legacy-saved".into(),
+                environment_id: Some("legacy-env-id".into()),
+                label: "Studio".into(),
+                http_base: "http://127.0.0.1:3773".into(),
+                access_token: Some("tok".into()),
+                local: true,
+                disabled: false,
+                ssh: None,
+                server_version: None,
+            });
+            state.environments.active = Some("legacy-saved".into());
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "role": "client",
+                    "permissions": ["orchestration:read", "orchestration:operate"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |_, cx| cx.emit(AppEvent::Phase));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            let latest = state.toasts.latest().expect("permission update toast");
+            assert_eq!(latest.kind, crate::toast::ToastKind::Warning);
+            assert_eq!(latest.title, "Permissions have changed for Studio");
+            assert_eq!(latest.permission_update_env.as_deref(), Some("legacy-env-id"));
+        });
 
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {

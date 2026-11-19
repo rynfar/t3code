@@ -47,6 +47,8 @@ pub(crate) struct GitHubStarPrompt {
     clock: Instant,
     eligible: bool,
     timer: Option<Task<()>>,
+    confetti: Option<core::ConfettiBurst>,
+    confetti_timer: Option<Task<()>>,
     _events: Subscription,
     #[cfg(feature = "snapshot")]
     fixture: Option<bool>,
@@ -74,6 +76,8 @@ impl GitHubStarPrompt {
             clock: Instant::now(),
             eligible: false,
             timer: None,
+            confetti: None,
+            confetti_timer: None,
             _events: events,
             #[cfg(feature = "snapshot")]
             fixture: None,
@@ -154,13 +158,18 @@ impl AppState {
             .is_some_and(|o| o.valid(self))
     }
     fn star_idle_eligible(&self) -> bool {
-        // Conservatively exclude the whole panel: embedded preview input bypasses GPUI capture.
+        // Exclude embedded Preview webview surfaces (their input bypasses GPUI capture) and
+        // any currently focused native WKWebView, while allowing native Diff/Files/Git panels.
         self.github_star.eligible
             && !embedded_focused()
-            && !self
-                .selected_thread
-                .as_ref()
-                .is_some_and(|id| self.panels.panels.panel(id).is_open)
+            && !self.selected_thread.as_ref().is_some_and(|id| {
+                let panel = self.panels.panels.panel(id);
+                panel.is_open
+                    && matches!(
+                        panel.active().map(|surface| &surface.kind),
+                        Some(t3_core::right_panel::SurfaceKind::Preview { .. })
+                    )
+            })
     }
     pub(crate) fn star_prompt_focus(&mut self, eligible: bool, cx: &mut Context<Self>) {
         self.github_star.eligible = eligible;
@@ -303,8 +312,39 @@ impl AppState {
         if self.github_star.machine.starred(result) {
             self.persist_star_dismissal(cx);
             self.thank_star_toast(cx);
+            self.start_star_confetti(cx);
         }
         cx.emit(AppEvent::Notice);
+    }
+
+    fn start_star_confetti(&mut self, cx: &mut Context<Self>) {
+        if !core::should_celebrate(prefers_reduced_motion()) {
+            return;
+        }
+        self.github_star.confetti = Some(core::ConfettiBurst::spawn(1200.0, 800.0));
+        self.github_star.confetti_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(24)).await;
+                let keep_going = this
+                    .update(cx, |state, cx| {
+                        let active = state
+                            .github_star
+                            .confetti
+                            .as_mut()
+                            .is_some_and(|burst| burst.step());
+                        if !active {
+                            state.github_star.confetti = None;
+                            state.github_star.confetti_timer = None;
+                        }
+                        cx.emit(AppEvent::Notice);
+                        active
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
     }
 }
 
@@ -480,6 +520,58 @@ fn embedded_focused() -> bool {
 #[cfg(not(target_os = "macos"))]
 fn embedded_focused() -> bool {
     false
+}
+
+#[cfg(target_os = "macos")]
+fn prefers_reduced_motion() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSWorkspace;
+    if MainThreadMarker::new().is_none() {
+        return false;
+    }
+    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prefers_reduced_motion() -> bool {
+    false
+}
+
+/// Self-stopping confetti canvas overlay (`pingdotgg/t3code#29987`), rendered only while a burst
+/// is active so idle windows incur zero cost.
+pub(crate) fn confetti_overlay(state: &Entity<AppState>, cx: &App) -> Option<gpui::AnyElement> {
+    use gpui::{Bounds, IntoElement, Styled, canvas, fill, point, px, size};
+    let burst = state.read(cx).github_star.confetti.clone()?;
+    let p = crate::theme::palette(cx);
+    let colors = [
+        crate::theme::hsla(p.primary),
+        crate::theme::hsla(p.success),
+        crate::theme::hsla(p.warning),
+        crate::theme::hsla(p.info),
+        crate::theme::hsla(p.destructive),
+        crate::theme::hsla(p.foreground),
+    ];
+    let el = canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let sx = f32::from(bounds.size.width) / 1200.0;
+            let sy = f32::from(bounds.size.height) / 800.0;
+            for particle in &burst.particles {
+                if particle.alpha <= 0.01 {
+                    continue;
+                }
+                let color = colors[particle.color_index % colors.len()].opacity(particle.alpha);
+                let rect = Bounds::new(
+                    point(bounds.origin.x + px(particle.x * sx), bounds.origin.y + px(particle.y * sy)),
+                    size(px(particle.size), px(particle.size * 0.65)),
+                );
+                window.paint_quad(fill(rect, color));
+            }
+        },
+    )
+    .absolute()
+    .inset_0();
+    Some(gpui::deferred(el).with_priority(65).into_any_element())
 }
 
 /// Paint-only listener, so descendant scroll handlers cannot swallow idle activity.

@@ -313,6 +313,10 @@ pub fn prompt_link_app_path(value: &str) -> Option<String> {
         }
         if url.path() == "/new" {
             "/new"
+        } else if let Some(rest) = url.path().strip_prefix("/threads")
+            && thread_path(rest)
+        {
+            rest.trim_end_matches('/')
         } else if thread_path(url.path()) && url.query_pairs().any(|(k, _)| k == "prompt") {
             url.path().trim_end_matches('/')
         } else {
@@ -447,6 +451,46 @@ pub fn pick_prompt_link_pull_request_thread(lookups: &[PullRequestLookup]) -> Op
         }
     }
     Some(None)
+}
+
+/// `pullRequests.linkedThreads` payload for a PR link lookup (`NewThreadLinkView.tsx`).
+pub fn pull_request_linked_threads_input(project_id: &str, pr: &PullRequest) -> Value {
+    serde_json::json!({
+        "projectId": project_id,
+        "repository": format!("{}/{}", pr.repository.owner, pr.repository.name),
+        "number": pr.number,
+    })
+}
+
+#[cfg(test)]
+mod hosted_thread_link_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_threads_path_opens_with_or_without_prompt() {
+        assert_eq!(
+            prompt_link_app_path("https://app.t3.codes/threads/env-1/thr-2").as_deref(),
+            Some("/env-1/thr-2")
+        );
+        assert_eq!(
+            prompt_link_app_path("https://app.t3.codes/threads/env-1/thr-2?prompt=hello").as_deref(),
+            Some("/env-1/thr-2?prompt=hello")
+        );
+        // Bare /<env>/<thread> without ?prompt still rejected so reloading a tab doesn't prompt.
+        assert_eq!(prompt_link_app_path("https://app.t3.codes/env-1/thr-2"), None);
+        assert_eq!(
+            prompt_link_app_path("https://app.t3.codes/env-1/thr-2?prompt=hi").as_deref(),
+            Some("/env-1/thr-2?prompt=hi")
+        );
+        let pr = PullRequest {
+            repository: Repository { owner: "pingdotgg".into(), name: "t3code".into() },
+            number: 42,
+        };
+        assert_eq!(
+            pull_request_linked_threads_input("proj-1", &pr),
+            serde_json::json!({ "projectId": "proj-1", "repository": "pingdotgg/t3code", "number": 42 })
+        );
+    }
 }
 
 #[cfg(test)]
