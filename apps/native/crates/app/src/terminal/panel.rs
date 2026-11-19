@@ -21,7 +21,7 @@ use t3_core::right_panel::SurfaceKind;
 use t3_core::terminal::{self, MAX_TERMINALS_PER_GROUP, SplitDirection};
 
 use super::drawer::{
-    allocate_panel_terminal_id, can_operate_terminals, close_terminal_session, consume_terminal_focus,
+    active_drawer, allocate_panel_terminal_id, can_operate_terminals, close_terminal_session, consume_terminal_focus,
     launch_panel_terminal, link_metadata_cache, record_terminal_focus, request_terminal_focus, terminal_label,
     terminal_location,
 };
@@ -107,11 +107,18 @@ impl PanelTerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let sub = cx.subscribe_in(&app, window, |this, _, event: &AppEvent, window, cx| {
+        let mut subscriptions = vec![cx.subscribe_in(&app, window, |this, _, event: &AppEvent, window, cx| {
             if matches!(event, AppEvent::Phase | AppEvent::RightPanel | AppEvent::Selection | AppEvent::Shell) {
                 this.sync(window, cx);
             }
-        });
+        })];
+        // Follow TerminalDrawer notifications so async `terminal:operate` grant gains and server
+        // metadata label updates immediately re-sync panes and consume pending focus requests.
+        if let Some(drawer) = active_drawer(cx) {
+            subscriptions.push(cx.observe_in(&drawer, window, |this, _, window, cx| {
+                this.sync(window, cx);
+            }));
+        }
         let mut view = PanelTerminalView {
             app,
             thread_id,
@@ -119,7 +126,7 @@ impl PanelTerminalView {
             panes: HashMap::new(),
             visible: false,
             connection: None,
-            _subscriptions: vec![sub],
+            _subscriptions: subscriptions,
         };
         view.sync(window, cx);
         view
@@ -130,6 +137,11 @@ impl PanelTerminalView {
             self.visible = visible;
             self.sync(window, cx);
         }
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn pane_count_for_test(&self) -> usize {
+        self.panes.len()
     }
 
     fn surface_state(&self, cx: &App) -> Option<(Vec<String>, String, SplitDirection)> {

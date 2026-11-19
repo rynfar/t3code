@@ -34,6 +34,7 @@ fn setup(cx: &mut gpui::TestAppContext) -> (Entity<AppState>, Entity<Previews>, 
         installed
     });
     state.update(cx, |state, cx| {
+        state.panels.panels = t3_core::right_panel::RightPanels::default();
         state.select_thread("menu-thread", cx);
     });
     fixture
@@ -505,6 +506,51 @@ async fn preview_find_action_shows_unavailable_info_toast(cx: &mut gpui::TestApp
         assert_eq!(toast.kind, crate::toast::ToastKind::Info);
         assert_eq!(toast.title, "Find on page isn't available for this page");
     });
+
+    state.update(window_cx, |state, _| state.stop_pump());
+    window_cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn capture_screenshot_attaches_full_frame_png_to_composer(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let (state, previews, _fixture, _runtime) = setup(cx);
+    previews.update(cx, |previews, cx| {
+        previews.seed_snapshot_for_test(snapshot("tab-shot", "https://example.com/", Some("default")), cx);
+    });
+
+    let mut jpeg = Vec::new();
+    let img = image::RgbImage::from_pixel(4, 4, image::Rgb([32, 96, 180]));
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+        .expect("encode test jpeg");
+
+    let (pane, window_cx) = cx.add_window_view(|window, cx| {
+        PreviewPane::new(
+            state.clone(),
+            previews.clone(),
+            "menu-thread".into(),
+            "browser:tab-shot".into(),
+            Some("tab-shot".into()),
+            window,
+            cx,
+        )
+    });
+
+    window_cx.update(|_, cx| {
+        let frame = pane.read(cx).frame_for_test().expect("frame view exists");
+        frame.update(cx, |frame, _| frame.seed_jpeg_for_test(jpeg));
+        pane.update(cx, |pane, cx| pane.capture_screenshot_for_test(cx));
+    });
+
+    let (prompt, attachments) = state
+        .update(window_cx, |state, _| state.take_composer_restore("menu-thread"))
+        .expect("capture_screenshot should restore composer attachment");
+    assert!(prompt.is_empty());
+    assert_eq!(attachments.len(), 1, "capture_screenshot should queue one full-frame PNG attachment");
+    assert_eq!(attachments[0].mime_type, "image/png");
+    assert!(attachments[0].name.ends_with(".png"));
+    assert!(attachments[0].bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
 
     state.update(window_cx, |state, _| state.stop_pump());
     window_cx.run_until_parked();

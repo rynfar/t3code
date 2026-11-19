@@ -1069,6 +1069,11 @@ impl FrameView {
     pub(super) fn inject_stream_event_for_test(&mut self, event: StreamEvent, cx: &mut Context<Self>) {
         self.on_event(event, cx);
     }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn seed_jpeg_for_test(&mut self, jpeg: Vec<u8>) {
+        self.latest_jpeg = Some(jpeg.into());
+    }
 }
 
 impl Render for FrameView {

@@ -197,6 +197,7 @@ fn apply_client(
             ClientSettingChange::DiffLayout(_)
                 | ClientSettingChange::DiffFilesCollapsed(_)
                 | ClientSettingChange::DiffIgnoreWhitespace(_)
+                | ClientSettingChange::ProactivePanelsEnabled(_)
         ) {
             cx.emit(AppEvent::RightPanel);
         }

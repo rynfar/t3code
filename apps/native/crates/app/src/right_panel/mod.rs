@@ -79,6 +79,8 @@ pub struct RightPanelView {
     proactive: ProactivePanelCoordinator,
     /// Last seen `proactive_panels_enabled` setting, so toggling it in Settings re-evaluates.
     last_proactive_enabled: Option<bool>,
+    /// Whether the panel is currently in narrow-window sheet mode (`ChatView.tsx:2035`).
+    in_sheet_mode: bool,
     /// Inline rename input for a device tab (`RightPanelTabs.tsx`).
     renaming_device: Option<(String, Entity<InputState>, Subscription)>,
     add_menu_open: bool,
@@ -88,6 +90,7 @@ pub struct RightPanelView {
     sheet_focus: FocusHandle,
     _save_width: Option<Task<()>>,
     _details_subscription: Option<Subscription>,
+    _git_subscription: Option<Subscription>,
     _subscription: Subscription,
 }
 
@@ -118,6 +121,11 @@ impl RightPanelView {
                 if !open {
                     this.add_menu_open = false;
                     this.renaming_device = None;
+                }
+                let proactive_enabled = crate::settings::store::try_client(cx)
+                    .is_some_and(|doc| doc.proactive_panels_enabled());
+                if this.last_proactive_enabled != Some(proactive_enabled) {
+                    this.evaluate_proactive(cx);
                 }
                 cx.notify();
             }
@@ -153,6 +161,7 @@ impl RightPanelView {
             pull_request_tabs: Vec::new(),
             proactive: ProactivePanelCoordinator::default(),
             last_proactive_enabled: None,
+            in_sheet_mode: false,
             renaming_device: None,
             add_menu_open: false,
             add_menu_dismissed: None,
@@ -161,6 +170,7 @@ impl RightPanelView {
             sheet_focus: cx.focus_handle(),
             _save_width: None,
             _details_subscription: None,
+            _git_subscription: None,
             _subscription: subscription,
         };
         view.attach_details_subscription(cx);
@@ -169,34 +179,52 @@ impl RightPanelView {
     }
 
     fn attach_details_subscription(&mut self, cx: &mut Context<Self>) {
-        if self._details_subscription.is_some() {
-            return;
-        }
         if let Some(details) = crate::thread_details::details(cx) {
-            self._details_subscription = Some(cx.subscribe(&details, |this, _, event: &crate::thread_details::DetailsEvent, cx| {
-                if *event == crate::thread_details::DetailsEvent::Changed {
-                    this.evaluate_proactive(cx);
-                }
-            }));
+            if self._details_subscription.is_none() {
+                self._details_subscription = Some(cx.subscribe(&details, |this, _, event: &crate::thread_details::DetailsEvent, cx| {
+                    if *event == crate::thread_details::DetailsEvent::Changed {
+                        this.evaluate_proactive(cx);
+                    }
+                }));
+            }
+            if self._git_subscription.is_none() {
+                let git = details.read(cx).git.clone();
+                self._git_subscription = Some(cx.subscribe(&git, |this, _, event: &crate::git::GitEvent, cx| {
+                    if *event == crate::git::GitEvent::Changed {
+                        this.evaluate_proactive(cx);
+                    }
+                }));
+            }
         }
     }
 
-    /// Ports `apps/web/src/hooks/useProactivePanels.ts` by reading `AppState`, `ClientSettings`,
-    /// and `Details.git` directly inside `RightPanelView`.
+    /// Ports `apps/web/src/hooks/useProactivePanels.ts` + `ChatView.tsx:1286-1287,1997-2051` +
+    /// `useThreadLinkedPullRequest.ts:99-104` by reading `AppState`, `ClientSettings`, and
+    /// `Details.git` directly inside `RightPanelView`.
     pub fn evaluate_proactive(&mut self, cx: &mut Context<Self>) {
         self.attach_details_subscription(cx);
         let settings_doc = crate::settings::store::try_client(cx);
         let settings_hydrated = settings_doc.is_some();
-        let enabled = settings_doc.is_some_and(|doc| doc.proactive_panels_enabled());
-        self.last_proactive_enabled = Some(enabled);
+        let setting_enabled = settings_doc.is_some_and(|doc| doc.proactive_panels_enabled());
+        self.last_proactive_enabled = Some(setting_enabled);
+        let enabled = setting_enabled && !self.in_sheet_mode;
 
-        let is_git_repo = {
+        let (is_git_repo, branch_pr) = {
             let selected = self.state.read(cx).selected_thread.clone();
-            crate::thread_details::details(cx).and_then(|details| {
-                let git = details.read(cx).git.read(cx);
-                let matches_thread = git.target.as_ref().map(|target| target.thread_id.as_str()) == selected.as_deref();
-                matches_thread.then(|| git.status.as_ref().map(|status| status.local.is_repo)).flatten()
-            })
+            crate::thread_details::details(cx)
+                .map(|details| {
+                    let git = details.read(cx).git.read(cx);
+                    let matches_thread = git.target.as_ref().map(|target| target.thread_id.as_str()) == selected.as_deref();
+                    if matches_thread {
+                        (
+                            git.status.as_ref().map(|status| status.local.is_repo),
+                            git.status.as_ref().and_then(|status| status.remote.pr.clone()),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                })
+                .unwrap_or((None, None))
         };
 
         let (
@@ -242,11 +270,12 @@ impl RightPanelView {
                 .and_then(|thread| resolve_thread_current_pull_request(&thread.pull_requests))
                 .map(|current| current.link());
             let project_id = thread_shell.map(|thread| thread.project_id.clone());
-            let has_repo_identity = project_id
+            let link_project = project_id
                 .as_deref()
                 .and_then(|id| state.shell.project(id))
-                .is_some_and(|project| project.repository_identity.is_some());
-            let linked_pr = current_pr.zip(project_id.clone()).map(|(link, project_id)| PullRequestTarget {
+                .and_then(|project| project.repository_identity.as_ref())
+                .and_then(t3_core::pull_requests::link::LinkProject::from_identity);
+            let persisted_pr = current_pr.zip(project_id.clone()).map(|(link, project_id)| PullRequestTarget {
                 environment_id: env_id.clone(),
                 project_id,
                 host: (!link.host.is_empty()).then(|| link.host.clone()),
@@ -256,9 +285,38 @@ impl RightPanelView {
                 reveal_url: None,
                 detail_tab: None,
             });
-            let pr_key = if visible_links.is_empty() {
-                None
-            } else {
+            // Match `useThreadLinkedPullRequest.ts:99-104`: branch PR from live git status
+            // overrides/supplements when resolvable against the project's repository, while
+            // `hasDetail` reflects whether a persisted link exists.
+            let branch_pr_target = branch_pr.and_then(|pr| {
+                let project_id = project_id.clone()?;
+                let parsed = t3_core::pull_requests::link::parse_change_request_url(&pr.url);
+                let (host, repository) = match (parsed, &link_project) {
+                    (Some(link), _) => (Some(link.host), link.repository),
+                    (None, Some(lp)) => (Some(lp.host.clone()), lp.repository.clone()),
+                    (None, None) => return None,
+                };
+                Some(PullRequestTarget {
+                    environment_id: env_id.clone(),
+                    project_id,
+                    host,
+                    repository,
+                    number: pr.number,
+                    url: Some(pr.url),
+                    reveal_url: None,
+                    detail_tab: None,
+                })
+            });
+            let linked_pr = branch_pr_target.or(persisted_pr);
+            let cap_known = state.server_config.config.is_some();
+            // Match `ChatView.tsx:1286-1287,1997-2003,2027-2031`:
+            let supports_pull_requests = cap_known;
+            let pull_requests_surface_available =
+                thread_id.is_some() && supports_pull_requests && visible_count > 0;
+            let linked_pr_key = linked_pr
+                .as_ref()
+                .map(|pr| format!("{}:{}#{}", pr.project_id, pr.repository.to_lowercase(), pr.number));
+            let pr_key = if pull_requests_surface_available {
                 let mut keys: Vec<String> = visible_links
                     .iter()
                     .map(|link| format!("{}/{}#{}", link.host.to_lowercase(), link.repository.to_lowercase(), link.number))
@@ -266,8 +324,9 @@ impl RightPanelView {
                 keys.sort();
                 keys.dedup();
                 Some(keys.join("|"))
+            } else {
+                linked_pr_key
             };
-            let cap_known = state.server_config.config.is_some();
             (
                 thread_id,
                 thread_detail_loading,
@@ -280,8 +339,8 @@ impl RightPanelView {
                 current_pr.is_some(),
                 pr_key,
                 cap_known,
-                cap_known && has_repo_identity,
-                state.selected_thread.is_some(),
+                supports_pull_requests,
+                pull_requests_surface_available,
                 visible_count,
             )
         };
@@ -322,6 +381,9 @@ impl RightPanelView {
         let sid = surface_id.clone();
         let sub = cx.subscribe_in(&input, window, move |this, input, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                if this.renaming_device.as_ref().is_none_or(|(active_id, _, _)| active_id != &sid) {
+                    return;
+                }
                 let value = input.read(cx).value().to_string();
                 this.renaming_device = None;
                 this.state.update(cx, |state, cx| state.rename_device_surface(&sid, &value, cx));
@@ -331,6 +393,12 @@ impl RightPanelView {
         window.focus(&input.focus_handle(cx), cx);
         self.renaming_device = Some((surface_id, input, sub));
         cx.notify();
+    }
+
+    fn cancel_device_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_device.take().is_some() {
+            cx.notify();
+        }
     }
 
     #[cfg(all(test, feature = "snapshot"))]
@@ -702,7 +770,10 @@ impl Render for RightPanelView {
             return div().into_any_element();
         }
         let viewport = f32::from(window.viewport_size().width);
-        let sheet_mode = is_sheet_mode(viewport);
+        // Match `ChatView.tsx:1074`: maximized panels render full-width inline (since `workspace.rs`
+        // hides the center column when `panel.maximized` is true) and keep the restore button visible.
+        let sheet_mode = is_sheet_mode(viewport) && !panel.maximized;
+        self.in_sheet_mode = sheet_mode;
         let stored = state.panels.panels.width(&thread_id).unwrap_or(DEFAULT_WIDTH);
         let width = if sheet_mode {
             sheet_width(viewport)
@@ -769,6 +840,7 @@ impl Render for RightPanelView {
         });
         let toggle_view = view.clone();
         let rename_view = view.clone();
+        let cancel_rename_view = view.clone();
         let renaming = self.renaming_device.as_ref().map(|(id, input, _)| (id.as_str(), input));
         let panel_el = v_flex()
             .id("right-panel")
@@ -795,6 +867,9 @@ impl Render for RightPanelView {
                 },
                 move |surface_id, current_title, window, cx| {
                     rename_view.update(cx, |this, cx| this.start_device_rename(surface_id, current_title, window, cx));
+                },
+                move |cx| {
+                    cancel_rename_view.update(cx, |this, cx| this.cancel_device_rename(cx));
                 },
                 window,
                 cx,
@@ -1044,19 +1119,328 @@ mod tests {
             assert!(panel.read(cx).pull_request_tabs.is_empty());
         });
 
-        // 3. ProactivePanelsEnabled client setting updates live and triggers re-evaluation.
+        // 3. Device rename cancel (Escape) drops the inline editor without changing the tab title.
+        state.update(vcx, |state, cx| {
+            state.mutate_panels(cx, |panels, thread| {
+                panels.panels.open_device(
+                    thread,
+                    t3_core::right_panel::DeviceTarget {
+                        host_id: "local".into(),
+                        device_id: "dev-2".into(),
+                        platform: t3_core::device::Platform::Ios,
+                        name: "Original Phone".into(),
+                    },
+                )
+            });
+        });
         vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.start_device_rename("device:local:dev-2".into(), "Original Phone".into(), window, cx);
+                if let Some((_, input, _)) = panel.renaming_device.as_ref() {
+                    input.update(cx, |input, cx| input.set_value("Discarded", window, cx));
+                }
+                panel.cancel_device_rename(cx);
+                assert!(panel.renaming_device.is_none());
+            });
+        });
+        state.read_with(vcx, |state, _| {
+            assert_eq!(state.panels.panels.active_surface("menu-thread").map(Surface::title).as_deref(), Some("Original Phone"));
+        });
+
+        // 4. Attachment tab renders in FilesPanel even when no workspace is open.
+        state.update(vcx, |state, cx| {
+            state.open_attachment(
+                t3_core::right_panel::FileAttachment {
+                    id: "att-42".into(),
+                    name: "notes.txt".into(),
+                    mime_type: "text/plain".into(),
+                    size_bytes: 256,
+                    url: None,
+                },
+                cx,
+            );
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        state.read_with(vcx, |state, _| {
+            assert_eq!(state.panels.panels.active_surface("menu-thread").map(Surface::id), Some("attachment:att-42"));
+        });
+
+        // 5. Resolved PR links open a single-PR right-panel tab when a thread is selected.
+        vcx.update(|_, cx| {
+            crate::pull_requests::open_resolved_link(
+                &state,
+                t3_core::pull_requests::target::Target {
+                    environment: state.read(cx).environment().unwrap_or("local").to_owned(),
+                    reference: PrRef {
+                        project_id: "proj-1".into(),
+                        host: Some("github.com".into()),
+                        repository: "owner/repo".into(),
+                        number: 101,
+                    },
+                    url: "https://github.com/owner/repo/pull/101".into(),
+                },
+                cx,
+            );
+        });
+        state.read_with(vcx, |state, _| {
+            assert!(!state.pull_requests_open);
+            let active = state.panels.panels.active_surface("menu-thread").expect("PR tab opened");
+            assert!(matches!(active.kind, SurfaceKind::PullRequest { number: 101, .. }));
+        });
+
+        // 6. ProactivePanelsEnabled client setting updates live via AppEvent::RightPanel.
+        vcx.update(|_, cx| {
             crate::settings::store::update_client(
                 &state,
                 t3_core::client_settings::ClientSettingChange::ProactivePanelsEnabled(true),
                 cx,
             );
             assert!(crate::settings::store::client(cx).proactive_panels_enabled());
-            window.draw(cx).clear();
         });
         vcx.run_until_parked();
         vcx.update(|_, cx| {
             assert_eq!(panel.read(cx).last_proactive_enabled, Some(true));
+        });
+
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
+
+    #[gpui::test]
+    fn narrow_window_sheet_mode_respects_maximize_and_escape_dismiss(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::keymap::init(cx);
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::store::init(cx);
+            installed
+        });
+        state.update(cx, |state, cx| {
+            state.panels.panels = t3_core::right_panel::RightPanels::default();
+            state.select_thread("menu-thread", cx);
+            state.add_diff_surface(cx);
+        });
+
+        let window = cx.open_window(gpui::size(px(800.), px(700.)), |window, cx| RightPanelView::new(state.clone(), window, cx));
+        let panel = window.entity(cx).unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // Narrow window + unmaximized -> sheet mode active.
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            assert!(panel.read(cx).in_sheet_mode);
+        });
+
+        // Maximizing at narrow width exits sheet mode so the panel fills full width inline
+        // with the restore button visible (never blanking center column with a narrow overlay).
+        state.update(&mut vcx, |state, cx| state.toggle_right_panel_maximized(cx));
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            assert!(!panel.read(cx).in_sheet_mode);
+        });
+
+        // Restoring returns to sheet mode; pressing Escape on the sheet closes the panel.
+        state.update(&mut vcx, |state, cx| state.toggle_right_panel_maximized(cx));
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            assert!(panel.read(cx).in_sheet_mode);
+            let focus = panel.read(cx).sheet_focus.clone();
+            window.focus(&focus, cx);
+            window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+        });
+        vcx.run_until_parked();
+        state.read_with(&vcx, |state, _| {
+            assert!(!state.panels.panels.is_open("menu-thread"), "Escape should dismiss sheet");
+        });
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
+
+    #[gpui::test]
+    fn proactive_panels_opens_on_git_event_after_turn_settle_and_live_setting_toggle(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::keymap::init(cx);
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::store::init(cx);
+            let _ = crate::thread_details::init(installed.0.clone(), cx);
+            installed
+        });
+        state.update(cx, |state, cx| {
+            state.panels.panels = t3_core::right_panel::RightPanels::default();
+            state.select_thread("menu-thread", cx);
+        });
+
+        let (panel, vcx) = cx.add_window_view(|window, cx| RightPanelView::new(state.clone(), window, cx));
+
+        // Turn on proactive panels live via ClientSettingChange (emits AppEvent::RightPanel).
+        vcx.update(|_, cx| {
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::ProactivePanelsEnabled(true),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        assert_eq!(panel.read_with(vcx, |p, _| p.last_proactive_enabled), Some(true));
+
+        // Seed a completed settled turn touching 3 files while GitStore status is still None -> defers.
+        state.update(vcx, |state, cx| {
+            let mut proj: t3_core::thread::ThreadProjection = serde_json::from_value(serde_json::json!({
+                "thread": {
+                    "id": "menu-thread",
+                    "projectId": "menu-project",
+                    "title": "Test",
+                    "providerInstanceId": "codex",
+                    "modelSelection": { "provider": "codex", "model": "gpt-5" },
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "branch": "main",
+                    "worktreePath": null,
+                    "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "menu-thread" },
+                    "createdAt": "2026-11-19T00:00:00Z",
+                    "updatedAt": "2026-11-19T00:00:00Z",
+                    "archivedAt": null
+                },
+                "runs": [{
+                    "id": "run-1",
+                    "ordinal": 1,
+                    "providerInstanceId": "codex",
+                    "modelSelection": { "provider": "codex", "model": "gpt-5" },
+                    "userMessageId": "m1",
+                    "rootNodeId": null,
+                    "status": "completed",
+                    "requestedAt": "2026-11-19T00:00:00Z",
+                    "startedAt": "2026-11-19T00:00:01Z",
+                    "completedAt": "2026-11-19T00:00:05Z"
+                }],
+                "attempts": [],
+                "nodes": [],
+                "subagents": [],
+                "providerSessions": [],
+                "providerThreads": [],
+                "providerTurns": [],
+                "runtimeRequests": [],
+                "messages": [],
+                "plans": [],
+                "turnItems": [],
+                "checkpointScopes": [],
+                "checkpoints": [{
+                    "id": "cp-1",
+                    "runId": "run-1",
+                    "appRunOrdinal": 1,
+                    "status": "ready",
+                    "capturedAt": "2026-11-19T00:00:05Z",
+                    "files": [
+                        { "path": "a.rs", "kind": "modified", "additions": 5, "deletions": 1 },
+                        { "path": "b.rs", "kind": "modified", "additions": 5, "deletions": 1 },
+                        { "path": "c.rs", "kind": "modified", "additions": 5, "deletions": 1 }
+                    ]
+                }],
+                "contextHandoffs": [],
+                "contextTransfers": [],
+                "visibleTurnItems": [],
+                "updatedAt": "2026-11-19T00:00:05Z"
+            }))
+            .unwrap();
+            proj.checkpoints.retain(|_| true);
+            state.thread.projection = Some(proj);
+            cx.emit(AppEvent::Thread);
+        });
+        vcx.run_until_parked();
+        state.read_with(vcx, |state, _| {
+            assert!(!state.panels.panels.is_open("menu-thread"), "must defer while is_git_repo is None");
+        });
+
+        // Async GitStore status arrives with `is_repo: true` -> GitEvent::Changed triggers proactive Diff open!
+        vcx.update(|_, cx| {
+            let details = crate::thread_details::details(cx).expect("details initialized");
+            let git = details.read(cx).git.clone();
+            git.update(cx, |git, cx| {
+                git.target = Some(crate::git::Target {
+                    thread_id: "menu-thread".into(),
+                    project_id: "menu-project".into(),
+                    is_draft: false,
+                    cwd: "/tmp".into(),
+                    project_cwd: "/tmp".into(),
+                    worktree_path: None,
+                    branch: Some("main".into()),
+                });
+                git.status = Some(t3_core::vcs::VcsStatus::default());
+                cx.emit(crate::git::GitEvent::Changed);
+            });
+        });
+        vcx.run_until_parked();
+        state.read_with(vcx, |state, _| {
+            assert!(state.panels.panels.is_open("menu-thread"), "GitEvent::Changed should trigger proactive Diff open");
+            assert_eq!(state.panels.panels.active_surface("menu-thread"), Some(&Surface::diff()));
+        });
+
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
+
+    #[gpui::test]
+    fn panel_terminal_splits_and_focuses_after_closing_sibling_tab(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::keymap::init(cx);
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::store::init(cx);
+            installed
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(serde_json::json!({
+                    "authenticated": true,
+                    "permissions": ["terminal:read", "terminal:operate"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |state, cx| {
+            state.panels.panels = t3_core::right_panel::RightPanels::default();
+            state.select_thread("menu-thread", cx);
+        });
+
+        let (panel, vcx) = cx.add_window_view(|window, cx| {
+            let _drawer = cx.new(|cx| crate::terminal::TerminalDrawer::new(state.clone(), window, cx));
+            RightPanelView::new(state.clone(), window, cx)
+        });
+
+        state.update(vcx, |state, cx| {
+            state.open_panel_terminal("menu-thread", "term-2", cx);
+            state.split_panel_terminal(
+                "menu-thread",
+                "terminal:term-2",
+                "term-3",
+                t3_core::terminal::SplitDirection::Horizontal,
+                cx,
+            );
+            // Open a sibling Diff tab on top, then close it -> should queue focus for term-3.
+            state.add_diff_surface(cx);
+            state.close_surface("diff", cx);
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            assert_eq!(panel.read(cx).terminals.len(), 1);
+            assert_eq!(panel.read(cx).terminals[0].2.read(cx).pane_count_for_test(), 2);
         });
 
         state.update(vcx, |state, _| state.stop_pump());

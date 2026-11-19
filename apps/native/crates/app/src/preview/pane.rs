@@ -1145,6 +1145,11 @@ impl PreviewPane {
     pub(super) fn toggle_device_toolbar_for_test(&mut self, cx: &mut Context<Self>) {
         self.toggle_device_toolbar(cx);
     }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn capture_screenshot_for_test(&mut self, cx: &mut Context<Self>) {
+        self.capture_screenshot(cx);
+    }
 }
 
 impl Render for PreviewPane {

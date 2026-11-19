@@ -65,6 +65,11 @@ impl AppState {
         });
     }
 
+    /// Opens a chat file attachment in a right-panel attachment tab (`openAttachment`).
+    pub fn open_attachment(&mut self, attachment: t3_core::right_panel::FileAttachment, cx: &mut Context<Self>) {
+        self.mutate_panels(cx, |state, thread| state.panels.open_attachment(thread, attachment));
+    }
+
     /// "Copy mention".
     pub fn copy_file_mention(&mut self, path: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(composer_file_link(path)));

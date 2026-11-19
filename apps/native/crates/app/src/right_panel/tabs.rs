@@ -161,6 +161,7 @@ pub fn tab_bar(
     renaming: Option<(&str, &Entity<InputState>)>,
     on_toggle_add: impl Fn(&mut Window, &mut App) + 'static,
     on_start_rename: impl Fn(String, String, &mut Window, &mut App) + Clone + 'static,
+    on_cancel_rename: impl Fn(&mut App) + Clone + 'static,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -172,7 +173,7 @@ pub fn tab_bar(
         .map(|(index, surface)| {
             let active = panel.active_surface_id.as_deref() == Some(surface.id.as_str());
             let rename_input = renaming.and_then(|(id, input)| (id == surface.id).then_some(input));
-            tab(state.clone(), surface, index, count, active, rename_input, on_start_rename.clone(), window, cx)
+            tab(state.clone(), surface, index, count, active, rename_input, on_start_rename.clone(), on_cancel_rename.clone(), window, cx)
         })
         .collect();
     let add_tooltip = crate::keymap::label("rightPanel.new", cx)
@@ -276,6 +277,7 @@ fn tab(
     active: bool,
     rename_input: Option<&Entity<InputState>>,
     on_start_rename: impl Fn(String, String, &mut Window, &mut App) + Clone + 'static,
+    on_cancel_rename: impl Fn(&mut App) + Clone + 'static,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -318,11 +320,25 @@ fn tab(
     let icon_color = hsla(if active { p.foreground } else { p.muted_foreground });
     let tab_id = ElementId::from(SharedString::from(format!("right-panel-tab-{id}")));
     let label_el = match rename_input {
-        Some(input) => div()
-            .w(px(96.))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(Input::new(input).xsmall())
-            .into_any_element(),
+        Some(input) => {
+            let cancel_action = on_cancel_rename.clone();
+            let cancel_key = on_cancel_rename;
+            div()
+                .w(px(96.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_action(move |_: &gpui_component::input::Escape, _, cx| {
+                    cx.stop_propagation();
+                    cancel_action(cx);
+                })
+                .on_key_down(move |event, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        cancel_key(cx);
+                    }
+                })
+                .child(Input::new(input).xsmall())
+                .into_any_element()
+        }
         None => div().min_w_0().truncate().child(title.clone()).into_any_element(),
     };
     focusable(div().id(tab_id.clone()), tab_id, true, window, cx)
@@ -350,8 +366,8 @@ fn tab(
             }
             activate.update(cx, |state, cx| state.activate_surface(&activate_id, cx));
         })
-        .on_mouse_up(MouseButton::Middle, move |_, _, cx| {
-            middle.update(cx, |state, cx| state.close_surface(&middle_id, cx));
+        .on_mouse_up(MouseButton::Middle, move |_, window, cx| {
+            middle.update(cx, |state, cx| state.close_surface_with_confirm(&middle_id, window, cx));
         })
         .child(
             div()
@@ -368,9 +384,9 @@ fn tab(
                     let label: SharedString = format!("Close {title}").into();
                     move |window, cx| super::tooltip_view(label.clone(), window, cx)
                 })
-                .on_click(move |_, _, cx| {
+                .on_click(move |_, window, cx| {
                     cx.stop_propagation();
-                    close.update(cx, |state, cx| state.close_surface(&close_id, cx));
+                    close.update(cx, |state, cx| state.close_surface_with_confirm(&close_id, window, cx));
                 })
                 .child(
                     surface_icon(surface)
@@ -397,12 +413,12 @@ fn tab(
         )
         .child(label_el)
         .context_menu(move |menu, _, _| {
-            let item = |label: &'static str, disabled: bool, run: fn(&mut AppState, &str, &mut gpui::Context<AppState>)| {
+            let item = |label: &'static str, disabled: bool, run: fn(&mut AppState, &str, &mut Window, &mut gpui::Context<AppState>)| {
                 let state = state.clone();
                 let id = id.clone();
                 PopupMenuItem::new(label)
                     .disabled(disabled)
-                    .on_click(move |_, _, cx| state.update(cx, |state, cx| run(state, &id, cx)))
+                    .on_click(move |_, window, cx| state.update(cx, |state, cx| run(state, &id, window, cx)))
             };
             let menu = match file_path.clone() {
                 Some(path) => {
@@ -421,10 +437,10 @@ fn tab(
             } else {
                 menu
             };
-            menu.item(item("Close", false, |state, id, cx| state.close_surface(id, cx)))
-                .item(item("Close others", count <= 1, |state, id, cx| state.close_other_surfaces(id, cx)))
-                .item(item("Close to the right", index + 1 >= count, |state, id, cx| state.close_surfaces_to_right(id, cx)))
-                .item(item("Close all", false, |state, _, cx| state.close_all_surfaces(cx)))
+            menu.item(item("Close", false, |state, id, window, cx| state.close_surface_with_confirm(id, window, cx)))
+                .item(item("Close others", count <= 1, |state, id, window, cx| state.close_other_surfaces_with_confirm(id, window, cx)))
+                .item(item("Close to the right", index + 1 >= count, |state, id, window, cx| state.close_surfaces_to_right_with_confirm(id, window, cx)))
+                .item(item("Close all", false, |state, _, window, cx| state.close_all_surfaces_with_confirm(window, cx)))
         })
         .into_any_element()
 }

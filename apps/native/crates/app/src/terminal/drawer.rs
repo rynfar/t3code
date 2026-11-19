@@ -18,7 +18,7 @@ use t3_core::composer::context::TerminalSelection;
 use t3_core::files::metadata::MetadataCache;
 use t3_core::terminal::{
     self, LaunchLocation, MetadataEvent, SplitDirection, TerminalAccess, TerminalFocusQueue, TerminalLayouts, TerminalSummary,
-    ThreadTerminalLayout, method,
+    ThreadEnterFocusDecision, ThreadTerminalLayout, method,
 };
 use tokio::sync::mpsc;
 
@@ -53,8 +53,16 @@ struct FocusQueue(TerminalFocusQueue);
 
 impl gpui::Global for FocusQueue {}
 
+pub(crate) fn active_drawer(cx: &App) -> Option<Entity<TerminalDrawer>> {
+    cx.try_global::<ActiveDrawer>().and_then(|active| active.0.upgrade())
+}
+
 pub(crate) fn request_terminal_focus(thread_id: &str, terminal_id: &str, cx: &mut App) {
     cx.default_global::<FocusQueue>().0.request(thread_id, terminal_id);
+}
+
+pub(crate) fn request_terminal_focus_on_navigation(thread_id: &str, terminal_id: &str, cx: &mut App) {
+    cx.default_global::<FocusQueue>().0.request_on_navigation(thread_id, terminal_id);
 }
 
 pub(crate) fn cancel_terminal_focus(thread_id: &str, cx: &mut App) {
@@ -70,6 +78,26 @@ pub(crate) fn consume_terminal_focus(thread_id: &str, terminal_id: &str, visible
 
 pub(crate) fn record_terminal_focus(thread_id: &str, terminal_id: &str, cx: &mut App) {
     cx.default_global::<FocusQueue>().0.record_terminal_focus(thread_id, terminal_id);
+}
+
+/// `focusPanelTerminalAfterClose` (`apps/web/src/lib/terminalFocus.ts:107-116`): after a right
+/// panel surface closes, focuses a newly exposed terminal surface; a terminal surface that was
+/// already active keeps its focus as is.
+pub(crate) fn focus_panel_terminal_after_close(
+    state: &AppState,
+    thread_id: &str,
+    previous_active_surface_id: Option<&str>,
+    cx: &mut App,
+) {
+    let panel = state.panels.panels.panel(thread_id);
+    if !panel.is_open || panel.active_surface_id.as_deref() == previous_active_surface_id {
+        return;
+    }
+    if let Some(t3_core::right_panel::SurfaceKind::Terminal { active_terminal_id, .. }) =
+        panel.active().map(|surface| &surface.kind)
+    {
+        request_terminal_focus(thread_id, active_terminal_id, cx);
+    }
 }
 
 /// Label for a terminal tab or pane (`session_label`), reading server metadata when available.
@@ -359,14 +387,43 @@ impl TerminalDrawer {
         if self.panes_thread != selected {
             self.panes.clear();
             let mut cache = self.link_metadata.borrow_mut();
-            if let Some(previous) = self.panes_thread.take() {
-                cache.1.release_thread(&previous);
+            let previous = self.panes_thread.take();
+            if let Some(previous) = &previous {
+                cache.1.release_thread(previous);
             }
             if let Some(thread_id) = &selected {
                 cache.1.retain_thread(thread_id);
             }
             drop(cache);
-            self.panes_thread = selected;
+            if let Some(previous) = &previous {
+                cx.default_global::<FocusQueue>().0.leave_thread(previous);
+            }
+            self.panes_thread = selected.clone();
+            if let Some(thread_id) = &selected {
+                let layout = self.layouts.get(thread_id).normalized();
+                let active_group_ids = layout.visible_terminal_ids();
+                let active_drawer_tid = (!layout.active_terminal_id.is_empty()).then_some(layout.active_terminal_id.as_str());
+                let panel_tids: Option<Vec<String>> = self
+                    .app
+                    .read(cx)
+                    .panels
+                    .panels
+                    .active_surface(thread_id)
+                    .and_then(|surface| match &surface.kind {
+                        t3_core::right_panel::SurfaceKind::Terminal { terminal_ids, .. } => Some(terminal_ids.clone()),
+                        _ => None,
+                    });
+                let decision = cx.default_global::<FocusQueue>().0.enter_thread(
+                    thread_id,
+                    layout.terminal_open,
+                    &active_group_ids,
+                    active_drawer_tid,
+                    panel_tids.as_deref(),
+                );
+                if matches!(decision, ThreadEnterFocusDecision::FocusComposer) {
+                    cancel_terminal_focus(thread_id, cx);
+                }
+            }
         }
         self.reconcile(cx);
         self.ensure_panes(window, cx);
@@ -574,6 +631,7 @@ impl TerminalDrawer {
     /// Opens `terminal_id` in `thread_id`'s drawer layout and focuses it when `thread_id` is open.
     pub fn open_terminal_for_thread(&mut self, thread_id: &str, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.layouts.ensure(thread_id, terminal_id, true, Some(true));
+        request_terminal_focus_on_navigation(thread_id, terminal_id, cx);
         if self.selected_thread(cx).as_deref() == Some(thread_id) {
             self.changed(window, cx);
         } else {
