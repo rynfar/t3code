@@ -17,6 +17,8 @@ pub mod query;
 pub mod reactions;
 pub mod review;
 pub mod reviewers;
+pub mod saved_views;
+pub mod selection;
 pub mod target;
 pub mod tasks;
 pub mod thread_badge;
@@ -155,6 +157,39 @@ impl ListPreferences {
     /// Whether anything narrows the list, for the empty state's copy.
     pub fn filtered(&self) -> bool {
         !self.menu_filters().is_empty() || self.state != ListState::Open || self.involvement != Involvement::All || self.project_id.is_some() || self.host.is_some()
+    }
+
+    /// Normalizes list preferences for persistence and saved-view comparison
+    /// (`pullRequestListPreferences` in `pullRequestListPreferences.ts`). Excludes `merge_method`
+    /// because it is a device-level action preference rather than a list filter.
+    pub fn normalized(&self) -> Self {
+        let non_empty = |value: &Option<String>| {
+            value
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| query::truncate_utf16(s, 200).to_owned())
+        };
+        let labels = self
+            .labels
+            .iter()
+            .filter(|label| !label.is_empty())
+            .take(10)
+            .map(|label| query::truncate_utf16(label, 200).to_owned())
+            .collect();
+        Self {
+            involvement: self.involvement,
+            state: self.state,
+            project_id: self.project_id.clone().filter(|s| !s.is_empty()),
+            host: non_empty(&self.host),
+            q: non_empty(&self.q),
+            draft: self.draft,
+            review: self.review,
+            checks: self.checks,
+            author: non_empty(&self.author),
+            labels,
+            sort: self.sort,
+            merge_method: None,
+        }
     }
 }
 

@@ -439,8 +439,8 @@ fn commit_scope_requests_commits_and_builds_host_urls() {
 
 #[test]
 fn selection_counts_reveals_and_reconciles_to_the_latest_turn() {
-    let first = DiffSelection::turn(&DiffSelection::default(), "r1", Some(" src/a.rs "));
-    assert_eq!(first, DiffSelection::Turn { turn_id: "r1".into(), file_path: Some("src/a.rs".into()), reveal_request_id: 1 });
+    let first = DiffSelection::turn(&DiffSelection::default(), "r1", Some("src/a.rs "));
+    assert_eq!(first, DiffSelection::Turn { turn_id: "r1".into(), file_path: Some("src/a.rs ".into()), reveal_request_id: 1 });
     let again = DiffSelection::turn(&first, "r1", Some(""));
     assert_eq!(again, DiffSelection::Turn { turn_id: "r1".into(), file_path: None, reveal_request_id: 2 });
 
@@ -965,4 +965,43 @@ fn server_config_shell_reveal_gates_file_context_menu() {
         wsl.shell_reveal_in_file_manager_kind.as_deref(),
     );
     assert_eq!(with_wsl.reveal_label, Some("Reveal in File Explorer"));
+}
+
+#[test]
+fn review_model_preserves_pre_patch_added_and_deleted_change_types_in_file_tree() {
+    let mut review = ReviewModel::new(review_scope());
+    let payload = json!({
+        "cwd": "/repo",
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "incomplete": false,
+        "sources": [{
+            "kind": "working-tree",
+            "diff": "",
+            "patchesDeferred": true,
+            "truncated": false,
+            "files": [
+                { "path": "src/added.rs", "previousPath": null, "changeType": "new", "additions": 10, "deletions": 0 },
+                { "path": "src/removed.rs", "previousPath": null, "changeType": "deleted", "additions": 0, "deletions": 8 },
+                { "path": "src/legacy.rs", "previousPath": null, "additions": 2, "deletions": 1 }
+            ]
+        }]
+    });
+    review.accept_preview(&payload);
+    let ParsedPatch::Files(files) = review.patch() else { panic!("files") };
+    let tree = file_tree_rows(&files, &HashSet::new());
+    let changes: Vec<(&str, ChangeKind)> = tree
+        .iter()
+        .filter_map(|row| match row.kind {
+            TreeRowKind::File { change, .. } => Some((row.label.as_str(), change)),
+            TreeRowKind::Directory { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        changes,
+        vec![
+            ("added.rs", ChangeKind::New),
+            ("legacy.rs", ChangeKind::Modified),
+            ("removed.rs", ChangeKind::Deleted),
+        ]
+    );
 }

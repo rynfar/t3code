@@ -21,27 +21,28 @@ use gpui_component::{h_flex, v_flex};
 use t3_core::commands::method::DISPATCH_COMMAND;
 use t3_core::pull_requests::detail::{MergeGate, PrimaryControl, StateKind, change_request_term, host_label, merge_gate, merge_method_label, primary_control, resolve_merge_method};
 use t3_core::pull_requests::anchor::{Anchor, LinkedTab, anchor_matches_url, link_commit, parse_anchor, resolve_review_anchor};
-use t3_core::pull_requests::chat_context::{ChatSubject, build_comment_context, build_pull_request_context};
+use t3_core::pull_requests::chat_context::{ChatSubject, build_comment_context_with_activity, build_pull_request_context};
 use t3_core::pull_requests::detail::EventKind;
 use t3_core::pull_requests::link::{
     LINKED_THREADS, LINKED_THREADS_POLL_SECONDS, LinkableThread, LinkedThread, LinkedThreads, SUBSCRIBE_LINKED_THREAD_REFRESHES, is_linked_to_url, link_command, linked_threads_input,
     linked_threads_label, parse_change_request_url, unlink_command, visible_linked_threads,
 };
 use t3_core::pull_requests::editing::{
-    self, DescriptionDraft, SOURCE_CONTROL_WRITE_SCOPE, allowed_review_verdicts, apply_label_change, can_edit_change_request, description_draft_in_force, label_change_input, patch_detail,
+    self, DescriptionDraft, SOURCE_CONTROL_WRITE_SCOPE, allowed_review_verdicts, apply_labels_change, can_edit_change_request, description_draft_in_force, labels_change_input, patch_detail,
     settle_description_save, start_description_save, thread_resolution_input, update_body_input, update_maintainer_edits_input, update_title_input,
 };
 use t3_core::pull_requests::reactions::set_reaction_input;
 use t3_core::pull_requests::review::{
     PendingReviewComment, ReviewDraft, post_comment_input, reply_to_thread_input, review_verdict_sent_label, submit_review_input, thread_comments_input, update_comment_input,
 };
-use t3_core::pull_requests::reviewers::{host_reviewer_query, request_reviewers_input, reviewer_candidates_input};
+use t3_core::pull_requests::reviewers::{host_reviewer_query, request_reviewers_batch_input, reviewer_candidates_input};
+use t3_core::pull_requests::selection::{SelectionDraft, change_batches};
 use t3_core::pull_requests::tasks::set_task_checked;
 use t3_core::pull_requests::wire::{
-    Action, Activity, CommentKind, Detail, LabelCandidates, ListEntry, MergeMethod, PrState, ReactionContent, ReviewVerdict, ReviewerCandidate, ReviewerCandidates, Stack, Summary,
+    Action, Activity, CommentKind, Detail, DiffResult, LabelCandidate, LabelCandidates, ListEntry, MergeMethod, PrState, ReactionContent, ReviewVerdict, ReviewerCandidate, ReviewerCandidates, Stack, Summary,
     ThreadCommentsPage, decode,
 };
-use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, invalidate_input, method, stack_merge};
+use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, failure_message, invalidate_input, method, stack_merge};
 
 use super::code::CodeTab;
 use super::controls::{BadgeKind, Button, Size, Variant, badge, diff_stat, state_glyph};
@@ -137,7 +138,8 @@ pub(super) struct CommentEditState {
 #[derive(Default)]
 struct PendingReactionOverlay {
     signature: String,
-    values: HashMap<ReactionContent, bool>,
+    /// `(reacted, monotonic_seq)` so a failed older toggle never clears a newer one (`pingdotgg/t3code#37853`).
+    values: HashMap<ReactionContent, (bool, u64)>,
 }
 
 pub(crate) type CloseHandler = Rc<dyn Fn(&mut App)>;
@@ -187,11 +189,14 @@ pub struct DetailView {
     description_draft: Option<DescriptionDraft>,
     pub(super) description_saves: u32,
     pub(super) maintainer_edits_saving: bool,
-    /// `pullRequests.labelCandidates`, read once the label picker can show.
+    /// `pullRequests.labelCandidates`, read once the label picker can show, plus batch draft (`pingdotgg/t3code#37733`).
+    pub(super) label_picker_open: bool,
+    pub(super) label_draft: SelectionDraft<LabelCandidate>,
     pub(super) label_candidates: Option<Result<LabelCandidates, String>>,
     pub(super) label_pending: bool,
-    /// `PullRequestReviewerPicker` state.
+    /// `PullRequestReviewerPicker` state + batch draft (`pingdotgg/t3code#37733`).
     pub(super) reviewer_picker_open: bool,
+    pub(super) reviewer_draft: SelectionDraft<ReviewerCandidate>,
     pub(super) reviewer_candidates: Option<Result<ReviewerCandidates, String>>,
     pub(super) reviewer_query: String,
     pub(super) reviewer_debounced_query: String,
@@ -222,6 +227,7 @@ pub struct DetailView {
     pub(super) loading_more_replies: HashSet<String>,
     /// Optimistic reactions overlay keyed by subject_id (or `"__pr__"` for the PR description).
     pending_reactions: HashMap<String, PendingReactionOverlay>,
+    reaction_seq: u64,
     /// Inline thread-link picker (`PullRequestThreadLinks`).
     pub(super) thread_picker_open: bool,
     pub(super) thread_link_pending: bool,
@@ -246,6 +252,10 @@ pub struct DetailView {
     pub(super) timeline_list: gpui::ListState,
     guide: Option<Entity<GuideTab>>,
     code: Option<Entity<CodeTab>>,
+    /// First diff slice prefetched on hovering the Code tab (`pingdotgg/t3code#32911`).
+    prefetched_diff: Option<DiffResult>,
+    diff_prefetching: bool,
+    _diff_prefetch: Option<Task<()>>,
     _detail: Option<Task<()>>,
     _activity: Option<Task<()>>,
     _stack: Option<Task<()>>,
@@ -325,9 +335,12 @@ impl DetailView {
             description_draft: None,
             description_saves: 0,
             maintainer_edits_saving: false,
+            label_picker_open: false,
+            label_draft: SelectionDraft::default(),
             label_candidates: None,
             label_pending: false,
             reviewer_picker_open: false,
+            reviewer_draft: SelectionDraft::default(),
             reviewer_candidates: None,
             reviewer_query: String::new(),
             reviewer_debounced_query: String::new(),
@@ -353,6 +366,7 @@ impl DetailView {
             reply_submitting: false,
             loading_more_replies: HashSet::new(),
             pending_reactions: HashMap::new(),
+            reaction_seq: 0,
             thread_picker_open: false,
             thread_link_pending: false,
             thread_picker_input: None,
@@ -371,6 +385,9 @@ impl DetailView {
             timeline_list: gpui::ListState::new(0, gpui::ListAlignment::Top, px(600.)),
             guide: None,
             code: None,
+            prefetched_diff: None,
+            diff_prefetching: false,
+            _diff_prefetch: None,
             _detail: None,
             _activity: None,
             _stack: None,
@@ -850,8 +867,12 @@ impl DetailView {
                     .find(|candidate| candidate.comments.iter().any(|comment| comment.id == comment_id))
             });
         let comment_chip = match thread {
-            Some(thread) => build_comment_context(detail, ChatSubject::Thread(thread)),
-            None => activity.comments.iter().find(|comment| comment.id == comment_id).and_then(|comment| build_comment_context(detail, ChatSubject::Comment(comment))),
+            Some(thread) => build_comment_context_with_activity(detail, Some(activity), ChatSubject::Thread(thread)),
+            None => activity
+                .comments
+                .iter()
+                .find(|comment| comment.id == comment_id)
+                .and_then(|comment| build_comment_context_with_activity(detail, Some(activity), ChatSubject::Comment(comment))),
         };
         let Some(comment_chip) = comment_chip else { return };
         let pr_chip = build_pull_request_context(detail);
@@ -956,36 +977,95 @@ impl DetailView {
         cx.notify();
     }
 
-    /// `PullRequestLabelPicker`'s toggle: one label on or off, shown on the detail once written.
-    pub(super) fn toggle_label(&mut self, name: String, applied: bool, cx: &mut Context<Self>) {
-        if self.label_pending {
+    /// `PullRequestLabelPicker` (`pingdotgg/t3code#37733`): toggles labels in a local draft and
+    /// commits additions/removals in batches when the picker closes.
+    pub(super) fn toggle_label_picker(&mut self, cx: &mut Context<Self>) {
+        if self.label_picker_open {
+            self.label_picker_open = false;
+            self.commit_label_draft(cx);
+        } else {
+            self.label_picker_open = true;
+            self.label_draft = SelectionDraft::default();
+            self.load_label_candidates(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn is_label_draft_selected(&self, candidate: &LabelCandidate) -> bool {
+        self.label_draft.is_selected(&candidate.name.to_lowercase(), candidate.is_applied)
+    }
+
+    pub(super) fn toggle_label_draft(&mut self, candidate: LabelCandidate, cx: &mut Context<Self>) {
+        let key = candidate.name.to_lowercase();
+        let host_selected = candidate.is_applied;
+        self.label_draft.toggle(key, candidate, host_selected);
+        cx.notify();
+    }
+
+    fn commit_label_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = std::mem::take(&mut self.label_draft);
+        if draft.is_empty() || !self.can_write_source_control(cx) {
             return;
         }
+        let mut current = HashMap::new();
+        if let Some(Ok(list)) = &self.label_candidates {
+            for candidate in &list.candidates {
+                current.insert(candidate.name.to_lowercase(), candidate.is_applied);
+            }
+        }
+        let changes = draft.changes(|key, item| current.get(key).copied().unwrap_or(item.is_applied));
+        if changes.is_empty() {
+            return;
+        }
+        let add_names: Vec<String> = changes.add.iter().map(|c| c.name.clone()).collect();
+        let remove_names: Vec<String> = changes.remove.iter().map(|c| c.name.clone()).collect();
+
+        // Optimistic immediate paint (`pingdotgg/t3code#32774`).
+        let mut candidates = self.label_candidates.take();
+        let held: &mut [_] = match candidates.as_mut() {
+            Some(Ok(list)) => &mut list.candidates,
+            _ => &mut [],
+        };
+        if let Some(detail) = self.detail.as_mut() {
+            if !add_names.is_empty() {
+                apply_labels_change(&mut detail.labels, held, &add_names, true);
+            }
+            if !remove_names.is_empty() {
+                apply_labels_change(&mut detail.labels, held, &remove_names, false);
+            }
+        }
+        self.label_candidates = candidates;
+        self.hold(cx);
+
+        let reference = self.reference.clone();
         self.label_pending = true;
-        let task = mutations::write(self.state.read(cx), editing::method::SET_LABELS, label_change_input(&self.reference, &name, !applied), cx);
         cx.notify();
+        let mut tasks = Vec::new();
+        for chunk in change_batches(&add_names) {
+            tasks.push(mutations::write(self.state.read(cx), editing::method::SET_LABELS, labels_change_input(&reference, chunk, true), cx));
+        }
+        for chunk in change_batches(&remove_names) {
+            tasks.push(mutations::write(self.state.read(cx), editing::method::SET_LABELS, labels_change_input(&reference, chunk, false), cx));
+        }
         cx.spawn(async move |this, cx| {
-            let result = settle(task).await;
+            let mut failed: Option<String> = None;
+            for task in tasks {
+                if let Err(err) = settle(task).await {
+                    failed = Some(err);
+                    break;
+                }
+            }
             let _ = this.update(cx, |this, cx| {
                 this.label_pending = false;
-                match result {
-                    Ok(()) => {
-                        let mut candidates = this.label_candidates.take();
-                        let held: &mut [_] = match candidates.as_mut() {
-                            Some(Ok(list)) => &mut list.candidates,
-                            _ => &mut [],
-                        };
-                        if let Some(detail) = this.detail.as_mut() {
-                            apply_label_change(&mut detail.labels, held, &name, !applied);
-                        }
-                        this.label_candidates = candidates;
-                        this.hold(cx);
-                    }
-                    Err(error) => {
-                        let title = if applied { format!("Could not take {name} off") } else { format!("Could not put {name} on") };
-                        let description = if error.trim().is_empty() { "The host refused it. Check that you have triage access on this repository.".to_owned() } else { error };
-                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, title).description(description), cx));
-                    }
+                if let Some(error) = failed {
+                    let description = if error.trim().is_empty() {
+                        "The host refused it. Check that you have triage access on this repository.".to_owned()
+                    } else {
+                        error
+                    };
+                    this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not update labels").description(description), cx));
+                    this.refresh(cx);
+                    this.retry_label_candidates(cx);
                 }
                 cx.notify();
             });
@@ -1081,7 +1161,8 @@ impl DetailView {
             let detail = self.detail.clone();
             let activity = self.activity.clone();
             let can_write = self.can_write_source_control(cx);
-            self.code = Some(cx.new(|cx| CodeTab::new(state, detail_view, reference, detail.as_ref(), activity.as_ref(), can_write, cx)));
+            let prefetched = self.prefetched_diff.take();
+            self.code = Some(cx.new(|cx| CodeTab::new_with_prefetched(state, detail_view, reference, detail.as_ref(), activity.as_ref(), can_write, prefetched, cx)));
         }
         if tab == Tab::Guide {
             if let Some(guide) = &self.guide {
@@ -1094,6 +1175,33 @@ impl DetailView {
             }
         }
         cx.notify();
+    }
+
+    /// Prefetches the first diff slice on hovering the Code tab so clicking it paints immediately
+    /// (`pingdotgg/t3code#32911`).
+    fn prefetch_code_diff(&mut self, cx: &mut Context<Self>) {
+        if self.code.is_some() || self.prefetched_diff.is_some() || self.diff_prefetching {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client_handle() else { return };
+        let payload = self.reference.payload();
+        self.diff_prefetching = true;
+        let task = self.state.read(cx).runtime().spawn(async move {
+            let value = client
+                .pull_request_diff(payload)
+                .await
+                .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
+            decode::<DiffResult>(value)
+        });
+        self._diff_prefetch = Some(cx.spawn(async move |this, cx| {
+            let res = task.await.unwrap_or_else(|e| Err(e.to_string()));
+            let _ = this.update(cx, |view, _| {
+                view.diff_prefetching = false;
+                if let Ok(diff) = res && view.code.is_none() {
+                    view.prefetched_diff = Some(diff);
+                }
+            });
+        }));
     }
 
     /// Jumps from the Guide tab straight to `path` in the Code tab (`onOpenFile`).
@@ -1153,7 +1261,14 @@ impl DetailView {
             cx.notify();
             return;
         }
+        // Paint the updated title immediately and roll back on failure (`pingdotgg/t3code#32774`).
+        let previous_title = self.detail.as_ref().map(|d| d.title.clone());
+        if let Some(detail) = self.detail.as_mut() {
+            detail.title = next.clone();
+        }
+        self.title_editing = false;
         self.title_saving = true;
+        self.hold(cx);
         let task = mutations::write(self.state.read(cx), editing::method::UPDATE, update_title_input(&self.reference, &next), cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -1162,14 +1277,16 @@ impl DetailView {
                 this.title_saving = false;
                 match res {
                     Ok(()) => {
-                        if let Some(detail) = this.detail.as_mut() {
-                            detail.title = next;
-                        }
-                        this.title_editing = false;
-                        this.hold(cx);
                         this.refresh(cx);
                     }
                     Err(err) => {
+                        if let (Some(prev), Some(detail)) = (previous_title, this.detail.as_mut())
+                            && detail.title == next
+                        {
+                            detail.title = prev;
+                        }
+                        this.title_editing = true;
+                        this.hold(cx);
                         let desc = if err.trim().is_empty() { "The host refused the new title.".to_owned() } else { err };
                         this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "The title could not be saved").description(desc), cx));
                     }
@@ -1234,11 +1351,23 @@ impl DetailView {
         .detach();
     }
 
-    // --- Reviewer picker (`PullRequestReviewerPicker`) ---
+    // --- Reviewer picker (`PullRequestReviewerPicker`, `pingdotgg/t3code#37733`) ---
+
+    fn reviewer_draft_key(candidate: &ReviewerCandidate) -> String {
+        format!("{:?}:{}", candidate.kind, candidate.id)
+    }
+
+    pub(super) fn is_reviewer_draft_selected(&self, candidate: &ReviewerCandidate) -> bool {
+        self.reviewer_draft.is_selected(&Self::reviewer_draft_key(candidate), candidate.is_requested)
+    }
 
     pub(super) fn toggle_reviewer_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.reviewer_picker_open = !self.reviewer_picker_open;
         if self.reviewer_picker_open {
+            self.reviewer_picker_open = false;
+            self.commit_reviewer_draft(cx);
+        } else {
+            self.reviewer_picker_open = true;
+            self.reviewer_draft = SelectionDraft::default();
             self.load_reviewer_candidates(cx);
             let input = self.ensure_reviewer_search_input(window, cx);
             input.update(cx, |input, cx| input.focus(window, cx));
@@ -1319,65 +1448,112 @@ impl DetailView {
     }
 
     pub(super) fn toggle_reviewer(&mut self, candidate: ReviewerCandidate, cx: &mut Context<Self>) {
-        if self.reviewer_request_pending.is_some() || !self.can_write_source_control(cx) {
+        if !self.can_write_source_control(cx) {
             return;
         }
-        let next_requested = !candidate.is_requested;
-        self.reviewer_request_pending = Some(candidate.id.clone());
-        let payload = request_reviewers_input(&self.reference, &candidate.id, candidate.kind, next_requested);
-        let task = mutations::write(self.state.read(cx), method::REQUEST_REVIEWERS, payload, cx);
+        let key = Self::reviewer_draft_key(&candidate);
+        let host_selected = candidate.is_requested;
+        self.reviewer_draft.toggle(key, candidate, host_selected);
         cx.notify();
+    }
+
+    /// Commits staged reviewer additions/removals on picker close in <=25-item batches
+    /// (`pingdotgg/t3code#37733`).
+    fn commit_reviewer_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = std::mem::take(&mut self.reviewer_draft);
+        if draft.is_empty() || !self.can_write_source_control(cx) {
+            return;
+        }
+        let mut current = HashMap::new();
+        for source in [self.reviewer_candidates.as_ref(), self.reviewer_search_result.as_ref()].into_iter().flatten() {
+            if let Ok(list) = source {
+                for candidate in &list.candidates {
+                    current.insert(Self::reviewer_draft_key(candidate), candidate.is_requested);
+                }
+            }
+        }
+        let changes = draft.changes(|key, item| current.get(key).copied().unwrap_or(item.is_requested));
+        if changes.is_empty() {
+            return;
+        }
+        // Optimistic immediate paint (`pingdotgg/t3code#32774`).
+        for candidate in &changes.add {
+            if let Some(Ok(list)) = self.reviewer_candidates.as_mut() {
+                for item in list.candidates.iter_mut().filter(|c| c.id == candidate.id && c.kind == candidate.kind) {
+                    item.is_requested = true;
+                }
+            }
+            if let Some(Ok(list)) = self.reviewer_search_result.as_mut() {
+                for item in list.candidates.iter_mut().filter(|c| c.id == candidate.id && c.kind == candidate.kind) {
+                    item.is_requested = true;
+                }
+            }
+            if let Some(detail) = self.detail.as_mut()
+                && !detail.reviewers.iter().any(|r| r.login.eq_ignore_ascii_case(&candidate.login))
+            {
+                detail.reviewers.push(t3_core::pull_requests::wire::Actor {
+                    is_bot: candidate.is_bot,
+                    login: candidate.login.clone(),
+                    name: candidate.name.clone(),
+                    avatar_url: candidate.avatar_url.clone(),
+                });
+            }
+        }
+        for candidate in &changes.remove {
+            if let Some(Ok(list)) = self.reviewer_candidates.as_mut() {
+                for item in list.candidates.iter_mut().filter(|c| c.id == candidate.id && c.kind == candidate.kind) {
+                    item.is_requested = false;
+                }
+            }
+            if let Some(Ok(list)) = self.reviewer_search_result.as_mut() {
+                for item in list.candidates.iter_mut().filter(|c| c.id == candidate.id && c.kind == candidate.kind) {
+                    item.is_requested = false;
+                }
+            }
+            if let Some(detail) = self.detail.as_mut() {
+                detail.reviewers.retain(|r| !r.login.eq_ignore_ascii_case(&candidate.login));
+            }
+        }
+        self.hold(cx);
+
+        let reference = self.reference.clone();
+        self.reviewer_request_pending = Some("batch".into());
+        cx.notify();
+        let mut tasks = Vec::new();
+        for chunk in change_batches(&changes.add) {
+            let refs: Vec<(String, _)> = chunk.iter().map(|c| (c.id.clone(), c.kind)).collect();
+            let payload = request_reviewers_batch_input(&reference, &refs, true);
+            tasks.push(mutations::write(self.state.read(cx), method::REQUEST_REVIEWERS, payload, cx));
+        }
+        for chunk in change_batches(&changes.remove) {
+            let refs: Vec<(String, _)> = chunk.iter().map(|c| (c.id.clone(), c.kind)).collect();
+            let payload = request_reviewers_batch_input(&reference, &refs, false);
+            tasks.push(mutations::write(self.state.read(cx), method::REQUEST_REVIEWERS, payload, cx));
+        }
         cx.spawn(async move |this, cx| {
-            let res = settle(task).await;
+            let mut failed: Option<String> = None;
+            for task in tasks {
+                if let Err(err) = settle(task).await {
+                    failed = Some(err);
+                    break;
+                }
+            }
             let _ = this.update(cx, |this, cx| {
                 this.reviewer_request_pending = None;
-                match res {
-                    Ok(()) => {
-                        if let Some(Ok(list)) = this.reviewer_candidates.as_mut() {
-                            for item in list.candidates.iter_mut().filter(|c| c.id == candidate.id && c.kind == candidate.kind) {
-                                item.is_requested = next_requested;
-                            }
-                        }
-                        if let Some(Ok(list)) = this.reviewer_search_result.as_mut() {
-                            for item in list.candidates.iter_mut().filter(|c| c.id == candidate.id && c.kind == candidate.kind) {
-                                item.is_requested = next_requested;
-                            }
-                        }
-                        if let Some(detail) = this.detail.as_mut() {
-                            if next_requested {
-                                if !detail.reviewers.iter().any(|r| r.login.eq_ignore_ascii_case(&candidate.login)) {
-                                    detail.reviewers.push(t3_core::pull_requests::wire::Actor {
-                                        is_bot: candidate.is_bot,
-                                        login: candidate.login.clone(),
-                                        name: candidate.name.clone(),
-                                        avatar_url: candidate.avatar_url.clone(),
-                                    });
-                                }
-                            } else {
-                                detail.reviewers.retain(|r| !r.login.eq_ignore_ascii_case(&candidate.login));
-                            }
-                        }
-                        this.hold(cx);
-                        let title = if next_requested {
-                            format!("Review requested from {}", candidate.login)
-                        } else {
-                            format!("Review request to {} taken back", candidate.login)
-                        };
-                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Success, title), cx));
+                match failed {
+                    None => {
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Success, "Reviewers updated"), cx));
                         this.refresh(cx);
                     }
-                    Err(err) => {
-                        let title = if next_requested {
-                            format!("Could not ask {} for a review", candidate.login)
-                        } else {
-                            format!("Could not take back the review request to {}", candidate.login)
-                        };
+                    Some(err) => {
                         let desc = if err.trim().is_empty() {
                             "The host refused it. Check that you have write access on this repository, and that they still have access to it.".to_owned()
                         } else {
                             err
                         };
-                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, title).description(desc), cx));
+                        this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "Could not update reviewers").description(desc), cx));
+                        this.refresh(cx);
+                        this.retry_reviewer_candidates(cx);
                     }
                 }
                 cx.notify();
@@ -1724,7 +1900,7 @@ impl DetailView {
         self.pending_reactions
             .get(subject_key)
             .filter(|overlay| overlay.signature == signature)
-            .map(|overlay| overlay.values.clone())
+            .map(|overlay| overlay.values.iter().map(|(&k, &(v, _))| (k, v)).collect())
             .unwrap_or_default()
     }
 
@@ -1732,13 +1908,15 @@ impl DetailView {
         if !self.can_write_source_control(cx) {
             return;
         }
+        self.reaction_seq = self.reaction_seq.wrapping_add(1);
+        let seq = self.reaction_seq;
         let subject_key = subject_id.clone().unwrap_or_else(|| "__pr__".to_owned());
         let entry = self.pending_reactions.entry(subject_key.clone()).or_default();
         if entry.signature != signature {
             entry.signature = signature.clone();
             entry.values.clear();
         }
-        entry.values.insert(content, reacted);
+        entry.values.insert(content, (reacted, seq));
         let payload = set_reaction_input(&self.reference, subject_id.as_deref(), content, reacted);
         let task = mutations::write(self.state.read(cx), method::SET_REACTION, payload, cx);
         cx.notify();
@@ -1748,7 +1926,10 @@ impl DetailView {
                 match res {
                     Ok(()) => this.refresh(cx),
                     Err(_) => {
-                        if let Some(overlay) = this.pending_reactions.get_mut(&subject_key) {
+                        // Only clear this failed write if no newer toggle superseded it (`pingdotgg/t3code#37853`).
+                        if let Some(overlay) = this.pending_reactions.get_mut(&subject_key)
+                            && overlay.values.get(&content).is_some_and(|&(_, current_seq)| current_seq == seq)
+                        {
                             overlay.values.remove(&content);
                         }
                         this.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Error, "The reaction could not be saved"), cx));
@@ -1994,7 +2175,15 @@ impl DetailView {
                 .child(option("pr-tab-summary", Icon::MessageSquare, Tab::Summary, "Summary", window, cx).child(tab_label("Summary")))
                 .child(option("pr-tab-guide", Icon::FileText, Tab::Guide, "Guide", window, cx).child(tab_label("Guide")))
                 .child(option("pr-tab-timeline", Icon::GitCommit, Tab::Timeline, "Timeline", window, cx).child(tab_label("Timeline")))
-                .child(option("pr-tab-code", Icon::FileDiff, Tab::Code, "Code", window, cx).child(tab_label("Code"))),
+                .child(
+                    option("pr-tab-code", Icon::FileDiff, Tab::Code, "Code", window, cx)
+                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.prefetch_code_diff(cx);
+                            }
+                        }))
+                        .child(tab_label("Code")),
+                ),
         )
     }
 
@@ -2640,6 +2829,64 @@ mod tests {
             });
             assert_eq!(selected_layer.get(), 99);
             assert!(closed.get());
+        });
+    }
+
+    #[gpui::test]
+    fn label_and_reviewer_pickers_stage_drafts_optimistically_on_close_and_reaction_seq_guards_races(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let reference = sample_ref();
+        let detail = sample_detail();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let view = cx.new(|cx| DetailView::new(state, WeakEntity::new_invalid(), reference, None, cx));
+            view.update(cx, |view, cx| {
+                view.detail = Some(detail);
+                view.label_candidates = Some(Ok(LabelCandidates {
+                    candidates: vec![
+                        LabelCandidate { name: "bug".into(), color: Some("ff0000".into()), description: None, is_applied: false },
+                        LabelCandidate { name: "docs".into(), color: Some("00ff00".into()), description: None, is_applied: true },
+                    ],
+                    truncated: false,
+                }));
+                view.detail.as_mut().unwrap().labels = vec![t3_core::pull_requests::wire::Label { name: "docs".into(), color: Some("00ff00".into()) }];
+
+                // Open label picker, toggle both labels locally without mutating detail yet.
+                view.toggle_label_picker(cx);
+                assert!(view.label_picker_open);
+                let bug = LabelCandidate { name: "bug".into(), color: Some("ff0000".into()), description: None, is_applied: false };
+                let docs = LabelCandidate { name: "docs".into(), color: Some("00ff00".into()), description: None, is_applied: true };
+                view.toggle_label_draft(bug.clone(), cx);
+                view.toggle_label_draft(docs.clone(), cx);
+                assert!(view.is_label_draft_selected(&bug));
+                assert!(!view.is_label_draft_selected(&docs));
+                assert_eq!(view.detail.as_ref().unwrap().labels.len(), 1);
+                assert_eq!(view.detail.as_ref().unwrap().labels[0].name, "docs");
+
+                // Closing commits the batch optimistically onto detail immediately (`#37733`, `#32774`).
+                view.toggle_label_picker(cx);
+                assert!(!view.label_picker_open);
+                let names: Vec<&str> = view.detail.as_ref().unwrap().labels.iter().map(|l| l.name.as_str()).collect();
+                assert_eq!(names, vec!["bug"]);
+
+                // Reaction sequence guard: rapid toggle twice -> older failure must not clear newer toggle (`#37853`).
+                view.toggle_reaction(None, ReactionContent::ThumbsUp, true, "sig".into(), cx);
+                let first_seq = view.reaction_seq;
+                view.toggle_reaction(None, ReactionContent::ThumbsUp, false, "sig".into(), cx);
+                let second_seq = view.reaction_seq;
+                assert!(second_seq > first_seq);
+                // Simulate older seq check failing — should NOT clear second_seq entry.
+                if let Some(overlay) = view.pending_reactions.get_mut("__pr__")
+                    && overlay.values.get(&ReactionContent::ThumbsUp).is_some_and(|&(_, s)| s == first_seq)
+                {
+                    overlay.values.remove(&ReactionContent::ThumbsUp);
+                }
+                assert_eq!(view.pending_reactions_for("__pr__", "sig").get(&ReactionContent::ThumbsUp), Some(&false));
+            });
         });
     }
 }

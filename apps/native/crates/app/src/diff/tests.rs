@@ -486,3 +486,103 @@ fn switching_viewed_target_flushes_pending_debounced_presses_before_reset(
     assert_eq!(payload["files"][0]["revision"], "2222222");
     let _ = reply.send(Ok(serde_json::json!({})));
 }
+
+#[gpui::test]
+fn pr_viewed_auto_folds_respects_explicit_unfold_and_collapse_all_preserves_hidden_tests(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (_runtime, panel, mut vcx) = setup_panel(cx);
+    let patch = "\
+diff --git a/src/app.rs b/src/app.rs
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/app.test.ts b/src/app.test.ts
+--- a/src/app.test.ts
++++ b/src/app.test.ts
+@@ -1 +1 @@
+-old test
++new test
+";
+    let parsed = Parsed::new(patch, false, None, None, None);
+    let target = ViewedTarget {
+        project_id: "proj-1".into(),
+        number: 12,
+        host: Some("github.com".into()),
+        repository: Some("acme/app".into()),
+        commit: None,
+        enabled: true,
+    };
+
+    panel.update(&mut vcx, |panel, cx| {
+        panel.show_external(
+            External { key: "pr:12".into(), parsed: Some(parsed), pending: false, error: None },
+            cx,
+        );
+        panel.set_viewed_target(Some(target.clone()), HashMap::new(), cx);
+        // Explicitly unfold src/app.rs before server Viewed marks arrive (`pingdotgg/t3code#37605`).
+        panel.set_folded(0, false, cx);
+        assert!(!panel.is_collapsed(0));
+
+        // Server Viewed marks arrive for both files: src/app.rs stays open (explicit choice),
+        // while src/app.test.ts auto-folds because it is Viewed with no explicit override.
+        let mut states = HashMap::new();
+        states.insert("src/app.rs".into(), FileViewedState::Viewed);
+        states.insert("src/app.test.ts".into(), FileViewedState::Viewed);
+        panel.set_viewed_target(Some(target.clone()), states, cx);
+        assert!(!panel.is_collapsed(0), "explicit reader unfold survives late Viewed state");
+        assert!(panel.is_collapsed(1), "viewed file without reader override auto-folds");
+
+        // Unfold the test file, hide test files, then Collapse All -> hidden test file keeps its fold (`pingdotgg/t3code#39213`).
+        panel.set_folded(1, false, cx);
+        assert!(!panel.is_collapsed(1));
+        panel.toggle_hide_test_files(cx);
+        panel.toggle_all_files(cx);
+        assert!(panel.is_collapsed(0));
+        panel.toggle_hide_test_files(cx);
+        assert!(!panel.is_collapsed(1), "hidden test file kept its open choice across Collapse All");
+    });
+}
+
+#[gpui::test]
+fn withheld_file_banner_triggers_callback_and_cut_lines_disable_expansion(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (_runtime, panel, mut vcx) = setup_panel(cx);
+    let loaded_paths: Rc<Mutex<Vec<String>>> = Rc::new(Mutex::new(Vec::new()));
+    let loaded_clone = loaded_paths.clone();
+    let placeholder = t3_core::diff::ReviewFile {
+        path: "dist/bundle.js".into(),
+        previous_path: None,
+        additions: 5000,
+        deletions: 0,
+        change_type: Some(t3_core::diff::ChangeKind::New),
+    }
+    .placeholder();
+    let parsed = Parsed::from_patch(
+        t3_core::diff::ParsedPatch::Files(vec![placeholder]),
+        true,
+        None,
+        None,
+        None,
+    );
+
+    panel.update(&mut vcx, |panel, cx| {
+        panel.set_on_load_withheld(move |path, _| loaded_clone.lock().unwrap().push(path));
+        panel.show_external(
+            External { key: "pr:99".into(), parsed: Some(parsed), pending: false, error: None },
+            cx,
+        );
+        let mut withheld = HashMap::new();
+        withheld.insert("dist/bundle.js".into(), super::WithheldFileStatus::Idle);
+        let cut = std::collections::HashSet::from(["dist/bundle.js".into()]);
+        panel.set_withheld_state(withheld, true, cut, cx);
+        panel.set_folded(0, false, cx);
+        assert!(!panel.can_expand_file(0));
+        panel.trigger_load_withheld("dist/bundle.js".into(), cx);
+    });
+    vcx.draw(point(px(0.), px(0.)), size(px(800.), px(240.)), |_, _| panel.clone().into_any_element());
+    assert_eq!(*loaded_paths.lock().unwrap(), vec!["dist/bundle.js".to_owned()]);
+}

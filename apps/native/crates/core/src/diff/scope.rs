@@ -40,6 +40,8 @@ impl Default for DiffSelection {
 
 impl DiffSelection {
     /// `selectTurn`: each request to reveal a file counts up, so repeating it reveals again.
+    /// Preserves trailing whitespace on `file_path` so files whose names end in whitespace still
+    /// reveal (`pingdotgg/t3code#37879`).
     pub fn turn(previous: &DiffSelection, turn_id: &str, file_path: Option<&str>) -> DiffSelection {
         let reveal_request_id = match previous {
             DiffSelection::Turn { reveal_request_id, .. } => reveal_request_id + 1,
@@ -47,7 +49,7 @@ impl DiffSelection {
         };
         DiffSelection::Turn {
             turn_id: turn_id.to_owned(),
-            file_path: file_path.map(str::trim).filter(|path| !path.is_empty()).map(str::to_owned),
+            file_path: file_path.filter(|path| !path.is_empty()).map(str::to_owned),
             reveal_request_id,
         }
     }
@@ -365,7 +367,21 @@ pub fn decode_diff_preview(value: &Value, kind: PreviewSourceKind) -> Option<Dif
         })
     });
     let mut files: Vec<_> = source.get("files").and_then(Value::as_array).into_iter().flatten().filter_map(|file| {
-        Some(super::ReviewFile { path: file.get("path")?.as_str()?.to_owned(), previous_path: file.get("previousPath").and_then(Value::as_str).map(str::to_owned), additions: file.get("additions").and_then(Value::as_u64).unwrap_or(0), deletions: file.get("deletions").and_then(Value::as_u64).unwrap_or(0) })
+        let change_type = file.get("changeType").and_then(Value::as_str).and_then(|kind| match kind {
+            "change" => Some(super::ChangeKind::Modified),
+            "new" => Some(super::ChangeKind::New),
+            "deleted" => Some(super::ChangeKind::Deleted),
+            "rename-pure" => Some(super::ChangeKind::RenamePure),
+            "rename-changed" => Some(super::ChangeKind::RenameChanged),
+            _ => None,
+        });
+        Some(super::ReviewFile {
+            path: file.get("path")?.as_str()?.to_owned(),
+            previous_path: file.get("previousPath").and_then(Value::as_str).map(str::to_owned),
+            change_type,
+            additions: file.get("additions").and_then(Value::as_u64).unwrap_or(0),
+            deletions: file.get("deletions").and_then(Value::as_u64).unwrap_or(0),
+        })
     }).collect();
     files.sort_by(|a,b| crate::terminal::natural_cmp(&a.path.to_lowercase(), &b.path.to_lowercase()));
     Some(DiffPreviewSource {

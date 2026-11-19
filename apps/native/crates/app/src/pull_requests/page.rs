@@ -17,6 +17,10 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use t3_client::store;
+use t3_core::issues::saved_views::{
+    create_saved_view, decode_saved_views, delete_saved_view, rename_saved_view,
+    update_saved_view_preferences,
+};
 use t3_core::pull_requests::assignment::{
     AssignableProject, AssignedProjectColumnRow, EnvironmentInfo, HostAvailability, project_assignment_rows, remember_hosts, reset_hosts,
 };
@@ -24,6 +28,9 @@ use t3_core::pull_requests::cache::{LIST_CACHE_KEY, PersistedListCache, Persiste
 use t3_core::pull_requests::editing::patch_list_entry;
 use t3_core::pull_requests::list::{Group, Shown, entry_key, needs_stats, shown_groups};
 use t3_core::pull_requests::query::parse_query;
+use t3_core::pull_requests::saved_views::{
+    PR_SAVED_VIEWS_KEY, PR_SAVED_VIEW_PLACEHOLDER, PrSavedView, apply_saved_view_patch,
+};
 use t3_core::pull_requests::wire::{Action, Activity, Detail, FilterOptions, ListResult, ListStats, MergeMethod, PrState, Stack, Summary, decode};
 use t3_core::pull_requests::{
     ListPreferences, MAX_PAGE_SIZE, PAGE_SIZE, PREFERENCES_KEY, PrRef, SEARCH_DEBOUNCE_MS, action_done_label, action_failed_label, action_input, list_accepts, list_input, method,
@@ -90,12 +97,22 @@ impl Drop for Refreshes {
 const REFRESH_RETRY_MIN: Duration = Duration::from_secs(1);
 const REFRESH_RETRY_MAX: Duration = Duration::from_secs(30);
 
+pub(super) struct SavedViewEditor {
+    pub editing_id: Option<String>,
+    pub input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
 pub struct PullRequestsPage {
     pub(super) state: Entity<AppState>,
     pub(super) prefs: ListPreferences,
     pub(super) search: Entity<InputState>,
     pub(super) typed: String,
     pub(super) sent: String,
+    pub(super) saved_views: Vec<PrSavedView>,
+    pub(super) selected_view_id: Option<String>,
+    pub(super) saved_view_editor: Option<SavedViewEditor>,
+    next_view_seq: u64,
     pub(super) data: ListData,
     pub(super) groups: Vec<Group>,
     pub(super) rows: Vec<Row>,
@@ -150,6 +167,7 @@ impl Focusable for PullRequestsPage {
 impl PullRequestsPage {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let prefs: ListPreferences = store::load_ui_state(PREFERENCES_KEY).and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
+        let saved_views = decode_saved_views(store::load_ui_state(PR_SAVED_VIEWS_KEY));
         let list_cache = PersistedListCache::from_value(store::load_ui_state(LIST_CACHE_KEY));
         let stats_cache = PersistedStatsCache::from_value(store::load_ui_state(STATS_CACHE_KEY));
         let typed = prefs.q.clone().unwrap_or_default();
@@ -173,6 +191,10 @@ impl PullRequestsPage {
             search,
             sent: typed.clone(),
             typed,
+            saved_views,
+            selected_view_id: None,
+            saved_view_editor: None,
+            next_view_seq: 0,
             data: ListData { page_size: PAGE_SIZE, ..Default::default() },
             groups: Vec::new(),
             rows: Vec::new(),
@@ -799,6 +821,125 @@ impl PullRequestsPage {
         cx.notify();
     }
 
+    // --- Saved PR filter views (`pingdotgg/t3code#29387`) ---
+
+    fn save_views(&self) {
+        store::save_ui_state(PR_SAVED_VIEWS_KEY, &self.saved_views);
+    }
+
+    pub(super) fn current_saved_preferences(&self) -> ListPreferences {
+        let mut current = self.prefs.clone();
+        let trimmed = self.typed.trim();
+        current.q = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        current.normalized()
+    }
+
+    pub(super) fn apply_saved_view(
+        &mut self,
+        view_id: String,
+        preferences: ListPreferences,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_view_id = Some(view_id);
+        let next = apply_saved_view_patch(&self.prefs, &preferences);
+        let q = next.q.clone().unwrap_or_default();
+        self.typed = q.clone();
+        self.sent = q.trim().to_owned();
+        self._debounce = None;
+        self.search.update(cx, |input, cx| input.set_value(q, window, cx));
+        self.update_prefs(move |prefs| *prefs = next, cx);
+    }
+
+    pub(super) fn open_saved_view_editor(
+        &mut self,
+        editing_id: Option<String>,
+        initial_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(PR_SAVED_VIEW_PLACEHOLDER)
+                .default_value(initial_name)
+        });
+        let subscription = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::Change => cx.notify(),
+            InputEvent::PressEnter { .. } => this.submit_saved_view_editor(cx),
+            _ => {}
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.saved_view_editor = Some(SavedViewEditor {
+            editing_id,
+            input,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn close_saved_view_editor(&mut self, cx: &mut Context<Self>) {
+        if self.saved_view_editor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn submit_saved_view_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.saved_view_editor.as_ref() else {
+            return;
+        };
+        let name = editor.input.read(cx).value().to_string();
+        let editing_id = editor.editing_id.clone();
+        match editing_id {
+            Some(id) => match rename_saved_view(&mut self.saved_views, &id, &name) {
+                Ok(true) => {
+                    self.save_views();
+                    self.selected_view_id = Some(id);
+                    self.saved_view_editor = None;
+                    cx.notify();
+                }
+                Ok(false) => {
+                    if let Some(ed) = self.saved_view_editor.as_mut() {
+                        ed.editing_id = None;
+                    }
+                    let toast = Toast::new(ToastKind::Error, "This saved view was removed")
+                        .description("Your name has been kept. Save it as a new view or cancel.");
+                    self.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                    cx.notify();
+                }
+                Err(_) => {}
+            },
+            None => {
+                let id = format!("pr-view-{}-{}", now_ms(), self.next_view_seq);
+                self.next_view_seq += 1;
+                let normalized = self.current_saved_preferences();
+                if let Ok(saved_id) = create_saved_view(&mut self.saved_views, id, &name, normalized) {
+                    self.save_views();
+                    self.selected_view_id = Some(saved_id);
+                    self.saved_view_editor = None;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    pub(super) fn update_active_saved_view(&mut self, view_id: &str, cx: &mut Context<Self>) {
+        let normalized = self.current_saved_preferences();
+        if update_saved_view_preferences(&mut self.saved_views, view_id, normalized) {
+            self.save_views();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn delete_active_saved_view(&mut self, view_id: &str, cx: &mut Context<Self>) {
+        if delete_saved_view(&mut self.saved_views, view_id) {
+            self.save_views();
+            if self.selected_view_id.as_deref() == Some(view_id) {
+                self.selected_view_id = None;
+            }
+            cx.notify();
+        }
+    }
+
     /// A finished action. With the host's reply the row shows what the host said, and leaves a
     /// listing that no longer takes it (`patchPullRequestListEntries`); without one, what the
     /// action implies, until the next host read.
@@ -1076,8 +1217,13 @@ impl Render for PullRequestsPage {
         let detail_width = (f32::from(window.viewport_size().width) / 2.).max(DETAIL_MIN_WIDTH);
         let projects_col = self.render_project_assignment_column(cx);
         let preview_card = self.preview.render_card(cx);
+        let saved_view_dialog = self
+            .saved_view_editor
+            .as_ref()
+            .map(|editor| super::toolbar::render_saved_view_dialog(self, editor, cx));
         h_flex()
             .id("pull-requests-page")
+            .relative()
             .track_focus(&self.focus)
             .size_full()
             .min_w_0()
@@ -1134,6 +1280,7 @@ impl Render for PullRequestsPage {
                     .border_color(hsla(p.border))
                     .child(detail)
             }))
+            .children(saved_view_dialog)
     }
 }
 
@@ -1272,6 +1419,63 @@ mod tests {
             assert_eq!(total_after, 3);
             assert_eq!(rows_after.iter().find(|r| r.project_id == "p1").map(|r| r.pr_count), Some(2));
             assert_eq!(rows_after.iter().find(|r| r.project_id == "p2").map(|r| r.pr_count), Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn saved_pr_views_create_apply_modify_rename_delete_preserving_merge_method_and_selection(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        let (page, vcx) = cx.add_window_view(|window, cx| PullRequestsPage::new(state.clone(), window, cx));
+        let selected_ref = PrRef {
+            project_id: "p1".into(),
+            host: Some("github.com".into()),
+            repository: "acme/app".into(),
+            number: 99,
+        };
+        page.update_in(vcx, |page, window, cx| {
+            page.saved_views.clear();
+            page.prefs.merge_method = Some(MergeMethod::Squash);
+            page.prefs.state = t3_core::pull_requests::list::ListState::Closed;
+            page.typed = "label:bug".into();
+            page.selected = Some(selected_ref.clone());
+
+            // Create a saved view from current preferences.
+            page.open_saved_view_editor(None, "Closed bugs".into(), window, cx);
+            page.submit_saved_view_editor(cx);
+            assert_eq!(page.saved_views.len(), 1);
+            assert_eq!(page.saved_views[0].name, "Closed bugs");
+            assert_eq!(page.saved_views[0].preferences.merge_method, None);
+            let id = page.saved_views[0].id.clone();
+
+            // Mutate preferences, then re-apply saved view: merge_method and selected PR survive.
+            page.prefs.state = t3_core::pull_requests::list::ListState::Open;
+            page.prefs.merge_method = Some(MergeMethod::Rebase);
+            let saved_prefs = page.saved_views[0].preferences.clone();
+            page.apply_saved_view(id.clone(), saved_prefs, window, cx);
+            assert_eq!(page.prefs.state, t3_core::pull_requests::list::ListState::Closed);
+            assert_eq!(page.prefs.merge_method, Some(MergeMethod::Rebase));
+            assert_eq!(page.selected.as_ref(), Some(&selected_ref));
+            assert_eq!(page.typed, "label:bug");
+
+            // Update, rename, and delete.
+            page.typed = "label:urgent".into();
+            page.update_active_saved_view(&id, cx);
+            assert_eq!(page.saved_views[0].preferences.q.as_deref(), Some("label:urgent"));
+
+            page.open_saved_view_editor(Some(id.clone()), "Urgent closed".into(), window, cx);
+            page.submit_saved_view_editor(cx);
+            assert_eq!(page.saved_views[0].name, "Urgent closed");
+
+            page.delete_active_saved_view(&id, cx);
+            assert!(page.saved_views.is_empty());
+            assert!(page.selected_view_id.is_none());
         });
     }
 }

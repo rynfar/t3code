@@ -11,6 +11,7 @@ mod completion;
 mod expand;
 mod file_actions;
 mod file_kind;
+mod fold;
 mod parse;
 mod hunks;
 mod reveal;
@@ -51,10 +52,15 @@ pub use expand::{
 pub use parse::parse_patch;
 pub use file_actions::{
     FileContextMenuAction, FileContextMenuCapabilities, file_context_menu_error_title,
-    file_context_menu_open_request, resolve_diff_path_for_workspace,
-    resolve_file_context_menu_absolute_path,
+    file_context_menu_open_request, format_diff_path_for_clipboard,
+    resolve_diff_path_for_workspace, resolve_file_context_menu_absolute_path,
 };
 pub use file_kind::{ChangedFileKind, classify_changed_file, is_test_changed_file};
+pub use fold::{
+    DiffFoldGroup, DiffFoldOverride, FileDiffFoldChoices, PullRequestDiffFolds,
+    are_all_diff_files_collapsed, cut_line_note, cut_line_note_start, has_cut_lines,
+    is_file_diff_collapsed, toggle_all_diff_files, with_file_diff_fold,
+};
 pub use hunks::FileHunks;
 pub use reveal::{
     FileReveal, FileRevealTarget, RevealAction, addition_line, expand_partial_diff_to_line,

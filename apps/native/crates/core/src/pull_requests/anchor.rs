@@ -20,6 +20,9 @@ pub struct Range {
     pub side: Side,
     pub end: u64,
     pub end_side: Side,
+    /// A GitLab line code's old-side counter: the line it names when that old line was removed
+    /// (`pingdotgg/t3code#34662`).
+    pub old_line: Option<u64>,
 }
 
 /// `PullRequestAnchor`.
@@ -81,7 +84,10 @@ fn path_tab(path: &str) -> Option<Anchor> {
 }
 
 static GITHUB_DIFF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^diff-([a-f0-9]+)(?:([LR])(\d+)(?:-([LR])(\d+))?)?$").unwrap());
-static GITLAB_DIFF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^([a-f0-9]{40})(?:_(\d+)_(\d+))?$").unwrap());
+static GITLAB_RAPID_DIFF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^line_([a-f0-9]{9})_(A?)(\d+)$").unwrap());
+static GITLAB_DIFF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:diff-content-)?([a-f0-9]{40})(?:_(\d+)_(\d+))?$").unwrap());
+static GITLAB_DIFFS_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)/-/merge_requests/\d+/diffs/?$").unwrap());
+static GITLAB_FILE_SHA1: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^[a-f0-9]{40}$").unwrap());
 static TIMELINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:(?:issuecomment-|pullrequestreview-|discussion_r|r|commitcomment-|event-|note_|comment-)\d+|discussion-diff-\d+(?:[LR]\d+(?:-[LR]\d+)?)?)$").unwrap()
 });
@@ -95,11 +101,71 @@ fn side(letter: &str) -> Side {
     if letter.eq_ignore_ascii_case("L") { Side::Left } else { Side::Right }
 }
 
+fn gitlab_line(start: u64, side: Side, old_line: Option<u64>) -> Option<Range> {
+    if !(1..=9_007_199_254_740_991).contains(&start) {
+        return None;
+    }
+    let old = old_line.filter(|line| (1..=9_007_199_254_740_991).contains(line));
+    Some(Range { start, side, end: start, end_side: side, old_line: old })
+}
+
+/// GitLab diff anchors: Rapid Diffs `line_<9-hex>_[A]<line>`, `diff-content-<40-hex>`,
+/// `<40-hex>_<old>_<new>`, or `?file=<40-hex>` on `/-/merge_requests/<n>/diffs`
+/// (`pingdotgg/t3code#34662`).
+fn gitlab_diff_anchor(anchor: &str, file_param: Option<&str>) -> Option<Anchor> {
+    if let Some(rapid) = GITLAB_RAPID_DIFF.captures(anchor) {
+        let digest = rapid[1].to_lowercase();
+        let line = rapid[3].parse::<u64>().unwrap_or(0);
+        let s = if !rapid[2].is_empty() { Side::Right } else { Side::Left };
+        return Some(Anchor::Diff { digest, range: gitlab_line(line, s, None) });
+    }
+    if let Some(code) = GITLAB_DIFF.captures(anchor) {
+        let digest = code[1].to_lowercase();
+        let (Some(old), Some(new)) = (code.get(2), code.get(3)) else {
+            return Some(Anchor::Diff { digest, range: None });
+        };
+        let old_line = old.as_str().parse::<u64>().unwrap_or(0);
+        let new_line = new.as_str().parse::<u64>().unwrap_or(0);
+        let range = if new_line == 0 {
+            gitlab_line(old_line, Side::Left, None)
+        } else {
+            gitlab_line(new_line, Side::Right, Some(old_line))
+        };
+        return Some(Anchor::Diff { digest, range });
+    }
+    if anchor.is_empty()
+        && let Some(file) = file_param
+        && GITLAB_FILE_SHA1.is_match(file)
+    {
+        return Some(Anchor::Diff { digest: file.to_lowercase(), range: None });
+    }
+    None
+}
+
+/// `resolvePullRequestAnchorRange` (`pingdotgg/t3code#34662`): once the diff is loaded, switches
+/// a GitLab `<sha1>_<old>_<new>` anchor to the left side when `old_line` was removed.
+pub fn resolve_anchor_range(range: Range, is_removed_line: impl FnOnce(u64) -> bool) -> Range {
+    if let Some(old_line) = range.old_line
+        && is_removed_line(old_line)
+    {
+        return gitlab_line(old_line, Side::Left, None).unwrap_or(range);
+    }
+    range
+}
+
 /// `parsePullRequestAnchor`.
 pub fn parse_anchor(url: &str) -> Option<Anchor> {
     let parsed = url::Url::parse(url).ok()?;
     let fallback = path_tab(parsed.path());
     let anchor = url_hash(url);
+    let file_param = if GITLAB_DIFFS_PATH.is_match(parsed.path()) {
+        parsed.query_pairs().find(|(k, _)| k == "file").map(|(_, v)| v.into_owned())
+    } else {
+        None
+    };
+    if let Some(gitlab) = gitlab_diff_anchor(&anchor, file_param.as_deref()) {
+        return Some(gitlab);
+    }
     if anchor.is_empty() {
         return fallback;
     }
@@ -112,17 +178,7 @@ pub fn parse_anchor(url: &str) -> Option<Anchor> {
         let (Some(start), Some(end)) = (start, end) else { return fallback };
         let start_side = side(start_side.as_str());
         let end_side = diff.get(4).map_or(start_side, |end| side(end.as_str()));
-        return Some(Anchor::Diff { digest, range: Some(Range { start, side: start_side, end, end_side }) });
-    }
-    // GitLab: SHA-1 of the path, then old and new line counters. A removed line still carries a
-    // new counter, so the new side wins unless the file has none (a 0 for a deleted file).
-    if let Some(gitlab) = GITLAB_DIFF.captures(&anchor) {
-        let digest = gitlab[1].to_lowercase();
-        let (Some(old), Some(new)) = (gitlab.get(2), gitlab.get(3)) else { return Some(Anchor::Diff { digest, range: None }) };
-        let new_line = new.as_str().parse::<u64>().unwrap_or(0);
-        let (side, line) = if new_line >= 1 { (Side::Right, line_number(new.as_str())) } else { (Side::Left, line_number(old.as_str())) };
-        let Some(line) = line else { return fallback };
-        return Some(Anchor::Diff { digest, range: Some(Range { start: line, side, end: line, end_side: side }) });
+        return Some(Anchor::Diff { digest, range: Some(Range { start, side: start_side, end, end_side, old_line: None }) });
     }
     if TIMELINE.is_match(&anchor) {
         return Some(Anchor::Timeline(normalize_comment_anchor(&anchor)));
@@ -161,15 +217,15 @@ pub fn resolve_review_anchor(anchor: &str, comments: &[super::wire::Comment], re
 }
 
 /// `pullRequestDiffPathMatches`: the host's digest of a file path, by its length (GitHub MD5
-/// legacy / SHA-256 current, GitLab SHA-1).
+/// legacy / SHA-256 current, GitLab SHA-1 or 9-char Rapid Diffs prefix).
 pub fn diff_path_matches(digest: &str, path: &str) -> bool {
     let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    let hashed = match digest.len() {
-        32 => hex(&md5_digest(path.as_bytes())),
-        40 => hex(&sha1_digest(path.as_bytes())),
-        _ => hex(&Sha256::digest(path.as_bytes())),
-    };
-    digest == hashed
+    match digest.len() {
+        9 => hex(&sha1_digest(path.as_bytes())).starts_with(digest),
+        32 => digest == hex(&md5_digest(path.as_bytes())),
+        40 => digest == hex(&sha1_digest(path.as_bytes())),
+        _ => digest == hex(&Sha256::digest(path.as_bytes())),
+    }
 }
 
 /// RFC 1321 MD5 for matching legacy GitHub diff file path digests without extra crate deps.
@@ -271,12 +327,21 @@ fn sha1_digest(input: &[u8]) -> [u8; 20] {
     out
 }
 
-static LINK_COMMIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)/pull/\d+/commits/([a-f0-9]{40})/?$").unwrap());
+static LINK_COMMIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)/(?:pull|-/merge_requests)/\d+/(?:commits|diffs)/([a-f0-9]{40})/?$").unwrap());
 
-/// `pullRequestLinkCommit`: the commit a GitHub pull request commit link names.
+/// `pullRequestLinkCommit`: the commit a GitHub PR commit link or GitLab MR `?commit_id=` link names.
 pub fn link_commit(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
-    LINK_COMMIT.captures(parsed.path()).map(|captures| captures[1].to_owned())
+    if let Some(captures) = LINK_COMMIT.captures(parsed.path()) {
+        return Some(captures[1].to_owned());
+    }
+    if GITLAB_DIFFS_PATH.is_match(parsed.path()) {
+        let sha = parsed.query_pairs().find(|(k, _)| k == "commit_id").map(|(_, v)| v.into_owned())?;
+        if GITLAB_FILE_SHA1.is_match(&sha) {
+            return Some(sha);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -309,23 +374,43 @@ mod tests {
         assert_eq!(parse_anchor(&format!("{PR}/files#diff-ABC")), Some(Anchor::Diff { digest: "abc".into(), range: None }));
         assert_eq!(
             parse_anchor(&format!("{PR}/files#diff-abcL3-R5")),
-            Some(Anchor::Diff { digest: "abc".into(), range: Some(Range { start: 3, side: Side::Left, end: 5, end_side: Side::Right }) })
+            Some(Anchor::Diff { digest: "abc".into(), range: Some(Range { start: 3, side: Side::Left, end: 5, end_side: Side::Right, old_line: None }) })
         );
         assert_eq!(
             parse_anchor(&format!("{PR}/files#diff-abcR8")),
-            Some(Anchor::Diff { digest: "abc".into(), range: Some(Range { start: 8, side: Side::Right, end: 8, end_side: Side::Right }) })
+            Some(Anchor::Diff { digest: "abc".into(), range: Some(Range { start: 8, side: Side::Right, end: 8, end_side: Side::Right, old_line: None }) })
         );
         assert_eq!(parse_anchor(&format!("{PR}/files#diff-abcR0")), Some(Anchor::Code), "a line zero falls back to the path's tab");
         let sha = "b".repeat(40);
         assert_eq!(
             parse_anchor(&format!("https://gitlab.com/a/b/-/merge_requests/1/diffs#{sha}_4_0")),
-            Some(Anchor::Diff { digest: sha.clone(), range: Some(Range { start: 4, side: Side::Left, end: 4, end_side: Side::Left }) })
+            Some(Anchor::Diff { digest: sha.clone(), range: Some(Range { start: 4, side: Side::Left, end: 4, end_side: Side::Left, old_line: None }) })
         );
         assert_eq!(
             parse_anchor(&format!("https://gitlab.com/a/b/-/merge_requests/1/diffs#{sha}_4_6")),
-            Some(Anchor::Diff { digest: sha.clone(), range: Some(Range { start: 6, side: Side::Right, end: 6, end_side: Side::Right }) })
+            Some(Anchor::Diff { digest: sha.clone(), range: Some(Range { start: 6, side: Side::Right, end: 6, end_side: Side::Right, old_line: Some(4) }) })
         );
-        assert_eq!(parse_anchor(&format!("https://gitlab.com/a/b/-/merge_requests/1/diffs#{sha}")), Some(Anchor::Diff { digest: sha, range: None }));
+        assert_eq!(parse_anchor(&format!("https://gitlab.com/a/b/-/merge_requests/1/diffs#{sha}")), Some(Anchor::Diff { digest: sha.clone(), range: None }));
+        // GitLab Rapid Diffs, diff-content, ?file=, ?commit_id=, and removed-line resolution (`pingdotgg/t3code#34662`).
+        let rapid = format!("https://gitlab.com/a/b/-/merge_requests/1/diffs#line_{}_A12", &sha[..9]);
+        assert_eq!(
+            parse_anchor(&rapid),
+            Some(Anchor::Diff { digest: sha[..9].to_owned(), range: Some(Range { start: 12, side: Side::Right, end: 12, end_side: Side::Right, old_line: None }) })
+        );
+        assert_eq!(
+            parse_anchor(&format!("https://gitlab.com/a/b/-/merge_requests/1/diffs?file={sha}")),
+            Some(Anchor::Diff { digest: sha.clone(), range: None })
+        );
+        assert_eq!(
+            link_commit(&format!("https://gitlab.com/a/b/-/merge_requests/1/diffs?commit_id={sha}")),
+            Some(sha.clone())
+        );
+        let removed_resolved = resolve_anchor_range(
+            Range { start: 6, side: Side::Right, end: 6, end_side: Side::Right, old_line: Some(4) },
+            |old| old == 4,
+        );
+        assert_eq!(removed_resolved, Range { start: 4, side: Side::Left, end: 4, end_side: Side::Left, old_line: None });
+        assert!(diff_path_matches("c46b6f338", "src/a.rs"));
     }
 
     #[test]

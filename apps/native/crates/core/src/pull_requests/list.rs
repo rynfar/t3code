@@ -222,14 +222,16 @@ pub fn compare_by_recency(left: &ListEntry, right: &ListEntry) -> Ordering {
 }
 
 /// `scorePullRequestMatch`: host search also matches bodies and commits, which score lowest.
+/// Numeric searches that do not match the PR number still fall through to title/branch/author/repo
+/// scoring so title matches rank above description-only matches (`pingdotgg/t3code#33692`).
 pub fn score_match(entry: &ListEntry, query: &str) -> u32 {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return 0;
     }
     let number = needle.strip_prefix('#').unwrap_or(&needle);
-    if !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()) {
-        return if entry.number.to_string() == number { 100 } else { 0 };
+    if entry.number.to_string() == number {
+        return 100;
     }
     let title = entry.title.to_lowercase();
     let terms: Vec<&str> = needle.split_whitespace().collect();
@@ -388,6 +390,12 @@ pub fn shown_groups(input: &Shown) -> Vec<Group> {
         .collect();
     if input.text.is_empty() {
         rows.sort_by(|left, right| compare_by_recency(&input.entries[*left], &input.entries[*right]));
+    } else {
+        rows.sort_by(|left, right| {
+            score_match(&input.entries[*right], input.text)
+                .cmp(&score_match(&input.entries[*left], input.text))
+                .then_with(|| compare_by_recency(&input.entries[*left], &input.entries[*right]))
+        });
     }
     let mut groups = if input.involvement == Involvement::All {
         group_by_involvement(input.entries, &rows, input.viewers)
@@ -511,6 +519,107 @@ pub fn label_color(color: Option<&str>) -> Option<u32> {
 /// `withDiffStat`: GitHub listings omit line counts, which `pullRequests.listStats` fills in.
 pub fn needs_stats(entry: &ListEntry) -> bool {
     entry.additions == 0 && entry.deletions == 0
+}
+
+/// One pull request entry tagged with the environment that answered it
+/// (`EnvironmentPullRequestEntry` in `pullRequestList.logic.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentListEntry {
+    pub environment_id: String,
+    pub entry: ListEntry,
+}
+
+/// `mergePullRequestLists` (`pingdotgg/t3code#37704`): deduplicates pull requests across servers
+/// by `entry.url`. The first environment to answer keeps a pull request that several servers read;
+/// multiple slices from the same environment keep the newer `updated_at`.
+pub fn merge_pull_request_lists(answers: &[(&str, &[ListEntry])]) -> Vec<EnvironmentListEntry> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_url: HashMap<String, EnvironmentListEntry> = HashMap::new();
+    for &(environment_id, entries) in answers {
+        for entry in entries {
+            match by_url.get(&entry.url) {
+                None => {
+                    order.push(entry.url.clone());
+                    by_url.insert(
+                        entry.url.clone(),
+                        EnvironmentListEntry {
+                            environment_id: environment_id.to_owned(),
+                            entry: entry.clone(),
+                        },
+                    );
+                }
+                Some(held)
+                    if held.environment_id == environment_id
+                        && entry.updated_at > held.entry.updated_at =>
+                {
+                    by_url.insert(
+                        entry.url.clone(),
+                        EnvironmentListEntry {
+                            environment_id: environment_id.to_owned(),
+                            entry: entry.clone(),
+                        },
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    order.into_iter().filter_map(|url| by_url.remove(&url)).collect()
+}
+
+/// `partitionPullRequestsWithPriority` (`pingdotgg/t3code#37704`): partitions entries into
+/// Authored, ReviewRequested, and Others matching by `entry.url` so cross-environment priority
+/// reads never list the same pull request twice.
+pub fn partition_with_priority(
+    entries: &[EnvironmentListEntry],
+    authored: &[EnvironmentListEntry],
+    review_requested: &[EnvironmentListEntry],
+) -> Vec<(GroupKey, Vec<EnvironmentListEntry>)> {
+    let mut authored_order: Vec<String> = Vec::new();
+    let mut authored_by_url: HashMap<String, EnvironmentListEntry> = HashMap::new();
+    for item in authored {
+        if !authored_by_url.contains_key(&item.entry.url) {
+            authored_order.push(item.entry.url.clone());
+            authored_by_url.insert(item.entry.url.clone(), item.clone());
+        }
+    }
+    let mut review_order: Vec<String> = Vec::new();
+    let mut review_by_url: HashMap<String, EnvironmentListEntry> = HashMap::new();
+    for item in review_requested {
+        if authored_by_url.contains_key(&item.entry.url) {
+            continue;
+        }
+        if !review_by_url.contains_key(&item.entry.url) {
+            review_order.push(item.entry.url.clone());
+            review_by_url.insert(item.entry.url.clone(), item.clone());
+        }
+    }
+    let mut others = Vec::new();
+    for item in entries {
+        let url = &item.entry.url;
+        if authored_by_url.contains_key(url) {
+            authored_by_url.insert(url.clone(), item.clone());
+        } else if review_by_url.contains_key(url) {
+            review_by_url.insert(url.clone(), item.clone());
+        } else {
+            others.push(item.clone());
+        }
+    }
+    let authored_vec: Vec<EnvironmentListEntry> =
+        authored_order.into_iter().filter_map(|url| authored_by_url.remove(&url)).collect();
+    let review_vec: Vec<EnvironmentListEntry> =
+        review_order.into_iter().filter_map(|url| review_by_url.remove(&url)).collect();
+    let mut groups = Vec::new();
+    if !authored_vec.is_empty() {
+        groups.push((GroupKey::Authored, authored_vec));
+    }
+    if !review_vec.is_empty() {
+        groups.push((GroupKey::ReviewRequested, review_vec));
+    }
+    if !others.is_empty() {
+        groups.push((GroupKey::Others, others));
+    }
+    groups
 }
 
 #[cfg(test)]

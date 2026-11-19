@@ -11,23 +11,33 @@ use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable, FontWeight, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString, Styled, Task, WeakEntity,
     Window, div, prelude::*, px,
 };
+use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_core::composer::review::{Selection, Side as DiffSide, build_diff_comment};
 use t3_core::diff::{FileDiff, LineKind};
 use t3_core::pull_requests::editing::allowed_review_verdicts;
 use t3_core::pull_requests::guide::{TourProgress, excerpt_rows, letter_stop_notes, stop_subline};
+use t3_core::pull_requests::review::{PendingReviewComment, ReviewPosition, pending_comment_from_diff};
 use t3_core::pull_requests::wire::{DiffResult, ReviewGuide, ReviewGuideResult, ReviewGuideRun, ReviewGuideStop, decode};
 use t3_core::pull_requests::{PrRef, failure_message, method};
 
 use super::controls::{BadgeKind, Button, Size, Variant, badge};
 use super::detail::DetailView;
 use super::{read, settle};
-use crate::app_state::AppState;
+use crate::app_state::{AppState, uuid_v4};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::transcript::markdown::{MarkdownStore, prose};
 
 const FAILURE_HINT: &str = "Check the review guide model in Settings → Source control.";
 const MAX_DIFF_SLICES: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuideCommentTarget {
+    path: String,
+    line: u32,
+    side: DiffSide,
+}
 
 pub struct GuideTab {
     state: Entity<AppState>,
@@ -42,6 +52,11 @@ pub struct GuideTab {
     diff_files: Vec<FileDiff>,
     diff_loaded_sha: Option<String>,
     diff_error: Option<String>,
+    /// Files expanded inline under "Also in this stop" (`pingdotgg/t3code#38858`).
+    expanded_files: HashSet<String>,
+    /// Active inline review comment target inside an excerpt or expanded stop file (`pingdotgg/t3code#38858`).
+    comment_target: Option<GuideCommentTarget>,
+    comment_input: Option<Entity<TextareaState>>,
     focus: FocusHandle,
     needs_focus: bool,
     scroll: ScrollHandle,
@@ -56,8 +71,17 @@ impl Focusable for GuideTab {
     }
 }
 
-fn wanted_excerpt_paths(guide: &ReviewGuide) -> HashSet<String> {
-    guide.stops.iter().flat_map(|stop| stop.excerpts.iter().map(|e| e.path.clone())).collect()
+fn wanted_guide_paths(guide: &ReviewGuide) -> HashSet<String> {
+    guide
+        .stops
+        .iter()
+        .flat_map(|stop| {
+            stop.excerpts
+                .iter()
+                .map(|e| e.path.clone())
+                .chain(stop.files.iter().map(|f| f.path.clone()))
+        })
+        .collect()
 }
 
 /// Paginates diff slices (`useGuideDiffFiles.ts:44-63`) until every excerpt path in `wanted` has
@@ -107,6 +131,9 @@ impl GuideTab {
             diff_files: Vec::new(),
             diff_loaded_sha: None,
             diff_error: None,
+            expanded_files: HashSet::new(),
+            comment_target: None,
+            comment_input: None,
             focus: cx.focus_handle(),
             needs_focus: true,
             scroll: ScrollHandle::new(),
@@ -122,6 +149,31 @@ impl GuideTab {
         self.needs_focus = true;
     }
 
+    /// Applies a loaded or newly generated guide, clearing stale diff files whenever the guide's
+    /// `head_sha` changes so a rewritten guide never shows code from a previous push (`pingdotgg/t3code#37864`).
+    fn apply_guide_result(&mut self, result: ReviewGuideResult, cx: &mut Context<Self>) {
+        let diff_target = result.guide.as_ref().map(|g| (g.head_sha.clone(), wanted_guide_paths(g)));
+        let sha_changed = match (&diff_target, &self.diff_loaded_sha) {
+            (Some((sha, _)), Some(loaded)) => sha != loaded,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if sha_changed {
+            self.diff_files.clear();
+            self.diff_loaded_sha = None;
+            self.diff_error = None;
+            self.expanded_files.clear();
+            self.comment_target = None;
+        }
+        self.result = Some(result);
+        self.error = None;
+        if let Some((sha, wanted)) = diff_target
+            && self.diff_loaded_sha.as_deref() != Some(sha.as_str())
+        {
+            self.load_diff(sha, wanted, cx);
+        }
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let task = read(self.state.read(cx), method::REVIEW_GUIDE, self.reference.payload(), decode::<ReviewGuideResult>);
         self.loading = true;
@@ -132,16 +184,7 @@ impl GuideTab {
             let _ = this.update(cx, |tab, cx| {
                 tab.loading = false;
                 match res {
-                    Ok(result) => {
-                        let diff_target = result.guide.as_ref().map(|g| (g.head_sha.clone(), wanted_excerpt_paths(g)));
-                        tab.result = Some(result);
-                        tab.error = None;
-                        if let Some((sha, wanted)) = diff_target
-                            && tab.diff_loaded_sha.as_deref() != Some(sha.as_str())
-                        {
-                            tab.load_diff(sha, wanted, cx);
-                        }
-                    }
+                    Ok(result) => tab.apply_guide_result(result, cx),
                     Err(err) => tab.error = Some(err),
                 }
                 cx.notify();
@@ -197,16 +240,7 @@ impl GuideTab {
             let _ = this.update(cx, |tab, cx| {
                 tab.generating = false;
                 match res {
-                    Ok(result) => {
-                        let diff_target = result.guide.as_ref().map(|g| (g.head_sha.clone(), wanted_excerpt_paths(g)));
-                        tab.result = Some(result);
-                        tab.error = None;
-                        if let Some((sha, wanted)) = diff_target
-                            && tab.diff_loaded_sha.as_deref() != Some(sha.as_str())
-                        {
-                            tab.load_diff(sha, wanted, cx);
-                        }
-                    }
+                    Ok(result) => tab.apply_guide_result(result, cx),
                     Err(err) => {
                         tab.state.update(cx, |state, cx| {
                             state.show_toast(crate::toast::Toast::new(crate::toast::ToastKind::Error, "Could not start review guide").description(err), cx);
@@ -234,6 +268,9 @@ impl GuideTab {
 
     /// Handles `j` / `k` keyboard tour stepping (`GuideTour.tsx:86-94`).
     pub fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.comment_target.is_some() {
+            return;
+        }
         let m = &event.keystroke.modifiers;
         if m.platform || m.control || m.alt || m.shift {
             return;
@@ -243,6 +280,108 @@ impl GuideTab {
             "k" => self.step(-1, cx),
             _ => {}
         }
+    }
+
+    pub(crate) fn can_comment_inline(&self, cx: &App) -> bool {
+        self.detail_view.upgrade().is_some_and(|view| {
+            let v = view.read(cx);
+            v.can_write_source_control(cx)
+                && v.detail.as_ref().is_some_and(|d| d.capabilities.review.inline_comment && d.viewer_permissions.comment)
+        })
+    }
+
+    pub fn toggle_stop_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.expanded_files.remove(&path) {
+            self.expanded_files.insert(path);
+        }
+        cx.notify();
+    }
+
+    pub fn open_line_comment(&mut self, path: String, line: u32, side: DiffSide, window: &mut Window, cx: &mut Context<Self>) {
+        self.comment_target = Some(GuideCommentTarget { path, line, side });
+        let input = match &self.comment_input {
+            Some(existing) => existing.clone(),
+            None => {
+                let created = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).placeholder("Write an inline review comment…"));
+                self.comment_input = Some(created.clone());
+                created
+            }
+        };
+        input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn cancel_line_comment(&mut self, cx: &mut Context<Self>) {
+        if self.comment_target.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn submit_line_comment(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.comment_target.clone() else { return };
+        let Some(input) = self.comment_input.as_ref() else { return };
+        let body = input.read(cx).value().trim().to_owned();
+        if body.is_empty() {
+            return;
+        }
+        let file = self.diff_files.iter().find(|f| f.path() == target.path);
+        let range_comments = self
+            .detail_view
+            .upgrade()
+            .and_then(|v| v.read(cx).detail.as_ref().and_then(|d| d.capabilities.review.range_comment))
+            == Some(true);
+        let selection = Selection {
+            start: target.line,
+            end: target.line,
+            side: target.side,
+            end_side: target.side,
+        };
+        let id = uuid_v4();
+        let pending = file
+            .and_then(|f| build_diff_comment(id.clone(), self.reference.key(), "Guide".into(), f, selection, &body))
+            .and_then(|comment| pending_comment_from_diff(&comment, file, range_comments))
+            .unwrap_or(PendingReviewComment {
+                id,
+                path: target.path.clone(),
+                old_path: file.map(|f| f.previous_path().to_owned()).filter(|old| old != &target.path),
+                position: match target.side {
+                    DiffSide::Deletions => ReviewPosition::Deleted { old_line: target.line },
+                    DiffSide::Additions => ReviewPosition::Added { new_line: target.line },
+                },
+                start_position: None,
+                range_label: format!("L{}", target.line),
+                body,
+            });
+        if let Some(detail_view) = self.detail_view.upgrade() {
+            detail_view.update(cx, |view, cx| view.add_pending_review_comment(pending, cx));
+        }
+        self.comment_target = None;
+        cx.notify();
+    }
+
+    fn pending_comments_for(&self, path: &str, cx: &App) -> Vec<PendingReviewComment> {
+        self.detail_view
+            .upgrade()
+            .map(|view| {
+                view.read(cx)
+                    .review_draft
+                    .comments
+                    .iter()
+                    .filter(|c| c.path == path)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn remove_pending_comment(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Some(view) = self.detail_view.upgrade() {
+            view.update(cx, |view, cx| view.remove_pending_review_comment(&id, cx));
+        }
+        cx.notify();
     }
 
     #[cfg(test)]
@@ -454,9 +593,10 @@ impl GuideTab {
         let notes = letter_stop_notes(stop);
         let summary_text: Arc<str> = Arc::from(stop.summary.as_str());
         let summary_md = self.markdown.state(&format!("guide-stop-{index}"), &summary_text, cx);
-        let summary_el = prose(&summary_md, cx);
+        let summary_el = prose(&summary_md, cx).into_any_element();
         let mono = cx.theme().mono_font_family.clone();
 
+        let can_comment = self.can_comment_inline(cx);
         let excerpts: Vec<AnyElement> = stop
             .excerpts
             .iter()
@@ -466,6 +606,8 @@ impl GuideTab {
                 let rows = file.map(|f| excerpt_rows(f, excerpt)).unwrap_or_default();
                 let line_markers = notes.by_excerpt.get(ex_ix).cloned().unwrap_or_default();
                 let jump_path = excerpt.path.clone();
+                let pending_for_file = self.pending_comments_for(&excerpt.path, cx);
+                let side_for_excerpt = if excerpt.side == "old" { DiffSide::Deletions } else { DiffSide::Additions };
                 v_flex()
                     .rounded(px(8.))
                     .border_1()
@@ -502,25 +644,27 @@ impl GuideTab {
                         v_flex()
                             .bg(hsla(p.code_background))
                             .py(px(4.))
-                            .children(rows.into_iter().map(|row| {
+                            .children(rows.into_iter().enumerate().map(|(row_ix, row)| {
                                 let line_no = if excerpt.side == "old" { row.old_line } else { row.new_line };
                                 let markers = line_no.and_then(|n| line_markers.iter().find(|(line, _)| *line == n)).map(|(_, m)| m.clone()).unwrap_or_default();
-                                let (prefix, row_bg) = match row.kind {
-                                    LineKind::Addition => ("+", Some(hsla(p.diff_row_addition))),
-                                    LineKind::Deletion => ("-", Some(hsla(p.diff_row_deletion))),
-                                    LineKind::Context => (" ", None),
+                                let line_side = match row.kind {
+                                    LineKind::Deletion => DiffSide::Deletions,
+                                    LineKind::Addition => DiffSide::Additions,
+                                    LineKind::Context => side_for_excerpt,
                                 };
-                                h_flex()
-                                    .px(px(8.))
-                                    .gap(px(6.))
-                                    .when_some(row_bg, |this, bg| this.bg(bg))
-                                    .font_family(mono.clone())
-                                    .text_size(px(12.))
-                                    .line_height(px(18.))
-                                    .child(div().w(px(36.)).flex_none().text_color(hsla(p.muted_foreground)).child(line_no.map_or(String::new(), |n| n.to_string())))
-                                    .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(prefix))
-                                    .child(div().flex_1().min_w_0().truncate().text_color(hsla(p.code_foreground)).child(row.text))
-                                    .children(markers.into_iter().map(|m| badge(m.marker, BadgeKind::Info, false, cx)))
+                                self.render_guide_diff_line(
+                                    format!("ex-{index}-{ex_ix}-{row_ix}"),
+                                    &excerpt.path,
+                                    line_no,
+                                    line_side,
+                                    row.kind,
+                                    row.text,
+                                    markers,
+                                    &pending_for_file,
+                                    can_comment,
+                                    &mono,
+                                    cx,
+                                )
                             }))
                             .into_any_element()
                     })
@@ -529,23 +673,77 @@ impl GuideTab {
             .collect();
 
         let files_section = (!stop.files.is_empty()).then(|| {
+            let heading = if stop.excerpts.is_empty() { "Files in this stop" } else { "Also in this stop" };
             v_flex()
-                .gap(px(4.))
-                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child("Files in this stop"))
+                .gap(px(6.))
+                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child(heading))
                 .children(stop.files.iter().enumerate().map(|(file_ix, file)| {
                     let path = file.path.clone();
-                    h_flex()
-                        .id(SharedString::from(format!("pr-guide-file-{index}-{file_ix}")))
-                        .gap(px(8.))
-                        .px(px(8.))
-                        .py(px(5.))
+                    let jump_path = file.path.clone();
+                    let expanded = self.expanded_files.contains(&file.path);
+                    let diff_file = expanded.then(|| self.diff_files.iter().find(|f| f.path() == file.path).cloned()).flatten();
+                    let pending_for_file = if expanded { self.pending_comments_for(&file.path, cx) } else { Vec::new() };
+                    v_flex()
                         .rounded(px(6.))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(hsla(p.accent).opacity(0.6)))
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_file(path.clone(), cx)))
-                        .child(Icon::FileText.sized(px(13.)).text_color(hsla(p.muted_foreground)))
-                        .child(div().font_family(mono.clone()).text_xs().text_color(hsla(p.foreground)).child(file.path.clone()))
-                        .children(file.note.as_ref().filter(|n| !n.trim().is_empty()).map(|note| div().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(note.clone())))
+                        .border_1()
+                        .border_color(hsla(p.border).opacity(if expanded { 1.0 } else { 0.6 }))
+                        .overflow_hidden()
+                        .child(
+                            h_flex()
+                                .id(SharedString::from(format!("pr-guide-file-{index}-{file_ix}")))
+                                .gap(px(6.))
+                                .px(px(8.))
+                                .py(px(5.))
+                                .cursor_pointer()
+                                .when(expanded, |this| this.bg(hsla(p.muted)))
+                                .hover(|style| style.bg(hsla(p.accent).opacity(0.6)))
+                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_stop_file(path.clone(), cx)))
+                                .child((if expanded { Icon::ChevronDown } else { Icon::ChevronRight }).sized(px(13.)).text_color(hsla(p.muted_foreground)))
+                                .child(Icon::FileText.sized(px(13.)).text_color(hsla(p.muted_foreground)))
+                                .child(div().font_family(mono.clone()).text_xs().text_color(hsla(p.foreground)).child(file.path.clone()))
+                                .children(file.note.as_ref().filter(|n| !n.trim().is_empty()).map(|note| div().flex_1().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(note.clone())))
+                                .when(file.note.as_ref().is_none_or(|n| n.trim().is_empty()), |this| this.child(div().flex_1()))
+                                .child(
+                                    Button::new(SharedString::from(format!("pr-guide-file-jump-{index}-{file_ix}")), Variant::Ghost, Size::Xs)
+                                        .label("Open in Code")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.open_file(jump_path.clone(), cx);
+                                        })),
+                                ),
+                        )
+                        .when(expanded, |this| {
+                            let body: AnyElement = match diff_file {
+                                Some(df) if !df.hunks.is_empty() => {
+                                    let mut line_els: Vec<AnyElement> = Vec::new();
+                                    for (hunk_ix, hunk) in df.hunks.iter().enumerate() {
+                                        for (line_ix, line) in hunk.lines.iter().enumerate() {
+                                            let (line_no, side) = match line.kind {
+                                                LineKind::Deletion => (line.old_line, DiffSide::Deletions),
+                                                LineKind::Addition | LineKind::Context => (line.new_line.or(line.old_line), DiffSide::Additions),
+                                            };
+                                            line_els.push(self.render_guide_diff_line(
+                                                format!("file-{index}-{file_ix}-{hunk_ix}-{line_ix}"),
+                                                &file.path,
+                                                line_no,
+                                                side,
+                                                line.kind,
+                                                line.text.to_string(),
+                                                Vec::new(),
+                                                &pending_for_file,
+                                                can_comment,
+                                                &mono,
+                                                cx,
+                                            ));
+                                        }
+                                    }
+                                    v_flex().bg(hsla(p.code_background)).py(px(4.)).children(line_els).into_any_element()
+                                }
+                                Some(_) => div().px(px(10.)).py(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child("No text diff available here. Open in Code to inspect.").into_any_element(),
+                                None => div().px(px(10.)).py(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child("Loading file diff…").into_any_element(),
+                            };
+                            this.child(body)
+                        })
                 }))
         });
 
@@ -669,6 +867,134 @@ impl GuideTab {
             .children(files_section)
             .children(questions_section)
             .child(nav_footer)
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_guide_diff_line(
+        &self,
+        id_prefix: String,
+        path: &str,
+        line_no: Option<u32>,
+        side: DiffSide,
+        kind: LineKind,
+        text: String,
+        markers: Vec<t3_core::pull_requests::guide::ExcerptLineMarker>,
+        pending_for_file: &[PendingReviewComment],
+        can_comment: bool,
+        mono: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let p = palette(cx);
+        let (prefix, row_bg) = match kind {
+            LineKind::Addition => ("+", Some(hsla(p.diff_row_addition))),
+            LineKind::Deletion => ("-", Some(hsla(p.diff_row_deletion))),
+            LineKind::Context => (" ", None),
+        };
+        let matching_pending: Vec<&PendingReviewComment> = line_no
+            .map(|n| {
+                pending_for_file
+                    .iter()
+                    .filter(|c| match &c.position {
+                        ReviewPosition::Added { new_line } => side == DiffSide::Additions && *new_line == n,
+                        ReviewPosition::Deleted { old_line } => side == DiffSide::Deletions && *old_line == n,
+                        ReviewPosition::Context { old_line, new_line, side: s } => {
+                            if side == DiffSide::Deletions {
+                                s == "left" && *old_line == n
+                            } else {
+                                s != "left" && *new_line == n
+                            }
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let composer_open = line_no.is_some_and(|n| {
+            self.comment_target
+                .as_ref()
+                .is_some_and(|t| t.path == path && t.line == n && t.side == side)
+        });
+        let comment_btn = (can_comment && line_no.is_some()).then(|| {
+            let target_path = path.to_owned();
+            let target_line = line_no.unwrap_or(1);
+            Button::new(SharedString::from(format!("pr-guide-comment-{id_prefix}")), Variant::GhostMuted, Size::Xs)
+                .icon(Icon::Plus)
+                .tooltip("Add review comment on this line")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_line_comment(target_path.clone(), target_line, side, window, cx);
+                }))
+        });
+        let line_row = h_flex()
+            .px(px(8.))
+            .gap(px(6.))
+            .when_some(row_bg, |this, bg| this.bg(bg))
+            .font_family(mono.clone())
+            .text_size(px(12.))
+            .line_height(px(18.))
+            .child(div().w(px(36.)).flex_none().text_color(hsla(p.muted_foreground)).child(line_no.map_or(String::new(), |n| n.to_string())))
+            .children(comment_btn)
+            .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(prefix))
+            .child(div().flex_1().min_w_0().truncate().text_color(hsla(p.code_foreground)).child(text))
+            .children(markers.into_iter().map(|m| badge(m.marker, BadgeKind::Info, false, cx)));
+
+        if matching_pending.is_empty() && !composer_open {
+            return line_row.into_any_element();
+        }
+        v_flex()
+            .child(line_row)
+            .children(matching_pending.into_iter().enumerate().map(|(c_ix, comment)| {
+                let id = comment.id.clone();
+                h_flex()
+                    .mx(px(12.))
+                    .my(px(4.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .gap(px(8.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(hsla(p.primary).opacity(0.4))
+                    .bg(hsla(p.muted))
+                    .text_xs()
+                    .child(badge("Pending", BadgeKind::Info, false, cx))
+                    .child(div().flex_1().min_w_0().text_color(hsla(p.foreground)).child(comment.body.clone()))
+                    .child(
+                        Button::new(SharedString::from(format!("pr-guide-rm-{id_prefix}-{c_ix}")), Variant::GhostMuted, Size::Xs)
+                            .icon(Icon::X)
+                            .tooltip("Remove pending comment")
+                            .on_click(cx.listener(move |this, _, _, cx| this.remove_pending_comment(id.clone(), cx))),
+                    )
+            }))
+            .when(composer_open, |this| {
+                let Some(input) = self.comment_input.clone() else { return this };
+                this.child(
+                    v_flex()
+                        .mx(px(12.))
+                        .my(px(6.))
+                        .p(px(8.))
+                        .gap(px(6.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(hsla(p.border))
+                        .bg(hsla(p.background))
+                        .child(Textarea::new(&input))
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap(px(6.))
+                                .child(
+                                    Button::new(SharedString::from(format!("pr-guide-cancel-{id_prefix}")), Variant::Ghost, Size::Xs)
+                                        .label("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| this.cancel_line_comment(cx))),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!("pr-guide-add-{id_prefix}")), Variant::Default, Size::Xs)
+                                        .label("Add review comment")
+                                        .on_click(cx.listener(|this, _, _, cx| this.submit_line_comment(cx))),
+                                ),
+                        ),
+                )
+            })
             .into_any_element()
     }
 }
@@ -812,7 +1138,7 @@ mod tests {
     fn guide_diff_pagination_fetches_multiple_slices_until_all_wanted_paths_arrive() {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let guide = sample_guide_result().guide.unwrap();
-        let wanted = wanted_excerpt_paths(&guide);
+        let wanted = wanted_guide_paths(&guide);
         assert_eq!(wanted.len(), 2);
 
         let mut seen_cursors: Vec<Option<String>> = Vec::new();
@@ -824,11 +1150,15 @@ mod tests {
                         patch: "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n".into(),
                         next_cursor: Some("slice-2".into()),
                         truncated: false,
+                        omitted_file_stats: Vec::new(),
+                        withheld_files_readable: None,
                     },
                     Some("slice-2") => DiffResult {
                         patch: "diff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-old2\n+new2\n".into(),
                         next_cursor: Some("slice-3".into()),
                         truncated: false,
+                        omitted_file_stats: Vec::new(),
+                        withheld_files_readable: None,
                     },
                     _ => panic!("should stop paginating once all wanted excerpt paths have arrived"),
                 };
@@ -839,5 +1169,75 @@ mod tests {
         assert_eq!(seen_cursors, vec![None, Some("slice-2".into())]);
         let paths: Vec<&str> = files.iter().map(|f| f.path()).collect();
         assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[gpui::test]
+    fn guide_also_in_this_stop_inline_comment_and_rewritten_head_sha_clears_stale_diff(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let reference = PrRef { project_id: "p1".into(), host: Some("github.com".into()), repository: "acme/app".into(), number: 42 };
+        let writable_detail: Detail = decode(json!({
+            "provider": "github",
+            "capabilities": {
+                "actions": [], "mergeMethods": ["merge"],
+                "edit": { "changeRequest": false, "comment": false },
+                "review": { "resolve": true, "inlineComment": true, "rangeComment": true, "verdicts": ["comment"] },
+                "labels": false
+            },
+            "viewerPermissions": { "actions": [], "comment": true, "resolve": true, "labels": false },
+            "projectId": "p1", "projectTitle": "Repo", "workspaceRoot": "/tmp/repo", "repository": "acme/app", "number": 42,
+            "title": "PR", "body": "", "url": "https://github.com/acme/app/pull/42", "author": { "login": "alice" },
+            "viewer": "alice", "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 1, "deletions": 0, "changedFiles": 1,
+            "headBranch": "feat", "baseBranch": "main", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+            "observedAt": 100, "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+            "mergeCapabilities": { "merge": true, "squash": false, "rebase": false }
+        }))
+        .unwrap();
+        let (state, detail_view) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            super::super::mutations::init(runtime.handle().clone(), cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let detail_view = cx.new(|cx| DetailView::new(state.clone(), WeakEntity::new_invalid(), reference.clone(), None, cx));
+            detail_view.update(cx, |v, _| v.detail = Some(writable_detail));
+            (state, detail_view)
+        });
+        let (guide, vcx) = cx.add_window_view(|_window, cx| GuideTab::new(state.clone(), detail_view.downgrade(), reference.clone(), cx));
+        let t3_core::diff::ParsedPatch::Files(files) = t3_core::diff::parse_patch(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        ) else {
+            panic!("files");
+        };
+        guide.update_in(vcx, |guide, window, cx| {
+            guide.set_result_for_test(sample_guide_result(), files, cx);
+            assert!(guide.can_comment_inline(cx));
+            guide.toggle_stop_file("src/a.rs".into(), cx);
+            assert!(guide.expanded_files.contains("src/a.rs"));
+            guide.open_line_comment("src/a.rs".into(), 1, DiffSide::Additions, window, cx);
+            guide.comment_input.as_ref().unwrap().update(cx, |input, cx| {
+                input.set_value("Check edge case here", window, cx);
+            });
+            guide.submit_line_comment(cx);
+            assert!(guide.comment_target.is_none());
+        });
+        assert_eq!(detail_view.read_with(vcx, |v, _| v.pending_review_comment_count()), 1);
+
+        // Rewritten guide for a new head_sha must clear stale diff_files immediately (`pingdotgg/t3code#37864`).
+        let rewritten: ReviewGuideResult = decode(json!({
+            "guide": {
+                "headSha": "def5678",
+                "generatedAt": "2026-01-03T02:00:00Z",
+                "stops": []
+            },
+            "run": null,
+            "currentHeadSha": "def5678"
+        }))
+        .unwrap();
+        guide.update(vcx, |guide, cx| {
+            guide.apply_guide_result(rewritten, cx);
+            assert!(guide.diff_files.is_empty());
+            assert!(guide.diff_loaded_sha.is_none());
+            assert!(guide.expanded_files.is_empty());
+        });
     }
 }

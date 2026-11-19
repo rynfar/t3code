@@ -117,10 +117,20 @@ pub fn reviewer_candidates_input(reference: &PrRef, query: Option<&str>) -> Valu
     payload
 }
 
-/// `PullRequestReviewerRequestInput`.
+/// `PullRequestReviewerRequestInput` for a single reviewer.
 pub fn request_reviewers_input(reference: &PrRef, id: &str, kind: ReviewerKind, requested: bool) -> Value {
+    request_reviewers_batch_input(reference, &[(id.to_owned(), kind)], requested)
+}
+
+/// `PullRequestReviewerRequestInput` for a batch of reviewers (`pingdotgg/t3code#37733`).
+pub fn request_reviewers_batch_input(reference: &PrRef, reviewers: &[(String, ReviewerKind)], requested: bool) -> Value {
     let mut payload = reference.payload();
-    payload["reviewers"] = json!([{ "id": id, "kind": kind.as_str() }]);
+    payload["reviewers"] = json!(
+        reviewers
+            .iter()
+            .map(|(id, kind)| json!({ "id": id, "kind": kind.as_str() }))
+            .collect::<Vec<_>>()
+    );
     payload["requested"] = json!(requested);
     payload
 }

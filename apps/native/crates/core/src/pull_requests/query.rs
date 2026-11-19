@@ -280,6 +280,10 @@ mod tests {
         let parsed = parse_query("draft:maybe -author:me review:soon checks:flaky label: url:/x");
         assert_eq!(parsed.text, "draft:maybe -author:me review:soon checks:flaky label: url:/x");
         assert!(parsed.filters.is_empty());
+        // JS Object.prototype property names must stay as search text (`pingdotgg/t3code#28095`).
+        let proto = parse_query("review:toString checks:constructor draft:valueOf");
+        assert_eq!(proto.text, "review:toString checks:constructor draft:valueOf");
+        assert!(proto.filters.is_empty());
     }
 
     #[test]

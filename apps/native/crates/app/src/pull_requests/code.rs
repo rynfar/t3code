@@ -7,7 +7,7 @@
 //! `DiffPanel::set_external_comment_handler` (inline PR review drafts), and
 //! `DiffPanel::set_completion_scope` (PR `@mention` / `#ref` completion).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -15,17 +15,20 @@ use gpui::{Context, Entity, IntoElement, ParentElement, Render, Styled, Task, We
 use gpui_component::{h_flex, v_flex};
 use serde_json::json;
 use t3_core::composer::review::{ReviewComment, Side as DiffSide};
-use t3_core::diff::{CompletionScope, CompletionSupport, FileDiff, FileRevealTarget, ParsedPatch, ReferenceSigil};
-use t3_core::pull_requests::anchor::{Range, Side, diff_path_matches};
+use t3_core::diff::{
+    ChangeKind, CompletionScope, CompletionSupport, FileDiff, FileRevealTarget, LineKind,
+    ParsedPatch, ReferenceSigil, ReviewFile, cut_line_note_start, has_cut_lines,
+};
+use t3_core::pull_requests::anchor::{Range, Side, diff_path_matches, resolve_anchor_range};
 use t3_core::pull_requests::review::{files_viewed_map, pending_comment_from_diff, to_inline_review_threads};
-use t3_core::pull_requests::wire::{Activity, Detail, DiffResult, FilesViewedResult, decode};
+use t3_core::pull_requests::wire::{Activity, Detail, DiffResult, FilesViewedResult, OmittedFileStat, decode};
 use t3_core::pull_requests::{PrRef, failure_message, method};
 
 use super::controls::{Button, Size, Variant};
 use super::detail::DetailView;
 use super::{read, settle};
 use crate::app_state::AppState;
-use crate::diff::{DiffPanel, External, Parsed, ViewedTarget};
+use crate::diff::{DiffPanel, External, Parsed, ViewedTarget, WithheldFileStatus};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -57,6 +60,15 @@ pub struct CodeTab {
     viewed_can_write: bool,
     inline_allowed: bool,
     range_comments: bool,
+    /// On-demand loading state for oversized files withheld from the initial diff (`pingdotgg/t3code#37007`).
+    omitted_file_stats: Vec<OmittedFileStat>,
+    withheld_files_readable: Option<bool>,
+    capability_withheld_readable: bool,
+    withheld_status: HashMap<String, WithheldFileStatus>,
+    withheld_loaded: HashMap<String, FileDiff>,
+    requested_withheld: HashSet<String>,
+    cut_line_files: HashSet<String>,
+    _withheld_tasks: HashMap<String, Task<()>>,
     /// PR-head inline review threads, cleared on `DiffPanel` while viewing a single commit and
     /// restored when returning to the full PR diff (`PullRequestCodeTab.tsx:595, 637-638`).
     head_review_threads: Vec<t3_core::diff::InlineReviewThread>,
@@ -76,6 +88,19 @@ impl CodeTab {
         can_write: bool,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::new_with_prefetched(state, detail_view, reference, detail, activity, can_write, None, cx)
+    }
+
+    pub fn new_with_prefetched(
+        state: Entity<AppState>,
+        detail_view: WeakEntity<DetailView>,
+        reference: PrRef,
+        detail: Option<&Detail>,
+        activity: Option<&Activity>,
+        can_write: bool,
+        prefetched: Option<DiffResult>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let panel = cx.new(|cx| DiffPanel::detached(state.clone(), cx));
         let this = cx.entity().downgrade();
         let rows = panel.downgrade();
@@ -86,6 +111,14 @@ impl CodeTab {
                 let near = rows.upgrade().is_some_and(|rows| rows.read(cx).near_end(px(NEAR_END)));
                 if near && let Some(this) = this.upgrade() {
                     this.update(cx, |tab, cx| tab.load_next(cx));
+                }
+            });
+        });
+        let this_withheld = cx.entity().downgrade();
+        panel.update(cx, |panel, _| {
+            panel.set_on_load_withheld(move |path, cx| {
+                if let Some(this) = this_withheld.upgrade() {
+                    this.update(cx, |tab, cx| tab.load_withheld_file(path, true, cx));
                 }
             });
         });
@@ -108,6 +141,14 @@ impl CodeTab {
             viewed_can_write: false,
             inline_allowed: false,
             range_comments: false,
+            omitted_file_stats: Vec::new(),
+            withheld_files_readable: None,
+            capability_withheld_readable: false,
+            withheld_status: HashMap::new(),
+            withheld_loaded: HashMap::new(),
+            requested_withheld: HashSet::new(),
+            cut_line_files: HashSet::new(),
+            _withheld_tasks: HashMap::new(),
             head_review_threads: Vec::new(),
             _fetch: None,
             _viewed: None,
@@ -115,7 +156,11 @@ impl CodeTab {
             last_requested_cursor: None,
         };
         tab.sync_state(detail, activity, can_write, cx);
-        tab.fetch(None, cx);
+        if let Some(diff) = prefetched {
+            tab.apply_diff_slice(None, diff, cx);
+        } else {
+            tab.fetch(None, cx);
+        }
         tab
     }
 
@@ -164,6 +209,8 @@ impl CodeTab {
     fn sync_capabilities(&mut self, detail: &Detail, can_write: bool, cx: &mut Context<Self>) {
         self.range_comments = detail.capabilities.review.range_comment == Some(true);
         self.inline_allowed = can_write && detail.capabilities.review.inline_comment && detail.viewer_permissions.comment;
+        self.capability_withheld_readable = detail.capabilities.withheld_file_diff == Some(true);
+        self.sync_withheld_panel(cx);
         self.apply_commit_review_state(cx);
 
         let reference_sigils: Vec<ReferenceSigil> = detail
@@ -261,10 +308,134 @@ impl CodeTab {
         self.generation += 1;
         self.slices.clear();
         self.next_cursor = None;
+        self.omitted_file_stats.clear();
+        self.withheld_loaded.clear();
+        self.withheld_status.clear();
+        self.cut_line_files.clear();
+        self._withheld_tasks.clear();
+        let to_refetch: Vec<String> = self.requested_withheld.iter().cloned().collect();
+        self.sync_withheld_panel(cx);
         self.fetch(None, cx);
+        for path in to_refetch {
+            self.load_withheld_file(path, false, cx);
+        }
         if self.viewed_supported {
             self.fetch_files_viewed(self.viewed_can_write, cx);
         }
+    }
+
+    fn withheld_readable(&self) -> bool {
+        self.withheld_files_readable.unwrap_or(self.capability_withheld_readable)
+    }
+
+    fn sync_withheld_panel(&self, cx: &mut Context<Self>) {
+        let status = self.withheld_status.clone();
+        let readable = self.withheld_readable();
+        let cut_lines = self.cut_line_files.clone();
+        self.panel.update(cx, |panel, cx| panel.set_withheld_state(status, readable, cut_lines, cx));
+    }
+
+    fn apply_diff_slice(&mut self, cursor: Option<&str>, diff: DiffResult, cx: &mut Context<Self>) {
+        let slice = Parsed::new(&diff.patch, diff.truncated, None, None, None);
+        if cursor.is_none() {
+            self.withheld_files_readable = diff.withheld_files_readable;
+        }
+        for file in slice.files() {
+            if file.hunks.iter().any(|hunk| hunk.lines.iter().any(|line| cut_line_note_start(line.text.trim_end_matches('\r')).is_some())) {
+                self.cut_line_files.insert(file.path().to_owned());
+            }
+        }
+        for stat in diff.omitted_file_stats {
+            if !self.omitted_file_stats.iter().any(|existing| existing.path == stat.path) {
+                if !self.withheld_loaded.contains_key(&stat.path) {
+                    self.withheld_status.entry(stat.path.clone()).or_insert(WithheldFileStatus::Idle);
+                }
+                self.omitted_file_stats.push(stat);
+            }
+        }
+        self.slices.push(slice);
+        self.next_cursor = diff.next_cursor;
+        self.rebuild_joined(cx);
+        self.sync_withheld_panel(cx);
+        self.try_reveal(cx);
+    }
+
+    fn rebuild_joined(&mut self, cx: &mut Context<Self>) {
+        let truncated = self.slices.last().is_some_and(|s| s.truncated) || self.next_cursor.is_some();
+        let joined = join_with_withheld(&self.slices, &self.omitted_file_stats, &self.withheld_loaded, truncated);
+        self.show_parsed(joined, cx);
+    }
+
+    /// Loads one withheld oversized file on demand (`POST /api/pull-requests/diff` with `path`,
+    /// `pingdotgg/t3code#37007`). Unfolds the file when `unfold_on_success` is true (first click),
+    /// while preserving reader fold state when re-fetching after a refresh.
+    pub fn load_withheld_file(&mut self, path: String, unfold_on_success: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client_handle() else {
+            self.withheld_status.insert(path, WithheldFileStatus::Error(super::NOT_CONNECTED.to_owned()));
+            self.sync_withheld_panel(cx);
+            return;
+        };
+        self.requested_withheld.insert(path.clone());
+        self.withheld_status.insert(path.clone(), WithheldFileStatus::Loading);
+        self.sync_withheld_panel(cx);
+
+        let mut payload = self.reference.payload();
+        payload["path"] = json!(path);
+        if let Some(commit) = &self.commit {
+            payload["commit"] = json!(commit);
+        }
+        let generation = self.generation;
+        let path_for_fetch = path.clone();
+        let task = self.state.read(cx).runtime().spawn(async move {
+            let value = client
+                .pull_request_diff(payload)
+                .await
+                .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
+            let diff: DiffResult = decode(value)?;
+            let cut = has_cut_lines(&diff.patch);
+            let parsed = Parsed::new(&diff.patch, diff.truncated, None, None, None);
+            let file = parsed
+                .files()
+                .iter()
+                .find(|f| f.path() == path_for_fetch)
+                .or_else(|| parsed.files().first())
+                .cloned();
+            Ok::<_, String>((file, cut))
+        });
+        let path_key = path.clone();
+        let ui_task = cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|e| Err(e.to_string()));
+            let _ = this.update(cx, |tab, cx| {
+                if tab.generation != generation {
+                    return;
+                }
+                tab._withheld_tasks.remove(&path_key);
+                match result {
+                    Ok((Some(file), cut)) if !file.hunks.is_empty() || file.binary => {
+                        if cut {
+                            tab.cut_line_files.insert(path_key.clone());
+                        }
+                        tab.withheld_status.remove(&path_key);
+                        tab.withheld_loaded.insert(path_key.clone(), file);
+                        tab.rebuild_joined(cx);
+                        tab.sync_withheld_panel(cx);
+                        if unfold_on_success {
+                            tab.panel.update(cx, |panel, cx| panel.unfold_path(&path_key, cx));
+                        }
+                    }
+                    Ok(_) => {
+                        tab.withheld_status.insert(path_key.clone(), WithheldFileStatus::Empty);
+                        tab.sync_withheld_panel(cx);
+                    }
+                    Err(err) => {
+                        tab.withheld_status.insert(path_key.clone(), WithheldFileStatus::Error(err));
+                        tab.sync_withheld_panel(cx);
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._withheld_tasks.insert(path, ui_task);
     }
 
     /// `canLoadNextSlice`: never after a failure, which would retry without end.
@@ -295,13 +466,9 @@ impl CodeTab {
         if let Some(commit) = &self.commit {
             payload["commit"] = json!(commit);
         }
-        let held = self.slices.clone();
         let task = self.state.read(cx).runtime().spawn(async move {
             let value = client.pull_request_diff(payload).await.map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
-            let diff: DiffResult = decode(value)?;
-            let slice = Parsed::new(&diff.patch, diff.truncated, None, None, None);
-            let joined = join(&held, &slice, diff.truncated || diff.next_cursor.is_some());
-            Ok::<_, String>((diff.next_cursor, slice, joined))
+            decode::<DiffResult>(value)
         });
         let generation = self.generation;
         self.pending = true;
@@ -315,11 +482,8 @@ impl CodeTab {
                 }
                 this.pending = false;
                 match result {
-                    Ok((next_cursor, slice, joined)) => {
-                        this.slices.push(slice);
-                        this.next_cursor = next_cursor;
-                        this.show_parsed(joined, cx);
-                        this.try_reveal(cx);
+                    Ok(diff) => {
+                        this.apply_diff_slice(cursor.as_deref(), diff, cx);
                     }
                     Err(error) => {
                         this.error = Some(error);
@@ -354,20 +518,35 @@ impl CodeTab {
             }
         }
         if let Some((digest, range)) = &self.reveal {
-            let path = self
+            let matched_file = self
                 .slices
                 .iter()
                 .flat_map(|slice| slice.files().iter())
-                .map(|file| file.path().to_owned())
-                .find(|path| diff_path_matches(digest, path));
-            if let Some(path) = path {
+                .chain(self.withheld_loaded.values())
+                .find(|file| diff_path_matches(digest, file.path()))
+                .cloned()
+                .or_else(|| {
+                    self.omitted_file_stats
+                        .iter()
+                        .find(|stat| diff_path_matches(digest, &stat.path))
+                        .map(placeholder_for_omitted)
+                });
+            if let Some(file) = matched_file {
+                let path = file.path().to_owned();
                 let target = match range {
                     Some(range) => {
-                        let side = match range.side {
+                        let resolved = resolve_anchor_range(*range, |old_line| file_has_removed_line(&file, old_line));
+                        let side = match resolved.side {
                             Side::Left => DiffSide::Deletions,
                             Side::Right => DiffSide::Additions,
                         };
-                        FileRevealTarget::range(path, range.start.min(u32::MAX as u64) as u32, Some(range.end.min(u32::MAX as u64) as u32), Some(side), true)
+                        FileRevealTarget::range(
+                            path,
+                            resolved.start.min(u32::MAX as u64) as u32,
+                            Some(resolved.end.min(u32::MAX as u64) as u32),
+                            Some(side),
+                            true,
+                        )
                     }
                     None => FileRevealTarget::file(path),
                 };
@@ -420,16 +599,67 @@ impl CodeTab {
     }
 }
 
-/// The held slices and a new one as one patch for the panel. Each slice keeps its own parse, so
-/// a new slice costs one parse plus copies of the files before it, all off the UI thread.
-fn join(held: &[Arc<Parsed>], slice: &Arc<Parsed>, truncated: bool) -> Arc<Parsed> {
-    if held.is_empty() && slice.truncated == truncated {
-        return slice.clone();
+fn file_has_removed_line(file: &FileDiff, old_line: u64) -> bool {
+    let target = old_line.min(u32::MAX as u64) as u32;
+    file.hunks.iter().any(|hunk| {
+        hunk.lines
+            .iter()
+            .any(|line| line.kind == LineKind::Deletion && line.old_line == Some(target))
+    })
+}
+
+fn placeholder_for_omitted(stat: &OmittedFileStat) -> FileDiff {
+    let change_type = match (stat.additions, stat.deletions) {
+        (a, 0) if a > 0 => Some(ChangeKind::New),
+        (0, d) if d > 0 => Some(ChangeKind::Deleted),
+        _ => None,
+    };
+    ReviewFile {
+        path: stat.path.clone(),
+        previous_path: None,
+        additions: stat.additions,
+        deletions: stat.deletions,
+        change_type,
     }
-    let slices = || held.iter().chain(std::iter::once(slice));
-    let files: Vec<FileDiff> = slices().flat_map(|slice| slice.files().iter().cloned()).collect();
+    .placeholder()
+}
+
+/// Joins held diff slices with any on-demand loaded withheld files and empty-hunk placeholders
+/// for still-withheld oversized files (`pingdotgg/t3code#37007`).
+fn join_with_withheld(
+    slices: &[Arc<Parsed>],
+    omitted: &[OmittedFileStat],
+    loaded: &HashMap<String, FileDiff>,
+    truncated: bool,
+) -> Arc<Parsed> {
+    if slices.len() == 1 && omitted.is_empty() && loaded.is_empty() && slices[0].truncated == truncated {
+        return slices[0].clone();
+    }
+    let mut files: Vec<FileDiff> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for slice in slices {
+        for file in slice.files() {
+            let path = file.path().to_owned();
+            seen.insert(path.clone());
+            if let Some(replacement) = loaded.get(&path) {
+                files.push(replacement.clone());
+            } else {
+                files.push(file.clone());
+            }
+        }
+    }
+    for stat in omitted {
+        if seen.insert(stat.path.clone()) {
+            if let Some(replacement) = loaded.get(&stat.path) {
+                files.push(replacement.clone());
+            } else {
+                files.push(placeholder_for_omitted(stat));
+            }
+        }
+    }
     let patch = if files.is_empty() {
-        slices()
+        slices
+            .iter()
             .find_map(|slice| match &slice.patch {
                 ParsedPatch::Raw { text, reason } => Some(ParsedPatch::Raw { text: text.clone(), reason }),
                 _ => None,
@@ -438,8 +668,7 @@ fn join(held: &[Arc<Parsed>], slice: &Arc<Parsed>, truncated: bool) -> Arc<Parse
     } else {
         ParsedPatch::Files(files)
     };
-    let max_line_len = slices().map(|slice| slice.max_line_len).max().unwrap_or(0);
-    Arc::new(Parsed { patch, truncated, totals: None, base_ref: None, head_ref: None, max_line_len })
+    Parsed::from_patch(patch, truncated, None, None, None)
 }
 
 impl Render for CodeTab {
@@ -614,6 +843,37 @@ mod tests {
                 assert!(tab.reveal_path.is_none());
                 assert_eq!(tab.reveals, 1);
             });
+        });
+    }
+
+    #[gpui::test]
+    fn code_tab_seeds_prefetched_slice_tracks_omitted_files_and_cut_lines(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let reference = PrRef { project_id: "p1".into(), host: Some("github.com".into()), repository: "acme/app".into(), number: 42 };
+        let prefetched = DiffResult {
+            patch: "diff --git a/src/long.js b/src/long.js\n--- a/src/long.js\n+++ b/src/long.js\n@@ -1 +1 @@\n-old\n+new …[120 more characters]\n".into(),
+            next_cursor: None,
+            truncated: true,
+            omitted_file_stats: vec![OmittedFileStat {
+                path: "dist/huge.min.js".into(),
+                additions: 1200,
+                deletions: 0,
+            }],
+            withheld_files_readable: Some(true),
+        };
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let code = cx.new(|cx| {
+                CodeTab::new_with_prefetched(state, WeakEntity::new_invalid(), reference, None, None, true, Some(prefetched), cx)
+            });
+            let tab = code.read(cx);
+            assert_eq!(tab.slices.len(), 1);
+            assert!(tab.withheld_readable());
+            assert_eq!(tab.withheld_status.get("dist/huge.min.js"), Some(&WithheldFileStatus::Idle));
+            assert!(tab.cut_line_files.contains("src/long.js"));
         });
     }
 }

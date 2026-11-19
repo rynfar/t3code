@@ -22,15 +22,23 @@ fn is_absolute(path: &str) -> bool {
 }
 
 /// `normalizedRelativePathSegments`: `None` for anything absolute, drive-relative (`C:x`), or
-/// climbing out with `..`.
-fn relative_segments(path: &str) -> Option<Vec<&str>> {
+/// climbing out with `..`. On POSIX a backslash is part of a file name (`pingdotgg/t3code#23167`);
+/// Windows treats it as a separator, so reject `..` under either split.
+fn relative_segments(path: &str, windows_root: bool) -> Option<Vec<&str>> {
     let bytes = path.as_bytes();
     let drive_prefixed = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     if path.starts_with('/') || is_windows_absolute(path) || drive_prefixed {
         return None;
     }
-    let segments: Vec<&str> = path.split(['/', '\\']).filter(|segment| !segment.is_empty() && *segment != ".").collect();
-    (!segments.is_empty() && !segments.contains(&"..")).then_some(segments)
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
+        return None;
+    }
+    let segments: Vec<&str> = if windows_root {
+        path.split(['/', '\\']).filter(|segment| !segment.is_empty() && *segment != ".").collect()
+    } else {
+        path.split('/').filter(|segment| !segment.is_empty() && *segment != ".").collect()
+    };
+    (!segments.is_empty()).then_some(segments)
 }
 
 /// `repositoryRelativeWorkspaceSegments`: where the workspace sits inside its repository,
@@ -41,20 +49,21 @@ fn workspace_segments(workspace_root: Option<&str>, repository_root: Option<&str
     if workspace == repository {
         return Some(Vec::new());
     }
-    let separator = if repository.contains('\\') { '\\' } else { '/' };
+    let separator = if is_windows_absolute(&repository) { '\\' } else { '/' };
     let prefix = if repository.ends_with(separator) { repository } else { format!("{repository}{separator}") };
     let rest = workspace.strip_prefix(&prefix)?;
-    Some(rest.split(['/', '\\']).filter(|segment| !segment.is_empty()).map(str::to_owned).collect())
+    Some(rest.split(separator).filter(|segment| !segment.is_empty()).map(str::to_owned).collect())
 }
 
 /// `resolveDiffPathForWorkspace`: the workspace-relative path to open for a file a diff names, or
 /// `None` when it lies outside the workspace and must not be opened.
 pub fn resolve_diff_path_for_workspace(file_path: &str, workspace_root: Option<&str>, repository_root: Option<&str>) -> Option<String> {
+    let windows_root = workspace_root.is_some_and(is_windows_absolute) || repository_root.is_some_and(is_windows_absolute);
     if is_absolute(file_path) {
         let relative = workspace_relative_path(file_path, workspace_root?)?;
-        return relative_segments(&relative).map(|segments| segments.join("/"));
+        return relative_segments(&relative, windows_root).map(|segments| segments.join("/"));
     }
-    let file_segments = relative_segments(file_path)?;
+    let file_segments = relative_segments(file_path, windows_root)?;
     let workspace = match workspace_segments(workspace_root, repository_root) {
         Some(workspace) if !workspace.is_empty() => workspace,
         _ => return Some(file_segments.join("/")),
@@ -68,6 +77,16 @@ pub fn resolve_diff_path_for_workspace(file_path: &str, workspace_root: Option<&
     }
     let relative = &file_segments[workspace.len()..];
     (!relative.is_empty()).then(|| relative.join("/"))
+}
+
+/// `formatFilePathForClipboard` (`pingdotgg/t3code#30394`): uses Windows path separators when
+/// copying a diff file path from a Windows workspace.
+pub fn format_diff_path_for_clipboard(file_path: &str, workspace_root: Option<&str>) -> String {
+    if workspace_root.is_some_and(is_windows_absolute) {
+        file_path.replace('/', "\\")
+    } else {
+        file_path.to_owned()
+    }
 }
 
 /// `revealInFileExplorerLabelForOs` (`apps/web/src/components/preview/fileExplorerLabel.ts`).
@@ -242,5 +261,27 @@ mod tests {
         assert_eq!(reveal_in_file_explorer_label_for_os("windows"), "Reveal in File Explorer");
         assert_eq!(reveal_in_file_explorer_label_for_os("linux"), "Reveal in Files");
         assert_eq!(reveal_in_file_explorer_label_for_kind("files"), Some("Reveal in Files"));
+    }
+
+    #[test]
+    fn posix_backslash_filenames_survive_and_windows_clipboard_uses_backslashes() {
+        // POSIX filename containing a literal backslash (`pingdotgg/t3code#23167`).
+        assert_eq!(
+            resolve("src/foo\\bar.ts", Some("/repo"), Some("/repo")).as_deref(),
+            Some("src/foo\\bar.ts")
+        );
+        assert_eq!(
+            resolve("frontend/a\\b.ts", Some("/repo/frontend"), Some("/repo")).as_deref(),
+            Some("a\\b.ts")
+        );
+        assert_eq!(
+            resolve("a\\..\\secret.ts", Some("/repo"), Some("/repo")),
+            None,
+            "traversal via backslash is still rejected"
+        );
+        // Windows clipboard separators (`pingdotgg/t3code#30394`).
+        assert_eq!(format_diff_path_for_clipboard("apps/web/src/index.ts", Some("C:\\repo")), "apps\\web\\src\\index.ts");
+        assert_eq!(format_diff_path_for_clipboard("apps/web/src/index.ts", Some("/repo")), "apps/web/src/index.ts");
+        assert_eq!(format_diff_path_for_clipboard("apps/web/src/index.ts", None), "apps/web/src/index.ts");
     }
 }

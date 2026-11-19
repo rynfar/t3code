@@ -1,17 +1,19 @@
 //! The list's toolbar (`PullRequestsColumn.tsx`): the search field (`PullRequestSearchInput`),
 //! the sort menu, the Filters menu (`PullRequestListFilters.tsx`) and refresh.
 
-use gpui::{App, Context, IntoElement, ParentElement, SharedString, Styled, WeakEntity, Window, div, px};
+use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, WeakEntity, Window, div, prelude::*, px};
 use gpui_component::input::Input;
 use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
-use gpui_component::{ActiveTheme, h_flex};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_core::issues::saved_views::{is_view_modified, resolve_selected_view, saved_view_name_error};
 use t3_core::pull_requests::ListPreferences;
 use t3_core::pull_requests::list::{Involvement, ListState, Sort, facets};
 use t3_core::pull_requests::query::{ChecksFilter, DraftFilter, ReviewFilter, apply_draft_filter_change};
+use t3_core::pull_requests::saved_views::{pull_request_view_matches, pull_request_view_suggested_name};
 use t3_core::pull_requests::wire::{Actor, Label};
 
 use super::controls::{Button, Size, Variant};
-use super::page::PullRequestsPage;
+use super::page::{PullRequestsPage, SavedViewEditor};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
@@ -35,6 +37,7 @@ pub fn render(page: &mut PullRequestsPage, _window: &mut Window, cx: &mut Contex
         })
     });
     let filters = filters_menu(page, entity.clone(), cx);
+    let saved_views = saved_views_menu(page, entity.clone(), cx);
     let refresh = Button::new("pr-refresh", Variant::Outline, Size::Icon)
         .icon(Icon::RefreshCw)
         .busy(page.data.pending)
@@ -63,6 +66,7 @@ pub fn render(page: &mut PullRequestsPage, _window: &mut Window, cx: &mut Contex
         )
         .child(sort_menu)
         .child(filters)
+        .child(saved_views)
         .child(refresh)
 }
 
@@ -247,4 +251,193 @@ impl PullRequestsPage {
         }
         self.update_prefs(move |prefs| prefs.draft = filters.draft, cx);
     }
+}
+
+/// Saved named pull request views menu (`SavedViewsMenu.tsx`, `pingdotgg/t3code#29387`).
+fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, _cx: &App) -> impl IntoElement {
+    let views = page.saved_views.clone();
+    let prefs = page.current_saved_preferences();
+    let selected = resolve_selected_view(&views, page.selected_view_id.as_deref(), &prefs, pull_request_view_matches).cloned();
+    let modified = is_view_modified(selected.as_ref(), &prefs, pull_request_view_matches);
+    let trigger_label = match &selected {
+        Some(view) if modified => format!("{}*", view.name),
+        Some(view) => view.name.clone(),
+        None => "Views".to_owned(),
+    };
+    let tooltip_text = selected
+        .as_ref()
+        .map(|view| view.name.clone())
+        .unwrap_or_else(|| "Saved pull request views".to_owned());
+
+    Button::new("pr-saved-views", Variant::Outline, Size::Default)
+        .icon(Icon::Bookmark)
+        .label(trigger_label)
+        .tooltip(tooltip_text)
+        .dropdown_menu(move |mut menu, _, _| {
+            for view in &views {
+                let is_active = selected.as_ref().is_some_and(|active| active.id == view.id && !modified);
+                let view_id = view.id.clone();
+                let view_prefs = view.preferences.normalized();
+                let entity = entity.clone();
+                menu = menu.item(PopupMenuItem::new(view.name.clone()).checked(is_active).on_click(move |_, window, cx| {
+                    if let Some(page) = entity.upgrade() {
+                        let view_id = view_id.clone();
+                        let view_prefs = view_prefs.clone();
+                        page.update(cx, |page, cx| page.apply_saved_view(view_id, view_prefs, window, cx));
+                    }
+                }));
+            }
+            if !views.is_empty() {
+                menu = menu.separator();
+            }
+            let save_entity = entity.clone();
+            let suggested = pull_request_view_suggested_name(&prefs);
+            menu = menu.item(PopupMenuItem::new("Save current view…").on_click(move |_, window, cx| {
+                if let Some(page) = save_entity.upgrade() {
+                    let initial = suggested.to_owned();
+                    page.update(cx, |page, cx| page.open_saved_view_editor(None, initial, window, cx));
+                }
+            }));
+            if let Some(active) = &selected {
+                if modified {
+                    let update_entity = entity.clone();
+                    let active_id = active.id.clone();
+                    menu = menu.item(PopupMenuItem::new("Update saved view").on_click(move |_, _, cx| {
+                        if let Some(page) = update_entity.upgrade() {
+                            let active_id = active_id.clone();
+                            page.update(cx, |page, cx| page.update_active_saved_view(&active_id, cx));
+                        }
+                    }));
+                }
+                let rename_entity = entity.clone();
+                let active_id = active.id.clone();
+                let active_name = active.name.clone();
+                menu = menu.item(PopupMenuItem::new("Rename view…").on_click(move |_, window, cx| {
+                    if let Some(page) = rename_entity.upgrade() {
+                        let active_id = active_id.clone();
+                        let active_name = active_name.clone();
+                        page.update(cx, |page, cx| page.open_saved_view_editor(Some(active_id), active_name, window, cx));
+                    }
+                }));
+                let delete_entity = entity.clone();
+                let active_id = active.id.clone();
+                menu = menu.item(PopupMenuItem::new("Delete view").on_click(move |_, _, cx| {
+                    if let Some(page) = delete_entity.upgrade() {
+                        let active_id = active_id.clone();
+                        page.update(cx, |page, cx| page.delete_active_saved_view(&active_id, cx));
+                    }
+                }));
+            }
+            menu
+        })
+}
+
+/// Modal dialog for saving or renaming a saved pull request view (`SavedViewsMenu.tsx`).
+pub(super) fn render_saved_view_dialog(
+    page: &PullRequestsPage,
+    editor: &SavedViewEditor,
+    cx: &mut Context<PullRequestsPage>,
+) -> AnyElement {
+    let p = palette(cx);
+    let dark = cx.theme().is_dark();
+    let typed_name = editor.input.read(cx).value().to_string();
+    let name_error = saved_view_name_error(&typed_name, &page.saved_views, editor.editing_id.as_deref());
+    let title = if editor.editing_id.is_some() {
+        "Rename pull request view"
+    } else {
+        "Save pull request view"
+    };
+    let show_error = !typed_name.is_empty() && name_error.is_some();
+
+    div()
+        .id("pr-saved-view-backdrop")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(hsla(p.background).opacity(0.65))
+        .on_click(cx.listener(|this, _, _, cx| this.close_saved_view_editor(cx)))
+        .child(
+            v_flex()
+                .id("pr-saved-view-dialog")
+                .w(px(380.))
+                .max_w(px(420.))
+                .p(px(20.))
+                .gap(px(14.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(hsla(p.border))
+                .bg(hsla(p.popover))
+                .shadow_lg()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    v_flex()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hsla(p.popover_foreground))
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(hsla(p.muted_foreground))
+                                .child("Save your search, filters, and sort order on this device."),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(hsla(p.foreground))
+                                .child("View name"),
+                        )
+                        .child(
+                            h_flex()
+                                .h(px(34.))
+                                .px(px(10.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(if show_error { hsla(p.destructive) } else { hsla(p.input) })
+                                .bg(if dark { hsla(p.input).opacity(0.32) } else { hsla(p.background) })
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Input::new(&editor.input).appearance(false).bordered(false)),
+                                ),
+                        )
+                        .when_some(show_error.then_some(name_error).flatten(), |this, error| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(hsla(p.destructive_foreground))
+                                    .child(error.message()),
+                            )
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(
+                            Button::new("pr-view-cancel", Variant::Outline, Size::Sm)
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.close_saved_view_editor(cx))),
+                        )
+                        .child(
+                            Button::new("pr-view-save", Variant::Default, Size::Sm)
+                                .label("Save")
+                                .disabled(name_error.is_some())
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_saved_view_editor(cx))),
+                        ),
+                ),
+        )
+        .into_any_element()
 }

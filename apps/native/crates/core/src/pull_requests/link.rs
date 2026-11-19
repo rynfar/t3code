@@ -414,6 +414,17 @@ pub fn thread_pull_request_search_terms(links: &[ThreadLink]) -> Vec<String> {
     terms
 }
 
+/// `canStartThreadPullRequestWatch` (`pingdotgg/t3code#29867`): settled, archived, and subagent
+/// threads cannot start a pull request watch (the server refuses it). Stopping an existing watch
+/// remains allowed.
+pub fn can_start_thread_pull_request_watch(
+    archived: bool,
+    settled_override: Option<&str>,
+    relationship_to_parent: Option<&str>,
+) -> bool {
+    !archived && settled_override != Some("settled") && relationship_to_parent != Some("subagent")
+}
+
 /// `thread.pull-request.watch` command payload (`ThreadPullRequestsPanel.tsx`).
 pub fn watch_command(command_id: &str, thread_id: &str, link: &ThreadLink, watching: bool) -> Value {
     json!({
@@ -551,5 +562,14 @@ mod tests {
         ];
         let matched: Vec<&str> = filter_linkable_threads(&candidates, "fix").iter().map(|t| t.id.as_str()).collect();
         assert_eq!(matched, vec!["t2", "t1"]);
+    }
+
+    #[test]
+    fn settled_archived_and_subagent_threads_cannot_start_watch() {
+        assert!(can_start_thread_pull_request_watch(false, None, None));
+        assert!(can_start_thread_pull_request_watch(false, Some("unsettled"), Some("fork")));
+        assert!(!can_start_thread_pull_request_watch(true, None, None));
+        assert!(!can_start_thread_pull_request_watch(false, Some("settled"), None));
+        assert!(!can_start_thread_pull_request_watch(false, None, Some("subagent")));
     }
 }

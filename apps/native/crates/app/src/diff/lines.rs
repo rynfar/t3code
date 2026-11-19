@@ -14,10 +14,11 @@ use gpui_component::{h_flex, v_flex};
 use t3_core::composer::review::Side;
 use t3_core::diff::{
     ChangeKind, DEFAULT_EXPAND_LINES, DiffLine, DiffRow, ExpandDirection, FileContextMenuAction,
-    FileDiff, FileViewedState, LineKind, RecordedContent, compact_count, separator_label,
+    FileDiff, FileViewedState, LineKind, RecordedContent, compact_count, cut_line_note_start,
+    separator_label,
 };
 
-use super::DiffPanel;
+use super::{DiffPanel, WithheldFileStatus};
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant, tooltip_view};
 use crate::theme::{Palette, hsla, palette};
@@ -150,7 +151,15 @@ impl DiffPanel {
             return div().into_any_element();
         };
         match row {
-            DiffRow::FileHeader { file } => self.render_file_header(file, cx),
+            DiffRow::FileHeader { file } => {
+                let header = self.render_file_header(file, cx);
+                if !self.is_collapsed(file)
+                    && let Some(banner) = self.render_withheld_banner(file, cx)
+                {
+                    return v_flex().w_full().child(header).child(banner).into_any_element();
+                }
+                header
+            }
             DiffRow::Separator { file, hunk, hidden } => self.render_separator(file, hunk, hidden, cx),
             DiffRow::Line { file, hunk, line } => {
                 let Some((line, digits)) = self.line(file, hunk, line).map(|(line, digits)| (line.clone(), digits)) else { return div().into_any_element() };
@@ -271,9 +280,11 @@ impl DiffPanel {
                     .px(px(CODE_PADDING))
                     .text_color(hsla(p.code_foreground))
                     .when(!self.wrap, |this| {
-                        this.overflow_hidden().whitespace_nowrap().child(div().ml(-self.h_offset).children(text.clone()))
+                        this.overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(div().ml(-self.h_offset).children(text.as_ref().map(|t| render_code_text(t, p))))
                     })
-                    .when(self.wrap, |this| this.children(text)),
+                    .when(self.wrap, |this| this.children(text.as_ref().map(|t| render_code_text(t, p)))),
             )
             .children(resolved_cluster.map(|(side, line_number, cluster)| {
                 let label = cluster.label.clone();
@@ -447,6 +458,56 @@ impl DiffPanel {
                     .child(msg)
             }))
             .into_any_element()
+    }
+
+    fn render_withheld_banner(&self, file_ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let file = self.view.as_ref()?.parsed.files().get(file_ix)?;
+        if file.binary || !file.hunks.is_empty() {
+            return None;
+        }
+        let status = self.withheld_status(file.path())?;
+        let p = palette(cx);
+        let path = file.path().to_owned();
+        let (message, action_label, is_error) = match status {
+            WithheldFileStatus::Idle => ("Diff too large to display.".to_owned(), self.withheld_readable.then_some("Load diff"), false),
+            WithheldFileStatus::Loading => ("Loading diff…".to_owned(), None, false),
+            WithheldFileStatus::Error(err) => {
+                let text = if err.trim().is_empty() {
+                    "Couldn't load this diff.".to_owned()
+                } else {
+                    format!("Couldn't load this diff: {err}")
+                };
+                (text, self.withheld_readable.then_some("Retry"), true)
+            }
+            WithheldFileStatus::Empty => ("No text diff for this file.".to_owned(), None, false),
+        };
+        Some(
+            h_flex()
+                .w_full()
+                .min_h(px(36.))
+                .px(px(12.))
+                .py(px(6.))
+                .gap(px(10.))
+                .items_center()
+                .bg(hsla(p.muted).opacity(0.35))
+                .border_t_1()
+                .border_b_1()
+                .border_color(hsla(p.border).opacity(0.6))
+                .text_xs()
+                .text_color(if is_error { hsla(p.error_foreground) } else { hsla(p.muted_foreground) })
+                .child(div().flex_1().min_w_0().child(message))
+                .children(action_label.map(|label| {
+                    Button::new(("diff-withheld-load", file_ix))
+                        .variant(Variant::Secondary)
+                        .size(Size::Xs)
+                        .label(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.trigger_load_withheld(path.clone(), cx);
+                        }))
+                }))
+                .into_any_element(),
+        )
     }
 
     pub(super) fn render_file_header(&self, file_ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -666,6 +727,31 @@ pub(crate) fn code_row(fill: Hsla, wrap: bool, cx: &App) -> Div {
         .when(wrap, |this| this.min_h(px(crate::theme::code_line_height(cx))))
         .bg(fill).font_family(cx.theme().mono_font_family.clone())
         .text_size(cx.theme().mono_font_size).line_height(px(crate::theme::code_line_height(cx)))
+}
+
+/// Renders one line's text, styling a server-appended `…[N more characters]` truncation note
+/// distinctly from code (`cutLineNotes.ts`, `pingdotgg/t3code#37007`).
+fn render_code_text(text: &SharedString, p: Palette) -> AnyElement {
+    if let Some(offset) = cut_line_note_start(text.as_ref()) {
+        let prefix = text[..offset].to_owned();
+        let note = text[offset..].to_owned();
+        return h_flex()
+            .items_center()
+            .gap(px(4.))
+            .child(prefix)
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(4.))
+                    .rounded(px(3.))
+                    .bg(hsla(p.warning).opacity(0.14))
+                    .text_size(px(11.))
+                    .text_color(hsla(p.warning_foreground))
+                    .child(note),
+            )
+            .into_any_element();
+    }
+    text.clone().into_any_element()
 }
 
 /// A line as shown: a trailing `\r` (CRLF content) is invisible on the web too, so it is kept
