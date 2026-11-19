@@ -44,6 +44,8 @@ fn decodes_the_wire_state_merging_cloud_hosts_and_skipping_bad_entries() {
     assert_eq!(decoded.host_statuses["eas"].status, HostStatus::Unknown);
     assert!(!decoded.host_statuses.contains_key("bad"));
     assert_eq!(decoded.booting_names("t"), ["iPad"]);
+    assert!(!decoded.supports_eas_hosts && !decoded.supports_simlock_hosts, "older servers send no capability");
+    assert!(state(json!({ "supportsEasHosts": true, "supportsSimlockHosts": true })).supports_eas_hosts);
     assert!(ServiceState::decode(json!({ "hostStatus": "ready" })).is_err());
 }
 
@@ -184,6 +186,9 @@ fn ios_socket_messages_decode_and_closes_classify() {
     assert_eq!(decode_ios_message(&[0x90, b'{', b'}']), IosMessage::Other);
     assert_eq!(decode_ios_message(&[]), IosMessage::Other);
     assert_eq!((classify_close(Some(4401)), classify_close(Some(1008)), classify_close(Some(1006)), classify_close(None)), (CloseAction::Unauthorized, CloseAction::Unauthorized, CloseAction::Retry, CloseAction::Retry));
+    // An ended Simlock lease stops instead of retrying, and keeps the gateway's reason.
+    assert_eq!(classify_close(Some(LEASE_ENDED_CLOSE)), CloseAction::LeaseEnded);
+    assert_eq!((lease_ended("expired"), lease_ended("")), ("Device lease ended: expired".to_owned(), "Device lease ended: ended".to_owned()));
     assert_eq!((close_detail(Some(1011), ""), close_detail(Some(1006), ""), close_detail(None, "gone")), ("closed 1011".to_owned(), "input socket refused".to_owned(), "gone".to_owned()));
     assert_eq!(input_disconnected_label(Some("closed 1011")), "Input disconnected (closed 1011), reconnecting…");
     assert_eq!(input_disconnected_label(None), "Input disconnected, reconnecting…");
@@ -288,4 +293,180 @@ fn the_probe_runs_each_time_it_becomes_active_including_when_state_arrives_late(
     // Hidden, then shown again: probe again.
     assert!(!gate.update(false));
     assert!(gate.update(true));
+}
+
+fn detail(settings: serde_json::Value) -> tools::Detail {
+    tools::Detail::decode(json!({ "hostId": "local", "deviceId": "sim", "settings": settings, "foregroundApp": { "id": "com.example" }, "readAt": "now" })).unwrap()
+}
+
+#[test]
+fn device_detail_decodes_leniently_and_actions_encode_as_the_contract_does() {
+    let decoded = detail(json!({ "appearance": "dark", "textSize": "extra-large", "reduceMotion": true, "colorFilter": "sepia", "liquidGlass": 3, "somethingNew": 1 }));
+    assert_eq!(decoded.settings.appearance, Some(tools::Appearance::Dark));
+    assert_eq!(decoded.settings.text_size, Some(tools::TextSize::ExtraLarge));
+    assert_eq!(decoded.settings.reduce_motion, Some(true));
+    assert_eq!((decoded.settings.color_filter, decoded.settings.liquid_glass), (None, None), "a value a newer host adds reads as unknown");
+    assert_eq!(decoded.foreground_app.as_ref().map(|app| app.id.as_str()), Some("com.example"));
+    let no_app = tools::Detail::decode(json!({ "hostId": "local", "deviceId": "sim", "settings": {}, "foregroundApp": null, "readAt": "now" })).unwrap();
+    assert_eq!(no_app.foreground_app, None);
+    assert_eq!(tools::detail_payload("mac", "sim"), json!({ "hostId": "mac", "deviceId": "sim" }));
+    let payload = |action: tools::Action| tools::action_payload("mac", "sim", &action);
+    assert_eq!(payload(tools::Action::SetAppearance(tools::Appearance::Light)), json!({ "hostId": "mac", "deviceId": "sim", "type": "setAppearance", "value": "light" }));
+    assert_eq!(payload(tools::Action::SetTextSize(tools::TextSize::ExtraLarge))["value"], "extra-large");
+    assert_eq!(payload(tools::Action::SetToggle(tools::Toggle::NetworkEnabled, false)), json!({ "hostId": "mac", "deviceId": "sim", "type": "setToggle", "setting": "networkEnabled", "value": false }));
+    assert_eq!(payload(tools::Action::SetOrientation(Orientation::LandscapeLeft))["value"], "landscape_left");
+    assert_eq!(payload(tools::Action::SetColorFilter(tools::ColorFilter::RedGreen))["value"], "red-green");
+    assert_eq!(payload(tools::Action::SetLocation { latitude: 59.3293, longitude: 18.0686 }), json!({ "hostId": "mac", "deviceId": "sim", "type": "setLocation", "latitude": 59.3293, "longitude": 18.0686 }));
+    assert_eq!(payload(tools::Action::ClearLocation), json!({ "hostId": "mac", "deviceId": "sim", "type": "clearLocation" }));
+    assert_eq!(
+        payload(tools::Action::SetPermission { app_id: "com.example".into(), permission: tools::Permission::MediaLibrary, decision: tools::Decision::Reset }),
+        json!({ "hostId": "mac", "deviceId": "sim", "type": "setPermission", "appId": "com.example", "permission": "media-library", "decision": "reset" })
+    );
+    assert_eq!(payload(tools::Action::OpenUrl("myapp://home".into())), json!({ "hostId": "mac", "deviceId": "sim", "type": "openUrl", "url": "myapp://home" }));
+    assert_eq!(payload(tools::Action::TerminateApp("com.example".into()))["type"], "terminateApp");
+    assert_eq!(payload(tools::Action::SendPush { app_id: "com.example".into(), payload: "Hi".into() })["payload"], "Hi");
+}
+
+#[test]
+fn device_controls_serialize_actions_and_drop_reads_an_action_overtook() {
+    let mut controls = tools::Controls::default();
+    assert!(!controls.begin(true), "nothing runs before the first detail");
+    assert!(controls.disabled(true));
+    let first = controls.start_read();
+    assert!(controls.read(first, Ok(detail(json!({ "appearance": "light" })))));
+    assert!(!controls.disabled(true));
+    assert!(controls.disabled(false), "a hidden device takes no action");
+    assert!(!controls.begin(false));
+    // A read sent before an action must not undo what the action confirms.
+    let stale = controls.start_read();
+    assert!(controls.begin(true));
+    assert!(controls.pending() && controls.disabled(true));
+    assert!(!controls.begin(true), "one action at a time");
+    assert!(controls.finish(Ok(detail(json!({ "appearance": "dark" })))));
+    assert!(!controls.read(stale, Ok(detail(json!({ "appearance": "light" })))));
+    assert_eq!(controls.settings().and_then(|settings| settings.appearance), Some(tools::Appearance::Dark));
+    // A failed action keeps the last detail and says why; the next action clears the error.
+    assert!(controls.begin(true));
+    assert!(!controls.finish(Err("Device setAppearance failed".into())));
+    assert_eq!((controls.error(), controls.pending()), (Some("Device setAppearance failed"), false));
+    assert!(controls.detail().is_some());
+    assert!(controls.begin(true));
+    assert_eq!(controls.error(), None);
+    // A failed read clears the detail, as `deviceDetailReadAtom` does.
+    let mut reread = tools::Controls::default();
+    let ticket = reread.start_read();
+    assert!(reread.read(ticket, Err("Device host is unavailable".into())));
+    assert_eq!((reread.detail(), reread.error()), (None, Some("Device host is unavailable")));
+}
+
+#[test]
+fn device_rail_and_tools_rules_follow_the_web() {
+    assert!(tools::runs_host_commands(Some(HostKind::Local)) && tools::runs_host_commands(Some(HostKind::Ssh)));
+    assert!(!tools::runs_host_commands(Some(HostKind::Eas)) && !tools::runs_host_commands(Some(HostKind::Simlock)) && !tools::runs_host_commands(None));
+    assert!(!tools::offers_screenshot(Some(HostKind::Simlock)) && tools::offers_screenshot(Some(HostKind::Eas)));
+    let dark = detail(json!({ "appearance": "dark" })).settings;
+    assert_eq!(tools::next_appearance(Some(&dark)), tools::Appearance::Light);
+    assert_eq!(tools::next_appearance(None), tools::Appearance::Dark);
+    assert_eq!(tools::appearance_label(tools::Appearance::Light), "Switch device to light mode");
+    assert_eq!(tools::Toggle::for_platform(Platform::Android), [tools::Toggle::ReduceMotion, tools::Toggle::NetworkEnabled]);
+    assert_eq!(tools::Permission::for_platform(Platform::Android).len(), 8);
+    assert_eq!(tools::Permission::parse("faceid"), Some(tools::Permission::FaceId));
+    assert_eq!(tools::parse_orientation("portrait_upside_down"), Some(Orientation::PortraitUpsideDown));
+    assert_eq!(tools::TextSize::parse("large"), Some(tools::TextSize::Large));
+    assert_eq!(tools::parse_location(" 59.3 ", "18"), Some((59.3, 18.)));
+    assert_eq!((tools::parse_location("91", "0"), tools::parse_location("0", "-181"), tools::parse_location("", "0"), tools::parse_location("x", "0")), (None, None, None, None));
+    assert_eq!((tools::resolve_app_id("  ", Some("com.fg")), tools::resolve_app_id(" com.typed ", Some("com.fg")), tools::resolve_app_id("", None)), (Some("com.fg"), Some("com.typed"), None));
+    assert_eq!((tools::submit_value("  https://x.dev "), tools::submit_value("   ")), (Some("https://x.dev"), None));
+}
+
+#[test]
+fn device_screenshot_extracts_the_png_and_names_the_file() {
+    // A minimal PNG: signature, one IHDR-sized chunk, IEND; `adb` may print warnings around it.
+    let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+    png.extend([0, 0, 0, 1]);
+    png.extend(b"IHDR");
+    png.push(7);
+    png.extend([0, 0, 0, 0]);
+    png.extend([0, 0, 0, 0]);
+    png.extend(b"IEND");
+    png.extend([0, 0, 0, 0]);
+    let noisy = [b"WARNING: multiple displays\n".as_slice(), &png, b"trailing"].concat();
+    assert_eq!(tools::extract_png(&noisy), Some(png.as_slice()));
+    assert_eq!(tools::extract_png(&png[..png.len() - 3]), None, "a truncated image is incomplete");
+    assert_eq!(tools::extract_png(b"no image"), None);
+    assert_eq!(tools::screenshot_file_name("iPhone 16 Pro (18.2)", 1_700), "iPhone-16-Pro--18-2--1700.png");
+    assert_eq!(tools::screenshot_path("SIM 1"), "/api/screenshot?device=SIM%201");
+    assert_eq!(tools::screenshot_status_error(500), "Screenshot capture failed (500). Try again.");
+}
+
+#[test]
+fn eas_host_access_token_is_a_literal_or_a_secret_reference() {
+    let base = json!({ "kind": "eas", "id": "expo", "label": " Expo " });
+    let host = hosts::EasHostConfig::decode(&base).unwrap();
+    assert_eq!((host.label.as_str(), &host.access_token, host.max_session_minutes, host.idle_minutes, host.max_concurrent_sessions), ("Expo", &hosts::SecretValue::default(), 30, 10, 2));
+    let with = |patch: serde_json::Value| {
+        let mut value = base.clone();
+        for (key, field) in patch.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        hosts::EasHostConfig::decode(&value)
+    };
+    let referenced = with(json!({ "accessToken": { "provider": "1Password", "reference": " op://vault/expo/token " } })).unwrap();
+    assert_eq!(referenced.access_token, hosts::SecretValue::Reference { provider: "1Password".into(), reference: "op://vault/expo/token".into() });
+    assert_eq!(referenced.access_token.literal(), "", "a reference holds no literal");
+    assert_eq!(hosts::EasHostConfig::decode(&referenced.encode()).unwrap(), referenced, "it round-trips");
+    assert_eq!(with(json!({ "accessToken": " tok " })).unwrap().access_token.literal(), "tok");
+    assert_eq!(with(json!({ "accessToken": { "provider": "-bad", "reference": "x" } })), Err(hosts::REFERENCE_PROBLEM.into()));
+    assert_eq!(with(json!({ "accessToken": { "provider": "op", "reference": "a\nb" } })), Err(hosts::REFERENCE_PROBLEM.into()));
+    assert_eq!(with(json!({ "accessToken": 4 })), Err(hosts::REFERENCE_PROBLEM.into()));
+    assert_eq!(with(json!({ "idleMinutes": 30 })), Err(hosts::IDLE_LIMIT_PROBLEM.into()));
+    assert!(with(json!({ "maxSessionMinutes": 116 })).is_err());
+    assert!(with(json!({ "maxConcurrentSessions": 2.5 })).is_err());
+    assert!(with(json!({ "id": "local" })).is_err(), "the local id is reserved");
+    assert!(with(json!({ "id": "_x" })).is_err());
+    assert!(with(json!({ "kind": "ssh" })).is_err());
+    assert!(hosts::decode_eas_hosts(&json!([base.clone(), base.clone()])).is_err(), "ids are unique");
+    assert_eq!(host.session_limits(), "Up to 2 sessions at once, each stopped after 30 min or 10 idle min");
+    let updated = hosts::update_eas_hosts(std::slice::from_ref(&referenced), &hosts::EasHostConfig { label: "Renamed".into(), ..hosts::EasHostConfig::new("expo") }, false, true);
+    assert_eq!((updated[0].label.as_str(), &updated[0].access_token), ("Renamed", &referenced.access_token), "keepToken keeps the environment's token");
+    assert!(hosts::update_eas_hosts(&updated, &host, true, false).is_empty());
+}
+
+#[test]
+fn eas_token_editor_blocks_check_and_save_on_an_invalid_reference_until_cleared() {
+    let saved = hosts::EasHostConfig { access_token: hosts::SecretValue::Literal("•••".into()), ..hosts::EasHostConfig::new("expo") };
+    let mut editor = hosts::EasTokenEditor::new(&saved, false);
+    assert!(editor.configured() && editor.field_value().is_empty(), "a saved literal arrives redacted");
+    assert_eq!(editor.open_check_payload("expo"), json!({ "hostId": "expo" }));
+    assert_eq!(editor.check_payload("expo"), json!({ "hostId": "expo" }));
+    assert_eq!(editor.token_for_save(), saved.access_token);
+    // Picking a provider before its reference is committed is invalid.
+    editor.set_validity(false);
+    assert!(!editor.can_check());
+    assert_eq!(editor.problem(&saved), Some(hosts::REFERENCE_PROBLEM));
+    let reference = hosts::SecretValue::reference("op", "op://vault/expo").unwrap();
+    editor.set_token(Some(reference.clone()));
+    editor.set_validity(true);
+    assert_eq!(editor.problem(&saved), None);
+    assert_eq!(editor.check_payload("expo"), json!({ "accessToken": { "provider": "op", "reference": "op://vault/expo" } }));
+    assert_eq!(editor.next(&saved).access_token, reference);
+    // Clear resets validation and sends an empty token, so the check cannot fall back to the saved one.
+    editor.set_validity(false);
+    editor.clear();
+    assert!(editor.valid() && editor.can_check());
+    assert_eq!(editor.check_payload("expo"), json!({ "accessToken": "" }));
+    assert!(editor.token_for_save().is_empty());
+    let idle = hosts::EasHostConfig { idle_minutes: 40, max_session_minutes: 40, ..saved.clone() };
+    assert_eq!(editor.problem(&idle), Some(hosts::IDLE_LIMIT_PROBLEM));
+    assert_eq!(editor.problem(&hosts::EasHostConfig { label: " ".into(), ..saved.clone() }), Some(hosts::LIMITS_PROBLEM));
+    // A saved reference is shown as written; a new host's saved token checks without an id.
+    let referenced = hosts::EasHostConfig { access_token: reference.clone(), ..saved.clone() };
+    let editor = hosts::EasTokenEditor::new(&referenced, true);
+    assert!(!editor.configured());
+    assert_eq!(editor.field_value(), reference);
+    assert_eq!((editor.open_check_payload("expo"), editor.check_payload("expo")), (json!({}), json!({})));
+    let empty = hosts::EasTokenEditor::new(&hosts::EasHostConfig::new("expo"), false);
+    assert_eq!((empty.token(), empty.open_check_payload("expo")), (&hosts::TokenDraft::Cleared, json!({ "accessToken": "" })));
+    let account = hosts::EasAccount::decode(json!({ "signedInAs": "ana", "credentialSource": "eas-login", "apps": [{ "id": "a1", "fullName": "@ana/app" }] })).unwrap();
+    assert_eq!((account.credential_source_label(), account.apps[0].full_name.as_str()), ("the server's eas login", "@ana/app"));
 }
