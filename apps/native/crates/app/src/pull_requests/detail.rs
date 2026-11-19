@@ -131,6 +131,7 @@ pub(super) struct CommentEditState {
     pub kind: CommentKind,
     pub input: Entity<TextareaState>,
     pub saving: bool,
+    _sub: Subscription,
 }
 
 #[derive(Default)]
@@ -1120,10 +1121,10 @@ impl DetailView {
     fn start_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(title) = self.detail.as_ref().map(|d| d.title.clone()) else { return };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
-        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.save_title(cx);
-            }
+        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
+            InputEvent::Change => cx.notify(),
+            InputEvent::PressEnter { .. } => this.save_title(cx),
+            _ => {}
         });
         input.update(cx, |input, cx| input.focus(window, cx));
         self.title_input = Some(input);
@@ -1403,6 +1404,12 @@ impl DetailView {
         }
         let initial = self.review_draft.summary.clone();
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 8).default_value(initial).placeholder("Summarize your review (optional)"));
+        let sub = cx.subscribe_in(&input, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(sub);
         self.review_summary_input = Some(input.clone());
         input
     }
@@ -1457,6 +1464,12 @@ impl DetailView {
             return input.clone();
         }
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 8).placeholder("Leave a comment"));
+        let sub = cx.subscribe_in(&input, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(sub);
         self.comment_input = Some(input.clone());
         input
     }
@@ -1559,7 +1572,12 @@ impl DetailView {
 
     pub(super) fn start_comment_edit(&mut self, comment_id: String, kind: CommentKind, body: String, window: &mut Window, cx: &mut Context<Self>) {
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 10).default_value(body));
-        self.editing_comment = Some(CommentEditState { comment_id, kind, input, saving: false });
+        let sub = cx.subscribe_in(&input, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        self.editing_comment = Some(CommentEditState { comment_id, kind, input, saving: false, _sub: sub });
         cx.notify();
     }
 
@@ -1612,6 +1630,12 @@ impl DetailView {
             return input.clone();
         }
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 8).placeholder("Write a reply..."));
+        let sub = cx.subscribe_in(&input, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        });
+        self._subscriptions.push(sub);
         self.reply_input = Some(input.clone());
         input
     }
