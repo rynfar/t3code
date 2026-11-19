@@ -896,7 +896,7 @@ mod tests {
         let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
         cx.update(|cx| crate::settings::init(state.clone(), cx));
         let git = cx.new(|cx| GitStore::new(state.clone(), cx));
-        let details = cx.new(|_| super::super::Details::new(git.clone()));
+        let details = cx.new(|cx| super::super::Details::new(state.clone(), git.clone(), cx));
         state.update(cx, |state, cx| {
             state.phase = Phase::Online(ConnectionStatus::Connected);
             apply_config(state, SCRATCH_ROOT);
@@ -956,7 +956,7 @@ mod tests {
         });
         let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
         let git = cx.new(|cx| GitStore::new(state.clone(), cx));
-        let details = cx.new(|_| super::super::Details::new(git.clone()));
+        let details = cx.new(|cx| super::super::Details::new(state.clone(), git.clone(), cx));
         state.update(cx, |state, cx| {
             state.phase = Phase::Online(ConnectionStatus::Connected);
             apply_config(state, SCRATCH_ROOT);
@@ -1067,7 +1067,7 @@ mod tests {
         let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
         cx.update(|cx| crate::settings::init(state.clone(), cx));
         let git = cx.new(|cx| GitStore::new(state.clone(), cx));
-        let details = cx.new(|_| super::super::Details::new(git.clone()));
+        let details = cx.new(|cx| super::super::Details::new(state.clone(), git.clone(), cx));
         state.update(cx, |state, cx| {
             state.phase = Phase::Online(ConnectionStatus::Connected);
             apply_config(state, SCRATCH_ROOT);
@@ -1140,7 +1140,7 @@ mod tests {
         let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
         cx.update(|cx| crate::settings::init(state.clone(), cx));
         let git = cx.new(|cx| GitStore::new(state.clone(), cx));
-        let details = cx.new(|_| super::super::Details::new(git.clone()));
+        let details = cx.new(|cx| super::super::Details::new(state.clone(), git.clone(), cx));
         let script = ProjectScript {
             id: "dev".into(),
             name: "Dev".into(),

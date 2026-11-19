@@ -85,6 +85,7 @@ pub enum DetailsEvent {
 
 /// The card's preferences and the open thread's Git store.
 pub struct Details {
+    state: Entity<AppState>,
     pub git: Entity<GitStore>,
     panels: HashMap<String, PanelVisibility>,
     pub items: items::Visibility,
@@ -127,15 +128,39 @@ fn clear_open_popovers(panels: &mut HashMap<String, PanelVisibility>) {
 }
 
 impl Details {
-    fn new(git: Entity<GitStore>) -> Self {
+    fn new(state: Entity<AppState>, git: Entity<GitStore>, cx: &App) -> Self {
         let persisted: Persisted = store::load_ui_state(STORE).and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
-        let legacy_usage_enabled = legacy_usage_flag(persisted.legacy_usage_cleared, store::load_client_settings().as_deref());
+        let (items, legacy_usage_enabled, legacy_usage_cleared) = if let Some(doc) = crate::settings::store::try_client(cx) {
+            if doc.entries().contains_key("threadDetailsItems")
+                || doc.entries().contains_key("threadDetailsUsageEnabled")
+                || persisted.items.is_empty()
+            {
+                (
+                    doc.thread_details_visibility(),
+                    Some(doc.thread_details_usage_enabled()),
+                    !doc.thread_details_usage_enabled(),
+                )
+            } else {
+                (
+                    items::Visibility::from_overrides(persisted.items),
+                    legacy_usage_flag(persisted.legacy_usage_cleared, store::load_client_settings().as_deref()),
+                    persisted.legacy_usage_cleared,
+                )
+            }
+        } else {
+            (
+                items::Visibility::from_overrides(persisted.items),
+                legacy_usage_flag(persisted.legacy_usage_cleared, store::load_client_settings().as_deref()),
+                persisted.legacy_usage_cleared,
+            )
+        };
         Details {
+            state,
             git,
             panels: persisted.panels,
-            items: items::Visibility::from_overrides(persisted.items),
+            items,
             legacy_usage_enabled,
-            legacy_usage_cleared: persisted.legacy_usage_cleared,
+            legacy_usage_cleared,
             last_scripts: persisted.last_scripts,
             last_editor: persisted.last_editor,
             presentation: Presentation::Inline,
@@ -143,6 +168,30 @@ impl Details {
             remote_capable_editors: None,
             remote_editor_probe: None,
             _git_subscription: None,
+        }
+    }
+
+    /// Mirrors `threadDetailsItems` / `threadDetailsUsageEnabled` from `ClientSettingsDoc`
+    /// (`AppearanceSettingsPanel.tsx` -> `ThreadDetailsItemsRow`).
+    pub fn sync_from_client_settings(
+        &mut self,
+        doc: &t3_core::client_settings::ClientSettingsDoc,
+        emit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next_items = doc.thread_details_visibility();
+        let next_legacy = Some(doc.thread_details_usage_enabled());
+        let next_cleared = !doc.thread_details_usage_enabled();
+        if self.items != next_items
+            || self.legacy_usage_enabled != next_legacy
+            || self.legacy_usage_cleared != next_cleared
+        {
+            self.items = next_items;
+            self.legacy_usage_enabled = next_legacy;
+            self.legacy_usage_cleared = next_cleared;
+            if emit {
+                self.save(cx);
+            }
         }
     }
 
@@ -245,13 +294,30 @@ impl Details {
     pub fn set_item(&mut self, id: &str, visible: bool, cx: &mut Context<Self>) {
         self.items.set_with_legacy_usage(id, visible, self.legacy_usage_enabled);
         self.save(cx);
+        if crate::settings::store::try_client(cx).is_some() {
+            crate::settings::store::update_client(
+                &self.state,
+                t3_core::client_settings::ClientSettingChange::ThreadDetailsItem {
+                    id: id.to_owned(),
+                    visible,
+                },
+                cx,
+            );
+        }
     }
 
     pub fn reset_items(&mut self, cx: &mut Context<Self>) {
-        self.legacy_usage_enabled = None;
+        self.legacy_usage_enabled = Some(false);
         self.legacy_usage_cleared = true;
         self.items.reset();
         self.save(cx);
+        if crate::settings::store::try_client(cx).is_some() {
+            crate::settings::store::update_client(
+                &self.state,
+                t3_core::client_settings::ClientSettingChange::ResetThreadDetailsItems,
+                cx,
+            );
+        }
     }
 
     pub fn last_script(&self, project_id: &str) -> Option<&str> {
@@ -414,8 +480,9 @@ pub(crate) fn point_in_find_bar(find_open: bool, position: gpui::Point<gpui::Pix
 /// `editor.openFavorite`.
 pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<Details> {
     let git = crate::git::init(state.clone(), cx);
+    let details_state = state.clone();
     let details = cx.new(|cx| {
-        let mut details = Details::new(git);
+        let mut details = Details::new(details_state, git, cx);
         details.observe_git(cx);
         details
     });

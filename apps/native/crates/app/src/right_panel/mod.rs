@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 const REOPEN_GUARD: Duration = Duration::from_millis(250);
 
 use gpui::{
-    AnchoredPositionMode, App, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Render, StyleRefinement, Styled, Subscription, Task, Window, actions, div, point, prelude::*, px,
+    AnchoredPositionMode, Animation, AnimationExt, App, Context, DragMoveEvent, ElementId, EmptyView, Entity, FocusHandle, Focusable,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, StyleRefinement, Styled, Subscription, Task, Window, actions, div,
+    ease_out_quint, point, prelude::*, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::v_flex;
@@ -79,6 +80,12 @@ pub struct RightPanelView {
     proactive: ProactivePanelCoordinator,
     /// Last seen `proactive_panels_enabled` setting, so toggling it in Settings re-evaluates.
     last_proactive_enabled: Option<bool>,
+    /// Tracks `(thread_id, is_open)` across frames so `panelAnimationDurationMs` animates
+    /// same-thread opens without animating thread navigation (`panelAnimations.ts`).
+    last_open_state: Option<(String, bool)>,
+    /// Monotonic id for the active open width transition; `None` when animations are off (`0 ms`).
+    open_animation: Option<(u64, u32)>,
+    open_animation_seq: u64,
     /// Whether the panel is currently in narrow-window sheet mode (`ChatView.tsx:2035`).
     in_sheet_mode: bool,
     /// Inline rename input for a device tab (`RightPanelTabs.tsx`).
@@ -167,6 +174,9 @@ impl RightPanelView {
             pull_request_tabs: Vec::new(),
             proactive: ProactivePanelCoordinator::default(),
             last_proactive_enabled: None,
+            last_open_state: None,
+            open_animation: None,
+            open_animation_seq: 0,
             in_sheet_mode: initial_sheet_mode,
             renaming_device: None,
             add_menu_open: false,
@@ -182,6 +192,11 @@ impl RightPanelView {
         view.attach_details_subscription(cx);
         view.evaluate_proactive(cx);
         view
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn open_animation_duration_ms(&self) -> Option<u32> {
+        self.open_animation.map(|(_, duration_ms)| duration_ms)
     }
 
     fn attach_details_subscription(&mut self, cx: &mut Context<Self>) {
@@ -779,9 +794,28 @@ impl Render for RightPanelView {
         self.sync_terminals(thread_id.as_deref(), panel.as_ref(), window, cx);
         self.sync_pull_request_tabs(thread_id.as_deref(), panel.as_ref(), cx);
         let state = self.state.read(cx);
-        let (Some(thread_id), Some(panel)) = (thread_id, panel) else { return div().into_any_element() };
-        if !panel.is_open {
+        let (Some(thread_id), Some(panel)) = (thread_id, panel) else {
+            self.last_open_state = None;
+            self.open_animation = None;
             return div().into_any_element();
+        };
+        let animation_duration_ms = crate::settings::store::try_client(cx)
+            .map_or(0, t3_core::client_settings::ClientSettingsDoc::panel_animation_duration_ms);
+        let same_thread_opened = matches!(
+            self.last_open_state.as_ref(),
+            Some((prev_thread, false)) if prev_thread == &thread_id
+        ) && panel.is_open;
+        let thread_switched = self.last_open_state.as_ref().is_some_and(|(prev, _)| prev != &thread_id);
+        self.last_open_state = Some((thread_id.clone(), panel.is_open));
+        if !panel.is_open {
+            self.open_animation = None;
+            return div().into_any_element();
+        }
+        if animation_duration_ms == 0 || thread_switched {
+            self.open_animation = None;
+        } else if same_thread_opened {
+            self.open_animation_seq = self.open_animation_seq.wrapping_add(1);
+            self.open_animation = Some((self.open_animation_seq, animation_duration_ms));
         }
         let stored = state.panels.panels.width(&thread_id).unwrap_or(DEFAULT_WIDTH);
         let width = if sheet_mode {
@@ -886,6 +920,23 @@ impl Render for RightPanelView {
             .child(div().flex_1().min_h_0().flex().flex_col().child(content))
             .children(add_menu);
 
+        let panel_el = if sheet_mode {
+            panel_el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        } else {
+            panel_el
+        };
+        let animated_panel: gpui::AnyElement = match self.open_animation {
+            Some((seq, duration_ms)) if sheet_mode || !panel.maximized => panel_el
+                .overflow_hidden()
+                .with_animation(
+                    ElementId::Name(format!("right-panel-open-{seq}").into()),
+                    Animation::new(Duration::from_millis(u64::from(duration_ms))).with_easing(ease_out_quint()),
+                    move |el, delta| el.w(px(width * delta)),
+                )
+                .into_any_element(),
+            _ => panel_el.into_any_element(),
+        };
+
         if sheet_mode {
             let dismiss_state = self.state.clone();
             let esc_state = self.state.clone();
@@ -914,14 +965,14 @@ impl Render for RightPanelView {
                                             esc_state.update(cx, |state, cx| state.toggle_right_panel(cx));
                                         }
                                     })
-                                    .child(panel_el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())),
+                                    .child(animated_panel),
                             ),
                     )
                     .with_priority(40),
                 )
                 .into_any_element();
         }
-        panel_el.into_any_element()
+        animated_panel
     }
 }
 

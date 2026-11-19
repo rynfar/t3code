@@ -2,38 +2,57 @@
 //! width (`AppearanceSettingsPanel.tsx`) and typography (`TypographySettings.tsx`).
 //! Choices apply live through `crate::theme`; editing is hosted by `crate::theme_editor`.
 
-use gpui::{
-    App, AppContext, Context, ElementId, Entity, FontWeight, Hsla, IntoElement, ParentElement, Styled, Subscription,
-    Window, div, prelude::*, px,
-};
-use gpui_component::{h_flex, v_flex};
-use t3_core::client_settings::{AppearanceMode, ChatWidth, ClientSettingChange, ThemePreference};
+use std::time::{Duration, Instant};
 
-use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, r, section, section_title};
+use gpui::{
+    Animation, AnimationExt, App, AppContext, Context, ElementId, Entity, FontWeight, Hsla, IntoElement, ParentElement, Styled,
+    Subscription, Window, div, ease_out_quint, prelude::*, px,
+};
+use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_core::client_settings::{
+    AppearanceMode, ChatWidth, ClientSettingChange, DEFAULT_PANEL_ANIMATION_DURATION_MS, EffortDisplay,
+    EnvironmentIdentificationMode, MAX_PANEL_ANIMATION_DURATION_MS, MIN_PANEL_ANIMATION_DURATION_MS, ThemePreference,
+    environment_identification_options, resolve_effective_environment_identification_mode, resolve_server_backed_stage_label,
+    resolve_sidebar_stage_backdrop_variant,
+};
+
+use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, r, section, section_title};
 use super::{Block, SettingsView, store};
+use crate::icons::Icon;
 use crate::theme::{self, hsla, palette, swatch};
-use gpui_component::slider::{SliderEvent, SliderState};
+use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use t3_core::themes::{self, ThemeDefinition};
 
+const THREAD_DETAILS_MENU_REOPEN_GUARD: Duration = Duration::from_millis(250);
+
 pub(super) struct AppearanceState {
-    sliders: [Entity<SliderState>; 2],
+    sliders: [Entity<SliderState>; 3],
     _subscriptions: Vec<Subscription>,
     removal: Option<ThemeDefinition>,
     pub(super) import: Option<Entity<super::theme_import::ThemeImportDialog>>,
     removal_ids: Vec<String>,
     variants: std::collections::BTreeMap<String, String>,
+    thread_details_menu_open: bool,
+    thread_details_menu_dismissed: Option<Instant>,
+    advanced_interface: bool,
+    panel_preview_open: bool,
+    panel_preview_seq: u64,
 }
 impl AppearanceState {
     pub fn new(cx: &mut Context<SettingsView>) -> Self {
-        let values = [store::client(cx).appearance_contrast(), store::client(cx).glass_opacity()];
+        let client = store::client(cx);
+        let values = [
+            client.appearance_contrast(),
+            client.glass_opacity(),
+            client.panel_animation_duration_ms(),
+        ];
         let sliders = std::array::from_fn(|i| {
-            cx.new(|_| {
-                SliderState::new()
-                    .min(if i == 0 { 50. } else { 40. })
-                    .max(if i == 0 { 200. } else { 100. })
-                    .step(5.)
-                    .default_value(values[i] as f32)
-            })
+            let (min, max, step) = match i {
+                0 => (50., 200., 5.),
+                1 => (40., 100., 5.),
+                _ => (MIN_PANEL_ANIMATION_DURATION_MS as f32, MAX_PANEL_ANIMATION_DURATION_MS as f32, 25.),
+            };
+            cx.new(|_| SliderState::new().min(min).max(max).step(step).default_value(values[i] as f32))
         });
         let subscriptions = sliders
             .iter()
@@ -42,11 +61,12 @@ impl AppearanceState {
                 cx.subscribe(slider, move |view, _, event: &SliderEvent, cx| {
                     if let SliderEvent::Change(value) = event {
                         let value = value.start().round() as u32;
-                        store::update_client(
-                            &view.state,
-                            if i == 0 { ClientSettingChange::AppearanceContrast(value) } else { ClientSettingChange::GlassOpacity(value) },
-                            cx,
-                        );
+                        let change = match i {
+                            0 => ClientSettingChange::AppearanceContrast(value),
+                            1 => ClientSettingChange::GlassOpacity(value),
+                            _ => ClientSettingChange::PanelAnimationDurationMs(value),
+                        };
+                        store::update_client(&view.state, change, cx);
                     }
                 })
             })
@@ -58,6 +78,11 @@ impl AppearanceState {
             import: None,
             removal_ids: Vec::new(),
             variants: std::collections::BTreeMap::new(),
+            thread_details_menu_open: false,
+            thread_details_menu_dismissed: None,
+            advanced_interface: false,
+            panel_preview_open: true,
+            panel_preview_seq: 0,
         }
     }
 }
@@ -416,56 +441,115 @@ impl SettingsView {
             });
 
         let width_state = self.state.clone();
+        let effort_state = self.state.clone();
+        let effort_reset_state = self.state.clone();
+        let effort_display = doc.effort_display();
         let math_enabled = doc.math_rendering_enabled();
         let math_state = self.state.clone();
         let math_reset_state = self.state.clone();
-        let interface = section(
-            "Interface",
-            vec![
-                self.percent_row(false, cx),
-                self.percent_row(true, cx),
-                Row::new("chat-width", "Chat width")
-                    .description("Set how wide messages and the composer can grow on large screens.")
-                    .highlighted(self.is_target("chat-width"))
-                    .reset(doc.chat_width() != ChatWidth::default(), {
-                        let state = self.state.clone();
-                        move |_, _, cx| store::update_client(&state, ClientSettingChange::ChatWidth(ChatWidth::default()), cx)
-                    })
-                    .control(
-                        Select::new(
-                            "chat-width-select",
-                            vec![
-                                SelectOption::new("comfortable", "Comfortable (default)"),
-                                SelectOption::new("wide", "Wide"),
-                                SelectOption::new("full", "Full"),
-                            ],
-                        )
-                        .selected(doc.chat_width().as_str())
-                        .label(doc.chat_width().label())
-                        .width(160.)
-                        .show_check()
-                        .on_change(move |value, _, cx| {
-                            if let Some(width) = ChatWidth::parse(&value) {
-                                store::update_client(&width_state, ClientSettingChange::ChatWidth(width), cx);
-                            }
-                        }),
+        let advanced_targeted = [
+            "panel-animations",
+            "environment-identification",
+            "appearance-interface",
+            "composer-context",
+        ]
+        .iter()
+        .any(|id| self.is_target(id));
+        let advanced_open = self.appearance_ui.advanced_interface || advanced_targeted;
+        let mut interface_rows = vec![
+            self.percent_row(false, cx),
+            self.percent_row(true, cx),
+            Row::new("chat-width", "Chat width")
+                .description("Set how wide messages and the composer can grow on large screens.")
+                .highlighted(self.is_target("chat-width"))
+                .reset(doc.chat_width() != ChatWidth::default(), {
+                    let state = self.state.clone();
+                    move |_, _, cx| store::update_client(&state, ClientSettingChange::ChatWidth(ChatWidth::default()), cx)
+                })
+                .control(
+                    Select::new(
+                        "chat-width-select",
+                        vec![
+                            SelectOption::new("comfortable", "Comfortable (default)"),
+                            SelectOption::new("wide", "Wide"),
+                            SelectOption::new("full", "Full"),
+                        ],
                     )
-                    .into_any_element(),
-                Row::new("math-rendering", "Render math")
-                    .description("Typeset LaTeX math, such as $x^2$ or \\[x^2\\], in messages and Markdown previews. The composer keeps TeX source editable.")
-                    .highlighted(self.is_target("math-rendering"))
-                    .reset(math_enabled, move |_, _, cx| {
-                        store::update_client(&math_reset_state, ClientSettingChange::MathRenderingEnabled(false), cx)
-                    })
-                    .control(
-                        super::controls::Switch::new("math-rendering-switch", math_enabled).on_change(move |checked, _, cx| {
-                            store::update_client(&math_state, ClientSettingChange::MathRenderingEnabled(checked), cx);
-                        }),
-                    )
-                    .into_any_element(),
-            ],
-            cx,
-        );
+                    .selected(doc.chat_width().as_str())
+                    .label(doc.chat_width().label())
+                    .width(160.)
+                    .show_check()
+                    .on_change(move |value, _, cx| {
+                        if let Some(width) = ChatWidth::parse(&value) {
+                            store::update_client(&width_state, ClientSettingChange::ChatWidth(width), cx);
+                        }
+                    }),
+                )
+                .into_any_element(),
+            self.thread_details_items_row(&doc, cx),
+            Row::new("effort-display", "Effort display")
+                .description("Show reasoning effort in the composer as its name, such as High, or as bars.")
+                .highlighted(self.is_target("effort-display"))
+                .reset(effort_display != EffortDisplay::default(), move |_, _, cx| {
+                    store::update_client(&effort_reset_state, ClientSettingChange::EffortDisplay(EffortDisplay::default()), cx)
+                })
+                .control(
+                    div()
+                        .debug_selector(|| "effort-display-control".to_owned())
+                        .child(
+                            Select::new(
+                                "effort-display-select",
+                                vec![
+                                    SelectOption::new("label", "Word (default)"),
+                                    SelectOption::new("bars", "Bars"),
+                                ],
+                            )
+                            .selected(effort_display.as_str())
+                            .label(effort_display.label())
+                            .width(160.)
+                            .show_check()
+                            .on_change(move |value, _, cx| {
+                                if let Some(display) = EffortDisplay::parse(&value) {
+                                    store::update_client(&effort_state, ClientSettingChange::EffortDisplay(display), cx);
+                                }
+                            }),
+                        ),
+                )
+                .into_any_element(),
+            Row::new("math-rendering", "Render math")
+                .description("Typeset LaTeX math, such as $x^2$ or \\[x^2\\], in messages and Markdown previews. The composer keeps TeX source editable.")
+                .highlighted(self.is_target("math-rendering"))
+                .reset(math_enabled, move |_, _, cx| {
+                    store::update_client(&math_reset_state, ClientSettingChange::MathRenderingEnabled(false), cx)
+                })
+                .control(
+                    Switch::new("math-rendering-switch", math_enabled).on_change(move |checked, _, cx| {
+                        store::update_client(&math_state, ClientSettingChange::MathRenderingEnabled(checked), cx);
+                    }),
+                )
+                .into_any_element(),
+            div()
+                .px(r(16.))
+                .py(r(8.))
+                .debug_selector(|| "appearance-interface-advanced".to_owned())
+                .child(
+                    Button::new("appearance-interface-advanced", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                        .icon(if advanced_open { Icon::ChevronDown } else { Icon::ChevronRight })
+                        .label("Advanced")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.appearance_ui.advanced_interface = !advanced_open;
+                            this.target = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        ];
+        if advanced_open {
+            interface_rows.push(self.panel_animations_row(&doc, cx));
+            interface_rows.push(self.environment_identification_row(&doc, cx));
+            interface_rows.push(self.composer_context_row(&doc));
+        }
+        let interface = section("Interface", interface_rows, cx);
 
         let typography = self.typography_rows(cx);
 
@@ -474,10 +558,15 @@ impl SettingsView {
             Block::new(
                 &[
                     "appearance-interface",
-                    "chat-width",
                     "setting-appearance-contrast",
                     "setting-glass-opacity",
+                    "chat-width",
+                    "thread-details-items",
+                    "effort-display",
                     "math-rendering",
+                    "panel-animations",
+                    "environment-identification",
+                    "composer-context",
                 ],
                 interface,
             ),
@@ -495,6 +584,389 @@ impl SettingsView {
                 typography,
             ),
         ]
+    }
+
+    fn thread_details_items_row(
+        &self,
+        doc: &t3_core::client_settings::ClientSettingsDoc,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = palette(cx);
+        let dark = cx.theme().is_dark();
+        let enabled = doc.thread_details_enabled_count();
+        let total = t3_core::thread_details::ITEMS.len();
+        let is_default = doc.thread_details_is_default();
+        let reset_state = self.state.clone();
+        let menu_open = self.appearance_ui.thread_details_menu_open;
+        let popover = menu_open.then(|| {
+            let menu_reset_state = self.state.clone();
+            let items = t3_core::thread_details::ITEMS.iter().map(|(id, label, _)| {
+                let item_id = (*id).to_owned();
+                let item_state = self.state.clone();
+                let shown = doc.thread_details_item_visible(id);
+                div()
+                    .debug_selector({
+                        let id = *id;
+                        move || format!("thread-details-item-{id}")
+                    })
+                    .child(
+                        crate::composer::controls::MenuItem::new(
+                            ElementId::Name(format!("thread-details-item-{id}").into()),
+                            *label,
+                        )
+                        .checked(shown)
+                        .on_click(move |_, _, cx| {
+                            store::update_client(
+                                &item_state,
+                                ClientSettingChange::ThreadDetailsItem { id: item_id.clone(), visible: !shown },
+                                cx,
+                            );
+                            if let Some(details) = crate::thread_details::details(cx) {
+                                let updated = store::client(cx).clone();
+                                details.update(cx, |details, cx| details.sync_from_client_settings(&updated, true, cx));
+                            }
+                        }),
+                    )
+            });
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(gpui::Anchor::TopRight)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        v_flex()
+                            .id("thread-details-items-popover")
+                            .debug_selector(|| "thread-details-items-popover".to_owned())
+                            .occlude()
+                            .mt(r(4.))
+                            .w(r(232.))
+                            .p(r(4.))
+                            .rounded(r(8.))
+                            .border_1()
+                            .border_color(hsla(p.dropdown_border))
+                            .bg(hsla(p.popover))
+                            .text_color(hsla(p.popover_foreground))
+                            .shadow(crate::composer::controls::floating_shadow(dark))
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                if this.appearance_ui.thread_details_menu_open {
+                                    this.appearance_ui.thread_details_menu_open = false;
+                                    this.appearance_ui.thread_details_menu_dismissed = Some(Instant::now());
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .px(r(8.))
+                                    .py(r(6.))
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(hsla(p.muted_foreground))
+                                    .child("Show in thread details"),
+                            )
+                            .children(items)
+                            .child(div().h(px(1.)).my(r(4.)).bg(hsla(p.border)))
+                            .child(
+                                div().debug_selector(|| "thread-details-menu-reset".to_owned()).child(
+                                    crate::composer::controls::MenuItem::new("thread-details-menu-reset", "Reset to default")
+                                        .disabled(is_default)
+                                        .on_click(move |_, _, cx| {
+                                            store::update_client(
+                                                &menu_reset_state,
+                                                ClientSettingChange::ResetThreadDetailsItems,
+                                                cx,
+                                            );
+                                            if let Some(details) = crate::thread_details::details(cx) {
+                                                let updated = store::client(cx).clone();
+                                                details.update(cx, |details, cx| details.sync_from_client_settings(&updated, true, cx));
+                                            }
+                                        }),
+                                ),
+                            ),
+                    ),
+            )
+            .with_priority(2)
+        });
+        Row::new("thread-details-items", "Thread details")
+            .description("Choose what the thread details card shows. You can also right-click the card.")
+            .highlighted(self.is_target("thread-details-items"))
+            .reset(!is_default, move |_, _, cx| {
+                store::update_client(&reset_state, ClientSettingChange::ResetThreadDetailsItems, cx);
+                if let Some(details) = crate::thread_details::details(cx) {
+                    let updated = store::client(cx).clone();
+                    details.update(cx, |details, cx| details.sync_from_client_settings(&updated, true, cx));
+                }
+            })
+            .control(
+                div()
+                    .relative()
+                    .w(r(160.))
+                    .debug_selector(|| "thread-details-items-trigger".to_owned())
+                    .child(
+                        Button::new("thread-details-items-trigger", ButtonVariant::Outline, ButtonSize::Sm)
+                            .label(format!("{enabled} of {total} on"))
+                            .trailing(Icon::ChevronDown)
+                            .full_width()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let just_dismissed = this
+                                    .appearance_ui
+                                    .thread_details_menu_dismissed
+                                    .take()
+                                    .is_some_and(|at| at.elapsed() < THREAD_DETAILS_MENU_REOPEN_GUARD);
+                                this.appearance_ui.thread_details_menu_open =
+                                    !(just_dismissed || this.appearance_ui.thread_details_menu_open);
+                                cx.notify();
+                            })),
+                    )
+                    .children(popover),
+            )
+            .into_any_element()
+    }
+
+    fn panel_animations_row(
+        &self,
+        doc: &t3_core::client_settings::ClientSettingsDoc,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = palette(cx);
+        let duration_ms = doc.panel_animation_duration_ms();
+        let slider = self.appearance_ui.sliders[2].clone();
+        let reset_slider = slider.clone();
+        let reset_state = self.state.clone();
+        let preview_open = self.appearance_ui.panel_preview_open;
+        let preview_seq = self.appearance_ui.panel_preview_seq;
+        let animate = duration_ms > 0 && preview_seq > 0;
+        let lerp = move |open_size: f32, delta: f32| {
+            if preview_open { open_size * delta } else { open_size * (1.0 - delta) }
+        };
+        let sidebar_strip = div()
+            .h_full()
+            .flex_none()
+            .overflow_hidden()
+            .rounded(r(4.))
+            .bg(hsla(p.sidebar));
+        let sidebar_strip: gpui::AnyElement = if animate {
+            sidebar_strip
+                .with_animation(
+                    ElementId::Name(format!("panel-preview-left-{preview_seq}").into()),
+                    Animation::new(Duration::from_millis(u64::from(duration_ms))).with_easing(ease_out_quint()),
+                    move |el, delta| el.w(px(lerp(16., delta))),
+                )
+                .into_any_element()
+        } else {
+            sidebar_strip.w(px(if preview_open { 16. } else { 0. })).into_any_element()
+        };
+        let drawer_strip = h_flex()
+            .flex_none()
+            .items_center()
+            .overflow_hidden()
+            .bg(hsla(p.foreground).opacity(0.05))
+            .px(px(6.))
+            .child(div().h(px(1.)).w(gpui::relative(0.66)).rounded_full().bg(hsla(p.muted_foreground).opacity(0.25)));
+        let drawer_strip: gpui::AnyElement = if animate {
+            drawer_strip
+                .border_t_1()
+                .border_color(hsla(p.border).opacity(0.7))
+                .with_animation(
+                    ElementId::Name(format!("panel-preview-bottom-{preview_seq}").into()),
+                    Animation::new(Duration::from_millis(u64::from(duration_ms))).with_easing(ease_out_quint()),
+                    move |el, delta| el.h(px(lerp(8., delta))),
+                )
+                .into_any_element()
+        } else {
+            drawer_strip
+                .when(preview_open, |this| this.h(px(8.)).border_t_1().border_color(hsla(p.border).opacity(0.7)))
+                .when(!preview_open, |this| this.h(px(0.)))
+                .into_any_element()
+        };
+        let right_strip = div()
+            .h_full()
+            .flex_none()
+            .overflow_hidden()
+            .rounded(r(4.))
+            .bg(hsla(p.muted));
+        let right_strip: gpui::AnyElement = if animate {
+            right_strip
+                .with_animation(
+                    ElementId::Name(format!("panel-preview-right-{preview_seq}").into()),
+                    Animation::new(Duration::from_millis(u64::from(duration_ms))).with_easing(ease_out_quint()),
+                    move |el, delta| el.w(px(lerp(20., delta))),
+                )
+                .into_any_element()
+        } else {
+            right_strip.w(px(if preview_open { 20. } else { 0. })).into_any_element()
+        };
+        let preview = h_flex()
+            .id("panel-animations-preview")
+            .debug_selector(|| "panel-animations-preview".to_owned())
+            .w(r(112.))
+            .h(r(40.))
+            .p(r(4.))
+            .overflow_hidden()
+            .rounded(r(8.))
+            .border_1()
+            .border_color(hsla(p.border))
+            .bg(hsla(p.background))
+            .cursor_pointer()
+            .tooltip(super::controls::tooltip("Replay panel animation preview".into()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.appearance_ui.panel_preview_open = !this.appearance_ui.panel_preview_open;
+                this.appearance_ui.panel_preview_seq = this.appearance_ui.panel_preview_seq.wrapping_add(1);
+                cx.notify();
+            }))
+            .child(sidebar_strip)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .px(px(4.))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .gap(px(4.))
+                            .pt(px(4.))
+                            .child(div().h(px(2.)).w_full().rounded_full().bg(hsla(p.muted_foreground).opacity(0.25)))
+                            .child(div().h(px(2.)).w(gpui::relative(0.8)).rounded_full().bg(hsla(p.muted_foreground).opacity(0.2)))
+                            .child(div().h(px(2.)).w(gpui::relative(0.6)).rounded_full().bg(hsla(p.muted_foreground).opacity(0.15))),
+                    )
+                    .child(drawer_strip),
+            )
+            .child(right_strip);
+
+        Row::new("panel-animations", "Panel animations")
+            .description("Set how fast panels open and close.")
+            .highlighted(self.is_target("panel-animations"))
+            .reset(duration_ms != DEFAULT_PANEL_ANIMATION_DURATION_MS, move |_, window, cx| {
+                reset_slider.update(cx, |s, cx| s.set_value(DEFAULT_PANEL_ANIMATION_DURATION_MS as f32, window, cx));
+                store::update_client(
+                    &reset_state,
+                    ClientSettingChange::PanelAnimationDurationMs(DEFAULT_PANEL_ANIMATION_DURATION_MS),
+                    cx,
+                );
+            })
+            .control(
+                h_flex()
+                    .gap(r(12.))
+                    .items_center()
+                    .child(preview)
+                    .child(DurationSlider::new(slider, duration_ms)),
+            )
+            .into_any_element()
+    }
+
+    fn environment_identification_row(
+        &self,
+        doc: &t3_core::client_settings::ClientSettingsDoc,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let dark = cx.theme().is_dark();
+        let stage_label = {
+            let app = self.state.read(cx);
+            let server_version = app
+                .server_config
+                .config
+                .as_ref()
+                .map(|c| c.environment.server_version.as_str())
+                .filter(|v| !v.is_empty());
+            let fallback = if cfg!(debug_assertions) { "Dev" } else { "Latest" };
+            resolve_server_backed_stage_label(server_version, fallback)
+        };
+        let stage_variant = resolve_sidebar_stage_backdrop_variant(stage_label, EnvironmentIdentificationMode::Artwork);
+        let options = environment_identification_options(stage_variant);
+        let current = doc.environment_identification_mode();
+        let active_theme = themes::half_theme(
+            &doc.theme(),
+            &themes::halves(doc),
+            dark,
+            &theme::preferences(cx).custom,
+            theme::environment_themes(cx),
+        );
+        let palette_theme_active = active_theme.is_some();
+        let palette_theme_allows_artwork =
+            active_theme.is_some_and(|t| themes::builtins().iter().any(|b| b.id == t.id));
+        let effective_mode = resolve_effective_environment_identification_mode(
+            current,
+            palette_theme_active,
+            palette_theme_allows_artwork,
+        );
+        let theme_hides_artwork = effective_mode == EnvironmentIdentificationMode::Pill
+            && resolve_sidebar_stage_backdrop_variant(stage_label, current).is_some();
+        let description = if theme_hides_artwork {
+            if stage_variant.is_some() {
+                "Only built-in themes show artwork, so this theme shows the version pill."
+            } else {
+                "Only built-in themes show artwork."
+            }
+        } else if stage_variant.is_some() {
+            "Choose how Dev and Nightly environments are identified."
+        } else {
+            "Show Dev or Nightly artwork in the sidebar header."
+        };
+        let label = options
+            .iter()
+            .find(|(value, _)| *value == current)
+            .map_or_else(|| current.label(), |(_, label)| *label);
+        let change_state = self.state.clone();
+        let reset_state = self.state.clone();
+        Row::new("environment-identification", "Environment identification")
+            .description(description)
+            .highlighted(self.is_target("environment-identification") || self.is_target("appearance-interface"))
+            .reset(current != EnvironmentIdentificationMode::default(), move |_, _, cx| {
+                store::update_client(
+                    &reset_state,
+                    ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::default()),
+                    cx,
+                );
+            })
+            .control(
+                div()
+                    .debug_selector(|| "environment-identification-control".to_owned())
+                    .child(
+                        Select::new(
+                            "environment-identification-select",
+                            options
+                                .iter()
+                                .map(|(value, option_label)| SelectOption::new(value.as_str(), *option_label))
+                                .collect(),
+                        )
+                        .selected(current.as_str())
+                        .label(label)
+                        .width(160.)
+                        .on_change(move |value, _, cx| {
+                            if let Some(mode) = EnvironmentIdentificationMode::parse(&value) {
+                                store::update_client(
+                                    &change_state,
+                                    ClientSettingChange::EnvironmentIdentificationMode(mode),
+                                    cx,
+                                );
+                            }
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn composer_context_row(
+        &self,
+        doc: &t3_core::client_settings::ClientSettingsDoc,
+    ) -> gpui::AnyElement {
+        let persist = doc.persist_composer_context_strip();
+        let toggle_state = self.state.clone();
+        let reset_state = self.state.clone();
+        Row::new("composer-context", "Composer context")
+            .description("Keep branch and worktree controls below the composer after a thread starts.")
+            .highlighted(self.is_target("composer-context"))
+            .reset(persist, move |_, _, cx| {
+                store::update_client(&reset_state, ClientSettingChange::PersistComposerContextStrip(false), cx)
+            })
+            .control(
+                div()
+                    .debug_selector(|| "composer-context-switch".to_owned())
+                    .child(Switch::new("composer-context-switch", persist).on_change(move |checked, _, cx| {
+                        store::update_client(&toggle_state, ClientSettingChange::PersistComposerContextStrip(checked), cx);
+                    })),
+            )
+            .into_any_element()
     }
     fn percent_row(&self, glass: bool, cx: &App) -> gpui::AnyElement {
         let doc = store::client(cx);
@@ -613,6 +1085,44 @@ fn wireframe(theme: &ThemePreference, mode: AppearanceMode, cx: &App) -> impl In
     }
 }
 
+#[derive(IntoElement)]
+struct DurationSlider {
+    state: Entity<SliderState>,
+    value: u32,
+}
+
+impl DurationSlider {
+    fn new(state: Entity<SliderState>, value: u32) -> Self {
+        Self { state, value }
+    }
+}
+
+impl RenderOnce for DurationSlider {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let p = palette(cx);
+        if self.state.read(cx).value().start() != self.value as f32 {
+            self.state.update(cx, |s, cx| s.set_value(self.value as f32, window, cx));
+        }
+        h_flex()
+            .w(r(208.))
+            .gap(r(12.))
+            .child(
+                div()
+                    .min_w(r(64.))
+                    .rounded(r(6.))
+                    .bg(hsla(p.muted))
+                    .px(r(8.))
+                    .py(r(4.))
+                    .text_center()
+                    .font_family(theme::font_family(t3_core::client_settings::typography::FontRole::Code, cx))
+                    .text_xs()
+                    .text_color(hsla(p.foreground))
+                    .child(format!("{} ms", self.value)),
+            )
+            .child(div().flex_1().child(Slider::new(&self.state)))
+    }
+}
+
 #[cfg(feature="snapshot")]
 pub(super) fn import_theme(state: &Entity<crate::app_state::AppState>, theme: ThemeDefinition, activate: bool, cx: &mut App) {
     match themes::install(store::client(cx), &theme) {
@@ -628,5 +1138,387 @@ pub(super) fn import_theme(state: &Entity<crate::app_state::AppState>, theme: Th
             }
         }
         Err(e) => store::show_error(e, cx),
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use gpui::{Render, Window, div, prelude::*};
+    use serde_json::json;
+    use t3_core::client_settings::{ClientSettingChange, EffortDisplay, EnvironmentIdentificationMode};
+    use t3_core::settings::search::Section;
+
+    use super::*;
+
+    struct SettingsFrame;
+    impl Render for SettingsFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().children(crate::settings::overlay(window, cx))
+        }
+    }
+
+    fn reset_interface_settings(state: &Entity<crate::app_state::AppState>, cx: &mut App) {
+        store::update_client(state, ClientSettingChange::ResetThreadDetailsItems, cx);
+        store::update_client(state, ClientSettingChange::EffortDisplay(EffortDisplay::Label), cx);
+        store::update_client(state, ClientSettingChange::PanelAnimationDurationMs(0), cx);
+        store::update_client(state, ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::Artwork), cx);
+        store::update_client(state, ClientSettingChange::PersistComposerContextStrip(false), cx);
+    }
+
+    #[gpui::test]
+    fn appearance_interface_controls_resets_and_search_expand_work(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.executor().allow_parking();
+        let (state, fixture) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.run_until_parked();
+        let details = cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            reset_interface_settings(&state, cx);
+            crate::thread_details::init(state.clone(), cx)
+        });
+
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // Opening via settings search for "environment-identification" (anchor "appearance-interface")
+        // auto-expands the Advanced Interface disclosure.
+        vcx.update(|_, cx| crate::settings::open_setting("environment-identification", cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        // Scroll the Interface section into the visible 960px modal viewport before clicking controls.
+        let view = vcx.read(|cx| cx.global::<crate::settings::Host>().view.clone().expect("settings view"));
+        let scroll_to_bounds = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+            vcx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            let bounds = vcx.debug_bounds(selector).unwrap_or_else(|| panic!("missing {selector}"));
+            let current_y = f32::from(view.read_with(vcx, |v, _| v.scroll.offset().y));
+            let delta = f32::from(bounds.origin.y) - 360.;
+            view.update(vcx, |v, _| {
+                v.scroll.set_offset(gpui::point(px(0.), px((current_y - delta).min(0.))));
+            });
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            vcx.debug_bounds(selector).unwrap_or_else(|| panic!("missing {selector} after scroll")).center()
+        };
+        assert!(vcx.debug_bounds("thread-details-items-trigger").is_some());
+        assert!(vcx.debug_bounds("effort-display-control").is_some());
+        assert!(vcx.debug_bounds("panel-animations-preview").is_some());
+        assert!(vcx.debug_bounds("environment-identification-control").is_some());
+        assert!(vcx.debug_bounds("composer-context-switch").is_some());
+
+        // Toggle Thread details items via the popover and verify Details entity syncs live.
+        let trigger_center = scroll_to_bounds(&mut vcx, "thread-details-items-trigger");
+        vcx.simulate_click(trigger_center, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("thread-details-items-popover").is_some());
+        let usage_item = vcx.debug_bounds("thread-details-item-usage").expect("usage checkbox").center();
+        vcx.simulate_click(usage_item, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.read(|cx| assert!(store::client(cx).thread_details_item_visible("usage")));
+        details.read_with(&vcx, |d, _| assert!(d.shows("usage")));
+
+        // Reset via the popover's "Reset to default" restores both ClientSettingsDoc and Details.
+        let reset_item = vcx.debug_bounds("thread-details-menu-reset").expect("menu reset").center();
+        vcx.simulate_click(reset_item, Default::default());
+        vcx.run_until_parked();
+        vcx.read(|cx| assert!(store::client(cx).thread_details_is_default()));
+        details.read_with(&vcx, |d, _| assert!(!d.shows("usage") && d.items_are_default()));
+
+        // Close Thread details popover before clicking other controls.
+        vcx.simulate_click(trigger_center, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        // Clicking PanelAnimationsPreview toggles preview_open state.
+        view.read_with(&vcx, |v, _| assert!(v.appearance_ui.panel_preview_open));
+        let preview_center = scroll_to_bounds(&mut vcx, "panel-animations-preview");
+        vcx.simulate_click(preview_center, Default::default());
+        vcx.run_until_parked();
+        view.read_with(&vcx, |v, _| assert!(!v.appearance_ui.panel_preview_open));
+
+        // Panel animations slider updates duration and resets cleanly to 0.
+        vcx.update(|window, cx| {
+            let slider = view.read(cx).appearance_ui.sliders[2].clone();
+            slider.update(cx, |s, cx| {
+                s.set_value(200., window, cx);
+                cx.emit(SliderEvent::Change(gpui_component::slider::SliderValue::Single(200.)));
+            });
+        });
+        vcx.run_until_parked();
+        vcx.read(|cx| assert_eq!(store::client(cx).panel_animation_duration_ms(), 200));
+
+        // Clicking Composer context switch toggles persistComposerContextStrip.
+        let switch_center = scroll_to_bounds(&mut vcx, "composer-context-switch");
+        vcx.simulate_click(switch_center, Default::default());
+        vcx.run_until_parked();
+        vcx.read(|cx| assert!(store::client(cx).persist_composer_context_strip()));
+
+        // Exercise EffortDisplay & EnvironmentIdentificationMode updates + resets via store.
+        vcx.update(|_, cx| {
+            store::update_client(&state, ClientSettingChange::EffortDisplay(EffortDisplay::Bars), cx);
+            store::update_client(&state, ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::Pill), cx);
+        });
+        vcx.read(|cx| {
+            assert_eq!(store::client(cx).effort_display(), EffortDisplay::Bars);
+            assert_eq!(store::client(cx).environment_identification_mode(), EnvironmentIdentificationMode::Pill);
+        });
+        vcx.update(|_, cx| {
+            store::update_client(&state, ClientSettingChange::EffortDisplay(EffortDisplay::Label), cx);
+            store::update_client(&state, ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::Artwork), cx);
+            store::update_client(&state, ClientSettingChange::PanelAnimationDurationMs(0), cx);
+            store::update_client(&state, ClientSettingChange::PersistComposerContextStrip(false), cx);
+        });
+        vcx.read(|cx| {
+            assert_eq!(store::client(cx).effort_display(), EffortDisplay::Label);
+            assert_eq!(store::client(cx).environment_identification_mode(), EnvironmentIdentificationMode::Artwork);
+            assert_eq!(store::client(cx).panel_animation_duration_ms(), 0);
+            assert!(!store::client(cx).persist_composer_context_strip());
+        });
+
+        // Open Appearance directly (without search target) and verify Advanced starts collapsed until clicked.
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.appearance_ui.advanced_interface = false;
+                v.navigate(Section::Appearance, None, cx);
+            });
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("panel-animations-preview").is_none());
+        let adv_center = scroll_to_bounds(&mut vcx, "appearance-interface-advanced");
+        vcx.simulate_click(adv_center, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("panel-animations-preview").is_some());
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        runtime.shutdown_background();
+    }
+
+    #[gpui::test]
+    fn appearance_consumers_react_to_effort_bars_context_strip_sidebar_id_and_panel_animation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct ConsumerStage {
+            sidebar: Entity<crate::sidebar::SidebarPane>,
+            composer: Entity<crate::composer::Composer>,
+            right_panel: Entity<crate::right_panel::RightPanelView>,
+        }
+        impl Render for ConsumerStage {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                h_flex()
+                    .size_full()
+                    .child(div().w(px(280.)).h_full().child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full())))
+                    .child(div().flex_1().h_full().child(self.composer.clone()))
+                    .child(self.right_panel.clone())
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.executor().allow_parking();
+        let (state, fixture) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            reset_interface_settings(&state, cx);
+            crate::thread_details::init(state.clone(), cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": { "environmentId": "fixture-env", "label": "Mac", "serverVersion": "0.1.7" },
+                        "providers": [{
+                            "driver": "codex",
+                            "instanceId": "codex",
+                            "enabled": true,
+                            "installed": true,
+                            "status": "ready",
+                            "auth": { "status": "authenticated" },
+                            "models": [{
+                                "slug": "gpt-5.4",
+                                "name": "GPT-5.4",
+                                "capabilities": {
+                                    "optionDescriptors": [{
+                                        "type": "select",
+                                        "id": "reasoningEffort",
+                                        "label": "Reasoning effort",
+                                        "role": "reasoning",
+                                        "options": [
+                                            { "id": "low", "label": "Low" },
+                                            { "id": "medium", "label": "Medium", "isDefault": true },
+                                            { "id": "high", "label": "High" }
+                                        ]
+                                    }]
+                                }
+                            }]
+                        }]
+                    }))
+                    .unwrap(),
+                );
+                let snapshot = serde_json::from_value(json!({
+                    "kind": "snapshot",
+                    "snapshot": {
+                        "snapshotSequence": 1,
+                        "projects": [{
+                            "id": "proj-1",
+                            "title": "Repo",
+                            "workspaceRoot": "/tmp/repo",
+                            "scripts": [],
+                            "createdAt": "2026-11-19T00:00:00Z",
+                            "updatedAt": "2026-11-19T00:00:00Z"
+                        }],
+                        "threads": [{
+                            "id": "thread-1",
+                            "projectId": "proj-1",
+                            "title": "Active thread",
+                            "providerInstanceId": "codex",
+                            "modelSelection": { "instanceId": "codex", "model": "gpt-5.4" },
+                            "runtimeMode": "full-access",
+                            "interactionMode": "default",
+                            "branch": "feat/appearance",
+                            "worktreePath": null,
+                            "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "thread-1" },
+                            "latestRunId": "run-1",
+                            "activeRunId": null,
+                            "status": "idle",
+                            "pendingRuntimeRequest": null,
+                            "latestVisibleMessage": null,
+                            "latestUserMessageAt": null,
+                            "hasActionableProposedPlan": false,
+                            "itemCount": 0,
+                            "visibleItemCount": 0,
+                            "createdAt": "2026-11-19T00:00:00Z",
+                            "updatedAt": "2026-11-19T00:00:00Z",
+                            "archivedAt": null,
+                            "settledOverride": null,
+                            "settledAt": null,
+                            "deletedAt": null,
+                            "pullRequests": []
+                        }],
+                        "archivedThreads": []
+                    }
+                }))
+                .unwrap();
+                state.shell.apply(snapshot);
+                state.selected_thread = Some("thread-1".into());
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+                cx.emit(crate::app_state::AppEvent::Shell);
+                cx.emit(crate::app_state::AppEvent::Selection);
+            });
+        });
+
+        let window = cx.add_window(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state.clone(), window, cx));
+            let menu = cx.new(|cx| crate::context_menu::ContextMenu::new(state.clone(), cx));
+            let confirm = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+            let snooze = cx.new(|cx| crate::snooze_dialog::SnoozeDialog::new(state.clone(), window, cx));
+            let sidebar = cx.new(|cx| crate::sidebar::SidebarPane::new(state.clone(), composer.clone(), menu, confirm, snooze, window, cx));
+            let right_panel = cx.new(|cx| crate::right_panel::RightPanelView::new(state.clone(), window, cx));
+            ConsumerStage { sidebar, composer, right_panel }
+        });
+        let right_panel = window.read_with(cx, |stage, _| stage.right_panel.clone()).unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let draw = |vcx: &mut gpui::VisualTestContext| {
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        };
+
+        // 1. Defaults: Effort word shown, active-thread context strip hidden, Dev artwork shown in sidebar,
+        // right panel animation disabled at 0 ms.
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("composer-effort-word").is_some(), "default effortDisplay=label shows word");
+        assert!(vcx.debug_bounds("composer-effort-bars").is_none());
+        assert!(vcx.debug_bounds("composer-context-strip").is_none(), "default persistComposerContextStrip=false hides active strip");
+        assert!(vcx.debug_bounds("sidebar-stage-backdrop-dev").is_some(), "default Artwork shows Dev backdrop");
+        assert!(vcx.debug_bounds("environment-identification-pill-dev").is_none());
+
+        // 2. Switch effortDisplay -> Bars, persistComposerContextStrip -> true, environmentIdentificationMode -> Pill.
+        vcx.update(|_, cx| {
+            store::update_client(&state, ClientSettingChange::EffortDisplay(EffortDisplay::Bars), cx);
+            store::update_client(&state, ClientSettingChange::PersistComposerContextStrip(true), cx);
+            store::update_client(&state, ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::Pill), cx);
+        });
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("composer-effort-bars").is_some(), "effortDisplay=bars renders bars glyph");
+        assert!(vcx.debug_bounds("composer-effort-word").is_none());
+        assert!(vcx.debug_bounds("composer-context-strip").is_some(), "persistComposerContextStrip=true shows active thread strip");
+        assert!(vcx.debug_bounds("environment-identification-pill-dev").is_some(), "Pill mode renders Dev pill");
+        assert!(vcx.debug_bounds("sidebar-stage-backdrop-dev").is_none());
+
+        // 3. Nightly artwork & None modes in sidebar.
+        vcx.update(|_, cx| {
+            store::update_client(&state, ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::NightlyArtwork), cx);
+        });
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("sidebar-stage-backdrop-nightly").is_some());
+        vcx.update(|_, cx| {
+            store::update_client(&state, ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::None), cx);
+        });
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("sidebar-stage-backdrop-nightly").is_none());
+        assert!(vcx.debug_bounds("sidebar-stage-backdrop-dev").is_none());
+        assert!(vcx.debug_bounds("environment-identification-pill-dev").is_none());
+
+        // 4. Right panel open animation activates only when panelAnimationDurationMs > 0 on same-thread open.
+        state.update(&mut vcx, |state, cx| {
+            state.toggle_right_panel(cx);
+        });
+        draw(&mut vcx);
+        right_panel.read_with(&vcx, |panel, _| {
+            assert_eq!(panel.open_animation_duration_ms(), None, "0 ms never animates panel open");
+        });
+        state.update(&mut vcx, |state, cx| state.toggle_right_panel(cx));
+        draw(&mut vcx);
+        vcx.update(|_, cx| {
+            store::update_client(&state, ClientSettingChange::PanelAnimationDurationMs(225), cx);
+        });
+        state.update(&mut vcx, |state, cx| state.toggle_right_panel(cx));
+        draw(&mut vcx);
+        right_panel.read_with(&vcx, |panel, _| {
+            assert_eq!(panel.open_animation_duration_ms(), Some(225), "non-zero duration animates same-thread panel open");
+        });
+
+        vcx.update(|_, cx| reset_interface_settings(&state, cx));
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        runtime.shutdown_background();
     }
 }

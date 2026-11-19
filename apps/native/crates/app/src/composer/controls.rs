@@ -674,3 +674,148 @@ impl RenderOnce for Segment {
             })
     }
 }
+
+/// Ports `EffortGlyph.tsx`: maps a reasoning select descriptor to rising bars, keeping
+/// `ultracode`, `max`, and prompt-injected levels named even in `"bars"` display mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortGlyphSpec {
+    pub count: usize,
+    pub filled: usize,
+    pub special: Option<String>,
+    pub label: String,
+}
+
+const EFFORT_NAMED_LEVELS: [&str; 2] = ["ultracode", "max"];
+const EFFORT_OFF_LEVELS: [&str; 2] = ["off", "none"];
+const EFFORT_MAX_BARS: usize = 7;
+
+/// `resolveEffortGlyph` (`apps/web/src/components/chat/EffortGlyph.tsx`).
+pub fn resolve_effort_glyph(
+    select: &t3_core::server_config::SelectDescriptor,
+    current: Option<&str>,
+) -> Option<EffortGlyphSpec> {
+    let current = current?;
+    let is_special = |id: &str| {
+        EFFORT_NAMED_LEVELS.contains(&id) || select.prompt_injected_values.iter().any(|v| v == id)
+    };
+    let levels: Vec<_> = select.options.iter().filter(|option| !is_special(&option.id)).collect();
+    if levels.len() < 2 || levels.len() > EFFORT_MAX_BARS {
+        return None;
+    }
+    let starts_at_off = EFFORT_OFF_LEVELS.contains(&levels[0].id.as_str());
+    let count = if starts_at_off { levels.len() - 1 } else { levels.len() };
+    if is_special(current) {
+        let label = select
+            .options
+            .iter()
+            .find(|option| option.id == current)
+            .map_or_else(|| current.to_owned(), |option| option.label.clone());
+        return Some(EffortGlyphSpec { count, filled: count, special: Some(label.clone()), label });
+    }
+    let index = levels.iter().position(|option| option.id == current)?;
+    Some(EffortGlyphSpec {
+        count,
+        filled: if starts_at_off { index } else { index + 1 },
+        special: None,
+        label: levels[index].label.clone(),
+    })
+}
+
+/// `effortBarHeights` (`apps/web/src/components/chat/EffortGlyph.tsx`): whole-pixel rising steps.
+pub fn effort_bar_heights(count: usize, max_bar: f32) -> Vec<f32> {
+    let denom = count.saturating_sub(1).max(1) as f32;
+    let step = ((max_bar / 2.0) / denom).round().max(1.0);
+    (0..count)
+        .map(|index| max_bar - ((count - 1 - index) as f32) * step)
+        .collect()
+}
+
+/// `EffortGlyph` (`apps/web/src/components/chat/EffortGlyph.tsx`): rising bars on whole pixels.
+#[derive(IntoElement)]
+pub struct EffortBars {
+    count: usize,
+    filled: usize,
+    color: Hsla,
+}
+
+impl EffortBars {
+    pub fn new(count: usize, filled: usize, color: Hsla) -> Self {
+        EffortBars { count, filled, color }
+    }
+}
+
+impl RenderOnce for EffortBars {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let max_bar = 12.0; // GLYPH_HEIGHT_SM (14) - BASELINE_INSET (2)
+        let heights = effort_bar_heights(self.count, max_bar);
+        h_flex()
+            .id("composer-effort-bars")
+            .debug_selector(|| "composer-effort-bars".to_owned())
+            .flex_none()
+            .h(px(14.))
+            .pb(px(2.))
+            .items_end()
+            .gap(px(2.))
+            .children(heights.into_iter().enumerate().map(|(index, bar_height)| {
+                let opacity = if index < self.filled { 1.0 } else { 0.4 };
+                div().w(px(2.)).h(px(bar_height)).bg(self.color.opacity(opacity))
+            }))
+    }
+}
+
+#[cfg(test)]
+mod effort_glyph_tests {
+    use super::*;
+    use t3_core::server_config::{OptionChoice, SelectDescriptor};
+
+    fn select_with(ids: &[(&str, &str)], prompt_injected: &[&str]) -> SelectDescriptor {
+        SelectDescriptor {
+            id: "reasoningEffort".into(),
+            label: "Effort".into(),
+            description: None,
+            role: Some("reasoning".into()),
+            options: ids
+                .iter()
+                .map(|(id, label)| OptionChoice {
+                    id: (*id).into(),
+                    label: (*label).into(),
+                    description: None,
+                    is_default: false,
+                })
+                .collect(),
+            current_value: None,
+            prompt_injected_values: prompt_injected.iter().map(|v| (*v).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_effort_glyph_maps_ordinary_off_and_special_levels() {
+        let desc = select_with(
+            &[("low", "Low"), ("medium", "Medium"), ("high", "High"), ("max", "Max")],
+            &[],
+        );
+        let med = resolve_effort_glyph(&desc, Some("medium")).expect("medium bars");
+        assert_eq!(med.count, 3);
+        assert_eq!(med.filled, 2);
+        assert_eq!(med.special, None);
+
+        // Max stays named even in bars mode.
+        let max = resolve_effort_glyph(&desc, Some("max")).expect("max special");
+        assert_eq!(max.special.as_deref(), Some("Max"));
+
+        // Off level renders zero filled bars.
+        let with_off = select_with(
+            &[("off", "Off"), ("low", "Low"), ("high", "High"), ("ultrathink", "Ultrathink")],
+            &["ultrathink"],
+        );
+        let off = resolve_effort_glyph(&with_off, Some("off")).expect("off bars");
+        assert_eq!(off.count, 2);
+        assert_eq!(off.filled, 0);
+        assert_eq!(off.special, None);
+
+        let ultra = resolve_effort_glyph(&with_off, Some("ultrathink")).expect("ultrathink special");
+        assert_eq!(ultra.special.as_deref(), Some("Ultrathink"));
+
+        assert_eq!(effort_bar_heights(3, 12.0), vec![6.0, 9.0, 12.0]);
+    }
+}

@@ -145,6 +145,159 @@ literal_enum!(
 );
 
 literal_enum!(
+    /// `EffortDisplay` (`packages/contracts/src/settings.ts`) with `EFFORT_DISPLAY_LABELS`
+    /// (`AppearanceSettingsPanel.tsx`).
+    EffortDisplay {
+        Label => "label": "Word",
+        Bars => "bars": "Bars",
+    } default Label
+);
+
+literal_enum!(
+    /// `EnvironmentIdentificationMode` (`packages/contracts/src/settings.ts`) with
+    /// `ENVIRONMENT_IDENTIFICATION_LABELS` (`AppearanceSettingsPanel.tsx`).
+    EnvironmentIdentificationMode {
+        Artwork => "artwork": "Artwork",
+        NightlyArtwork => "nightly-artwork": "Nightly artwork",
+        DevArtwork => "dev-artwork": "Dev artwork",
+        Pill => "pill": "Version pill",
+        None => "none": "None",
+    } default Artwork
+);
+
+pub const MIN_PANEL_ANIMATION_DURATION_MS: u32 = 0;
+pub const MAX_PANEL_ANIMATION_DURATION_MS: u32 = 400;
+pub const DEFAULT_PANEL_ANIMATION_DURATION_MS: u32 = 0;
+
+/// `SidebarStageBackdropVariant` (`SidebarStageBackdrop.tsx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StageBackdropVariant {
+    Dev,
+    Nightly,
+}
+
+impl StageBackdropVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StageBackdropVariant::Dev => "dev",
+            StageBackdropVariant::Nightly => "nightly",
+        }
+    }
+}
+
+/// Matches `NIGHTLY_SERVER_VERSION_PATTERN = /^[^-+]+-(?:nightly|preview)\.\d{8}\.\d+$/`
+/// (`apps/web/src/branding.logic.ts`).
+pub fn is_nightly_server_version(version: &str) -> bool {
+    let Some((prefix, rest)) = version.split_once('-') else {
+        return false;
+    };
+    if prefix.is_empty() || prefix.contains('+') {
+        return false;
+    }
+    let Some(suffix) = rest.strip_prefix("nightly.").or_else(|| rest.strip_prefix("preview.")) else {
+        return false;
+    };
+    let Some((date, build)) = suffix.split_once('.') else {
+        return false;
+    };
+    date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+        && !build.is_empty()
+        && build.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `resolveServerBackedAppStageLabel` (`apps/web/src/branding.logic.ts`).
+pub fn resolve_server_backed_stage_label<'a>(
+    primary_server_version: Option<&str>,
+    fallback_stage_label: &'a str,
+) -> &'a str {
+    if primary_server_version.is_some_and(is_nightly_server_version) {
+        "Nightly"
+    } else {
+        fallback_stage_label
+    }
+}
+
+/// `resolveSidebarStageBackdropVariant` (`apps/web/src/components/SidebarStageBackdrop.tsx`).
+pub fn resolve_sidebar_stage_backdrop_variant(
+    stage_label: &str,
+    mode: EnvironmentIdentificationMode,
+) -> Option<StageBackdropVariant> {
+    match mode {
+        EnvironmentIdentificationMode::NightlyArtwork => Some(StageBackdropVariant::Nightly),
+        EnvironmentIdentificationMode::DevArtwork => Some(StageBackdropVariant::Dev),
+        EnvironmentIdentificationMode::Artwork => match stage_label.trim().to_ascii_lowercase().as_str() {
+            "nightly" => Some(StageBackdropVariant::Nightly),
+            "dev" => Some(StageBackdropVariant::Dev),
+            _ => None,
+        },
+        EnvironmentIdentificationMode::Pill | EnvironmentIdentificationMode::None => None,
+    }
+}
+
+/// `resolveEnvironmentIdentificationPillLabel` (`apps/web/src/components/SidebarStageBackdrop.tsx`).
+pub fn resolve_environment_identification_pill_label(stage_label: &str) -> Option<&'static str> {
+    match stage_label.trim().to_ascii_lowercase().as_str() {
+        "dev" => Some("Dev"),
+        "nightly" => Some("Nightly"),
+        _ => None,
+    }
+}
+
+/// `resolveEnvironmentIdentificationMode` (`apps/web/src/hooks/useSettings.ts`): custom or
+/// environment palette themes cannot show sidebar artwork and fall back to the version pill.
+pub fn resolve_effective_environment_identification_mode(
+    mode: EnvironmentIdentificationMode,
+    palette_theme_active: bool,
+    palette_theme_allows_artwork: bool,
+) -> EnvironmentIdentificationMode {
+    let is_artwork = !matches!(mode, EnvironmentIdentificationMode::Pill | EnvironmentIdentificationMode::None);
+    if palette_theme_active && !palette_theme_allows_artwork && is_artwork {
+        EnvironmentIdentificationMode::Pill
+    } else {
+        mode
+    }
+}
+
+/// `environmentIdentificationOptions` (`apps/web/src/components/settings/AppearanceSettingsPanel.tsx`).
+pub fn environment_identification_options(
+    stage_variant: Option<StageBackdropVariant>,
+) -> &'static [(EnvironmentIdentificationMode, &'static str)] {
+    match stage_variant {
+        Some(StageBackdropVariant::Dev) => &[
+            (EnvironmentIdentificationMode::Artwork, "Dev artwork"),
+            (EnvironmentIdentificationMode::NightlyArtwork, "Nightly artwork"),
+            (EnvironmentIdentificationMode::Pill, "Version pill"),
+            (EnvironmentIdentificationMode::None, "None"),
+        ],
+        Some(StageBackdropVariant::Nightly) => &[
+            (EnvironmentIdentificationMode::Artwork, "Nightly artwork"),
+            (EnvironmentIdentificationMode::DevArtwork, "Dev artwork"),
+            (EnvironmentIdentificationMode::Pill, "Version pill"),
+            (EnvironmentIdentificationMode::None, "None"),
+        ],
+        None => &[
+            (EnvironmentIdentificationMode::Artwork, "None"),
+            (EnvironmentIdentificationMode::NightlyArtwork, "Nightly artwork"),
+            (EnvironmentIdentificationMode::DevArtwork, "Dev artwork"),
+        ],
+    }
+}
+
+/// `shouldShowComposerContextStrip` (`apps/web/src/components/BranchToolbar.logic.ts`).
+pub fn should_show_composer_context_strip(
+    is_draft_hero_state: bool,
+    persist_in_active_threads: bool,
+    has_active_project: bool,
+    is_git_repo: bool,
+    show_environment_indicator: bool,
+) -> bool {
+    has_active_project
+        && (is_draft_hero_state
+            || (persist_in_active_threads && (is_git_repo || show_environment_indicator)))
+}
+
+literal_enum!(
     /// `ThemePreferenceMode`: which half of a theme paints, or the OS's choice.
     AppearanceMode {
         System => "system": "System",
@@ -254,6 +407,12 @@ pub enum ClientSettingChange {
     ConfirmQuit(QuitConfirmationMode),
     TimestampFormat(TimestampFormat),
     ChatWidth(ChatWidth),
+    EffortDisplay(EffortDisplay),
+    PanelAnimationDurationMs(u32),
+    EnvironmentIdentificationMode(EnvironmentIdentificationMode),
+    PersistComposerContextStrip(bool),
+    ThreadDetailsItem { id: String, visible: bool },
+    ResetThreadDetailsItems,
     ToolCallVisibility(ToolCallVisibility),
     InterfaceFontSize(u32),
     FontSize(FontRole, u32),
@@ -335,6 +494,20 @@ impl ClientSettingChange {
             ClientSettingChange::ConfirmQuit(mode) => ("confirmQuit", text(mode.as_str())),
             ClientSettingChange::TimestampFormat(format) => ("timestampFormat", text(format.as_str())),
             ClientSettingChange::ChatWidth(width) => ("chatWidth", text(width.as_str())),
+            ClientSettingChange::EffortDisplay(display) => ("effortDisplay", text(display.as_str())),
+            ClientSettingChange::PanelAnimationDurationMs(ms) => (
+                "panelAnimationDurationMs",
+                Value::from((*ms).clamp(MIN_PANEL_ANIMATION_DURATION_MS, MAX_PANEL_ANIMATION_DURATION_MS)),
+            ),
+            ClientSettingChange::EnvironmentIdentificationMode(mode) => {
+                ("environmentIdentificationMode", text(mode.as_str()))
+            }
+            ClientSettingChange::PersistComposerContextStrip(on) => {
+                ("persistComposerContextStrip", Value::Bool(*on))
+            }
+            ClientSettingChange::ThreadDetailsItem { .. } | ClientSettingChange::ResetThreadDetailsItems => {
+                unreachable!("thread details visibility applies to the current record")
+            }
             ClientSettingChange::ToolCallVisibility(visibility) => ("toolCallVisibility", text(visibility.as_str())),
             ClientSettingChange::InterfaceFontSize(size) => {
                 ("fontSizeInterface", Value::from((*size).clamp(MIN_INTERFACE_FONT_SIZE, MAX_INTERFACE_FONT_SIZE)))
@@ -440,6 +613,37 @@ impl ClientSettingsDoc {
             if self.entries.get(key) == Some(&value) { return Map::new(); }
             self.entries.insert(key.to_owned(), value.clone());
             return [(key.to_owned(), value)].into_iter().collect();
+        }
+        if let ClientSettingChange::ThreadDetailsItem { id, visible } = change {
+            let mut visibility = self.thread_details_visibility();
+            visibility.set_with_legacy_usage(id, *visible, Some(self.thread_details_usage_enabled()));
+            let value = Value::Object(
+                visibility
+                    .overrides()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Value::Bool(*v)))
+                    .collect(),
+            );
+            let key = "threadDetailsItems";
+            if self.entries.get(key) == Some(&value) {
+                return Map::new();
+            }
+            self.entries.insert(key.to_owned(), value.clone());
+            return [(key.to_owned(), value)].into_iter().collect();
+        }
+        if let ClientSettingChange::ResetThreadDetailsItems = change {
+            let mut patch = Map::new();
+            let empty_items = Value::Object(Map::new());
+            if self.entries.get("threadDetailsItems") != Some(&empty_items)
+                && (self.entries.contains_key("threadDetailsItems") || !self.thread_details_is_default())
+            {
+                patch.insert("threadDetailsItems".to_owned(), empty_items);
+            }
+            if self.thread_details_usage_enabled() || self.entries.get("threadDetailsUsageEnabled") == Some(&Value::Bool(true)) {
+                patch.insert("threadDetailsUsageEnabled".to_owned(), Value::Bool(false));
+            }
+            self.entries.extend(patch.clone());
+            return patch;
         }
         if let ClientSettingChange::ThemePatch(patch) = change {
             let patch: Map<String, Value> = patch.iter().filter(|(k,v)|self.entries.get(*k)!=Some(*v)).map(|(k,v)|(k.clone(),v.clone())).collect();
@@ -630,6 +834,65 @@ impl ClientSettingsDoc {
 
     pub fn chat_width(&self) -> ChatWidth {
         self.literal("chatWidth", ChatWidth::parse)
+    }
+
+    pub fn effort_display(&self) -> EffortDisplay {
+        self.literal("effortDisplay", EffortDisplay::parse)
+    }
+
+    pub fn panel_animation_duration_ms(&self) -> u32 {
+        self.entries
+            .get("panelAnimationDurationMs")
+            .and_then(Value::as_u64)
+            .and_then(|ms| u32::try_from(ms).ok())
+            .filter(|ms| (MIN_PANEL_ANIMATION_DURATION_MS..=MAX_PANEL_ANIMATION_DURATION_MS).contains(ms))
+            .unwrap_or(DEFAULT_PANEL_ANIMATION_DURATION_MS)
+    }
+
+    pub fn environment_identification_mode(&self) -> EnvironmentIdentificationMode {
+        self.literal("environmentIdentificationMode", EnvironmentIdentificationMode::parse)
+    }
+
+    pub fn persist_composer_context_strip(&self) -> bool {
+        self.flag("persistComposerContextStrip", false)
+    }
+
+    pub fn thread_details_usage_enabled(&self) -> bool {
+        self.flag("threadDetailsUsageEnabled", false)
+    }
+
+    pub fn thread_details_items(&self) -> std::collections::HashMap<String, bool> {
+        self.entries
+            .get("threadDetailsItems")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_bool()?)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn thread_details_visibility(&self) -> crate::thread_details::Visibility {
+        crate::thread_details::Visibility::from_overrides(self.thread_details_items())
+    }
+
+    pub fn thread_details_item_visible(&self, id: &str) -> bool {
+        self.thread_details_visibility()
+            .shows_with_legacy_usage(id, Some(self.thread_details_usage_enabled()))
+    }
+
+    pub fn thread_details_is_default(&self) -> bool {
+        self.thread_details_visibility()
+            .is_default_with_legacy_usage(Some(self.thread_details_usage_enabled()))
+    }
+
+    pub fn thread_details_enabled_count(&self) -> usize {
+        crate::thread_details::ITEMS
+            .iter()
+            .filter(|(id, _, _)| self.thread_details_item_visible(id))
+            .count()
     }
 
     pub fn tool_call_visibility(&self) -> ToolCallVisibility {

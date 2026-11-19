@@ -326,6 +326,32 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("setting-appearance-contrast", "Contrast", Appearance, &["colors borders readability contrast"]),
         SearchItem::new("setting-glass-opacity", "Glass opacity", Appearance, &["menus dialogs composer transparency glass"]),
         SearchItem::new("chat-width", "Chat width", Appearance, &["wide full width column layout messages composer monitor"]),
+        SearchItem::new(
+            "thread-details-items",
+            "Thread details",
+            Appearance,
+            &["customize show hide panel card environment editor scripts branch pull request git changes servers automations lineage usage limits 5 hour weekly quota tokens context window"],
+        ),
+        SearchItem::new(
+            "effort-display",
+            "Effort display",
+            Appearance,
+            &["reasoning effort thinking bars graph word label level composer"],
+        ),
+        SearchItem::new(
+            "math-rendering",
+            "Render math",
+            Appearance,
+            &["latex tex katex equations formulas markdown"],
+        ),
+        SearchItem::new("panel-animations", "Panel animations", Appearance, &[]),
+        SearchItem::new(
+            "environment-identification",
+            "Environment identification",
+            Appearance,
+            &["dev nightly latest channel artwork pill label hide none"],
+        )
+        .target("appearance-interface"),
         SearchItem::new("prompt-font", "Prompt font", Appearance, &["typography composer input family size"]),
         SearchItem::new("code-font", "Code font", Appearance, &["typography monospace family size diffs previews"]),
         SearchItem::new("terminal-font", "Terminal font", Appearance, &["typography monospace output family size"]),
@@ -333,6 +359,7 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("font-smoothing", "Font smoothing", Appearance, &["advanced typography grayscale antialiased macOS thin"]).mac_only(),
         SearchItem::new("word-wrap", "Word wrap", Appearance, &["code diffs file previews long lines typography"]),
         SearchItem::new("interface-font", "Interface font", Appearance, &["typography family size system sans"]),
+        SearchItem::new("composer-context", "Composer context", Appearance, &[]),
         SearchItem::new("project-grouping", "Project grouping", General, &["combine matching repositories environments sidebar"]),
         SearchItem::new("project-order", "Project order", General, &["sort projects sidebar manual created recent"]),
         SearchItem::new("snooze-options", "Snooze options", Threads, &["snooze presets times later tonight tomorrow next week remind"]).scope(EnvironmentDefaults).environment_only(),
@@ -416,6 +443,13 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("thread-title-instructions", "Thread title instructions", Threads, &["generated thread titles prompt custom style naming rename regenerate"]).scope(ProjectDefaults),
         SearchItem::new("app-version", "Version", About, &["about check for updates download install upgrade release"]),
         SearchItem::new("mobile-app", "Mobile app", About, &["phone tablet iPhone iPad iOS Android App Store Google Play QR"]),
+        SearchItem::new(
+            "welcome-page",
+            "Welcome page",
+            About,
+            &["onboarding setup first run getting started agents import projects"],
+        )
+        .environment_only(),
         SearchItem::new("privacy-policy", "Privacy policy", About, &["telemetry analytics usage data tracking legal opt out"]),
         SearchItem::new("open-source-licenses", "Open source licenses", About, &["third party notices dependencies mit apache"]),
         SearchItem::new("telemetry-export", "OpenTelemetry export", Diagnostics, &["OTel OTLP telemetry export endpoints logs traces metrics Grafana"]).scope(Environment),
@@ -662,5 +696,36 @@ mod search_parity_tests {
         assert!(ja_hits.iter().any(|item| item.id == "time-format"));
         let zh_hits = search_with_locale("语言", &all, "zh");
         assert!(zh_hits.iter().any(|item| item.id == "language"));
+
+        // Appearance Interface rows + Render math + About Welcome page are searchable and gated.
+        for expected_id in [
+            "thread-details-items",
+            "effort-display",
+            "math-rendering",
+            "panel-animations",
+            "environment-identification",
+            "composer-context",
+            "welcome-page",
+        ] {
+            assert!(
+                all.iter().any(|item| item.id == expected_id),
+                "missing appearance/about search item {expected_id}"
+            );
+        }
+        assert!(search("katex", &all).iter().any(|item| item.id == "math-rendering"));
+        assert!(search("bars", &all).iter().any(|item| item.id == "effort-display"));
+        assert!(search("usage limits", &all).iter().any(|item| item.id == "thread-details-items"));
+        assert!(search("panel animations", &all).iter().any(|item| item.id == "panel-animations"));
+        assert!(search("composer context", &all).iter().any(|item| item.id == "composer-context"));
+        assert!(search("onboarding", &all).iter().any(|item| item.id == "welcome-page"));
+        let env_id_item = all
+            .iter()
+            .find(|item| item.id == "environment-identification")
+            .expect("environment-identification item");
+        assert_eq!(env_id_item.anchor(), "appearance-interface");
+        assert!(
+            !restricted.iter().any(|item| item.id == "welcome-page"),
+            "welcome-page should be gated when no environment is connected"
+        );
     }
 }
