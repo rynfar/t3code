@@ -360,6 +360,16 @@ fn card_height(window: &Window) -> gpui::Pixels {
     px((viewport - 176. * rem).min(704. * rem).max(512. * rem))
 }
 
+/// Formats the project-override inheritance tooltip for a provider list row, resolving the
+/// device-level enablement via `InstanceRow::enabled` (default-disabled drivers and `config.enabled`).
+pub(super) fn provider_override_summary(row: &InstanceRow, project_enabled: bool) -> String {
+    format!(
+        "Overridden for this project (Project: {} \u{00b7} Device: {})",
+        if project_enabled { "On" } else { "Off" },
+        if row.enabled() { "On" } else { "Off" },
+    )
+}
+
 impl SettingsView {
     /// Whether project-scoped provider enablement overrides are active (`ProviderSettingsPanel.tsx:562-566`).
     /// Hidden on older servers whose `capabilities.projectProviderInstanceOverrides` is not true.
@@ -375,6 +385,19 @@ impl SettingsView {
     fn can_write_project_provider_overrides(&self, cx: &App) -> bool {
         self.scoped_session(cx)
             .is_none_or(|session| session.grants(super::projects::SETTINGS_WRITE_SCOPE))
+    }
+
+    /// Project checkouts targeted by a `Providers` override write: restricted to the single
+    /// environment `Providers` is displaying (`_chat.settings.providers.tsx:25-27`).
+    pub(super) fn scoped_provider_project_members(
+        &self,
+        cx: &App,
+    ) -> Vec<t3_core::sidebar::grouping::ScopedProject> {
+        let primary = self.scoped_primary_owner(cx);
+        self.scoped_project_members(cx)
+            .into_iter()
+            .filter(|member| primary.as_ref().is_none_or(|owner| member.owner == *owner))
+            .collect()
     }
 
     fn page_data(&self, cx: &App) -> Option<PageData> {
@@ -608,7 +631,7 @@ impl SettingsView {
             )
         };
         let can_write_override = self.can_write_project_provider_overrides(cx);
-        let project_override = self
+        let project_override_summary = self
             .supports_project_provider_overrides(cx)
             .then(|| {
                 let project_id = self.scope_project_id(cx)?;
@@ -618,8 +641,7 @@ impl SettingsView {
                     &project_id,
                     &row.instance_id,
                 )?;
-                let device_enabled = row.explicit.as_ref().and_then(|inst| inst.enabled).unwrap_or(true);
-                Some((project_enabled, device_enabled))
+                Some(provider_override_summary(row, project_enabled))
             })
             .flatten();
         let reset_id = row.instance_id.clone();
@@ -686,12 +708,7 @@ impl SettingsView {
                     .flex_none()
                     .items_center()
                     .gap(r(4.))
-                    .when_some(project_override, |this, (project_enabled, device_enabled)| {
-                        let summary = format!(
-                            "Overridden for this project (Project: {} \u{00b7} Device: {})",
-                            if project_enabled { "On" } else { "Off" },
-                            if device_enabled { "On" } else { "Off" },
-                        );
+                    .when_some(project_override_summary, |this, summary| {
                         this.child(
                             h_flex()
                                 .items_center()
@@ -1167,7 +1184,7 @@ impl SettingsView {
 
     /// Saves an edit of one instance as an upsert (or as a `projectSettingsOverrides[projectId].providerInstances[id].enabled`
     /// override when toggling enabled at Project/Checkout scope).
-    fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
+    pub(super) fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
         if matches!(edit, model::InstanceEdit::Enabled(true))
             && let Some(c) = self.scoped_raw_representative_config(cx)
         {
@@ -1180,7 +1197,7 @@ impl SettingsView {
             if !self.can_write_project_provider_overrides(cx) {
                 return;
             }
-            let members = self.scoped_project_members(cx);
+            let members = self.scoped_provider_project_members(cx);
             if !members.is_empty() {
                 store::update_projects(
                     &self.state,
@@ -1207,7 +1224,7 @@ impl SettingsView {
         if !self.can_write_project_provider_overrides(cx) || !self.supports_project_provider_overrides(cx) {
             return;
         }
-        let members = self.scoped_project_members(cx);
+        let members = self.scoped_provider_project_members(cx);
         if members.is_empty() {
             return;
         }

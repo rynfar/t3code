@@ -2825,4 +2825,258 @@ mod shell_tests {
         drop(vcx);
         drop(runtime);
     }
+
+    #[gpui::test]
+    async fn provider_project_overrides_target_only_scoped_owner_and_resolve_device_enabled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use t3_client::supervisor::ClientFixture;
+        use t3_core::commands::method;
+        use t3_core::server_config::{ProviderInstanceConfig, ServerConfigState};
+        use t3_core::settings::providers::{InstanceEdit, InstanceRow};
+        use t3_core::shell::ShellState;
+
+        // 1. `provider_override_summary` uses `InstanceRow::enabled()`, handling default-disabled
+        //    drivers (`cursor`) and `config.enabled == false` accurately.
+        let cursor_row = InstanceRow {
+            instance_id: "cursor".into(),
+            driver: "cursor".into(),
+            is_default: true,
+            is_dirty: false,
+            explicit: None,
+        };
+        assert_eq!(
+            providers::provider_override_summary(&cursor_row, true),
+            "Overridden for this project (Project: On \u{00b7} Device: Off)",
+        );
+        let config_disabled_row = InstanceRow {
+            instance_id: "codex".into(),
+            driver: "codex".into(),
+            is_default: true,
+            is_dirty: false,
+            explicit: Some(
+                serde_json::from_value::<ProviderInstanceConfig>(json!({
+                    "driver": "codex",
+                    "config": { "enabled": false }
+                }))
+                .unwrap(),
+            ),
+        };
+        assert_eq!(
+            providers::provider_override_summary(&config_disabled_row, true),
+            "Overridden for this project (Project: On \u{00b7} Device: Off)",
+        );
+        let default_enabled_row = InstanceRow {
+            instance_id: "codex".into(),
+            driver: "codex".into(),
+            is_default: true,
+            is_dirty: false,
+            explicit: None,
+        };
+        assert_eq!(
+            providers::provider_override_summary(&default_enabled_row, false),
+            "Overridden for this project (Project: Off \u{00b7} Device: On)",
+        );
+
+        // 2. Multi-machine grouped project: toggling & resetting a provider override in `Providers`
+        //    with `scope.machine == None` writes ONLY to the scoped primary owner (`env-mac`),
+        //    never to the secondary machine (`env-vps`).
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _active_fixture) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::updates::init(cx);
+            init(state.clone(), cx);
+        });
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mut ready_tx = Some(ready_tx);
+        let _sub = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell
+                    && state.fleet.environments.len() == 2
+                    && let Some(tx) = ready_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+
+        let mut fixtures = Vec::new();
+        let mut events = Vec::new();
+        for (saved, label, project_id, root) in [
+            ("env-mac", "Mac Studio", "proj-mac", "/mac/demo"),
+            ("env-vps", "Build VPS", "proj-vps", "/vps/demo"),
+        ] {
+            let session = serde_json::from_value(json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "settings:write", "providers:manage"]
+            }))
+            .unwrap();
+            let (client, fixture) = ClientFixture::handle(session);
+            let mut shell = ShellState::default();
+            shell.apply(
+                serde_json::from_value(json!({
+                    "kind": "snapshot",
+                    "snapshot": {
+                        "snapshotSequence": 1,
+                        "projects": [{
+                            "id": project_id,
+                            "title": "Demo Repo",
+                            "workspaceRoot": root,
+                            "repositoryIdentity": {
+                                "canonicalKey": "github.com/acme/demo",
+                                "locator": {},
+                                "name": "demo",
+                                "displayName": "acme/demo",
+                                "rootPath": root
+                            },
+                            "createdAt": "2026-01-01T00:00:00Z",
+                            "updatedAt": "2026-01-01T00:00:00Z",
+                            "scripts": []
+                        }],
+                        "threads": []
+                    }
+                }))
+                .unwrap(),
+            );
+            shell.synchronized = true;
+            let mut config = ServerConfigState::default();
+            config.apply(
+                serde_json::from_value(json!({
+                    "type": "snapshot",
+                    "config": {
+                        "environment": {
+                            "environmentId": saved,
+                            "label": label,
+                            "capabilities": { "projectProviderInstanceOverrides": true }
+                        },
+                        "settings": {
+                            "providerInstances": { "codex": { "driver": "codex", "enabled": true } },
+                            "projectSettingsOverrides": {
+                                project_id: {
+                                    "providerInstances": { "codex": { "enabled": false } }
+                                }
+                            }
+                        }
+                    }
+                }))
+                .unwrap(),
+            );
+            let install = state.update(cx, |state, _| {
+                state.connections.install_fixture(saved, client, shell, config, ConnectionStatus::Connected)
+            });
+            events.push(runtime.spawn(install).await.unwrap());
+            fixtures.push(fixture);
+        }
+        ready_rx.await.unwrap();
+
+        cx.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.environments.active = Some("env-mac".into());
+                for (id, label, local) in [("env-mac", "Mac Studio", true), ("env-vps", "Build VPS", false)] {
+                    state.environments.environments.push(
+                        serde_json::from_value(json!({
+                            "id": id,
+                            "label": label,
+                            "httpBase": format!("http://127.0.0.1/{id}"),
+                            "local": local,
+                            "environmentId": id
+                        }))
+                        .unwrap(),
+                    );
+                }
+                state.server_config.config = state
+                    .scoped_environment("env-mac")
+                    .and_then(|e| e.config.config.clone());
+                cx.emit(AppEvent::ServerConfig);
+            });
+            open(Section::Providers, cx);
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+
+        vcx.update(|_, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            let groups = view.read(cx).all_scope_project_groups(cx);
+            let key = groups.first().expect("grouped project").project_key.clone();
+            view.update(cx, |v, cx| {
+                v.scope = SettingsScopeSearch { project: Some(key), machine: None, checkout: None };
+                cx.notify();
+            });
+            assert_eq!(view.read(cx).scoped_project_members(cx).len(), 2);
+            let provider_members = view.read(cx).scoped_provider_project_members(cx);
+            assert_eq!(provider_members.len(), 1);
+            assert_eq!(provider_members[0].owner.saved_id, "env-mac");
+            assert_eq!(provider_members[0].project.id, "proj-mac");
+        });
+
+        async fn next_settings_update(
+            fixture: &mut ClientFixture,
+        ) -> (
+            serde_json::Value,
+            tokio::sync::oneshot::Sender<Result<serde_json::Value, t3_client::session::RpcError>>,
+        ) {
+            loop {
+                let (rpc, payload, reply) = fixture.next_request().await;
+                if rpc == method::SERVER_UPDATE_SETTINGS {
+                    return (payload, reply);
+                }
+                let _ = reply.send(Ok(json!({})));
+            }
+        }
+
+        // Toggle provider override -> writes ONLY to `env-mac`.
+        vcx.update(|_, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            view.update(cx, |v, cx| v.update_instance("codex", InstanceEdit::Enabled(true), cx));
+        });
+        let (payload, reply) = next_settings_update(&mut fixtures[0]).await;
+        assert_eq!(payload["patch"]["projectSettingsOverrides"]["proj-mac"]["providerInstances"]["codex"]["enabled"], true);
+        reply.send(Ok(payload["patch"].clone())).unwrap();
+        vcx.run_until_parked();
+
+        // Reset provider override -> writes ONLY to `env-mac` (and emits null since sole key).
+        vcx.update(|_, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            view.update(cx, |v, cx| v.reset_provider_instance_override("codex", cx));
+        });
+        let (payload, reply) = next_settings_update(&mut fixtures[0]).await;
+        assert_eq!(payload["patch"]["projectSettingsOverrides"]["proj-mac"], serde_json::Value::Null);
+        reply.send(Ok(payload["patch"].clone())).unwrap();
+        vcx.run_until_parked();
+
+        // `env-vps` never received a `server.updateSettings` write.
+        let mut saw_settings_write_on_vps = false;
+        loop {
+            let next = std::future::poll_fn(|task_cx| {
+                let mut fut = std::pin::pin!(fixtures[1].next_request());
+                match fut.as_mut().poll(task_cx) {
+                    std::task::Poll::Ready((rpc, _, reply)) => {
+                        let _ = reply.send(Ok(json!({})));
+                        std::task::Poll::Ready(Some(rpc))
+                    }
+                    std::task::Poll::Pending => std::task::Poll::Ready(None),
+                }
+            })
+            .await;
+            match next {
+                Some(rpc) if rpc == method::SERVER_UPDATE_SETTINGS => saw_settings_write_on_vps = true,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(!saw_settings_write_on_vps, "env-vps must not receive provider project override writes");
+
+        vcx.update(|window, cx| finish_close(window, cx));
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        vcx.run_until_parked();
+        drop(events);
+        drop(vcx);
+        drop(runtime);
+    }
 }
