@@ -140,6 +140,21 @@ pub struct CleanupRules {
     pub worktree_unchanged: bool,
 }
 
+impl CleanupRules {
+    /// Serializes every `WorktreeCleanupRules` field for merging into a project-scoped
+    /// `worktreeCleanup: { mode: "custom", rules }` override (`scopedSettings.ts:258-267`).
+    pub fn to_json_map(self) -> serde_json::Map<String, Value> {
+        let mut map = serde_json::Map::new();
+        map.insert("worktreeKeepWhen".to_owned(), json!(self.worktree_keep_when.as_str()));
+        map.insert("worktreeAfterDays".to_owned(), json!(self.worktree_after_days));
+        map.insert("worktreeSettledAfterDays".to_owned(), json!(self.worktree_settled_after_days));
+        map.insert("worktreeOnMerge".to_owned(), json!(self.worktree_on_merge));
+        map.insert("worktreeOnDelete".to_owned(), json!(self.worktree_on_delete));
+        map.insert("worktreeUnchanged".to_owned(), json!(self.worktree_unchanged));
+        map
+    }
+}
+
 /// `StorageCleanupSettings`: the worktree rules, plus the artifact and log retention the
 /// Maintenance page edits. Each field falls back to its default alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -230,6 +245,19 @@ pub enum CleanupRule {
     KeepWhen(KeepWhen),
 }
 
+impl CleanupRule {
+    pub fn patch_entry(self) -> (&'static str, Value) {
+        match self {
+            CleanupRule::OnDelete(on) => ("worktreeOnDelete", json!(on)),
+            CleanupRule::OnMerge(on) => ("worktreeOnMerge", json!(on)),
+            CleanupRule::AfterDays(days) => ("worktreeAfterDays", json!(days.map(|days| days.clamp(1, MAX_RETENTION_DAYS)))),
+            CleanupRule::SettledAfterDays(days) => ("worktreeSettledAfterDays", json!(days.map(|days| days.min(MAX_RETENTION_DAYS)))),
+            CleanupRule::Unchanged(on) => ("worktreeUnchanged", json!(on)),
+            CleanupRule::KeepWhen(mode) => ("worktreeKeepWhen", json!(mode.as_str())),
+        }
+    }
+}
+
 /// One Worktrees page edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeChange {
@@ -240,6 +268,12 @@ pub enum WorktreeChange {
     BranchPrefix(String),
     BranchInstructions(String),
     Cleanup(CleanupRule),
+    /// Project-scoped `worktreeCleanup: { mode: "off" }` (`StorageSettings.tsx:627`).
+    ProjectCleanupOff,
+    /// Project-scoped `worktreeCleanup: { mode: "custom", rules: {} }` (`StorageSettings.tsx:629`).
+    ProjectCleanupCustom,
+    /// Project-scoped rule edit under `worktreeCleanup: { mode: "custom", rules }` (`StorageSettings.tsx:580`).
+    ProjectCleanupRule(CleanupRule),
 }
 
 /// `RetentionControl`'s commit: rounded and held inside the field's bounds.
@@ -257,15 +291,14 @@ impl WorktreeChange {
             WorktreeChange::BranchPrefix(prefix) => json!({ "branchNamePrefix": prefix.trim() }),
             WorktreeChange::BranchInstructions(text) => json!({ "branchNameInstructions": text.trim() }),
             WorktreeChange::Cleanup(rule) => {
-                let (key, value) = match *rule {
-                    CleanupRule::OnDelete(on) => ("worktreeOnDelete", json!(on)),
-                    CleanupRule::OnMerge(on) => ("worktreeOnMerge", json!(on)),
-                    CleanupRule::AfterDays(days) => ("worktreeAfterDays", json!(days.map(|days| days.clamp(1, MAX_RETENTION_DAYS)))),
-                    CleanupRule::SettledAfterDays(days) => ("worktreeSettledAfterDays", json!(days.map(|days| days.min(MAX_RETENTION_DAYS)))),
-                    CleanupRule::Unchanged(on) => ("worktreeUnchanged", json!(on)),
-                    CleanupRule::KeepWhen(mode) => ("worktreeKeepWhen", json!(mode.as_str())),
-                };
+                let (key, value) = rule.patch_entry();
                 json!({ "storageCleanup": { key: value } })
+            }
+            WorktreeChange::ProjectCleanupOff => json!({ "worktreeCleanup": { "mode": "off" } }),
+            WorktreeChange::ProjectCleanupCustom => json!({ "worktreeCleanup": { "mode": "custom", "rules": {} } }),
+            WorktreeChange::ProjectCleanupRule(rule) => {
+                let (key, value) = rule.patch_entry();
+                json!({ "worktreeCleanup": { "mode": "custom", "rules": { key: value } } })
             }
         }
     }

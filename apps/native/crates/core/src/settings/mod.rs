@@ -1074,10 +1074,21 @@ pub fn effective_provider_enabled(
     base_enabled: bool,
 ) -> bool {
     project_id
-        .and_then(|id| settings.project_settings_overrides.get(id))
+        .and_then(|id| project_provider_instance_override(settings, id, instance_id))
+        .unwrap_or(base_enabled)
+}
+
+/// Explicit project-scoped override value for `providerInstances[instanceId].enabled`, if any.
+pub fn project_provider_instance_override(
+    settings: &ServerSettings,
+    project_id: &str,
+    instance_id: &str,
+) -> Option<bool> {
+    settings
+        .project_settings_overrides
+        .get(project_id)
         .and_then(|entry| entry.provider_instances.get(instance_id))
         .and_then(|inst| inst.enabled)
-        .unwrap_or(base_enabled)
 }
 
 /// Converts a server setting change into a project-override edit when every key in its patch is
@@ -1968,6 +1979,11 @@ mod panel_tests {
         assert!(!effective_provider_enabled(&base, Some("proj-1"), "codex", true));
         assert!(effective_provider_enabled(&base, Some("proj-other"), "codex", true));
 
+        assert_eq!(project_provider_instance_override(&base, "proj-1", "codex"), Some(false));
+        assert_eq!(project_provider_instance_override(&base, "proj-other", "codex"), None);
+
+        // Clearing the last provider instance override while sibling keys remain must send
+        // `"providerInstances": {}` so the server replaces (instead of keeping) the stored map.
         let patch = projects::override_patch(
             &base,
             &[project_actions::Member { id: "proj-1".into(), scripts: Vec::new() }],
@@ -1976,6 +1992,145 @@ mod panel_tests {
                 enabled: None,
             },
         );
-        assert!(patch["patch"]["projectSettingsOverrides"]["proj-1"].get("providerInstances").is_none());
+        assert_eq!(
+            patch["patch"]["projectSettingsOverrides"]["proj-1"]["providerInstances"],
+            json!({}),
+        );
+        assert_eq!(patch["patch"]["projectSettingsOverrides"]["proj-1"]["defaultAutoPull"], json!(true));
+
+        // Clearing the last provider instance override when it is the ONLY key emits `null`.
+        let solo: crate::server_config::ServerSettings = serde_json::from_value(json!({
+            "projectSettingsOverrides": {
+                "proj-solo": { "providerInstances": { "codex": { "enabled": false } } }
+            }
+        }))
+        .unwrap();
+        let solo_patch = projects::override_patch(
+            &solo,
+            &[project_actions::Member { id: "proj-solo".into(), scripts: Vec::new() }],
+            &projects::OverrideEdit::ProviderInstanceEnabled {
+                instance_id: "codex".into(),
+                enabled: None,
+            },
+        );
+        assert_eq!(solo_patch["patch"]["projectSettingsOverrides"]["proj-solo"], Value::Null);
+    }
+
+    #[test]
+    fn project_override_merges_source_control_writing_style_and_worktree_cleanup() {
+        let base: crate::server_config::ServerSettings = serde_json::from_value(json!({
+            "sourceControlWritingStyle": {
+                "mode": "conventional_commits",
+                "customInstructions": "env rule",
+                "followChangeRequestTemplates": true
+            },
+            "storageCleanup": {
+                "worktreeOnDelete": true,
+                "worktreeOnMerge": false,
+                "worktreeAfterDays": 14,
+                "worktreeKeepWhen": "tracked-changes"
+            },
+            "projectSettingsOverrides": {
+                "proj-1": {
+                    "sourceControlWritingStyle": {
+                        "mode": "custom",
+                        "customInstructions": "keep me",
+                        "followChangeRequestTemplates": true
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let members = [project_actions::Member { id: "proj-1".into(), scripts: Vec::new() }];
+
+        // Toggling followChangeRequestTemplates off preserves custom mode & instructions.
+        let toggle_templates = server_change_to_override_edit(
+            &source_control::SourceControlChange::FollowTemplates(false).into_server(),
+        )
+        .expect("follow templates is project-scoped");
+        let patch = projects::override_patch(&base, &members, &toggle_templates);
+        assert_eq!(
+            patch["patch"]["projectSettingsOverrides"]["proj-1"]["sourceControlWritingStyle"],
+            json!({
+                "mode": "custom",
+                "customInstructions": "keep me",
+                "followChangeRequestTemplates": false,
+            }),
+        );
+
+        // Switching mode / resetting writing style preserves followChangeRequestTemplates=false.
+        let with_templates_off: crate::server_config::ServerSettings = serde_json::from_value(json!({
+            "sourceControlWritingStyle": {
+                "mode": "conventional_commits",
+                "customInstructions": "env rule",
+                "followChangeRequestTemplates": true
+            },
+            "projectSettingsOverrides": {
+                "proj-1": {
+                    "sourceControlWritingStyle": {
+                        "mode": "custom",
+                        "customInstructions": "keep me",
+                        "followChangeRequestTemplates": false
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let reset_style = server_change_to_override_edit(
+            &source_control::SourceControlChange::WritingMode {
+                mode: source_control::WritingMode::ConventionalCommits,
+                custom_instructions: Some("env rule".into()),
+            }
+            .into_server(),
+        )
+        .unwrap();
+        let patch = projects::override_patch(&with_templates_off, &members, &reset_style);
+        assert_eq!(
+            patch["patch"]["projectSettingsOverrides"]["proj-1"]["sourceControlWritingStyle"],
+            json!({
+                "mode": "conventional_commits",
+                "customInstructions": "env rule",
+                "followChangeRequestTemplates": false,
+            }),
+        );
+
+        // Worktree cleanup: Off, Custom rule merge (preserving sibling rules from effective
+        // storageCleanup), and Inherit clear.
+        let off_edit = server_change_to_override_edit(&worktrees::WorktreeChange::ProjectCleanupOff.into_server())
+            .expect("worktreeCleanup is project-scoped");
+        let off_patch = projects::override_patch(&base, &members, &off_edit);
+        assert_eq!(
+            off_patch["patch"]["projectSettingsOverrides"]["proj-1"]["worktreeCleanup"],
+            json!({ "mode": "off" }),
+        );
+
+        let rule_edit = server_change_to_override_edit(
+            &worktrees::WorktreeChange::ProjectCleanupRule(worktrees::CleanupRule::OnMerge(true)).into_server(),
+        )
+        .expect("project worktree cleanup rule is project-scoped");
+        let rule_patch = projects::override_patch(&base, &members, &rule_edit);
+        assert_eq!(
+            rule_patch["patch"]["projectSettingsOverrides"]["proj-1"]["worktreeCleanup"],
+            json!({
+                "mode": "custom",
+                "rules": {
+                    "worktreeKeepWhen": "tracked-changes",
+                    "worktreeAfterDays": 14,
+                    "worktreeSettledAfterDays": null,
+                    "worktreeOnMerge": true,
+                    "worktreeOnDelete": true,
+                    "worktreeUnchanged": false,
+                }
+            }),
+        );
+
+        // Environment capabilities decode projectWorktreeCleanup & projectProviderInstanceOverrides.
+        let caps: crate::server_config::EnvironmentCapabilities = serde_json::from_value(json!({
+            "projectWorktreeCleanup": true,
+            "projectProviderInstanceOverrides": true,
+        }))
+        .unwrap();
+        assert_eq!(caps.project_worktree_cleanup, Some(true));
+        assert_eq!(caps.project_provider_instance_overrides, Some(true));
     }
 }

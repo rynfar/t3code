@@ -411,6 +411,46 @@ pub enum OverrideEdit {
     Scripts(ScriptsEdit),
 }
 
+/// Completes a partial plain-object override against the project's effective resolved value
+/// (`planScopedSettingsPatch` in `scopedSettings.ts:255-292`) so editing one sub-field does not
+/// clobber sibling fields when the server replaces the whole override object.
+fn merge_override_value(settings: &ServerSettings, project_id: &str, key: &str, value: Value) -> Value {
+    match (key, value) {
+        ("sourceControlWritingStyle", Value::Object(patch)) => {
+            let effective = super::resolve_project_settings(settings, project_id)
+                .source_control
+                .source_control_writing_style;
+            let mut merged = Map::new();
+            merged.insert("mode".to_owned(), Value::String(effective.mode.as_str().to_owned()));
+            merged.insert("customInstructions".to_owned(), Value::String(effective.custom_instructions));
+            merged.insert(
+                "followChangeRequestTemplates".to_owned(),
+                Value::Bool(effective.follow_change_request_templates),
+            );
+            for (k, v) in patch {
+                merged.insert(k, v);
+            }
+            Value::Object(merged)
+        }
+        ("worktreeCleanup", Value::Object(mut obj))
+            if obj.get("mode").and_then(Value::as_str) == Some("custom") =>
+        {
+            let mut merged_rules = super::resolve_project_settings(settings, project_id)
+                .worktrees
+                .cleanup()
+                .to_json_map();
+            if let Some(patch_rules) = obj.get("rules").and_then(Value::as_object) {
+                for (k, v) in patch_rules {
+                    merged_rules.insert(k.clone(), v.clone());
+                }
+            }
+            obj.insert("rules".to_owned(), Value::Object(merged_rules));
+            Value::Object(obj)
+        }
+        (_, other) => other,
+    }
+}
+
 /// `projectOverrideWrites`: each member's entry with `edit` applied, its other keys kept.
 pub fn override_patch(settings: &ServerSettings, members: &[Member], edit: &OverrideEdit) -> Value {
     let entries: Map<String, Value> = members
@@ -423,9 +463,10 @@ pub fn override_patch(settings: &ServerSettings, members: &[Member], edit: &Over
                     if value.is_null() && !nullable_override(key) {
                         entry.remove(key);
                     } else {
-                        entry.insert(key.clone(), value.clone());
+                        let merged = merge_override_value(settings, id, key, value.clone());
+                        entry.insert(key.clone(), merged);
                     }
-                    Value::Object(entry)
+                    if entry.is_empty() { Value::Null } else { Value::Object(entry) }
                 }
                 OverrideEdit::SetMap(patch) => {
                     let mut entry = override_entry(settings, id).unwrap_or_default();
@@ -433,7 +474,8 @@ pub fn override_patch(settings: &ServerSettings, members: &[Member], edit: &Over
                         if value.is_null() && !nullable_override(key) {
                             entry.remove(key);
                         } else {
-                            entry.insert(key.clone(), value.clone());
+                            let merged = merge_override_value(settings, id, key, value.clone());
+                            entry.insert(key.clone(), merged);
                         }
                     }
                     if entry.is_empty() { Value::Null } else { Value::Object(entry) }
@@ -471,10 +513,18 @@ pub fn override_patch(settings: &ServerSettings, members: &[Member], edit: &Over
                     }
                     if instances.is_empty() {
                         entry.remove("providerInstances");
+                        if entry.is_empty() {
+                            Value::Null
+                        } else {
+                            // Server `mergeProjectSettingsOverridesPatch` keeps the stored
+                            // `providerInstances` map if the key is omitted on a non-null entry.
+                            entry.insert("providerInstances".to_owned(), Value::Object(Map::new()));
+                            Value::Object(entry)
+                        }
                     } else {
                         entry.insert("providerInstances".to_owned(), Value::Object(instances));
+                        Value::Object(entry)
                     }
-                    if entry.is_empty() { Value::Null } else { Value::Object(entry) }
                 }
                 OverrideEdit::Scripts(edit) => {
                     let current = resolve_project_scripts(settings, id, member.scripts.clone());

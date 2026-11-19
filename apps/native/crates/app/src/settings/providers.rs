@@ -361,10 +361,29 @@ fn card_height(window: &Window) -> gpui::Pixels {
 }
 
 impl SettingsView {
+    /// Whether project-scoped provider enablement overrides are active (`ProviderSettingsPanel.tsx:562-566`).
+    /// Hidden on older servers whose `capabilities.projectProviderInstanceOverrides` is not true.
+    pub(super) fn supports_project_provider_overrides(&self, cx: &App) -> bool {
+        self.is_project_scope(cx)
+            && self
+                .scoped_raw_representative_config(cx)
+                .is_some_and(|c| c.environment.capabilities.project_provider_instance_overrides == Some(true))
+    }
+
+    /// Whether the scoped environment grants `settings:write` for project provider overrides
+    /// (`ProviderSettingsPanel.tsx:555`, `ProviderInstanceCard.tsx:1160,1169`).
+    fn can_write_project_provider_overrides(&self, cx: &App) -> bool {
+        self.scoped_session(cx)
+            .is_none_or(|session| session.grants(super::projects::SETTINGS_WRITE_SCOPE))
+    }
+
     fn page_data(&self, cx: &App) -> Option<PageData> {
         let app = self.state.read(cx);
         let config = self.scoped_raw_representative_config(cx)?;
-        let scope_project = self.is_project_scope(cx).then(|| self.scope_project_id(cx)).flatten();
+        let scope_project = self
+            .supports_project_provider_overrides(cx)
+            .then(|| self.scope_project_id(cx))
+            .flatten();
         let settings = &config.settings;
         let live = &config.providers;
         let rows = model::instance_rows(settings, live, self.providers.selected.as_deref());
@@ -588,6 +607,22 @@ impl SettingsView {
                 model::find_driver(&row.driver).map_or(row.driver.as_str(), |d| d.label),
             )
         };
+        let can_write_override = self.can_write_project_provider_overrides(cx);
+        let project_override = self
+            .supports_project_provider_overrides(cx)
+            .then(|| {
+                let project_id = self.scope_project_id(cx)?;
+                let config = self.scoped_raw_representative_config(cx)?;
+                let project_enabled = t3_core::settings::project_provider_instance_override(
+                    &config.settings,
+                    &project_id,
+                    &row.instance_id,
+                )?;
+                let device_enabled = row.explicit.as_ref().and_then(|inst| inst.enabled).unwrap_or(true);
+                Some((project_enabled, device_enabled))
+            })
+            .flatten();
+        let reset_id = row.instance_id.clone();
         let toggle = cx.listener(move |this, checked: &bool, _, cx| this.update_instance(&toggle_id, model::InstanceEdit::Enabled(*checked), cx));
         h_flex()
             .id(("provider-row", index))
@@ -645,7 +680,54 @@ impl SettingsView {
                             ),
                     ),
             )
-            .child(h_flex().h(r(20.)).flex_none().child(crate::components::managed::ManagedControl::new(("managed-provider", index), denial, Switch::new(("provider-enabled", index), enabled).on_change(move |checked, window, cx| toggle(&checked, window, cx)))))
+            .child(
+                h_flex()
+                    .h(r(20.))
+                    .flex_none()
+                    .items_center()
+                    .gap(r(4.))
+                    .when_some(project_override, |this, (project_enabled, device_enabled)| {
+                        let summary = format!(
+                            "Overridden for this project (Project: {} \u{00b7} Device: {})",
+                            if project_enabled { "On" } else { "Off" },
+                            if device_enabled { "On" } else { "Off" },
+                        );
+                        this.child(
+                            h_flex()
+                                .items_center()
+                                .child(
+                                    Button::new(
+                                        ("provider-override-inheritance", index),
+                                        ButtonVariant::GhostMuted,
+                                        ButtonSize::IconMicro,
+                                    )
+                                    .icon(Icon::Layers)
+                                    .icon_color(hsla(p.primary))
+                                    .tooltip(summary),
+                                )
+                                .child(
+                                    Button::new(
+                                        ("provider-override-reset", index),
+                                        ButtonVariant::GhostMuted,
+                                        ButtonSize::IconMicro,
+                                    )
+                                    .icon(Icon::Undo2)
+                                    .tooltip("Reset to the device setting")
+                                    .disabled(!can_write_override)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reset_provider_instance_override(&reset_id, cx);
+                                    })),
+                                ),
+                        )
+                    })
+                    .child(crate::components::managed::ManagedControl::new(
+                        ("managed-provider", index),
+                        denial,
+                        Switch::new(("provider-enabled", index), enabled)
+                            .disabled(self.supports_project_provider_overrides(cx) && !can_write_override)
+                            .on_change(move |checked, window, cx| toggle(&checked, window, cx)),
+                    )),
+            )
             .into_any_element()
     }
 
@@ -1086,16 +1168,18 @@ impl SettingsView {
     /// Saves an edit of one instance as an upsert (or as a `projectSettingsOverrides[projectId].providerInstances[id].enabled`
     /// override when toggling enabled at Project/Checkout scope).
     fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
-        if !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE,cx) {return;}
         if matches!(edit, model::InstanceEdit::Enabled(true))
             && let Some(c) = self.scoped_raw_representative_config(cx)
         {
             let driver = c.provider(instance_id).map(|p| p.driver.as_str()).or_else(|| c.settings.provider_instances.get(instance_id).map(|i| i.driver.as_str())).unwrap_or(instance_id);
             if t3_core::managed_policy::driver_denial(c.managed_policy.as_ref(), driver, driver).is_some() { return; }
         }
-        if self.is_project_scope(cx)
+        if self.supports_project_provider_overrides(cx)
             && let model::InstanceEdit::Enabled(flag) = edit
         {
+            if !self.can_write_project_provider_overrides(cx) {
+                return;
+            }
             let members = self.scoped_project_members(cx);
             if !members.is_empty() {
                 store::update_projects(
@@ -1111,7 +1195,32 @@ impl SettingsView {
                 return;
             }
         }
+        if !self.may(t3_core::usage::PROVIDERS_MANAGE_SCOPE, cx) {
+            return;
+        }
         self.update_scoped_single_env(ServerSettingChange::ProviderInstance { instance_id: instance_id.to_owned(), edit }, cx);
+    }
+
+    /// Resets a project-level provider enablement override back to inherit the device setting
+    /// (`ProviderInstanceCard.tsx:1157-1162`).
+    pub(super) fn reset_provider_instance_override(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        if !self.can_write_project_provider_overrides(cx) || !self.supports_project_provider_overrides(cx) {
+            return;
+        }
+        let members = self.scoped_project_members(cx);
+        if members.is_empty() {
+            return;
+        }
+        store::update_projects(
+            &self.state,
+            members,
+            t3_core::settings::projects::OverrideEdit::ProviderInstanceEnabled {
+                instance_id: instance_id.to_owned(),
+                enabled: None,
+            },
+            |_, _| {},
+            cx,
+        );
     }
 
     pub(super) fn selected_instance_id(&self, cx: &App) -> Option<String> {

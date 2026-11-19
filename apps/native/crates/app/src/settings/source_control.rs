@@ -1642,16 +1642,50 @@ impl SettingsView {
         let mode_view = view.clone();
         let custom = style.mode == WritingMode::Custom;
         let instructions = self.source_control.custom_instructions.clone();
-        let writing = self
-            .apply_scoped_reset(
-                Row::new("source-control-writing-style", "Source control writing style")
-                    .description(style.mode.description())
-                    .highlighted(self.is_target("source-control-writing-style")),
-                &["sourceControlWritingStyle"],
-                !style.is_default_style(),
-                SourceControlChange::ResetWritingStyle.into_server(),
-                cx,
+        let is_project_scope = self.is_project_scope(cx);
+        let has_style_override = self.has_project_override(&["sourceControlWritingStyle"], cx);
+        let env_style = self
+            .scoped_raw_representative_config(cx)
+            .map(|cfg| cfg.settings.source_control.source_control_writing_style)
+            .unwrap_or_default();
+        let style_differs =
+            style.mode != env_style.mode || style.custom_instructions != env_style.custom_instructions;
+        let templates_differs =
+            style.follow_change_request_templates != env_style.follow_change_request_templates;
+        let writing_row = Row::new("source-control-writing-style", "Source control writing style")
+            .description(style.mode.description())
+            .highlighted(self.is_target("source-control-writing-style"));
+        let writing = if is_project_scope {
+            let reset_view = view.clone();
+            let env_mode = env_style.mode;
+            let env_instructions = env_style.custom_instructions.clone();
+            writing_row.reset_tooltip("Reset to inherited value").reset(
+                has_style_override && (style_differs || !templates_differs),
+                move |_, _, cx| {
+                    let _ = reset_view.update(cx, |this, cx| {
+                        if templates_differs {
+                            this.update_scoped_server(
+                                SourceControlChange::WritingMode {
+                                    mode: env_mode,
+                                    custom_instructions: Some(env_instructions.clone()),
+                                }
+                                .into_server(),
+                                cx,
+                            );
+                        } else {
+                            this.clear_project_overrides(&["sourceControlWritingStyle"], cx);
+                        }
+                    });
+                },
             )
+        } else {
+            let reset_view = view.clone();
+            writing_row.reset(!style.is_default_style(), move |_, _, cx| {
+                let _ = reset_view.update(cx, |this, cx| {
+                    this.update_scoped_server(SourceControlChange::ResetWritingStyle.into_server(), cx);
+                });
+            })
+        }
             .control(
                 Select::new("source-control-writing-style-select", WritingMode::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                     .selected(style.mode.as_str())
@@ -1711,22 +1745,43 @@ impl SettingsView {
             );
         }
         let templates_view = view.clone();
-        let advanced_rows = vec![
-            self.apply_scoped_reset(
-                Row::new("follow-change-request-templates", "Follow change request templates")
-                    .description("Use the repository's template for change request descriptions when available.")
-                    .highlighted(self.is_target("follow-change-request-templates")),
-                &["sourceControlWritingStyle"],
-                !style.follow_change_request_templates,
-                SourceControlChange::FollowTemplates(true).into_server(),
-                cx,
+        let templates_row = Row::new("follow-change-request-templates", "Follow change request templates")
+            .description("Use the repository's template for change request descriptions when available.")
+            .highlighted(self.is_target("follow-change-request-templates"));
+        let templates_row = if is_project_scope {
+            let reset_view = view.clone();
+            let env_templates = env_style.follow_change_request_templates;
+            templates_row.reset_tooltip("Reset to inherited value").reset(
+                has_style_override && templates_differs,
+                move |_, _, cx| {
+                    let _ = reset_view.update(cx, |this, cx| {
+                        if style_differs {
+                            this.update_scoped_server(
+                                SourceControlChange::FollowTemplates(env_templates).into_server(),
+                                cx,
+                            );
+                        } else {
+                            this.clear_project_overrides(&["sourceControlWritingStyle"], cx);
+                        }
+                    });
+                },
             )
-            .control(Switch::new("follow-change-request-templates-switch", style.follow_change_request_templates).on_change(move |on, _, cx| {
-                let _ = templates_view.update(cx, |this, cx| {
-                    this.update_scoped_server(SourceControlChange::FollowTemplates(on).into_server(), cx);
+        } else {
+            let reset_view = view.clone();
+            templates_row.reset(!style.follow_change_request_templates, move |_, _, cx| {
+                let _ = reset_view.update(cx, |this, cx| {
+                    this.update_scoped_server(SourceControlChange::FollowTemplates(true).into_server(), cx);
                 });
-            }))
-            .into_any_element(),
+            })
+        };
+        let advanced_rows = vec![
+            templates_row
+                .control(Switch::new("follow-change-request-templates-switch", style.follow_change_request_templates).on_change(move |on, _, cx| {
+                    let _ = templates_view.update(cx, |this, cx| {
+                        this.update_scoped_server(SourceControlChange::FollowTemplates(on).into_server(), cx);
+                    });
+                }))
+                .into_any_element(),
             self.model_row(
                 config,
                 ModelRow {

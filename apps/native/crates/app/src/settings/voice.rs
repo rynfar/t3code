@@ -2373,13 +2373,22 @@ impl SettingsView {
                 "Used by everyone who dictates on this environment.".to_owned(),
             ),
         };
-        dict_rows.push(
-            Row::new("speech-project-dictionary", proj_dict_title)
-                .description(proj_dict_desc)
-                .highlighted(self.is_target("speech-project-dictionary"))
-                .below(project_editor)
-                .into_any_element(),
-        );
+        let mut proj_dict_row = Row::new("speech-project-dictionary", proj_dict_title)
+            .description(proj_dict_desc)
+            .highlighted(self.is_target("speech-project-dictionary"))
+            .below(project_editor);
+        if self.is_project_scope(cx) {
+            let reset_view = cx.entity().downgrade();
+            proj_dict_row = proj_dict_row.reset_tooltip("Reset to inherited value").reset(
+                self.has_project_override(&["speechProjectCustomWords"], cx),
+                move |_, _, cx| {
+                    let _ = reset_view.update(cx, |this, cx| {
+                        this.clear_project_overrides(&["speechProjectCustomWords"], cx);
+                    });
+                },
+            );
+        }
+        dict_rows.push(proj_dict_row.into_any_element());
         let dictionary_section = section("Dictionary", dict_rows, cx);
 
         // -------------------------------------------------------------------

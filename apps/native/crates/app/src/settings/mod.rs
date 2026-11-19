@@ -2541,4 +2541,288 @@ mod shell_tests {
         drop(vcx);
         drop(runtime);
     }
+
+    #[gpui::test]
+    async fn project_scope_overrides_round_trip_title_speech_providers_and_worktrees(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use t3_client::supervisor::ClientFixture;
+        use t3_core::commands::method;
+        use t3_core::server_config::ServerConfigState;
+        use t3_core::settings::worktrees::CleanupRule;
+        use t3_core::shell::ShellState;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _active_fixture) =
+            cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::updates::init(cx);
+            init(state.clone(), cx);
+        });
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mut ready_tx = Some(ready_tx);
+        let _sub = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell
+                    && state.fleet.environments.iter().any(|e| e.summary.owner.saved_id == "env-mac")
+                    && let Some(tx) = ready_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+
+        let session = serde_json::from_value(json!({
+            "authenticated": true,
+            "permissions": ["orchestration:read", "settings:write", "providers:manage"]
+        }))
+        .unwrap();
+        let (client, mut fixture) = ClientFixture::handle(session);
+        let mut shell = ShellState::default();
+        shell.apply(
+            serde_json::from_value(json!({
+                "kind": "snapshot",
+                "snapshot": {
+                    "snapshotSequence": 1,
+                    "projects": [{
+                        "id": "proj-1",
+                        "title": "Demo Repo",
+                        "workspaceRoot": "/tmp/demo-repo",
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-01T00:00:00Z",
+                        "scripts": []
+                    }],
+                    "threads": []
+                }
+            }))
+            .unwrap(),
+        );
+        shell.synchronized = true;
+        let mut config = ServerConfigState::default();
+        config.apply(
+            serde_json::from_value(json!({
+                "type": "snapshot",
+                "config": {
+                    "environment": {
+                        "environmentId": "env-mac",
+                        "label": "Mac Studio",
+                        "capabilities": {
+                            "storageCleanup": true,
+                            "projectWorktreeCleanup": true,
+                            "projectProviderInstanceOverrides": true
+                        }
+                    },
+                    "settings": {
+                        "threadTitleInstructions": "",
+                        "speechProjectCustomWords": ["env-word"],
+                        "providerInstances": { "codex": { "driver": "codex", "enabled": true } },
+                        "storageCleanup": {
+                            "worktreeOnDelete": true,
+                            "worktreeOnMerge": false,
+                            "worktreeAfterDays": 14
+                        },
+                        "projectSettingsOverrides": {
+                            "proj-1": {
+                                "threadTitleInstructions": "Project rule",
+                                "speechProjectCustomWords": ["proj-word"],
+                                "providerInstances": { "codex": { "enabled": false } }
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        let install = state.update(cx, |state, _| {
+            state.connections.install_fixture("env-mac", client, shell, config, ConnectionStatus::Connected)
+        });
+        let events = runtime.spawn(install).await.unwrap();
+        ready_rx.await.unwrap();
+
+        cx.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.environments.active = Some("env-mac".into());
+                state.environments.environments.push(
+                    serde_json::from_value(json!({
+                        "id": "env-mac",
+                        "label": "Mac Studio",
+                        "httpBase": "http://127.0.0.1:3773",
+                        "local": true,
+                        "environmentId": "env-mac"
+                    }))
+                    .unwrap(),
+                );
+                state.server_config.config = state
+                    .scoped_environment("env-mac")
+                    .and_then(|e| e.config.config.clone());
+                cx.emit(AppEvent::ServerConfig);
+            });
+            open(Section::Threads, cx);
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+
+        // Scope SettingsView to `proj-1`.
+        let project_key = vcx.update(|_, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            let groups = view.read(cx).all_scope_project_groups(cx);
+            let key = groups.first().expect("demo project group").project_key.clone();
+            view.update(cx, |v, cx| {
+                v.scope = SettingsScopeSearch { project: Some(key.clone()), machine: None, checkout: None };
+                cx.notify();
+            });
+            key
+        });
+        assert!(!project_key.is_empty());
+
+        // Helper that ignores background non-settings RPCs (such as favicon `assets.createUrl`).
+        async fn next_settings_update(
+            fixture: &mut ClientFixture,
+        ) -> (
+            serde_json::Value,
+            tokio::sync::oneshot::Sender<Result<serde_json::Value, t3_client::session::RpcError>>,
+        ) {
+            loop {
+                let (rpc, payload, reply) = fixture.next_request().await;
+                if rpc == method::SERVER_UPDATE_SETTINGS {
+                    return (payload, reply);
+                }
+                let _ = reply.send(Ok(json!({})));
+            }
+        }
+
+        let server_reply = |patch: &serde_json::Value| {
+            json!({
+                "threadTitleInstructions": "",
+                "speechProjectCustomWords": ["env-word"],
+                "providerInstances": { "codex": { "driver": "codex", "enabled": true } },
+                "storageCleanup": {
+                    "worktreeOnDelete": true,
+                    "worktreeOnMerge": false,
+                    "worktreeAfterDays": 14
+                },
+                "projectSettingsOverrides": patch["projectSettingsOverrides"]
+            })
+        };
+
+        // 1. `commit_title_instructions` in Project scope must compare against the project override
+        //    ("Project rule"), not the active environment's empty string ("").
+        vcx.update(|window, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            view.update(cx, |v, cx| {
+                v.threads.title_instructions.update(cx, |input, cx| input.set_value("", window, cx));
+                v.commit_title_instructions(cx);
+            });
+        });
+        let (payload, reply) = next_settings_update(&mut fixture).await;
+        assert_eq!(payload["patch"]["projectSettingsOverrides"]["proj-1"]["threadTitleInstructions"], "");
+        reply.send(Ok(server_reply(&payload["patch"]))).unwrap();
+        vcx.run_until_parked();
+
+        // 2. `speechProjectCustomWords` override is detected and cleared cleanly in Project scope.
+        vcx.update(|_, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            assert!(view.read(cx).has_project_override(&["speechProjectCustomWords"], cx));
+            view.update(cx, |v, cx| v.clear_project_overrides(&["speechProjectCustomWords"], cx));
+        });
+        let (payload, reply) = next_settings_update(&mut fixture).await;
+        assert!(payload["patch"]["projectSettingsOverrides"]["proj-1"].get("speechProjectCustomWords").is_none());
+        reply.send(Ok(server_reply(&payload["patch"]))).unwrap();
+        vcx.run_until_parked();
+
+        // 3. `providerInstances` override reset emits `"providerInstances": {}` when sibling keys
+        //    remain, and is gated by `capabilities.projectProviderInstanceOverrides == Some(true)`.
+        vcx.update(|_, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            assert!(view.read(cx).supports_project_provider_overrides(cx));
+            view.update(cx, |v, cx| v.reset_provider_instance_override("codex", cx));
+        });
+        let (payload, reply) = next_settings_update(&mut fixture).await;
+        assert_eq!(payload["patch"]["projectSettingsOverrides"]["proj-1"]["providerInstances"], json!({}));
+        reply.send(Ok(server_reply(&payload["patch"]))).unwrap();
+        vcx.run_until_parked();
+
+        // 4. `worktreeCleanup` rule edit in Project scope writes `worktreeCleanup: { mode: "custom", rules }`
+        //    merged with the project's effective cleanup rules (never `storageCleanup`).
+        vcx.update(|_, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            view.update(cx, |v, cx| {
+                let change = v.cleanup_change(CleanupRule::OnMerge(true), cx);
+                v.update_scoped_server(change.into_server(), cx);
+            });
+        });
+        let (payload, reply) = next_settings_update(&mut fixture).await;
+        assert_eq!(
+            payload["patch"]["projectSettingsOverrides"]["proj-1"]["worktreeCleanup"],
+            json!({
+                "mode": "custom",
+                "rules": {
+                    "worktreeKeepWhen": "uncommitted-changes",
+                    "worktreeAfterDays": 14,
+                    "worktreeSettledAfterDays": null,
+                    "worktreeOnMerge": true,
+                    "worktreeOnDelete": true,
+                    "worktreeUnchanged": false
+                }
+            }),
+        );
+        reply.send(Ok(server_reply(&payload["patch"]))).unwrap();
+        vcx.run_until_parked();
+
+        // 5. Older servers without `projectProviderInstanceOverrides` disable project provider overrides.
+        let (cap_tx, cap_rx) = tokio::sync::oneshot::channel();
+        let mut cap_tx = Some(cap_tx);
+        let _cap_sub = state.update(&mut vcx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::ServerConfig
+                    && state
+                        .scoped_environment("env-mac")
+                        .and_then(|e| e.config.config.as_ref())
+                        .is_some_and(|c| c.environment.capabilities.project_provider_instance_overrides != Some(true))
+                    && let Some(tx) = cap_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            })
+        });
+        events
+            .send(t3_client::supervisor::ClientEvent::ServerConfig(Box::new(
+                serde_json::from_value(json!({
+                    "type": "snapshot",
+                    "config": {
+                        "environment": {
+                            "environmentId": "env-mac",
+                            "label": "Mac Studio",
+                            "capabilities": {
+                                "storageCleanup": true,
+                                "projectWorktreeCleanup": true
+                            }
+                        },
+                        "settings": {}
+                    }
+                }))
+                .unwrap(),
+            )))
+            .await
+            .unwrap();
+        cap_rx.await.unwrap();
+        vcx.update(|_, cx| {
+            let view = cx.global::<Host>().view.clone().expect("settings view open");
+            assert!(!view.read(cx).supports_project_provider_overrides(cx));
+        });
+        drop(events);
+
+        vcx.update(|window, cx| {
+            finish_close(window, cx);
+        });
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        vcx.run_until_parked();
+        drop(vcx);
+        drop(runtime);
+    }
 }

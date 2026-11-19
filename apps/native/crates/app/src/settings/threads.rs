@@ -925,9 +925,11 @@ impl SettingsView {
         }
     }
 
-    fn commit_title_instructions(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn commit_title_instructions(&mut self, cx: &mut Context<Self>) {
         let value = self.threads.title_instructions.read(cx).value().trim().to_owned();
-        let saved = self.thread_settings(cx).map(|config| config.settings.threads.thread_title_instructions.clone());
+        let saved = self
+            .scoped_representative_config(cx)
+            .map(|config| config.settings.threads.thread_title_instructions.clone());
         let target = self
             .threads
             .title_instructions_pending

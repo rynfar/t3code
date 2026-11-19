@@ -12,7 +12,7 @@ use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaSta
 use gpui_component::{Sizable, h_flex, v_flex};
 use t3_core::server_config::ServerConfig;
 use t3_core::settings::maintenance::{RetentionCommit, RetentionDraft, RetentionToggle};
-use t3_core::settings::worktrees::{BranchNaming, CleanupRule, DEFAULT_BRANCH_PREFIX, KeepWhen, Submodules, WorktreeChange};
+use t3_core::settings::worktrees::{BranchNaming, CleanupPolicy, CleanupRule, DEFAULT_BRANCH_PREFIX, KeepWhen, Submodules, WorktreeChange};
 
 use super::controls::{Row, Select, SelectOption, Switch, group, icon, muted_text, r, section, section_title};
 use super::{Block, SettingsView};
@@ -49,11 +49,11 @@ impl Retention {
         }
     }
 
-    fn change(self, days: Option<u32>) -> WorktreeChange {
-        WorktreeChange::Cleanup(match self {
+    fn rule(self, days: Option<u32>) -> CleanupRule {
+        match self {
             Retention::Inactive => CleanupRule::AfterDays(days),
             Retention::Settled => CleanupRule::SettledAfterDays(days),
-        })
+        }
     }
 }
 
@@ -197,6 +197,14 @@ impl SettingsView {
         self.update_scoped_server(change.into_server(), cx);
     }
 
+    pub(super) fn cleanup_change(&self, rule: CleanupRule, cx: &App) -> WorktreeChange {
+        if self.is_project_scope(cx) {
+            WorktreeChange::ProjectCleanupRule(rule)
+        } else {
+            WorktreeChange::Cleanup(rule)
+        }
+    }
+
     fn commit_worktree_directory(&mut self, cx: &mut Context<Self>) {
         if self.is_project_scope(cx) {
             return;
@@ -237,7 +245,7 @@ impl SettingsView {
                 self.worktrees.retention_seq = next_seq;
                 input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
                 self.save_retention_setting(
-                    field.change(Some(days)).into_server(),
+                    self.cleanup_change(field.rule(Some(days)), cx).into_server(),
                     move |this| this.worktrees.retention_drafts[idx].fail_submit(next_seq),
                     cx,
                 );
@@ -333,7 +341,8 @@ impl SettingsView {
                             cx.notify();
                         }
                         RetentionToggle::SaveOff => {
-                            this.update_scoped_server(field.change(None).into_server(), cx);
+                            let change = this.cleanup_change(field.rule(None), cx);
+                            this.update_scoped_server(change.into_server(), cx);
                             cx.notify();
                         }
                         RetentionToggle::DiscardDraft => {
@@ -493,7 +502,20 @@ impl SettingsView {
         }
         let branches = section("Branches", branches, cx);
 
-        let cleanup = if capabilities.storage_cleanup == Some(true) {
+        let is_project_scope = self.is_project_scope(cx);
+        let all_configs = self.scoped_all_configs(cx);
+        let lacks_project_cleanup = is_project_scope
+            && !all_configs.is_empty()
+            && all_configs
+                .iter()
+                .any(|cfg| cfg.environment.capabilities.project_worktree_cleanup != Some(true));
+        let cleanup = if lacks_project_cleanup {
+            v_flex()
+                .gap(r(10.))
+                .child(section_title("Cleanup"))
+                .child(div().px(r(16.)).child(muted_text("Update the selected machines to configure project worktree cleanup.", cx)))
+                .into_any_element()
+        } else if capabilities.storage_cleanup == Some(true) {
             self.cleanup_section(&config, cx).into_any_element()
         } else {
             v_flex()
@@ -511,65 +533,130 @@ impl SettingsView {
     }
 
     fn cleanup_section(&mut self, config: &ServerConfig, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_project_scope = self.is_project_scope(cx);
         let rules = config.settings.worktrees.cleanup();
         let capabilities = &config.environment.capabilities;
-        let rule = |rule: fn(bool) -> CleanupRule| move |on: bool| WorktreeChange::Cleanup(rule(on));
-        let rows = vec![
-            Row::new("worktree-on-delete", "Delete worktrees with deleted threads")
-                .description("Remove unused worktrees when active or archived threads are deleted. Worktrees with local changes are kept.")
-                .control(self.worktree_switch("worktree-on-delete-switch", rules.worktree_on_delete, rule(CleanupRule::OnDelete), cx))
-                .into_any_element(),
-            Row::new("worktree-on-merge", "Delete merged worktrees")
-                .description("Remove worktrees whose pull request is merged and whose commits are included in the default branch.")
-                .control(self.worktree_switch("worktree-on-merge-switch", rules.worktree_on_merge, rule(CleanupRule::OnMerge), cx))
-                .into_any_element(),
-            Row::new("worktree-after-days", "Delete inactive worktrees")
-                .description("Remove worktrees after their threads have been inactive for this many days. Branches and thread history are kept.")
-                .control(self.retention_control(Retention::Inactive, "worktree-after-days-switch", rules.worktree_after_days, cx))
-                .into_any_element(),
-        ];
-        let mut advanced_rows = Vec::new();
-        if capabilities.settled_worktree_cleanup == Some(true) {
-            advanced_rows.push(
-                Row::new("worktree-settled-after-days", "Delete settled worktrees")
-                    .description("Remove worktrees this many days after their thread settles. Set 0 days to remove them at the next cleanup. Branches and thread history are kept.")
-                    .control(self.retention_control(Retention::Settled, "worktree-settled-after-days-switch", rules.worktree_settled_after_days, cx))
-                    .into_any_element(),
-            );
-        }
-        advanced_rows.push(
-            Row::new("worktree-unchanged", "Delete unchanged worktrees")
-                .description("Remove worktrees with no commits beyond the default branch.")
-                .control(self.worktree_switch("worktree-unchanged-switch", rules.worktree_unchanged, rule(CleanupRule::Unchanged), cx))
-                .into_any_element(),
-        );
-        if capabilities.storage_cleanup_run == Some(true) {
-            let keep_view = cx.entity().downgrade();
-            advanced_rows.push(
-                Row::new("storage-worktree-keep-when", "Keep worktrees with local changes")
-                    .description(rules.worktree_keep_when.description())
-                    .highlighted(self.is_target("storage-worktree-keep-when"))
+        let project_mode = if is_project_scope && self.has_project_override(&["worktreeCleanup"], cx) {
+            match config.settings.worktrees.worktree_cleanup {
+                Some(CleanupPolicy::Off) => "off",
+                Some(CleanupPolicy::Custom(_)) => "custom",
+                None => "inherit",
+            }
+        } else {
+            "inherit"
+        };
+        let mut rows = Vec::new();
+        if is_project_scope {
+            let mode_view = cx.entity().downgrade();
+            let reset_view = cx.entity().downgrade();
+            let description = match project_mode {
+                "off" => "Keep this project's worktrees until you delete them manually.",
+                "custom" => "Use these rules for this project.",
+                _ => "Use each machine's worktree cleanup settings.",
+            };
+            rows.push(
+                Row::new("project-worktree-cleanup-mode", "Automatic worktree cleanup")
+                    .description(description)
+                    .reset_tooltip("Reset to inherited value")
+                    .reset(project_mode != "inherit", move |_, _, cx| {
+                        let _ = reset_view.update(cx, |this, cx| {
+                            this.clear_project_overrides(&["worktreeCleanup"], cx);
+                        });
+                    })
                     .control(
-                        Select::new("storage-worktree-keep-when-select", KeepWhen::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
-                            .selected(rules.worktree_keep_when.as_str())
-                            .width(196.)
-                            .on_change(move |value, _, cx| {
-                                if let Some(mode) = KeepWhen::parse(&value) {
-                                    let _ = keep_view.update(cx, |this, cx| {
-                                        this.update_scoped_server(WorktreeChange::Cleanup(CleanupRule::KeepWhen(mode)).into_server(), cx);
-                                    });
-                                }
-                            }),
+                        Select::new(
+                            "project-worktree-cleanup-mode-select",
+                            vec![
+                                SelectOption::new("inherit", "Inherit"),
+                                SelectOption::new("off", "Off"),
+                                SelectOption::new("custom", "Custom"),
+                            ],
+                        )
+                        .selected(project_mode)
+                        .width(156.)
+                        .on_change(move |value, _, cx| {
+                            let _ = mode_view.update(cx, |this, cx| match value.as_str() {
+                                "inherit" => this.clear_project_overrides(&["worktreeCleanup"], cx),
+                                "off" => this.update_scoped_server(WorktreeChange::ProjectCleanupOff.into_server(), cx),
+                                "custom" => this.update_scoped_server(WorktreeChange::ProjectCleanupCustom.into_server(), cx),
+                                _ => {}
+                            });
+                        }),
                     )
                     .into_any_element(),
             );
         }
-        let toggle = cx.listener(|this, _, _, cx| {
-            this.worktrees.cleanup_advanced = !this.worktrees.cleanup_advanced;
-            cx.notify();
-        });
-        let mut rows = rows;
-        rows.push(advanced("worktree-cleanup-advanced", self.worktrees.cleanup_advanced, advanced_rows, toggle, cx));
+        if !is_project_scope || project_mode == "custom" {
+            let rule = move |make: fn(bool) -> CleanupRule| {
+                move |on: bool| {
+                    if is_project_scope {
+                        WorktreeChange::ProjectCleanupRule(make(on))
+                    } else {
+                        WorktreeChange::Cleanup(make(on))
+                    }
+                }
+            };
+            rows.push(
+                Row::new("worktree-on-delete", "Delete worktrees with deleted threads")
+                    .description("Remove unused worktrees when active or archived threads are deleted. Worktrees with local changes are kept.")
+                    .control(self.worktree_switch("worktree-on-delete-switch", rules.worktree_on_delete, rule(CleanupRule::OnDelete), cx))
+                    .into_any_element(),
+            );
+            rows.push(
+                Row::new("worktree-on-merge", "Delete merged worktrees")
+                    .description("Remove worktrees whose pull request is merged and whose commits are included in the default branch.")
+                    .control(self.worktree_switch("worktree-on-merge-switch", rules.worktree_on_merge, rule(CleanupRule::OnMerge), cx))
+                    .into_any_element(),
+            );
+            rows.push(
+                Row::new("worktree-after-days", "Delete inactive worktrees")
+                    .description("Remove worktrees after their threads have been inactive for this many days. Branches and thread history are kept.")
+                    .control(self.retention_control(Retention::Inactive, "worktree-after-days-switch", rules.worktree_after_days, cx))
+                    .into_any_element(),
+            );
+            let mut advanced_rows = Vec::new();
+            if capabilities.settled_worktree_cleanup == Some(true) {
+                advanced_rows.push(
+                    Row::new("worktree-settled-after-days", "Delete settled worktrees")
+                        .description("Remove worktrees this many days after their thread settles. Set 0 days to remove them at the next cleanup. Branches and thread history are kept.")
+                        .control(self.retention_control(Retention::Settled, "worktree-settled-after-days-switch", rules.worktree_settled_after_days, cx))
+                        .into_any_element(),
+                );
+            }
+            advanced_rows.push(
+                Row::new("worktree-unchanged", "Delete unchanged worktrees")
+                    .description("Remove worktrees with no commits beyond the default branch.")
+                    .control(self.worktree_switch("worktree-unchanged-switch", rules.worktree_unchanged, rule(CleanupRule::Unchanged), cx))
+                    .into_any_element(),
+            );
+            if capabilities.storage_cleanup_run == Some(true) {
+                let keep_view = cx.entity().downgrade();
+                advanced_rows.push(
+                    Row::new("storage-worktree-keep-when", "Keep worktrees with local changes")
+                        .description(rules.worktree_keep_when.description())
+                        .highlighted(self.is_target("storage-worktree-keep-when"))
+                        .control(
+                            Select::new("storage-worktree-keep-when-select", KeepWhen::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
+                                .selected(rules.worktree_keep_when.as_str())
+                                .width(196.)
+                                .on_change(move |value, _, cx| {
+                                    if let Some(mode) = KeepWhen::parse(&value) {
+                                        let _ = keep_view.update(cx, |this, cx| {
+                                            let change = this.cleanup_change(CleanupRule::KeepWhen(mode), cx);
+                                            this.update_scoped_server(change.into_server(), cx);
+                                        });
+                                    }
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            let toggle = cx.listener(|this, _, _, cx| {
+                this.worktrees.cleanup_advanced = !this.worktrees.cleanup_advanced;
+                cx.notify();
+            });
+            rows.push(advanced("worktree-cleanup-advanced", self.worktrees.cleanup_advanced, advanced_rows, toggle, cx));
+        }
         let highlighted = self.is_target("storage-worktrees");
         let p = palette(cx);
         v_flex()
