@@ -17,8 +17,9 @@ use t3_core::voice_input::{
     SpeechTranscriptionOptions, VoiceControllerEffect, VoiceDraftSnapshot, VoiceErrorAction,
     VoiceInputControllerMachine, VoiceInputPhase, VoiceInputState, VoiceSelection,
     VoiceTranscriptionDestination, VoiceTranscriptionError, VoiceTranscriptionErrorCode,
-    choose_setup_speech_model, cleanup_context, f32_slice_to_le_bytes, preferred_microphone_id,
-    preferred_speech_languages, remember_microphones, resolve_speech_vocabulary,
+    choose_setup_speech_model_for_tier, cleanup_context, f32_slice_to_le_bytes,
+    preferred_microphone_id, preferred_speech_languages, remember_microphones,
+    resolve_speech_vocabulary,
 };
 
 use super::consent::{
@@ -86,6 +87,23 @@ pub type DraftReader = Rc<dyn Fn(&App) -> Option<VoiceDraftSnapshot>>;
 pub type HintsReader = Rc<dyn Fn(&App) -> Vec<String>>;
 pub type ProjectIdReader = Rc<dyn Fn(&App) -> Option<String>>;
 pub type VoiceSettingsHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+pub type StoredDraftCommit = Rc<dyn Fn(String, VoiceSelection, &mut App)>;
+
+/// Metadata for a dictation target that can outlive its currently presented thread
+/// (`VoiceInputTarget` in `apps/web/src/speech/voiceInputSession.ts`, `pingdotgg/t3code#35761`).
+#[derive(Clone)]
+pub struct BackgroundVoiceTarget {
+    pub owner_key: String,
+    pub label: Option<String>,
+    pub persistent: bool,
+    pub open: Option<VoiceSettingsHandler>,
+    pub read_stored_draft: Option<DraftReader>,
+    pub commit_stored_draft: Option<StoredDraftCommit>,
+}
+
+pub type TargetMetaReader = Rc<dyn Fn(&App) -> Option<BackgroundVoiceTarget>>;
+
+static IDLE_VOICE_STATE: VoiceInputState = VoiceInputState::idle();
 
 #[derive(Default)]
 struct ActiveVoiceSessionLock {
@@ -109,7 +127,7 @@ fn try_acquire_voice_session(
         .and_then(|(id, w)| w.upgrade().map(|e| (*id, e)));
     if let Some((active_id, active_entity)) = existing
         && active_id != entity_id
-        && active_entity.read(cx).state().is_busy()
+        && active_entity.read(cx).session_state().is_busy()
     {
         return false;
     }
@@ -173,6 +191,8 @@ pub struct VoiceSpeechController {
     project_id_reader: ProjectIdReader,
     environment_id_reader: ProjectIdReader,
     on_open_voice_settings: VoiceSettingsHandler,
+    target_meta_reader: Option<TargetMetaReader>,
+    active_target: Option<BackgroundVoiceTarget>,
 
     machine: VoiceInputControllerMachine,
     submission_gate: DictationSubmissionGate,
@@ -229,6 +249,8 @@ impl VoiceSpeechController {
             project_id_reader: config.project_id_reader,
             environment_id_reader: config.environment_id_reader,
             on_open_voice_settings: config.on_open_voice_settings,
+            target_meta_reader: None,
+            active_target: None,
             machine: VoiceInputControllerMachine::new(true, true),
             submission_gate: DictationSubmissionGate::new(),
             setup: VoiceSetupState::default(),
@@ -266,9 +288,53 @@ impl VoiceSpeechController {
         &self.owner_key
     }
 
+    /// Registers a metadata reader so persistent thread drafts keep recording across navigation
+    /// (`pingdotgg/t3code#35761`).
+    pub fn set_target_meta_reader(&mut self, reader: TargetMetaReader) {
+        self.target_meta_reader = Some(reader);
+    }
+
     /// Overrides transcript cleanup (`cleanup: false` for the Settings model test).
     pub fn set_cleanup_override(&mut self, allow: Option<bool>) {
         self.cleanup_override = allow;
+    }
+
+    /// True when no active recording exists or the active recording belongs to the currently
+    /// presented composer owner.
+    pub fn is_recording_owner_presented(&self) -> bool {
+        self.active_target
+            .as_ref()
+            .is_none_or(|target| target.owner_key == self.owner_key)
+    }
+
+    /// True when a persistent background recording is in progress for a different thread/draft.
+    pub fn is_busy_elsewhere(&self) -> bool {
+        self.machine.state().is_busy() && !self.is_recording_owner_presented()
+    }
+
+    /// True when the floating `GlobalVoiceInputIndicator` should display for this controller
+    /// (non-idle recording whose owner draft is currently off-screen).
+    pub fn shows_floating_indicator(&self) -> bool {
+        self.machine.state().phase != VoiceInputPhase::Idle
+            && self.active_target.is_some()
+            && !self.is_recording_owner_presented()
+    }
+
+    pub fn active_target_label(&self) -> Option<&str> {
+        self.active_target.as_ref().and_then(|t| t.label.as_deref())
+    }
+
+    pub fn can_open_active_target(&self) -> bool {
+        self.active_target.as_ref().is_some_and(|t| t.open.is_some())
+    }
+
+    pub fn active_target_open_handler(&self) -> Option<VoiceSettingsHandler> {
+        self.active_target.as_ref().and_then(|t| t.open.clone())
+    }
+
+    /// The underlying session state regardless of which thread is currently presented.
+    pub fn session_state(&self) -> &VoiceInputState {
+        self.machine.state()
     }
 
     pub fn set_owner_key(&mut self, next: impl Into<String>, cx: &mut Context<Self>) {
@@ -277,8 +343,22 @@ impl VoiceSpeechController {
             return;
         }
         self.owner_key = next;
+        let keep_background = self
+            .active_target
+            .as_ref()
+            .is_some_and(|target| target.persistent)
+            && self.machine.state().phase != VoiceInputPhase::Idle;
+        if keep_background {
+            self.setup = VoiceSetupState::default();
+            self._setup_task = None;
+            self._download_poll_task = None;
+            self.submission_gate.clear();
+            cx.notify();
+            return;
+        }
         self.start_request_id = self.start_request_id.wrapping_add(1);
         self.setup = VoiceSetupState::default();
+        self.active_target = None;
         self._prepare_task = None;
         self._setup_task = None;
         self._download_poll_task = None;
@@ -289,7 +369,12 @@ impl VoiceSpeechController {
         cx.notify();
     }
 
+    /// State scoped to the currently presented owner: returns idle when a background recording
+    /// belongs to another thread (`pingdotgg/t3code#35761`).
     pub fn state(&self) -> &VoiceInputState {
+        if !self.is_recording_owner_presented() {
+            return &IDLE_VOICE_STATE;
+        }
         self.machine.state()
     }
 
@@ -298,22 +383,24 @@ impl VoiceSpeechController {
     }
 
     pub fn blocks_submission(&self) -> bool {
-        self.machine.state().blocks_submission()
+        self.is_recording_owner_presented() && self.machine.state().blocks_submission()
     }
 
     pub fn freezes_editor(&self) -> bool {
-        self.machine.state().blocks_submission()
+        self.is_recording_owner_presented() && self.machine.state().blocks_submission()
     }
 
     pub fn preparing(&self) -> bool {
-        self.machine.state().phase == VoiceInputPhase::Preparing
+        self.is_recording_owner_presented()
+            && self.machine.state().phase == VoiceInputPhase::Preparing
     }
 
     pub fn preview(&self) -> Option<&SpeechStreamText> {
-        matches!(
-            self.machine.state().phase,
-            VoiceInputPhase::Recording | VoiceInputPhase::Transcribing
-        )
+        (self.is_recording_owner_presented()
+            && matches!(
+                self.machine.state().phase,
+                VoiceInputPhase::Recording | VoiceInputPhase::Transcribing
+            ))
         .then_some(self.live_preview.as_ref())
         .flatten()
     }
@@ -360,6 +447,9 @@ impl VoiceSpeechController {
         if self.setup.open && self.setup.downloading {
             return;
         }
+        if self.is_busy_elsewhere() {
+            return;
+        }
         if !matches!(
             self.machine.state().phase,
             VoiceInputPhase::Idle | VoiceInputPhase::Error
@@ -372,7 +462,7 @@ impl VoiceSpeechController {
                 (self.on_open_voice_settings)(window, cx);
             } else {
                 self.machine.set_has_transcriber(false);
-                let draft = (self.draft_reader)(cx);
+                let draft = self.read_active_or_current_draft(cx);
                 let effects = self.machine.start(draft);
                 self.apply_effects(effects, cx);
             }
@@ -390,10 +480,29 @@ impl VoiceSpeechController {
 
         self.start_request_id = self.start_request_id.wrapping_add(1);
         self.setup = VoiceSetupState::default();
+        // Keep an existing off-screen retry target if retrying from the floating indicator,
+        // otherwise snapshot the current composer's metadata.
+        if self.is_recording_owner_presented() {
+            self.active_target = self
+                .target_meta_reader
+                .as_ref()
+                .and_then(|reader| reader(cx));
+        }
         self.machine.set_has_transcriber(true);
-        let draft = (self.draft_reader)(cx);
+        let draft = self.read_active_or_current_draft(cx);
         let effects = self.machine.start(draft);
         self.apply_effects(effects, cx);
+    }
+
+    fn read_active_or_current_draft(&self, cx: &App) -> Option<VoiceDraftSnapshot> {
+        if !self.is_recording_owner_presented() {
+            return self
+                .active_target
+                .as_ref()
+                .and_then(|target| target.read_stored_draft.as_ref())
+                .and_then(|reader| reader(cx));
+        }
+        (self.draft_reader)(cx)
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
@@ -405,6 +514,7 @@ impl VoiceSpeechController {
         self.start_request_id = self.start_request_id.wrapping_add(1);
         self.submission_gate.clear();
         self.setup = VoiceSetupState::default();
+        self.active_target = None;
         self._prepare_task = None;
         self._op_task = None;
         self._stream_updates_task = None;
@@ -674,12 +784,21 @@ impl VoiceSpeechController {
                 }
                 match res {
                     Ok(Ok(catalog)) => {
-                        if let Some((model, language)) = choose_setup_speech_model(
-                            &catalog.models,
-                            &selected_model_id,
-                            &intent,
-                            &preferred,
-                        ) {
+                        let benchmark_tier = match &this.status {
+                            Some(EnvironmentSpeechStatus::Supported { benchmark_tier, .. }) => {
+                                Some(*benchmark_tier)
+                            }
+                            _ => None,
+                        };
+                        if let Some((model, language, _recommended)) =
+                            choose_setup_speech_model_for_tier(
+                                &catalog.models,
+                                &selected_model_id,
+                                &intent,
+                                &preferred,
+                                benchmark_tier,
+                            )
+                        {
                             this.setup = VoiceSetupState {
                                 open: true,
                                 step: if model.state == EnvironmentSpeechModelState::Downloading {
@@ -774,7 +893,7 @@ impl VoiceSpeechController {
                         MicPermissionStatus::Denied | MicPermissionStatus::Restricted
                     );
                     let uri = format!("memory://voice/{}", uuid::Uuid::new_v4());
-                    let current_draft = (self.draft_reader)(cx);
+                    let current_draft = self.read_active_or_current_draft(cx);
                     let result = if denied {
                         Err(MICROPHONE_PERMISSION_ERROR.to_owned())
                     } else {
@@ -835,15 +954,25 @@ impl VoiceSpeechController {
                 }
 
                 VoiceControllerEffect::ReadyToCommit { operation_token } => {
-                    let current = (self.draft_reader)(cx);
+                    let current = self.read_active_or_current_draft(cx);
                     let effects = self.machine.finalize_commit(operation_token, current.as_ref());
                     self.apply_effects(effects, cx);
                 }
 
                 VoiceControllerEffect::CommitDraft { text, selection } => {
-                    self.submission_gate.on_commit_draft(&text);
                     self.live_preview = None;
-                    cx.emit(VoiceControllerEvent::CommitDraft { text, selection });
+                    if !self.is_recording_owner_presented() {
+                        if let Some(commit) = self
+                            .active_target
+                            .as_ref()
+                            .and_then(|target| target.commit_stored_draft.clone())
+                        {
+                            commit(text, selection, cx);
+                        }
+                    } else {
+                        self.submission_gate.on_commit_draft(&text);
+                        cx.emit(VoiceControllerEvent::CommitDraft { text, selection });
+                    }
                 }
 
                 VoiceControllerEffect::DeleteRecording(uri) => {
@@ -881,6 +1010,9 @@ impl VoiceSpeechController {
                     }
                     if !next_state.is_busy() {
                         release_voice_session(cx.entity_id(), cx);
+                    }
+                    if next_state.phase == VoiceInputPhase::Idle {
+                        self.active_target = None;
                     }
                     cx.emit(VoiceControllerEvent::StateChanged);
                     if let Some(text) = submit_text {
@@ -936,10 +1068,15 @@ impl VoiceSpeechController {
         let translate = settings_doc.speech_translate_to_english();
         let remove_fillers = settings_doc.speech_remove_filler_words();
         let silence_filter = settings_doc.speech_silence_filtering();
+        let streaming_enabled = settings_doc.speech_streaming();
         let post_prompt = settings_doc.speech_post_processing_prompt();
         let consent_grant_id = active.grant_id.clone();
         let cleanup_grant_id = active.cleanup_grant_id.clone();
-        let owner_key = self.owner_key.clone();
+        let owner_key = self
+            .active_target
+            .as_ref()
+            .map(|target| target.owner_key.clone())
+            .unwrap_or_else(|| self.owner_key.clone());
         let runtime = app_state.runtime().clone();
 
         if let VoiceTranscriptionDestination::Cloud { provider, model, .. } = &active.destination {
@@ -1145,13 +1282,17 @@ impl VoiceSpeechController {
                             supports_language_detection.unwrap_or(true),
                             &intent_lang,
                         );
-                        let locale = if !*supports_streaming && *supports_translation && translate {
+                        let native_streaming = *supports_streaming && streaming_enabled;
+                        let locale = if !native_streaming && *supports_translation && translate {
                             "en".to_owned()
                         } else {
                             effective_lang.clone()
                         };
-                        let can_stream =
-                            *supports_streaming || supports_buffered_streaming.unwrap_or(false);
+                        let can_stream = if *supports_streaming {
+                            native_streaming
+                        } else {
+                            supports_buffered_streaming.unwrap_or(false)
+                        };
                         let options = SpeechTranscriptionOptions {
                             speech_language: effective_lang,
                             speech_translate_to_english: translate,

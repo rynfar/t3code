@@ -220,6 +220,8 @@ fn setup_harness<'a>(
         );
         cx.new(|cx| {
             let mut state = AppState::new(runtime, cx);
+            #[cfg(feature = "snapshot")]
+            state.stop_pump();
             state.environments = SavedEnvironments {
                 active: Some("env-1".into()),
                 environments: vec![SavedEnvironment {
@@ -1116,6 +1118,8 @@ fn cleanup_routes_to_draft_environment_and_setup_download_respects_cancel(cx: &m
         );
         cx.new(|cx| {
             let mut state = AppState::new(runtime.handle().clone(), cx);
+            #[cfg(feature = "snapshot")]
+            state.stop_pump();
             state.environments = SavedEnvironments {
                 active: Some("env-draft".into()),
                 environments: vec![

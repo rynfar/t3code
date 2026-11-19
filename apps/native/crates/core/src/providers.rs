@@ -5,9 +5,94 @@
 //! `web/src/components/chat/providerIconUtils.ts`, and search ranking from
 //! `web/src/components/chat/modelPickerSearch.ts`.
 
+use std::collections::HashSet;
+
 use crate::model::ModelSelection;
-use crate::server_config::{ProviderInstanceConfig, ProviderModel, ServerConfig, ServerProvider, ServerSettings, UsageWindow, WorkspaceSnapshot};
+use crate::server_config::{
+    ProviderInstanceConfig, ProviderModel, ProviderSubProvider, ServerConfig, ServerProvider,
+    ServerSettings, UsageWindow, WorkspaceSnapshot,
+};
 use crate::sidebar::time::parse_iso;
+
+const RUNTIME_MODEL_CATALOG_DRIVERS: [&str; 5] =
+    ["opencode", "antigravity", "cursor", "pi", "acpRegistry"];
+const ANTIGRAVITY_DEFAULT_MODEL: &str = "antigravity-default";
+
+/// `hasRuntimeModelCatalog` (`apps/web/src/providerModels.ts`, `pingdotgg/t3code#37528`):
+/// drivers that discover models at runtime, so a refresh can briefly omit a chosen model.
+pub fn has_runtime_model_catalog(driver: &str) -> bool {
+    RUNTIME_MODEL_CATALOG_DRIVERS.contains(&driver)
+}
+
+/// `isRuntimeModelDefaultAlias` (`apps/web/src/providerModels.ts`, `pingdotgg/t3code#37528`):
+/// markers that follow the session's current model rather than naming an unavailable model.
+pub fn is_runtime_model_default_alias(driver: &str, model: Option<&str>) -> bool {
+    matches!(
+        (driver, model),
+        ("antigravity", Some(ANTIGRAVITY_DEFAULT_MODEL)) | ("acpRegistry", Some("default"))
+    )
+}
+
+/// `keepsUnavailableModelOptions` (`apps/web/src/providerModels.ts`, `pingdotgg/t3code#37528`).
+pub fn keeps_unavailable_model_options(driver: &str, model: Option<&str>) -> bool {
+    driver != "antigravity"
+        && !is_runtime_model_default_alias(driver, model)
+        && has_runtime_model_catalog(driver)
+}
+
+/// Whether `selected_model` should be preserved as an unavailable entry during a runtime catalog gap.
+pub fn should_preserve_unavailable_selection(
+    driver: &str,
+    selected_model: &str,
+    models: &[ProviderModel],
+    hidden_models: &[String],
+) -> bool {
+    let trimmed = selected_model.trim();
+    if trimmed.is_empty()
+        || !has_runtime_model_catalog(driver)
+        || is_runtime_model_default_alias(driver, Some(trimmed))
+        || hidden_models.iter().any(|h| h == trimmed)
+    {
+        return false;
+    }
+    !models.iter().any(|m| m.slug == trimmed)
+}
+
+/// One sub-provider group in the provider's declared order (`packages/client-runtime/src/providerSubProviders.ts`,
+/// `pingdotgg/t3code#29388`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubProviderGroup<'a, M> {
+    pub sub_provider: &'a ProviderSubProvider,
+    pub models: Vec<M>,
+}
+
+/// `groupModelsBySubProvider` (`packages/client-runtime/src/providerSubProviders.ts`):
+/// splits models into ungrouped (such as "Default") and one group per sub-provider in order.
+/// A signed-out/unavailable sub-provider keeps its group with no models.
+pub fn group_models_by_sub_provider<'a, M: Clone>(
+    models: &[M],
+    sub_providers: &'a [ProviderSubProvider],
+    sub_provider_of: impl Fn(&M) -> Option<&str>,
+) -> (Vec<M>, Vec<SubProviderGroup<'a, M>>) {
+    let names: HashSet<&str> = sub_providers.iter().map(|s| s.name.as_str()).collect();
+    let ungrouped = models
+        .iter()
+        .filter(|m| !sub_provider_of(m).is_some_and(|name| names.contains(name)))
+        .cloned()
+        .collect();
+    let groups = sub_providers
+        .iter()
+        .map(|sub_provider| SubProviderGroup {
+            sub_provider,
+            models: models
+                .iter()
+                .filter(|m| sub_provider_of(m) == Some(sub_provider.name.as_str()))
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    (ungrouped, groups)
+}
 
 /// Refresh inputs from `ProviderStatusBanner.tsx`, provider settings, Usage and composer menus.
 /// `client-runtime/src/state/server.ts` adds on-demand workspace snapshots to every request.
@@ -260,9 +345,49 @@ impl ProviderEntry<'_> {
         &self.provider.driver
     }
 
-    /// `isProviderInstancePickerReady`.
+    /// `isProviderInstanceHealthy` (`apps/web/src/providerInstances.ts`, `pingdotgg/t3code#29388`, `pingdotgg/t3code#39114`):
+    /// ready, or warning with at least one usable sub-provider that has models.
+    pub fn is_healthy(&self) -> bool {
+        if !self.enabled || !self.provider.is_available() {
+            return false;
+        }
+        if self.provider.status == "ready" {
+            return true;
+        }
+        if self.provider.status != "warning" {
+            return false;
+        }
+        let usable: HashSet<&str> = self
+            .provider
+            .sub_providers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|sub| sub.unavailable_reason.is_none())
+            .map(|sub| sub.name.as_str())
+            .collect();
+        self.provider
+            .models
+            .iter()
+            .any(|model| model.sub_provider.as_deref().is_some_and(|sub| usable.contains(sub)))
+    }
+
+    /// `isProviderInstancePickerReady` (`apps/web/src/providerInstances.ts`, `pingdotgg/t3code#39114`):
+    /// also true after a transient failed/late check when `models_retained` is true or auth is confirmed.
     pub fn is_ready(&self) -> bool {
-        self.enabled && self.provider.is_available() && self.provider.status == "ready"
+        if self.is_healthy() {
+            return true;
+        }
+        if !self.enabled || !self.provider.is_available() || self.provider.sub_providers.is_some() {
+            return false;
+        }
+        if self.provider.models_retained == Some(true) {
+            return true;
+        }
+        self.provider.status == "warning"
+            && self.provider.installed
+            && self.provider.auth.status == "authenticated"
+            && !self.provider.models.is_empty()
     }
 
     fn is_selectable(&self) -> bool {
@@ -292,7 +417,7 @@ pub fn entries<'a>(config: &'a ServerConfig, project_id: Option<&str>) -> Vec<Pr
     sorted
 }
 
-/// `resolveSelectableProviderInstanceEntry`.
+/// `resolveSelectableProviderInstanceEntry` (`pingdotgg/t3code#39114`: prefers healthy instances).
 pub fn selectable_entry<'e, 'a>(entries: &'e [ProviderEntry<'a>], instance_id: Option<&str>) -> Option<&'e ProviderEntry<'a>> {
     if let Some(requested) = instance_id.and_then(|id| entries.iter().find(|entry| entry.instance_id() == id))
         && requested.is_selectable()
@@ -301,7 +426,7 @@ pub fn selectable_entry<'e, 'a>(entries: &'e [ProviderEntry<'a>], instance_id: O
     }
     entries
         .iter()
-        .find(|entry| entry.is_ready())
+        .find(|entry| entry.is_healthy())
         .or_else(|| entries.iter().find(|entry| entry.is_selectable() && entry.provider.status != "error"))
 }
 
@@ -333,7 +458,8 @@ pub fn models_for_cwd<'a>(provider: &'a ServerProvider, snapshot: Option<&'a Wor
 }
 
 /// `getAppModelOptionsForInstance` without custom models: hidden models drop out (custom ones
-/// never hide) and the user's model order leads, then the server's order.
+/// never hide), duplicate slugs are listed once (`pingdotgg/t3code#31590`), and the user's model
+/// order leads, then the server's order.
 pub fn model_options_for_cwd<'a>(
     settings: &ServerSettings,
     provider: &'a ServerProvider,
@@ -341,8 +467,11 @@ pub fn model_options_for_cwd<'a>(
 ) -> Vec<&'a ProviderModel> {
     let preferences = settings.provider_model_preferences.as_ref().and_then(|prefs| prefs.get(&provider.instance_id));
     let hidden = |model: &ProviderModel| preferences.is_some_and(|prefs| prefs.hidden_models.contains(&model.slug));
-    let mut options: Vec<&ProviderModel> =
-        models_for_cwd(provider, snapshot).iter().filter(|model| model.is_custom || !hidden(model)).collect();
+    let mut seen_slugs: HashSet<&str> = HashSet::new();
+    let mut options: Vec<&ProviderModel> = models_for_cwd(provider, snapshot)
+        .iter()
+        .filter(|model| (model.is_custom || !hidden(model)) && seen_slugs.insert(model.slug.as_str()))
+        .collect();
     if let Some(order) = preferences.map(|prefs| &prefs.model_order).filter(|order| !order.is_empty()) {
         let rank = |model: &ProviderModel| order.iter().position(|slug| *slug == model.slug).unwrap_or(usize::MAX);
         options.sort_by_key(|model| rank(model));

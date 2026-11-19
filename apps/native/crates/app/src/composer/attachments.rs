@@ -51,6 +51,8 @@ pub(super) struct Staged {
     _copy_upload: Option<Task<()>>,
     settled: Vec<oneshot::Sender<()>>,
     source: Option<String>,
+    /// Optional SnapShot source metadata (`pingdotgg/t3code#37771`).
+    pub(super) snapshot_source: Option<serde_json::Value>,
 }
 
 impl Staged {
@@ -67,6 +69,7 @@ impl Staged {
             _copy_upload: None,
             settled: Vec::new(),
             source: None,
+            snapshot_source: None,
         }
     }
 
@@ -494,6 +497,7 @@ impl Composer {
         let copying = imported.source.is_some();
         let mut entry = Staged::ready(imported.attachment);
         entry.source = imported.source;
+        entry.snapshot_source = imported.snapshot_source;
         self.attachments.staged.entry(target.clone()).or_default().push(entry);
         if copying { self.start_upload(target.clone(), id, cx); }
     }
@@ -581,11 +585,12 @@ impl Composer {
                 .map(|path| prepare_picked_file(&path, file_limit))
                 .collect::<Vec<_>>()
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let picked = read.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 if !this.attachments.preparations.complete(&storage_key, preparation, picked) { return; }
                 this.finish_prepared_reads(cx);
+                this.try_flush_pending_submit_after_prepare(&storage_key, window, cx);
                 cx.notify();
             });
         })
@@ -622,6 +627,29 @@ impl Composer {
         if self.attachment_target().as_ref() == Some(target) { self.cancel_pending_send(); }
         if self.cancel_pending_routed_send_for(target) { cx.notify(); }
         let size = picked.bytes.len() as u64;
+        // Distinct images with matching metadata must both stage, while byte-identical repeats dedup (`pingdotgg/t3code#37116`).
+        if picked.kind == AttachmentKind::Image {
+            let incoming_key = image_rules::composer_image_dedup_key_with_bytes(
+                &picked.mime_type,
+                size,
+                &picked.name,
+                Some(&picked.bytes),
+            );
+            let duplicate = self.staged_for(target).iter().any(|existing| {
+                existing.attachment.kind == AttachmentKind::Image
+                    && existing.bytes.as_deref().is_some_and(|bytes| {
+                        image_rules::composer_image_dedup_key_with_bytes(
+                            &existing.attachment.mime_type,
+                            existing.attachment.size_bytes,
+                            &existing.attachment.name,
+                            Some(bytes),
+                        ) == incoming_key
+                    })
+            });
+            if duplicate {
+                return;
+            }
+        }
         // Replacing a matching reattach marker must not consume an extra slot (`useComposerAttachmentIntake.ts`).
         if picked.kind == AttachmentKind::File
             && let Some(reattach_id) = self.staged_for(target).iter().find(|s| s.matches_reattach(&picked.name, &picked.mime_type, size)).map(|s| s.attachment.id.clone())
@@ -720,6 +748,7 @@ impl Composer {
             _copy_upload: None,
             settled: Vec::new(),
             source: None,
+            snapshot_source: None,
         });
         self.record_draft(target, cx);
         self.start_upload(target.clone(), id, cx);
@@ -877,7 +906,6 @@ impl Composer {
                         }
                         Some(AttachmentUploadState::Ready(ready)) => {
                             staged.attachment.upload = Upload::Ready { attachment_id: ready.attachment_id };
-                            staged.bytes = None;
                             staged.progress = 1.0;
                             staged.show_progress = false;
                             staged.upload_delay = None;
@@ -991,7 +1019,6 @@ impl Composer {
                         became_ready = true;
                     }
                     staged.attachment.upload = Upload::Ready { attachment_id: ready.attachment_id };
-                    staged.bytes = None;
                     staged.progress = 1.0;
                     staged.show_progress = false;
                     staged.upload_delay = None;
@@ -1251,11 +1278,12 @@ impl Composer {
                         let task = cx.background_executor().spawn(async move {
                             vec![prepare_image_bytes(name, mime_owned, bytes, false)]
                         });
-                        cx.spawn(async move |this, cx| {
+                        cx.spawn_in(window, async move |this, cx| {
                             let picked = task.await;
-                            let _ = this.update(cx, |this, cx| {
+                            let _ = this.update_in(cx, |this, window, cx| {
                                 if !this.attachments.preparations.complete(&storage_key, preparation, picked) { return; }
                                 this.finish_prepared_reads(cx);
+                                this.try_flush_pending_submit_after_prepare(&storage_key, window, cx);
                                 cx.notify();
                             });
                         })
@@ -1358,6 +1386,39 @@ impl Composer {
         }
     }
 
+    /// Copies a staged image/SnapShot into the clipboard with its context fragment so pasting into
+    /// another composer preserves `source` metadata (`pingdotgg/t3code#37771`).
+    pub(super) fn copy_staged_snapshot(&self, id: &str, cx: &mut Context<Self>) {
+        let Some(staged) = self.staged().iter().find(|s| s.attachment.id == id) else {
+            return;
+        };
+        if let Some(record) = staged
+            .attachment
+            .context_record_with_source(staged.snapshot_source.as_ref())
+        {
+            let text = t3_core::composer::records::reference(&record).unwrap_or_default();
+            let environment = self.environment_id(cx);
+            if let Some(fragment) = t3_core::composer::records::copy_fragment(
+                &text,
+                &[record],
+                &environment,
+                self.thread_id().as_deref(),
+                None,
+            ) {
+                super::clipboard::write(text, fragment, cx);
+                return;
+            }
+        }
+        if let Some(bytes) = &staged.bytes
+            && let Some(format) = image_format(&staged.attachment.mime_type)
+        {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+                format,
+                (**bytes).clone(),
+            )));
+        }
+    }
+
     /// `ComposerAttachmentMediaRow` and `ComposerAttachmentFileList`.
     pub(super) fn render_attachments(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let staged = self.staged();
@@ -1383,6 +1444,7 @@ impl Composer {
                     _ => size_text,
                 };
                 let can_preview = !staged.needs_reattach && (staged.bytes.is_some() || attachment.attachment_id().is_some());
+                let can_copy = !staged.needs_reattach && (attachment.attachment_id().is_some() || staged.bytes.is_some());
                 let preview_snapshot = (can_preview && attachment.kind == AttachmentKind::Image).then(|| Staged {
                     attachment: attachment.clone(),
                     preview: staged.preview.clone(),
@@ -1395,6 +1457,7 @@ impl Composer {
                     _copy_upload: None,
                     settled: Vec::new(),
                     source: None,
+                    snapshot_source: staged.snapshot_source.clone(),
                 });
                 let thumbnail = match &staged.preview {
                     Some(image) => img(image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
@@ -1450,6 +1513,21 @@ impl Composer {
                                         this.on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.retry_upload(id.clone(), cx);
+                                        }))
+                                    }),
+                            ),
+                        )
+                    })
+                    .when(can_copy && failed_reason(attachment).is_none(), |this| {
+                        let copy_id = id.clone();
+                        this.child(
+                            div().absolute().top(px(4.)).left(px(4.)).child(
+                                media_button(SharedString::from(format!("copy-{}", attachment.id)), Icon::Copy, rewinding, cx)
+                                    .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new("Copy image").build(window, cx))
+                                    .when(!rewinding, |this| {
+                                        this.on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.copy_staged_snapshot(&copy_id, cx);
                                         }))
                                     }),
                             ),
@@ -1616,6 +1694,62 @@ impl Composer {
         self.attachments.staged.insert(target.clone(), staged);
         for id in retry { self.start_upload(target.clone(), id, cx); }
     }
+
+    /// Moves attachments staged on an unanswered (`cancelled`/`expired`) question back into the
+    /// thread composer so the user does not lose their files (`pingdotgg/t3code#38005`).
+    pub(super) fn return_question_attachments_to_thread(
+        &mut self,
+        from: &Target,
+        thread_id: &str,
+        staged: Vec<Staged>,
+        cx: &mut Context<Self>,
+    ) {
+        if staged.is_empty() {
+            return;
+        }
+        let thread_target = Target::Thread(thread_id.to_owned());
+        let uploads = self.state.read(cx).uploads.clone();
+        let existing_count = self.staged_for(&thread_target).len();
+        let remaining_slots = rules::MAX_ATTACHMENTS.saturating_sub(existing_count);
+        let mut kept = Vec::new();
+        let mut overflow = Vec::new();
+        for entry in staged {
+            if kept.len() < remaining_slots {
+                kept.push(entry);
+            } else {
+                overflow.push(entry);
+            }
+        }
+        let mut retry = Vec::new();
+        for entry in &kept {
+            let id = entry.attachment.id.clone();
+            if entry.source.is_none()
+                && uploads.adopt_target(&job_key(from, &id), job_key(&thread_target, &id), draft_target(&thread_target, &id))
+            {
+                continue;
+            }
+            if entry.attachment.attachment_id().is_none() {
+                retry.push(id);
+            }
+        }
+        if !kept.is_empty() {
+            self.attachments
+                .staged
+                .entry(thread_target.clone())
+                .or_default()
+                .extend(kept);
+            for id in retry {
+                self.start_upload(thread_target.clone(), id, cx);
+            }
+            self.record_draft(&thread_target, cx);
+        }
+        if !overflow.is_empty() {
+            self.release_discarded_attachments(from, &overflow, cx);
+        } else {
+            // Release any leftover queue entries belonging only to `from` that were not adopted.
+            uploads.release_draft(&super::drafts::key(from));
+        }
+    }
 }
 
 #[cfg(feature = "snapshot")]
@@ -1642,7 +1776,7 @@ impl Composer {
                 upload_delay: None,
                 needs_reattach: value["needsReattach"].as_bool().unwrap_or(false),
                 reattach_reason: None,
-                _copy_upload: held, settled: Vec::new(), source: None,
+                _copy_upload: held, settled: Vec::new(), source: None, snapshot_source: None,
             }
         }).collect();
         self.attachments.staged.insert(target, entries);

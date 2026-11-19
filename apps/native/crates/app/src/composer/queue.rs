@@ -15,6 +15,7 @@ use super::controls::{Button, ButtonSize, ButtonVariant};
 use crate::app_state::uuid_v4;
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
+use crate::toast::{Toast, ToastKind};
 
 /// A queued message open in the composer.
 #[derive(Debug, Clone)]
@@ -42,7 +43,14 @@ impl Composer {
         self.queue.editing.as_ref()
     }
 
-    fn run_queue_command(&mut self, run_id: String, command: serde_json::Value, failure: &'static str, cx: &mut Context<Self>) {
+    fn run_queue_command(
+        &mut self,
+        run_id: String,
+        command: serde_json::Value,
+        failure: &'static str,
+        toast_title: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
         self.queue.busy = Some(run_id);
         let request = self.state.read(cx).rpc(t3_core::commands::method::DISPATCH_COMMAND, command);
         cx.spawn(async move |this, cx| {
@@ -50,7 +58,12 @@ impl Composer {
             let _ = this.update(cx, |this, cx| {
                 this.queue.busy = None;
                 if let Err(error) = result {
-                    this.error = Some(format!("{failure} {error}"));
+                    let detail = error.to_string();
+                    this.error = Some(format!("{failure} {detail}"));
+                    if let Some(title) = toast_title {
+                        let toast = Toast::new(ToastKind::Error, title).description(detail);
+                        this.state.update(cx, |state, cx| state.show_toast(toast, cx));
+                    }
                 }
                 cx.notify();
             });
@@ -105,7 +118,13 @@ impl Composer {
             return;
         }
         let Some(command) = rules::send_now(&self.snapshot.queue, &uuid_v4(), &thread_id, &run_id) else { return };
-        self.run_queue_command(run_id, command, "Failed to send the queued message.", cx);
+        self.run_queue_command(
+            run_id,
+            command,
+            "Failed to send the queued message.",
+            Some("Could not send queued message"),
+            cx,
+        );
     }
 
     fn remove_queued(&mut self, run_id: String, cx: &mut Context<Self>) {
@@ -114,7 +133,7 @@ impl Composer {
             return;
         }
         let command = rules::cancel_queued_run(&uuid_v4(), &thread_id, &run_id);
-        self.run_queue_command(run_id, command, "Failed to remove the queued message.", cx);
+        self.run_queue_command(run_id, command, "Failed to remove the queued message.", None, cx);
     }
 
     /// Opens a queued message in the composer, setting the thread's draft aside.
@@ -166,8 +185,14 @@ impl Composer {
         cx.notify();
     }
 
-    /// Send while editing saves the queued message in place.
-    pub(super) fn save_queued_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Send while editing saves the queued message in place; `Cmd+Enter` (`SubmitIntent::Alternate`)
+    /// also steers the edited queued run into the active turn (`pingdotgg/t3code#37507`).
+    pub(super) fn save_queued_edit(
+        &mut self,
+        intent: t3_core::composer::SubmitIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_rewinding(cx) {
             return;
         }
@@ -176,6 +201,7 @@ impl Composer {
         if prompt.is_empty() && !editing.has_attachments {
             return;
         }
+        let steer_after = intent == t3_core::composer::SubmitIntent::Alternate && self.snapshot.running;
         let text = text_for_send(&prompt, editing.has_attachments);
         let command = rules::edit_queued_run(&uuid_v4(), &editing.thread_id, &editing.run_id, &text);
         let request = self.state.read(cx).rpc(t3_core::commands::method::DISPATCH_COMMAND, command);
@@ -189,6 +215,14 @@ impl Composer {
                     Ok(_) => {
                         if this.queue.editing.as_ref().is_some_and(|current| current.run_id == editing.run_id) {
                             this.cancel_queued_edit(window, cx);
+                        }
+                        if steer_after
+                            && this.thread_id().as_deref() == Some(editing.thread_id.as_str())
+                            && this.snapshot.queue.queued.iter().any(|run| {
+                                run.run_id == editing.run_id && this.snapshot.queue.can_send_run(run.fresh_context)
+                            })
+                        {
+                            this.send_queued_now(editing.run_id.clone(), cx);
                         }
                     }
                     Err(error) => this.error = Some(format!("Could not save the edited queued message. {error}")),

@@ -105,7 +105,7 @@ fn collect_snapshots(
             let controller = entity.read(cx);
             let snapshot = DictationTargetSnapshot {
                 target_id: entry.target_id,
-                phase: controller.state().phase,
+                phase: controller.session_state().phase,
                 focused: (entry.is_focused)(window, cx),
                 targeted: entry.targeted,
                 available: controller.available(cx),
@@ -114,6 +114,23 @@ fn collect_snapshots(
             Some((entry.clone(), snapshot))
         })
         .collect()
+}
+
+fn active_modifier_names(modifiers: gpui::Modifiers) -> Vec<&'static str> {
+    let mut names = Vec::with_capacity(4);
+    if modifiers.alt {
+        names.push("alt");
+    }
+    if modifiers.control {
+        names.push("control");
+    }
+    if modifiers.platform {
+        names.push("meta");
+    }
+    if modifiers.shift {
+        names.push("shift");
+    }
+    names
 }
 
 pub fn handle_dictation_action(window: &mut Window, cx: &mut App) -> bool {
@@ -147,19 +164,23 @@ pub fn handle_dictation_action(window: &mut Window, cx: &mut App) -> bool {
         .map(|doc| doc.voice_shortcut_mode())
         .unwrap_or(VoiceShortcutMode::Auto);
 
+    let modifiers = active_modifier_names(window.modifiers());
     let action = {
         let registry = ensure_registry(cx);
         let key_code = registry.last_keydown_key.clone();
         let repeat = registry.last_keydown_repeat;
-        let action = registry.shortcut_state.on_dictation_keydown(DictationKeydown {
-            phase: snap.phase,
-            available: snap.available,
-            disabled: snap.disabled,
-            repeat,
-            key_code: &key_code,
-            now_ms: now_ms(),
-            mode,
-        });
+        let action = registry.shortcut_state.on_dictation_keydown_with_modifiers(
+            DictationKeydown {
+                phase: snap.phase,
+                available: snap.available,
+                disabled: snap.disabled,
+                repeat,
+                key_code: &key_code,
+                now_ms: now_ms(),
+                mode,
+            },
+            &modifiers,
+        );
         if action == DictationShortcutAction::Start {
             registry.active_target_id = Some(owner_id);
         }
@@ -193,6 +214,35 @@ pub fn handle_key_up(key: &str, cx: &mut App) {
         let action = registry
             .shortcut_state
             .on_keyup_or_blur(Some(&key_lower), now_ms());
+        let target = if action == DictationShortcutAction::Stop {
+            registry.active_target_id.take().and_then(|target_id| {
+                registry
+                    .targets
+                    .iter()
+                    .find(|t| t.target_id == target_id)
+                    .and_then(|t| t.controller.upgrade())
+            })
+        } else {
+            None
+        };
+        (action, target)
+    };
+    if action == DictationShortcutAction::Stop
+        && let Some(target) = target
+    {
+        target.update(cx, |voice, cx| voice.stop(cx));
+    }
+}
+
+/// Stops held dictation when a shortcut chord modifier is released (`pingdotgg/t3code#32648`).
+pub fn handle_modifiers_changed(modifiers: &gpui::Modifiers, cx: &mut App) {
+    if cx.try_global::<DictationShortcutRegistry>().is_none() {
+        return;
+    }
+    let held = active_modifier_names(*modifiers);
+    let (action, target) = {
+        let registry = cx.global_mut::<DictationShortcutRegistry>();
+        let action = registry.shortcut_state.on_modifiers_changed(&held, now_ms());
         let target = if action == DictationShortcutAction::Stop {
             registry.active_target_id.take().and_then(|target_id| {
                 registry
@@ -275,6 +325,16 @@ pub fn active_setup_controller(cx: &App) -> Option<Entity<VoiceSpeechController>
     registry.targets.iter().find_map(|entry| {
         let entity = entry.controller.upgrade()?;
         entity.read(cx).setup().open.then_some(entity)
+    })
+}
+
+/// Returns the controller currently recording in the background for an off-screen thread draft,
+/// driving the floating `GlobalVoiceInputIndicator` (`pingdotgg/t3code#35761`, `pingdotgg/t3code#38225`).
+pub fn active_floating_indicator_controller(cx: &App) -> Option<Entity<VoiceSpeechController>> {
+    let registry = cx.try_global::<DictationShortcutRegistry>()?;
+    registry.targets.iter().find_map(|entry| {
+        let entity = entry.controller.upgrade()?;
+        entity.read(cx).shows_floating_indicator().then_some(entity)
     })
 }
 

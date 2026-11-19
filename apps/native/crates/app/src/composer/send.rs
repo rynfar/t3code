@@ -120,6 +120,43 @@ impl Composer {
 
     /// Submit, as the send button and Enter do.
     pub(crate) fn submit(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_inner(intent, false, window, cx);
+    }
+
+    pub(super) fn try_flush_pending_submit_after_prepare(
+        &mut self,
+        storage_key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pending_key, _)) = self.pending_submit_after_prepare.as_ref() else {
+            return;
+        };
+        if pending_key != storage_key {
+            return;
+        }
+        if self.attachments.preparations.count(storage_key) > 0 {
+            return;
+        }
+        let Some((_, intent)) = self.pending_submit_after_prepare.take() else {
+            return;
+        };
+        if self.error.is_none()
+            && self
+                .attachment_target()
+                .is_some_and(|target| super::drafts::key(&target) == storage_key)
+        {
+            self.submit_inner(intent, false, window, cx);
+        }
+    }
+
+    fn submit_inner(
+        &mut self,
+        intent: SubmitIntent,
+        verified_for_send: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         #[cfg(feature = "snapshot")]
         if let Some(audit) = cx.try_global::<super::SnapshotAudit>() {
             audit.submissions.set(audit.submissions.get() + 1);
@@ -137,7 +174,7 @@ impl Composer {
             && let Some(prompt) = t3_core::composer::menu::parse_side_chat_command(&self.prompt(cx))
             && !(answering && self.side_chat_disabled_reason(cx).is_some())
         {
-            self.send_side_chat(prompt, window, cx);
+            self.send_side_chat(prompt, intent, verified_for_send, window, cx);
             return;
         }
         if answering {
@@ -145,7 +182,7 @@ impl Composer {
             return;
         }
         if self.editing_queued().is_some() {
-            self.save_queued_edit(window, cx);
+            self.save_queued_edit(intent, window, cx);
             return;
         }
         if let Some(target) = self.snapshot.target.clone() {
@@ -180,6 +217,16 @@ impl Composer {
         if self.runtime_mode_ceiling_denial(&resolved_for_policy, cx).is_some() {
             return;
         }
+        // Pressing Enter while an image is still compressing defers send until preparation lands (`pingdotgg/t3code#37547`).
+        if let Some(target) = self.attachment_target() {
+            let storage_key = super::drafts::key(&target);
+            if self.attachments.preparations.count(&storage_key) > 0 {
+                self.pending_submit_after_prepare = Some((storage_key, intent));
+                self.error = None;
+                cx.notify();
+                return;
+            }
+        }
         // Excerpts whose text is gone are left out, links and all (`snapshotComposerSend`).
         let terminals = TerminalSend::of(&prompt, self.current_terminals());
         if !terminals.has_content(
@@ -196,13 +243,6 @@ impl Composer {
             return;
         }
         let text = terminals.text;
-        if let Some(target) = self.attachment_target()
-            && self.attachments.preparations.count(&super::drafts::key(&target)) > 0
-        {
-            self.error = Some("Wait for attachments to finish preparing before sending.".to_owned());
-            cx.notify();
-            return;
-        }
         if self.staged_needs_reattach() {
             self.error = Some("Attach the interrupted file again or remove it".to_owned());
             cx.notify();
@@ -240,6 +280,9 @@ impl Composer {
         }
         if staged.iter().any(|attachment| attachment.attachment_id().is_none()) {
             self.await_uploads(intent, window, cx);
+            return;
+        }
+        if !verified_for_send && self.verify_and_refresh_uploads_before_send(intent, window, cx) {
             return;
         }
         let outgoing = self.outgoing(text.clone(), &staged);
@@ -569,23 +612,151 @@ impl Composer {
         self.state.read(cx).side_chat_disabled_reason()
     }
 
-    /// `/side` and `/btw` as the whole message: its text starts a side chat of the open thread.
-    fn send_side_chat(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// `/side` and `/btw` as the whole message: its text, attachments, and context start a side
+    /// chat of the open thread (`pingdotgg/t3code#38350`).
+    fn send_side_chat(
+        &mut self,
+        prompt: String,
+        intent: SubmitIntent,
+        verified_for_send: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let warn = |title: &'static str, description: &'static str| Toast::new(ToastKind::Warning, title).description(description);
         if let Some(reason) = self.side_chat_disabled_reason(cx) {
             self.state.update(cx, |state, cx| state.show_toast(warn("Side chat not started", reason), cx));
             return;
         }
+        if let Some(target) = self.attachment_target() {
+            let storage_key = super::drafts::key(&target);
+            if self.attachments.preparations.count(&storage_key) > 0 {
+                self.pending_submit_after_prepare = Some((storage_key, intent));
+                self.error = None;
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(target) = self.snapshot.target.clone() {
+            self.sync_upload_states_for(&target, cx);
+        }
+        let raw_prompt = self.prompt(cx);
         let staged = self.staged_attachments();
-        if !staged.is_empty() || self.has_context_records(&self.prompt(cx)) || self.current_reply_to().is_some() {
-            let toast = warn("Side chats take text only", "Remove the attachments and context, then send it again.");
-            self.state.update(cx, |state, cx| state.show_toast(toast, cx));
+        let has_extra_context =
+            !staged.is_empty() || self.has_context_records(&raw_prompt) || self.current_reply_to().is_some();
+        if !has_extra_context {
+            if self.state.update(cx, |state, cx| state.open_side_chat(Some(prompt), cx)) {
+                self.set_prompt("", window, cx);
+                self.draft_changed(cx);
+            }
             return;
         }
-        if self.state.update(cx, |state, cx| state.open_side_chat(Some(prompt), cx)) {
-            self.set_prompt("", window, cx);
-            self.draft_changed(cx);
+        let Some(Target::Thread(parent)) = self.snapshot.target.clone() else {
+            return;
+        };
+        if self.staged_needs_reattach() {
+            self.error = Some("Attach the interrupted file again or remove it".to_owned());
+            cx.notify();
+            return;
         }
+        if let Some(reason) = attachments::send_block_reason(&staged) {
+            self.error = Some(reason);
+            cx.notify();
+            return;
+        }
+        if staged.iter().any(|attachment| attachment.attachment_id().is_none()) {
+            self.await_uploads(intent, window, cx);
+            return;
+        }
+        if !verified_for_send && self.verify_and_refresh_uploads_before_send(intent, window, cx) {
+            return;
+        }
+        let terminals = TerminalSend::of(&prompt, self.current_terminals());
+        let outgoing = self.outgoing(terminals.text, &staged);
+        if let Some(validation_message) = rules::prompt_length_validation_message(&prompt, Some(&outgoing.text)) {
+            self.prompt_length_error = Some(validation_message);
+            cx.notify();
+            return;
+        }
+        self.prompt_length_error = None;
+        let (runtime_mode, model_selection) = {
+            let state = self.state.read(cx);
+            let Some(parent_thread) = state.thread_shell(&parent) else { return };
+            let (choice_model, choice_runtime) = super::thread_choices(&parent, cx);
+            t3_core::side_chat::resolve_parent_settings(
+                state.server_config.config.as_ref(),
+                parent_thread,
+                choice_model.as_ref(),
+                choice_runtime,
+            )
+        };
+        let resolved = self.resolve(cx);
+        let Some(selection) = model_selection.or_else(|| Self::dispatch_selection(&resolved)) else {
+            self.error = Some(NO_PROVIDER.into());
+            cx.notify();
+            return;
+        };
+        let target_thread = uuid_v4();
+        let mut steps = vec![
+            (
+                t3_core::side_chat::fork_command(&uuid_v4(), &parent, &target_thread),
+                "Could not start a side chat.",
+            ),
+            (
+                commands::set_runtime_mode(&uuid_v4(), &target_thread, runtime_mode),
+                "Could not set the side chat's permission mode.",
+            ),
+        ];
+        let (command_id, message_id) = (uuid_v4(), uuid_v4());
+        steps.push((
+            commands::composer_message(&ComposerMessage {
+                command_id: &command_id,
+                thread_id: &target_thread,
+                message_id: &message_id,
+                text: &outgoing.text,
+                title_seed: &outgoing.title,
+                model_selection: &selection,
+                dispatch: commands::ComposerDispatch::Auto,
+                context: outgoing.context.as_ref(),
+                attachments: &outgoing.attachments,
+                fresh_context: false,
+                idle_compaction: None,
+            }),
+            "Could not send the side chat message.",
+        ));
+        let failures: Vec<&'static str> = steps.iter().map(|(_, f)| *f).collect();
+        let star_origin = self.state.read(cx).star_prompt_origin();
+        let request = self.state.read(cx).dispatch_in_order(steps.into_iter().map(|(c, _)| c).collect());
+        let parent_target = Target::Thread(parent.clone());
+        let taken = self.begin_send(&parent_target, &raw_prompt, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            let failure = match with_dispatch_timeout(&executor, request).await {
+                Ok(Ok(())) => None,
+                Ok(Err((index, error))) => {
+                    Some((index, format!("{} {error}", failures.get(index).copied().unwrap_or("Could not start a side chat."))))
+                }
+                Err(timeout) => Some((0, timeout.to_owned())),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.sending = false;
+                if let Some((failed_index, error)) = failure {
+                    if failed_index > 0 {
+                        let delete_cmd = t3_core::side_chat::delete_command(&uuid_v4(), &target_thread, true);
+                        let req = this.state.read(cx).rpc(method::DISPATCH_COMMAND, delete_cmd);
+                        cx.background_executor().spawn(async move { let _ = req.await; }).detach();
+                    }
+                    this.restore(taken, error, window, cx);
+                } else {
+                    this.retire_sent_attachments(&taken.target, &taken.attachments, cx);
+                    this.state.update(cx, |state, cx| {
+                        state.record_prompt_sent(star_origin, cx);
+                        state.show_side_chat_tab(&parent, &target_thread, cx);
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn question_revision(&self, cx: &App) -> Vec<(String, String)> {
@@ -595,8 +766,94 @@ impl Composer {
 
     pub(super) fn cancel_pending_send(&mut self) -> bool {
         let cancelled = self.pending_send.cancel();
+        let had_prepare = self.pending_submit_after_prepare.take().is_some();
         if cancelled { self.sending = false; }
-        cancelled
+        cancelled || had_prepare
+    }
+
+    /// Verifies that ready uploaded attachments still exist on the server before send, re-uploading
+    /// expired ones from retained local bytes (`pingdotgg/t3code#32910`).
+    fn verify_and_refresh_uploads_before_send(
+        &mut self,
+        intent: SubmitIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target) = self.snapshot.target.clone() else {
+            return false;
+        };
+        let (uploads, runtime, env_id, connection, transport, phase) = {
+            let state = self.state.read(cx);
+            (
+                state.uploads.clone(),
+                state.runtime().clone(),
+                self.environment_id(cx),
+                state.connection_id(),
+                state.client_handle().map(|client| *client.connection_generation().borrow()),
+                state.phase.clone(),
+            )
+        };
+        if env_id.is_empty() {
+            return false;
+        }
+        let verify_keys: Vec<String> = self
+            .target_job_keys(&target)
+            .into_iter()
+            .filter(|key| {
+                matches!(
+                    uploads.state(key),
+                    Some(t3_core::composer::attachments::queue::AttachmentUploadState::Ready(_))
+                )
+            })
+            .collect();
+        if verify_keys.is_empty() {
+            return false;
+        }
+        self.send_connection = Some((connection, transport, phase));
+        self.pending_questions = self.question_revision(cx);
+        let generation = self.pending_send.begin();
+        self.sending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let _ = runtime
+                .spawn(async move {
+                    uploads.refresh_expired_uploads(&env_id, &verify_keys).await;
+                    uploads.await_uploads(&verify_keys).await;
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if !this.pending_send.finish(generation) {
+                    return;
+                }
+                this.sending = false;
+                if this.is_rewinding(cx) {
+                    cx.notify();
+                    return;
+                }
+                this.sync_upload_states_for(&target, cx);
+                let same_connection = matches!(
+                    this.state.read(cx).phase,
+                    crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected)
+                ) && this.question_revision(cx) == this.pending_questions
+                    && this.state.read(cx).connection_id() == connection
+                    && this.state.read(cx).client_handle().map(|client| *client.connection_generation().borrow())
+                        == transport;
+                if same_connection {
+                    if this.staged_needs_reattach() {
+                        this.error = Some("Attach the interrupted file again or remove it".into());
+                    } else {
+                        match attachments::uploaded_for_send(&this.staged_attachments()) {
+                            Ok(_) => this.submit_inner(intent, true, window, cx),
+                            Err(reason) => this.error = Some(reason.into()),
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        true
     }
 
     fn await_uploads(&mut self, intent: SubmitIntent, window: &mut Window, cx: &mut Context<Self>) {
@@ -632,7 +889,7 @@ impl Composer {
                         this.error = Some("Attach the interrupted file again or remove it".into());
                     } else {
                         match attachments::uploaded_for_send(&this.staged_attachments()) {
-                            Ok(_) => this.submit(intent, window, cx),
+                            Ok(_) => this.submit_inner(intent, true, window, cx),
                             Err(reason) => this.error = Some(reason.into()),
                         }
                     }
@@ -657,10 +914,24 @@ impl Composer {
             None => prompt.clone(),
         };
         let text = attachments::text_for_send(&prompt_for_send, !staged.is_empty());
+        let staged_entries = self.staged();
+        let chat_attachments = if staged_entries.len() == staged.len()
+            && staged_entries
+                .iter()
+                .zip(staged.iter())
+                .all(|(entry, att)| entry.attachment.id == att.id)
+        {
+            staged_entries
+                .iter()
+                .filter_map(|entry| entry.attachment.chat_attachment_with_source(entry.snapshot_source.as_ref()))
+                .collect::<Vec<_>>()
+        } else {
+            attachments::chat_attachments(staged).unwrap_or_default()
+        };
         Outgoing {
             title: rules::thread_title_seed(&prompt_for_send, staged),
             context: self.message_context(&prompt_for_send, staged),
-            attachments: attachments::chat_attachments(staged).unwrap_or_default(),
+            attachments: chat_attachments,
             text,
             prompt,
         }
@@ -1030,7 +1301,13 @@ impl Composer {
                 steps.push((commands::set_interaction_mode(&uuid_v4(), &thread_id, resolved.interaction_mode), "Could not resume thread."));
             }
             steps.push((
-                commands::resume_thread_turn(&uuid_v4(), &thread_id, &uuid_v4(), resumable_run_id, selection.as_ref()),
+                rules::with_manual_continuation_fallback(commands::resume_thread_turn(
+                    &uuid_v4(),
+                    &thread_id,
+                    &uuid_v4(),
+                    resumable_run_id,
+                    selection.as_ref(),
+                )),
                 "Could not resume thread.",
             ));
             if self.snapshot.has_held_queued_runs {

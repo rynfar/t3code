@@ -198,6 +198,7 @@ impl Composer {
             .filter_map(|key| rules::QuestionDraftKey::parse(key))
             .collect();
         let mut pending_by_thread = HashMap::new();
+        let mut unanswered_requests: HashMap<(String, String), bool> = HashMap::new();
         let state = self.state.read(cx);
         for key in &questions {
             if key.environment != environment || pending_by_thread.contains_key(&key.thread) {
@@ -209,15 +210,20 @@ impl Composer {
                 .as_ref()
                 .filter(|projection| projection.thread.id == key.thread)
             {
-                pending_by_thread.insert(
-                    key.thread.clone(),
-                    projection
-                        .runtime_requests
-                        .iter()
-                        .filter(|request| request.value["status"] == "pending")
-                        .map(|request| request.id.clone())
-                        .collect(),
-                );
+                let mut pending = Vec::new();
+                for request in &projection.runtime_requests {
+                    let status = request
+                        .value
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if status == "pending" {
+                        pending.push(request.id.clone());
+                    } else if rules::is_unanswered_request_status(status) {
+                        unanswered_requests.insert((key.thread.clone(), request.id.clone()), true);
+                    }
+                }
+                pending_by_thread.insert(key.thread.clone(), pending);
             }
         }
         let resolved = rules::resolved_draft_keys(&questions, environment, &pending_by_thread);
@@ -229,7 +235,17 @@ impl Composer {
             self.responding.remove(&question.request_key());
             let target = Target::Question(question.clone());
             let staged = self.take_draft_attachments(&target);
-            self.release_discarded_attachments(&target, &staged, cx);
+            if unanswered_requests
+                .get(&(question.thread.clone(), question.request.clone()))
+                .copied()
+                .unwrap_or(false)
+                && !staged.is_empty()
+            {
+                // Return attached files to the thread composer when the question stops/expires (`pingdotgg/t3code#38005`).
+                self.return_question_attachments_to_thread(&target, &question.thread, staged, cx);
+            } else {
+                self.release_discarded_attachments(&target, &staged, cx);
+            }
             self.discard_draft(&target, cx);
         }
         changed

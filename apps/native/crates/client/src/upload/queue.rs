@@ -357,6 +357,134 @@ impl AttachmentUploadQueueClient {
         inner.queue.queued_count(environment_id)
     }
 
+    /// Revalidates `Ready` uploads on `environment_id` before sending (`refreshExpiredAttachmentUploads`
+    /// in `apps/web/src/lib/attachmentUploadQueue.ts`, `pingdotgg/t3code#32910`): long-lived drafts
+    /// can outlive server attachment cleanup, so missing uploads with local bytes force a fresh
+    /// re-upload while missing/unverifiable uploads without bytes fail clearly.
+    pub async fn refresh_expired_uploads(&self, environment_id: &str, job_keys: &[String]) {
+        if job_keys.is_empty() {
+            return;
+        }
+        let mut checks = Vec::new();
+        {
+            let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let client = inner.clients.get(environment_id).cloned();
+            for key in job_keys {
+                let Some(AttachmentUploadState::Ready(ready)) = inner.queue.state(key).cloned()
+                else {
+                    continue;
+                };
+                if ready.environment_id != environment_id {
+                    continue;
+                }
+                let has_bytes = inner
+                    .payloads
+                    .get(key)
+                    .is_some_and(|payload| payload.bytes.is_some());
+                let Some(target) = inner.queue.target_of(key).cloned() else {
+                    continue;
+                };
+                checks.push((key.clone(), ready, has_bytes, target, client.clone()));
+            }
+        }
+
+        let tasks = checks.into_iter().map(|(key, ready, has_bytes, target, client)| {
+            let this = self.clone();
+            let env_id = environment_id.to_owned();
+            async move {
+                let Some(client) = client else {
+                    let effects = {
+                        let mut inner = this.inner.lock().unwrap_or_else(|p| p.into_inner());
+                        inner.queue.mark_verification_failed(
+                            &key,
+                            &ready.attachment_id,
+                            "Uploaded attachment could not be verified. Retry when the server reconnects."
+                                .to_owned(),
+                        )
+                    };
+                    this.apply_effects(effects);
+                    return;
+                };
+                let can_verify = client
+                    .session_state()
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|session| {
+                        session.grants(t3_core::auth::ORCHESTRATION_READ_SCOPE)
+                            || session.grants(t3_core::auth::ORCHESTRATION_OPERATE_SCOPE)
+                    });
+                if !can_verify {
+                    if has_bytes && has_orchestration_operate_scope(&client) {
+                        let effects = {
+                            let mut inner = this.inner.lock().unwrap_or_else(|p| p.into_inner());
+                            inner
+                                .queue
+                                .start_with_force(key, target, env_id, true, None, None, true)
+                                .1
+                        };
+                        this.apply_effects(effects);
+                    } else {
+                        let effects = {
+                            let mut inner = this.inner.lock().unwrap_or_else(|p| p.into_inner());
+                            inner.queue.mark_verification_failed(
+                                &key,
+                                &ready.attachment_id,
+                                "Uploaded attachment could not be verified. Attach the file again."
+                                    .to_owned(),
+                            )
+                        };
+                        this.apply_effects(effects);
+                    }
+                    return;
+                }
+
+                let verification =
+                    verify_persisted_attachment_upload(&client, &ready.attachment_id).await;
+                let effects = {
+                    let mut inner = this.inner.lock().unwrap_or_else(|p| p.into_inner());
+                    // The user may have removed or replaced the attachment while verification ran.
+                    if inner.queue.state(&key) != Some(&AttachmentUploadState::Ready(ready.clone())) {
+                        return;
+                    }
+                    match verification {
+                        PersistedAttachmentVerification::Verified => Vec::new(),
+                        PersistedAttachmentVerification::Missing { .. }
+                            if inner
+                                .payloads
+                                .get(&key)
+                                .is_some_and(|payload| payload.bytes.is_some())
+                                && has_orchestration_operate_scope(&client) =>
+                        {
+                            inner
+                                .queue
+                                .start_with_force(key, target, env_id, true, None, None, true)
+                                .1
+                        }
+                        PersistedAttachmentVerification::Missing { .. } => inner
+                            .queue
+                            .mark_verification_failed(
+                                &key,
+                                &ready.attachment_id,
+                                "Uploaded attachment expired. Remove it and attach it again."
+                                    .to_owned(),
+                            ),
+                        PersistedAttachmentVerification::Failed { .. } => inner
+                            .queue
+                            .mark_verification_failed(
+                                &key,
+                                &ready.attachment_id,
+                                "Uploaded attachment could not be verified. Retry when the server reconnects."
+                                    .to_owned(),
+                            ),
+                    }
+                };
+                this.apply_effects(effects);
+            }
+        });
+        futures::future::join_all(tasks).await;
+        self.await_uploads(job_keys).await;
+    }
+
     /// Awaits settlement of every pending upload named in `job_keys` without polling.
     pub async fn await_uploads(&self, job_keys: &[String]) {
         let receivers = {

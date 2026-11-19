@@ -12,7 +12,9 @@ use t3_core::voice_input::{
 };
 
 use super::controller::{VoiceSetupStep, VoiceSpeechController};
-use super::shortcuts::{active_setup_controller, dictation_shortcut_label};
+use super::shortcuts::{
+    active_floating_indicator_controller, active_setup_controller, dictation_shortcut_label,
+};
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
 use crate::theme::{hsla, palette};
@@ -97,14 +99,29 @@ pub fn render_speech_recording_pill(
     disabled: bool,
     cx: &App,
 ) -> AnyElement {
+    render_speech_recording_pill_inner(id_prefix, controller, size, disabled, false, cx)
+}
+
+fn render_speech_recording_pill_inner(
+    id_prefix: &str,
+    controller: &Entity<VoiceSpeechController>,
+    size: VoiceUiSize,
+    disabled: bool,
+    use_session_state: bool,
+    cx: &App,
+) -> AnyElement {
     let voice = controller.read(cx);
-    let state = voice.state();
+    let state = if use_session_state {
+        voice.session_state()
+    } else {
+        voice.state()
+    };
     if state.phase == VoiceInputPhase::Idle {
         return div().into_any_element();
     }
 
     if state.phase == VoiceInputPhase::Error {
-        return render_error_pill(id_prefix, controller, size, disabled, cx);
+        return render_error_pill(id_prefix, controller, size, disabled, use_session_state, cx);
     }
 
     let p = palette(cx);
@@ -286,10 +303,15 @@ fn render_error_pill(
     controller: &Entity<VoiceSpeechController>,
     size: VoiceUiSize,
     disabled: bool,
+    use_session_state: bool,
     cx: &App,
 ) -> AnyElement {
     let voice = controller.read(cx);
-    let state = voice.state();
+    let state = if use_session_state {
+        voice.session_state()
+    } else {
+        voice.state()
+    };
     let p = palette(cx);
     let compact = size == VoiceUiSize::Compact;
     let err_msg = state.error.as_deref();
@@ -520,9 +542,98 @@ pub fn render_text_field_speech_controls(
         .into_any_element()
 }
 
+/// Renders both the active voice setup modal and the floating `GlobalVoiceInputIndicator`
+/// (`pingdotgg/t3code#35761`, `pingdotgg/t3code#38225`) through the workspace overlay slot.
 pub fn render_active_voice_setup_modal(cx: &App) -> Option<AnyElement> {
-    let controller = active_setup_controller(cx)?;
-    Some(render_voice_setup_modal("workspace", &controller, cx))
+    let indicator = active_floating_indicator_controller(cx)
+        .map(|controller| render_global_voice_input_indicator(&controller, cx));
+    let modal = active_setup_controller(cx)
+        .map(|controller| render_voice_setup_modal("workspace", &controller, cx));
+    match (indicator, modal) {
+        (None, None) => None,
+        (Some(el), None) | (None, Some(el)) => Some(el),
+        (Some(indicator), Some(modal)) => Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(indicator)
+                .child(modal)
+                .into_any_element(),
+        ),
+    }
+}
+
+/// Floating top-center pill shown while dictation continues for an off-screen thread draft
+/// (`GlobalVoiceInputIndicator.tsx`, `pingdotgg/t3code#35761`, `pingdotgg/t3code#38225`).
+pub fn render_global_voice_input_indicator(
+    controller: &Entity<VoiceSpeechController>,
+    cx: &App,
+) -> AnyElement {
+    let voice = controller.read(cx);
+    let p = palette(cx);
+    let label = voice
+        .active_target_label()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Untitled thread")
+        .to_owned();
+    let can_open = voice.can_open_active_target();
+    let open_entity = controller.clone();
+
+    deferred(
+        div()
+            .id("global-voice-input-indicator-layer")
+            .absolute()
+            .top(px(12.))
+            .left_0()
+            .right_0()
+            .px(px(16.))
+            .flex()
+            .justify_center()
+            .child(
+                h_flex()
+                    .id("global-voice-input-indicator")
+                    .max_w(px(520.))
+                    .items_center()
+                    .gap(px(4.))
+                    .p(px(2.))
+                    .rounded(px(999.))
+                    .border_1()
+                    .border_color(hsla(p.border))
+                    .bg(hsla(p.popover))
+                    .occlude()
+                    .shadow(vec![BoxShadow {
+                        color: hsla(p.dialog_backdrop),
+                        offset: point(px(0.), px(8.)),
+                        blur_radius: px(24.),
+                        spread_radius: px(-8.),
+                        inset: false,
+                    }])
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Button::new(
+                            "global-voice-indicator-thread",
+                            ButtonVariant::Ghost,
+                            ButtonSize::Sm,
+                        )
+                        .label(label)
+                        .disabled(!can_open)
+                        .on_click(move |_, window, cx| {
+                            if let Some(open) = open_entity.read(cx).active_target_open_handler() {
+                                open(window, cx);
+                            }
+                        }),
+                    )
+                    .child(render_speech_recording_pill_inner(
+                        "global-voice-indicator",
+                        controller,
+                        VoiceUiSize::Regular,
+                        false,
+                        true,
+                        cx,
+                    )),
+            ),
+    )
+    .into_any_element()
 }
 
 pub fn render_voice_setup_modal(

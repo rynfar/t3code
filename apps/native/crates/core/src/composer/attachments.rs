@@ -167,6 +167,11 @@ impl Attachment {
 
     /// The `ChatAttachment` a turn carries, once uploaded.
     pub fn chat_attachment(&self) -> Option<Value> {
+        self.chat_attachment_with_source(None)
+    }
+
+    /// The `ChatAttachment` a turn carries, preserving an optional `SnapShotSource` (`pingdotgg/t3code#37771`).
+    pub fn chat_attachment_with_source(&self, snapshot_source: Option<&Value>) -> Option<Value> {
         let mut attachment = json!({
             "type": self.kind.as_str(),
             "id": self.attachment_id()?,
@@ -176,6 +181,10 @@ impl Attachment {
         });
         if self.pasted_text {
             attachment["source"] = json!({ "_tag": "pasted-text" });
+        } else if self.kind == AttachmentKind::Image
+            && let Some(source) = snapshot_source
+        {
+            attachment["source"] = source.clone();
         }
         Some(attachment)
     }
@@ -186,7 +195,12 @@ impl Attachment {
 
     /// `attachmentContextRecord`.
     pub fn context_record(&self) -> Option<Value> {
-        Some(json!({
+        self.context_record_with_source(None)
+    }
+
+    /// `attachmentContextRecord` preserving an optional `SnapShotSource` (`pingdotgg/t3code#37771`).
+    pub fn context_record_with_source(&self, snapshot_source: Option<&Value>) -> Option<Value> {
+        let mut record = json!({
             "version": 1,
             "kind": self.kind.as_str(),
             "contextId": self.context_id(),
@@ -195,7 +209,13 @@ impl Attachment {
             "name": self.name,
             "mimeType": self.mime_type,
             "sizeBytes": self.size_bytes,
-        }))
+        });
+        if self.kind == AttachmentKind::Image
+            && let Some(source) = snapshot_source
+        {
+            record["source"] = source.clone();
+        }
+        Some(record)
     }
 }
 

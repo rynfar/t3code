@@ -344,6 +344,7 @@ pub struct Composer {
     stash: Option<String>,
     sending: bool,
     pending_send: t3_core::composer::attachments::PendingSend,
+    pending_submit_after_prepare: Option<(String, rules::SubmitIntent)>,
     pending_routed_send: Option<send::PendingRoutedSend>,
     pending_questions: Vec<(String, String)>,
     send_connection: Option<(Option<u64>, Option<u64>, crate::app_state::Phase)>,
@@ -536,8 +537,9 @@ impl Composer {
         let composer_weak_env = composer_weak.clone();
         let composer_weak_focus = composer_weak.clone();
         let composer_weak_disabled = composer_weak.clone();
+        let composer_weak_meta = composer_weak.clone();
         let voice = cx.new(|cx| {
-            crate::voice::VoiceSpeechController::new(
+            let mut controller = crate::voice::VoiceSpeechController::new(
                 crate::voice::VoiceSpeechConfig {
                     app: state.clone(),
                     owner_key: fixed
@@ -570,7 +572,13 @@ impl Composer {
                     }),
                 },
                 cx,
-            )
+            );
+            controller.set_target_meta_reader(std::rc::Rc::new(move |cx| {
+                composer_weak_meta
+                    .upgrade()
+                    .and_then(|c| c.read(cx).voice_target_meta(cx))
+            }));
+            controller
         });
         let _dictation_target_id = crate::voice::register_dictation_target(
             &voice,
@@ -757,6 +765,7 @@ impl Composer {
             stash: None,
             sending: false,
             pending_send: Default::default(),
+            pending_submit_after_prepare: None,
             pending_routed_send: None,
             pending_questions: Vec::new(),
             send_connection: None,
@@ -1481,11 +1490,77 @@ impl Composer {
             .unwrap_or_default()
     }
 
+    pub(super) fn voice_target_meta(&self, cx: &App) -> Option<crate::voice::BackgroundVoiceTarget> {
+        let target = self.snapshot.target.as_ref()?;
+        let owner_key = self.voice.read(cx).owner_key().to_owned();
+        let persistent = self.active_question().is_none()
+            && self.editing_queued().is_none()
+            && matches!(target, Target::Thread(_) | Target::Draft(_));
+        let storage_key = drafts::key(target);
+        let state_entity = self.state.clone();
+        let (label, open): (Option<String>, Option<crate::voice::VoiceSettingsHandler>) = match target {
+            Target::Thread(thread_id) => {
+                let title = self
+                    .state
+                    .read(cx)
+                    .thread_shell(thread_id)
+                    .map(|t| t.title.trim().to_owned())
+                    .filter(|t| !t.is_empty());
+                let tid = thread_id.clone();
+                let open = std::rc::Rc::new(move |_: &mut Window, cx: &mut App| {
+                    state_entity.update(cx, |s, cx| s.select_thread(&tid, cx));
+                });
+                (title, Some(open))
+            }
+            Target::Draft(project_id) => {
+                let title = self
+                    .state
+                    .read(cx)
+                    .shell
+                    .project(project_id)
+                    .map(|p| p.title.trim().to_owned())
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| Some("New thread".to_owned()));
+                let pid = project_id.clone();
+                let open = std::rc::Rc::new(move |_: &mut Window, cx: &mut App| {
+                    state_entity.update(cx, |s, cx| s.start_draft(&pid, cx));
+                });
+                (title, Some(open))
+            }
+            Target::Question(_) => (None, None),
+        };
+        let read_owner = owner_key.clone();
+        let read_key = storage_key.clone();
+        let read_stored_draft: crate::voice::DraftReader = std::rc::Rc::new(move |cx| {
+            let text = drafts::read_stored_prompt(&read_key, cx);
+            let end = t3_core::voice_input::utf8_to_utf16_offset(&text, text.len());
+            Some(t3_core::voice_input::VoiceDraftSnapshot {
+                owner_key: read_owner.clone(),
+                text,
+                selection: t3_core::voice_input::VoiceSelection { start: end, end },
+            })
+        });
+        let commit_key = storage_key;
+        let commit_stored_draft: crate::voice::StoredDraftCommit =
+            std::rc::Rc::new(move |text, _selection, cx| {
+                drafts::write_stored_prompt(&commit_key, text, cx);
+            });
+        Some(crate::voice::BackgroundVoiceTarget {
+            owner_key,
+            label,
+            persistent,
+            open,
+            read_stored_draft: Some(read_stored_draft),
+            commit_stored_draft: Some(commit_stored_draft),
+        })
+    }
+
     pub(super) fn voice_is_disabled(&self, cx: &App) -> bool {
         self.sending
             || self.is_rewinding(cx)
             || !self.snapshot.can_operate_thread
             || self.snapshot.setup_blocks_send
+            || self.voice.read(cx).is_busy_elsewhere()
             || self.active_input().is_some_and(|input| {
                 !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx)
             })

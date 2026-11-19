@@ -13,6 +13,7 @@ pub(super) enum ImportMode {
 pub(super) struct ImportedAttachment {
     pub attachment: Attachment,
     pub source: Option<String>,
+    pub snapshot_source: Option<Value>,
 }
 pub(super) struct ImportPlan {
     pub text: String,
@@ -43,6 +44,7 @@ pub(super) fn prepare(
     let mut attachments = Vec::new();
     for record in held.into_iter().filter(|r| !existing.contains(r)) {
         if let Some(mut attachment) = records::attachment_from_record(&record) {
+            let snapshot_source = records::snapshot_source_from_record(&record);
             let source = match mode {
                 ImportMode::Copy => {
                     let source = attachment.attachment_id().map(str::to_owned);
@@ -51,7 +53,7 @@ pub(super) fn prepare(
                 }
                 ImportMode::Move => None,
             };
-            attachments.push(ImportedAttachment { attachment, source });
+            attachments.push(ImportedAttachment { attachment, source, snapshot_source });
         } else if !records::pull_request(&record)
             && let Some(review) = t3_core::composer::review::ReviewComment::from_record(&record)
         {
