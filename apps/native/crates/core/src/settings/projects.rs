@@ -140,6 +140,11 @@ impl ProjectUpdate {
         ProjectUpdate { favicon_path: Some(None), project_icon: Some(icon), ..Default::default() }
     }
 
+    /// Selecting a custom image file clears any Lucide/emoji/monogram icon override.
+    pub fn favicon_file(path: String) -> ProjectUpdate {
+        ProjectUpdate { favicon_path: Some(Some(path)), project_icon: Some(None), ..Default::default() }
+    }
+
     pub fn payload(&self, command_id: &str, project_id: &str) -> Value {
         let mut payload = json!({ "type": "project.update", "commandId": command_id, "projectId": project_id });
         if let Some(title) = &self.title {
@@ -243,7 +248,50 @@ pub struct RemovalPlan {
     pub confirmation: String,
 }
 
-/// `planProjectRemoval`. `thread_count` counts the members' threads, loaded or not.
+/// `projects.searchEntries` request for image files (`ProjectFaviconPickerDialog.tsx`).
+pub const SEARCH_ENTRIES: &str = "projects.searchEntries";
+pub const FAVICON_SEARCH_LIMIT: usize = 200;
+
+pub fn favicon_search_request(cwd: &str, query: &str) -> Value {
+    json!({
+        "cwd": cwd,
+        "query": query,
+        "limit": FAVICON_SEARCH_LIMIT,
+        "imageOnly": true,
+    })
+}
+
+/// Decodes file paths returned by `projects.searchEntries` with `imageOnly: true`.
+pub fn decode_favicon_entries(reply: &Value) -> Vec<String> {
+    reply
+        .get("entries")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| entry.get("kind").and_then(Value::as_str) != Some("directory"))
+                .filter_map(|entry| entry.get("path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Counts a project's listed-lineage threads plus any unloaded older-settled threads
+/// (`planProjectRemoval` in `client-runtime/src/state/projectRemoval.ts`, `pingdotgg/t3code#29917`).
+/// Side chats and subagents go with their parent and are excluded from the count.
+pub fn count_listed_removal_threads<'a>(
+    threads: impl IntoIterator<Item = (&'a str, &'a crate::shell::Lineage)>,
+    project_id: &str,
+    unloaded_count: usize,
+) -> usize {
+    threads
+        .into_iter()
+        .filter(|(thread_project_id, lineage)| *thread_project_id == project_id && lineage.is_listed())
+        .count()
+        + unloaded_count
+}
+
+/// `planProjectRemoval`. `thread_count` counts the members' listed threads, loaded or not.
 pub fn plan_removal(members: &[RemovalMember], group_member_count: usize, has_other_members: bool, display_name: &str, thread_count: usize) -> RemovalPlan {
     let is_whole_group = members.len() == group_member_count;
     let target_kind = if has_other_members || !is_whole_group { "checkout" } else { "project" };

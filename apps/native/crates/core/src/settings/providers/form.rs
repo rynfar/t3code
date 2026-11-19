@@ -393,8 +393,87 @@ pub struct ArgumentRow {
 #[derive(Debug, Clone)]
 pub struct ArgumentPublication {
     pub id: usize,
+    /// The server `commandArgs` snapshot this edit started from, used to 3-way merge concurrent updates.
+    pub base: Vec<String>,
     pub values: Vec<String>,
 }
+
+/// 3-way LCS-anchored merge of `commandArgs` arrays so concurrent edits from two clients
+/// (e.g. changing different flags, or adding/removing disjoint arguments) both survive instead
+/// of one client clobbering the other's whole array (`#139`).
+pub fn merge_command_args(base: &[String], local: &[String], remote: &[String]) -> Vec<String> {
+    if base == remote {
+        return local.to_vec();
+    }
+    if base == local {
+        return remote.to_vec();
+    }
+    let local_diff = diff_against_base(base, local);
+    let remote_diff = diff_against_base(base, remote);
+    let mut out = Vec::new();
+    for i in 0..=base.len() {
+        let l_ins = &local_diff.inserts[i];
+        let r_ins = &remote_diff.inserts[i];
+        if l_ins.is_empty() {
+            out.extend(r_ins.iter().cloned());
+        } else if r_ins.is_empty() || l_ins == r_ins {
+            out.extend(l_ins.iter().cloned());
+        } else {
+            out.extend(r_ins.iter().cloned());
+            for item in l_ins {
+                if !r_ins.contains(item) {
+                    out.push(item.clone());
+                }
+            }
+        }
+        if i < base.len() && local_diff.kept[i] && remote_diff.kept[i] {
+            out.push(base[i].clone());
+        }
+    }
+    out
+}
+
+struct BaseDiff {
+    kept: Vec<bool>,
+    /// `base.len() + 1` buckets: items inserted immediately before `base[i]` (or after the end at `base.len()`).
+    inserts: Vec<Vec<String>>,
+}
+
+fn diff_against_base(base: &[String], target: &[String]) -> BaseDiff {
+    let n = base.len();
+    let m = target.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if base[i] == target[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut kept = vec![false; n];
+    let mut inserts = vec![Vec::new(); n + 1];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if base[i] == target[j] {
+            kept[i] = true;
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            inserts[i].push(target[j].clone());
+            j += 1;
+        }
+    }
+    while j < m {
+        inserts[n].push(target[j].clone());
+        j += 1;
+    }
+    BaseDiff { kept, inserts }
+}
+
 #[derive(Default)]
 pub struct ArgumentsDraft {
     pub rows: Vec<ArgumentRow>,
@@ -419,19 +498,41 @@ impl ArgumentsDraft {
             .iter()
             .rfind(|publication| publication.values == incoming)
             .map(|publication| publication.id);
-        self.seen = incoming;
+        let previous_seen = std::mem::replace(&mut self.seen, incoming);
         if self.seen_echo.is_some() {
+            return;
+        }
+        if let Some(first) = self.outstanding.first() {
+            // Concurrent remote change while local edits are still in flight: 3-way merge onto
+            // incoming instead of discarding the user's pending edits (`#139`).
+            let base = if first.base.is_empty() && !previous_seen.is_empty() {
+                &previous_seen
+            } else {
+                &first.base
+            };
+            let local: Vec<String> = self.rows.iter().map(|r| r.value.clone()).collect();
+            let merged = merge_command_args(base, &local, &self.seen);
+            self.reseed_values(&merged);
             return;
         }
         self.reseed();
     }
     fn reseed(&mut self) {
-        self.rows = self.seen
+        let values = self.seen.clone();
+        self.reseed_values(&values);
+    }
+    fn reseed_values(&mut self, values: &[String]) {
+        let mut old = std::mem::take(&mut self.rows);
+        self.rows = values
             .iter()
             .map(|value| {
-                let id = self.next_id;
-                self.next_id += 1;
-                ArgumentRow { id, value: value.clone() }
+                if let Some(pos) = old.iter().position(|row| &row.value == value) {
+                    old.remove(pos)
+                } else {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    ArgumentRow { id, value: value.clone() }
+                }
             })
             .collect();
     }
@@ -461,6 +562,7 @@ impl ArgumentsDraft {
         }
     }
     pub fn edit(&mut self, edit: ArgumentEdit) -> Option<ArgumentPublication> {
+        let base = self.rows.iter().map(|r| r.value.clone()).collect::<Vec<_>>();
         match edit {
             ArgumentEdit::Add => {
                 let id = self.next_id;
@@ -489,6 +591,7 @@ impl ArgumentsDraft {
             .collect::<Vec<_>>();
         let publication = ArgumentPublication {
             id: self.next_publication,
+            base,
             values,
         };
         self.next_publication += 1;
@@ -877,5 +980,50 @@ mod tests {
         assert_eq!(with_ref.config.as_ref().unwrap()["apiKey"], secret);
         let cleared = with_field(&with_ref, "apiKey", json!(""));
         assert!(cleared.config.is_none());
+    }
+
+    #[test]
+    fn concurrent_command_args_edits_merge_without_clobbering_remote_changes() {
+        let s = |v: &[&str]| v.iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
+
+        // Disjoint edits to different slots both survive.
+        assert_eq!(
+            merge_command_args(&s(&["--verbose", "--model=sonnet"]), &s(&["--debug", "--model=sonnet"]), &s(&["--verbose", "--model=opus"])),
+            s(&["--debug", "--model=opus"])
+        );
+        // Local delete + remote append both survive.
+        assert_eq!(
+            merge_command_args(&s(&["--a", "--b"]), &s(&["--b"]), &s(&["--a", "--b", "--timeout=30"])),
+            s(&["--b", "--timeout=30"])
+        );
+        // Concurrent appends both survive.
+        assert_eq!(
+            merge_command_args(&s(&["--a"]), &s(&["--a", "--local"]), &s(&["--a", "--remote"])),
+            s(&["--a", "--remote", "--local"])
+        );
+
+        // ArgumentsDraft preserves an in-flight local edit when a concurrent remote update arrives.
+        let mut draft = ArgumentsDraft::default();
+        draft.reconcile(s(&["--a", "--b"]));
+        let row_a = draft.rows[0].id;
+        let pub1 = draft.edit(ArgumentEdit::Value(row_a, "--a-local".into())).unwrap();
+        assert_eq!(pub1.base, s(&["--a", "--b"]));
+        assert_eq!(pub1.values, s(&["--a-local", "--b"]));
+        // Remote client appends "--c" before pub1 settles.
+        draft.reconcile(s(&["--a", "--b", "--c"]));
+        let draft_vals: Vec<String> = draft.rows.iter().map(|r| r.value.clone()).collect();
+        assert_eq!(draft_vals, s(&["--a-local", "--b", "--c"]));
+
+        // InstanceEdit::CommandArgs merges against live server settings at send time.
+        let remote_instance: ProviderInstanceConfig =
+            serde_json::from_value(json!({ "driver": "kiro", "config": { "commandArgs": ["--a", "--b", "--c"] } })).unwrap();
+        let merged = crate::settings::providers::InstanceEdit::CommandArgs { base: pub1.base, values: pub1.values }.apply(&remote_instance);
+        assert_eq!(command_args(&merged), s(&["--a-local", "--b", "--c"]));
+
+        // Auth removeMethod payload (`pingdotgg/t3code#29280`).
+        assert_eq!(
+            crate::settings::providers::auth::remove_method_payload("codex", "chatgpt:acct-1"),
+            json!({ "instanceId": "codex", "methodId": "chatgpt:acct-1" })
+        );
     }
 }

@@ -3,8 +3,8 @@
 //! (`SettingsScopeNotice`); a chosen one shows its name, icon, pin and archive, its New threads
 //! overrides (`ProjectDefaultsSettings` at project scope), its actions (`project_actions.rs`), its
 //! checkouts and removal. The project picker follows the watched environments' scoped groups.
-//! Not ported: the image picker ("Choose file"), and the info alert about
-//! keeping the project picked on other pages, which other native pages do not scope by project.
+//! Not ported: the info alert about keeping the project picked on other pages, which other
+//! native pages do not scope by project.
 
 use std::rc::Rc;
 
@@ -311,8 +311,17 @@ impl SettingsView {
         let mut thread_count = 0;
         for project in &members {
             if let Some(environment) = state.scoped_environment(&project.owner.saved_id) {
-                thread_count += environment.summary.threads.iter().filter(|thread| thread.thread.project_id == project.project.id).count();
-                thread_count += environment.summary.older_settled.as_ref().and_then(|cut| cut.counts.iter().find(|count| count.project_id == project.project.id)).map_or(0, |count| count.count as usize);
+                let unloaded = environment
+                    .summary
+                    .older_settled
+                    .as_ref()
+                    .and_then(|cut| cut.counts.iter().find(|count| count.project_id == project.project.id))
+                    .map_or(0, |count| count.count as usize);
+                thread_count += model::count_listed_removal_threads(
+                    environment.summary.threads.iter().map(|thread| (thread.thread.project_id.as_str(), &thread.lineage)),
+                    &project.project.id,
+                    unloaded,
+                );
             }
         }
         let removal = members.iter().map(|member| RemovalMember { title: &member.project.title, workspace_root: &member.project.workspace_root, environment_label: Some(&member.environment_label) }).collect::<Vec<_>>();
@@ -586,12 +595,21 @@ impl SettingsView {
                     cx.listener(|this, _, _, cx| this.reset_project_icon(cx)),
                 )
                 .control(
-                    h_flex().gap(r(8.)).child(self.scoped_project_favicon(&shown.group.representative, 24., cx)).child(
-                        Button::new("project-choose-icon", ButtonVariant::Outline, ButtonSize::Sm)
-                            .label("Choose icon")
-                            .disabled(!can_edit || saving_icon)
-                            .on_click(cx.listener(|this, _, window, cx| this.open_project_icon_picker(window, cx))),
-                    ),
+                    h_flex()
+                        .gap(r(8.))
+                        .child(self.scoped_project_favicon(&shown.group.representative, 24., cx))
+                        .child(
+                            Button::new("project-choose-icon", ButtonVariant::Outline, ButtonSize::Sm)
+                                .label("Choose icon")
+                                .disabled(!can_edit || saving_icon)
+                                .on_click(cx.listener(|this, _, window, cx| this.open_project_icon_picker(window, cx))),
+                        )
+                        .child(
+                            Button::new("project-choose-file", ButtonVariant::Outline, ButtonSize::Sm)
+                                .label("Choose file")
+                                .disabled(!can_edit || saving_icon)
+                                .on_click(cx.listener(|this, _, window, cx| this.open_project_favicon_picker(window, cx))),
+                        ),
                 )
                 .into_any_element(),
         );

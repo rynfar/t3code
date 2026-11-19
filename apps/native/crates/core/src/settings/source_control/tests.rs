@@ -89,9 +89,170 @@ fn discovery_decodes_effect_options_and_summarizes_like_the_web() {
     assert_eq!(github.auth.as_ref().and_then(|auth| auth.account.as_deref()), Some("octocat"));
     assert_eq!((github.dot(), github.summary().as_str(), github.auth_badge()), (Dot::Success, "Authenticated \u{00b7} github.com", None));
     assert_eq!(gitlab.auth_badge(), Some("Not authenticated"));
-    assert_eq!(
-        gitlab.summary(),
-        "GitLab is not authenticated on this server. Sign in or configure credentials using the glab tool on the server host to enable change request features."
-    );
+    assert_eq!(gitlab.summary(), "GitLab is not authenticated on this server. Sign in or configure credentials using the glab tool on the server host to enable change request features.");
     assert_eq!(bitbucket.summary(), "Available. Add an API token.");
+}
+
+#[test]
+fn saving_or_removing_one_host_token_preserves_other_hosts_tokens_and_references() {
+    let settings = full(json!({
+        "offeredSourceControlProviders": { "github": true, "gitcafe": false, "bad": "ignored" },
+        "sourceControlHosts": {
+            "github": {
+                "tokens": {
+                    "github.com": "__REDACTED_SECRET__",
+                    "ghe.corp.internal": { "provider": "op", "reference": "op://Work/GHE/token" }
+                },
+                "signIns": {
+                    "github.com": "__REDACTED_SESSION__",
+                    "ghe.corp.internal": "__REDACTED_GHE_SESSION__"
+                },
+                "hosts": {
+                    "ghe.corp.internal": { "enabled": false, "account": "corp-user" }
+                }
+            }
+        }
+    }));
+    assert!(settings.source_control.is_provider_offered("github"));
+    assert!(!settings.source_control.is_provider_offered("gitcafe"));
+    assert!(settings.source_control.is_provider_offered("bitbucket"));
+
+    let creds = read_host_credential_settings(&settings.source_control_hosts, "github");
+    assert_eq!(creds.tokens.len(), 2);
+    assert_eq!(creds.tokens.get("github.com"), Some(&SecretValue::Literal("__REDACTED_SECRET__".into())));
+    assert_eq!(
+        creds.tokens.get("ghe.corp.internal"),
+        Some(&SecretValue::Reference { provider: "op".into(), reference: "op://Work/GHE/token".into() })
+    );
+
+    // Saving a new host token sends the whole `tokens` map so other hosts' tokens are preserved (`pingdotgg/t3code#29554`).
+    let save_patch = SourceControlChange::SaveHostToken {
+        kind: "github".into(),
+        existing: creds.tokens.clone(),
+        host: " GHE.Staging.Corp ".into(),
+        token: SecretValue::Literal("ghp_new".into()),
+    }
+    .into_server()
+    .payload()["patch"]
+        .clone();
+    assert_eq!(
+        save_patch,
+        json!({
+            "sourceControlHosts": {
+                "github": {
+                    "tokens": {
+                        "github.com": "__REDACTED_SECRET__",
+                        "ghe.corp.internal": { "provider": "op", "reference": "op://Work/GHE/token" },
+                        "ghe.staging.corp": "ghp_new"
+                    }
+                }
+            }
+        })
+    );
+
+    // Removing one host token clears only that host while keeping the other hosts intact.
+    let remove_patch = SourceControlChange::SaveHostToken {
+        kind: "github".into(),
+        existing: creds.tokens,
+        host: "github.com".into(),
+        token: SecretValue::Literal(String::new()),
+    }
+    .into_server()
+    .payload()["patch"]
+        .clone();
+    assert_eq!(
+        remove_patch,
+        json!({
+            "sourceControlHosts": {
+                "github": {
+                    "tokens": {
+                        "github.com": "",
+                        "ghe.corp.internal": { "provider": "op", "reference": "op://Work/GHE/token" }
+                    }
+                }
+            }
+        })
+    );
+
+    // Signing out of one host preserves other hosts' sign-in sessions.
+    let sign_out_patch = SourceControlChange::SignOutApp {
+        kind: "github".into(),
+        existing: creds.sign_ins,
+        host: "github.com".into(),
+    }
+    .into_server()
+    .payload()["patch"]
+        .clone();
+    assert_eq!(
+        sign_out_patch,
+        json!({
+            "sourceControlHosts": {
+                "github": {
+                    "signIns": {
+                        "github.com": "",
+                        "ghe.corp.internal": "__REDACTED_GHE_SESSION__"
+                    }
+                }
+            }
+        })
+    );
+}
+
+#[test]
+fn accounts_grouping_host_choices_and_sign_in_prompt_follow_web() {
+    let prompt = decode_sign_in_prompt(&json!({
+        "userCode": "ABCD-1234",
+        "verificationUri": "https://github.com/login/device",
+        "expiresAt": 1700000000000_i64
+    }))
+    .unwrap();
+    assert_eq!(prompt.user_code, "ABCD-1234");
+    assert_eq!(prompt.verification_uri, "https://github.com/login/device");
+
+    let discovery = decode_discovery(&json!({
+        "versionControlSystems": [],
+        "sourceControlProviders": [{
+            "kind": "github",
+            "label": "GitHub",
+            "executable": "gh",
+            "status": "available",
+            "installHint": "",
+            "appSignIn": true,
+            "auth": {
+                "status": "authenticated",
+                "account": { "_tag": "Some", "value": "alice" },
+                "accounts": [
+                    { "host": "github.com", "account": "alice", "authenticated": true, "active": true },
+                    { "host": "github.com", "account": "bob", "authenticated": true, "active": false },
+                    { "host": "github.com", "account": "expired", "authenticated": false, "active": false, "detail": { "_tag": "Some", "value": "Token expired" } },
+                    { "host": "ghe.local", "account": "ci-bot", "authenticated": true, "active": true, "environmentVariable": { "_tag": "Some", "value": "GH_TOKEN" } }
+                ]
+            }
+        }]
+    }));
+    let gh = &discovery.source_control_providers[0];
+    assert!(gh.app_sign_in);
+    let groups = group_host_accounts(&gh.auth.as_ref().unwrap().accounts);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].host, "github.com");
+    assert_eq!(groups[0].active_account.as_deref(), Some("alice"));
+    assert_eq!(groups[0].selectable, vec!["alice", "bob"]);
+    assert_eq!(groups[0].broken.len(), 1);
+    assert_eq!(groups[0].broken[0].account, "expired");
+    assert_eq!(groups[1].host, "ghe.local");
+    assert_eq!(groups[1].environment_variable.as_deref(), Some("GH_TOKEN"));
+
+    let mut choices = BTreeMap::new();
+    choices = next_host_account_choices(&choices, "github.com", None, Some(Some("bob".into())));
+    assert_eq!(choices["github.com"], HostAccountChoice { enabled: true, account: Some("bob".into()) });
+    // Clearing account while enabled omits the host entry (returns to default).
+    choices = next_host_account_choices(&choices, "github.com", None, Some(None));
+    assert!(choices.is_empty());
+    // Disabling keeps the entry.
+    choices = next_host_account_choices(&choices, "github.com", Some(false), None);
+    assert_eq!(choices["github.com"], HostAccountChoice { enabled: false, account: None });
+    assert_eq!(
+        SourceControlChange::SaveHostAccounts { kind: "github".into(), hosts: choices }.into_server().payload()["patch"],
+        json!({ "sourceControlHosts": { "github": { "hosts": { "github.com": { "enabled": false } } } } })
+    );
 }

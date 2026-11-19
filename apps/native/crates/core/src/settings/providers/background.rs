@@ -178,6 +178,8 @@ pub struct ProviderPanelSettings {
     pub idle_compaction: Option<String>,
     #[serde(deserialize_with = "lenient")]
     pub text_generation_model_selection: Option<Value>,
+    #[serde(deserialize_with = "lenient")]
+    pub speech_post_processing_model_selection: Option<Value>,
 }
 
 fn ms(value: Option<f64>, default: u64) -> u64 {

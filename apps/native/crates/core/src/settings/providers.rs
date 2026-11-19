@@ -13,6 +13,7 @@ pub mod form;
 pub mod wizard;
 pub mod registry;
 pub mod removal;
+pub mod text_generators;
 
 use std::collections::{HashMap, HashSet};
 
@@ -487,6 +488,8 @@ pub fn upsert_payload(settings: &ServerSettings, instance_id: &str, previous: &P
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstanceEdit {
     ConfigField { key: String, value: Value },
+    /// 3-way merged `commandArgs` edit (`#139`): merges `values` against the live server args using `base`.
+    CommandArgs { base: Vec<String>, values: Vec<String> },
     Environment(Vec<Value>),
     Enabled(bool),
     DisplayName(String),
@@ -499,6 +502,11 @@ impl InstanceEdit {
     pub fn apply(&self, instance: &ProviderInstanceConfig) -> ProviderInstanceConfig {
         match self {
             InstanceEdit::ConfigField {key,value} => form::with_field(instance,key,value.clone()),
+            InstanceEdit::CommandArgs { base, values } => {
+                let remote = form::command_args(instance);
+                let merged = form::merge_command_args(base, values, &remote);
+                form::with_field(instance, "commandArgs", json!(merged))
+            }
             InstanceEdit::Environment(rows) => form::with_environment(instance,rows.clone()),
             InstanceEdit::Enabled(enabled) => with_enabled(instance, *enabled),
             InstanceEdit::DisplayName(name) => with_display_name(instance, name),

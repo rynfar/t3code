@@ -15,6 +15,7 @@ pub const AUTH_RESPOND: &str = "provider.auth.respond";
 pub const AUTH_COMPLETE: &str = "provider.auth.complete";
 pub const AUTH_CANCEL: &str = "provider.auth.cancel";
 pub const AUTH_LOGOUT: &str = "provider.auth.logout";
+pub const AUTH_REMOVE_METHOD: &str = "provider.auth.removeMethod";
 pub const AUTH_SUBSCRIBE: &str = "provider.auth.subscribe";
 pub const INSTALL_START: &str = "provider.install.start";
 pub const INSTALL_CANCEL: &str = "provider.install.cancel";
@@ -429,6 +430,11 @@ pub fn runtime_view(provider: &ServerProvider, install: Option<&InstallState>, b
         can_remove: !active && install.is_some_and(|install| install.can_remove),
         status,
     }
+}
+
+/// `provider.auth.removeMethod` payload (`pingdotgg/t3code#29280`).
+pub fn remove_method_payload(instance_id: &str, method_id: &str) -> Value {
+    json!({ "instanceId": instance_id, "methodId": method_id })
 }
 
 /// The confirmation removing the runtime asks for.

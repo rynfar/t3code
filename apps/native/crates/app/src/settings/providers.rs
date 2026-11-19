@@ -13,6 +13,7 @@ mod dialog_config;
 mod editor;
 mod removal;
 mod form;
+mod text_generators;
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -186,6 +187,7 @@ pub(crate) struct ProvidersState {
     setup_target: Option<ProviderSettingsTarget>,
     setup_unavailable: bool,
     dialog: Option<dialog::AddDialog>,
+    text_generators: text_generators::TextGeneratorsState,
     /// Redraws once when the "Checked …" label would next read differently.
     label_timer: Option<(i64, Task<()>)>,
     _subscriptions: Vec<Subscription>,
@@ -200,6 +202,7 @@ impl ProvidersState {
     pub(super) fn leave(&mut self) {
         self.removal.model.cancel();
         self.dialog=None;
+        self.text_generators.clear();
         self.chatgpt=None;
         self.auth=None;
         self.install=None;
@@ -289,6 +292,7 @@ impl ProvidersState {
             setup_target: None,
             setup_unavailable: false,
             dialog: None,
+            text_generators: text_generators::TextGeneratorsState::default(),
             label_timer: None,
             _subscriptions: subscriptions,
         }
@@ -302,6 +306,7 @@ impl ProvidersState {
         if let Some(dialog) = &self.dialog {
             inputs.extend(dialog.inputs());
         }
+        inputs.extend(self.text_generators.inputs());
         inputs
     }
 }
@@ -432,12 +437,14 @@ impl SettingsView {
         self.sync_health_interval(&data.panel, window, cx);
 
         let providers = self.render_providers_section(&data, window, cx);
+        let text_generators = self.render_text_generators_section(cx);
         let advanced = self.render_advanced(&data.panel, cx);
         let dialog = self.render_add_dialog(window, cx);
         let removal = self.render_provider_removal(window, cx);
         let notice = self.render_notice(cx);
         vec![
             Block::new(&["providers"], v_flex().gap(r(16.)).children(notice).child(providers).children(dialog).children(removal)),
+            Block::new(&["text-generators"], text_generators),
             Block::new(&["provider-health-check-interval", "compact-idle-threads"], advanced),
         ]
     }

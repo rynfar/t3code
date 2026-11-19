@@ -528,9 +528,9 @@ impl SettingsView {
                 &self.state,
                 ServerSettingChange::ProviderInstance {
                     instance_id: id.clone(),
-                    edit: model::InstanceEdit::ConfigField {
-                        key: "commandArgs".into(),
-                        value: json!(publication.values),
+                    edit: model::InstanceEdit::CommandArgs {
+                        base: publication.base,
+                        values: publication.values,
                     },
                 },
                 move |error, cx| {
