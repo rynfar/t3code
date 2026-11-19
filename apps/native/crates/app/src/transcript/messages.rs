@@ -653,10 +653,23 @@ fn render_user_file_cards(
                 let interactive_content = if card.downloadable
                     && let Some(aid) = open_id
                 {
+                    let open_state = state.clone();
+                    let attachment = t3_core::right_panel::FileAttachment {
+                        id: aid,
+                        name: card.label.clone(),
+                        mime_type: card
+                            .attachment
+                            .get("mimeType")
+                            .and_then(Value::as_str)
+                            .unwrap_or("application/octet-stream")
+                            .to_owned(),
+                        size_bytes: card.size_bytes.unwrap_or(0),
+                        url: card.attachment.get("url").and_then(Value::as_str).map(str::to_owned),
+                    };
                     focusable(
                         content
                             .cursor_pointer()
-                            .on_click(move |_, _, cx| crate::media::open_asset(&AssetResource::Attachment { attachment_id: aid.clone() }, cx)),
+                            .on_click(move |_, _, cx| open_state.update(cx, |state, cx| state.open_attachment(attachment.clone(), cx))),
                         cx,
                     )
                     .into_any_element()

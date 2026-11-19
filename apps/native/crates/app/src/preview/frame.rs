@@ -239,6 +239,14 @@ impl FrameView {
         crop_frame_to_png(jpeg, self.viewport, target)
     }
 
+    pub fn capture_full_png(&self) -> Option<Vec<u8>> {
+        let jpeg = self.latest_jpeg.as_ref()?;
+        let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
+        let mut png = Vec::new();
+        image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+        Some(png)
+    }
+
     /// A state the page cannot show through (host setup, refused): drawn over the empty state.
     pub fn blocks(&self) -> bool {
         self.host_setup.is_some() || self.refused
@@ -1060,6 +1068,11 @@ impl FrameView {
     #[cfg(all(test, feature = "snapshot"))]
     pub(super) fn inject_stream_event_for_test(&mut self, event: StreamEvent, cx: &mut Context<Self>) {
         self.on_event(event, cx);
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn seed_jpeg_for_test(&mut self, jpeg: Vec<u8>) {
+        self.latest_jpeg = Some(jpeg.into());
     }
 }
 

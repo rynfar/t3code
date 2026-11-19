@@ -24,6 +24,7 @@ use t3_client::session::RpcError;
 use t3_core::pull_requests::failure_message;
 use tokio::task::JoinHandle;
 
+pub(crate) use detail::{DetailView, Tab as DetailTab};
 pub use link_dialog::LinkPullRequestDialog;
 pub use page::PullRequestsPage;
 pub use thread_panel::ThreadPullRequestsPanel;
@@ -98,6 +99,28 @@ pub(crate) fn link_projects(state: &AppState) -> Vec<t3_core::pull_requests::tar
 
 pub(crate) fn open_resolved_link(state: &Entity<AppState>, target: t3_core::pull_requests::target::Target, cx: &mut App) {
     if state.read(cx).environment() != Some(target.environment.as_str()) { return; }
+    let open_in_right_panel = {
+        let app = state.read(cx);
+        !app.pull_requests_open && app.selected_thread.is_some()
+    };
+    if open_in_right_panel {
+        state.update(cx, |state, cx| {
+            state.open_pull_request_surface(
+                t3_core::right_panel::PullRequestTarget {
+                    environment_id: Some(target.environment),
+                    project_id: target.reference.project_id,
+                    host: target.reference.host,
+                    repository: target.reference.repository,
+                    number: target.reference.number,
+                    url: Some(target.url.clone()),
+                    reveal_url: Some(target.url),
+                    detail_tab: None,
+                },
+                cx,
+            );
+        });
+        return;
+    }
     cx.set_global(thread_panel::PendingSelection(Some((target.reference, Some(target.url)))));
     state.update(cx, |state, cx| {
         state.set_pull_requests_open(true, cx);

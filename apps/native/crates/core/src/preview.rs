@@ -745,15 +745,132 @@ impl DiscoveredServer {
     }
 }
 
+/// `PREVIEW_URL_MAX_LENGTH` (`packages/contracts/src/preview.ts`).
+pub const PREVIEW_URL_MAX_LENGTH: usize = 2_048;
+/// `CONFIGURED_LOCAL_SERVER_URLS_MAX_ITEMS` (`packages/contracts/src/preview.ts`).
+pub const CONFIGURED_LOCAL_SERVER_URLS_MAX_ITEMS: usize = 32;
+
+/// A `DiscoveredLocalServerList` update (`servers` + `configuredUrlProbing`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiscoveredServerList {
+    pub servers: Vec<DiscoveredServer>,
+    pub configured_url_probing: bool,
+}
+
+/// Source priority for `PreviewableServer` (`useDiscoveredLocalServers.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewableServerSource {
+    Configured,
+    Scanner,
+}
+
+/// Merged live server entry shown in the preview empty state (`useDiscoveredLocalServers.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewableServer {
+    pub server: DiscoveredServer,
+    pub source: PreviewableServerSource,
+    /// Pre-resolution loopback URL used for opening & history.
+    pub requested_url: String,
+}
+
+fn is_loopback_hostname(host: &str) -> bool {
+    let normalized = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    matches!(normalized.as_str(), "localhost" | "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1" | "0.0.0.0" | "::")
+        || normalized.ends_with(".localhost")
+}
+
+fn canonical_server_key(host: &str, port: u16) -> String {
+    let normalized = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let bucket = if is_loopback_hostname(&normalized) { "loopback" } else { normalized.as_str() };
+    format!("{bucket}:{port}")
+}
+
+/// `boundConfiguredLocalServerUrls` (`portDiscoveryState.ts`): keeps up to 32 unique loopback
+/// http(s) URLs with no surrounding whitespace, deduplicating by hash-stripped URL.
+pub fn bound_configured_local_server_urls<'a>(urls: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut bounded = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in urls {
+        if raw.is_empty() || raw.len() > PREVIEW_URL_MAX_LENGTH || raw.trim().len() != raw.len() {
+            continue;
+        }
+        let Ok(parsed) = url::Url::parse(raw) else { continue };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            continue;
+        }
+        let Some(host) = parsed.host_str() else { continue };
+        let href = parsed.as_str();
+        if !is_loopback_hostname(host) || href.len() > PREVIEW_URL_MAX_LENGTH {
+            continue;
+        }
+        let mut key_url = parsed.clone();
+        key_url.set_fragment(None);
+        if !seen.insert(key_url.to_string()) {
+            continue;
+        }
+        bounded.push(href.to_owned());
+        if bounded.len() >= CONFIGURED_LOCAL_SERVER_URLS_MAX_ITEMS {
+            break;
+        }
+    }
+    bounded
+}
+
 /// A `DiscoveredLocalServerList` update, sorted by port as `mergeServers` sorts scanner results.
 pub fn decode_discovered_servers(value: &Value) -> Vec<DiscoveredServer> {
+    decode_discovered_server_list(value).servers
+}
+
+pub fn decode_discovered_server_list(value: &Value) -> DiscoveredServerList {
     let mut servers: Vec<DiscoveredServer> = value
         .get("servers")
         .and_then(Value::as_array)
         .map(|servers| servers.iter().filter_map(|server| serde_json::from_value(server.clone()).ok()).collect())
         .unwrap_or_default();
     servers.sort_by_key(|server| server.port);
-    servers
+    let configured_url_probing = value.get("configuredUrlProbing").and_then(Value::as_bool).unwrap_or(false);
+    DiscoveredServerList { servers, configured_url_probing }
+}
+
+/// `mergeServers` (`useDiscoveredLocalServers.ts`): promotes scanned local servers whose host/port
+/// match a configured loopback URL ahead of other scanned servers, sorted by port within each tier.
+pub fn merge_discovered_servers(
+    scanner: &[DiscoveredServer],
+    configured_urls: &[String],
+    configured_url_probing: bool,
+) -> Vec<PreviewableServer> {
+    let mut configured_by_server = std::collections::HashMap::<String, String>::new();
+    for raw in configured_urls {
+        let Ok(parsed) = url::Url::parse(raw) else { continue };
+        if !matches!(parsed.scheme(), "http" | "https") {
+            continue;
+        }
+        let Some(host) = parsed.host_str() else { continue };
+        if !is_loopback_hostname(host) {
+            continue;
+        }
+        let Some(port) = parsed.port_or_known_default() else { continue };
+        configured_by_server.entry(canonical_server_key(host, port)).or_insert_with(|| parsed.to_string());
+    }
+
+    let mut merged: Vec<PreviewableServer> = scanner
+        .iter()
+        .map(|server| {
+            let key = canonical_server_key(&server.host, server.port);
+            let configured = configured_by_server.get(&key);
+            let requested_url = match configured {
+                Some(url) if !configured_url_probing => url.clone(),
+                _ => server.url.clone(),
+            };
+            PreviewableServer {
+                server: server.clone(),
+                source: if configured.is_some() { PreviewableServerSource::Configured } else { PreviewableServerSource::Scanner },
+                requested_url,
+            }
+        })
+        .collect();
+    merged.sort_by_key(|entry| (matches!(entry.source, PreviewableServerSource::Scanner), entry.server.port));
+    merged
 }
 
 #[cfg(test)]

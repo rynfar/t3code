@@ -243,3 +243,30 @@ fn a_thread_shown_again_catches_its_tabs_up_with_changes_made_while_hidden() {
     follow(&mut panels, edit);
     assert!(browser_tabs(&panels).is_empty());
 }
+
+#[test]
+fn configured_local_server_urls_are_bounded_and_prioritized_on_merge() {
+    let bounded = bound_configured_local_server_urls([
+        "http://localhost:5173/app#top",
+        "http://localhost:5173/app#other",
+        " http://localhost:3000",
+        "https://example.com:3000",
+        "http://127.0.0.1:4000/dashboard",
+    ]);
+    assert_eq!(bounded, ["http://localhost:5173/app#top", "http://127.0.0.1:4000/dashboard"]);
+
+    let list = decode_discovered_server_list(&json!({
+        "configuredUrlProbing": false,
+        "servers": [
+            { "host": "127.0.0.1", "port": 3000, "url": "http://127.0.0.1:3000/", "processName": "next" },
+            { "host": "localhost", "port": 5173, "url": "http://localhost:5173/", "processName": "vite" }
+        ]
+    }));
+    let merged = merge_discovered_servers(&list.servers, &bounded, list.configured_url_probing);
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].source, PreviewableServerSource::Configured);
+    assert_eq!(merged[0].server.port, 5173);
+    assert_eq!(merged[0].requested_url, "http://localhost:5173/app#top");
+    assert_eq!(merged[1].source, PreviewableServerSource::Scanner);
+    assert_eq!(merged[1].server.port, 3000);
+}

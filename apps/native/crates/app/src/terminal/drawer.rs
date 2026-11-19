@@ -17,8 +17,8 @@ use t3_client::store;
 use t3_core::composer::context::TerminalSelection;
 use t3_core::files::metadata::MetadataCache;
 use t3_core::terminal::{
-    self, LaunchLocation, MetadataEvent, SplitDirection, TerminalAccess, TerminalLayouts, TerminalSummary, ThreadTerminalLayout,
-    method,
+    self, LaunchLocation, MetadataEvent, SplitDirection, TerminalAccess, TerminalFocusQueue, TerminalLayouts, TerminalSummary,
+    ThreadEnterFocusDecision, ThreadTerminalLayout, method,
 };
 use tokio::sync::mpsc;
 
@@ -40,11 +40,133 @@ pub struct RunningTerminals {
 
 impl gpui::Global for RunningTerminals {}
 
-/// The workspace's live terminal drawer, so `runProjectScript` (`GT-SCRIPTS`) can open and focus
-/// the script's terminal from `GitStore` or keybindings without holding a `Window`.
+/// The workspace's live terminal drawer, so `runProjectScript` (`GT-SCRIPTS`) and right-panel
+/// terminal tabs can share metadata, grants, ID allocation, and focus tracking without holding a `Window`.
 struct ActiveDrawer(gpui::WeakEntity<TerminalDrawer>);
 
 impl gpui::Global for ActiveDrawer {}
+
+/// Shared pending-focus queue (`apps/web/src/lib/terminalFocus.ts`) coordinating drawer and
+/// right-panel terminal viewports.
+#[derive(Default)]
+struct FocusQueue(TerminalFocusQueue);
+
+impl gpui::Global for FocusQueue {}
+
+pub(crate) fn active_drawer(cx: &App) -> Option<Entity<TerminalDrawer>> {
+    cx.try_global::<ActiveDrawer>().and_then(|active| active.0.upgrade())
+}
+
+pub(crate) fn request_terminal_focus(thread_id: &str, terminal_id: &str, cx: &mut App) {
+    cx.default_global::<FocusQueue>().0.request(thread_id, terminal_id);
+}
+
+pub(crate) fn request_terminal_focus_on_navigation(thread_id: &str, terminal_id: &str, cx: &mut App) {
+    cx.default_global::<FocusQueue>().0.request_on_navigation(thread_id, terminal_id);
+}
+
+pub(crate) fn cancel_terminal_focus(thread_id: &str, cx: &mut App) {
+    if cx.has_global::<FocusQueue>() {
+        cx.global_mut::<FocusQueue>().0.cancel(thread_id);
+    }
+}
+
+pub(crate) fn consume_terminal_focus(thread_id: &str, terminal_id: &str, visible: bool, can_operate: bool, cx: &mut App) -> bool {
+    cx.has_global::<FocusQueue>()
+        && cx.global_mut::<FocusQueue>().0.consume_if_ready(thread_id, terminal_id, visible, can_operate)
+}
+
+pub(crate) fn record_terminal_focus(thread_id: &str, terminal_id: &str, cx: &mut App) {
+    cx.default_global::<FocusQueue>().0.record_terminal_focus(thread_id, terminal_id);
+}
+
+/// `focusPanelTerminalAfterClose` (`apps/web/src/lib/terminalFocus.ts:107-116`): after a right
+/// panel surface closes, focuses a newly exposed terminal surface; a terminal surface that was
+/// already active keeps its focus as is.
+pub(crate) fn focus_panel_terminal_after_close(
+    state: &AppState,
+    thread_id: &str,
+    previous_active_surface_id: Option<&str>,
+    cx: &mut App,
+) {
+    let panel = state.panels.panels.panel(thread_id);
+    if !panel.is_open || panel.active_surface_id.as_deref() == previous_active_surface_id {
+        return;
+    }
+    if let Some(t3_core::right_panel::SurfaceKind::Terminal { active_terminal_id, .. }) =
+        panel.active().map(|surface| &surface.kind)
+    {
+        request_terminal_focus(thread_id, active_terminal_id, cx);
+    }
+}
+
+/// Label for a terminal tab or pane (`session_label`), reading server metadata when available.
+pub(crate) fn terminal_label(thread_id: &str, terminal_id: &str, cx: &App) -> String {
+    cx.try_global::<ActiveDrawer>()
+        .and_then(|active| active.0.upgrade())
+        .map(|drawer| drawer.read(cx).label(thread_id, terminal_id))
+        .unwrap_or_else(|| terminal::session_label(terminal_id, None))
+}
+
+pub(crate) fn can_operate_terminals(cx: &App) -> bool {
+    cx.try_global::<ActiveDrawer>()
+        .and_then(|active| active.0.upgrade())
+        .is_some_and(|drawer| drawer.read(cx).can_operate())
+}
+
+pub(crate) fn link_metadata_cache(cx: &App) -> Option<SharedMetadataCache> {
+    cx.try_global::<ActiveDrawer>()
+        .and_then(|active| active.0.upgrade())
+        .map(|drawer| drawer.read(cx).link_metadata.clone())
+}
+
+pub(crate) fn terminal_location(state: &AppState, thread_id: &str, terminal_id: Option<&str>, cx: &App) -> Option<LaunchLocation> {
+    if let Some(drawer) = cx.try_global::<ActiveDrawer>().and_then(|active| active.0.upgrade()) {
+        return drawer.read(cx).location_with_state(state, thread_id, terminal_id);
+    }
+    let (root, thread_worktree) = if let Some(thread) = state.thread_shell(thread_id) {
+        (&state.shell.project(&thread.project_id)?.workspace_root, thread.worktree_path.as_deref())
+    } else {
+        let project_id = thread_id.strip_prefix("draft:")?;
+        let project = state.shell.project(project_id)?;
+        if project.workspace_root.is_empty() {
+            return None;
+        }
+        (&project.workspace_root, None)
+    };
+    Some(LaunchLocation::new(root, thread_worktree))
+}
+
+pub(crate) fn allocate_panel_terminal_id(state: &AppState, thread_id: &str, cx: &App) -> String {
+    if let Some(drawer) = cx.try_global::<ActiveDrawer>().and_then(|active| active.0.upgrade()) {
+        return drawer.read(cx).allocate_id_with_state(state, thread_id);
+    }
+    let panel_ids = state.panels.panels.panel_terminal_ids(thread_id);
+    let suffix = uuid::Uuid::new_v4().to_string();
+    terminal::next_terminal_id(panel_ids.iter().map(String::as_str), Some(&suffix))
+}
+
+/// Launches a PTY session for a right-panel terminal tab (`terminal.open`).
+pub(crate) fn launch_panel_terminal(state: &AppState, thread_id: &str, terminal_id: &str, cx: &App) -> Option<LaunchLocation> {
+    let location = terminal_location(state, thread_id, None, cx)?;
+    let client = state.client_handle()?;
+    let open = client.request(method::OPEN, terminal::open_input(thread_id, terminal_id, &location, None));
+    state.runtime().spawn(open);
+    Some(location)
+}
+
+/// Ends a terminal session and deletes its history; a failed close falls back to typing `exit`.
+pub(crate) fn close_terminal_session(state: &AppState, thread_id: &str, terminal_id: &str) {
+    if let Some(client) = state.client_handle() {
+        let (thread_id, terminal_id) = (thread_id.to_owned(), terminal_id.to_owned());
+        state.runtime().spawn(async move {
+            let closed = client.request(method::CLOSE, terminal::close_input(&thread_id, &terminal_id, true)).await;
+            if let Err(RpcError::Failure(_)) = closed {
+                let _ = client.request(method::WRITE, terminal::write_input(&thread_id, &terminal_id, "exit\n")).await;
+            }
+        });
+    }
+}
 
 /// Opens and focuses `terminal_id` in `thread_id`'s terminal drawer (`useChatTerminalActions.ts`).
 pub fn open_script_terminal(thread_id: String, terminal_id: String, cx: &mut App) {
@@ -96,7 +218,7 @@ impl TerminalDrawer {
         let layouts = TerminalLayouts::from_saved(load_layouts());
         let subscription = cx.subscribe_in(&app, window, |drawer, _, event: &AppEvent, window, cx| match event {
             AppEvent::Phase => drawer.connection_changed(window, cx),
-            AppEvent::Selection | AppEvent::Shell => drawer.sync_selection(window, cx),
+            AppEvent::Selection | AppEvent::Shell | AppEvent::RightPanel => drawer.sync_selection(window, cx),
             _ => {}
         });
         let mut drawer = TerminalDrawer {
@@ -170,7 +292,7 @@ impl TerminalDrawer {
         if self.metadata.is_none()
             && let Some(client) = self.app.read(cx).client_handle()
         {
-            self.watch_grants(&client, cx);
+            self.watch_grants(&client, window, cx);
             self.start_metadata(client, window, cx);
         }
         self.sync_selection(window, cx);
@@ -181,15 +303,19 @@ impl TerminalDrawer {
     }
 
     /// Follows this device's grants; the last answer holds while reconnecting.
-    fn watch_grants(&mut self, client: &t3_client::supervisor::ClientHandle, cx: &mut Context<Self>) {
+    fn watch_grants(&mut self, client: &t3_client::supervisor::ClientHandle, window: &mut Window, cx: &mut Context<Self>) {
         let mut grants = client.session_state();
         self.access = TerminalAccess::of(grants.borrow_and_update().as_ref());
-        self.grants = Some(cx.spawn(async move |this, cx| {
+        self.grants = Some(cx.spawn_in(window, async move |this, cx| {
             while grants.changed().await.is_ok() {
                 let access = TerminalAccess::of(grants.borrow_and_update().as_ref());
-                let updated = this.update(cx, |drawer, cx| {
+                let updated = this.update_in(cx, |drawer, window, cx| {
                     if drawer.access != access {
+                        let gained_operate = !drawer.access.operate && access.operate;
                         drawer.access = access;
+                        if gained_operate {
+                            drawer.ensure_panes(window, cx);
+                        }
                         cx.notify();
                     }
                 });
@@ -261,14 +387,43 @@ impl TerminalDrawer {
         if self.panes_thread != selected {
             self.panes.clear();
             let mut cache = self.link_metadata.borrow_mut();
-            if let Some(previous) = self.panes_thread.take() {
-                cache.1.release_thread(&previous);
+            let previous = self.panes_thread.take();
+            if let Some(previous) = &previous {
+                cache.1.release_thread(previous);
             }
             if let Some(thread_id) = &selected {
                 cache.1.retain_thread(thread_id);
             }
             drop(cache);
-            self.panes_thread = selected;
+            if let Some(previous) = &previous {
+                cx.default_global::<FocusQueue>().0.leave_thread(previous);
+            }
+            self.panes_thread = selected.clone();
+            if let Some(thread_id) = &selected {
+                let layout = self.layouts.get(thread_id).normalized();
+                let active_group_ids = layout.visible_terminal_ids();
+                let active_drawer_tid = (!layout.active_terminal_id.is_empty()).then_some(layout.active_terminal_id.as_str());
+                let panel_tids: Option<Vec<String>> = self
+                    .app
+                    .read(cx)
+                    .panels
+                    .panels
+                    .active_surface(thread_id)
+                    .and_then(|surface| match &surface.kind {
+                        t3_core::right_panel::SurfaceKind::Terminal { terminal_ids, .. } => Some(terminal_ids.clone()),
+                        _ => None,
+                    });
+                let decision = cx.default_global::<FocusQueue>().0.enter_thread(
+                    thread_id,
+                    layout.terminal_open,
+                    &active_group_ids,
+                    active_drawer_tid,
+                    panel_tids.as_deref(),
+                );
+                if matches!(decision, ThreadEnterFocusDecision::FocusComposer) {
+                    cancel_terminal_focus(thread_id, cx);
+                }
+            }
         }
         self.reconcile(cx);
         self.ensure_panes(window, cx);
@@ -281,16 +436,31 @@ impl TerminalDrawer {
         for terminal_id in &visible_ids {
             self.pane(&thread_id, terminal_id, window, cx);
         }
+        let can_operate = self.access.operate;
+        let mut focus_target = None;
         for (terminal_id, pane) in &self.panes {
             let visible = layout.terminal_open && visible_ids.iter().any(|id| id == terminal_id);
             pane.update(cx, |pane, cx| pane.set_visible(visible, cx));
+            if visible && consume_terminal_focus(&thread_id, terminal_id, true, can_operate, cx) {
+                focus_target = Some(pane.clone());
+            }
+        }
+        if let Some(pane) = focus_target {
+            window.focus(&pane.focus_handle(cx), cx);
         }
     }
 
-    /// Adopts the server's terminal list for the selected thread (the drawer's reconcile effect).
+    /// Adopts the server's terminal list for the selected thread (the drawer's reconcile effect),
+    /// excluding terminals currently owned by right-panel terminal tabs
+    /// (`PersistentThreadTerminals.tsx:124-129`).
     fn reconcile(&mut self, cx: &mut Context<Self>) {
         let (Some(thread_id), Some(summaries)) = (self.selected_thread(cx), self.summaries.as_ref()) else { return };
-        let server_ids: Vec<String> = terminal::thread_terminals(summaries, &thread_id).iter().map(|t| t.terminal_id.clone()).collect();
+        let panel_ids = self.app.read(cx).panels.panels.panel_terminal_ids(&thread_id);
+        let server_ids: Vec<String> = terminal::thread_terminals(summaries, &thread_id)
+            .into_iter()
+            .filter(|t| !panel_ids.contains(&t.terminal_id))
+            .map(|t| t.terminal_id.clone())
+            .collect();
         let client_ids = self.layouts.get(&thread_id).normalized().terminal_ids;
         if terminal::should_reconcile(&server_ids, &client_ids) && self.layouts.reconcile(&thread_id, &server_ids) {
             self.drop_stale_panes(&thread_id);
@@ -322,7 +492,10 @@ impl TerminalDrawer {
     /// Where a terminal runs: its server session's cwd when known (reopening elsewhere would
     /// restart it), otherwise the thread's worktree or the thread/draft's project root.
     fn location(&self, thread_id: &str, terminal_id: Option<&str>, cx: &App) -> Option<LaunchLocation> {
-        let app = self.app.read(cx);
+        self.location_with_state(self.app.read(cx), thread_id, terminal_id)
+    }
+
+    fn location_with_state(&self, app: &AppState, thread_id: &str, terminal_id: Option<&str>) -> Option<LaunchLocation> {
         let (root, thread_worktree) = if let Some(thread) = app.thread_shell(thread_id) {
             (&app.shell.project(&thread.project_id)?.workspace_root, thread.worktree_path.as_deref())
         } else {
@@ -368,7 +541,10 @@ impl TerminalDrawer {
         let (thread, terminal) = (thread_id.to_owned(), terminal_id.to_owned());
         cx.subscribe_in(&pane, window, move |drawer, _, event: &PaneEvent, window, cx| match event {
             PaneEvent::Exited => drawer.close_terminal(&thread, &terminal, window, cx),
-            PaneEvent::Activated => drawer.activate(&terminal, window, cx),
+            PaneEvent::Activated => {
+                record_terminal_focus(&thread, &terminal, cx);
+                drawer.activate(&terminal, window, cx);
+            }
             PaneEvent::AddToChat(excerpt) => drawer.add_to_chat(&thread, &terminal, excerpt.clone(), cx),
         })
         .detach();
@@ -392,9 +568,14 @@ impl TerminalDrawer {
     fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((thread_id, layout)) = self.layout(cx) else { return };
         if !layout.terminal_open || layout.active_terminal_id.is_empty() {
+            cancel_terminal_focus(&thread_id, cx);
             return;
         }
-        if let Some(pane) = self.pane(&thread_id, &layout.active_terminal_id, window, cx) {
+        request_terminal_focus(&thread_id, &layout.active_terminal_id, cx);
+        let can_operate = self.access.operate;
+        if let Some(pane) = self.pane(&thread_id, &layout.active_terminal_id, window, cx)
+            && consume_terminal_focus(&thread_id, &layout.active_terminal_id, true, can_operate, cx)
+        {
             window.focus(&pane.focus_handle(cx), cx);
         }
     }
@@ -450,6 +631,7 @@ impl TerminalDrawer {
     /// Opens `terminal_id` in `thread_id`'s drawer layout and focuses it when `thread_id` is open.
     pub fn open_terminal_for_thread(&mut self, thread_id: &str, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.layouts.ensure(thread_id, terminal_id, true, Some(true));
+        request_terminal_focus_on_navigation(thread_id, terminal_id, cx);
         if self.selected_thread(cx).as_deref() == Some(thread_id) {
             self.changed(window, cx);
         } else {
@@ -496,24 +678,35 @@ impl TerminalDrawer {
         let thread_id = self.selected_thread(cx)?;
         let location = self.location(&thread_id, None, cx)?;
         let client = self.app.read(cx).client_handle()?;
-        let terminal_id = self.allocate_id(&thread_id);
+        let terminal_id = self.allocate_id(&thread_id, cx);
         place(&mut self.layouts, &thread_id, &terminal_id);
         let open = client.request(method::OPEN, terminal::open_input(&thread_id, &terminal_id, &location, None));
         self.app.read(cx).runtime().spawn(open);
         Some(terminal_id)
     }
 
-    /// The lowest free `term-N`; without the server's list, suffixed so it cannot collide with
-    /// a session this client has not seen.
-    fn allocate_id(&self, thread_id: &str) -> String {
+    /// The lowest free `term-N` across server sessions, drawer layouts, and right-panel terminal
+    /// tabs; without the server's list, suffixed so it cannot collide with an unseen session.
+    pub(super) fn allocate_id(&self, thread_id: &str, cx: &App) -> String {
+        self.allocate_id_with_state(self.app.read(cx), thread_id)
+    }
+
+    fn allocate_id_with_state(&self, state: &AppState, thread_id: &str) -> String {
         let layout_ids = self.layouts.get(thread_id).terminal_ids;
+        let panel_ids = state.panels.panels.panel_terminal_ids(thread_id);
         let server_ids: Vec<&str> = self
             .summaries
             .as_ref()
             .map(|summaries| summaries.iter().filter(|t| t.thread_id == thread_id).map(|t| t.terminal_id.as_str()).collect())
             .unwrap_or_default();
         let suffix = self.summaries.is_none().then(|| uuid::Uuid::new_v4().to_string());
-        terminal::next_terminal_id(server_ids.into_iter().chain(layout_ids.iter().map(String::as_str)), suffix.as_deref())
+        terminal::next_terminal_id(
+            server_ids
+                .into_iter()
+                .chain(layout_ids.iter().map(String::as_str))
+                .chain(panel_ids.iter().map(String::as_str)),
+            suffix.as_deref(),
+        )
     }
 
     pub fn activate(&mut self, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {

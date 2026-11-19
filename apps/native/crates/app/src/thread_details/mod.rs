@@ -15,7 +15,7 @@ mod view;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use gpui::{Action, App, AppContext, Context, Entity, EventEmitter, Global, Task, Window, actions};
+use gpui::{Action, App, AppContext, Context, Entity, EventEmitter, Global, Subscription, Task, Window, actions};
 use serde::{Deserialize, Serialize};
 use t3_client::store;
 use t3_core::project_scripts::{ProjectScript, preferred_script, resolve_project_scripts};
@@ -98,6 +98,7 @@ pub struct Details {
     popover_closed_at: Option<Instant>,
     remote_capable_editors: Option<Vec<String>>,
     remote_editor_probe: Option<Task<()>>,
+    _git_subscription: Option<Subscription>,
 }
 
 impl EventEmitter<DetailsEvent> for Details {}
@@ -141,7 +142,20 @@ impl Details {
             popover_closed_at: None,
             remote_capable_editors: None,
             remote_editor_probe: None,
+            _git_subscription: None,
         }
+    }
+
+    fn observe_git(&mut self, cx: &mut Context<Self>) {
+        if self._git_subscription.is_some() {
+            return;
+        }
+        let git = self.git.clone();
+        self._git_subscription = Some(cx.subscribe(&git, |_, _, event: &crate::git::GitEvent, cx| {
+            if *event == crate::git::GitEvent::Changed {
+                cx.emit(DetailsEvent::Changed);
+            }
+        }));
     }
 
     pub(crate) fn start_remote_editor_probe(&mut self, cx: &mut Context<Self>) {
@@ -400,7 +414,11 @@ pub(crate) fn point_in_find_bar(find_open: bool, position: gpui::Point<gpui::Pix
 /// `editor.openFavorite`.
 pub fn init(state: Entity<AppState>, cx: &mut App) -> Entity<Details> {
     let git = crate::git::init(state.clone(), cx);
-    let details = cx.new(|_| Details::new(git));
+    let details = cx.new(|cx| {
+        let mut details = Details::new(git);
+        details.observe_git(cx);
+        details
+    });
     cx.set_global(DetailsGlobal(details.clone()));
     details.update(cx, |details, cx| details.start_remote_editor_probe(cx));
     let toggle = (state.clone(), details.clone());

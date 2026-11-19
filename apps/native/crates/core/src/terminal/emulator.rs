@@ -10,7 +10,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::Selection;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
@@ -22,7 +22,19 @@ pub use alacritty_terminal::selection::SelectionType;
 pub use alacritty_terminal::term::TermMode;
 pub use alacritty_terminal::vte::ansi::Rgb;
 
-const SCROLLBACK_LINES: usize = 5_000;
+/// 10 MB scrollback byte budget (`pingdotgg/t3code#8766`, matching Ghostty's `MAX_SCROLLBACK_BYTES`).
+pub const MAX_SCROLLBACK_BYTES: usize = 10_000_000;
+const MAX_SCROLLBACK_LINES: usize = 100_000;
+
+/// Scrollback line limit derived from a byte budget and terminal column width so narrow panes stay
+/// bounded while normal-width panes retain thousands of lines within `budget_bytes`.
+pub fn scrollback_lines_for_budget(cols: u16, budget_bytes: usize) -> usize {
+    if budget_bytes == 0 {
+        return 0;
+    }
+    let bytes_per_row = (cols.max(1) as usize).saturating_mul(std::mem::size_of::<Cell>().max(1));
+    (budget_bytes / bytes_per_row.max(1)).clamp(1, MAX_SCROLLBACK_LINES)
+}
 
 struct Size(Grid);
 
@@ -160,19 +172,30 @@ pub struct Emulator {
     events: Listener,
     theme: ThemeColors,
     cell_size: (f32, f32),
+    scrollback_bytes: usize,
 }
 
 impl Emulator {
     pub fn new(grid: Grid, theme: ThemeColors) -> Self {
+        Self::with_scrollback_bytes(grid, theme, MAX_SCROLLBACK_BYTES)
+    }
+
+    pub fn with_scrollback_bytes(grid: Grid, theme: ThemeColors, scrollback_bytes: usize) -> Self {
         let events = Listener::default();
-        let config = Config { scrolling_history: SCROLLBACK_LINES, ..Config::default() };
+        let scrolling_history = scrollback_lines_for_budget(grid.cols, scrollback_bytes);
+        let config = Config { scrolling_history, ..Config::default() };
         Emulator {
             term: Term::new(config, &Size(grid), events.clone()),
             parser: Processor::new(),
             events,
             theme,
             cell_size: (7., 16.),
+            scrollback_bytes,
         }
+    }
+
+    pub fn scrollback_line_limit(&self) -> usize {
+        scrollback_lines_for_budget(self.grid().cols, self.scrollback_bytes)
     }
 
     pub fn set_theme(&mut self, theme: ThemeColors) {
@@ -193,7 +216,7 @@ impl Emulator {
     /// An empty emulator with this one's grid, theme and cell size. A session replays history
     /// into it without holding the lock the UI needs, then swaps it in.
     pub fn blank(&self) -> Emulator {
-        Emulator { cell_size: self.cell_size, ..Emulator::new(self.grid(), self.theme) }
+        Emulator { cell_size: self.cell_size, ..Emulator::with_scrollback_bytes(self.grid(), self.theme, self.scrollback_bytes) }
     }
 
     /// Parses a session's history. Replies are dropped: they answered queries from a program
@@ -258,6 +281,10 @@ impl Emulator {
 
     pub fn resize(&mut self, grid: Grid) {
         if grid != self.grid() {
+            self.term.set_options(Config {
+                scrolling_history: scrollback_lines_for_budget(grid.cols, self.scrollback_bytes),
+                ..Config::default()
+            });
             self.term.resize(Size(grid));
         }
     }
@@ -767,5 +794,25 @@ mod tests {
 
         emulator.feed(b"\x1b[?1003l");
         assert!(!emulator.mouse_tracking());
+    }
+
+    #[test]
+    fn byte_budget_scrollback_retains_thousands_of_rows_and_scales_with_width() {
+        let lines_80 = scrollback_lines_for_budget(80, MAX_SCROLLBACK_BYTES);
+        let lines_160 = scrollback_lines_for_budget(160, MAX_SCROLLBACK_BYTES);
+        assert!(lines_80 >= 3_000, "80-col 10 MB budget should retain thousands of rows, got {lines_80}");
+        assert!(lines_80 > lines_160, "wider terminals should get fewer lines for the same byte budget");
+        assert_eq!(scrollback_lines_for_budget(80, 0), 0);
+
+        // A small explicit budget caps scrollback history cleanly.
+        let small_budget = 80 * std::mem::size_of::<Cell>() * 25;
+        let mut emulator = Emulator::with_scrollback_bytes(Grid::new(80, 5), theme(), small_budget);
+        assert_eq!(emulator.scrollback_line_limit(), 25);
+        for line in 1..=60 {
+            emulator.feed(format!("row-{line}\r\n").as_bytes());
+        }
+        let mut snapshot = Snapshot::default();
+        emulator.snapshot(&mut snapshot);
+        assert_eq!(snapshot.history, 25);
     }
 }

@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use t3_client::store;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::diff::{turn_diff_summaries, workspace_mutation_id};
-use t3_core::files::{breadcrumbs, is_host_path, is_markdown};
-use t3_core::right_panel::SurfaceKind;
+use t3_core::files::{breadcrumbs, group_thousands, is_host_path, is_markdown};
+use t3_core::right_panel::{FileAttachment, SurfaceKind, breadcrumb_path_of, retained_breadcrumb_trail};
 
 pub use actions::FileWorkspace;
 pub use explorer::init;
@@ -96,6 +96,8 @@ struct Shown {
     path: Option<String>,
     reveal_line: Option<u64>,
     reveal_request_id: u64,
+    attachment: Option<FileAttachment>,
+    folder_trail: Option<String>,
 }
 
 struct ExplorerResize;
@@ -178,14 +180,29 @@ impl FilesPanel {
         let root = state.environment().zip(state.file_workspace()).map(|(environment, workspace)| Root { environment: environment.to_owned(), workspace });
         let connected = matches!(state.phase, Phase::Online(ConnectionStatus::Connected));
         let shown = state.panel_thread().as_deref().and_then(|thread| state.panels.panels.active_surface(thread)).and_then(|surface| match &surface.kind {
-            SurfaceKind::Files => Some(Shown { surface_id: surface.id.clone(), path: None, reveal_line: None, reveal_request_id: 0 }),
-            SurfaceKind::File { relative_path, reveal_line, reveal_request_id } => Some(Shown {
+            SurfaceKind::Files { folder_trail } => Some(Shown {
+                surface_id: surface.id.clone(),
+                path: None,
+                reveal_line: None,
+                reveal_request_id: 0,
+                attachment: None,
+                folder_trail: folder_trail.clone(),
+            }),
+            SurfaceKind::File { relative_path, reveal_line, reveal_request_id, attachment, folder_trail } => Some(Shown {
                 surface_id: surface.id.clone(),
                 path: Some(relative_path.clone()),
                 reveal_line: *reveal_line,
                 reveal_request_id: *reveal_request_id,
+                attachment: attachment.clone(),
+                folder_trail: folder_trail.clone(),
             }),
-            SurfaceKind::Diff | SurfaceKind::PullRequests | SurfaceKind::SideChat { .. } | SurfaceKind::Preview { .. } | SurfaceKind::Device { .. } => None,
+            SurfaceKind::Diff
+            | SurfaceKind::PullRequests
+            | SurfaceKind::PullRequest { .. }
+            | SurfaceKind::Terminal { .. }
+            | SurfaceKind::SideChat { .. }
+            | SurfaceKind::Preview { .. }
+            | SurfaceKind::Device { .. } => None,
         });
         let projection = state
             .thread
@@ -218,7 +235,7 @@ impl FilesPanel {
         // Hidden files do no work: they catch up when they show.
         if visible {
             self.explorer.update(cx, |explorer, cx| explorer.set_root(root.clone(), cx));
-            let target = shown.as_ref().zip(root.as_ref()).and_then(|(shown, root)| {
+            let target = shown.as_ref().filter(|shown| shown.attachment.is_none()).zip(root.as_ref()).and_then(|(shown, root)| {
                 Some(preview::Target {
                     root: root.clone(),
                     path: shown.path.clone()?,
@@ -277,14 +294,22 @@ impl FilesPanel {
         let project = root.map_or("", |root| root.workspace.project_name.as_str());
         let surface_id = self.shown.as_ref().map(|shown| shown.surface_id.clone()).unwrap_or_default();
         let is_folder = !previewing;
-        let crumbs = breadcrumbs(project, path);
+        let current_canonical = breadcrumb_path_of(path);
+        let trail = retained_breadcrumb_trail(self.shown.as_ref().and_then(|shown| shown.folder_trail.as_deref()), path);
+        let crumbs = breadcrumbs(project, &trail);
+        let current_index = crumbs
+            .iter()
+            .position(|crumb| crumb.path == current_canonical)
+            .unwrap_or_else(|| crumbs.len().saturating_sub(1));
         let crumb_row = h_flex().id("file-breadcrumbs").min_w_0().flex_1().overflow_x_scroll().text_xs().children(crumbs.into_iter().enumerate().flat_map(|(index, crumb)| {
             let label: SharedString = crumb.label.clone().into();
-            let separator = (index > 0).then(|| Icon::ChevronRight.svg().flex_none().size(px(12.)).mx(px(2.)).text_color(hsla(p.muted_foreground).opacity(0.6)).into_any_element());
+            let separator = (index > 0).then(|| Icon::ChevronRight.svg().flex_none().size(px(12.)).mx(px(2.)).text_color(hsla(p.muted_foreground).opacity(if index > current_index { 0.35 } else { 0.6 })).into_any_element());
             let state = self.state.clone();
             let surface_id = surface_id.clone();
             let folder = crumb.path.clone();
-            let current = crumb.is_last;
+            let trail_for_click = trail.clone();
+            let current = index == current_index;
+            let descendant = index > current_index;
             let item = div()
                 .id(("file-crumb", index))
                 .flex_none()
@@ -294,11 +319,13 @@ impl FilesPanel {
                 .whitespace_nowrap()
                 .when(current, |this| this.font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)))
                 .when(!current, |this| {
-                    this.text_color(hsla(p.muted_foreground))
+                    this.text_color(hsla(p.muted_foreground).opacity(if descendant { 0.6 } else { 1. }))
                         .cursor_pointer()
                         .hover(|style| style.bg(hsla(p.accent)).text_color(hsla(p.foreground)))
                         .on_click(move |_, _, cx| {
-                            state.update(cx, |state, cx| state.navigate_file_folder(&surface_id, &folder, !is_folder, cx));
+                            state.update(cx, |state, cx| {
+                                state.navigate_file_folder_with_trail(&surface_id, &folder, &trail_for_click, !is_folder, cx);
+                            });
                         })
                 })
                 .child(label)
@@ -406,6 +433,106 @@ impl FilesPanel {
             })
             .child(self.explorer.clone())
     }
+    fn render_attachment(&self, attachment: &FileAttachment, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let p = palette(cx);
+        let size_label = format!("{} bytes", group_thousands(attachment.size_bytes));
+        let open_target = attachment_open_target(attachment);
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .bg(hsla(p.background))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .h(px(28.))
+                    .mb(px(12.))
+                    .px(px(12.))
+                    .gap(px(6.))
+                    .items_center()
+                    .bg(hsla(p.background))
+                    .child(Icon::Paperclip.render(px(13.), hsla(p.muted_foreground)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.foreground))
+                            .child(attachment.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(hsla(p.muted_foreground))
+                            .child(format!("{} · {size_label}", attachment.mime_type)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.))
+                    .px(px(20.))
+                    .child(Icon::FileText.render(px(28.), hsla(p.muted_foreground).opacity(0.6)))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(hsla(p.foreground))
+                            .child(attachment.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(p.muted_foreground))
+                            .child(format!("{} ({size_label})", attachment.mime_type)),
+                    )
+                    .when_some(open_target, |this, target| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "attachment-open-url".into())
+                                .child(
+                                    Button::new("attachment-open-url")
+                                        .icon(Icon::ExternalLink)
+                                        .label("Open attachment")
+                                        .on_click(move |_, _, cx| match &target {
+                                            AttachmentOpenTarget::Url(url) => cx.open_url(url),
+                                            AttachmentOpenTarget::ServerAsset(attachment_id) => {
+                                                crate::media::open_asset(
+                                                    &t3_core::media::AssetResource::Attachment {
+                                                        attachment_id: attachment_id.clone(),
+                                                    },
+                                                    cx,
+                                                );
+                                            }
+                                        }),
+                                ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachmentOpenTarget {
+    Url(String),
+    ServerAsset(String),
+}
+
+fn attachment_open_target(attachment: &FileAttachment) -> Option<AttachmentOpenTarget> {
+    if let Some(url) = attachment.url.as_ref().filter(|u| u.starts_with("http://") || u.starts_with("https://")) {
+        return Some(AttachmentOpenTarget::Url(url.clone()));
+    }
+    let id = attachment.id.trim();
+    if !id.is_empty() {
+        return Some(AttachmentOpenTarget::ServerAsset(id.to_owned()));
+    }
+    None
 }
 
 impl Render for FilesPanel {
@@ -414,6 +541,9 @@ impl Render for FilesPanel {
         if self.wrap != wrap {
             self.wrap = wrap;
             self.preview.update(cx, |preview, cx| preview.set_wrap(wrap, cx));
+        }
+        if let Some(attachment) = self.shown.as_ref().and_then(|shown| shown.attachment.as_ref()).cloned() {
+            return self.render_attachment(&attachment, cx);
         }
         let p = palette(cx);
         if self.root.is_none() {
@@ -428,16 +558,18 @@ impl Render for FilesPanel {
                 .into_any_element();
         }
         let path = self.shown.as_ref().and_then(|shown| shown.path.clone());
+        let has_trail = self.shown.as_ref().and_then(|shown| shown.folder_trail.as_deref()).is_some_and(|t| !t.is_empty());
         let preview = self.preview.read(cx);
         let previewing = path.is_some() && !preview.is_folder();
         let notice = previewing.then(|| preview.truncation_notice()).flatten();
         let host = path.as_deref().is_some_and(is_host_path);
         let show_explorer = !host && (self.prefs.explorer_open || !previewing);
+        let subheader_path = path.as_deref().or(has_trail.then_some(""));
         v_flex()
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
-            .children(path.as_deref().map(|path| self.render_subheader(path, previewing, cx)))
+            .children(subheader_path.map(|path| self.render_subheader(path, previewing, cx)))
             .children(notice.map(|notice| {
                 div()
                     .flex_none()
@@ -466,5 +598,122 @@ impl Render for FilesPanel {
                     }),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_open_target_falls_back_to_server_asset_when_url_absent() {
+        let with_url = FileAttachment {
+            id: "att-1".into(),
+            name: "spec.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size_bytes: 128,
+            url: Some("https://example.com/spec.pdf".into()),
+        };
+        assert_eq!(
+            attachment_open_target(&with_url),
+            Some(AttachmentOpenTarget::Url("https://example.com/spec.pdf".into()))
+        );
+
+        let server_only = FileAttachment {
+            id: "att-server-42".into(),
+            name: "report.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size_bytes: 256,
+            url: None,
+        };
+        assert_eq!(
+            attachment_open_target(&server_only),
+            Some(AttachmentOpenTarget::ServerAsset("att-server-42".into()))
+        );
+
+        let unsafe_url_falls_back_to_id = FileAttachment {
+            id: "att-server-43".into(),
+            name: "note.txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: 12,
+            url: Some("javascript:alert(1)".into()),
+        };
+        assert_eq!(
+            attachment_open_target(&unsafe_url_falls_back_to_id),
+            Some(AttachmentOpenTarget::ServerAsset("att-server-43".into()))
+        );
+
+        let unopenable = FileAttachment {
+            id: "   ".into(),
+            name: "orphan.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            size_bytes: 4,
+            url: None,
+        };
+        assert_eq!(attachment_open_target(&unopenable), None);
+    }
+
+    #[gpui::test]
+    fn server_backed_attachment_without_http_url_renders_open_attachment_button(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::keymap::init(cx);
+            let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::store::init(cx);
+            installed
+        });
+        state.update(cx, |state, cx| {
+            state.panels.panels = t3_core::right_panel::RightPanels::default();
+            state.select_thread("menu-thread", cx);
+            state.open_attachment(
+                FileAttachment {
+                    id: "att-server-99".into(),
+                    name: "trace.log".into(),
+                    mime_type: "text/plain".into(),
+                    size_bytes: 512,
+                    url: None,
+                },
+                cx,
+            );
+        });
+
+        let (panel, vcx) = cx.add_window_view(|window, cx| FilesPanel::new(state.clone(), window, cx));
+        vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.sync(cx));
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("attachment-open-url").is_some(),
+            "server-backed attachment without HTTP URL must still render the Open attachment button"
+        );
+
+        // Empty ID + no URL renders no Open attachment button.
+        state.update(vcx, |state, cx| {
+            state.open_attachment(
+                FileAttachment {
+                    id: String::new(),
+                    name: "orphan.bin".into(),
+                    mime_type: "application/octet-stream".into(),
+                    size_bytes: 4,
+                    url: None,
+                },
+                cx,
+            );
+        });
+        vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.sync(cx));
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("attachment-open-url").is_none(),
+            "attachment with neither HTTP URL nor ID should omit the Open attachment button"
+        );
+
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
     }
 }

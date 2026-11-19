@@ -10,6 +10,7 @@ mod drawer;
 mod drawer_view;
 pub(crate) mod element;
 pub(crate) mod pane;
+mod panel;
 pub(crate) mod session;
 
 use gpui::prelude::FluentBuilder;
@@ -19,8 +20,13 @@ use gpui::{
 };
 use gpui_component::tooltip::Tooltip;
 
+pub(crate) use drawer::{
+    allocate_panel_terminal_id, can_operate_terminals, close_terminal_session, focus_panel_terminal_after_close,
+    launch_panel_terminal, request_terminal_focus, terminal_label,
+};
 pub use drawer::{RunningTerminals, TerminalDrawer, open_script_terminal};
 pub use pane::{PaneEvent, TerminalPane};
+pub use panel::PanelTerminalView;
 pub use session::Target;
 pub use element::{set_typography, typography};
 

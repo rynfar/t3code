@@ -51,9 +51,23 @@ impl AppState {
         }
     }
 
-    /// A breadcrumb opened a folder: in place of `surface_id`, or beside it when `keep_source`.
-    pub fn navigate_file_folder(&mut self, surface_id: &str, folder: &str, keep_source: bool, cx: &mut Context<Self>) {
-        self.mutate_panels(cx, |state, thread| state.panels.navigate_folder(thread, surface_id, folder, keep_source));
+    /// A breadcrumb opened a folder while keeping its deeper `folder_trail` (`FileBreadcrumbs.tsx`).
+    pub fn navigate_file_folder_with_trail(
+        &mut self,
+        surface_id: &str,
+        folder: &str,
+        folder_trail: &str,
+        keep_source: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.mutate_panels(cx, |state, thread| {
+            state.panels.navigate_folder_with_trail(thread, surface_id, folder, folder_trail, keep_source)
+        });
+    }
+
+    /// Opens a chat file attachment in a right-panel attachment tab (`openAttachment`).
+    pub fn open_attachment(&mut self, attachment: t3_core::right_panel::FileAttachment, cx: &mut Context<Self>) {
+        self.mutate_panels(cx, |state, thread| state.panels.open_attachment(thread, attachment));
     }
 
     /// "Copy mention".

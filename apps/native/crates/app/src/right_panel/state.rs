@@ -4,12 +4,16 @@
 
 use std::collections::HashMap;
 
-use gpui::{App, Context};
+use gpui::{App, Context, PromptLevel, Window};
 use serde_json::json;
 use t3_client::store;
 use t3_core::diff::{DiffSelection, TurnDiffSummary};
 use t3_core::preview::{self, SessionSnapshot};
-use t3_core::right_panel::{BrowserSnapshot, ClosedTarget, ClosedView, Reopened, RightPanels, Surface, SurfaceKind, decode_lenient_map};
+use t3_core::right_panel::{
+    BrowserSnapshot, ClosedTarget, ClosedView, ProactiveEvaluationInput, ProactivePanelCoordinator, PullRequestDetailTab,
+    PullRequestTarget, Reopened, RightPanels, Surface, SurfaceKind, decode_lenient_map,
+};
+use t3_core::terminal::SplitDirection;
 
 use crate::app_state::{AppEvent, AppState};
 
@@ -145,6 +149,97 @@ impl AppState {
         });
     }
 
+    /// Opens a single pull request tab in the right panel (`openPullRequest`).
+    pub fn open_pull_request_surface(&mut self, target: PullRequestTarget, cx: &mut Context<Self>) {
+        if self.selected_thread.is_none() {
+            return;
+        }
+        self.mutate_panels(cx, |state, thread| state.panels.open_pull_request(thread, target));
+    }
+
+    pub fn set_pull_request_surface_detail_tab(&mut self, thread_id: &str, surface_id: &str, tab: PullRequestDetailTab, cx: &mut Context<Self>) {
+        if self.panels.panels.set_pull_request_detail_tab(thread_id, surface_id, tab) {
+            self.save_panels(cx);
+        }
+    }
+
+    pub fn settle_pull_request_surface_reveal(&mut self, thread_id: &str, surface_id: &str, expected_url: &str, cx: &mut Context<Self>) {
+        if self.panels.panels.settle_pull_request_reveal(thread_id, surface_id, expected_url) {
+            self.save_panels(cx);
+        }
+    }
+
+    /// The "Terminal" launcher entry and add-menu item (`addTerminalSurface`): allocates a new
+    /// terminal id, launches its PTY session, opens a right-panel terminal tab, and queues focus.
+    pub fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
+        if !crate::terminal::can_operate_terminals(cx) {
+            return;
+        }
+        let Some(thread_id) = self.panel_thread() else { return };
+        let terminal_id = crate::terminal::allocate_panel_terminal_id(self, &thread_id, cx);
+        if crate::terminal::launch_panel_terminal(self, &thread_id, &terminal_id, cx).is_none() {
+            return;
+        }
+        self.open_panel_terminal(&thread_id, &terminal_id, cx);
+        crate::terminal::request_terminal_focus(&thread_id, &terminal_id, cx);
+    }
+
+    pub fn open_panel_terminal(&mut self, thread_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
+        if self.panels.panels.open_terminal(thread_id, terminal_id) {
+            self.save_panels(cx);
+        }
+    }
+
+    pub fn split_panel_terminal(
+        &mut self,
+        thread_id: &str,
+        surface_id: &str,
+        terminal_id: &str,
+        direction: SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panels.panels.split_terminal(thread_id, surface_id, terminal_id, direction) {
+            self.save_panels(cx);
+        }
+    }
+
+    pub fn activate_panel_terminal(&mut self, thread_id: &str, surface_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
+        if self.panels.panels.activate_terminal(thread_id, surface_id, terminal_id) {
+            self.save_panels(cx);
+        }
+    }
+
+    pub fn close_panel_terminal(&mut self, thread_id: &str, surface_id: &str, terminal_id: &str, cx: &mut Context<Self>) {
+        if self.panels.panels.close_terminal(thread_id, surface_id, terminal_id) {
+            self.save_panels(cx);
+        }
+    }
+
+    /// Renames a device tab (`renameDevice` in `rightPanelStore.ts`).
+    pub fn rename_device_surface(&mut self, surface_id: &str, title: &str, cx: &mut Context<Self>) {
+        self.mutate_panels(cx, |state, thread| state.panels.rename_device(thread, surface_id, title));
+    }
+
+    /// Evaluates proactive panel opening (`useProactivePanels.ts`) for the active thread.
+    pub fn apply_proactive_panels(
+        &mut self,
+        coordinator: &mut ProactivePanelCoordinator,
+        input: ProactiveEvaluationInput<'_>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let thread_id = input.thread_id.map(str::to_owned);
+        let outcome = coordinator.evaluate(&mut self.panels.panels, input);
+        if outcome.diff_opened
+            && let Some(thread_id) = thread_id
+        {
+            self.reset_diff_to_branch(&thread_id);
+        }
+        if outcome.panels_changed {
+            self.save_panels(cx);
+        }
+        outcome.panels_changed
+    }
+
     /// The "Diff" launcher entry: always opens on the branch scope (`addDiffSurface`).
     pub fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.selected_thread.clone() else { return };
@@ -211,22 +306,130 @@ impl AppState {
         self.close_surfaces(cx, |panels, thread| panels.close_all_surfaces(thread));
     }
 
+    /// `useRightPanelSurfaceClose.ts`: prompts with `confirmTerminalClose` when closing terminal
+    /// tab(s) with `terminal:operate` permission before stopping their server PTYs.
+    pub fn close_surface_with_confirm(&mut self, surface_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let id = surface_id.to_owned();
+        let target_id = id.clone();
+        self.confirm_and_close(
+            window,
+            cx,
+            move |surfaces| surfaces.iter().filter(|s| s.id == target_id).cloned().collect(),
+            move |state, cx| state.close_surface(&id, cx),
+        );
+    }
+
+    pub fn close_other_surfaces_with_confirm(&mut self, surface_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let id = surface_id.to_owned();
+        let target_id = id.clone();
+        self.confirm_and_close(
+            window,
+            cx,
+            move |surfaces| surfaces.iter().filter(|s| s.id != target_id).cloned().collect(),
+            move |state, cx| state.close_other_surfaces(&id, cx),
+        );
+    }
+
+    pub fn close_surfaces_to_right_with_confirm(&mut self, surface_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let id = surface_id.to_owned();
+        let target_id = id.clone();
+        self.confirm_and_close(
+            window,
+            cx,
+            move |surfaces| {
+                surfaces
+                    .iter()
+                    .position(|s| s.id == target_id)
+                    .map(|idx| surfaces[idx + 1..].to_vec())
+                    .unwrap_or_default()
+            },
+            move |state, cx| state.close_surfaces_to_right(&id, cx),
+        );
+    }
+
+    pub fn close_all_surfaces_with_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_and_close(window, cx, |surfaces| surfaces.to_vec(), |state, cx| state.close_all_surfaces(cx));
+    }
+
+    fn confirm_and_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        select_targets: impl FnOnce(&[Surface]) -> Vec<Surface>,
+        finish: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        let Some(thread_id) = self.panel_thread() else { return };
+        let targets = select_targets(&self.panels.panels.panel(&thread_id).surfaces);
+        let mut terminal_labels = Vec::new();
+        if crate::terminal::can_operate_terminals(cx) {
+            for surface in &targets {
+                if let SurfaceKind::Terminal { terminal_ids, active_terminal_id, .. } = &surface.kind {
+                    if terminal_ids.iter().any(|id| id == active_terminal_id) {
+                        terminal_labels.push(crate::terminal::terminal_label(&thread_id, active_terminal_id, cx));
+                    }
+                    for tid in terminal_ids {
+                        if tid != active_terminal_id {
+                            terminal_labels.push(crate::terminal::terminal_label(&thread_id, tid, cx));
+                        }
+                    }
+                }
+            }
+        }
+        if terminal_labels.is_empty() {
+            finish(self, cx);
+            return;
+        }
+        let (message, detail) = t3_core::terminal::close_confirmation(&terminal_labels);
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &["Close", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0) {
+                let _ = this.update(cx, |state, cx| finish(state, cx));
+            }
+        })
+        .detach();
+    }
+
     /// A user's close. Browser tabs it removes are remembered with their session's snapshot
-    /// (`closePreviewSession`), active tab last; a session the server already closed has none.
+    /// (`closePreviewSession`), active tab last; closed terminal tabs stop their server PTYs when
+    /// this client holds `terminal:operate`, and newly exposed terminal tabs receive focus.
     fn close_surfaces(&mut self, cx: &mut Context<Self>, close: impl FnOnce(&mut RightPanels, &str) -> bool) {
         let Some(thread_id) = self.panel_thread() else { return };
         let browsers = self.browser_snapshots(&thread_id, cx);
+        let previous_active = self.panels.panels.panel(&thread_id).active_surface_id.clone();
+        let before_terminals: Vec<(String, Vec<String>)> = self
+            .panels
+            .panels
+            .panel(&thread_id)
+            .surfaces
+            .iter()
+            .filter_map(|surface| match &surface.kind {
+                SurfaceKind::Terminal { terminal_ids, .. } => Some((surface.id.clone(), terminal_ids.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut closed_terminals = Vec::new();
         self.mutate_panels(cx, |state, thread| {
             if !close(&mut state.panels, thread) {
                 return false;
             }
             let open = &state.panels.panel(thread).surfaces;
             let closed: Vec<BrowserSnapshot> = browsers.into_iter().filter(|(id, _)| !open.iter().any(|surface| surface.id == *id)).map(|(_, snapshot)| snapshot).collect();
+            for (surface_id, terminal_ids) in before_terminals {
+                if !open.iter().any(|surface| surface.id == surface_id) {
+                    closed_terminals.extend(terminal_ids);
+                }
+            }
             for snapshot in closed {
                 state.panels.remember_browser(thread, snapshot);
             }
             true
         });
+        if !closed_terminals.is_empty() && crate::terminal::can_operate_terminals(cx) {
+            for terminal_id in closed_terminals {
+                crate::terminal::close_terminal_session(self, &thread_id, &terminal_id);
+            }
+        }
+        crate::terminal::focus_panel_terminal_after_close(self, &thread_id, previous_active.as_deref(), cx);
     }
 
     /// The thread's browser tabs and their sessions' snapshots, the active tab last.
@@ -248,11 +451,25 @@ impl AppState {
         snapshots
     }
 
-    /// `rightPanel.close` (`cmd-w`): closes the active tab while the panel shows.
+    /// `rightPanel.close` (`cmd-w`): closes the active tab while the panel shows, prompting before
+    /// closing a terminal tab when this client can operate terminals.
     pub fn close_active_surface(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.panel_thread() else { return };
-        let Some(active) = self.panels.panels.active_surface(&thread_id).map(|surface| surface.id.clone()) else { return };
-        self.close_surface(&active, cx);
+        let Some(active) = self.panels.panels.active_surface(&thread_id).cloned() else { return };
+        if matches!(active.kind, SurfaceKind::Terminal { .. })
+            && crate::terminal::can_operate_terminals(cx)
+            && let Some(window) = cx.active_window().or_else(|| cx.windows().into_iter().next())
+        {
+            let entity = cx.entity();
+            let id = active.id;
+            cx.defer(move |cx| {
+                let _ = window.update(cx, |_, window, cx| {
+                    entity.update(cx, |state, cx| state.close_surface_with_confirm(&id, window, cx));
+                });
+            });
+            return;
+        }
+        self.close_surface(&active.id, cx);
     }
 
     pub fn toggle_right_panel_maximized(&mut self, cx: &mut Context<Self>) {
@@ -296,7 +513,10 @@ impl AppState {
         let ClosedTarget::Browser { snapshot } = &view.target else { return };
         let connection = self.connection_id();
         let previews = crate::preview::previews(cx).filter(|previews| previews.read(cx).availability() == crate::preview::Availability::Available);
-        let task = previews.as_ref().and_then(|_| self.request(preview::method::OPEN, snapshot.open_input(&view.thread_id), SessionSnapshot::decode));
+        let defaults = previews.as_ref().map(|previews| previews.read(cx).browser_defaults(cx)).unwrap_or_default();
+        let task = previews
+            .as_ref()
+            .and_then(|_| self.request(preview::method::OPEN, snapshot.open_input_with_defaults(&view.thread_id, &defaults), SessionSnapshot::decode));
         let (Some(previews), Some(task)) = (previews, task) else {
             self.panels.panels.defer_closed(view);
             self.save_panels(cx);

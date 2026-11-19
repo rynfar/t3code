@@ -6,6 +6,7 @@
 //! emulator keeps scrollback, so the reducer reports resets and appends instead.
 
 pub mod emulator;
+pub mod focus;
 mod input;
 mod layout;
 pub mod links;
@@ -16,6 +17,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+pub use focus::{LastThreadFocus, PendingFocus, TerminalFocusQueue, ThreadEnterFocusDecision};
 pub use input::{KeyInput, TerminalShortcut, encode_key, encode_paste, local_shortcut, paste_chunks, shortcut_data};
 pub use layout::{
     MAX_TERMINALS_PER_GROUP, SplitDirection, TerminalGroup, TerminalLayouts, ThreadTerminalLayout,

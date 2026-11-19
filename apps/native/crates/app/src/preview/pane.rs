@@ -26,9 +26,11 @@ use t3_core::preview::viewport::{
     AppearancePreference, BROWSER_DEVICE_TOOLBAR_HEIGHT, ViewportSetting, profile_name, responsive_viewport_for_toggle,
 };
 use t3_core::preview::{
-    DiscoveredServer, FileDownload, NavStatus, SessionSnapshot, decode_discovered_servers, describe_error, error_label, host_label, method,
+    DiscoveredServerList, FileDownload, NavStatus, SessionSnapshot, bound_configured_local_server_urls,
+    decode_discovered_server_list, describe_error, error_label, host_label, merge_discovered_servers, method,
     shows_empty_state, step_zoom,
 };
+use t3_core::sidebar::time::compact_relative_label;
 
 use super::annotation::{AnnotationEditor, AnnotationEditorEvent};
 use super::device_toolbar::{DeviceToolbar, DeviceToolbarEvent};
@@ -68,7 +70,7 @@ pub struct PreviewPane {
     zoom_indicator_task: Option<Task<()>>,
     focus: FocusHandle,
     visible: bool,
-    servers: Vec<DiscoveredServer>,
+    servers: DiscoveredServerList,
     servers_feed: Option<(Abort, Task<()>)>,
     unreachable_details: bool,
     _subscriptions: Vec<Subscription>,
@@ -132,7 +134,7 @@ impl PreviewPane {
             zoom_indicator_task: None,
             focus: cx.focus_handle(),
             visible: false,
-            servers: Vec::new(),
+            servers: DiscoveredServerList::default(),
             servers_feed: None,
             unreachable_details: false,
             _subscriptions: vec![input_events, preview_events],
@@ -268,21 +270,32 @@ impl PreviewPane {
         }
     }
 
+    fn configured_local_server_urls(&self, cx: &App) -> Vec<String> {
+        let recents = self.previews.read(cx).recent(&self.thread_id, cx);
+        bound_configured_local_server_urls(recents.iter().map(|entry| entry.url.as_str()))
+    }
+
     /// `subscribeDiscoveredLocalServers`, held only while the empty state shows.
     fn watch_servers(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let Some(client) = state.client_handle() else { return };
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<DiscoveredServer>>();
+        let configured_urls = self.configured_local_server_urls(cx);
+        let payload = if configured_urls.is_empty() {
+            json!({})
+        } else {
+            json!({ "configuredUrls": configured_urls })
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DiscoveredServerList>();
         let driver = state.runtime().spawn(async move {
             let mut attempt = 0u32;
             loop {
-                match client.stream(method::SUBSCRIBE_DISCOVERED_SERVERS, json!({})).await {
+                match client.stream(method::SUBSCRIBE_DISCOVERED_SERVERS, payload.clone()).await {
                     Ok(mut stream) => {
                         while let Some(item) = stream.receiver.recv().await {
                             match item {
                                 Ok(value) => {
                                     attempt = 0;
-                                    if tx.send(decode_discovered_servers(&value)).is_err() {
+                                    if tx.send(decode_discovered_server_list(&value)).is_err() {
                                         return;
                                     }
                                 }
@@ -411,6 +424,23 @@ impl PreviewPane {
             let thread = self.thread_id.clone();
             self.previews.update(cx, |previews, cx| previews.adjust(&thread, &tab, json!({ "zoomFactor": next }), cx));
         }
+    }
+
+    fn capture_screenshot(&mut self, cx: &mut Context<Self>) {
+        let Some(bytes) = self.frame.as_ref().and_then(|frame| frame.read(cx).capture_full_png()) else {
+            return;
+        };
+        let thread_id = self.thread_id.clone();
+        let attachment = RestoredAttachment {
+            kind: AttachmentKind::Image,
+            name: "preview-screenshot.png".to_owned(),
+            mime_type: "image/png".to_owned(),
+            bytes,
+        };
+        self.state.update(cx, |state, cx| {
+            state.restore_composer_prompt(&thread_id, String::new(), vec![attachment], cx);
+            state.show_toast(Toast::new(ToastKind::Success, "Screenshot added to composer"), cx);
+        });
     }
 
     fn toggle_annotate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -601,6 +631,15 @@ impl PreviewPane {
                             }),
                     )
                     .child(
+                        Button::new("preview-screenshot")
+                            .variant(Variant::Ghost)
+                            .size(Size::IconXs)
+                            .icon(Icon::Image)
+                            .tooltip("Attach screenshot to chat")
+                            .disabled(annotate_disabled)
+                            .on_click(cx.listener(|this, _, _, cx| this.capture_screenshot(cx))),
+                    )
+                    .child(
                         Button::new("preview-annotate")
                             .variant(if annotate_active { Variant::Secondary } else { Variant::Ghost })
                             .size(Size::IconXs)
@@ -781,7 +820,9 @@ impl PreviewPane {
         let p = palette(cx);
         let recents: Vec<HistoryEntry> =
             self.previews.read(cx).recent(&self.thread_id, cx).into_iter().take(RECENT_SHOWN).collect();
-        if recents.is_empty() && self.servers.is_empty() {
+        let configured_urls = self.configured_local_server_urls(cx);
+        let merged_servers = merge_discovered_servers(&self.servers.servers, &configured_urls, self.servers.configured_url_probing);
+        if recents.is_empty() && merged_servers.is_empty() {
             return v_flex()
                 .size_full()
                 .items_center()
@@ -821,6 +862,7 @@ impl PreviewPane {
                 .child(div().font_weight(FontWeight::MEDIUM).child(label))
         };
         let list = || v_flex().overflow_hidden().rounded(px(12.)).border_1().border_color(hsla(p.border).opacity(0.7)).bg(hsla(p.background));
+        let now = crate::sidebar::controller::now_ms();
         let recent_rows: Vec<AnyElement> = recents
             .iter()
             .enumerate()
@@ -830,6 +872,7 @@ impl PreviewPane {
                     Some(title) => (title.clone(), label.clone()),
                     None => (label.clone(), String::new()),
                 };
+                let relative = (entry.last_visited_at > 0).then(|| compact_relative_label(entry.last_visited_at, now));
                 let (open_url, remove_url) = (entry.url.clone(), entry.url.clone());
                 self.row(
                     ElementId::from(("preview-recent", index)),
@@ -838,31 +881,39 @@ impl PreviewPane {
                     index > 0,
                     cx.listener(move |this, _, _, cx| this.open_listed(&open_url, cx)),
                     Some(
-                        Button::new(("preview-recent-remove", index))
-                            .variant(Variant::GhostMuted)
-                            .size(Size::IconMicro)
-                            .icon(Icon::X)
-                            .tooltip(SharedString::from(format!("Remove {label} from history")))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let thread = this.thread_id.clone();
-                                this.previews.update(cx, |previews, cx| previews.remove_recent(&thread, &remove_url, cx));
-                            }))
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(6.))
+                            .when_some(relative, |this, rel| {
+                                this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(rel))
+                            })
+                            .child(
+                                Button::new(("preview-recent-remove", index))
+                                    .variant(Variant::GhostMuted)
+                                    .size(Size::IconMicro)
+                                    .icon(Icon::X)
+                                    .tooltip(SharedString::from(format!("Remove {label} from history")))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let thread = this.thread_id.clone();
+                                        this.previews.update(cx, |previews, cx| previews.remove_recent(&thread, &remove_url, cx));
+                                    })),
+                            )
                             .into_any_element(),
                     ),
                     cx,
                 )
             })
             .collect();
-        let server_rows: Vec<AnyElement> = self
-            .servers
+        let server_rows: Vec<AnyElement> = merged_servers
             .iter()
             .enumerate()
-            .map(|(index, server)| {
-                let url = server.url.clone();
+            .map(|(index, entry)| {
+                let url = entry.requested_url.clone();
                 self.row(
                     ElementId::from(("preview-server", index)),
-                    server.title().to_owned(),
-                    server.address(),
+                    entry.server.title().to_owned(),
+                    entry.server.address(),
                     index > 0,
                     cx.listener(move |this, _, _, cx| this.open_listed(&url, cx)),
                     None,
@@ -1093,6 +1144,11 @@ impl PreviewPane {
     #[cfg(all(test, feature = "snapshot"))]
     pub(super) fn toggle_device_toolbar_for_test(&mut self, cx: &mut Context<Self>) {
         self.toggle_device_toolbar(cx);
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn capture_screenshot_for_test(&mut self, cx: &mut Context<Self>) {
+        self.capture_screenshot(cx);
     }
 }
 
