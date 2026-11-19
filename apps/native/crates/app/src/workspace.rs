@@ -382,12 +382,12 @@ impl Render for Workspace {
                 this.composer.update(cx, |composer, cx| composer.focus(window, cx));
             }))
             .on_action(cx.listener(|this, _: &crate::composer::OpenWorkspace, window, cx| this.composer.update(cx, |composer, cx| composer.open_workspace(window, cx))))
-            .on_action(cx.listener(|this, _: &crate::composer::OpenBranch, window, cx| this.composer.update(cx, |composer, cx| composer.open_base_branch_picker(window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::OpenBranch, window, cx| this.open_composer_branch(window, cx)))
             .on_action(cx.listener(|this, _: &crate::composer::OpenHost, window, cx| this.composer.update(cx, |composer, cx| composer.open_host(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::CycleHost, window, cx| this.composer.update(cx, |composer, cx| composer.cycle_host(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::UsePreviousWorktree, window, cx| this.composer.update(cx, |composer, cx| composer.use_previous_worktree(window, cx))))
-            .on_action(cx.listener(|this, _: &crate::composer::IncreaseEffort, window, cx| this.composer.update(cx, |composer, cx| composer.step_reasoning_effort(1, window, cx))))
-            .on_action(cx.listener(|this, _: &crate::composer::DecreaseEffort, window, cx| this.composer.update(cx, |composer, cx| composer.step_reasoning_effort(-1, window, cx))))
+            .on_action(cx.listener(|this, _: &crate::composer::IncreaseEffort, window, cx| this.step_composer_effort(1, window, cx)))
+            .on_action(cx.listener(|this, _: &crate::composer::DecreaseEffort, window, cx| this.step_composer_effort(-1, window, cx)))
             .on_action(cx.listener(|this, _: &crate::composer::SendAlternate, window, cx| this.composer.update(cx, |composer, cx| composer.send_alternate(window, cx))))
             .on_action(cx.listener(|this, _: &crate::composer::SteerQueuedMessage, window, cx| {
                 if !this.composer.update(cx, |composer, cx| composer.steer_queued_message(window, cx)) {
@@ -1035,9 +1035,43 @@ impl Workspace {
         }
     }
 
+    /// Whether the main composer is currently shown and unobstructed by any modal/overlay.
+    fn composer_visible(&self, window: &mut Window, cx: &mut gpui::App) -> bool {
+        if self.composer_replaced || self.has_blocking_overlay(window, cx) {
+            return false;
+        }
+        let state = self.state.read(cx);
+        if state.pull_requests_open || (state.selected_thread.is_none() && state.draft_project.is_none()) {
+            return false;
+        }
+        let maximized = state
+            .panel_thread()
+            .as_deref()
+            .map(|thread| state.panels.panels.panel(thread))
+            .is_some_and(|panel| panel.is_open && panel.maximized);
+        !maximized
+    }
+
+    /// `composer.branch`: opens the composer's base branch picker only while the composer is visible.
+    fn open_composer_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.composer_visible(window, cx) {
+            return;
+        }
+        self.composer.update(cx, |composer, cx| composer.open_base_branch_picker(window, cx));
+    }
+
+    /// `composer.increaseEffort` / `composer.decreaseEffort`: steps reasoning effort only while
+    /// the composer is visible.
+    fn step_composer_effort(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.composer_visible(window, cx) {
+            return;
+        }
+        self.composer.update(cx, |composer, cx| composer.step_reasoning_effort(direction, window, cx));
+    }
+
     /// `composer.sendBackground`: starts a draft thread in the background and keeps the draft open.
     fn send_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer_replaced {
+        if !self.composer_visible(window, cx) {
             return;
         }
         let state = self.state.read(cx);
@@ -1051,7 +1085,7 @@ impl Workspace {
     /// `composer.sendAndNewThread`: sends to the active server thread and opens a fresh draft in
     /// the thread's project only after the send succeeds (`SendAndNewThreadCompleted`).
     fn send_and_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer_replaced {
+        if !self.composer_visible(window, cx) {
             return;
         }
         if self.state.read(cx).selected_thread.is_some() {
@@ -1218,6 +1252,51 @@ mod tests {
             assert!(state.selected_thread.is_none(), "sendAndNewThread opens a fresh draft after success");
             assert_eq!(state.draft_project.as_deref(), Some(expected_project.as_str()));
         });
+
+        // 3. Blocking overlays, Pull Requests page, maximized right panel, and `composer_replaced`
+        // guard workspace-level composer & right-panel shortcuts (`NewSurface`, `OpenBranch`,
+        // `IncreaseEffort`, `DecreaseEffort`, `SendAndNewThread`).
+        state.update(cx, |state, cx| {
+            state.panels.panels = t3_core::right_panel::RightPanels::default();
+            state.select_thread("menu-thread", cx);
+            state.toggle_right_panel(cx);
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                assert!(ws.composer_visible(window, cx));
+
+                // Opening CommandPalette blocks both `open_right_panel_add_menu` and composer actions.
+                ws.palette.update(cx, |palette, cx| palette.toggle(window, cx));
+                assert!(ws.has_blocking_overlay(window, cx));
+                assert!(!ws.composer_visible(window, cx));
+                ws.open_right_panel_add_menu(window, cx);
+                assert!(!ws.right_panel.read(cx).is_add_menu_open(), "overlay must block rightPanel.new");
+                ws.palette.update(cx, |palette, cx| palette.toggle(window, cx));
+                assert!(!ws.has_blocking_overlay(window, cx));
+
+                // With overlay closed, `open_right_panel_add_menu` opens the add-surface menu.
+                ws.open_right_panel_add_menu(window, cx);
+                assert!(ws.right_panel.read(cx).is_add_menu_open());
+                ws.right_panel.update(cx, |panel, cx| panel.close_add_surface_menu(cx));
+
+                // Pull Requests page hides composer.
+                ws.state.update(cx, |state, _| state.pull_requests_open = true);
+                assert!(!ws.composer_visible(window, cx));
+                ws.state.update(cx, |state, _| state.pull_requests_open = false);
+
+                // Maximized right panel hides composer.
+                ws.state.update(cx, |state, cx| state.toggle_right_panel_maximized(cx));
+                assert!(!ws.composer_visible(window, cx));
+                ws.state.update(cx, |state, cx| state.toggle_right_panel_maximized(cx));
+                assert!(ws.composer_visible(window, cx));
+
+                // `composer_replaced` hides composer.
+                ws.composer_replaced = true;
+                assert!(!ws.composer_visible(window, cx));
+                ws.composer_replaced = false;
+            });
+        })
+        .unwrap();
 
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {

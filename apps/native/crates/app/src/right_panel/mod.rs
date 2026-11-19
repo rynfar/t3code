@@ -7,7 +7,9 @@ mod controls;
 mod state;
 mod tabs;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const REOPEN_GUARD: Duration = Duration::from_millis(250);
 
 use gpui::{
     App, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, IntoElement, KeyDownEvent, ParentElement, Render, StyleRefinement,
@@ -63,6 +65,7 @@ pub struct RightPanelView {
     /// One pane per open device tab of the showing thread; only the active one streams.
     devices: Vec<Entity<crate::device::DevicePane>>,
     add_menu_open: bool,
+    add_menu_dismissed: Option<Instant>,
     add_menu_highlighted: usize,
     add_menu_focus: FocusHandle,
     _save_width: Option<Task<()>>,
@@ -122,6 +125,7 @@ impl RightPanelView {
             previews: Vec::new(),
             devices: Vec::new(),
             add_menu_open: false,
+            add_menu_dismissed: None,
             add_menu_highlighted: 0,
             add_menu_focus: cx.focus_handle(),
             _save_width: None,
@@ -148,6 +152,7 @@ impl RightPanelView {
         }
         let entries = tabs::add_menu_entries(state, cx);
         self.add_menu_highlighted = entries.iter().position(|entry| entry.unavailable.is_none()).unwrap_or(0);
+        self.add_menu_dismissed = None;
         self.add_menu_open = true;
         window.focus(&self.add_menu_focus, cx);
         cx.notify();
@@ -156,8 +161,18 @@ impl RightPanelView {
     pub fn toggle_add_surface_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.add_menu_open {
             self.close_add_surface_menu(cx);
+        } else if self.add_menu_dismissed.take().is_some_and(|at| at.elapsed() < REOPEN_GUARD) {
+            return;
         } else {
             self.open_add_surface_menu(window, cx);
+        }
+    }
+
+    pub fn dismiss_add_surface_menu_outside(&mut self, cx: &mut Context<Self>) {
+        if self.add_menu_open {
+            self.add_menu_open = false;
+            self.add_menu_dismissed = Some(Instant::now());
+            cx.notify();
         }
     }
 
@@ -379,6 +394,7 @@ impl Render for RightPanelView {
         let add_menu = self.add_menu_open.then(|| {
             let entries = tabs::add_menu_entries(self.state.read(cx), cx);
             let close_view = view.clone();
+            let dismiss_view = view.clone();
             let key_view = view.clone();
             tabs::render_add_menu(
                 self.state.clone(),
@@ -387,6 +403,9 @@ impl Render for RightPanelView {
                 &self.add_menu_focus,
                 move |cx| {
                     close_view.update(cx, |this, cx| this.close_add_surface_menu(cx));
+                },
+                move |cx| {
+                    dismiss_view.update(cx, |this, cx| this.dismiss_add_surface_menu_outside(cx));
                 },
                 move |event, window, cx| {
                     key_view.update(cx, |this, cx| this.handle_add_menu_key_down(event, window, cx));
@@ -405,7 +424,6 @@ impl Render for RightPanelView {
             .when(!panel.maximized, |this| {
                 this.flex_none().w(px(width)).border_l_1().border_color(hsla(p.border))
             })
-            .on_action(cx.listener(|this, _: &NewSurface, window, cx| this.open_add_surface_menu(window, cx)))
             .on_drag_move(cx.listener(Self::resize))
             .when(!panel.maximized, |this| this.child(self.render_resize_handle(cx)))
             .child(tabs::tab_bar(
@@ -502,6 +520,21 @@ mod tests {
             let esc = KeyDownEvent { keystroke: Keystroke::parse("escape").unwrap(), is_held: false, prefer_character_input: false };
             panel.update(cx, |panel, cx| panel.handle_add_menu_key_down(&esc, window, cx));
             assert!(!panel.read(cx).is_add_menu_open());
+        });
+
+        // Clicking the `+` trigger while the menu is open fires `on_mouse_down_out` before `on_click`:
+        // the reopen guard keeps the menu closed instead of reopening on mouse-up, while `Mod+T` still opens it.
+        vcx.update(|window, cx| {
+            panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
+            assert!(panel.read(cx).is_add_menu_open());
+            panel.update(cx, |panel, cx| {
+                panel.dismiss_add_surface_menu_outside(cx);
+                panel.toggle_add_surface_menu(window, cx);
+            });
+            assert!(!panel.read(cx).is_add_menu_open(), "mouse-down-out + trigger click must stay closed");
+            panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
+            assert!(panel.read(cx).is_add_menu_open(), "keyboard shortcut still opens immediately");
+            panel.update(cx, |panel, cx| panel.close_add_surface_menu(cx));
         });
 
         // Re-open menu and press `d` (Diff shortcut) -> closes menu and opens Diff surface.

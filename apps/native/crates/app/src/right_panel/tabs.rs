@@ -194,11 +194,11 @@ pub(super) fn render_add_menu(
     highlighted: usize,
     focus: &gpui::FocusHandle,
     on_close: impl Fn(&mut App) + Clone + 'static,
+    on_dismiss_outside: impl Fn(&mut App) + 'static,
     on_key_down: impl Fn(&gpui::KeyDownEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
     let p = palette(cx);
-    let close_out = on_close.clone();
     let rows = entries.iter().enumerate().map(|(index, entry)| {
         let state = state.clone();
         let open = entry.open;
@@ -233,9 +233,10 @@ pub(super) fn render_add_menu(
     let menu = crate::composer::controls::popup_surface(cx)
         .id("right-panel-add-menu")
         .track_focus(focus)
+        .occlude()
         .w(px(216.))
         .p(px(4.))
-        .on_mouse_down_out(move |_, _, cx| close_out(cx))
+        .on_mouse_down_out(move |_, _, cx| on_dismiss_outside(cx))
         .on_key_down(move |event, window, cx| on_key_down(event, window, cx))
         .child(v_flex().gap(px(2.)).children(rows));
     gpui::deferred(
