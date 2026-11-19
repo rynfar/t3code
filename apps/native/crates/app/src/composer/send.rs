@@ -176,6 +176,10 @@ impl Composer {
         if self.snapshot.setup_blocks_send {
             return;
         }
+        let resolved_for_policy = self.resolve(cx);
+        if self.runtime_mode_ceiling_denial(&resolved_for_policy, cx).is_some() {
+            return;
+        }
         // Excerpts whose text is gone are left out, links and all (`snapshotComposerSend`).
         let terminals = TerminalSend::of(&prompt, self.current_terminals());
         if !terminals.has_content(
@@ -1013,6 +1017,9 @@ impl Composer {
         }
         let Some(Target::Thread(thread_id)) = self.snapshot.target.clone() else { return };
         let resolved = self.resolve(cx);
+        if self.runtime_mode_ceiling_denial(&resolved, cx).is_some() {
+            return;
+        }
         let selection = Self::dispatch_selection(&resolved);
         let mut steps: Vec<(Value, &'static str)> = Vec::new();
         if let Some(resumable_run_id) = self.snapshot.resumable_run_id.as_deref() {

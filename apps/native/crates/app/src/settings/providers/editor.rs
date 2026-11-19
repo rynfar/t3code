@@ -92,9 +92,10 @@ impl SettingsView {
         let p = palette(cx);
         let view = &selected.view;
         let row = &selected.row;
+        let instance_path = format!("providerInstances.{}", row.instance_id);
         let providers_locked = self
             .scoped_raw_representative_config(cx)
-            .and_then(|c| t3_core::managed_policy::setting_lock_reason(c.managed_policy.as_ref(), "providers"));
+            .and_then(|c| t3_core::managed_policy::setting_lock_reason(c.managed_policy.as_ref(), &instance_path));
         let reset = (row.is_default && row.is_dirty).then(|| {
             let id = row.instance_id.clone();
             let label = model::find_driver(&row.driver).map_or(row.driver.clone(), |driver| driver.label.to_owned());
@@ -249,7 +250,8 @@ impl SettingsView {
                             .when(!enabled, |this| {
                                 let raw_config = self.scoped_raw_representative_config(cx);
                                 let policy = raw_config.as_ref().and_then(|c| c.managed_policy.as_ref());
-                                let denial = t3_core::managed_policy::setting_lock_reason(policy, "providers")
+                                let instance_path = format!("providerInstances.{}", selected.row.instance_id);
+                                let denial = t3_core::managed_policy::setting_lock_reason(policy, &instance_path)
                                     .or_else(|| t3_core::managed_policy::driver_denial(policy, "antigravity", "Antigravity"));
                                 this.child(
                                     crate::components::managed::ManagedControl::new("managed-antigravity", denial, Button::new("enable-antigravity", ButtonVariant::Outline, ButtonSize::Sm)

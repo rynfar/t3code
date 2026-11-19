@@ -535,7 +535,7 @@ impl SettingsView {
         let linked_enabled = config.as_ref().is_some_and(|c| c.settings.threads.linked_environments_enabled);
         let linked_unavailable = managed_policy::setting_lock_reason_for_any(
             scoped_policies.iter().copied(),
-            &["threads.linkedEnvironmentsEnabled", "linkedEnvironmentsEnabled"],
+            &["linkedEnvironmentsEnabled"],
         )
         .or_else(|| write_unavailable.clone());
         let connections_link = cx.entity().downgrade();
@@ -579,7 +579,7 @@ impl SettingsView {
         let simlock_enabled = config.as_ref().is_some_and(|c| c.settings.threads.simlock_device_hosts_enabled);
         let simlock_unavailable = managed_policy::setting_lock_reason_for_any(
             scoped_policies.iter().copied(),
-            &["threads.simlockDeviceHostsEnabled", "simlockDeviceHostsEnabled"],
+            &["simlockDeviceHostsEnabled"],
         )
         .or_else(|| write_unavailable.clone());
         let devices_link = cx.entity().downgrade();
@@ -621,7 +621,7 @@ impl SettingsView {
             let fast_checkout = config.as_ref().is_some_and(|c| c.settings.threads.fast_worktree_checkout);
             let fast_unavailable = managed_policy::setting_lock_reason_for_any(
                 scoped_policies.iter().copied(),
-                &["threads.fastWorktreeCheckout", "fastWorktreeCheckout"],
+                &["fastWorktreeCheckout"],
             )
             .or(write_unavailable);
             rows.push(
@@ -780,7 +780,7 @@ mod tests {
                         },
                         "managedPolicy": {
                             "organization": "Acme Corp",
-                            "lockedSettings": ["enableAgentBrowserAccess", "guestSharingEnabled", "providers"],
+                            "lockedSettings": ["enableAgentBrowserAccess", "guestSharingEnabled", "providerInstances"],
                             "limits": {
                                 "connect": false,
                                 "browserCookieImport": false,
@@ -846,6 +846,106 @@ mod tests {
             vcx.debug_bounds("managed-provider-environment-notice").is_some(),
             "Provider editor must render ManagedNotice when whole environment is locked"
         );
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        runtime.shutdown_background();
+    }
+
+    #[gpui::test]
+    fn managed_locked_settings_lock_rows_across_server_settings_pages(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": {
+                            "environmentId": "fixture-env",
+                            "label": "Studio Mac",
+                            "platform": { "os": "darwin", "arch": "arm64" },
+                            "capabilities": {
+                                "storageCleanup": true,
+                                "storageCleanupRun": true,
+                                "worktreesDirectory": true
+                            }
+                        },
+                        "managedPolicy": {
+                            "organization": "Acme Corp",
+                            "lockedSettings": [
+                                "enableProviderUpdateChecks",
+                                "backgroundActivity",
+                                "storageCleanup.logsAfterDays",
+                                "defaultRuntimeMode",
+                                "snoozePresets",
+                                "worktreesDirectory",
+                                "branchNamingMode",
+                                "storageCleanup.worktreeOnDelete",
+                                "defaultAutoPull",
+                                "sourceControlWritingStyle",
+                                "speechProjectCustomWords"
+                            ],
+                            "limits": {
+                                "maxRuntimeMode": "auto-accept-edits"
+                            }
+                        },
+                        "providers": [{
+                            "instanceId": "codex",
+                            "driver": "codex",
+                            "enabled": true,
+                            "installed": true,
+                            "status": "ready",
+                            "auth": { "status": "authenticated" },
+                            "models": [{ "slug": "gpt-5", "name": "GPT-5" }]
+                        }],
+                        "settings": {}
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        let open_and_draw = |vcx: &mut gpui::VisualTestContext, section: Section| {
+            vcx.update(|_, cx| crate::settings::open(section, cx));
+            vcx.run_until_parked();
+            vcx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        };
+
+        open_and_draw(&mut vcx, Section::Maintenance);
+        assert!(vcx.debug_bounds("provider-update-checks-unavailable").is_some());
+        assert!(vcx.debug_bounds("background-activity-unavailable").is_some());
+        assert!(vcx.debug_bounds("storage-logs-unavailable").is_some());
+
+        open_and_draw(&mut vcx, Section::Threads);
+        assert!(vcx.debug_bounds("default-permissions-unavailable").is_some());
+        assert!(vcx.debug_bounds("snooze-options-below-unavailable").is_some());
+
+        open_and_draw(&mut vcx, Section::Worktrees);
+        assert!(vcx.debug_bounds("storage-worktrees-location-unavailable").is_some());
+        assert!(vcx.debug_bounds("worktree-branch-naming-unavailable").is_some());
+        assert!(vcx.debug_bounds("worktree-on-delete-unavailable").is_some());
+
+        open_and_draw(&mut vcx, Section::SourceControl);
+        assert!(vcx.debug_bounds("automatic-pull-unavailable").is_some());
+        assert!(vcx.debug_bounds("source-control-writing-style-unavailable").is_some());
+
+        open_and_draw(&mut vcx, Section::Voice);
+        assert!(vcx.debug_bounds("speech-project-dictionary-below-unavailable").is_some());
 
         state.update(&mut vcx, |state, _| state.stop_pump());
         drop(vcx);

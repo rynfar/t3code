@@ -1149,6 +1149,16 @@ impl Composer {
             .and_then(|c| c.managed_policy.clone())
     }
 
+    /// `ChatComposer.tsx`: denial message when the thread/draft's runtime mode exceeds the
+    /// administrator's `maxRuntimeMode` ceiling.
+    fn runtime_mode_ceiling_denial(&self, resolved: &Resolved, cx: &App) -> Option<String> {
+        let policy = self.managed_policy(cx);
+        t3_core::managed_policy::runtime_mode_denial(
+            policy.as_ref(),
+            resolved.runtime_mode.as_str(),
+        )
+    }
+
     fn picker_input(&self, cx: &App) -> PickerInput {
         let resolved = self.resolve(cx);
         let cwd = self.menu_cwd(cx);
@@ -5389,13 +5399,26 @@ mod stream_error_tests {
             .debug_bounds("managed-runtime-mode-switch")
             .expect("Switch to Auto-accept edits action must render");
 
-        // Trying to pick an above-ceiling mode is rejected.
-        vcx.update(|_, cx| {
+        // Trying to pick an above-ceiling mode is rejected, and submitting while above ceiling is blocked.
+        vcx.update(|window, cx| {
             composer.update(cx, |composer, cx| {
                 let input = composer.picker_input(cx);
                 assert!(input.managed_policy.is_some());
                 composer.set_runtime_mode(RuntimeMode::Auto, cx);
                 assert_eq!(composer.resolve(cx).runtime_mode, RuntimeMode::FullAccess);
+                let resolved = composer.resolve(cx);
+                assert!(
+                    composer.runtime_mode_ceiling_denial(&resolved, cx).is_some(),
+                    "runtime_mode_ceiling_denial must report a denial above maxRuntimeMode"
+                );
+                composer.input.update(cx, |input, cx| input.set_value("blocked message", window, cx));
+                composer.submit(rules::SubmitIntent::Foreground, window, cx);
+                assert!(!composer.sending, "submit() must not start sending above maxRuntimeMode");
+                assert_eq!(
+                    composer.input.read(cx).value().as_ref(),
+                    "blocked message",
+                    "submit() blocked by maxRuntimeMode must preserve draft text"
+                );
             });
         });
 

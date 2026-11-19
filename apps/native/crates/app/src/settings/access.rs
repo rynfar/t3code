@@ -996,10 +996,17 @@ impl SettingsView {
         // advertises `requireConnectDeviceApproval`.
         if connect_approval_row_visible(self.access.managed_tunnel_active, target.extras.require_connect_device_approval) {
             let require_approval = target.extras.require_connect_device_approval.unwrap_or(false);
+            let policy = target.config.as_ref().and_then(|c| c.managed_policy.as_ref());
             let approval_locked = t3_core::managed_policy::setting_lock_reason(
-                target.config.as_ref().and_then(|c| c.managed_policy.as_ref()),
+                policy,
                 "requireConnectDeviceApproval",
-            );
+            )
+            .or_else(|| {
+                t3_core::managed_policy::capability_denial(
+                    policy,
+                    t3_core::managed_policy::Capability::Connect,
+                )
+            });
             let toggle_client = target.client.clone();
             let toggle_target = target.saved_id.clone();
             let toggle_entity = cx.entity().downgrade();

@@ -213,8 +213,9 @@ impl ChatGptSetup {
         }
         let app = self.app.read(cx);
         let policy = app.server_config.config.as_ref().and_then(|c| c.managed_policy.as_ref());
+        let instance_path = format!("providerInstances.{}", self.instance);
         t3_core::managed_policy::driver_denial(policy, "codex", "Codex")
-            .or_else(|| t3_core::managed_policy::setting_lock_reason(policy, "providers"))
+            .or_else(|| t3_core::managed_policy::setting_lock_reason(policy, &instance_path))
             .or_else(|| {
                 t3_core::managed_policy::managed_instance_locks(policy, "codex")
                     .filter(|locks| locks.config_keys.contains("setupMode"))

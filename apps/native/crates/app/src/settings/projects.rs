@@ -806,6 +806,7 @@ impl SettingsView {
     fn project_model_trait_controls(
         config: &ServerConfig,
         selection: &t3_core::model::ModelSelection,
+        disabled: bool,
         view: gpui::WeakEntity<Self>,
     ) -> Vec<AnyElement> {
         use t3_core::server_config::OptionDescriptor;
@@ -847,6 +848,7 @@ impl SettingsView {
                     .width(124.)
                     .popup_width(180.)
                     .show_check()
+                    .disabled(disabled)
                     .on_change(move |value, _, cx| {
                         let option_id = option_id.clone();
                         let base_selection = base_selection.clone();
@@ -938,7 +940,7 @@ impl SettingsView {
                     },
                 );
                 let traits = if !mixed_model && unavailable.is_none() {
-                    Self::project_model_trait_controls(config, selection, cx.entity().downgrade())
+                    Self::project_model_trait_controls(config, selection, model_locked.is_some(), cx.entity().downgrade())
                 } else {
                     Vec::new()
                 };

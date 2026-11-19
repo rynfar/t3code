@@ -523,7 +523,7 @@ impl SettingsView {
             .scoped_raw_representative_config(cx)
             .and_then(|c| c.managed_policy);
         let can_add_provider = !t3_core::managed_policy::providers_allowed_drivers_empty(policy.as_ref())
-            && !t3_core::managed_policy::setting_locked(policy.as_ref(), "providers");
+            && !t3_core::managed_policy::setting_locked(policy.as_ref(), "providerInstances");
         let refreshing = self.providers.refreshing;
         let label = if refreshing { Some("Refreshing providers".to_owned()) } else { data.checked_label.clone() };
         let header = h_flex()
@@ -649,7 +649,8 @@ impl SettingsView {
         };
         let raw_config = self.scoped_raw_representative_config(cx);
         let policy = raw_config.as_ref().and_then(|c| c.managed_policy.as_ref());
-        let denial = t3_core::managed_policy::setting_lock_reason(policy, "providers").or_else(|| {
+        let instance_path = format!("providerInstances.{}", row.instance_id);
+        let denial = t3_core::managed_policy::setting_lock_reason(policy, &instance_path).or_else(|| {
             if enabled {
                 None
             } else {
@@ -933,14 +934,14 @@ impl SettingsView {
         let env_only = self.env_only_unavailable(cx);
         let raw_config = self.scoped_raw_representative_config(cx);
         let policy = raw_config.as_ref().and_then(|c| c.managed_policy.as_ref());
-        let interval_unavailable = t3_core::managed_policy::setting_lock_reason(
-            policy,
-            "providerHealthCheckIntervalSeconds",
+        let interval_unavailable = t3_core::managed_policy::setting_lock_reason_for_any(
+            [policy],
+            &["backgroundActivity", "providerHealthRefreshInterval"],
         )
         .or_else(|| env_only.clone());
-        let compact_unavailable = t3_core::managed_policy::setting_lock_reason(
-            policy,
-            "claudeIdleCompactionMode",
+        let compact_unavailable = t3_core::managed_policy::setting_lock_reason_for_any(
+            [policy],
+            &["idleCompaction", "compactIdleThreads"],
         )
         .or(env_only);
         let view = cx.entity().downgrade();
@@ -1228,7 +1229,8 @@ impl SettingsView {
     /// override when toggling enabled at Project/Checkout scope).
     pub(super) fn update_instance(&mut self, instance_id: &str, edit: model::InstanceEdit, cx: &mut Context<Self>) {
         if let Some(c) = self.scoped_raw_representative_config(cx) {
-            if t3_core::managed_policy::setting_locked(c.managed_policy.as_ref(), "providers") {
+            let instance_path = format!("providerInstances.{instance_id}");
+            if t3_core::managed_policy::setting_locked(c.managed_policy.as_ref(), &instance_path) {
                 return;
             }
             if matches!(edit, model::InstanceEdit::Enabled(true)) {

@@ -177,24 +177,7 @@ pub fn runtime_mode_denial(policy: Option<&Value>, mode: &str) -> Option<String>
         .then(|| runtime_mode_ceiling_message(organization(p), ceiling))
 }
 
-/// `clampManagedRuntimeMode` (`contracts/src/managedPolicy.ts`).
-pub fn clamp_runtime_mode<'a>(
-    policy: Option<&Value>,
-    mode: &'a str,
-    modes: &[&'a str],
-) -> Option<&'a str> {
-    let ceiling = policy.and_then(|p| p["limits"]["maxRuntimeMode"].as_str());
-    if !is_runtime_mode_above(mode, ceiling) {
-        return Some(mode);
-    }
-    modes
-        .iter()
-        .rev()
-        .copied()
-        .find(|candidate| !is_runtime_mode_above(candidate, ceiling))
-}
-
-/// Typed convenience wrapper over `clamp_runtime_mode` for `RuntimeMode`.
+/// `clampManagedRuntimeMode` (`contracts/src/managedPolicy.ts`) over `RuntimeMode`.
 pub fn clamp_typed_runtime_mode(
     policy: Option<&Value>,
     mode: crate::server_config::RuntimeMode,
@@ -209,26 +192,6 @@ pub fn clamp_typed_runtime_mode(
         .rev()
         .copied()
         .find(|candidate| !is_runtime_mode_above(candidate.as_str(), ceiling))
-}
-
-/// `managedUpdatesMessage` (`contracts/src/managedPolicy.ts`).
-pub fn updates_message(organization: &str) -> String {
-    format!("{organization} manages T3 Code updates.")
-}
-
-/// `managedNightlyDeniedMessage` (`contracts/src/managedPolicy.ts`).
-pub fn nightly_denied_message(organization: &str) -> String {
-    format!(
-        "{} Only stable releases can be installed.",
-        updates_message(organization)
-    )
-}
-
-/// `managedUpdatesDenial` (`contracts/src/managedPolicy.ts`).
-pub fn updates_denial(policy: Option<&Value>) -> Option<String> {
-    let p = policy?;
-    (p["limits"]["updates"]["mode"].as_str() == Some("off"))
-        .then(|| updates_message(organization(p)))
 }
 
 /// Whether `limits.providers.allowedDrivers` is present and empty (`ProviderSettingsPanel.tsx`).
@@ -287,16 +250,16 @@ mod tests {
     use serde_json::json;
     #[test]
     fn locks_and_copy_match_web() {
-        let p = json!({"organization":"Example Corp", "lockedSettings":["storage.logs", "providers"], "limits":{"clients":["desktop"],"webhookTasks":false,"telemetry":false,"providers":{"allowedDrivers":["codex"],"lockedInstanceFields":{"codex":["config.binaryPath","environment","environment.FOO"]}}}});
+        let p = json!({"organization":"Example Corp", "lockedSettings":["storageCleanup.logsAfterDays", "providerInstances"], "limits":{"clients":["desktop"],"webhookTasks":false,"telemetry":false,"providers":{"allowedDrivers":["codex"],"lockedInstanceFields":{"codex":["config.binaryPath","environment","environment.FOO"]}}}});
         for path in [
-            "storage",
-            "storage.logs",
-            "storage.logs.days",
-            "providers.codex",
+            "storageCleanup",
+            "storageCleanup.logsAfterDays",
+            "storageCleanup.logsAfterDays.nested",
+            "providerInstances.codex",
         ] {
             assert!(setting_locked(Some(&p), path));
         }
-        for path in ["storage.log", "storage.logsOther", "provider"] {
+        for path in ["storageCleanup.log", "storageCleanup.logsAfterDaysOther", "providerInstance"] {
             assert!(!setting_locked(Some(&p), path));
         }
         assert_eq!(
@@ -334,7 +297,7 @@ mod tests {
             Some("Example Corp turned off anonymous usage data.")
         );
         assert_eq!(
-            setting_lock_reason(Some(&p), "storage.logs").as_deref(),
+            setting_lock_reason(Some(&p), "storageCleanup.logsAfterDays").as_deref(),
             Some("Managed by Example Corp.")
         );
         assert_eq!(
@@ -350,14 +313,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mode_ceiling_updates_and_provider_restrictions_match_web() {
+    fn runtime_mode_ceiling_and_provider_restrictions_match_web() {
         use crate::server_config::RuntimeMode;
         let policy = json!({
             "organization": "Example Corp",
-            "lockedSettings": ["guestSharingEnabled", "threads.linkedEnvironmentsEnabled"],
+            "lockedSettings": ["guestSharingEnabled", "linkedEnvironmentsEnabled"],
             "limits": {
                 "maxRuntimeMode": "auto-accept-edits",
-                "updates": { "mode": "off", "allowNightly": false },
                 "providers": { "allowedDrivers": [] }
             }
         });
@@ -375,18 +337,6 @@ mod tests {
         assert!(runtime_mode_denial(None, "full-access").is_none());
 
         assert_eq!(
-            clamp_runtime_mode(Some(&policy), "full-access", &RUNTIME_MODE_ORDER),
-            Some("auto-accept-edits")
-        );
-        assert_eq!(
-            clamp_runtime_mode(Some(&policy), "full-access", &["approval-required", "full-access"]),
-            Some("approval-required")
-        );
-        assert_eq!(
-            clamp_runtime_mode(Some(&policy), "full-access", &["auto", "full-access"]),
-            None
-        );
-        assert_eq!(
             clamp_typed_runtime_mode(
                 Some(&policy),
                 RuntimeMode::FullAccess,
@@ -395,18 +345,26 @@ mod tests {
             Some(RuntimeMode::AutoAcceptEdits)
         );
         assert_eq!(
+            clamp_typed_runtime_mode(
+                Some(&policy),
+                RuntimeMode::FullAccess,
+                &[RuntimeMode::ApprovalRequired, RuntimeMode::FullAccess],
+            ),
+            Some(RuntimeMode::ApprovalRequired)
+        );
+        assert_eq!(
+            clamp_typed_runtime_mode(
+                Some(&policy),
+                RuntimeMode::FullAccess,
+                &[RuntimeMode::Auto, RuntimeMode::FullAccess],
+            ),
+            None
+        );
+        assert_eq!(
             clamp_typed_runtime_mode(Some(&policy), RuntimeMode::ApprovalRequired, &RuntimeMode::ALL),
             Some(RuntimeMode::ApprovalRequired)
         );
 
-        assert_eq!(
-            updates_denial(Some(&policy)).as_deref(),
-            Some("Example Corp manages T3 Code updates.")
-        );
-        assert_eq!(
-            nightly_denied_message("Example Corp"),
-            "Example Corp manages T3 Code updates. Only stable releases can be installed."
-        );
         assert!(providers_allowed_drivers_empty(Some(&policy)));
         assert!(providers_allowed_drivers_restricted(Some(&policy)));
         assert!(!providers_allowed_drivers_empty(None));
@@ -417,7 +375,7 @@ mod tests {
         assert!(providers_allowed_drivers_restricted(Some(&non_empty)));
 
         assert_eq!(
-            setting_lock_reason_for_any([None, Some(&non_empty), Some(&policy)], &["threads.linkedEnvironmentsEnabled"]).as_deref(),
+            setting_lock_reason_for_any([None, Some(&non_empty), Some(&policy)], &["linkedEnvironmentsEnabled"]).as_deref(),
             Some("Managed by Example Corp.")
         );
         assert!(setting_lock_reason_for_any([Some(&policy)], &["promptSuggestionsEnabled"]).is_none());

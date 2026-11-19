@@ -901,20 +901,74 @@ impl RenderOnce for Row {
                         h_flex()
                             .gap(r(8.))
                             .map(|this| if stacked { this.w_full().min_w_0() } else { this.flex_none().max_w(r(420.)).justify_end() })
-                            .map(|this| match unavailable {
-                                Some(message) => this.child(
-                                    div()
-                                        .id(ElementId::Name(format!("{id}-unavailable").into()))
-                                        .relative()
-                                        .child(div().opacity(0.5).child(control))
-                                        .child(div().absolute().inset_0().occlude())
-                                        .tooltip(tooltip(message)),
-                                ),
+                            .map(|this| match unavailable.clone() {
+                                Some(message) => {
+                                    let selector = format!("{id}-unavailable");
+                                    let unavailable_id = ElementId::Name(selector.clone().into());
+                                    let focus = focus_handle(&unavailable_id, window, cx);
+                                    let ring = hsla(p.ring);
+                                    this.child(
+                                        div()
+                                            .id(unavailable_id)
+                                            .debug_selector(move || selector.clone())
+                                            .relative()
+                                            .rounded(r(6.))
+                                            .track_focus(&focus)
+                                            .tab_index(0)
+                                            .role(gpui::Role::Group)
+                                            .aria_label(message.clone())
+                                            .focus_visible(move |s| {
+                                                s.shadow(vec![BoxShadow {
+                                                    color: ring,
+                                                    offset: point(px(0.), px(0.)),
+                                                    blur_radius: px(0.),
+                                                    spread_radius: px(2.),
+                                                    inset: true,
+                                                }])
+                                            })
+                                            .child(div().opacity(0.5).child(control))
+                                            .child(div().absolute().inset_0().occlude())
+                                            .tooltip(tooltip(message)),
+                                    )
+                                }
                                 None => this.child(control),
                             })
                     })),
             )
-            .children(self.below)
+            .children(self.below.map(|below| {
+                let id = self.id.clone();
+                match unavailable {
+                    Some(message) => {
+                        let selector = format!("{id}-below-unavailable");
+                        let unavailable_id = ElementId::Name(selector.clone().into());
+                        let focus = focus_handle(&unavailable_id, window, cx);
+                        let ring = hsla(p.ring);
+                        div()
+                            .id(unavailable_id)
+                            .debug_selector(move || selector.clone())
+                            .relative()
+                            .rounded(r(6.))
+                            .track_focus(&focus)
+                            .tab_index(0)
+                            .role(gpui::Role::Group)
+                            .aria_label(message.clone())
+                            .focus_visible(move |s| {
+                                s.shadow(vec![BoxShadow {
+                                    color: ring,
+                                    offset: point(px(0.), px(0.)),
+                                    blur_radius: px(0.),
+                                    spread_radius: px(2.),
+                                    inset: true,
+                                }])
+                            })
+                            .child(div().opacity(0.5).child(below))
+                            .child(div().absolute().inset_0().occlude())
+                            .tooltip(tooltip(message))
+                            .into_any_element()
+                    }
+                    None => below,
+                }
+            }))
     }
 }
 

@@ -308,7 +308,7 @@ impl SettingsView {
 
     /// `RetentionControl`: a day count while on, "Off" while off, and a switch that opens a
     /// draft at eight days without saving until Enter or blur after editing.
-    fn retention_control(&self, field: Retention, id: &'static str, value: Option<u32>, cx: &Context<Self>) -> impl IntoElement {
+    fn retention_control(&self, field: Retention, id: &'static str, value: Option<u32>, disabled: bool, cx: &Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let idx = field.index();
         let on = self.worktrees.retention_drafts[idx].is_on(value);
@@ -319,7 +319,7 @@ impl SettingsView {
                     this.child(
                         h_flex()
                             .gap(r(6.))
-                            .child(div().w(r(72.)).child(Input::new(self.worktrees.retention_input(field)).small()))
+                            .child(div().w(r(72.)).child(Input::new(self.worktrees.retention_input(field)).small().disabled(disabled)))
                             .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("days")),
                     )
                 } else {
@@ -329,6 +329,7 @@ impl SettingsView {
             .child(self.retention_switch(
                 id,
                 on,
+                disabled,
                 move |this, pressed| this.worktrees.retention_switch_pressed[idx] = pressed,
                 move |this, next, window, cx| {
                     let saved = this.scoped_representative_config(cx).and_then(|config| field.saved(&config));
@@ -389,17 +390,20 @@ impl SettingsView {
         let env_only = self.env_only_unavailable(cx);
         let mut creation = Vec::new();
         if capabilities.worktrees_directory == Some(true) {
+            let dir_lock = self.managed_setting_lock(&["worktreesDirectory"], cx);
+            let dir_unavail = dir_lock.clone().or_else(|| env_only.clone());
             creation.push(
                 Row::new("storage-worktrees-location", "Worktree location")
                     .description("Folder where new worktrees are created, on any drive, such as D:\\worktrees or ~/worktrees. Existing worktrees stay where they are. Leave empty to use the T3 home folder.")
                     .highlighted(self.is_target("storage-worktrees-location"))
-                    .unavailable(env_only.clone())
-                    .reset(!settings.worktrees_directory.is_empty(), self.worktree_reset(WorktreeChange::Directory(String::new()), cx))
-                    .control(div().w(r(288.)).child(Input::new(&self.worktrees.directory).small().disabled(env_only.is_some())))
+                    .unavailable(dir_unavail.clone())
+                    .reset(dir_lock.is_none() && !settings.worktrees_directory.is_empty(), self.worktree_reset(WorktreeChange::Directory(String::new()), cx))
+                    .control(div().w(r(288.)).child(Input::new(&self.worktrees.directory).small().disabled(dir_unavail.is_some())))
                     .into_any_element(),
             );
         }
         let start_from_origin = config.settings.new_worktrees_start_from_origin.unwrap_or(true);
+        let start_from_origin_locked = self.managed_setting_lock(&["newWorktreesStartFromOrigin"], cx).is_some();
         creation.push(
             self.apply_scoped_reset(
                 Row::new("start-from-origin", "Start from remote")
@@ -410,10 +414,11 @@ impl SettingsView {
                 WorktreeChange::StartFromOrigin(true).into_server(),
                 cx,
             )
-            .control(self.worktree_switch("start-from-origin-switch", start_from_origin, WorktreeChange::StartFromOrigin, cx))
+            .control(self.worktree_switch("start-from-origin-switch", start_from_origin, WorktreeChange::StartFromOrigin, cx).disabled(start_from_origin_locked))
             .into_any_element(),
         );
         let submodules_view = cx.entity().downgrade();
+        let submodules_locked = self.managed_setting_lock(&["worktreeSubmodules"], cx).is_some();
         let submodules = self
             .apply_scoped_reset(
                 Row::new("worktree-submodules", "Submodules")
@@ -428,6 +433,7 @@ impl SettingsView {
                 Select::new("worktree-submodules-select", Submodules::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                     .selected(settings.effective_submodules().as_str())
                     .width(176.)
+                    .disabled(submodules_locked)
                     .on_change(move |value, _, cx| {
                         if let Some(mode) = Submodules::parse(&value) {
                             let _ = submodules_view.update(cx, |this, cx| {
@@ -446,6 +452,7 @@ impl SettingsView {
 
         let mode = settings.branch_naming_mode;
         let naming_view = cx.entity().downgrade();
+        let naming_locked = self.managed_setting_lock(&["branchNamingMode"], cx).is_some();
         let mut branches = vec![
             self.apply_scoped_reset(
                 Row::new("worktree-branch-naming", "Worktree branch naming")
@@ -463,6 +470,7 @@ impl SettingsView {
                 Select::new("worktree-branch-naming-select", BranchNaming::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                     .selected(mode.as_str())
                     .width(196.)
+                    .disabled(naming_locked)
                     .on_change(move |value, _, cx| {
                         if let Some(mode) = BranchNaming::parse(&value) {
                             let _ = naming_view.update(cx, |this, cx| {
@@ -474,30 +482,36 @@ impl SettingsView {
             .into_any_element(),
         ];
         match mode {
-            BranchNaming::Static => branches.push(
-                self.apply_scoped_reset(
-                    Row::new("worktree-branch-prefix", "Branch prefix")
-                        .description("For example, t3 or t3/ produces t3/add-search. Leave empty for no prefix."),
-                    &["branchNamePrefix"],
-                    settings.branch_name_prefix != DEFAULT_BRANCH_PREFIX,
-                    WorktreeChange::BranchPrefix(DEFAULT_BRANCH_PREFIX.to_owned()).into_server(),
-                    cx,
-                )
-                .control(div().w(r(176.)).child(Input::new(&self.worktrees.prefix).small()))
-                .into_any_element(),
-            ),
-            BranchNaming::Custom => branches.push(
-                self.apply_scoped_reset(
-                    Row::new("worktree-branch-instructions", "Branch naming instructions")
-                        .description("Appended to the naming prompt. The model returns the complete branch name; no prefix or suffix is added."),
-                    &["branchNameInstructions"],
-                    !settings.branch_name_instructions.is_empty(),
-                    WorktreeChange::BranchInstructions(String::new()).into_server(),
-                    cx,
-                )
-                .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.worktrees.instructions)))
-                .into_any_element(),
-            ),
+            BranchNaming::Static => {
+                let prefix_locked = self.managed_setting_lock(&["branchNamePrefix"], cx).is_some();
+                branches.push(
+                    self.apply_scoped_reset(
+                        Row::new("worktree-branch-prefix", "Branch prefix")
+                            .description("For example, t3 or t3/ produces t3/add-search. Leave empty for no prefix."),
+                        &["branchNamePrefix"],
+                        settings.branch_name_prefix != DEFAULT_BRANCH_PREFIX,
+                        WorktreeChange::BranchPrefix(DEFAULT_BRANCH_PREFIX.to_owned()).into_server(),
+                        cx,
+                    )
+                    .control(div().w(r(176.)).child(Input::new(&self.worktrees.prefix).small().disabled(prefix_locked)))
+                    .into_any_element(),
+                );
+            }
+            BranchNaming::Custom => {
+                let instructions_locked = self.managed_setting_lock(&["branchNameInstructions"], cx).is_some();
+                branches.push(
+                    self.apply_scoped_reset(
+                        Row::new("worktree-branch-instructions", "Branch naming instructions")
+                            .description("Appended to the naming prompt. The model returns the complete branch name; no prefix or suffix is added."),
+                        &["branchNameInstructions"],
+                        !settings.branch_name_instructions.is_empty(),
+                        WorktreeChange::BranchInstructions(String::new()).into_server(),
+                        cx,
+                    )
+                    .below(div().mt(r(12.)).pb(r(14.)).max_w(r(672.)).child(Textarea::new(&self.worktrees.instructions).disabled(instructions_locked)))
+                    .into_any_element(),
+                );
+            }
             BranchNaming::Semantic => {}
         }
         let branches = section("Branches", branches, cx);
@@ -547,6 +561,7 @@ impl SettingsView {
         };
         let mut rows = Vec::new();
         if is_project_scope {
+            let mode_lock = self.managed_setting_lock(&["worktreeCleanup"], cx);
             let mode_view = cx.entity().downgrade();
             let reset_view = cx.entity().downgrade();
             let description = match project_mode {
@@ -557,8 +572,9 @@ impl SettingsView {
             rows.push(
                 Row::new("project-worktree-cleanup-mode", "Automatic worktree cleanup")
                     .description(description)
+                    .unavailable(mode_lock.clone())
                     .reset_tooltip("Reset to inherited value")
-                    .reset(project_mode != "inherit", move |_, _, cx| {
+                    .reset(mode_lock.is_none() && project_mode != "inherit", move |_, _, cx| {
                         let _ = reset_view.update(cx, |this, cx| {
                             this.clear_project_overrides(&["worktreeCleanup"], cx);
                         });
@@ -574,6 +590,7 @@ impl SettingsView {
                         )
                         .selected(project_mode)
                         .width(156.)
+                        .disabled(mode_lock.is_some())
                         .on_change(move |value, _, cx| {
                             let _ = mode_view.update(cx, |this, cx| match value.as_str() {
                                 "inherit" => this.clear_project_overrides(&["worktreeCleanup"], cx),
@@ -596,49 +613,69 @@ impl SettingsView {
                     }
                 }
             };
+            let cleanup_lock = |key: &str, cx: &App| {
+                if is_project_scope {
+                    self.managed_setting_lock(&["worktreeCleanup"], cx)
+                } else {
+                    self.managed_setting_lock(&["worktreeCleanup", key], cx)
+                }
+            };
+            let on_delete_lock = cleanup_lock("storageCleanup.worktreeOnDelete", cx);
             rows.push(
                 Row::new("worktree-on-delete", "Delete worktrees with deleted threads")
                     .description("Remove unused worktrees when active or archived threads are deleted. Worktrees with local changes are kept.")
-                    .control(self.worktree_switch("worktree-on-delete-switch", rules.worktree_on_delete, rule(CleanupRule::OnDelete), cx))
+                    .unavailable(on_delete_lock.clone())
+                    .control(self.worktree_switch("worktree-on-delete-switch", rules.worktree_on_delete, rule(CleanupRule::OnDelete), cx).disabled(on_delete_lock.is_some()))
                     .into_any_element(),
             );
+            let on_merge_lock = cleanup_lock("storageCleanup.worktreeOnMerge", cx);
             rows.push(
                 Row::new("worktree-on-merge", "Delete merged worktrees")
                     .description("Remove worktrees whose pull request is merged and whose commits are included in the default branch.")
-                    .control(self.worktree_switch("worktree-on-merge-switch", rules.worktree_on_merge, rule(CleanupRule::OnMerge), cx))
+                    .unavailable(on_merge_lock.clone())
+                    .control(self.worktree_switch("worktree-on-merge-switch", rules.worktree_on_merge, rule(CleanupRule::OnMerge), cx).disabled(on_merge_lock.is_some()))
                     .into_any_element(),
             );
+            let after_days_lock = cleanup_lock("storageCleanup.worktreeAfterDays", cx);
             rows.push(
                 Row::new("worktree-after-days", "Delete inactive worktrees")
                     .description("Remove worktrees after their threads have been inactive for this many days. Branches and thread history are kept.")
-                    .control(self.retention_control(Retention::Inactive, "worktree-after-days-switch", rules.worktree_after_days, cx))
+                    .unavailable(after_days_lock.clone())
+                    .control(self.retention_control(Retention::Inactive, "worktree-after-days-switch", rules.worktree_after_days, after_days_lock.is_some(), cx))
                     .into_any_element(),
             );
             let mut advanced_rows = Vec::new();
             if capabilities.settled_worktree_cleanup == Some(true) {
+                let settled_lock = cleanup_lock("storageCleanup.worktreeSettledAfterDays", cx);
                 advanced_rows.push(
                     Row::new("worktree-settled-after-days", "Delete settled worktrees")
                         .description("Remove worktrees this many days after their thread settles. Set 0 days to remove them at the next cleanup. Branches and thread history are kept.")
-                        .control(self.retention_control(Retention::Settled, "worktree-settled-after-days-switch", rules.worktree_settled_after_days, cx))
+                        .unavailable(settled_lock.clone())
+                        .control(self.retention_control(Retention::Settled, "worktree-settled-after-days-switch", rules.worktree_settled_after_days, settled_lock.is_some(), cx))
                         .into_any_element(),
                 );
             }
+            let unchanged_lock = cleanup_lock("storageCleanup.worktreeUnchanged", cx);
             advanced_rows.push(
                 Row::new("worktree-unchanged", "Delete unchanged worktrees")
                     .description("Remove worktrees with no commits beyond the default branch.")
-                    .control(self.worktree_switch("worktree-unchanged-switch", rules.worktree_unchanged, rule(CleanupRule::Unchanged), cx))
+                    .unavailable(unchanged_lock.clone())
+                    .control(self.worktree_switch("worktree-unchanged-switch", rules.worktree_unchanged, rule(CleanupRule::Unchanged), cx).disabled(unchanged_lock.is_some()))
                     .into_any_element(),
             );
             if capabilities.storage_cleanup_run == Some(true) {
                 let keep_view = cx.entity().downgrade();
+                let keep_lock = cleanup_lock("storageCleanup.worktreeKeepWhen", cx);
                 advanced_rows.push(
                     Row::new("storage-worktree-keep-when", "Keep worktrees with local changes")
                         .description(rules.worktree_keep_when.description())
                         .highlighted(self.is_target("storage-worktree-keep-when"))
+                        .unavailable(keep_lock.clone())
                         .control(
                             Select::new("storage-worktree-keep-when-select", KeepWhen::ALL.iter().map(|mode| SelectOption::new(mode.as_str(), mode.label())).collect())
                                 .selected(rules.worktree_keep_when.as_str())
                                 .width(196.)
+                                .disabled(keep_lock.is_some())
                                 .on_change(move |value, _, cx| {
                                     if let Some(mode) = KeepWhen::parse(&value) {
                                         let _ = keep_view.update(cx, |this, cx| {
