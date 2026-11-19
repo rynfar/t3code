@@ -1,12 +1,14 @@
-//! Archive: archived threads by project with Unarchive, and Unarchive or Delete from the row's
-//! context menu (`web/src/components/settings/ArchivedThreadsPanel.tsx`). Delete asks first while
-//! the delete confirmation setting is on, with the copy `confirmAndDeleteThread` uses. The rows
-//! are a virtualized list over entries computed when the archive loads or a row leaves, so a
-//! large archive costs only its visible rows on each render (a settings search keystroke).
+//! Archive: archived threads by project with inline Unarchive and Delete actions, and Unarchive
+//! or Delete from the row's context menu (`web/src/components/settings/ArchivedThreadsPanel.tsx`).
+//! Delete asks first while the delete confirmation setting is on, with the copy
+//! `confirmAndDeleteThread` uses. The rows are a virtualized list over entries computed when the
+//! archive loads or a row leaves, so a large archive costs only its visible rows on each render.
+
+use std::collections::HashSet;
 
 use gpui::{
     AnyElement, Context, FontWeight, IntoElement, ListAlignment, ListOffset, ListState, MouseButton, ParentElement, Pixels, Point,
-    PromptLevel, SharedString, Styled, Window, div, list, prelude::*, px,
+    SharedString, Styled, div, list, prelude::*, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::{self, method};
@@ -32,6 +34,9 @@ pub(crate) struct ArchiveState {
     entries: Vec<ArchiveEntry>,
     list: ListState,
     menu: Option<(String, Point<Pixels>)>,
+    pending: HashSet<String>,
+    connection: Option<u64>,
+    load_id: u64,
     action_error: Option<(&'static str, String)>,
 }
 
@@ -42,6 +47,9 @@ impl Default for ArchiveState {
             entries: Vec::new(),
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             menu: None,
+            pending: HashSet::new(),
+            connection: None,
+            load_id: 0,
             action_error: None,
         }
     }
@@ -63,6 +71,10 @@ impl ArchiveState {
     fn has_rows(&self) -> bool {
         !self.entries.is_empty()
     }
+
+    pub(super) fn dismiss(&mut self) -> bool {
+        self.menu.take().is_some()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,14 +85,31 @@ enum Action {
 
 impl SettingsView {
     pub(super) fn load_archive(&mut self, cx: &mut Context<Self>) {
+        let connection = self.state.read(cx).connection_id();
+        self.archive.connection = connection;
+        self.archive.load_id += 1;
+        let load_id = self.archive.load_id;
+        self.archive.menu = None;
+        self.archive.pending.clear();
+        self.archive.action_error = None;
         self.archive.status = Status::Loading;
         self.archive.sync_entries();
+        let hidden_tags = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|config| config.settings.hidden_tags());
         let task = self.state.read(cx).rpc(GET_ARCHIVED_SHELL_SNAPSHOT, json!({}));
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                if this.archive.load_id != load_id || this.archive.connection != connection {
+                    return;
+                }
                 this.archive.status = match result {
-                    Ok(snapshot) => Status::Loaded(model::groups(&snapshot)),
+                    Ok(snapshot) => Status::Loaded(model::groups_filtered(&snapshot, hidden_tags.as_deref())),
                     Err(_) => Status::Failed,
                 };
                 this.archive.entries.clear();
@@ -92,30 +121,73 @@ impl SettingsView {
         .detach();
     }
 
-    fn run_archive_action(&mut self, action: Action, thread_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn run_archive_action(&mut self, action: Action, thread_id: String, cx: &mut Context<Self>) {
         self.archive.menu = None;
-        self.archive.action_error = None;
-        let title = self.archived_title(&thread_id).unwrap_or_else(|| "this thread".to_owned());
-        if action == Action::Delete && store::client(cx).confirm_thread_delete() {
-            let (message, detail) = model::delete_prompt(&title);
-            let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Delete", "Cancel"], cx);
-            cx.spawn_in(window, async move |this, cx| {
-                if answer.await.ok() == Some(0) {
-                    let _ = this.update(cx, |this, cx| this.dispatch_archive_action(action, thread_id, cx));
-                }
-            })
-            .detach();
+        if self.archive.pending.contains(&thread_id) {
             return;
         }
-        self.dispatch_archive_action(action, thread_id, cx);
+        self.archive.action_error = None;
+        let connection = self.archive.connection;
+        let title = self.archived_title(&thread_id).unwrap_or_else(|| "this thread".to_owned());
+        self.archive.pending.insert(thread_id.clone());
+        cx.notify();
+        if action == Action::Delete && store::client(cx).confirm_thread_delete() {
+            let (message, detail) = model::delete_prompt(&title);
+            let confirm_view = cx.entity().downgrade();
+            let cancel_view = cx.entity().downgrade();
+            let confirm_id = thread_id.clone();
+            let cancel_id = thread_id.clone();
+            let opened = crate::dialog::ask_available_cancellable(
+                message,
+                detail,
+                "Delete",
+                move |_, cx| {
+                    // Defer so `AppState` is no longer borrowed by `ConfirmDialog::resolve`.
+                    cx.defer(move |cx| {
+                        let _ = confirm_view.update(cx, |this, cx| {
+                            if this.archive.connection != connection {
+                                this.archive.pending.remove(&confirm_id);
+                                cx.notify();
+                                return;
+                            }
+                            this.dispatch_archive_action(action, confirm_id, connection, cx);
+                        });
+                    });
+                },
+                move |_, cx| {
+                    cx.defer(move |cx| {
+                        let _ = cancel_view.update(cx, |this, cx| {
+                            this.archive.pending.remove(&cancel_id);
+                            cx.notify();
+                        });
+                    });
+                },
+                cx,
+            );
+            if !opened {
+                self.archive.pending.remove(&thread_id);
+                cx.notify();
+            }
+            return;
+        }
+        self.dispatch_archive_action(action, thread_id, connection, cx);
     }
 
-    fn dispatch_archive_action(&mut self, action: Action, thread_id: String, cx: &mut Context<Self>) {
+    fn dispatch_archive_action(&mut self, action: Action, thread_id: String, connection: Option<u64>, cx: &mut Context<Self>) {
+        if self.archive.connection != connection {
+            self.archive.pending.remove(&thread_id);
+            cx.notify();
+            return;
+        }
         let kind = if action == Action::Unarchive { "thread.unarchive" } else { "thread.delete" };
         let task = self.state.read(cx).rpc(method::DISPATCH_COMMAND, commands::simple_thread_command(kind, &uuid_v4(), &thread_id));
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                this.archive.pending.remove(&thread_id);
+                if this.archive.connection != connection {
+                    return;
+                }
                 match result {
                     Ok(_) => {
                         if let Status::Loaded(groups) = &mut this.archive.status {
@@ -211,11 +283,11 @@ impl SettingsView {
                             this.archive.menu = None;
                             cx.notify();
                         }))
-                        .child(item("Unarchive", false).on_click(cx.listener(move |this, _, window, cx| {
-                            this.run_archive_action(Action::Unarchive, unarchive_id.clone(), window, cx)
+                        .child(item("Unarchive", false).on_click(cx.listener(move |this, _, _, cx| {
+                            this.run_archive_action(Action::Unarchive, unarchive_id.clone(), cx)
                         })))
-                        .child(item("Delete", true).on_click(cx.listener(move |this, _, window, cx| {
-                            this.run_archive_action(Action::Delete, delete_id.clone(), window, cx)
+                        .child(item("Delete", true).on_click(cx.listener(move |this, _, _, cx| {
+                            this.run_archive_action(Action::Delete, delete_id.clone(), cx)
                         }))),
                 ),
             )
@@ -255,7 +327,8 @@ impl SettingsView {
                 let thread = &groups[group].threads[position];
                 let now = chrono::Utc::now().timestamp_millis();
                 let id = thread.id.clone();
-                let (unarchive_id, menu_id) = (id.clone(), id.clone());
+                let pending = self.archive.pending.contains(&id);
+                let (unarchive_id, delete_id, menu_id) = (id.clone(), id.clone(), id.clone());
                 // One segment of `SettingsGroup`: the card's sides on every row, its ends on the first and last.
                 div()
                     .id(SharedString::from(format!("archived-{id}")))
@@ -268,6 +341,9 @@ impl SettingsView {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            if this.archive.pending.contains(&menu_id) {
+                                return;
+                            }
                             this.archive.menu = Some((menu_id.clone(), event.position));
                             cx.notify();
                         }),
@@ -277,12 +353,26 @@ impl SettingsView {
                             Row::new(SharedString::from(format!("archived-row-{id}")), thread.title.clone())
                                 .description(model::description(thread, now))
                                 .control(
-                                    Button::new(SharedString::from(format!("unarchive-{id}")), ButtonVariant::Outline, ButtonSize::Sm)
-                                        .icon(Icon::ArchiveX)
-                                        .label("Unarchive")
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.run_archive_action(Action::Unarchive, unarchive_id.clone(), window, cx)
-                                        })),
+                                    h_flex()
+                                        .gap(r(8.))
+                                        .child(
+                                            Button::new(SharedString::from(format!("unarchive-{id}")), ButtonVariant::Outline, ButtonSize::IconSm)
+                                                .icon(Icon::ArchiveX)
+                                                .tooltip("Unarchive")
+                                                .disabled(pending)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.run_archive_action(Action::Unarchive, unarchive_id.clone(), cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new(SharedString::from(format!("delete-archived-{id}")), ButtonVariant::DestructiveOutline, ButtonSize::IconSm)
+                                                .icon(Icon::Trash2)
+                                                .tooltip("Delete")
+                                                .disabled(pending)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.run_archive_action(Action::Delete, delete_id.clone(), cx)
+                                                })),
+                                        ),
                                 ),
                         ),
                     )
@@ -297,5 +387,155 @@ impl SettingsView {
             .when(last, |this| this.pb(r(48.)))
             .child(div().w_full().max_w(r(896.)).px(r(24.)).child(content))
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use gpui::{Focusable, Render, Window, div, prelude::*};
+    use serde_json::json;
+    use t3_core::settings::archive::{ArchiveGroup, ArchivedThread};
+    use t3_core::settings::search::Section;
+
+    use super::*;
+
+    struct TestFrame {
+        dialog: gpui::Entity<crate::dialog::ConfirmDialog>,
+    }
+    impl Render for TestFrame {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .children(crate::settings::overlay(window, cx))
+                .child(self.dialog.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn archive_unarchive_and_confirmed_delete_dispatch_and_guard_pending(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let drive = |vcx: &mut gpui::VisualTestContext| {
+            vcx.run_until_parked();
+            runtime.block_on(async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            });
+            vcx.run_until_parked();
+        };
+        cx.executor().allow_parking();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+        });
+        let dialog = cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx));
+        let frame_dialog = dialog.clone();
+        let window = cx.add_window(|_, _| TestFrame { dialog: frame_dialog });
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| crate::settings::open(Section::Archived, cx));
+        drive(&mut vcx);
+        let _ = fixture.take_requests();
+
+        let view = vcx.read(|cx| cx.global::<crate::settings::Host>().view.clone().expect("settings view open"));
+        vcx.update(|_, cx| {
+            view.update(cx, |view, _| {
+                view.archive.status = Status::Loaded(vec![ArchiveGroup {
+                    project_id: "proj-1".into(),
+                    title: "App".into(),
+                    threads: vec![ArchivedThread {
+                        id: "thread-1".into(),
+                        project_id: "proj-1".into(),
+                        title: "Old migration".into(),
+                        created_at: "2026-11-18T00:00:00Z".into(),
+                        archived_at: Some("2026-11-18T00:00:00Z".into()),
+                        tags: vec![],
+                        parent_thread_id: None,
+                    }],
+                }]);
+                view.archive.sync_entries();
+            });
+        });
+
+        // Unarchive dispatches immediately and blocks duplicate actions while pending.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.run_archive_action(Action::Unarchive, "thread-1".into(), cx);
+                assert!(view.archive.pending.contains("thread-1"));
+                view.run_archive_action(Action::Unarchive, "thread-1".into(), cx);
+            });
+        });
+        drive(&mut vcx);
+        let (requests, _) = fixture.take_requests();
+        let unarchives: Vec<_> = requests.into_iter().filter(|(m, _, _)| *m == "orchestration.dispatchCommand").collect();
+        assert_eq!(unarchives.len(), 1);
+        assert_eq!(unarchives[0].1["type"], json!("thread.unarchive"));
+        assert_eq!(unarchives[0].1["threadId"], json!("thread-1"));
+        let _ = unarchives.into_iter().next().unwrap().2.send(Ok(json!({})));
+        drive(&mut vcx);
+        view.read_with(&vcx, |view, _| assert!(!view.archive.pending.contains("thread-1")));
+
+        // Delete opens confirmation first; cancelling sends nothing and releases pending.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.run_archive_action(Action::Delete, "thread-1".into(), cx);
+            });
+        });
+        drive(&mut vcx);
+        assert!(vcx.read(|cx| crate::dialog::is_open(cx)));
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "orchestration.dispatchCommand"));
+        vcx.update(|window, cx| {
+            let focus = dialog.focus_handle(cx);
+            window.focus(&focus, cx);
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.simulate_keystrokes("escape");
+        drive(&mut vcx);
+        assert!(!vcx.read(|cx| crate::dialog::is_open(cx)));
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "orchestration.dispatchCommand"));
+        view.read_with(&vcx, |view, _| assert!(!view.archive.pending.contains("thread-1")));
+
+        // Confirming Delete dispatches thread.delete.
+        vcx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.run_archive_action(Action::Delete, "thread-1".into(), cx);
+            });
+        });
+        drive(&mut vcx);
+        vcx.update(|window, cx| {
+            let focus = dialog.focus_handle(cx);
+            window.focus(&focus, cx);
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.simulate_keystrokes("enter");
+        drive(&mut vcx);
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "orchestration.dispatchCommand").expect("thread.delete sent");
+        assert_eq!(payload["type"], json!("thread.delete"));
+        assert_eq!(payload["threadId"], json!("thread-1"));
+        let _ = reply.send(Ok(json!({})));
+        drive(&mut vcx);
+        view.read_with(&vcx, |view, _| assert!(!view.archive.pending.contains("thread-1")));
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        drop(runtime);
     }
 }

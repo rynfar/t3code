@@ -289,6 +289,38 @@ pub fn visible_processes(processes: &[Process], collapsed: &HashSet<Identity>) -
 pub fn should_show_retry(status: Option<SourceStatus>, error: Option<&str>) -> bool {
     matches!(status, Some(SourceStatus::Degraded | SourceStatus::Unavailable | SourceStatus::Stopped)) || (status.is_none() && error.is_some())
 }
+
+/// `canSignalProcess` in `ResourceTelemetryDiagnostics.tsx`: only server children, provider roots,
+/// and terminal roots expose signal actions in the resource monitor tree.
+pub fn can_signal(category: Category) -> bool {
+    matches!(category, Category::ServerChild | Category::ProviderRoot | Category::TerminalRoot)
+}
+
+/// `server.signalProcess` payload for a resource-monitor process identity.
+pub fn signal_payload(identity: &Identity, signal: &str) -> Value {
+    json!({
+        "pid": identity.pid,
+        "startTimeMs": identity.start_time_ms,
+        "signal": signal,
+    })
+}
+
+/// Interprets `server.signalProcess` reply for `ResourceTelemetryDiagnostics.tsx`: returns `None`
+/// when `signaled` is true, or an error description when signaling failed.
+pub fn signal_failure_message(reply: &Value, signal: &str, pid: u64) -> Option<String> {
+    if reply.get("signaled").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let message = match reply.get("message") {
+        Some(value) => match value.get("_tag").and_then(Value::as_str) {
+            Some("Some") => value.get("value").and_then(Value::as_str),
+            Some(_) => None,
+            None => value.as_str(),
+        },
+        None => None,
+    };
+    Some(message.map(str::to_owned).unwrap_or_else(|| format!("Failed to send {signal} to process {pid}.")))
+}
 pub fn history_bar_height(value: f64, max: f64, minimum: f64) -> f64 {
     if value <= 0. { 0. } else { minimum.max(value / max.max(1.) * 100.) }
 }
@@ -391,3 +423,53 @@ pub fn boolean_label(state: BooleanState, yes: &'static str, no: &'static str) -
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    #[test]
+    fn can_signal_matches_web_categories() {
+        assert!(can_signal(Category::ServerChild));
+        assert!(can_signal(Category::ProviderRoot));
+        assert!(can_signal(Category::TerminalRoot));
+        for blocked in [
+            Category::Server,
+            Category::ElectronMain,
+            Category::ElectronRenderer,
+            Category::ElectronGpu,
+            Category::ElectronUtility,
+            Category::ResourceMonitor,
+            Category::UnknownT3,
+            Category::Unknown,
+        ] {
+            assert!(!can_signal(blocked), "{blocked:?} should not be signalable");
+        }
+    }
+
+    #[test]
+    fn signal_payload_and_failure_message_match_contract() {
+        let id = Identity { pid: 4242, start_time_ms: 1_700_000_000_000 };
+        assert_eq!(
+            signal_payload(&id, "SIGINT"),
+            json!({ "pid": 4242, "startTimeMs": 1_700_000_000_000u64, "signal": "SIGINT" })
+        );
+        assert_eq!(signal_failure_message(&json!({ "signaled": true }), "SIGINT", 4242), None);
+        assert_eq!(
+            signal_failure_message(
+                &json!({ "signaled": false, "message": { "_tag": "Some", "value": "Process exited" } }),
+                "SIGKILL",
+                4242,
+            ),
+            Some("Process exited".to_owned())
+        );
+        assert_eq!(
+            signal_failure_message(
+                &json!({ "signaled": false, "message": { "_tag": "None" } }),
+                "SIGKILL",
+                4242,
+            ),
+            Some("Failed to send SIGKILL to process 4242.".to_owned())
+        );
+    }
+}

@@ -6,7 +6,7 @@ use gpui::{
     App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Styled, Subscription,
     Window, div,
 };
-use gpui_component::Sizable;
+use gpui_component::{Sizable, h_flex};
 use gpui_component::input::{Input, InputEvent, InputState};
 use t3_core::client_settings::{
     BrowserLinkTarget, BrowserSearchEngine, ClientSettingChange, DiffColorScheme, valid_search_template,
@@ -21,6 +21,7 @@ use super::controls::{
 use super::{Block, SettingsView, store};
 use crate::app_state::AppState;
 use crate::icons::Icon;
+use crate::theme::{hsla, palette};
 
 const BROWSER_UNAVAILABLE: &str = "Browser profiles and cookie import, floating previews, viewport, zoom, appearance, and recordings require the Electron desktop app. They aren't available in the native client yet.";
 const PR_UNAVAILABLE: &str = "Proactive panels aren't available in the native client yet.";
@@ -32,7 +33,7 @@ const ADVANCED: &[&str] = &[
 ];
 
 pub(super) struct BrowserState {
-    custom_url: Entity<InputState>,
+    pub(super) custom_url: Entity<InputState>,
     advanced: bool,
     _subscription: Subscription,
 }
@@ -153,7 +154,26 @@ impl SettingsView {
                 .description("Choose colors for additions and deletions, including change counts.")
                 .highlighted(self.is_target("diff-color-scheme"))
                 .reset(doc.diff_color_scheme() != DiffColorScheme::default(), reset(&state, ClientSettingChange::DiffColorScheme(DiffColorScheme::default())))
-                .control(select(&state, "diff-colors-select", DiffColorScheme::ALL, doc.diff_color_scheme(), DiffColorScheme::as_str, DiffColorScheme::label, ClientSettingChange::DiffColorScheme).label(if doc.diff_color_scheme() == DiffColorScheme::RedGreen { "Red & green" } else { "Blue & orange" }).popup_width(208.)).into_any_element(),
+                .control(
+                    select(&state, "diff-colors-select", DiffColorScheme::ALL, doc.diff_color_scheme(), DiffColorScheme::as_str, DiffColorScheme::label, ClientSettingChange::DiffColorScheme)
+                        .render_icon(|value, cx| {
+                            let p = palette(cx);
+                            let (first, second) = if value == "blue-orange" {
+                                (hsla(p.diff_addition), hsla(p.diff_deletion))
+                            } else {
+                                (hsla(p.diff_deletion), hsla(p.diff_addition))
+                            };
+                            Some(
+                                h_flex()
+                                    .gap(r(4.))
+                                    .child(div().size(r(8.)).rounded_full().bg(first))
+                                    .child(div().size(r(8.)).rounded_full().bg(second))
+                                    .into_any_element(),
+                            )
+                        })
+                        .label(if doc.diff_color_scheme() == DiffColorScheme::RedGreen { "Red & green" } else { "Blue & orange" })
+                        .popup_width(208.),
+                ).into_any_element(),
         ], cx);
         let pr_links_state = state.clone();
         let prs = section("Pull requests", vec![
@@ -161,7 +181,7 @@ impl SettingsView {
                 unavailable("proactive-panels", "Open pull requests and changes panels proactively", "Open linked pull requests first. Otherwise, open Changes for edits to at least 3 files or 50 lines.", "Unavailable", self.is_target("proactive-panels"), cx),
             ], cx).into_any_element(),
             Row::new("pull-request-links-open-in-app", "Open pull requests in T3 Code")
-                .description("Clicking a pull request link in an HTML page opens it in T3 Code. Turn off to open pull request links like any other link, on your git host.")
+                .description("Clicking a pull request link opens it in T3 Code. Turn off to open pull request links like any other link, on your git host.")
                 .highlighted(self.is_target("pull-request-links-open-in-app"))
                 .reset(!doc.pull_request_links_open_in_app(), reset(&state, ClientSettingChange::PullRequestLinksOpenInApp(true)))
                 .control(Switch::new("pull-request-links-open-in-app-switch", doc.pull_request_links_open_in_app()).on_change(move |on, _, cx| store::update_client(&pr_links_state, ClientSettingChange::PullRequestLinksOpenInApp(on), cx))).into_any_element(),
@@ -243,7 +263,7 @@ impl SettingsView {
             unavailable("browser-auto-show-floating-preview", "Auto-show floating preview", "Show the floating preview when an agent opens a browser or device unless the agent says otherwise.", "Unavailable", self.is_target("browser-auto-show-floating-preview"), cx),
         ], cx).into_any_element(),
             Row::new("browser-link-target", "Open links in")
-                .description("Where links in HTML pages open. Hold ⌘ or Ctrl while clicking a link to open it in your default browser either way.")
+                .description("Where links in the chat and terminal open. Hold \u{2318} or Ctrl while clicking a link to open it in your default browser either way.")
                 .highlighted(self.is_target("browser-link-target"))
                 .reset(doc.browser_link_target() != BrowserLinkTarget::default(), reset(&state, ClientSettingChange::BrowserLinkTarget(BrowserLinkTarget::default())))
                 .control(select(&state, "browser-link-target-select", BrowserLinkTarget::ALL, doc.browser_link_target(), BrowserLinkTarget::as_str, BrowserLinkTarget::label, ClientSettingChange::BrowserLinkTarget)).into_any_element(),

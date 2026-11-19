@@ -1,36 +1,60 @@
 //! Threads: `ThreadsSettingsPanel` in `web/src/components/settings/SettingsPanels.tsx` with the
-//! general rows of `ProjectDefaultsSettings.tsx` and `SnoozePresetsSettings.tsx`, at environment
-//! scope. Every row is server-backed. The text generation model, effort traits and thread title
-//! instructions are not ported yet.
+//! general rows of `ProjectDefaultsSettings.tsx`, `SnoozePresetsSettings.tsx`, and
+//! `ThreadTitleInstructionsSettings.tsx`, at environment scope. Every row is server-backed.
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveTime, TimeZone};
-use gpui::{App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled, Subscription, Window, div};
-use gpui_component::input::{Input, InputEvent, InputState};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveTime, Timelike, TimeZone};
+use gpui::{
+    AnyElement, App, AppContext, Context, Entity, Focusable, IntoElement, ParentElement, SharedString, Styled,
+    Subscription, Window, div,
+};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::{Sizable, h_flex, v_flex};
 use t3_core::client_settings::TimestampFormat;
 use t3_core::composer::{runtime_mode_description, runtime_mode_label};
 use t3_core::model::ModelSelection;
 use t3_core::providers;
-use t3_core::server_config::{RuntimeMode, ServerConfig, ThreadEnvMode};
+use t3_core::server_config::{OptionDescriptor, RuntimeMode, ServerConfig, ThreadEnvMode};
 use t3_core::settings::snooze::{self, DurationUnit, SnoozeDay, SnoozeDraft, SnoozePreset};
 use t3_core::settings::{
-    DEFAULT_AUTO_SETTLE_DAYS, ENV_MODES, MAX_AUTO_SETTLE_DAYS, MIN_AUTO_SETTLE_DAYS, ResponseStreamingMode, ServerSettingChange,
+    AutoSettleDaysField, DEFAULT_AUTO_SETTLE_DAYS, ENV_MODES, ResponseStreamingMode, ServerSettingChange,
     effective_env_mode,
 };
+use t3_core::sidebar::time::LocalTime;
+use t3_core::timeline::TimestampLocale;
+use t3_core::traits::{self, OptionValue};
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, muted_text, r, section};
 use super::{Block, SettingsView, store};
 use crate::composer::runtime_mode_icon;
+use crate::icons::Icon;
 use crate::theme::{hsla, palette};
+use crate::timestamp::SystemTimestampLocale;
 
 const SELECTION_SEPARATOR: char = '\u{1f}';
 
 type SnoozeEdit = Box<dyn FnOnce(&mut Vec<SnoozePreset>)>;
 
+#[derive(Clone)]
+struct SnoozeRowMemory {
+    minutes: u32,
+    time: String,
+    chosen_unit: Option<DurationUnit>,
+}
+
+impl Default for SnoozeRowMemory {
+    fn default() -> Self {
+        Self { minutes: 60, time: "09:00".to_owned(), chosen_unit: None }
+    }
+}
+
 pub(crate) struct ThreadsState {
     pub(crate) base_directory: Entity<InputState>,
     pub(crate) auto_settle_days: Entity<InputState>,
+    auto_settle_field: AutoSettleDaysField,
+    pub(crate) title_instructions: Entity<TextareaState>,
+    text_gen_advanced: bool,
     time_inputs: Vec<(Entity<InputState>, Subscription)>,
+    row_memory: Vec<SnoozeRowMemory>,
     /// The snooze editor's local copy, created from the saved options on first render.
     snooze: Option<SnoozeDraft>,
     _subscriptions: Vec<Subscription>,
@@ -44,6 +68,11 @@ impl ThreadsState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
         let base_directory = cx.new(|cx| InputState::new(window, cx).placeholder("~/"));
         let auto_settle_days = cx.new(|cx| InputState::new(window, cx));
+        let title_instructions = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(4, 8)
+                .placeholder("Keep titles to a few words. Lead with the main subject.")
+        });
         let subscriptions = vec![
             cx.subscribe_in(&base_directory, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -52,22 +81,33 @@ impl ThreadsState {
             }),
             cx.subscribe_in(&auto_settle_days, window, |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => {
-                    let days = input.read(cx).value().trim().parse::<u32>().ok().filter(|days| (MIN_AUTO_SETTLE_DAYS..=MAX_AUTO_SETTLE_DAYS).contains(days));
-                    let saved = this.thread_settings(cx).and_then(|config| config.settings.threads.sidebar_auto_settle_after_days);
-                    if let Some(days) = days.filter(|days| Some(*days) != saved) {
-                        store::update_server(&this.state, ServerSettingChange::AutoSettleAfterDays(Some(days)), cx);
+                    let value = input.read(cx).value().to_string();
+                    if this.threads.auto_settle_field.draft != value {
+                        this.threads.auto_settle_field.edit(value);
                     }
                 }
-                InputEvent::Blur => {
-                    let saved = this.thread_settings(cx).and_then(|config| config.settings.threads.sidebar_auto_settle_after_days);
-                    if let Some(days) = saved {
-                        input.update(cx, |input, cx| input.set_value(days.to_string(), window, cx));
-                    }
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    this.commit_auto_settle_days(window, cx);
                 }
                 _ => {}
             }),
+            cx.subscribe_in(&title_instructions, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    this.commit_title_instructions(cx);
+                }
+            }),
         ];
-        ThreadsState { base_directory, auto_settle_days, time_inputs: Vec::new(), snooze: None, _subscriptions: subscriptions }
+        ThreadsState {
+            base_directory,
+            auto_settle_days,
+            auto_settle_field: AutoSettleDaysField::new(DEFAULT_AUTO_SETTLE_DAYS),
+            title_instructions,
+            text_gen_advanced: false,
+            time_inputs: Vec::new(),
+            row_memory: Vec::new(),
+            snooze: None,
+            _subscriptions: subscriptions,
+        }
     }
 }
 
@@ -104,12 +144,81 @@ pub(super) fn selection_label(config: &ServerConfig, selection: &ModelSelection)
         .unwrap_or_else(|| selection.model.clone())
 }
 
-/// `formatShortTimestamp` for a wake time.
+/// `formatShortTimestamp` for a wake time, honoring the host locale when `Locale` is selected.
 fn format_time(time: &DateTime<Local>, format: TimestampFormat) -> String {
-    match format {
-        TimestampFormat::TwentyFourHour => time.format("%H:%M").to_string(),
-        TimestampFormat::Locale | TimestampFormat::TwelveHour => time.format("%-I:%M %p").to_string(),
+    let local = LocalTime {
+        year: i64::from(time.year()),
+        month: i64::from(time.month()),
+        day: i64::from(time.day()),
+        hour: i64::from(time.hour()),
+        minute: i64::from(time.minute()),
+        second: i64::from(time.second()),
+        millis: 0,
+        weekday: i64::from(time.weekday().num_days_from_sunday()),
+    };
+    SystemTimestampLocale.time(local, format)
+}
+
+/// Renders effort/trait controls for a selected model (`TraitsPicker` in `SettingsPanels.tsx`).
+fn model_trait_controls(
+    id_prefix: &'static str,
+    config: &ServerConfig,
+    selection: &ModelSelection,
+    state: &gpui::Entity<crate::app_state::AppState>,
+    change: fn(Option<ModelSelection>) -> ServerSettingChange,
+) -> Vec<AnyElement> {
+    let Some(provider) = config.provider(&selection.instance_id) else {
+        return Vec::new();
+    };
+    let model = provider.models.iter().find(|candidate| candidate.slug == selection.model);
+    let explicit = traits::selections(selection.options.as_ref());
+    let resolved = traits::composer_options(&provider.driver, model, false, &explicit);
+    let descriptors = resolved.descriptors;
+    let mut controls = Vec::new();
+    for descriptor in &descriptors {
+        let OptionDescriptor::Select(select) = descriptor else {
+            continue;
+        };
+        let options: Vec<SelectOption> = traits::selectable_choices(select)
+            .map(|choice| {
+                let mut option = SelectOption::new(choice.id.clone(), choice.label.clone());
+                if let Some(description) = &choice.description {
+                    option = option.description(description.clone());
+                }
+                option
+            })
+            .collect();
+        if options.is_empty() {
+            continue;
+        }
+        let selected = select
+            .current_value
+            .clone()
+            .or_else(|| options.first().map(|option| option.value.to_string()))
+            .unwrap_or_default();
+        let all_descriptors = descriptors.clone();
+        let option_id = select.id.clone();
+        let instance_id = selection.instance_id.clone();
+        let model_slug = selection.model.clone();
+        let state = state.clone();
+        controls.push(
+            Select::new(SharedString::from(format!("{id_prefix}-trait-{}", select.id)), options)
+                .selected(selected)
+                .width(124.)
+                .popup_width(180.)
+                .show_check()
+                .on_change(move |value, _, cx| {
+                    if let Some(next_selections) =
+                        traits::with_value(&all_descriptors, &option_id, OptionValue::Str(value.to_string()))
+                    {
+                        let next = traits::model_selection(&instance_id, &model_slug, &next_selections);
+                        store::update_server(&state, change(Some(next)), cx);
+                    }
+                })
+                .into_any_element(),
+        );
     }
+    controls
 }
 
 /// `resolveSnoozePreset` against the local clock: (id, label, when, wake minute).
@@ -159,21 +268,39 @@ impl SettingsView {
         };
 
         Self::sync_input(&self.threads.base_directory, &threads.add_project_base_directory, window, cx);
-        if let Some(days) = threads.sidebar_auto_settle_after_days {
-            Self::sync_input(&self.threads.auto_settle_days, &days.to_string(), window, cx);
+        self.sync_auto_settle_days(threads.sidebar_auto_settle_after_days, window, cx);
+        if !self.threads.title_instructions.focus_handle(cx).is_focused(window)
+            && self.threads.title_instructions.read(cx).value().as_ref() != threads.thread_title_instructions.as_str()
+        {
+            let value = threads.thread_title_instructions.clone();
+            self.threads.title_instructions.update(cx, |input, cx| input.set_value(value, window, cx));
         }
 
+        let ghq_state = self.state.clone();
         let new_projects = section(
             "New projects",
-            vec![Row::new("add-project-starts-in", "Add project starts in")
-                .description("Leave empty to use \"~/\" when the Add Project browser opens.")
-                .highlighted(self.is_target("add-project-starts-in"))
-                .reset(!threads.add_project_base_directory.is_empty(), {
-                    let reset = update(ServerSettingChange::AddProjectBaseDirectory(String::new()));
-                    move |_, _, cx| reset(cx)
-                })
-                .control(div().w(r(288.)).child(Input::new(&self.threads.base_directory).small()))
-                .into_any_element()],
+            vec![
+                Row::new("add-project-starts-in", "Add project starts in")
+                    .description("Leave empty to use \"~/\" when the Add Project browser opens.")
+                    .highlighted(self.is_target("add-project-starts-in"))
+                    .reset(!threads.add_project_base_directory.is_empty(), {
+                        let reset = update(ServerSettingChange::AddProjectBaseDirectory(String::new()));
+                        move |_, _, cx| reset(cx)
+                    })
+                    .control(div().w(r(288.)).child(Input::new(&self.threads.base_directory).small()))
+                    .into_any_element(),
+                Row::new("ghq-clone-layout", "Clone into host folders")
+                    .description("Clones go to github.com/owner/repo under the folder above, like ghq.")
+                    .highlighted(self.is_target("ghq-clone-layout"))
+                    .reset(threads.ghq_clone_layout, {
+                        let reset = update(ServerSettingChange::GhqCloneLayout(false));
+                        move |_, _, cx| reset(cx)
+                    })
+                    .control(Switch::new("ghq-clone-layout-switch", threads.ghq_clone_layout).on_change(move |checked, _, cx| {
+                        store::update_server(&ghq_state, ServerSettingChange::GhqCloneLayout(checked), cx);
+                    }))
+                    .into_any_element(),
+            ],
             cx,
         );
 
@@ -197,19 +324,35 @@ impl SettingsView {
                 move |_, _, cx| reset(cx)
             });
         let model_row = match &selection {
-            Some(selection) if !options.is_empty() => model_row.control(
-                Select::new("default-model-select", options.clone())
-                    .selected(selection_value(selection))
-                    .label(selection_label(&config, selection))
-                    .width(220.)
-                    .popup_width(260.)
-                    .show_check()
-                    .on_change(move |value, _, cx| {
-                        if let Some(selection) = parse_selection(&value) {
-                            store::update_server(&model_state, ServerSettingChange::DefaultModelSelection(Some(selection)), cx);
-                        }
-                    }),
-            ),
+            Some(selection) if !options.is_empty() => {
+                let trait_pickers = model_trait_controls(
+                    "default-model",
+                    &config,
+                    selection,
+                    &self.state,
+                    ServerSettingChange::DefaultModelSelection,
+                );
+                model_row.control(
+                    h_flex()
+                        .flex_wrap()
+                        .justify_end()
+                        .gap(r(6.))
+                        .child(
+                            Select::new("default-model-select", options.clone())
+                                .selected(selection_value(selection))
+                                .label(selection_label(&config, selection))
+                                .width(220.)
+                                .popup_width(260.)
+                                .show_check()
+                                .on_change(move |value, _, cx| {
+                                    if let Some(selection) = parse_selection(&value) {
+                                        store::update_server(&model_state, ServerSettingChange::DefaultModelSelection(Some(selection)), cx);
+                                    }
+                                }),
+                        )
+                        .children(trait_pickers),
+                )
+            }
             _ => model_row.control(muted_text("No providers available", cx)),
         };
 
@@ -223,19 +366,41 @@ impl SettingsView {
                 move |_, _, cx| reset(cx)
             });
         let fallback_row = match &fallback {
-            Some(shown) if !options.is_empty() => fallback_row.control(
-                Select::new("fallback-model-select", options)
-                    .selected(selection_value(shown))
-                    .label(if settings.fallback_model_selection.is_none() { "None".to_owned() } else { selection_label(&config, shown) })
-                    .width(220.)
-                    .popup_width(260.)
-                    .show_check()
-                    .on_change(move |value, _, cx| {
-                        if let Some(selection) = parse_selection(&value) {
-                            store::update_server(&fallback_state, ServerSettingChange::FallbackModelSelection(Some(selection)), cx);
-                        }
-                    }),
-            ),
+            Some(shown) if !options.is_empty() => {
+                let trait_pickers = settings
+                    .fallback_model_selection
+                    .as_ref()
+                    .map(|explicit| {
+                        model_trait_controls(
+                            "fallback-model",
+                            &config,
+                            explicit,
+                            &self.state,
+                            ServerSettingChange::FallbackModelSelection,
+                        )
+                    })
+                    .unwrap_or_default();
+                fallback_row.control(
+                    h_flex()
+                        .flex_wrap()
+                        .justify_end()
+                        .gap(r(6.))
+                        .child(
+                            Select::new("fallback-model-select", options.clone())
+                                .selected(selection_value(shown))
+                                .label(if settings.fallback_model_selection.is_none() { "None".to_owned() } else { selection_label(&config, shown) })
+                                .width(220.)
+                                .popup_width(260.)
+                                .show_check()
+                                .on_change(move |value, _, cx| {
+                                    if let Some(selection) = parse_selection(&value) {
+                                        store::update_server(&fallback_state, ServerSettingChange::FallbackModelSelection(Some(selection)), cx);
+                                    }
+                                }),
+                        )
+                        .children(trait_pickers),
+                )
+            }
             _ => fallback_row.control(muted_text("No providers available", cx)),
         };
 
@@ -360,44 +525,146 @@ impl SettingsView {
         }
         let auto_settle = section("Auto-settle", auto_settle_rows, cx);
 
-        let streaming = threads.response_streaming_mode;
-        let streaming_state = self.state.clone();
-        let text_generation = section(
-            "Text generation",
-            vec![Row::new("response-streaming", "Response streaming")
-                .description(streaming.description())
-                .highlighted(self.is_target("response-streaming"))
-                .reset(streaming != ResponseStreamingMode::default(), {
-                    let reset = update(ServerSettingChange::ResponseStreamingMode(ResponseStreamingMode::default()));
-                    move |_, _, cx| reset(cx)
-                })
-                .control(
-                    Select::new(
-                        "response-streaming-select",
-                        ResponseStreamingMode::ALL.iter().map(|mode| SelectOption::new(streaming_value(*mode), mode.label())).collect(),
-                    )
-                    .selected(streaming_value(streaming))
-                    .width(224.)
-                    .on_change(move |value, _, cx| {
-                        let mode = match value.as_ref() {
-                            "turn" => ResponseStreamingMode::Turn,
-                            "paragraph" => ResponseStreamingMode::Paragraph,
-                            _ => return,
-                        };
-                        store::update_server(&streaming_state, ServerSettingChange::ResponseStreamingMode(mode), cx);
-                    }),
+        let saved_text_gen = t3_core::settings::text_generation_model_selection(settings);
+        let text_gen_selection = saved_text_gen
+            .clone()
+            .filter(|selection| providers::instance_enabled(settings, None, &selection.instance_id))
+            .or_else(|| selection.clone());
+        let text_gen_state = self.state.clone();
+        let text_gen_row = Row::new("text-generation-model", "Text generation model")
+            .description("For thread titles and other generated text. Source control has its own setting. Text generators from Providers also appear here.")
+            .highlighted(self.is_target("text-generation-model"))
+            .reset(saved_text_gen.is_some(), {
+                let reset = update(ServerSettingChange::TextGenerationModelSelection(None));
+                move |_, _, cx| reset(cx)
+            });
+        let text_gen_row = match &text_gen_selection {
+            Some(shown) if !options.is_empty() => {
+                let trait_pickers = model_trait_controls(
+                    "text-generation-model",
+                    &config,
+                    shown,
+                    &self.state,
+                    ServerSettingChange::TextGenerationModelSelection,
+                );
+                text_gen_row.control(
+                    h_flex()
+                        .flex_wrap()
+                        .justify_end()
+                        .gap(r(6.))
+                        .child(
+                            Select::new("text-generation-model-select", options)
+                                .selected(selection_value(shown))
+                                .label(selection_label(&config, shown))
+                                .width(220.)
+                                .popup_width(260.)
+                                .show_check()
+                                .on_change(move |value, _, cx| {
+                                    if let Some(selection) = parse_selection(&value) {
+                                        store::update_server(
+                                            &text_gen_state,
+                                            ServerSettingChange::TextGenerationModelSelection(Some(selection)),
+                                            cx,
+                                        );
+                                    }
+                                }),
+                        )
+                        .children(trait_pickers),
                 )
-                .into_any_element()],
-            cx,
-        );
+            }
+            _ => text_gen_row.control(muted_text("No text generation providers available.", cx)),
+        };
+
+        let text_gen_advanced = self.threads.text_gen_advanced
+            || self.is_target("thread-title-instructions")
+            || self.is_target("response-streaming");
+        let weak_advanced = cx.entity().downgrade();
+        let mut text_gen_rows = vec![
+            text_gen_row.into_any_element(),
+            div()
+                .px(r(16.))
+                .py(r(8.))
+                .child(
+                    Button::new("threads-text-gen-advanced", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                        .icon(if text_gen_advanced { Icon::ChevronDown } else { Icon::ChevronRight })
+                        .label("Advanced")
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_advanced.update(cx, |view, cx| {
+                                view.threads.text_gen_advanced = !text_gen_advanced;
+                                if view.is_target("thread-title-instructions") || view.is_target("response-streaming") {
+                                    view.target = None;
+                                }
+                                cx.notify();
+                            });
+                        }),
+                )
+                .into_any_element(),
+        ];
+        if text_gen_advanced {
+            let streaming = threads.response_streaming_mode;
+            let streaming_state = self.state.clone();
+            text_gen_rows.push(
+                Row::new("thread-title-instructions", "Thread title instructions")
+                    .description("Appended to the prompt for new and regenerated thread titles.")
+                    .highlighted(self.is_target("thread-title-instructions"))
+                    .reset(!threads.thread_title_instructions.is_empty(), {
+                        let reset = update(ServerSettingChange::ThreadTitleInstructions(String::new()));
+                        move |_, _, cx| reset(cx)
+                    })
+                    .below(
+                        div()
+                            .mt(r(12.))
+                            .pb(r(12.))
+                            .max_w(r(672.))
+                            .child(Textarea::new(&self.threads.title_instructions)),
+                    )
+                    .into_any_element(),
+            );
+            text_gen_rows.push(
+                Row::new("response-streaming", "Response streaming")
+                    .description(streaming.description())
+                    .highlighted(self.is_target("response-streaming"))
+                    .reset(streaming != ResponseStreamingMode::default(), {
+                        let reset = update(ServerSettingChange::ResponseStreamingMode(ResponseStreamingMode::default()));
+                        move |_, _, cx| reset(cx)
+                    })
+                    .control(
+                        Select::new(
+                            "response-streaming-select",
+                            ResponseStreamingMode::ALL.iter().map(|mode| SelectOption::new(streaming_value(*mode), mode.label())).collect(),
+                        )
+                        .selected(streaming_value(streaming))
+                        .width(224.)
+                        .on_change(move |value, _, cx| {
+                            let mode = match value.as_ref() {
+                                "turn" => ResponseStreamingMode::Turn,
+                                "paragraph" => ResponseStreamingMode::Paragraph,
+                                _ => return,
+                            };
+                            store::update_server(&streaming_state, ServerSettingChange::ResponseStreamingMode(mode), cx);
+                        }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let text_generation = section("Text generation", text_gen_rows, cx);
 
         vec![
-            Block::new(&["new-projects", "add-project-starts-in"], new_projects),
+            Block::new(&["new-projects", "add-project-starts-in", "ghq-clone-layout"], new_projects),
             Block::new(&["project-defaults", "default-model", "fallback-model", "default-permissions", "new-threads"], new_threads),
             Block::new(&["snooze", "snooze-options"], snooze_section),
             Block::new(&["usage-limits", "auto-resume-limited-threads", "snooze-limited-threads"], usage_limits),
-            Block::new(&["auto-settle", "auto-settle-merged-threads", "auto-settle-inactive-threads"], auto_settle),
-            Block::new(&["text-generation", "response-streaming"], text_generation),
+            Block::new(
+                &[
+                    "auto-settle",
+                    "auto-settle-merged-threads",
+                    "auto-settle-inactive-threads",
+                    "days-before-auto-settle",
+                    "keep-threads-with-pull-requests",
+                ],
+                auto_settle,
+            ),
+            Block::new(&["text-generation", "text-generation-model", "thread-title-instructions", "response-streaming"], text_generation),
         ]
     }
 
@@ -407,6 +674,56 @@ impl SettingsView {
         if saved.as_deref() != Some(value.as_str()) {
             store::update_server(&self.state, ServerSettingChange::AddProjectBaseDirectory(value), cx);
         }
+    }
+
+    fn commit_title_instructions(&mut self, cx: &mut Context<Self>) {
+        let value = self.threads.title_instructions.read(cx).value().trim().to_owned();
+        let saved = self.thread_settings(cx).map(|config| config.settings.threads.thread_title_instructions.clone());
+        if saved.as_deref() != Some(value.as_str()) {
+            store::update_server(&self.state, ServerSettingChange::ThreadTitleInstructions(value), cx);
+        }
+    }
+
+    fn sync_auto_settle_days(&mut self, saved: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(days) = saved {
+            self.threads.auto_settle_field.sync(days);
+            if !self.threads.auto_settle_field.dirty
+                && self.threads.auto_settle_days.read(cx).value().as_ref() != self.threads.auto_settle_field.draft
+            {
+                let draft = self.threads.auto_settle_field.draft.clone();
+                self.threads.auto_settle_days.update(cx, |input, cx| input.set_value(draft, window, cx));
+            }
+        }
+    }
+
+    /// Commits the deferred auto-settle days draft on Enter, Blur, or modal close (`pingdotgg/t3code#36303`).
+    fn commit_auto_settle_days(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (draft, submit) = self.threads.auto_settle_field.commit();
+        if self.threads.auto_settle_days.read(cx).value().as_ref() != draft {
+            self.threads.auto_settle_days.update(cx, |input, cx| input.set_value(draft, window, cx));
+        }
+        let Some((days, revision)) = submit else {
+            return;
+        };
+        let view = cx.entity().downgrade();
+        let on_failed = Box::new(move |cx: &mut App| {
+            let _ = view.update(cx, |this, cx| {
+                let _ = this.threads.auto_settle_field.fail(revision);
+                cx.notify();
+            });
+        });
+        store::update_server_with(&self.state, ServerSettingChange::AutoSettleAfterDays(Some(days)), Some(on_failed), cx);
+    }
+
+    /// Escape while editing auto-settle days cancels the dirty draft without closing Settings.
+    pub(super) fn dismiss_auto_settle_days(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.threads.auto_settle_days.focus_handle(cx).is_focused(window) && self.threads.auto_settle_field.dirty {
+            let restored = self.threads.auto_settle_field.cancel();
+            self.threads.auto_settle_days.update(cx, |input, cx| input.set_value(restored, window, cx));
+            cx.notify();
+            return true;
+        }
+        false
     }
 
     /// Saves a typed wake time, or puts the saved one back when it does not parse.
@@ -432,6 +749,12 @@ impl SettingsView {
     pub(super) fn commit_focused_thread_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.threads.base_directory.focus_handle(cx).is_focused(window) {
             self.commit_base_directory(cx);
+        }
+        if self.threads.auto_settle_days.focus_handle(cx).is_focused(window) {
+            self.commit_auto_settle_days(window, cx);
+        }
+        if self.threads.title_instructions.focus_handle(cx).is_focused(window) {
+            self.commit_title_instructions(cx);
         }
         if let Some(index) = self.threads.time_inputs.iter().position(|(input, _)| input.focus_handle(cx).is_focused(window)) {
             self.commit_time_input(index, window, cx);
@@ -467,6 +790,7 @@ impl SettingsView {
         draft.observe(saved);
         let presets = draft.presets().to_vec();
         let presets = presets.as_slice();
+        self.threads.row_memory.resize_with(presets.len(), SnoozeRowMemory::default);
         self.sync_time_inputs(presets, window, cx);
 
         let view = cx.entity().downgrade();
@@ -502,7 +826,13 @@ impl SettingsView {
             };
             let remove = {
                 let save = save.clone();
+                let view = cx.entity().downgrade();
                 move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                    let _ = view.update(cx, |this, _| {
+                        if index < this.threads.row_memory.len() {
+                            this.threads.row_memory.remove(index);
+                        }
+                    });
                     save(
                         Box::new(move |presets| {
                             if index < presets.len() {
@@ -576,18 +906,21 @@ impl SettingsView {
                 .children(full.then(|| div().text_xs().text_color(hsla(p.muted_foreground)).child(format!("Up to {} options", snooze::MAX_PRESETS)))),
         );
         let defaults = snooze::default_presets();
+        let reset_view = cx.entity().downgrade();
         Row::new("snooze-options", "Snooze options")
             .description("Choices in every snooze menu, listed soonest first. Weekdays mean the next one after today.")
             .highlighted(self.is_target("snooze-options"))
             .reset(!snooze::same_presets(presets, &defaults), move |_, _, cx| {
+                let _ = reset_view.update(cx, |this, _| this.threads.row_memory.clear());
                 let defaults = defaults.clone();
                 save(Box::new(move |presets| *presets = defaults), cx)
             })
             .below(list)
     }
 
-    fn snooze_fields(&self, index: usize, preset: &SnoozePreset, replace: impl Fn(SnoozePreset, &mut App) + Clone + 'static, cx: &App) -> impl IntoElement {
+    fn snooze_fields(&self, index: usize, preset: &SnoozePreset, replace: impl Fn(SnoozePreset, &mut App) + Clone + 'static, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
+        let memory = self.threads.row_memory.get(index).cloned().unwrap_or_default();
         let when_options = std::iter::once(SelectOption::new("after", "In"))
             .chain(SnoozeDay::ALL.iter().map(|day| SelectOption::new(day.as_str(), day.label())))
             .collect();
@@ -597,19 +930,38 @@ impl SettingsView {
         };
         let when_preset = preset.clone();
         let when_replace = replace.clone();
+        let when_view = cx.entity().downgrade();
+        let mem_minutes = memory.minutes;
+        let mem_time = memory.time.clone();
         let when = Select::new(("snooze-when", index), when_options).selected(when_value).width(128.).on_change(move |value, _, cx| {
             let day = SnoozeDay::ALL.iter().copied().find(|day| day.as_str() == value.as_ref());
             if value.as_ref() != "after" && day.is_none() {
                 return;
             }
-            when_replace(snooze::with_when(&when_preset, day, 60, "09:00"), cx);
+            let next = snooze::with_when(&when_preset, day, mem_minutes, &mem_time);
+            let _ = when_view.update(cx, |this, _| {
+                if let Some(slot) = this.threads.row_memory.get_mut(index) {
+                    match &when_preset {
+                        SnoozePreset::After { minutes } if matches!(next, SnoozePreset::At { .. }) => slot.minutes = *minutes,
+                        SnoozePreset::At { time, .. } if matches!(next, SnoozePreset::After { .. }) => slot.time = time.clone(),
+                        _ => {}
+                    }
+                }
+            });
+            when_replace(next, cx);
         });
         let fields = h_flex().gap(r(8.)).child(when);
         match preset {
             SnoozePreset::After { minutes } => {
-                let (amount, unit) = snooze::split_minutes(*minutes);
                 let minutes = *minutes;
+                let unit = memory
+                    .chosen_unit
+                    .filter(|chosen| minutes.is_multiple_of(chosen.minutes()))
+                    .unwrap_or_else(|| snooze::split_minutes(minutes).1);
+                let amount = minutes / unit.minutes();
+                let max_amount = snooze::MAX_PRESET_MINUTES / unit.minutes();
                 let (minus, plus, units) = (replace.clone(), replace.clone(), replace);
+                let unit_view = cx.entity().downgrade();
                 fields
                     .child(
                         h_flex()
@@ -622,14 +974,21 @@ impl SettingsView {
                                     .icon(crate::icons::Icon::Minus)
                                     .tooltip("Decrease")
                                     .disabled(amount <= 1)
-                                    .on_click(move |_, _, cx| minus(SnoozePreset::After { minutes: snooze::step_amount(minutes, -1) }, cx)),
+                                    .on_click(move |_, _, cx| {
+                                        let next = amount.saturating_sub(1).max(1) * unit.minutes();
+                                        minus(SnoozePreset::After { minutes: next }, cx);
+                                    }),
                             )
                             .child(div().w(r(40.)).text_center().text_sm().child(amount.to_string()))
                             .child(
                                 Button::new(("snooze-increase", index), ButtonVariant::Ghost, ButtonSize::IconSm)
                                     .icon(crate::icons::Icon::Plus)
                                     .tooltip("Increase")
-                                    .on_click(move |_, _, cx| plus(SnoozePreset::After { minutes: snooze::step_amount(minutes, 1) }, cx)),
+                                    .disabled(amount >= max_amount)
+                                    .on_click(move |_, _, cx| {
+                                        let next = (amount + 1).min(max_amount) * unit.minutes();
+                                        plus(SnoozePreset::After { minutes: next }, cx);
+                                    }),
                             ),
                     )
                     .child(
@@ -637,14 +996,20 @@ impl SettingsView {
                             ("snooze-unit", index),
                             DurationUnit::ALL
                                 .iter()
-                                .map(|unit| SelectOption::new(unit.plural(), if amount == 1 { unit.singular() } else { unit.plural() }))
+                                .map(|candidate| SelectOption::new(candidate.plural(), if amount == 1 { candidate.singular() } else { candidate.plural() }))
                                 .collect(),
                         )
                         .selected(unit.plural())
                         .width(112.)
                         .on_change(move |value, _, cx| {
-                            if let Some(unit) = DurationUnit::ALL.iter().copied().find(|unit| unit.plural() == value.as_ref()) {
-                                units(SnoozePreset::After { minutes: snooze::with_unit(minutes, unit) }, cx);
+                            if let Some(next_unit) = DurationUnit::ALL.iter().copied().find(|u| u.plural() == value.as_ref()) {
+                                let _ = unit_view.update(cx, |this, _| {
+                                    if let Some(slot) = this.threads.row_memory.get_mut(index) {
+                                        slot.chosen_unit = Some(next_unit);
+                                    }
+                                });
+                                let next_minutes = (amount.saturating_mul(next_unit.minutes())).min(snooze::MAX_PRESET_MINUTES);
+                                units(SnoozePreset::After { minutes: next_minutes }, cx);
                             }
                         }),
                     )
@@ -689,5 +1054,122 @@ fn streaming_value(mode: ResponseStreamingMode) -> &'static str {
     match mode {
         ResponseStreamingMode::Turn => "turn",
         ResponseStreamingMode::Paragraph => "paragraph",
+    }
+}
+
+#[cfg(all(test, feature = "snapshot"))]
+mod tests {
+    use gpui::{Render, div, prelude::*};
+    use serde_json::json;
+    use t3_core::settings::search::Section;
+
+    use super::*;
+
+    struct EmptyFrame;
+    impl Render for EmptyFrame {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn auto_settle_days_defers_save_cancels_on_escape_and_rolls_back_on_failure(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let drive = |vcx: &mut gpui::VisualTestContext| {
+            vcx.run_until_parked();
+            runtime.block_on(async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            });
+            vcx.run_until_parked();
+        };
+        cx.executor().allow_parking();
+        let (state, mut fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "settings:write"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            state.update(cx, |state, cx| {
+                state.server_config.config = Some(
+                    serde_json::from_value(json!({
+                        "environment": { "environmentId": "fixture-env", "label": "Mac" },
+                        "settings": { "sidebarAutoSettleAfterDays": 7 }
+                    }))
+                    .unwrap(),
+                );
+                cx.emit(crate::app_state::AppEvent::ServerConfig);
+            });
+        });
+        let window = cx.add_window(|_, _| EmptyFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let view = vcx.update(|window, cx| cx.new(|cx| SettingsView::new(state.clone(), Section::Threads, None, window, cx)));
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.sync_auto_settle_days(Some(7), window, cx);
+            });
+        });
+
+        // Editing the draft must not send an immediate RPC.
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let focus = view.threads.auto_settle_days.focus_handle(cx);
+                window.focus(&focus, cx);
+                view.threads.auto_settle_days.update(cx, |input, cx| input.set_value("14", window, cx));
+                view.threads.auto_settle_field.edit("14".into());
+            });
+        });
+        drive(&mut vcx);
+        assert!(fixture.take_requests().0.into_iter().all(|(m, _, _)| m != "server.updateSettings"));
+
+        // Escape cancels dirty draft without losing view state.
+        vcx.update(|window, cx| {
+            let handled = view.update(cx, |view, cx| view.dismiss_auto_settle_days(window, cx));
+            assert!(handled);
+            assert_eq!(view.read(cx).threads.auto_settle_days.read(cx).value().as_ref(), "7");
+        });
+
+        // Re-edit and commit emits server.updateSettings; failure rolls back to saved "7".
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.threads.auto_settle_days.update(cx, |input, cx| input.set_value("14", window, cx));
+                view.threads.auto_settle_field.edit("14".into());
+                view.commit_auto_settle_days(window, cx);
+            });
+        });
+        drive(&mut vcx);
+        let (requests, _) = fixture.take_requests();
+        let (_, payload, reply) = requests.into_iter().find(|(m, _, _)| *m == "server.updateSettings").expect("auto-settle save sent");
+        assert_eq!(payload["patch"]["sidebarAutoSettleAfterDays"], json!(14));
+        let _ = reply.send(Err(t3_client::session::RpcError::Closed));
+        drive(&mut vcx);
+        vcx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.sync_auto_settle_days(Some(7), window, cx);
+            });
+        });
+        view.read_with(&vcx, |view, cx| {
+            assert_eq!(view.threads.auto_settle_field.draft, "7");
+            assert_eq!(view.threads.auto_settle_days.read(cx).value().as_ref(), "7");
+        });
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(view);
+        vcx.run_until_parked();
+        drop(vcx);
+        drop(fixture);
+        drop(runtime);
     }
 }

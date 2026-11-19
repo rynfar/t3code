@@ -28,6 +28,10 @@ pub struct ArchivedThread {
     pub created_at: String,
     #[serde(default)]
     pub archived_at: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
 }
 
 impl ArchivedThread {
@@ -54,9 +58,41 @@ fn decode_each<T: for<'de> Deserialize<'de>>(value: Option<&Value>) -> Vec<T> {
 /// Projects in snapshot order with their archived threads, newest archive first; projects
 /// without threads are left out.
 pub fn groups(snapshot: &Value) -> Vec<ArchiveGroup> {
+    groups_filtered(snapshot, None)
+}
+
+/// Projects in snapshot order with their archived threads, omitting threads tagged with any
+/// hidden tag (or whose archived ancestor carries one), matching `archivedThreads.ts`.
+pub fn groups_filtered(snapshot: &Value, hidden_tags: Option<&[String]>) -> Vec<ArchiveGroup> {
     let projects: Vec<ArchivedProject> = decode_each(snapshot.get("projects"));
+    let threads: Vec<ArchivedThread> = decode_each(snapshot.get("threads"));
+    let hidden_ids: std::collections::HashSet<String> = match hidden_tags {
+        Some(hidden) if !hidden.is_empty() => {
+            let by_id: HashMap<&str, &ArchivedThread> = threads.iter().map(|t| (t.id.as_str(), t)).collect();
+            let mut result = std::collections::HashSet::new();
+            for thread in &threads {
+                let mut current = Some(thread);
+                let mut visited = std::collections::HashSet::new();
+                while let Some(node) = current {
+                    if !visited.insert(node.id.as_str()) {
+                        break;
+                    }
+                    if node.tags.iter().any(|tag| hidden.iter().any(|h| h == tag.trim())) {
+                        result.insert(thread.id.clone());
+                        break;
+                    }
+                    current = node.parent_thread_id.as_deref().and_then(|parent| by_id.get(parent).copied());
+                }
+            }
+            result
+        }
+        _ => std::collections::HashSet::new(),
+    };
     let mut by_project: HashMap<String, Vec<ArchivedThread>> = HashMap::new();
-    for thread in decode_each::<ArchivedThread>(snapshot.get("threads")) {
+    for thread in threads {
+        if hidden_ids.contains(&thread.id) {
+            continue;
+        }
         by_project.entry(thread.project_id.clone()).or_default().push(thread);
     }
     projects
@@ -126,4 +162,29 @@ pub fn description(thread: &ArchivedThread, now_ms: i64) -> String {
 /// The confirm prompt `confirmAndDeleteThread` shows.
 pub fn delete_prompt(title: &str) -> (String, &'static str) {
     (format!("Delete thread \"{title}\"?"), "This permanently clears conversation history for this thread.")
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn groups_filtered_omits_hidden_tags_and_children_of_hidden_parents() {
+        let snapshot = json!({
+            "projects": [{ "id": "p1", "title": "Repo" }],
+            "threads": [
+                { "id": "t-keep", "projectId": "p1", "title": "Visible", "createdAt": "2026-01-01T00:00:00Z", "tags": ["feature"] },
+                { "id": "t-hidden", "projectId": "p1", "title": "Secret", "createdAt": "2026-01-02T00:00:00Z", "tags": ["private"] },
+                { "id": "t-child", "projectId": "p1", "title": "Child", "createdAt": "2026-01-03T00:00:00Z", "parentThreadId": "t-hidden", "tags": [] }
+            ]
+        });
+        let unfiltered = groups(&snapshot);
+        assert_eq!(unfiltered[0].threads.len(), 3);
+
+        let filtered = groups_filtered(&snapshot, Some(&["private".to_owned()]));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].threads.len(), 1);
+        assert_eq!(filtered[0].threads[0].id, "t-keep");
+    }
 }
