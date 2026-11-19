@@ -232,7 +232,16 @@ impl Composer {
                 .as_ref()
                 .map_or(thread.branch.is_some() || thread.worktree_path.is_some(), |s| s.local.is_repo);
         let host = self.host_options(cx);
-        let show_env_indicator = host.active.is_some();
+        let primary_id = state.local_saved_environment().map(|env| env.id.as_str()).or_else(|| {
+            let mut local = state.environments.environments.iter().filter(|env| env.local);
+            let first = local.next()?;
+            local.next().is_none().then_some(first.id.as_str())
+        });
+        let active_is_primary = host.active.as_ref().is_some_and(|active| {
+            primary_id == Some(active.saved_id.as_str())
+                || state.environments.environments.iter().any(|e| e.id == active.saved_id && e.local)
+        });
+        let show_env_indicator = host.can_pick || (host.active.is_some() && !active_is_primary);
         if !t3_core::client_settings::should_show_composer_context_strip(
             false,
             persist,
@@ -243,7 +252,7 @@ impl Composer {
             return None;
         }
         let p = palette(cx);
-        let env_chip = host.active.as_ref().map(|active| {
+        let env_chip = show_env_indicator.then_some(host.active.as_ref()).flatten().map(|active| {
             let icon = crate::new_thread::environment_machine_icon(state, &active.saved_id);
             ComposerControl::new("composer-active-environment")
                 .icon(icon)
@@ -388,10 +397,12 @@ impl Composer {
         if (can_interrupt || stop_retained) && !has_text && !editing_queued && !voice_blocks {
             return with_voice(stop_button().into_any_element());
         }
+        let stage_backdrop = crate::sidebar::active_stage_backdrop_variant(self.state.read(cx), cx);
         let show_resume = self.snapshot.can_resume && !has_text && !editing_queued && !voice_blocks;
         if show_resume {
             let resume_btn = RoundButton::new("send", RoundKind::Resume, "Resume thread")
                 .disabled(self.sending || !can_operate || rewinding)
+                .stage_backdrop(stage_backdrop)
                 .on_click(cx.listener(|this, _, window, cx| {
                     if this.stop_phase != StopPhase::Landed {
                         this.resume(window, cx);
@@ -457,6 +468,7 @@ impl Composer {
         let submit_btn = div().flex_none().debug_selector(|| "send".to_owned()).child(
             RoundButton::new("send", kind, tooltip)
                 .disabled(disabled)
+                .stage_backdrop(stage_backdrop)
                 .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
                     if this.stop_phase == StopPhase::Landed {
                         return;

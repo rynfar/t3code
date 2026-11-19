@@ -12,8 +12,7 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::client_settings::{
     AppearanceMode, ChatWidth, ClientSettingChange, DEFAULT_PANEL_ANIMATION_DURATION_MS, EffortDisplay,
     EnvironmentIdentificationMode, MAX_PANEL_ANIMATION_DURATION_MS, MIN_PANEL_ANIMATION_DURATION_MS, ThemePreference,
-    environment_identification_options, resolve_effective_environment_identification_mode, resolve_server_backed_stage_label,
-    resolve_sidebar_stage_backdrop_variant,
+    environment_identification_options, resolve_sidebar_stage_backdrop_variant,
 };
 
 use super::controls::{Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, r, section, section_title};
@@ -859,36 +858,11 @@ impl SettingsView {
         doc: &t3_core::client_settings::ClientSettingsDoc,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let dark = cx.theme().is_dark();
-        let stage_label = {
-            let app = self.state.read(cx);
-            let server_version = app
-                .server_config
-                .config
-                .as_ref()
-                .map(|c| c.environment.server_version.as_str())
-                .filter(|v| !v.is_empty());
-            let fallback = if cfg!(debug_assertions) { "Dev" } else { "Latest" };
-            resolve_server_backed_stage_label(server_version, fallback)
-        };
+        let stage_label = crate::sidebar::environment_stage_label(self.state.read(cx));
         let stage_variant = resolve_sidebar_stage_backdrop_variant(stage_label, EnvironmentIdentificationMode::Artwork);
         let options = environment_identification_options(stage_variant);
         let current = doc.environment_identification_mode();
-        let active_theme = themes::half_theme(
-            &doc.theme(),
-            &themes::halves(doc),
-            dark,
-            &theme::preferences(cx).custom,
-            theme::environment_themes(cx),
-        );
-        let palette_theme_active = active_theme.is_some();
-        let palette_theme_allows_artwork =
-            active_theme.is_some_and(|t| themes::builtins().iter().any(|b| b.id == t.id));
-        let effective_mode = resolve_effective_environment_identification_mode(
-            current,
-            palette_theme_active,
-            palette_theme_allows_artwork,
-        );
+        let effective_mode = crate::sidebar::effective_environment_identification_mode(cx);
         let theme_hides_artwork = effective_mode == EnvironmentIdentificationMode::Pill
             && resolve_sidebar_stage_backdrop_variant(stage_label, current).is_some();
         let description = if theme_hides_artwork {
@@ -1460,13 +1434,14 @@ mod tests {
             });
         };
 
-        // 1. Defaults: Effort word shown, active-thread context strip hidden, Dev artwork shown in sidebar,
-        // right panel animation disabled at 0 ms.
+        // 1. Defaults: Effort word shown, active-thread context strip hidden, Dev artwork shown in
+        // sidebar and on the composer Send button, right panel animation disabled at 0 ms.
         draw(&mut vcx);
         assert!(vcx.debug_bounds("composer-effort-word").is_some(), "default effortDisplay=label shows word");
         assert!(vcx.debug_bounds("composer-effort-bars").is_none());
         assert!(vcx.debug_bounds("composer-context-strip").is_none(), "default persistComposerContextStrip=false hides active strip");
         assert!(vcx.debug_bounds("sidebar-stage-backdrop-dev").is_some(), "default Artwork shows Dev backdrop");
+        assert!(vcx.debug_bounds("send-stage-art-dev").is_some(), "default Artwork shows Dev stage art on Send button");
         assert!(vcx.debug_bounds("environment-identification-pill-dev").is_none());
 
         // 2. Switch effortDisplay -> Bars, persistComposerContextStrip -> true, environmentIdentificationMode -> Pill.
@@ -1481,22 +1456,81 @@ mod tests {
         assert!(vcx.debug_bounds("composer-context-strip").is_some(), "persistComposerContextStrip=true shows active thread strip");
         assert!(vcx.debug_bounds("environment-identification-pill-dev").is_some(), "Pill mode renders Dev pill");
         assert!(vcx.debug_bounds("sidebar-stage-backdrop-dev").is_none());
+        assert!(vcx.debug_bounds("send-stage-art-dev").is_none(), "Pill mode hides Send button stage art");
 
-        // 3. Nightly artwork & None modes in sidebar.
+        // 3. Nightly artwork & None modes in sidebar + Send button.
         vcx.update(|_, cx| {
             store::update_client(&state, ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::NightlyArtwork), cx);
         });
         draw(&mut vcx);
         assert!(vcx.debug_bounds("sidebar-stage-backdrop-nightly").is_some());
+        assert!(vcx.debug_bounds("send-stage-art-nightly").is_some(), "NightlyArtwork renders Nightly stage art on Send button");
         vcx.update(|_, cx| {
             store::update_client(&state, ClientSettingChange::EnvironmentIdentificationMode(EnvironmentIdentificationMode::None), cx);
         });
         draw(&mut vcx);
         assert!(vcx.debug_bounds("sidebar-stage-backdrop-nightly").is_none());
         assert!(vcx.debug_bounds("sidebar-stage-backdrop-dev").is_none());
+        assert!(vcx.debug_bounds("send-stage-art-nightly").is_none());
+        assert!(vcx.debug_bounds("send-stage-art-dev").is_none());
         assert!(vcx.debug_bounds("environment-identification-pill-dev").is_none());
 
-        // 4. Right panel open animation activates only when panelAnimationDurationMs > 0 on same-thread open.
+        // 3b. Stage detection prefers the primary/local environment's serverVersion over an active remote.
+        state.update(&mut vcx, |state, _| {
+            if let Some(first) = state.environments.environments.first_mut() {
+                first.local = true;
+                first.server_version = Some("0.1.0-nightly.20260401.1".into());
+            }
+            let remote_id = "remote-stable".to_owned();
+            let mut remote = state.environments.environments[0].clone();
+            remote.id = remote_id.clone();
+            remote.local = false;
+            remote.label = "Remote Stable".into();
+            remote.server_version = Some("0.1.0".into());
+            state.environments.environments.push(remote);
+            state.environments.active = Some(remote_id);
+        });
+        state.read_with(&vcx, |state, _| {
+            assert_eq!(
+                crate::sidebar::environment_stage_label(state),
+                "Nightly",
+                "primary local nightly version must not be overridden by active remote stable config"
+            );
+        });
+        // Reverse check: local stable + active remote nightly does not turn stage into Nightly.
+        state.update(&mut vcx, |state, _| {
+            state.environments.environments[0].server_version = Some("0.1.0".into());
+            if let Some(cfg) = state.server_config.config.as_mut() {
+                cfg.environment.server_version = "0.1.0-nightly.20260401.1".into();
+            }
+        });
+        state.read_with(&vcx, |state, _| {
+            assert_eq!(
+                crate::sidebar::environment_stage_label(state),
+                if cfg!(debug_assertions) { "Dev" } else { "Latest" },
+                "active remote nightly config must not override local stable primary environment"
+            );
+        });
+
+        // 3c. Single-project primary thread on a non-git checkout hides context strip even in a multi-env fleet.
+        state.update(&mut vcx, |state, cx| {
+            let local_id = state.environments.environments[0].id.clone();
+            state.environments.active = Some(local_id);
+            if let Some(snapshot) = state.shell.snapshot.as_mut() {
+                if let Some(thread) = snapshot.threads.first_mut() {
+                    thread.branch = None;
+                    thread.worktree_path = None;
+                }
+            }
+            cx.emit(crate::app_state::AppEvent::Shell);
+        });
+        draw(&mut vcx);
+        assert!(
+            vcx.debug_bounds("composer-context-strip").is_none(),
+            "non-git primary thread without fleet picker hides context strip"
+        );
+
+        // 4. Right panel open and close animations activate only when panelAnimationDurationMs > 0 on same-thread transitions.
         state.update(&mut vcx, |state, cx| {
             state.toggle_right_panel(cx);
         });
@@ -1506,6 +1540,9 @@ mod tests {
         });
         state.update(&mut vcx, |state, cx| state.toggle_right_panel(cx));
         draw(&mut vcx);
+        right_panel.read_with(&vcx, |panel, _| {
+            assert_eq!(panel.close_animation_duration_ms(), None, "0 ms never animates panel close");
+        });
         vcx.update(|_, cx| {
             store::update_client(&state, ClientSettingChange::PanelAnimationDurationMs(225), cx);
         });
@@ -1514,6 +1551,18 @@ mod tests {
         right_panel.read_with(&vcx, |panel, _| {
             assert_eq!(panel.open_animation_duration_ms(), Some(225), "non-zero duration animates same-thread panel open");
         });
+        state.update(&mut vcx, |state, cx| state.toggle_right_panel(cx));
+        draw(&mut vcx);
+        right_panel.read_with(&vcx, |panel, _| {
+            assert_eq!(panel.close_animation_duration_ms(), Some(225), "non-zero duration animates same-thread panel close");
+        });
+        assert!(vcx.debug_bounds("right-panel-closing").is_some(), "closing shell animates width collapse");
+        vcx.executor().advance_clock(std::time::Duration::from_millis(300));
+        draw(&mut vcx);
+        right_panel.read_with(&vcx, |panel, _| {
+            assert_eq!(panel.close_animation_duration_ms(), None, "close animation settles and clears after duration");
+        });
+        assert!(vcx.debug_bounds("right-panel-closing").is_none());
 
         vcx.update(|_, cx| reset_interface_settings(&state, cx));
         state.update(&mut vcx, |state, _| state.stop_pump());

@@ -430,10 +430,16 @@ impl SettingsView {
                 .control(store_buttons)
                 .into_any_element(),
         );
+        // The Welcome page sets up this computer, so it targets the local/primary environment
+        // (`SettingsPanels.tsx:2292-2293` `usePrimaryEnvironmentId`).
         let welcome_env = {
             let app = self.state.read(cx);
-            app.active_environment()
-                .or_else(|| app.local_saved_environment())
+            app.local_saved_environment()
+                .or_else(|| {
+                    let mut local = app.environments.environments.iter().filter(|env| env.local);
+                    let first = local.next()?;
+                    local.next().is_none().then_some(first)
+                })
                 .map(|env| env.id.clone())
         };
         if let Some(env_id) = welcome_env {
@@ -823,6 +829,17 @@ mod tests {
                 cx,
             );
         });
+        // Ensure a local primary environment exists alongside a secondary remote environment.
+        state.update(cx, |state, _| {
+            if let Some(env) = state.environments.environments.first_mut() {
+                env.local = true;
+            }
+            let mut remote = state.environments.environments[0].clone();
+            remote.id = "remote-box".into();
+            remote.local = false;
+            remote.label = "Remote Box".into();
+            state.environments.environments.push(remote);
+        });
         let window = cx.add_window(|window, cx| {
             let wizard = cx.new(|cx| crate::onboarding::WelcomeWizard::new(state.clone(), window, cx));
             AboutWithWelcome { wizard }
@@ -830,7 +847,7 @@ mod tests {
         let wizard = window.read_with(cx, |root, _| root.wizard.clone()).unwrap();
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
 
-        // With an active environment, the Welcome page row renders and "Open" closes Settings and opens Welcome.
+        // With a local primary environment, the Welcome page row renders and "Open" closes Settings and opens Welcome.
         vcx.update(|_, cx| crate::settings::open_setting("welcome-page", cx));
         vcx.run_until_parked();
         vcx.update(|window, cx| {
@@ -854,10 +871,12 @@ mod tests {
             "clicking Open on About -> Welcome page reopens WelcomeWizard"
         );
 
-        // Without any saved/active environment, the Welcome page row hides.
+        // Remote-only setup (active environment is non-local and no local environment exists):
+        // Welcome page row must hide (`SettingsPanels.tsx:2292-2293`).
         state.update(&mut vcx, |state, cx| {
-            state.environments.active = None;
-            state.environments.environments.clear();
+            for env in &mut state.environments.environments {
+                env.local = false;
+            }
             state.connect.local_server = None;
             cx.emit(crate::app_state::AppEvent::Phase);
         });
@@ -869,7 +888,7 @@ mod tests {
         });
         assert!(
             vcx.debug_bounds("about-welcome-open").is_none(),
-            "Welcome page row must hide when no environment is configured"
+            "Welcome page row must hide on remote-only setups without a local primary environment"
         );
 
         state.update(&mut vcx, |state, _| state.stop_pump());

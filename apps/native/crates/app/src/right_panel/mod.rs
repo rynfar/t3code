@@ -61,6 +61,14 @@ pub fn init(state: Entity<AppState>, cx: &mut App) {
 
 struct ResizeDrag;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PanelAnimation {
+    seq: u64,
+    duration_ms: u32,
+    opening: bool,
+    from_width: f32,
+}
+
 pub struct RightPanelView {
     state: Entity<AppState>,
     diff: Entity<DiffPanel>,
@@ -81,11 +89,14 @@ pub struct RightPanelView {
     /// Last seen `proactive_panels_enabled` setting, so toggling it in Settings re-evaluates.
     last_proactive_enabled: Option<bool>,
     /// Tracks `(thread_id, is_open)` across frames so `panelAnimationDurationMs` animates
-    /// same-thread opens without animating thread navigation (`panelAnimations.ts`).
+    /// same-thread open/close transitions without animating thread navigation (`panelAnimations.ts`).
     last_open_state: Option<(String, bool)>,
-    /// Monotonic id for the active open width transition; `None` when animations are off (`0 ms`).
-    open_animation: Option<(u64, u32)>,
-    open_animation_seq: u64,
+    /// Last rendered inline/sheet panel width, used as the start width for close transitions.
+    last_rendered_width: f32,
+    /// Active open or close width transition; `None` when settled or animations are off (`0 ms`).
+    panel_animation: Option<PanelAnimation>,
+    animation_seq: u64,
+    _close_animation_task: Option<Task<()>>,
     /// Whether the panel is currently in narrow-window sheet mode (`ChatView.tsx:2035`).
     in_sheet_mode: bool,
     /// Inline rename input for a device tab (`RightPanelTabs.tsx`).
@@ -140,6 +151,8 @@ impl RightPanelView {
                 this.prune_side_chats(cx);
                 this.add_menu_open = false;
                 this.renaming_device = None;
+                this.panel_animation = None;
+                this._close_animation_task = None;
                 // A pending width save belongs to the thread that was showing: flush it now.
                 let flush = this._save_width.take().is_some();
                 state.update(cx, |state, cx| {
@@ -175,8 +188,10 @@ impl RightPanelView {
             proactive: ProactivePanelCoordinator::default(),
             last_proactive_enabled: None,
             last_open_state: None,
-            open_animation: None,
-            open_animation_seq: 0,
+            last_rendered_width: DEFAULT_WIDTH,
+            panel_animation: None,
+            animation_seq: 0,
+            _close_animation_task: None,
             in_sheet_mode: initial_sheet_mode,
             renaming_device: None,
             add_menu_open: false,
@@ -196,7 +211,12 @@ impl RightPanelView {
 
     #[cfg(all(test, feature = "snapshot"))]
     pub(crate) fn open_animation_duration_ms(&self) -> Option<u32> {
-        self.open_animation.map(|(_, duration_ms)| duration_ms)
+        self.panel_animation.filter(|anim| anim.opening).map(|anim| anim.duration_ms)
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn close_animation_duration_ms(&self) -> Option<u32> {
+        self.panel_animation.filter(|anim| !anim.opening).map(|anim| anim.duration_ms)
     }
 
     fn attach_details_subscription(&mut self, cx: &mut Context<Self>) {
@@ -796,7 +816,8 @@ impl Render for RightPanelView {
         let state = self.state.read(cx);
         let (Some(thread_id), Some(panel)) = (thread_id, panel) else {
             self.last_open_state = None;
-            self.open_animation = None;
+            self.panel_animation = None;
+            self._close_animation_task = None;
             return div().into_any_element();
         };
         let animation_duration_ms = crate::settings::store::try_client(cx)
@@ -805,17 +826,58 @@ impl Render for RightPanelView {
             self.last_open_state.as_ref(),
             Some((prev_thread, false)) if prev_thread == &thread_id
         ) && panel.is_open;
+        let same_thread_closed = matches!(
+            self.last_open_state.as_ref(),
+            Some((prev_thread, true)) if prev_thread == &thread_id
+        ) && !panel.is_open;
         let thread_switched = self.last_open_state.as_ref().is_some_and(|(prev, _)| prev != &thread_id);
         self.last_open_state = Some((thread_id.clone(), panel.is_open));
-        if !panel.is_open {
-            self.open_animation = None;
-            return div().into_any_element();
-        }
         if animation_duration_ms == 0 || thread_switched {
-            self.open_animation = None;
-        } else if same_thread_opened {
-            self.open_animation_seq = self.open_animation_seq.wrapping_add(1);
-            self.open_animation = Some((self.open_animation_seq, animation_duration_ms));
+            self.panel_animation = None;
+            self._close_animation_task = None;
+        }
+        if !panel.is_open {
+            if same_thread_closed && animation_duration_ms > 0 && !panel.maximized {
+                let from_width = self.last_rendered_width.max(1.);
+                self.animation_seq = self.animation_seq.wrapping_add(1);
+                let seq = self.animation_seq;
+                self.panel_animation = Some(PanelAnimation {
+                    seq,
+                    duration_ms: animation_duration_ms,
+                    opening: false,
+                    from_width,
+                });
+                let wait = Duration::from_millis(u64::from(animation_duration_ms) + 16);
+                self._close_animation_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.panel_animation.is_some_and(|a| !a.opening && a.seq == seq) {
+                            this.panel_animation = None;
+                            this._close_animation_task = None;
+                            cx.notify();
+                        }
+                    });
+                }));
+            }
+            if let Some(anim) = self.panel_animation.filter(|a| !a.opening) {
+                let p = palette(cx);
+                let closing_el = div()
+                    .id("right-panel-closing")
+                    .debug_selector(|| "right-panel-closing".to_owned())
+                    .h_full()
+                    .flex_none()
+                    .overflow_hidden()
+                    .bg(hsla(p.background))
+                    .border_l_1()
+                    .border_color(hsla(p.border))
+                    .with_animation(
+                        ElementId::Name(format!("right-panel-close-{}", anim.seq).into()),
+                        Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
+                        move |el, delta| el.w(px(anim.from_width * (1. - delta))),
+                    );
+                return closing_el.into_any_element();
+            }
+            return div().into_any_element();
         }
         let stored = state.panels.panels.width(&thread_id).unwrap_or(DEFAULT_WIDTH);
         let width = if sheet_mode {
@@ -823,6 +885,20 @@ impl Render for RightPanelView {
         } else {
             clamp_width(stored, viewport, viewport - sidebar_inline_width(state, viewport))
         };
+        self.last_rendered_width = width;
+        if same_thread_opened && animation_duration_ms > 0 && (sheet_mode || !panel.maximized) {
+            self._close_animation_task = None;
+            self.animation_seq = self.animation_seq.wrapping_add(1);
+            self.panel_animation = Some(PanelAnimation {
+                seq: self.animation_seq,
+                duration_ms: animation_duration_ms,
+                opening: true,
+                from_width: 0.,
+            });
+        } else if self.panel_animation.is_some_and(|a| !a.opening) {
+            self.panel_animation = None;
+            self._close_animation_task = None;
+        }
         // Maximized beside a hidden sidebar, the tab bar clears the traffic lights and the
         // sidebar toggle as the thread header does (design-system §5).
         let titlebar_inset = !sheet_mode && panel.maximized && sidebar_inline_width(state, viewport) == 0.;
@@ -925,12 +1001,12 @@ impl Render for RightPanelView {
         } else {
             panel_el
         };
-        let animated_panel: gpui::AnyElement = match self.open_animation {
-            Some((seq, duration_ms)) if sheet_mode || !panel.maximized => panel_el
+        let animated_panel: gpui::AnyElement = match self.panel_animation {
+            Some(anim) if anim.opening && (sheet_mode || !panel.maximized) => panel_el
                 .overflow_hidden()
                 .with_animation(
-                    ElementId::Name(format!("right-panel-open-{seq}").into()),
-                    Animation::new(Duration::from_millis(u64::from(duration_ms))).with_easing(ease_out_quint()),
+                    ElementId::Name(format!("right-panel-open-{}", anim.seq).into()),
+                    Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
                     move |el, delta| el.w(px(width * delta)),
                 )
                 .into_any_element(),
