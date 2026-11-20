@@ -139,6 +139,11 @@ fn disconnected_saved_environment_uses_saved_label() {
         assert_eq!(p.rows.len(), 1);
         assert_eq!(p.rows[0].label, "Work Linux");
     });
+
+    state.update(&mut cx, |state, _| state.stop_pump());
+    drop(_loaded);
+    drop(state);
+    cx.run_until_parked();
 }
 
 #[gpui::test]
