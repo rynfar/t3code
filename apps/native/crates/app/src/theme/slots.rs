@@ -45,6 +45,34 @@ pub fn slot_style(slot: ThemeSlot, cx: &App) -> Option<SlotStyleSet> {
     sheet.get(slot).cloned()
 }
 
+/// Zero-allocation check for whether the active stylesheet defines `:hover` overrides for `slot`.
+pub fn slot_has_hover(slot: ThemeSlot, cx: &App) -> bool {
+    cx.try_global::<ActiveSlotStylesheet>()
+        .is_some_and(|g| !g.0.is_empty() && g.0.get(slot).is_some_and(|set| !set.hover.is_empty()))
+}
+
+/// Zero-allocation check for whether the active stylesheet defines `:active` overrides for `slot`.
+pub fn slot_has_active(slot: ThemeSlot, cx: &App) -> bool {
+    cx.try_global::<ActiveSlotStylesheet>()
+        .is_some_and(|g| !g.0.is_empty() && g.0.get(slot).is_some_and(|set| !set.active.is_empty()))
+}
+
+/// Zero-allocation check for whether the active stylesheet defines a base `background` override for
+/// `slot` (used by glass overlays to suppress `glass::backdrop` so custom backgrounds show cleanly).
+pub fn slot_has_background(slot: ThemeSlot, cx: &App) -> bool {
+    cx.try_global::<ActiveSlotStylesheet>()
+        .is_some_and(|g| !g.0.is_empty() && g.0.get(slot).is_some_and(|set| set.base.background.is_some()))
+}
+
+/// Zero-allocation lookup for a slot's compiled base `border-color` override, if any.
+pub fn slot_border_color(slot: ThemeSlot, cx: &App) -> Option<gpui::Hsla> {
+    let g = cx.try_global::<ActiveSlotStylesheet>()?;
+    if g.0.is_empty() {
+        return None;
+    }
+    g.0.get(slot)?.base.border_color.map(hsla)
+}
+
 /// Applies a compiled [`SlotStyleOverride`] directly onto a GPUI [`StyleRefinement`].
 pub fn apply_slot_override(style: &mut StyleRefinement, ov: &SlotStyleOverride, cx: &App) {
     if ov.is_empty() {
@@ -405,6 +433,30 @@ pub fn theme_slot_background_layer(slot: ThemeSlot, cx: &App) -> Option<AnyEleme
     }
 }
 
+/// Like [`theme_slot_background_layer`], wrapped in an absolutely-positioned rounded clip container
+/// matching `default_radius` (or `slot`'s overridden `border-radius`). Safe for containers that
+/// cannot set `.overflow_hidden()` directly (such as menus with overflowing submenus or scrollable
+/// dropdown lists).
+pub fn theme_slot_clipped_background_layer(
+    slot: ThemeSlot,
+    default_radius: impl Into<AbsoluteLength>,
+    cx: &App,
+) -> Option<AnyElement> {
+    let layer = theme_slot_background_layer(slot, cx)?;
+    let mut clip = div().absolute().inset_0().rounded(default_radius.into()).overflow_hidden();
+    if let Some(global) = cx.try_global::<ActiveSlotStylesheet>()
+        && let Some(set) = global.0.get(slot)
+        && !set.base.border_radii.is_empty()
+    {
+        let radii_only = SlotStyleOverride {
+            border_radii: set.base.border_radii,
+            ..Default::default()
+        };
+        apply_slot_override(clip.style(), &radii_only, cx);
+    }
+    Some(clip.child(layer).into_any_element())
+}
+
 fn to_radius_length(len: SlotLength) -> Option<AbsoluteLength> {
     match len {
         SlotLength::Px(v) => Some(px(v).into()),
@@ -649,6 +701,174 @@ mod tests {
             assert!(slot_style(ThemeSlot::Sidebar, cx).is_none());
             assert!(slot_style(ThemeSlot::Button, cx).is_some());
             assert!(slot_stylesheet(cx).has_scoped_background_image());
+        });
+    }
+
+    #[gpui::test]
+    fn primitive_and_overlay_slots_render_cleanly_without_duplicate_hover_panics(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AppContext, Context, Entity, Render, Window};
+        use gpui_component::input::{Input, InputState};
+
+        struct Harness {
+            input: Entity<InputState>,
+            dialog_focus: gpui::FocusHandle,
+        }
+
+        impl Render for Harness {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let settings_tooltip = crate::settings::controls::tooltip("Settings tip".into())(window, cx);
+                let panel_tooltip = crate::right_panel::tooltip_view("Panel tip".into(), window, cx);
+                let select_options = vec![
+                    crate::settings::controls::SelectOption::new("a", "Alpha"),
+                    crate::settings::controls::SelectOption::new("b", "Beta"),
+                ];
+                let dialog = crate::settings::controls::DialogFrame {
+                    id: "slot-test-dialog",
+                    title: "Dialog".into(),
+                    description: "Description".into(),
+                    max_width: 420.,
+                    body: div().child("Body").into_any_element(),
+                    footer: crate::settings::controls::dialog_footer(false, vec![], cx).into_any_element(),
+                    focus: self.dialog_focus.clone(),
+                }
+                .render(window, |_, _| {}, cx);
+
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        crate::settings::controls::Button::new(
+                            "settings-btn-enabled",
+                            crate::settings::controls::ButtonVariant::Default,
+                            crate::settings::controls::ButtonSize::Default,
+                        )
+                        .label("Save"),
+                    )
+                    .child(
+                        crate::settings::controls::Button::new(
+                            "settings-btn-disabled",
+                            crate::settings::controls::ButtonVariant::Outline,
+                            crate::settings::controls::ButtonSize::Sm,
+                        )
+                        .label("Disabled")
+                        .disabled(true),
+                    )
+                    .child(crate::settings::controls::Switch::new("settings-sw-on", true))
+                    .child(crate::settings::controls::Switch::new("settings-sw-off", false).disabled(true))
+                    .child(
+                        crate::settings::controls::Select::new("settings-select", select_options)
+                            .selected("a"),
+                    )
+                    .child(
+                        crate::right_panel::Button::new("rp-btn-enabled")
+                            .variant(crate::right_panel::Variant::Ghost)
+                            .label("Diff"),
+                    )
+                    .child(
+                        crate::right_panel::Button::new("rp-btn-disabled")
+                            .variant(crate::right_panel::Variant::Secondary)
+                            .disabled(true),
+                    )
+                    .child(
+                        crate::composer::controls::ComposerControl::new("comp-ctrl")
+                            .label("Model"),
+                    )
+                    .child(
+                        crate::composer::controls::Button::new(
+                            "comp-btn",
+                            crate::composer::controls::ButtonVariant::Outline,
+                            crate::composer::controls::ButtonSize::Sm,
+                        )
+                        .label("Attach"),
+                    )
+                    .child(crate::composer::controls::menu_surface(cx).child("Menu item"))
+                    .child(crate::composer::controls::popup_surface(cx).child("Popover body"))
+                    .child(
+                        crate::thread_details::controls::Row::new("td-row-btn", "Open")
+                            .on_click(|_, _, _| {}),
+                    )
+                    .child(
+                        crate::thread_details::controls::Row::new("td-row-sel", "Branch")
+                            .select()
+                            .opens_menu(),
+                    )
+                    .child(crate::thread_details::controls::MenuTrigger::new("td-trigger", "More"))
+                    .child(Input::new(&self.input).theme_slot(ThemeSlot::Input, cx))
+                    .child(settings_tooltip)
+                    .child(panel_tooltip)
+                    .child(dialog)
+            }
+        }
+
+        let css = r#"
+            [data-slot="button"] { background: #223344; color: #ffffff; border: 1px solid #445566; border-radius: 10px; }
+            [data-slot="button"]:hover { background: #334455; }
+            [data-slot="button"]:active { background: #112233; }
+            [data-slot="input"] { background: #1a1b26; color: #c0caf5; border: 1px solid #7aa2f7; }
+            [data-slot="switch"] { background: #2a2b3d; border-radius: 999px; }
+            [data-slot="switch"]:hover { opacity: 0.92; }
+            [data-slot="switch"]:active { opacity: 0.8; }
+            [data-slot="select-trigger"] { background: #1f2335; border: 1px solid #565f89; }
+            [data-slot="select-trigger"]:hover { background: #292e42; }
+            [data-slot="select-trigger"]:active { background: #16161e; }
+            [data-slot="dialog-popup"] { background: #141622; border: 2px solid #7aa2f7; border-radius: 20px; }
+            [data-slot="popover-popup"] { background: #181a28; border: 1px solid #bb9af7; }
+            [data-slot="menu-popup"] { background: #1c1e2e; border: 1px solid #9ece6a; }
+            [data-slot="tooltip-popup"] { background: #0f1018; color: #e0af68; border: 1px solid #e0af68; }
+            [data-slot="scroll-area-scrollbar"] { background: #10121a; }
+            [data-slot="scroll-area-thumb"] { background: #565f89; }
+            [data-slot="scroll-area-thumb"]:hover { background: #7aa2f7; }
+        "#;
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::init(cx);
+            let colors = themes::standard(true);
+            theme::preview_with_css(Some((&colors, Some(css), true)), cx);
+
+            assert!(slot_has_hover(ThemeSlot::Button, cx));
+            assert!(slot_has_active(ThemeSlot::Button, cx));
+            assert!(slot_has_hover(ThemeSlot::Switch, cx));
+            assert!(slot_has_active(ThemeSlot::Switch, cx));
+            assert!(slot_has_hover(ThemeSlot::SelectTrigger, cx));
+            assert!(slot_has_active(ThemeSlot::SelectTrigger, cx));
+            assert!(slot_has_background(ThemeSlot::DialogPopup, cx));
+            assert!(slot_has_background(ThemeSlot::PopoverPopup, cx));
+            assert!(slot_has_background(ThemeSlot::MenuPopup, cx));
+            assert_eq!(slot_border_color(ThemeSlot::DialogPopup, cx), Some(hsla(0x7aa2_f7ff)));
+
+            // Verify menu_surface and popup_surface apply their compiled overrides directly.
+            let mut menu = crate::composer::controls::menu_surface(cx);
+            assert_eq!(menu.style().border_color, Some(hsla(0x9ece_6aff)));
+            assert_eq!(
+                menu.style().background,
+                Some(Fill::Color(solid_background(hsla(0x1c1e_2eff))))
+            );
+            let mut popover = crate::composer::controls::popup_surface(cx);
+            assert_eq!(popover.style().border_color, Some(hsla(0xbb9a_f7ff)));
+            assert_eq!(
+                popover.style().background,
+                Some(Fill::Color(solid_background(hsla(0x181a_28ff))))
+            );
+
+            // Verify Tooltip receives ThemeSlot::TooltipPopup overrides.
+            let mut tip = gpui_component::tooltip::Tooltip::new("Tip").theme_slot(ThemeSlot::TooltipPopup, cx);
+            assert_eq!(tip.style().border_color, Some(hsla(0xe0af_68ff)));
+            assert_eq!(tip.style().text.color, Some(hsla(0xe0af_68ff)));
+        });
+
+        let (_view, visual_cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            Harness { input, dialog_focus: cx.focus_handle() }
+        });
+        visual_cx.refresh().unwrap();
+
+        cx.update(|cx| {
+            theme::preview(None, cx);
         });
     }
 }

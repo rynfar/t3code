@@ -12,7 +12,10 @@ use gpui::{
 use t3_core::thread_actions::{archive_confirmation, unpin_confirmation};
 
 use crate::app_state::AppState;
-use crate::theme::{WHITE, hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt, WHITE, hsla, palette, refine_slot_active, refine_slot_hover,
+    slot_border_color, slot_has_active, slot_has_background, theme_slot_background_layer,
+};
 
 struct Host(WeakEntity<ConfirmDialog>);
 
@@ -368,9 +371,15 @@ impl Render for ConfirmDialog {
                         inset: false,
                     }])
                 })
-                .hover(|this| this.opacity(0.9))
+                .theme_slot(ThemeSlot::Button, cx)
+                .hover(|this| refine_slot_hover(this.opacity(0.9), ThemeSlot::Button, cx))
+                .when(slot_has_active(ThemeSlot::Button, cx), |this| {
+                    this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
+                })
                 .child(label)
         };
+        let has_custom_bg = slot_has_background(ThemeSlot::DialogPopup, cx);
+        let backdrop_border = slot_border_color(ThemeSlot::DialogPopup, cx).unwrap_or_else(|| hsla(p.dialog_border));
         deferred(
             div()
                 .id("confirm-dialog-backdrop")
@@ -411,8 +420,12 @@ impl Render for ConfirmDialog {
                         .w_full()
                         .max_w(px(512.))
                         .relative()
+                        .overflow_hidden()
                         .rounded(px(16.))
-                        .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+                        .when(!has_custom_bg, |this| {
+                            this.child(crate::glass::backdrop(16., hsla(p.dialog_surface), backdrop_border, cx))
+                        })
+                        .children(theme_slot_background_layer(ThemeSlot::DialogPopup, cx))
                         .shadow(vec![BoxShadow {
                             color: gpui_hsla(0., 0., 0., 0.65),
                             offset: point(px(0.), px(24.)),
@@ -420,6 +433,7 @@ impl Render for ConfirmDialog {
                             spread_radius: px(-24.),
                             inset: false,
                         }])
+                        .theme_slot(ThemeSlot::DialogPopup, cx)
                         .child(
                             div()
                                 .p(px(24.))
@@ -532,6 +546,49 @@ mod tests {
 
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn confirm_dialog_renders_with_dialog_popup_and_button_slot_overrides(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            let colors = t3_core::themes::standard(true);
+            crate::theme::preview_with_css(
+                Some((
+                    &colors,
+                    Some(
+                        r#"
+                        [data-slot="dialog-popup"] { background: #141622; border: 2px solid #7aa2f7; border-radius: 20px; }
+                        [data-slot="button"] { background: #223344; border-radius: 10px; }
+                        [data-slot="button"]:hover { background: #334455; }
+                        [data-slot="button"]:active { background: #112233; }
+                        "#,
+                    ),
+                    true,
+                )),
+                cx,
+            );
+        });
+        let (_dialog, visual_cx) = cx.add_window_view(|_, cx| ConfirmDialog::new(state.clone(), cx));
+        visual_cx.update(|_, cx| {
+            ask("Delete thread?", "This cannot be undone.", "Delete", |_, _| {}, cx);
+        });
+        visual_cx.refresh().unwrap();
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            crate::theme::preview(None, cx);
             cx.shutdown();
             cx.clear_globals();
         });

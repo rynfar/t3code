@@ -12,14 +12,17 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, h_flex};
 
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
+    slot_border_color, slot_has_active, slot_has_background, theme_slot_clipped_background_layer,
+};
 
 type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 const DISABLED_OPACITY: f32 = 0.64;
 
 fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
-    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
+    move |window, cx| Tooltip::new(text.clone()).theme_slot(ThemeSlot::TooltipPopup, cx).build(window, cx)
 }
 
 /// A footer control (`ComposerControl.tsx`): 28 tall, 16px icon, label at 80% foreground.
@@ -134,8 +137,17 @@ impl RenderOnce for ComposerControl {
             .text_color(if self.pressed || self.active { hsla(p.foreground) } else { label_color })
             .when(self.pressed, |this| this.bg(hsla(p.accent)))
             .when(!self.pressed && self.active, |this| this.bg(hsla(p.accent).opacity(0.6)))
+            .theme_slot(ThemeSlot::Button, cx)
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
-            .when(!self.disabled, |this| this.cursor_pointer().hover(|this| this.bg(hsla(p.accent)).text_color(hsla(p.foreground))))
+            .when(!self.disabled, |this| {
+                this.cursor_pointer()
+                    .hover(|this| {
+                        refine_slot_hover(this.bg(hsla(p.accent)).text_color(hsla(p.foreground)), ThemeSlot::Button, cx)
+                    })
+                    .when(slot_has_active(ThemeSlot::Button, cx), |this| {
+                        this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
+                    })
+            })
             .children(self.icon.map(|glyph| glyph.render(px(16.), icon_color)))
             .children(self.leading)
             .children(self.label.map(|label| {
@@ -488,8 +500,15 @@ impl RenderOnce for Button {
                     inset: false,
                 }])
             })
+            .theme_slot(ThemeSlot::Button, cx)
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
-            .when(!self.disabled, |this| this.cursor_pointer().hover(|this| this.bg(hover)))
+            .when(!self.disabled, |this| {
+                this.cursor_pointer()
+                    .hover(|this| refine_slot_hover(this.bg(hover), ThemeSlot::Button, cx))
+                    .when(slot_has_active(ThemeSlot::Button, cx), |this| {
+                        this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
+                    })
+            })
             .children(self.icon.map(|glyph| glyph.render(px(icon_size), icon_color)))
             .children(self.label.map(|label| div().max_w(px(160.)).truncate().child(label)))
             .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))
@@ -536,6 +555,7 @@ pub fn floating_shadow(dark: bool) -> Vec<BoxShadow> {
 pub fn menu_surface(cx: &App) -> gpui::Div {
     let p = palette(cx);
     div()
+        .relative()
         .flex()
         .flex_col()
         .min_w(px(160.))
@@ -546,12 +566,16 @@ pub fn menu_surface(cx: &App) -> gpui::Div {
         .bg(hsla(p.popover))
         .text_color(hsla(p.popover_foreground))
         .shadow(floating_shadow(cx.theme().is_dark()))
+        .theme_slot(ThemeSlot::MenuPopup, cx)
+        .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, px(8.), cx))
 }
 
 /// The dropdown glass, floating shadow and control bevel of `popover.tsx` (§6.5).
 pub fn popup_surface(cx: &App) -> gpui::Div {
     let p = palette(cx);
     let dark = cx.theme().is_dark();
+    let has_custom_bg = slot_has_background(ThemeSlot::PopoverPopup, cx);
+    let backdrop_border = slot_border_color(ThemeSlot::PopoverPopup, cx).unwrap_or_else(|| hsla(p.dropdown_border));
     let mut shadows = floating_shadow(dark);
     shadows.push(BoxShadow {
         color: if dark { gpui::white().opacity(0.06) } else { gpui::black().opacity(0.04) },
@@ -560,10 +584,24 @@ pub fn popup_surface(cx: &App) -> gpui::Div {
         spread_radius: px(0.),
         inset: true,
     });
-    div().relative().flex().flex_col().p(crate::theme::rem(4.)).rounded(crate::theme::rem(8.))
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .p(crate::theme::rem(4.))
+        .rounded(crate::theme::rem(8.))
         .text_color(hsla(p.popover_foreground))
         .shadow(shadows)
-        .child(crate::glass::backdrop(8. * f32::from(cx.theme().font_size) / 16., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+        .when(!has_custom_bg, |this| {
+            this.child(crate::glass::backdrop(
+                8. * f32::from(cx.theme().font_size) / 16.,
+                hsla(p.dropdown_surface),
+                backdrop_border,
+                cx,
+            ))
+        })
+        .children(theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, crate::theme::rem(8.), cx))
+        .theme_slot(ThemeSlot::PopoverPopup, cx)
 }
 
 /// A menu item: min 28, pad 8 / 4, radius 4, highlighted `accent`.
