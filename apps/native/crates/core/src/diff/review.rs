@@ -34,6 +34,8 @@ impl ReviewScope {
 pub struct ReviewFile {
     pub path: String,
     pub previous_path: Option<String>,
+    /// Pre-patch change kind reported by the server (`pingdotgg/t3code#33310`); `None` on older servers.
+    pub change_type: Option<ChangeKind>,
     pub additions: u64,
     pub deletions: u64,
 }
@@ -44,14 +46,16 @@ impl ReviewFile {
     }
 
     pub fn placeholder(&self) -> FileDiff {
+        let change = self.change_type.unwrap_or(if self.previous_path.is_some() {
+            ChangeKind::RenameChanged
+        } else {
+            ChangeKind::Modified
+        });
         FileDiff {
-            old_path: Some(self.previous_path.clone().unwrap_or_else(|| self.path.clone())),
-            new_path: Some(self.path.clone()),
-            change: if self.previous_path.is_some() {
-                ChangeKind::RenameChanged
-            } else {
-                ChangeKind::Modified
-            },
+            old_path: (change != ChangeKind::New)
+                .then(|| self.previous_path.clone().unwrap_or_else(|| self.path.clone())),
+            new_path: (change != ChangeKind::Deleted).then(|| self.path.clone()),
+            change,
             binary: false,
             hunks: Vec::new().into(),
             additions: self.additions as u32,

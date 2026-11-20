@@ -6,28 +6,30 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Global, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div, prelude::*, px, uniform_list,
+    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Global, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Escape, Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{Sizable, h_flex, v_flex};
+use serde_json::json;
 use t3_client::session::RpcError;
 use t3_client::store;
 use t3_core::commands::method::DISPATCH_COMMAND;
 use t3_core::pull_requests::cache::{LIST_CACHE_KEY, PersistedListCache};
 use t3_core::pull_requests::detail::{StateKind, checks_state_label};
 use t3_core::pull_requests::link::{
-    ChangeRequestLink, LinkProject, ThreadLink, is_linked_to_url, link_command, link_validation, parse_change_request_url, resolve_link_input, unlink_command, watch_command,
+    ChangeRequestLink, LinkProject, ThreadLink, can_start_thread_pull_request_watch, is_linked_to_url, link_command, link_validation, parse_change_request_url, resolve_link_input, unlink_command, watch_command,
 };
 use t3_core::pull_requests::thread_badge::resolve_thread_pull_request_chains;
-use t3_core::pull_requests::wire::{ListEntry, PrState, Preview};
-use t3_core::pull_requests::{PrRef, failure_message};
+use t3_core::pull_requests::wire::{Activity, Detail, ListEntry, PrState, Preview, decode};
+use t3_core::pull_requests::{PrRef, failure_message, method};
 use t3_core::sidebar::time::{compact_relative_label, parse_iso};
 
 use super::controls::{Button, Size, Variant, checks_glyph, glyph, state_glyph};
-use super::detail::DetailView;
+use super::detail::{DetailView, has_held_detail, prefetch_into_held};
+use super::page::INTENT_PREFETCH_DELAY;
 use super::preview::{LinkPreviewController, PreviewTarget};
-use super::{LinkPullRequest, OpenPullRequests};
+use super::{LinkPullRequest, OpenPullRequests, owner_for_pr, read_for_owner, settle};
 use crate::app_state::{AppEvent, AppState, uuid_v4};
 use crate::icons::Icon;
 use crate::right_panel::tooltip_view;
@@ -64,6 +66,10 @@ pub struct ThreadPullRequestsPanel {
     _picker_sub: Option<Subscription>,
     /// Hover preview card for linked pull request rows.
     preview: LinkPreviewController,
+    /// Hover-intent prefetch into `DetailView` held cache (`pingdotgg/t3code#32911`).
+    intent_target: Option<PrRef>,
+    _intent_timer: Option<Task<()>>,
+    _intent_fetch: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -80,6 +86,7 @@ impl ThreadPullRequestsPanel {
                     this.picker_dirty = false;
                     this.picker_error = None;
                     this.preview.clear();
+                    this.cancel_intent();
                 }
                 cx.notify();
             }
@@ -95,8 +102,63 @@ impl ThreadPullRequestsPanel {
             picker_error: None,
             _picker_sub: None,
             preview: LinkPreviewController::default(),
+            intent_target: None,
+            _intent_timer: None,
+            _intent_fetch: None,
             _subscription: subscription,
         }
+    }
+
+    fn cancel_intent(&mut self) {
+        self.intent_target = None;
+        self._intent_timer = None;
+        self._intent_fetch = None;
+    }
+
+    fn hover_intent(&mut self, reference: Option<PrRef>, cx: &mut Context<Self>) {
+        if self.intent_target == reference {
+            return;
+        }
+        self.cancel_intent();
+        let Some(reference) = reference else { return };
+        if has_held_detail(self.state.read(cx), &reference, cx) {
+            return;
+        }
+        self.intent_target = Some(reference.clone());
+        self._intent_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(INTENT_PREFETCH_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.intent_target.as_ref() != Some(&reference) {
+                    return;
+                }
+                let mut detail_input = reference.payload();
+                detail_input["allowStale"] = json!(false);
+                let app = this.state.read(cx);
+                let owner = owner_for_pr(app, None, &reference.project_id);
+                let detail_task = read_for_owner(app, owner.as_ref(), method::DETAIL, detail_input, decode::<Detail>);
+                let activity_task = read_for_owner(app, owner.as_ref(), method::ACTIVITY, reference.payload(), decode::<Activity>);
+                let reference_done = reference.clone();
+                this._intent_fetch = Some(cx.spawn(async move |this, cx| {
+                    let (detail_res, activity_res) = futures::future::join(settle(detail_task), settle(activity_task)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        prefetch_into_held(&this.state, &reference_done, detail_res.ok().as_ref(), activity_res.ok().as_ref(), cx);
+                    });
+                }));
+            });
+        }));
+    }
+
+    /// `canStartThreadPullRequestWatch` (`pingdotgg/t3code#29867`).
+    pub(crate) fn can_start_watch(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        let Some(thread) = state.selected_thread.as_deref().and_then(|id| state.thread_shell(id)) else {
+            return false;
+        };
+        can_start_thread_pull_request_watch(
+            thread.archived_at.is_some(),
+            thread.settled_override.as_deref(),
+            thread.lineage.relationship_to_parent.as_deref(),
+        )
     }
 
     fn thread_project(&self, cx: &App) -> (Option<String>, Option<LinkProject>) {
@@ -186,6 +248,7 @@ impl ThreadPullRequestsPanel {
 
     pub(crate) fn open_detail(&mut self, reference: PrRef, entry: Option<ListEntry>, cx: &mut Context<Self>) {
         self.preview.clear();
+        self.cancel_intent();
         let panel = cx.entity().downgrade();
         let on_close = Rc::new({
             let panel = panel.clone();
@@ -308,6 +371,9 @@ impl ThreadPullRequestsPanel {
     fn toggle_watch(&mut self, link: &ThreadLink, cx: &mut Context<Self>) {
         let Some(thread_id) = self.state.read(cx).selected_thread.clone() else { return };
         let enable = link.watch.is_none();
+        if enable && !self.can_start_watch(cx) {
+            return;
+        }
         let task = self.state.read(cx).rpc(DISPATCH_COMMAND, watch_command(&uuid_v4(), &thread_id, link, enable));
         let state = self.state.clone();
         cx.spawn(async move |_, cx| {
@@ -446,7 +512,7 @@ impl ThreadPullRequestsPanel {
             updated_at: snapshot.updated_at.clone(),
             observed_at: None,
         });
-        PreviewTarget { reference: reference.clone(), url: link.url.clone(), fallback }
+        PreviewTarget { environment_id: None, reference: reference.clone(), url: link.url.clone(), fallback }
     }
 
     fn row(&self, item: &FlattenedLink, project_id: Option<&str>, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -476,11 +542,13 @@ impl ThreadPullRequestsPanel {
 
         let panel_entity = cx.entity();
         let open_here_ref = reference.clone();
+        let hover_ref = reference.clone();
         let hover_target = reference.as_ref().map(|reference| Self::preview_target(link, reference));
         let menu_ref = reference.clone();
         let menu_link = link.clone();
         let unlink_target = link.clone();
         let is_watching = link.watch.is_some();
+        let can_watch = open && (is_watching || self.can_start_watch(cx));
 
         h_flex()
             .id(SharedString::from(format!("thread-pr-{index}")))
@@ -495,6 +563,7 @@ impl ThreadPullRequestsPanel {
                 let target = if *hovered { hover_target.clone() } else { None };
                 let state = this.state.clone();
                 this.preview.hover(&state, target, |panel| &mut panel.preview, cx);
+                this.hover_intent(if *hovered { hover_ref.clone() } else { None }, cx);
             }))
             .when(item.depth > 0, |this| {
                 this.border_l_2().border_color(hsla(p.border).opacity(0.7))
@@ -580,7 +649,7 @@ impl ThreadPullRequestsPanel {
                         menu = menu.item(PopupMenuItem::new("Open on host").on_click(move |_, _, cx| {
                             cx.open_url(&open_url);
                         }));
-                        if open {
+                        if can_watch {
                             let watch_link = menu_link.clone();
                             let panel = panel_entity.clone();
                             let watch_label = if is_watching { "Stop watching" } else { "Watch for changes" };
@@ -844,6 +913,67 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             assert!(panel.read(cx).detail.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn settled_archived_and_subagent_threads_cannot_start_pr_watch(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            state.update(cx, |state, _| {
+                state.shell.snapshot = Some(serde_json::from_value(json!({
+                    "snapshotSequence": 1,
+                    "projects": [{
+                        "id": "p1", "title": "Repo", "workspaceRoot": "/tmp/repo",
+                        "defaultModelSelection": null, "scripts": [],
+                        "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"
+                    }],
+                    "threads": [
+                        {
+                            "id": "t-active", "projectId": "p1", "title": "Active", "providerInstanceId": "replay",
+                            "modelSelection": { "instanceId": "replay", "model": "replay" },
+                            "runtimeMode": "full-access", "interactionMode": "default",
+                            "lineage": { "rootThreadId": "t-active" }, "status": "idle",
+                            "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+                            "pullRequests": []
+                        },
+                        {
+                            "id": "t-settled", "projectId": "p1", "title": "Settled", "providerInstanceId": "replay",
+                            "modelSelection": { "instanceId": "replay", "model": "replay" },
+                            "runtimeMode": "full-access", "interactionMode": "default",
+                            "lineage": { "rootThreadId": "t-settled" }, "status": "idle",
+                            "settledOverride": "settled",
+                            "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+                            "pullRequests": []
+                        },
+                        {
+                            "id": "t-subagent", "projectId": "p1", "title": "Subagent", "providerInstanceId": "replay",
+                            "modelSelection": { "instanceId": "replay", "model": "replay" },
+                            "runtimeMode": "full-access", "interactionMode": "default",
+                            "lineage": { "rootThreadId": "t-active", "relationshipToParent": "subagent" }, "status": "idle",
+                            "hasActionableProposedPlan": false, "itemCount": 0, "visibleItemCount": 0,
+                            "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z",
+                            "pullRequests": []
+                        }
+                    ],
+                    "updatedAt": "2026-01-02T00:00:00Z"
+                })).unwrap());
+                state.selected_thread = Some("t-active".into());
+            });
+            let panel = cx.new(|cx| ThreadPullRequestsPanel::new(state.clone(), cx));
+            assert!(panel.read(cx).can_start_watch(cx));
+
+            state.update(cx, |state, _| state.selected_thread = Some("t-settled".into()));
+            assert!(!panel.read(cx).can_start_watch(cx));
+
+            state.update(cx, |state, _| state.selected_thread = Some("t-subagent".into()));
+            assert!(!panel.read(cx).can_start_watch(cx));
         });
     }
 }

@@ -20,8 +20,11 @@ mod toolbar;
 
 use gpui::{App, Context, Entity, Window, actions};
 use serde_json::Value;
+use t3_client::environments::DestinationError;
 use t3_client::session::RpcError;
+use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::pull_requests::failure_message;
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use tokio::task::JoinHandle;
 
 pub(crate) use detail::{DetailView, Tab as DetailTab};
@@ -73,6 +76,93 @@ pub(crate) fn read<T: Send + 'static>(state: &AppState, method: &'static str, pa
             Err(RpcError::Failure(failure)) => Err(failure_message(failure.tag.as_deref(), &failure.error, &failure.message)),
             Err(RpcError::Closed) => Err(NOT_CONNECTED.to_owned()),
         }
+    }))
+}
+
+pub(crate) fn destination_error_message(error: DestinationError) -> String {
+    match error {
+        DestinationError::Denied => "Permission required for this environment.".to_owned(),
+        DestinationError::Disconnected | DestinationError::Unsynchronized => NOT_CONNECTED.to_owned(),
+        DestinationError::Missing | DestinationError::Stale => "This environment is no longer available.".to_owned(),
+    }
+}
+
+/// Finds the fleet `EnvironmentOwner` matching `env_id` (either `saved_id` or `canonical_id`).
+pub(crate) fn owner_for_env(state: &AppState, env_id: &str) -> Option<EnvironmentOwner> {
+    state
+        .fleet
+        .environments
+        .iter()
+        .find(|env| env.summary.owner.saved_id == env_id || env.summary.owner.canonical_id.as_deref() == Some(env_id))
+        .map(|env| env.summary.owner.clone())
+}
+
+/// Resolves the fleet `EnvironmentOwner` for a pull request: prefers an explicit `env_id`,
+/// otherwise finds the enabled fleet environment owning `project_id`. Returns `None` when no
+/// fleet environments are loaded (single-host mode).
+pub(crate) fn owner_for_pr(state: &AppState, env_id: Option<&str>, project_id: &str) -> Option<EnvironmentOwner> {
+    if let Some(id) = env_id
+        && let Some(owner) = owner_for_env(state, id)
+    {
+        return Some(owner);
+    }
+    state
+        .fleet
+        .environments
+        .iter()
+        .filter(|env| {
+            !state
+                .environments
+                .environments
+                .iter()
+                .any(|saved| saved.id == env.summary.owner.saved_id && saved.disabled)
+        })
+        .find(|env| env.summary.projects.iter().any(|scoped| scoped.project.id == project_id))
+        .map(|env| env.summary.owner.clone())
+}
+
+/// One PR RPC read targeting a fleet environment via `connections.destination`, or falling back
+/// to the active `client_handle` when `owner` is `None`.
+pub(crate) fn read_for_owner<T: Send + 'static>(
+    state: &AppState,
+    owner: Option<&EnvironmentOwner>,
+    method: &'static str,
+    payload: Value,
+    decode: fn(Value) -> Result<T, String>,
+) -> Read<T> {
+    if let Some(owner) = owner {
+        let dest_fut = state.connections.destination(owner, ORCHESTRATION_READ_SCOPE);
+        return Some(state.runtime().spawn(async move {
+            let client = dest_fut.await.map_err(destination_error_message)?.client;
+            match client.request(method, payload).await {
+                Ok(value) => decode(value),
+                Err(RpcError::Failure(failure)) => Err(failure_message(failure.tag.as_deref(), &failure.error, &failure.message)),
+                Err(RpcError::Closed) => Err(NOT_CONNECTED.to_owned()),
+            }
+        }));
+    }
+    read(state, method, payload, decode)
+}
+
+/// One PR diff HTTP read (`POST /api/pull-requests/diff`) targeting `owner` when set, or the
+/// active `client_handle` in single-host mode.
+pub(crate) fn diff_for_owner(state: &AppState, owner: Option<&EnvironmentOwner>, payload: Value) -> Read<Value> {
+    if let Some(owner) = owner {
+        let dest_fut = state.connections.destination(owner, ORCHESTRATION_READ_SCOPE);
+        return Some(state.runtime().spawn(async move {
+            let client = dest_fut.await.map_err(destination_error_message)?.client;
+            client
+                .pull_request_diff(payload)
+                .await
+                .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))
+        }));
+    }
+    let client = state.client_handle()?;
+    Some(state.runtime().spawn(async move {
+        client
+            .pull_request_diff(payload)
+            .await
+            .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))
     }))
 }
 

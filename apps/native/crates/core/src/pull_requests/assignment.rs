@@ -1,7 +1,7 @@
 //! Multi-environment project assignment and host availability tracking for the Pull Requests page.
 //! Ports `apps/web/src/components/pullRequest/pullRequestProjectAssignment.logic.ts`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::wire::ProviderSummary;
 
@@ -129,12 +129,31 @@ fn repository_key(project: &AssignableProject) -> Option<String> {
 }
 
 /// Assigns each repository canonical key to a single owning environment so the same repository
-/// cloned on multiple machines is queried once, preferring readable hosts and `preferred_environment_id`.
+/// cloned on multiple machines is queried once, preferring reachable & readable hosts and
+/// `preferred_environment_id`.
 pub fn assign_projects_to_environments(
     projects: &[AssignableProject],
     environment_ids: &[String],
     preferred_environment_id: Option<&str>,
     host_availability: Option<&HostAvailability>,
+) -> HashMap<String, Vec<String>> {
+    assign_projects_to_environments_with_unreachable(
+        projects,
+        environment_ids,
+        preferred_environment_id,
+        host_availability,
+        None,
+    )
+}
+
+/// Variant of [`assign_projects_to_environments`] that yields shared repositories away from
+/// unreachable environments (`pingdotgg/t3code#34088`). Cost: unreachable (+2) + unreadable (+1).
+pub fn assign_projects_to_environments_with_unreachable(
+    projects: &[AssignableProject],
+    environment_ids: &[String],
+    preferred_environment_id: Option<&str>,
+    host_availability: Option<&HostAvailability>,
+    unreachable_environment_ids: Option<&HashSet<String>>,
 ) -> HashMap<String, Vec<String>> {
     let rank: HashMap<&str, usize> = environment_ids.iter().enumerate().map(|(ix, id)| (id.as_str(), ix)).collect();
     let mut owner: HashMap<String, &AssignableProject> = HashMap::new();
@@ -149,6 +168,11 @@ pub fn assign_projects_to_environments(
             .or(project.host.as_deref());
         host.and_then(|h| availability.hosts.get(&h.to_lowercase())).is_some_and(|status| !status.configured)
     };
+    let cost = |project: &AssignableProject| -> u8 {
+        let unreachable_penalty = if unreachable_environment_ids.is_some_and(|set| set.contains(&project.environment_id)) { 2 } else { 0 };
+        let unreadable_penalty = u8::from(unreadable(project));
+        unreachable_penalty + unreadable_penalty
+    };
     for project in projects {
         let Some(key) = repository_key(project) else { continue };
         let Some(&env_rank) = rank.get(project.environment_id.as_str()) else { continue };
@@ -156,10 +180,10 @@ pub fn assign_projects_to_environments(
             owner.insert(key, project);
             continue;
         };
-        let current_unreadable = unreadable(current);
-        let candidate_unreadable = unreadable(project);
-        if current_unreadable != candidate_unreadable {
-            if current_unreadable {
+        let current_cost = cost(current);
+        let candidate_cost = cost(project);
+        if current_cost != candidate_cost {
+            if candidate_cost < current_cost {
                 owner.insert(key, project);
             }
             continue;
@@ -201,8 +225,24 @@ pub fn pull_request_project_queries(
     environment_ids: &[String],
     host_availability: Option<&HostAvailability>,
 ) -> Vec<ProjectQuerySlice> {
+    pull_request_project_queries_with_unreachable(projects, environment_ids, host_availability, None)
+}
+
+/// Variant of [`pull_request_project_queries`] honoring unreachable environments (`pingdotgg/t3code#34088`).
+pub fn pull_request_project_queries_with_unreachable(
+    projects: &[AssignableProject],
+    environment_ids: &[String],
+    host_availability: Option<&HostAvailability>,
+    unreachable_environment_ids: Option<&HashSet<String>>,
+) -> Vec<ProjectQuerySlice> {
     let preferred = environment_ids.first().map(String::as_str);
-    let assignment = assign_projects_to_environments(projects, environment_ids, preferred, host_availability);
+    let assignment = assign_projects_to_environments_with_unreachable(
+        projects,
+        environment_ids,
+        preferred,
+        host_availability,
+        unreachable_environment_ids,
+    );
     let mut totals: HashMap<&str, usize> = HashMap::new();
     for project in projects {
         *totals.entry(project.environment_id.as_str()).or_default() += 1;
@@ -297,8 +337,36 @@ pub fn project_assignment_rows(
     pr_counts: &HashMap<String, usize>,
     unavailable_projects: &std::collections::HashSet<String>,
 ) -> Vec<AssignedProjectColumnRow> {
+    project_assignment_rows_with_unreachable(
+        projects,
+        environment_ids,
+        environments,
+        host_availability,
+        pr_counts,
+        unavailable_projects,
+        None,
+    )
+}
+
+/// Variant of [`project_assignment_rows`] that yields shared repositories away from unreachable
+/// environments (`pingdotgg/t3code#34088`).
+pub fn project_assignment_rows_with_unreachable(
+    projects: &[AssignableProject],
+    environment_ids: &[String],
+    environments: &[EnvironmentInfo],
+    host_availability: Option<&HostAvailability>,
+    pr_counts: &HashMap<String, usize>,
+    unavailable_projects: &std::collections::HashSet<String>,
+    unreachable_environment_ids: Option<&HashSet<String>>,
+) -> Vec<AssignedProjectColumnRow> {
     let preferred = environment_ids.first().map(String::as_str);
-    let assignment = assign_projects_to_environments(projects, environment_ids, preferred, host_availability);
+    let assignment = assign_projects_to_environments_with_unreachable(
+        projects,
+        environment_ids,
+        preferred,
+        host_availability,
+        unreachable_environment_ids,
+    );
     let env_labels: HashMap<&str, &str> = environments.iter().map(|e| (e.environment_id.as_str(), e.label.as_str())).collect();
     let mut rows = Vec::new();
     for env_id in environment_ids {
@@ -403,5 +471,38 @@ mod tests {
         assert_eq!(pickable.len(), 2);
         assert_eq!(pickable[0].label, "Local");
         assert_eq!(pickable[1].project_id, "p2");
+    }
+
+    #[test]
+    fn unreachable_environment_yields_shared_repo_even_to_unconfigured_reachable_env() {
+        let projects = vec![
+            project("p1", "env-1", Some("github.com/acme/shared"), Some("github.com")),
+            project("p1-only", "env-1", Some("github.com/acme/only-offline"), Some("github.com")),
+            project("p2", "env-2", Some("github.com/acme/shared"), Some("github.com")),
+        ];
+        let envs = vec!["env-1".into(), "env-2".into()];
+        let unconfigured = ProviderSummary {
+            host: "github.com".into(),
+            kind: "github".into(),
+            searches_on_host: true,
+            actions: None,
+            project_count: 1,
+            project_ids: Some(vec!["p2".into()]),
+            configured: false,
+            detail: None,
+        };
+        let availability = remember_hosts(&HashMap::new(), &[("env-2", &[unconfigured], 10)]);
+        let unreachable = HashSet::from(["env-1".to_owned()]);
+        let assigned = assign_projects_to_environments_with_unreachable(
+            &projects,
+            &envs,
+            Some("env-1"),
+            Some(&availability),
+            Some(&unreachable),
+        );
+        // env-1 is unreachable (cost 2) vs env-2 reachable+unconfigured (cost 1): shared repo moves to env-2,
+        // while env-1 keeps its exclusive repo.
+        assert_eq!(assigned.get("env-1").map(Vec::as_slice), Some(&["p1-only".to_owned()][..]));
+        assert_eq!(assigned.get("env-2").map(Vec::as_slice), Some(&["p2".to_owned()][..]));
     }
 }

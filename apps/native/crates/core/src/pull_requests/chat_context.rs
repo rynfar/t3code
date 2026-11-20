@@ -8,14 +8,18 @@ use std::sync::{Arc, LazyLock};
 use markdown::mdast::Node;
 use regex::Regex;
 
+use super::anchor::{Anchor, anchor_matches_url, parse_anchor};
 use super::detail::{change_request_term, visible_body};
-use super::wire::{Comment, Detail, ReviewThread};
+use super::wire::{Activity, Comment, CommentKind, Detail, ReviewThread};
 use crate::composer::review::ReviewComment;
 
 const FINDING_BODY_MAX_LENGTH: usize = 1_000;
+/// `COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS` (`packages/contracts/src/composerContext.ts`).
+pub const COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS: usize = 16_000;
 
 static HTML_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<!--.*?(?:-->|$)").unwrap());
 static WHITESPACE_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+static REVIEW_ANCHOR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^pullrequestreview-\d+$").unwrap());
 
 /// Bounds text to `FINDING_BODY_MAX_LENGTH` UTF-16 code units, matching the web's `bounded` without
 /// splitting a surrogate pair.
@@ -161,6 +165,17 @@ pub enum ChatSubject<'a> {
 /// `buildPullRequestCommentContext`: builds the `ReviewComment` chip for a comment or thread
 /// brought into the chat composer. Returns `None` when there are no readable words in it.
 pub fn build_comment_context(detail: &Detail, subject: ChatSubject<'_>) -> Option<ReviewComment> {
+    build_comment_context_with_activity(detail, None, subject)
+}
+
+/// Variant of [`build_comment_context`] that attaches a GitHub review summary's line comments
+/// (preserving left/right side, `pingdotgg/t3code#38113`, `pingdotgg/t3code#38276`) and keeps a
+/// single remark whole up to `COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS`.
+pub fn build_comment_context_with_activity(
+    detail: &Detail,
+    activity: Option<&Activity>,
+    subject: ChatSubject<'_>,
+) -> Option<ReviewComment> {
     let number = detail.number;
     match subject {
         ChatSubject::Thread(thread) => {
@@ -173,7 +188,7 @@ pub fn build_comment_context(detail: &Detail, subject: ChatSubject<'_>) -> Optio
                     Some(format!("{author}: {body}"))
                 })
                 .collect();
-            let text = bounded(&lines.join("\n"));
+            let text = lines.join("\n").trim().to_owned();
             if text.is_empty() {
                 return None;
             }
@@ -181,9 +196,8 @@ pub fn build_comment_context(detail: &Detail, subject: ChatSubject<'_>) -> Optio
             let first_author = thread.comments.first().and_then(|comment| comment.author.as_ref()).map_or("ghost", |actor| actor.login.as_str());
             let (file_path, range_label, section_title, fence_language) = match thread.path.as_deref() {
                 Some(path) => {
-                    let range_label = match thread.line {
+                    let range_label = match review_thread_line(thread) {
                         None => "file".to_owned(),
-                        Some(line) if thread.side.as_deref() == Some("left") => format!("L{line} (before)"),
                         Some(line) => format!("L{line}"),
                     };
                     (path.to_owned(), range_label, format!("PR #{number} review"), infer_fence_language(path))
@@ -209,6 +223,10 @@ pub fn build_comment_context(detail: &Detail, subject: ChatSubject<'_>) -> Optio
             let author = comment.author.as_ref().map_or("ghost", |actor| actor.login.as_str());
             let file_path = comment.path.clone().unwrap_or_else(|| format!("@{author}"));
             let fence_language = comment.path.as_deref().and_then(infer_fence_language);
+            let review_lines = activity
+                .map(|act| review_line_comments(comment, &act.review_threads, act.review_threads_truncated))
+                .unwrap_or_default();
+            let text = remark_text(format!("{author}: {body}").trim(), &review_lines);
             Some(ReviewComment {
                 id: format!("pr-comment:{}:comment:{}", detail.url, comment.id),
                 section_id: format!("pull-request:{number}"),
@@ -217,13 +235,99 @@ pub fn build_comment_context(detail: &Detail, subject: ChatSubject<'_>) -> Optio
                 start_index: 0,
                 end_index: 0,
                 range_label: "comment".to_owned(),
-                text: Arc::from(bounded(&format!("{author}: {body}"))),
+                text: Arc::from(text),
                 diff: Arc::from(""),
                 fence_language,
                 selection: None,
             })
         }
     }
+}
+
+/// `reviewThreadLine` (`pingdotgg/t3code#38276`): marks left-side lines with ` (before)`.
+fn review_thread_line(thread: &ReviewThread) -> Option<String> {
+    let line = thread.line?;
+    Some(if thread.side.as_deref() == Some("left") {
+        format!("{line} (before)")
+    } else {
+        line.to_string()
+    })
+}
+
+/// `remarkText` (`pingdotgg/t3code#38113`): keeps at least half of `COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS`
+/// for the review summary while leaving room for the review link and its line comments.
+fn remark_text(remark: &str, review: &[String]) -> String {
+    if review.is_empty() {
+        return remark.to_owned();
+    }
+    let after = review.join("\n\n");
+    let after_utf16: usize = after.chars().map(char::len_utf16).sum();
+    let remark_utf16: usize = remark.chars().map(char::len_utf16).sum();
+    let room = (COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS / 2)
+        .max(COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS.saturating_sub(after_utf16 + 200));
+    if remark_utf16 <= room {
+        return format!("{remark}\n\n{after}");
+    }
+    let mut units = 0;
+    let mut end = 0;
+    for (index, ch) in remark.char_indices() {
+        let width = ch.len_utf16();
+        if units + width > room {
+            break;
+        }
+        units += width;
+        end = index + ch.len_utf8();
+    }
+    let omitted = remark_utf16.saturating_sub(units);
+    format!(
+        "{}\n… {omitted} more characters of the review summary are omitted; read it at the review link.\n\n{after}",
+        &remark[..end]
+    )
+}
+
+/// `reviewLineComments` (`pingdotgg/t3code#38113`, `pingdotgg/t3code#38276`).
+fn review_line_comments(
+    comment: &Comment,
+    review_threads: &[ReviewThread],
+    review_threads_truncated: Option<bool>,
+) -> Vec<String> {
+    if comment.kind != CommentKind::Review {
+        return Vec::new();
+    }
+    let Some(url) = comment.url.as_deref() else { return Vec::new() };
+    let Some(Anchor::Timeline(anchor)) = parse_anchor(url) else { return Vec::new() };
+    if !REVIEW_ANCHOR.is_match(&anchor) {
+        return Vec::new();
+    }
+    let mut posted = Vec::new();
+    for thread in review_threads {
+        for line_comment in &thread.comments {
+            let Some(body) = readable_body(&line_comment.body) else { continue };
+            if !anchor_matches_url(&anchor, line_comment.review_url.as_deref()) {
+                continue;
+            }
+            let author = line_comment.author.as_ref().map_or("ghost", |a| a.login.as_str());
+            let path = thread.path.as_deref().unwrap_or("");
+            let at = review_thread_line(thread).map_or(String::new(), |line| format!(" line {line}"));
+            posted.push(format!("{author} on `{path}`{at}: {body}"));
+        }
+    }
+    let complete = review_threads_truncated == Some(false)
+        && review_threads.iter().all(|thread| thread.next_comments_cursor.is_none());
+    let mut out = vec![format!("Review: {url}")];
+    if posted.is_empty() {
+        out.push(if complete {
+            "This review posted no line comments.".to_owned()
+        } else {
+            "No line comments from this review were loaded.".to_owned()
+        });
+    } else {
+        out.push(format!("Line comments in this review:\n\n{}", posted.join("\n\n")));
+    }
+    if !complete {
+        out.push("More may exist; see the review link.".to_owned());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -322,5 +426,68 @@ mod tests {
         let utf16_len: usize = result.chars().map(char::len_utf16).sum();
         assert!(utf16_len <= FINDING_BODY_MAX_LENGTH);
         assert!(utf16_len >= FINDING_BODY_MAX_LENGTH - 1);
+    }
+
+    #[test]
+    fn single_comment_is_sent_whole_and_github_review_attaches_line_comments() {
+        let detail = sample_detail();
+        let long_body = "x".repeat(2_500);
+        let review_url = "https://github.com/acme/app/pull/42#pullrequestreview-900";
+        let review_comment = Comment {
+            id: "r900".into(),
+            kind: CommentKind::Review,
+            author: Some(actor("carol")),
+            body: long_body.clone(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            edited_at: None,
+            url: Some(review_url.into()),
+            path: None,
+            review_state: Some("CHANGES_REQUESTED".into()),
+            reactions: Vec::new(),
+            can_edit: None,
+        };
+        let thread = ReviewThread {
+            id: "rt1".into(),
+            path: Some("src/cache.rs".into()),
+            line: Some(88),
+            side: Some("left".into()),
+            is_resolved: false,
+            is_outdated: false,
+            comments: vec![ThreadComment {
+                id: "tc1".into(),
+                author: Some(actor("carol")),
+                body: "Avoid cloning on hot path".into(),
+                created_at: "2026-01-01T00:01:00Z".into(),
+                edited_at: None,
+                url: None,
+                review_url: Some(review_url.into()),
+                reactions: Vec::new(),
+                can_edit: None,
+            }],
+            comment_count: Some(1),
+            next_comments_cursor: None,
+            can_resolve: None,
+        };
+        let activity = Activity {
+            comments: vec![review_comment.clone()],
+            comment_count: 1,
+            comments_truncated: false,
+            review_threads: vec![thread],
+            review_threads_truncated: Some(false),
+            overview_threads: Vec::new(),
+            commits: Vec::new(),
+            reactions: Vec::new(),
+        };
+        let chip = build_comment_context_with_activity(&detail, Some(&activity), ChatSubject::Comment(&review_comment)).unwrap();
+        // Whole summary preserved (not truncated at FINDING_BODY_MAX_LENGTH=1000).
+        assert!(chip.text.contains(&long_body));
+        assert!(chip.text.contains(&format!("Review: {review_url}")));
+        assert!(chip.text.contains("carol on `src/cache.rs` line 88 (before): Avoid cloning on hot path"));
+        assert!(!chip.text.contains("More may exist"));
+
+        // Truncated activity adds the incompleteness note.
+        let truncated_activity = Activity { review_threads_truncated: Some(true), ..activity };
+        let truncated_chip = build_comment_context_with_activity(&detail, Some(&truncated_activity), ChatSubject::Comment(&review_comment)).unwrap();
+        assert!(truncated_chip.text.contains("More may exist; see the review link."));
     }
 }

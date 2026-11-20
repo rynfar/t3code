@@ -168,6 +168,7 @@ pub(super) fn reviewer_picker(view: &mut DetailView, detail: &Detail, window: &m
             .children(reviewer_view.candidates.into_iter().take(40).enumerate().map(|(ix, candidate)| {
                 let c = candidate.clone();
                 let is_team = candidate.kind == ReviewerKind::Team;
+                let selected = view.is_reviewer_draft_selected(&candidate);
                 h_flex()
                     .id(SharedString::from(format!("pr-reviewer-cand-{ix}")))
                     .gap(px(6.))
@@ -180,7 +181,7 @@ pub(super) fn reviewer_picker(view: &mut DetailView, detail: &Detail, window: &m
                     .child(avatar(&candidate.login, 16., cx))
                     .child(div().flex_1().min_w_0().truncate().text_color(hsla(p.foreground)).child(candidate.login.clone()))
                     .when(is_team, |this| this.child(div().text_color(hsla(p.muted_foreground)).child("team")))
-                    .when(candidate.is_requested, |this| this.child(Icon::Check.sized(px(13.)).text_color(hsla(p.primary))))
+                    .when(selected, |this| this.child(Icon::Check.sized(px(13.)).text_color(hsla(p.primary))))
             }))
             .into_any_element()
     };

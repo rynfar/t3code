@@ -465,6 +465,11 @@ pub struct Capabilities {
     pub mentions: Option<bool>,
     #[serde(default)]
     pub reference_sigils: Option<Vec<String>>,
+    #[serde(default)]
+    pub checks_always_report: Option<bool>,
+    /// The diff can read one file the paged diff withheld as too large (`pingdotgg/t3code#37007`).
+    #[serde(default)]
+    pub withheld_file_diff: Option<bool>,
 }
 
 /// Unreported host permissions are granted.
@@ -825,6 +830,17 @@ pub struct Activity {
     pub reactions: Vec<Reaction>,
 }
 
+/// `PullRequestOmittedFileStat`: line counts for a file whose diff the server withheld as too large.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OmittedFileStat {
+    pub path: String,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
 /// `PullRequestDiffResult`, from `POST /api/pull-requests/diff`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -835,6 +851,12 @@ pub struct DiffResult {
     pub truncated: bool,
     #[serde(default)]
     pub next_cursor: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub omitted_file_stats: Vec<OmittedFileStat>,
+    /// On the first page: files this diff withholds can be read one at a time with `path`
+    /// (`pingdotgg/t3code#37007`).
+    #[serde(default)]
+    pub withheld_files_readable: Option<bool>,
 }
 
 pub fn decode<T: DeserializeOwned>(value: Value) -> Result<T, String> {

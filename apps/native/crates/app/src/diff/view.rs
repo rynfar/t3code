@@ -244,6 +244,26 @@ impl View {
         self.recount(0);
     }
 
+    /// Applies an explicit per-file folded vector (used by `PullRequestDiffFolds`), rebuilding
+    /// rows only for files whose fold state changed.
+    pub fn set_folds(&mut self, next_folded: Vec<bool>) -> bool {
+        if next_folded.len() != self.folded.len() || next_folded == self.folded {
+            return false;
+        }
+        let files = self.parsed.files();
+        for (i, file) in files.iter().enumerate() {
+            if next_folded[i] != self.folded[i] {
+                self.folded[i] = next_folded[i];
+                if !self.hidden[i] {
+                    let trailing = self.trailing_hidden.get(i).copied().unwrap_or(0);
+                    self.rows[i] = Arc::new(file_rows_with_trailing(0, file, next_folded[i], self.layout, trailing));
+                }
+            }
+        }
+        self.recount(0);
+        true
+    }
+
     pub fn folded_keys(&self) -> HashSet<String> {
         self.keys.iter().zip(&self.folded).filter(|(_, folded)| **folded).map(|(key, _)| key.clone()).collect()
     }
@@ -345,7 +365,7 @@ mod tests {
 
     #[test]
     fn lazy_file_keys_keep_folds_when_metadata_changes_type_and_inserts_a_path() {
-        let stat = ReviewFile { path: "new.rs".into(), previous_path: Some("old.rs".into()), additions: 1, deletions: 0 };
+        let stat = ReviewFile { path: "new.rs".into(), previous_path: Some("old.rs".into()), additions: 1, deletions: 0, change_type: None };
         let placeholder = stat.placeholder();
         let parsed = |files| Parsed::from_patch(ParsedPatch::Files(files), false, None, None, None);
         let mut session = DiffSession::default();
@@ -353,7 +373,8 @@ mod tests {
         let key = initial.key(0).unwrap().to_owned();
         session.set_file_fold("scope".into(), key.clone(), false, || initial.folded_keys());
         let loaded = FileDiff { change: ChangeKind::RenamePure, ..placeholder };
-        let inserted = ReviewFile { path: "a.rs".into(), previous_path: None, additions: 1, deletions: 0 }.placeholder();
+        let inserted = ReviewFile { path: "a.rs".into(), previous_path: None, additions: 1, deletions: 0, change_type: Some(ChangeKind::New) }.placeholder();
+        assert_eq!(inserted.change, ChangeKind::New);
         let next = View::new(parsed(vec![inserted, loaded.clone()]), "scope".into(), Layout::Stacked, &session, true, &HashSet::new(), true);
         assert_eq!(next.key(1), Some(key.as_str()));
         assert!(!next.is_folded(1));

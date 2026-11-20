@@ -64,7 +64,7 @@ fn entry_row(page: &mut PullRequestsPage, index: usize, window: &mut Window, cx:
     let select_ref = reference.clone();
     let select = cx.listener(move |this, _: &ClickEvent, _, cx| this.select(select_ref.clone(), cx));
     let hover_ref = reference.clone();
-    let preview_target = super::preview::PreviewTarget::from_entry(&entry);
+    let preview_target = super::preview::PreviewTarget::from_entry_in_env(&entry, page.entry_environment(&reference).map(str::to_owned));
     let on_hover = cx.listener(move |this, hovered: &bool, _, cx| {
         if *hovered {
             this.hover_row(Some((hover_ref.clone(), preview_target.clone())), cx);

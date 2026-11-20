@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use gpui::{AnyElement, App, Context, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, px};
 use gpui_component::input::Textarea;
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::{h_flex, v_flex};
 use t3_core::pull_requests::detail::{EventKind, check_status_label, describe_checks, ordered_checks};
 use t3_core::pull_requests::editing::can_edit_maintainer_edits;
@@ -244,52 +244,108 @@ fn labels(view: &DetailView, detail: &Detail, cx: &mut Context<DetailView>) -> i
     meta_row(Icon::Tag, "Labels", applied, cx)
 }
 
-/// `PullRequestLabelPicker`: the repository's labels, each toggled on or off in one write.
+/// `PullRequestLabelPicker` (`pingdotgg/t3code#37733`): toggles multiple labels in a local draft
+/// and commits all additions and removals in one batch when the picker closes.
 fn label_picker(view: &DetailView, detail: &Detail, cx: &mut Context<DetailView>) -> AnyElement {
     let allowed = view.can_write_source_control(cx) && detail.viewer_permissions.labels != Some(false);
-    let button = Button::new("pr-labels-edit", Variant::GhostMuted, Size::Xs).icon(Icon::Tag);
     if !allowed {
-        return button.disabled(true).tooltip("Changing labels needs triage access on this repository").into_any_element();
+        return Button::new("pr-labels-edit", Variant::GhostMuted, Size::Xs)
+            .icon(Icon::Tag)
+            .disabled(true)
+            .tooltip("Changing labels needs triage access on this repository")
+            .into_any_element();
     }
-    let candidates = view.label_candidates.clone();
+    let open = view.label_picker_open;
+    let trigger = Button::new("pr-labels-edit", Variant::GhostMuted, Size::Xs)
+        .icon(Icon::Tag)
+        .tooltip(if open { "Apply label changes" } else { "Change labels" })
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_label_picker(cx)));
+    if !open {
+        return trigger.into_any_element();
+    }
+    let p = palette(cx);
     let pending = view.label_pending;
-    let entity = cx.entity().downgrade();
-    button
-        .tooltip("Change labels")
-        .dropdown_menu(move |menu, _, cx| {
-            let note = |menu: gpui_component::menu::PopupMenu, text: &'static str| menu.item(PopupMenuItem::new(text).disabled(true));
-            match &candidates {
-                None => note(menu, "Loading labels…"),
-                Some(Err(_)) => {
-                    let retry_on_open = entity.clone();
-                    cx.defer(move |cx| {
-                        let _ = retry_on_open.update(cx, |view, cx| view.retry_label_candidates(cx));
-                    });
-                    let retry_on_click = entity.clone();
-                    note(menu, "The labels could not be read.").item(PopupMenuItem::new("Retry").on_click(move |_, _, cx| {
-                        let _ = retry_on_click.update(cx, |view, cx| view.retry_label_candidates(cx));
-                    }))
-                }
-                Some(Ok(list)) if list.candidates.is_empty() => note(menu, "This repository has no labels."),
-                Some(Ok(list)) => {
-                    let mut menu = menu;
-                    for candidate in &list.candidates {
-                        let label = match candidate.description.as_deref().filter(|text| !text.is_empty()) {
-                            Some(text) => format!("{} · {text}", candidate.name),
-                            None => candidate.name.clone(),
-                        };
-                        let (name, applied, entity) = (candidate.name.clone(), candidate.is_applied, entity.clone());
-                        menu = menu.item(PopupMenuItem::new(label).checked(applied).disabled(pending).on_click(move |_, _, cx| {
-                            let _ = entity.update(cx, |view, cx| view.toggle_label(name.clone(), applied, cx));
-                        }));
-                    }
-                    if list.truncated {
-                        menu = note(menu.separator(), "This repository has more labels than are listed here. Apply the rest on the host.");
-                    }
-                    menu
-                }
-            }
-        })
+    let body: AnyElement = match &view.label_candidates {
+        None => div().px(px(10.)).py(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child("Loading labels…").into_any_element(),
+        Some(Err(_)) => h_flex()
+            .justify_between()
+            .px(px(10.))
+            .py(px(8.))
+            .gap(px(8.))
+            .text_xs()
+            .text_color(hsla(p.destructive))
+            .child("The labels could not be read.")
+            .child(Button::new("pr-labels-retry", Variant::Outline, Size::Xs).label("Retry").on_click(cx.listener(|this, _, _, cx| this.retry_label_candidates(cx))))
+            .into_any_element(),
+        Some(Ok(list)) if list.candidates.is_empty() => div().px(px(10.)).py(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child("This repository has no labels.").into_any_element(),
+        Some(Ok(list)) => {
+            let truncated = list.truncated;
+            v_flex()
+                .child(
+                    v_flex()
+                        .max_h(px(220.))
+                        .overflow_y_scrollbar()
+                        .children(list.candidates.iter().enumerate().map(|(ix, candidate)| {
+                            let selected = view.is_label_draft_selected(candidate);
+                            let c = candidate.clone();
+                            let desc = candidate.description.as_deref().filter(|text| !text.is_empty()).map(str::to_owned);
+                            h_flex()
+                                .id(SharedString::from(format!("pr-label-cand-{ix}")))
+                                .gap(px(6.))
+                                .px(px(8.))
+                                .py(px(5.))
+                                .rounded(px(6.))
+                                .text_xs()
+                                .when(!pending, |this| this.cursor_pointer().hover(|style| style.bg(hsla(p.accent))))
+                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_label_draft(c.clone(), cx)))
+                                .child(div().flex_1().min_w_0().truncate().text_color(hsla(p.foreground)).child(match desc {
+                                    Some(text) => format!("{} · {text}", candidate.name),
+                                    None => candidate.name.clone(),
+                                }))
+                                .when(selected, |this| this.child(Icon::Check.sized(px(13.)).text_color(hsla(p.primary))))
+                        })),
+                )
+                .when(truncated, |this| {
+                    this.child(
+                        div()
+                            .px(px(8.))
+                            .py(px(6.))
+                            .border_t_1()
+                            .border_color(hsla(p.border).opacity(0.6))
+                            .text_size(px(11.))
+                            .text_color(hsla(p.muted_foreground))
+                            .child("This repository has more labels than are listed here. Apply the rest on the host."),
+                    )
+                })
+                .into_any_element()
+        }
+    };
+    v_flex()
+        .gap(px(6.))
+        .child(trigger)
+        .child(
+            v_flex()
+                .w(px(260.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(hsla(p.border))
+                .bg(hsla(p.popover))
+                .p(px(6.))
+                .gap(px(4.))
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child("Labels"))
+                        .child(
+                            Button::new("pr-labels-done", Variant::Ghost, Size::Xs)
+                                .label("Done")
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_label_picker(cx))),
+                        ),
+                )
+                .child(body),
+        )
         .into_any_element()
 }
 

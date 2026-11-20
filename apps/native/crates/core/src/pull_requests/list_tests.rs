@@ -135,7 +135,8 @@ fn recency_and_creation_sorts() {
 fn search_scores_numbers_titles_and_elsewhere() {
     let row = entry(42, "Fix model picker");
     assert_eq!(score_match(&row, "#42"), 100);
-    assert_eq!(score_match(&row, "43"), 0);
+    // Non-matching numeric queries fall through to title/branch/elsewhere scoring (`pingdotgg/t3code#33692`).
+    assert_eq!(score_match(&row, "43"), 10);
     assert_eq!(score_match(&row, "fix model picker"), 90);
     assert_eq!(score_match(&row, "picker model"), 70);
     assert_eq!(score_match(&row, "branch-42"), 60);
@@ -228,4 +229,78 @@ fn facets_count_authors_and_labels_in_state() {
     assert_eq!(label_color(Some("#FF0000")), Some(0xff0000));
     assert_eq!(label_color(Some("red")), None);
     assert!(needs_stats(&a));
+}
+
+#[test]
+fn numeric_query_falls_through_to_title_and_branch_scoring() {
+    let mut title_match = entry(10, "Upgrade node 42 runtime");
+    title_match.updated_at = "2026-01-01T00:00:00Z".into();
+    let mut number_match = entry(42, "Unrelated fix");
+    number_match.updated_at = "2026-01-01T00:00:00Z".into();
+    let mut body_only = entry(99, "Other work");
+    body_only.updated_at = "2026-01-05T00:00:00Z".into();
+    assert_eq!(score_match(&number_match, "42"), 100);
+    assert_eq!(score_match(&title_match, "42"), 80);
+    assert_eq!(score_match(&body_only, "42"), 10);
+
+    let entries = vec![body_only, title_match, number_match];
+    let providers = vec![ProviderSummary {
+        host: "github.com".into(),
+        kind: "github".into(),
+        searches_on_host: true,
+        actions: None,
+        project_count: 1,
+        project_ids: None,
+        configured: true,
+        detail: None,
+    }];
+    let viewers = viewers();
+    let filters = ListFilters::default();
+    let shown = Shown {
+        entries: &entries,
+        viewers: &viewers,
+        providers: &providers,
+        involvement: Involvement::All,
+        filters: &filters,
+        text: "42",
+        answered: true,
+        sort: Sort::Updated,
+        state: ListState::Open,
+    };
+    let rows = numbers(&entries, &shown_groups(&shown)[0].entries);
+    assert_eq!(rows, vec![42, 10, 99]);
+}
+
+#[test]
+fn merges_and_partitions_entries_across_environments_by_url() {
+    let mut a = entry(1, "Shared PR");
+    a.url = "https://github.com/acme/app/pull/1".into();
+    let mut a_dup = entry(1, "Shared PR stale copy");
+    a_dup.url = "https://github.com/acme/app/pull/1".into();
+    let mut b = entry(2, "Remote PR");
+    b.url = "https://github.com/acme/app/pull/2".into();
+
+    let merged = merge_pull_request_lists(&[
+        ("env-1", &[a.clone()]),
+        ("env-2", &[a_dup.clone(), b.clone()]),
+    ]);
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].environment_id, "env-1");
+    assert_eq!(merged[0].entry.title, "Shared PR");
+    assert_eq!(merged[1].environment_id, "env-2");
+    assert_eq!(merged[1].entry.number, 2);
+
+    let authored = vec![EnvironmentListEntry { environment_id: "env-2".into(), entry: a_dup.clone() }];
+    let review_requested = vec![
+        EnvironmentListEntry { environment_id: "env-1".into(), entry: a.clone() },
+        EnvironmentListEntry { environment_id: "env-2".into(), entry: b.clone() },
+    ];
+    let groups = partition_with_priority(&merged, &authored, &review_requested);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].0, GroupKey::Authored);
+    assert_eq!(groups[0].1.len(), 1);
+    assert_eq!(groups[0].1[0].entry.title, "Shared PR");
+    assert_eq!(groups[1].0, GroupKey::ReviewRequested);
+    assert_eq!(groups[1].1.len(), 1);
+    assert_eq!(groups[1].1[0].entry.number, 2);
 }

@@ -159,10 +159,15 @@ pub fn thread_resolution_input(reference: &PrRef, thread_id: &str, resolved: boo
     input
 }
 
-/// `PullRequestLabelChangeInput` for one label, the way the label picker toggles them.
+/// `PullRequestLabelChangeInput` for one label.
 pub fn label_change_input(reference: &PrRef, label: &str, applied: bool) -> Value {
+    labels_change_input(reference, &[label.to_owned()], applied)
+}
+
+/// `PullRequestLabelChangeInput` for a batch of labels (`pingdotgg/t3code#37733`).
+pub fn labels_change_input(reference: &PrRef, labels: &[String], applied: bool) -> Value {
     let mut input = reference.payload();
-    input["labels"] = json!([label]);
+    input["labels"] = json!(labels);
     input["applied"] = json!(applied);
     input
 }
@@ -179,6 +184,13 @@ pub fn apply_label_change(labels: &mut Vec<Label>, candidates: &mut [LabelCandid
         }
     } else {
         labels.retain(|label| label.name != name);
+    }
+}
+
+/// Applies a batch of label changes to both the held detail and candidate list.
+pub fn apply_labels_change(labels: &mut Vec<Label>, candidates: &mut [LabelCandidate], names: &[String], applied: bool) {
+    for name in names {
+        apply_label_change(labels, candidates, name, applied);
     }
 }
 

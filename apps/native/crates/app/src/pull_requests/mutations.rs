@@ -13,11 +13,13 @@ use serde_json::{Value, json};
 use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
 use t3_core::pull_requests::detail::resolve_merge_method;
+use t3_core::pull_requests::editing::SOURCE_CONTROL_WRITE_SCOPE;
 use t3_core::pull_requests::wire::{Action, Detail, MergeMethod, PrState, Stack, Summary, decode, decode_summary};
 use t3_core::pull_requests::{PrRef, action_input, failure_message, method};
+use t3_core::sidebar::grouping::EnvironmentOwner;
 use tokio::sync::{mpsc, oneshot};
 
-use super::{NOT_CONNECTED, Read};
+use super::{NOT_CONNECTED, Read, destination_error_message};
 use crate::app_state::AppState;
 
 type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -85,17 +87,36 @@ async fn request(client: &ClientHandle, method: &'static str, payload: Value) ->
     }
 }
 
+type ClientFuture = Pin<Box<dyn Future<Output = Result<ClientHandle, String>> + Send>>;
+
+/// Resolves the write `ClientHandle` for `owner` (via `connections.destination`) or falls back to
+/// the active `client_handle` in single-host mode.
+fn write_client(state: &AppState, owner: Option<&EnvironmentOwner>) -> Option<ClientFuture> {
+    if let Some(owner) = owner {
+        let dest_fut = state.connections.destination(owner, SOURCE_CONTROL_WRITE_SCOPE);
+        return Some(Box::pin(async move { dest_fut.await.map(|dest| dest.client).map_err(destination_error_message) }));
+    }
+    let client = state.client_handle()?;
+    Some(Box::pin(async move { Ok(client) }))
+}
+
 /// `pullRequests.runAction` with the input as built, answering with the host's reply when the
 /// server sent one (`replyWithSummary`).
-pub(crate) fn run_action(state: &AppState, input: Value, cx: &App) -> Read<Option<Summary>> {
-    let client = state.client_handle()?;
-    queue(cx, async move { decode_summary(request(&client, method::RUN_ACTION, input).await?) })
+pub(crate) fn run_action(state: &AppState, owner: Option<&EnvironmentOwner>, input: Value, cx: &App) -> Read<Option<Summary>> {
+    let client_fut = write_client(state, owner)?;
+    queue(cx, async move {
+        let client = client_fut.await?;
+        decode_summary(request(&client, method::RUN_ACTION, input).await?)
+    })
 }
 
 /// Any other pull request write (`update`, `setThreadResolution`, `setLabels`), in the same lane.
-pub(crate) fn write(state: &AppState, method: &'static str, input: Value, cx: &App) -> Read<()> {
-    let client = state.client_handle()?;
-    queue(cx, async move { request(&client, method, input).await.map(|_| ()) })
+pub(crate) fn write(state: &AppState, owner: Option<&EnvironmentOwner>, method: &'static str, input: Value, cx: &App) -> Read<()> {
+    let client_fut = write_client(state, owner)?;
+    queue(cx, async move {
+        let client = client_fut.await?;
+        request(&client, method, input).await.map(|_| ())
+    })
 }
 
 /// The merge method picks in force when the merge was asked for.
@@ -109,9 +130,10 @@ pub(crate) struct MergePicks {
 /// A merge of one pull request (`runAction` with `resolveMergeMethod`): the detail is re-read
 /// fresh and the merge refused unless the pull request is still open, ready, allowed, and in no
 /// stack where the host runs stack actions; then the method is chosen.
-pub(crate) fn merge(state: &AppState, reference: PrRef, picks: MergePicks, cx: &App) -> Read<Option<Summary>> {
-    let client = state.client_handle()?;
+pub(crate) fn merge(state: &AppState, owner: Option<&EnvironmentOwner>, reference: PrRef, picks: MergePicks, cx: &App) -> Read<Option<Summary>> {
+    let client_fut = write_client(state, owner)?;
     queue(cx, async move {
+        let client = client_fut.await?;
         let mut fresh = reference.payload();
         fresh["allowStale"] = json!(false);
         let detail: Detail = decode(request(&client, method::DETAIL, fresh.clone()).await?)?;

@@ -27,13 +27,14 @@ use gpui_component::v_flex;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::composer::review::Side;
 use t3_core::diff::{
-    BranchCommits, DiffFileContents, DiffLine, DiffScope, DiffSelection, DiffSession,
-    ExpandDirection, FILES_VIEWED_FLUSH_DELAY_MS, FileContextMenuAction,
+    BranchCommits, DiffFileContents, DiffFoldOverride, DiffLine, DiffScope, DiffSelection,
+    DiffSession, ExpandDirection, FILES_VIEWED_FLUSH_DELAY_MS, FileContextMenuAction,
     FileContextMenuCapabilities, FileReveal, FileRevealTarget, FileViewedState, FilesViewedTracker,
     InlineReviewThread, InlineReviewThreadsState, Layout, ParsedPatch, PreviewSourceKind,
-    RevealAction, ScrollRestore, ScrollRestoreAction, TurnDiffSummary, branch_commits_request,
-    decode_branch_commits, decode_diff_file_contents, diff_file_contents_request,
-    expand_hunk_context, file_context_menu_error_title, file_context_menu_open_request,
+    PullRequestDiffFolds, RevealAction, ScrollRestore, ScrollRestoreAction, TurnDiffSummary,
+    branch_commits_request, decode_branch_commits, decode_diff_file_contents,
+    diff_file_contents_request, expand_hunk_context, file_context_menu_error_title,
+    file_context_menu_open_request, format_diff_path_for_clipboard, is_test_changed_file,
     line_number_for_side, project_commit_url, resolve_file_context_menu_absolute_path,
     set_files_viewed_payload, trailing_hidden_lines, turn_diff_summaries, viewed_range_indices,
     workspace_mutation_id,
@@ -116,11 +117,32 @@ pub struct DiffPanel {
     /// Revision-tracked PR files-viewed state (`pingdotgg/t3code#35114`).
     viewed_target: Option<ViewedTarget>,
     viewed_tracker: FilesViewedTracker,
+    /// GitHub-style PR diff fold tracker (`pingdotgg/t3code#37605`, `pingdotgg/t3code#39213`).
+    pr_folds: Option<PullRequestDiffFolds>,
+    /// File path explicitly revealed in detached/PR mode so hidden test files stay visible (`pingdotgg/t3code#39213`).
+    revealed_path: Option<String>,
+    /// On-demand loading status for oversized PR files withheld from the initial patch (`pingdotgg/t3code#37007`).
+    withheld_files: HashMap<String, WithheldFileStatus>,
+    withheld_readable: bool,
+    /// Files whose loaded diff has server-truncated long lines (`…[N more characters]`), disabling hunk expansion.
+    cut_line_files: HashSet<String>,
+    on_load_withheld: Option<LoadWithheldCallback>,
     last_viewed_file_key: Option<String>,
     _viewed_flush: Option<Task<()>>,
     /// Inline review conversations and resolved-avatar expansion state (`pingdotgg/t3code#34644`).
     pub(super) review_threads: InlineReviewThreadsState,
     _subscription: Subscription,
+}
+
+type LoadWithheldCallback = Rc<dyn Fn(String, &mut gpui::App)>;
+
+/// On-demand load status for a file withheld from an oversized PR diff (`pingdotgg/t3code#37007`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WithheldFileStatus {
+    Idle,
+    Loading,
+    Error(String),
+    Empty,
 }
 
 #[derive(Default)]
@@ -245,6 +267,12 @@ impl DiffPanel {
             expansion_scope_key: None,
             viewed_target: None,
             viewed_tracker: FilesViewedTracker::default(),
+            pr_folds: None,
+            revealed_path: None,
+            withheld_files: HashMap::new(),
+            withheld_readable: false,
+            cut_line_files: HashSet::new(),
+            on_load_withheld: None,
             last_viewed_file_key: None,
             _viewed_flush: None,
             review_threads: InlineReviewThreadsState::default(),
@@ -277,6 +305,9 @@ impl DiffPanel {
 
     /// The pull request Code tab uses the same initial fold preference as thread diffs.
     pub fn show_external(&mut self, external: External, cx: &mut Context<Self>) {
+        if self.external.as_ref().map(|existing| existing.key.as_str()) != Some(external.key.as_str()) {
+            self.revealed_path = None;
+        }
         self.external = Some(external);
         self.rebuild(cx);
         cx.notify();
@@ -317,6 +348,7 @@ impl DiffPanel {
             self.expansions.clear();
             self.expansion_scope_key = None;
             self.file_reveal.reset();
+            self.revealed_path = None;
             self.scroll_restore = ScrollRestore::default();
             self._grants = None;
             if let Some(client) = self.state.read(cx).client_handle() {
@@ -343,6 +375,7 @@ impl DiffPanel {
             self.workspace_mutation = None;
             self.selected_file = None;
             self.file_reveal.reset();
+            self.revealed_path = None;
             self.tree_collapsed.clear();
             self.branch_commits = None;
             self.branch_commits_error = None;
@@ -700,6 +733,7 @@ impl DiffPanel {
         }
         if self.scroll_restore.current_scope() != Some(scope_key.as_str()) {
             self.file_reveal.reset();
+            self.revealed_path = None;
         }
         if let DiffSelection::Turn { file_path: Some(path), reveal_request_id, .. } = &self.selection {
             self.file_reveal.request(&scope_key, *reveal_request_id, FileRevealTarget::file(path));
@@ -760,11 +794,12 @@ impl DiffPanel {
         };
         let hidden = self.hidden_files(self.view.as_ref().expect("installed view").parsed.files());
         let hidden_changed = self.view.as_mut().expect("installed view").set_hidden(hidden, &self.tree_collapsed);
+        let pr_folds_changed = self.apply_pr_folds_to_view();
         let view = self.view.as_ref().expect("installed view");
         if self.comments.editor.as_ref().is_some_and(|editor| !(0..view.parsed.files().len()).any(|i| view.key(i) == Some(editor.file_key.as_str()))) { self.comments.editor = None; }
         let count = view.row_count();
         match changes {
-            Some(changes) if !hidden_changed => {
+            Some(changes) if !hidden_changed && !pr_folds_changed => {
                 view::apply_row_changes(&self.list, changes);
                 let _ = self.list.clone().with_uniform_item_height(px(lines::LINE_HEIGHT));
             }
@@ -784,16 +819,64 @@ impl DiffPanel {
         self.reveal_requested(cx);
     }
 
+    /// Computes the GitHub-style fold state for every file in `self.view` from `self.pr_folds`
+    /// and applies it without resetting the list (callers reset/splice as needed).
+    fn apply_pr_folds_to_view(&mut self) -> bool {
+        let viewed_enabled = self.viewed_enabled();
+        let Some(pr_folds) = self.pr_folds.as_ref() else { return false };
+        let viewed_tracker = &self.viewed_tracker;
+        let Some(view) = self.view.as_mut() else { return false };
+        let next: Vec<bool> = view
+            .parsed
+            .files()
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                let key = view.key(i).unwrap_or(file.path());
+                let is_test = is_test_changed_file(file.path());
+                let viewed = viewed_enabled && viewed_tracker.state_for(file.path()) == FileViewedState::Viewed;
+                pr_folds.is_collapsed(key, is_test, viewed)
+            })
+            .collect();
+        view.set_folds(next)
+    }
+
+    fn sync_pr_folds(&mut self, cx: &mut Context<Self>) {
+        if self.apply_pr_folds_to_view()
+            && let Some(view) = self.view.as_ref()
+        {
+            self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
+            cx.notify();
+        }
+    }
+
     /// Folds or unfolds one file, splicing only its rows so the list keeps its place.
     fn set_folded(&mut self, file: usize, folded: bool, cx: &mut Context<Self>) {
         let Some(view) = self.view.as_mut() else { return };
-        let change = view.set_folded(file, folded);
         let Some(key) = view.key(file).map(str::to_owned) else { return };
+        let is_test = view.parsed.files().get(file).is_some_and(|f| is_test_changed_file(f.path()));
+        if let Some(pr_folds) = self.pr_folds.as_mut() {
+            // Record explicit reader choice even if the file is already in that state, so
+            // late-arriving Viewed marks cannot fold an explicitly opened/revealed file (`#37605`).
+            pr_folds.set_choice(&key, is_test, Some(folded));
+        }
+        let change = view.set_folded(file, folded);
         self.session.set_file_fold(view.scope_key.clone(), key, folded, || view.folded_keys());
         if let Some((range, count)) = change {
             self.list.splice(range, count);
             cx.notify();
         }
+    }
+
+    /// Explicitly unfolds a file by path (used when an on-demand withheld diff finishes loading
+    /// for the first time, `pingdotgg/t3code#37007`).
+    pub fn unfold_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(file_ix) = self.view.as_ref().and_then(|view| {
+            view.parsed.files().iter().position(|f| f.path() == path)
+        }) else {
+            return;
+        };
+        self.set_folded(file_ix, false, cx);
     }
 
     pub fn toggle_file(&mut self, file: usize, cx: &mut Context<Self>) {
@@ -805,9 +888,35 @@ impl DiffPanel {
 
     /// `toggleAllDiffFiles`: expands every file when all are collapsed, else collapses all.
     pub fn toggle_all_files(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.view.as_mut() else { return };
+        let Some(view) = self.view.as_ref() else { return };
         let scope_key = view.scope_key.clone();
         let fold = !view.all_folded();
+        if self.pr_folds.is_some() {
+            let shown_test_keys: Option<Vec<String>> = self.session.hide_test_files.then(|| {
+                view.parsed
+                    .files()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, f)| !view.is_hidden(*i) && is_test_changed_file(f.path()))
+                    .filter_map(|(i, _)| view.key(i).map(str::to_owned))
+                    .collect()
+            });
+            if let Some(pr_folds) = self.pr_folds.as_mut() {
+                pr_folds.fold_all(
+                    if fold { DiffFoldOverride::Folded } else { DiffFoldOverride::Expanded },
+                    shown_test_keys.as_deref(),
+                );
+            }
+            self.apply_pr_folds_to_view();
+            if let Some(view) = self.view.as_ref() {
+                self.session.remember_folds(scope_key.clone(), view.folded_keys());
+                self.scroll_restore.discard(&scope_key);
+                self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
+            }
+            cx.notify();
+            return;
+        }
+        let Some(view) = self.view.as_mut() else { return };
         view.set_all_folded(fold);
         self.session.remember_folds(scope_key.clone(), view.folded_keys());
         self.scroll_restore.discard(&scope_key);
@@ -868,6 +977,15 @@ impl DiffPanel {
         cx: &mut Context<Self>,
     ) {
         let scope_key = self.scope_key();
+        self.revealed_path = Some(target.path.clone());
+        if let Some(files) = self.view.as_ref().map(|view| view.parsed.clone()) {
+            let hidden = self.hidden_files(files.files());
+            if let Some(view) = self.view.as_mut()
+                && view.set_hidden(hidden, &self.tree_collapsed)
+            {
+                self.list.reset_with_uniform_height(view.row_count(), px(lines::LINE_HEIGHT));
+            }
+        }
         if self.file_reveal.request(&scope_key, request_id, target) {
             self.scroll_restore.discard(&scope_key);
             self.reveal_requested(cx);
@@ -1108,6 +1226,37 @@ impl DiffPanel {
         self.sync(cx);
     }
 
+    /// Configures on-demand withheld-file state and cut-line files (`pingdotgg/t3code#37007`).
+    pub fn set_withheld_state(
+        &mut self,
+        withheld: HashMap<String, WithheldFileStatus>,
+        readable: bool,
+        cut_line_files: HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.withheld_files = withheld;
+        self.withheld_readable = readable;
+        self.cut_line_files = cut_line_files;
+        if let Some(view) = &self.view {
+            self.list.remeasure_items(0..view.row_count());
+        }
+        cx.notify();
+    }
+
+    pub fn set_on_load_withheld(&mut self, callback: impl Fn(String, &mut gpui::App) + 'static) {
+        self.on_load_withheld = Some(Rc::new(callback));
+    }
+
+    pub(super) fn withheld_status(&self, path: &str) -> Option<&WithheldFileStatus> {
+        self.withheld_files.get(path)
+    }
+
+    pub(super) fn trigger_load_withheld(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Some(callback) = self.on_load_withheld.clone() {
+            callback(path, cx);
+        }
+    }
+
     /// Whether hidden hunk context expansion is available for `file_ix` in the active scope.
     pub(super) fn can_expand_file(&self, file_ix: usize) -> bool {
         if self.external.is_some() {
@@ -1116,7 +1265,7 @@ impl DiffPanel {
         let Some(file) = self.view.as_ref().and_then(|view| view.parsed.files().get(file_ix)) else {
             return false;
         };
-        if file.binary || file.hunks.is_empty() {
+        if file.binary || file.hunks.is_empty() || self.cut_line_files.contains(file.path()) {
             return false;
         }
         matches!(self.scope, DiffScope::Branch { .. } | DiffScope::Unstaged | DiffScope::Commit { .. })
@@ -1285,10 +1434,16 @@ impl DiffPanel {
             }
             self.viewed_target = target;
             self.viewed_tracker = FilesViewedTracker::default();
+            self.pr_folds = self
+                .viewed_target
+                .as_ref()
+                .filter(|t| t.enabled)
+                .map(|_| PullRequestDiffFolds::default());
             self.last_viewed_file_key = None;
             self._viewed_flush = None;
         }
         self.viewed_tracker.set_server_states(states);
+        self.sync_pr_folds(cx);
         cx.notify();
     }
 
@@ -1325,16 +1480,27 @@ impl DiffPanel {
         self.last_viewed_file_key = Some(clicked_key);
         let commit_scope = target.commit.is_some();
         for ix in indices {
-            let Some((path, revision)) = self.view.as_ref().and_then(|view| {
+            let Some((path, key, is_test, revision)) = self.view.as_ref().and_then(|view| {
                 let file = view.parsed.files().get(ix)?;
+                let key = view.key(ix)?.to_owned();
+                let is_test = is_test_changed_file(file.path());
                 // Commit diffs name that commit's blob, not the PR head's (`pingdotgg/t3code#35114`).
                 let rev = (!commit_scope).then(|| file.new_object_id().map(str::to_owned)).flatten();
-                Some((file.path().to_owned(), rev))
+                Some((file.path().to_owned(), key, is_test, rev))
             }) else {
                 continue;
             };
             self.viewed_tracker.set_viewed(&path, next_viewed, revision);
-            self.set_folded(ix, next_viewed, cx);
+            if let Some(pr_folds) = self.pr_folds.as_mut() {
+                pr_folds.on_viewed_toggled(&key, is_test, next_viewed);
+                if let Some(view) = self.view.as_mut()
+                    && let Some((range, count)) = view.set_folded(ix, next_viewed)
+                {
+                    self.list.splice(range, count);
+                }
+            } else {
+                self.set_folded(ix, next_viewed, cx);
+            }
         }
         self.schedule_viewed_flush(target, cx);
         cx.notify();
@@ -1430,13 +1596,13 @@ impl DiffPanel {
     }
 
     /// `isFileShown`: with "Hide test files" on, test files are left out, except the one another
-    /// view asked to reveal.
+    /// view asked to reveal (`pingdotgg/t3code#39213`).
     fn hidden_files(&self, files: &[t3_core::diff::FileDiff]) -> Vec<bool> {
         let keep = match &self.selection {
             DiffSelection::Turn { file_path: Some(path), .. } if self.external.is_none() => Some(path.as_str()),
-            _ => None,
+            _ => self.revealed_path.as_deref(),
         };
-        files.iter().map(|file| self.session.hide_test_files && keep != Some(file.path()) && t3_core::diff::is_test_changed_file(file.path())).collect()
+        files.iter().map(|file| self.session.hide_test_files && keep != Some(file.path()) && is_test_changed_file(file.path())).collect()
     }
 
     /// `testFileCount`: the toggle shows only when the patch has test files.
@@ -1462,7 +1628,9 @@ impl DiffPanel {
 
     pub fn copy_path(&mut self, file: usize, cx: &mut Context<Self>) {
         let Some(path) = self.view.as_ref().and_then(|view| view.parsed.files().get(file)).map(|file| file.path().to_owned()) else { return };
-        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+        let (workspace_root, _) = self.workspace_roots(cx);
+        let formatted = format_diff_path_for_clipboard(&path, workspace_root.as_deref());
+        cx.write_to_clipboard(ClipboardItem::new_string(formatted));
         self.copied_generation += 1;
         let generation = self.copied_generation;
         self.copied_path = Some((path, generation));
@@ -1488,10 +1656,15 @@ impl DiffPanel {
         let Some(thread) = state.thread_shell(thread_id) else { return (None, None) };
         let project = state.shell.project(&thread.project_id);
         let workspace_root = thread.worktree_path.clone().or_else(|| project.map(|project| project.workspace_root.clone()));
-        // A worktree is its own repository root; the project's identity names the main checkout.
-        let repository_root = match (&thread.worktree_path, project) {
-            (None, Some(project)) => project.repository_identity.as_ref().and_then(|identity| identity.get("rootPath")).and_then(|root| root.as_str()).map(str::to_owned),
-            _ => None,
+        // A worktree is its own repository root; tool-call diffs are already workspace-relative
+        // (`pingdotgg/t3code#32684`), so skip repository root re-basing for them.
+        let repository_root = if matches!(self.scope, DiffScope::ToolCall(_)) {
+            None
+        } else {
+            match (&thread.worktree_path, project) {
+                (None, Some(project)) => project.repository_identity.as_ref().and_then(|identity| identity.get("rootPath")).and_then(|root| root.as_str()).map(str::to_owned),
+                _ => None,
+            }
         };
         (workspace_root, repository_root)
     }
