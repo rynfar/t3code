@@ -44,7 +44,10 @@ use crate::keymap::{
 use crate::new_thread::{NewThread, NewThreadWithoutProject};
 use crate::sidebar::is_composing;
 use crate::sidebar::controller::{now_ms, uuid};
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
+    slot_border_color, slot_has_active, slot_has_background, theme_slot_background_layer,
+};
 use crate::thread_view::FindInThread;
 use crate::toast::{Toast, ToastKind};
 
@@ -1727,6 +1730,8 @@ impl Render for CommandPalette {
         self.groups = groups;
         let top = window.viewport_size().height * 0.1;
         let input_disabled = self.input_disabled(cx);
+        let has_custom_bg = slot_has_background(ThemeSlot::DialogPopup, cx);
+        let backdrop_border = slot_border_color(ThemeSlot::DialogPopup, cx).unwrap_or_else(|| hsla(p.dialog_border));
         deferred(
             div()
                 .id("palette-backdrop")
@@ -1822,9 +1827,17 @@ impl Render for CommandPalette {
                         .flex()
                         .flex_col()
                         .relative()
+                        .overflow_hidden()
                         .rounded(px(16.))
-                        .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+                        .when(!has_custom_bg, |this| {
+                            this.child(crate::glass::backdrop(16., hsla(p.dialog_surface), backdrop_border, cx))
+                        })
+                        .when(has_custom_bg, |this| {
+                            this.bg(hsla(p.dialog_surface)).border_1().border_color(backdrop_border)
+                        })
+                        .children(theme_slot_background_layer(ThemeSlot::DialogPopup, cx))
                         .shadow(vec![BoxShadow { color: gpui_hsla(0., 0., 0., 0.65), offset: point(px(0.), px(24.)), blur_radius: px(64.), spread_radius: px(-24.), inset: false }])
+                        .theme_slot(ThemeSlot::DialogPopup, cx)
                         .child(
                             div()
                                 .px(px(8.))
@@ -1847,12 +1860,33 @@ impl Render for CommandPalette {
                                                     .justify_center()
                                                     .rounded(px(6.))
                                                     .cursor_pointer()
-                                                    .hover(|this| this.bg(hsla(p.foreground).opacity(0.08)))
+                                                    .theme_slot(ThemeSlot::Button, cx)
+                                                    .hover(|this| {
+                                                        refine_slot_hover(
+                                                            this.bg(hsla(p.foreground).opacity(0.08)),
+                                                            ThemeSlot::Button,
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .when(slot_has_active(ThemeSlot::Button, cx), |this| {
+                                                        this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
+                                                    })
                                                     .child(Icon::ArrowLeft.render(px(14.), hsla(p.muted_foreground)))
                                                     .on_click(cx.listener(|this, _, window, cx| this.escape(window, cx))),
                                             )
                                         })
-                                        .child(div().flex_1().min_w_0().child(Input::new(&self.input).appearance(false).bordered(false).disabled(input_disabled)))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(
+                                                    Input::new(&self.input)
+                                                        .appearance(false)
+                                                        .bordered(false)
+                                                        .disabled(input_disabled)
+                                                        .theme_slot(ThemeSlot::Input, cx),
+                                                ),
+                                        )
                                         .when(self.mode == Mode::Content && self.content.target.is_some(), |this| this.child(self.render_content_options(cx))),
                                 ),
                         )

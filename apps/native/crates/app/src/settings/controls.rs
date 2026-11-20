@@ -15,7 +15,11 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
+    slot_border_color, slot_has_active, slot_has_background, slot_has_hover,
+    theme_slot_background_layer, theme_slot_clipped_background_layer,
+};
 
 const DISABLED_OPACITY: f32 = 0.64;
 
@@ -39,7 +43,7 @@ pub fn icon(glyph: Icon, size: f32, color: Hsla) -> Svg {
 }
 
 pub fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
-    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
+    move |window, cx| Tooltip::new(text.clone()).theme_slot(ThemeSlot::TooltipPopup, cx).build(window, cx)
 }
 
 fn control_shadow() -> Vec<BoxShadow> {
@@ -232,8 +236,15 @@ impl RenderOnce for Button {
             .when(outlined, |this| this.shadow(control_shadow()))
             .when_some(focus, |this, focus| this.track_focus(&focus))
             .when(ring, |this| this.shadow(focus_ring(hsla(p.ring))))
+            .theme_slot(ThemeSlot::Button, cx)
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
-            .when(!self.disabled, |this| this.cursor_pointer().hover(move |this| this.bg(hover_fill).text_color(hover_text)))
+            .when(!self.disabled, |this| {
+                this.cursor_pointer()
+                    .hover(|this| refine_slot_hover(this.bg(hover_fill).text_color(hover_text), ThemeSlot::Button, cx))
+                    .when(slot_has_active(ThemeSlot::Button, cx), |this| {
+                        this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
+                    })
+            })
             .children(self.icon.map(|glyph| icon(glyph, icon_size, self.icon_color.unwrap_or(icon_color))))
             .children(self.label.map(|label| div().truncate().child(crate::i18n::t(cx, label.as_ref()).to_owned())))
             .children(self.trailing.map(|glyph| icon(glyph, icon_size, icon_color)))
@@ -293,8 +304,17 @@ impl RenderOnce for Switch {
             .rounded_full()
             .bg(if self.checked { hsla(p.primary) } else { hsla(p.input) })
             .when(focused, |this| this.shadow(focus_ring(hsla(p.ring))))
+            .theme_slot(ThemeSlot::Switch, cx)
             .when(disabled, |this| this.opacity(0.64))
-            .when(!disabled, |this| this.cursor_pointer())
+            .when(!disabled, |this| {
+                this.cursor_pointer()
+                    .when(slot_has_hover(ThemeSlot::Switch, cx), |this| {
+                        this.hover(|style| refine_slot_hover(style, ThemeSlot::Switch, cx))
+                    })
+                    .when(slot_has_active(ThemeSlot::Switch, cx), |this| {
+                        this.active(|style| refine_slot_active(style, ThemeSlot::Switch, cx))
+                    })
+            })
             .child(
                 div()
                     .size(r(14.))
@@ -539,7 +559,6 @@ impl RenderOnce for Select {
         let trigger = h_flex()
             .id(self.id.clone())
             .when(!disabled, |view| view.track_focus(&focus))
-            .when(disabled, |v| v.opacity(DISABLED_OPACITY))
             .min_h(r(28.))
             .when_some(self.width, |this, width| this.w(r(width)))
             .px(r(9.))
@@ -551,7 +570,15 @@ impl RenderOnce for Select {
             .shadow(if focused { focus_ring(hsla(p.ring).opacity(0.24)) } else { control_shadow() })
             .text_sm()
             .text_color(hsla(p.foreground))
+            .theme_slot(ThemeSlot::SelectTrigger, cx)
+            .when(disabled, |v| v.opacity(DISABLED_OPACITY))
             .cursor_pointer()
+            .when(!disabled && slot_has_hover(ThemeSlot::SelectTrigger, cx), |this| {
+                this.hover(|style| refine_slot_hover(style, ThemeSlot::SelectTrigger, cx))
+            })
+            .when(!disabled && slot_has_active(ThemeSlot::SelectTrigger, cx), |this| {
+                this.active(|style| refine_slot_active(style, ThemeSlot::SelectTrigger, cx))
+            })
             .key_context("SettingsSelect")
             .on_action({
                 let state = state.clone();
@@ -657,11 +684,13 @@ impl RenderOnce for Select {
                     gpui::anchored().anchor(gpui::Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
                         div()
                             .id((self.id.clone(), "popup"))
+                            .relative()
+                            .flex()
+                            .flex_col()
                             .occlude()
                             .mt(r(4.))
                             .min_w(r(self.popup_width))
                             .max_h(r(320.))
-                            .overflow_y_scroll()
                             .p(r(4.))
                             .rounded(r(8.))
                             .border_1()
@@ -674,6 +703,8 @@ impl RenderOnce for Select {
                                 spread_radius: px(-18.),
                                 inset: false,
                             }])
+                            .theme_slot(ThemeSlot::PopoverPopup, cx)
+                            .theme_slot(ThemeSlot::MenuPopup, cx)
                             .on_mouse_down_out(move |_, _, cx| {
                                 close_state.update(cx, |state, cx| {
                                     state.open = false;
@@ -681,7 +712,18 @@ impl RenderOnce for Select {
                                     cx.notify();
                                 });
                             })
-                            .child(list),
+                            .children(
+                                theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, r(8.), cx)
+                                    .or_else(|| theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx)),
+                            )
+                            .child(
+                                div()
+                                    .id((self.id.clone(), "popup-scroll"))
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .child(list),
+                            ),
                     ),
                 )
                 .with_priority(2),
@@ -1098,16 +1140,25 @@ impl DialogFrame {
         let p = palette(cx);
         let dark = cx.theme().is_dark();
         let viewport = window.viewport_size();
+        let has_custom_bg = slot_has_background(ThemeSlot::DialogPopup, cx);
+        let backdrop_border = slot_border_color(ThemeSlot::DialogPopup, cx).unwrap_or_else(|| hsla(p.dialog_border));
         let dialog = v_flex()
             .id(self.id)
             .track_focus(&self.focus)
             .occlude()
             .relative()
+            .overflow_hidden()
             .w_full()
             .max_w(r(self.max_width))
             .max_h(viewport.height - px(32.))
             .rounded(r(16.))
-            .child(crate::glass::backdrop(16., hsla(p.dialog_surface), hsla(p.dialog_border), cx))
+            .when(!has_custom_bg, |this| {
+                this.child(crate::glass::backdrop(16., hsla(p.dialog_surface), backdrop_border, cx))
+            })
+            .when(has_custom_bg, |this| {
+                this.bg(hsla(p.dialog_surface)).border_1().border_color(backdrop_border)
+            })
+            .children(theme_slot_background_layer(ThemeSlot::DialogPopup, cx))
             .shadow(vec![BoxShadow {
                 color: gpui::black().opacity(if dark { 0.9 } else { 0.65 }),
                 offset: point(px(0.), px(24.)),
@@ -1115,6 +1166,7 @@ impl DialogFrame {
                 spread_radius: px(-24.),
                 inset: false,
             }])
+            .theme_slot(ThemeSlot::DialogPopup, cx)
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 v_flex()

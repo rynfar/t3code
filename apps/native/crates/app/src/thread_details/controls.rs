@@ -13,7 +13,10 @@ use gpui_component::{ActiveTheme, Selectable, h_flex};
 
 use crate::icons::Icon;
 use crate::right_panel::{focusable, tooltip_view};
-use crate::theme::{hsla, metrics, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt, hsla, metrics, palette, refine_slot_active, refine_slot_hover,
+    slot_has_active,
+};
 
 type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 type MouseMoveHandler = Rc<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)>;
@@ -143,6 +146,7 @@ impl RenderOnce for Row {
             ElementId::Name(name) => Some(name.clone()),
             _ => None,
         };
+        let slot = if self.chevron { ThemeSlot::SelectTrigger } else { ThemeSlot::Button };
         let base = focusable(self.base, self.id, interactive, window, cx)
             .flex()
             .items_center()
@@ -157,8 +161,15 @@ impl RenderOnce for Row {
             .font_weight(FontWeight::MEDIUM)
             .text_color(label_color(cx))
             .when(self.open, |this| this.bg(fill))
+            .theme_slot(slot, cx)
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
-            .when(interactive, |this| this.cursor_pointer().hover(move |style| style.bg(fill)))
+            .when(interactive, |this| {
+                this.cursor_pointer()
+                    .hover(|style| refine_slot_hover(style.bg(fill), slot, cx))
+                    .when(slot_has_active(slot, cx), |this| {
+                        this.active(|style| refine_slot_active(style, slot, cx))
+                    })
+            })
             .children(self.icon.map(|icon| row_icon(icon, cx)))
             .child(row_label(self.label))
             .children(self.trailing)
@@ -259,8 +270,15 @@ impl RenderOnce for MenuTrigger {
             .h(px(ROW_HEIGHT))
             .rounded_r(px(8.))
             .when(self.selected, |this| this.bg(fill))
+            .theme_slot(ThemeSlot::Button, cx)
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
-            .when(enabled, |this| this.cursor_pointer().hover(move |style| style.bg(fill)))
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .hover(|style| refine_slot_hover(style.bg(fill), ThemeSlot::Button, cx))
+                    .when(slot_has_active(ThemeSlot::Button, cx), |this| {
+                        this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
+                    })
+            })
             .child(Icon::ChevronDown.sized(px(16.)).text_color(hsla(p.muted_foreground)))
             .tooltip(move |window, cx| tooltip_view(label.clone(), window, cx));
         #[cfg(test)]

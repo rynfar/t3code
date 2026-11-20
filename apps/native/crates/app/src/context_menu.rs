@@ -15,7 +15,10 @@ use crate::app_state::AppState;
 use crate::icons::Icon;
 use crate::snooze_dialog::SnoozeRequest;
 use crate::sidebar::controller::now_ms;
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt, hsla, palette, slot_border_color, slot_has_background,
+    theme_slot_clipped_background_layer,
+};
 
 const MENU_WIDTH: f32 = 220.;
 const ITEM_HEIGHT: f32 = 28.;
@@ -787,12 +790,20 @@ impl ContextMenu {
 
     fn panel(cx: &App) -> gpui::Div {
         let p = palette(cx);
+        let has_custom_bg = slot_has_background(ThemeSlot::MenuPopup, cx);
+        let backdrop_border = slot_border_color(ThemeSlot::MenuPopup, cx).unwrap_or_else(|| hsla(p.dropdown_border));
         div()
             .relative()
             .w(px(MENU_WIDTH))
             .p(px(5.))
             .rounded(px(8.))
-            .child(crate::glass::backdrop(8., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+            .when(!has_custom_bg, |this| {
+                this.child(crate::glass::backdrop(8., hsla(p.dropdown_surface), backdrop_border, cx))
+            })
+            .when(has_custom_bg, |this| {
+                this.bg(hsla(p.dropdown_surface)).border_1().border_color(backdrop_border)
+            })
+            .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, px(8.), cx))
             .shadow(vec![BoxShadow {
                 color: gpui_hsla(0., 0., 0., 0.55),
                 offset: point(px(0.), px(16.)),
@@ -800,6 +811,7 @@ impl ContextMenu {
                 spread_radius: px(-18.),
                 inset: false,
             }])
+            .theme_slot(ThemeSlot::MenuPopup, cx)
     }
 
     fn render_list(&self, items: &[MenuItem<MenuAction>], highlighted: Option<usize>, parent: Option<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {

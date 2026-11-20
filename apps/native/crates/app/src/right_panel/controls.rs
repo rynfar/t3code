@@ -15,7 +15,9 @@ use gpui_component::menu::DropdownMenu;
 use gpui_component::tooltip::Tooltip;
 
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover, slot_has_active,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
@@ -217,11 +219,20 @@ impl RenderOnce for Button {
             .font_weight(FontWeight::MEDIUM)
             .text_color(hsla(text))
             .when_some(fill, |this, fill| this.bg(hsla(fill)))
+            .theme_slot(ThemeSlot::Button, cx)
             .when(self.disabled, |this| this.opacity(0.64))
             .when(!self.disabled, |this| {
-                this.cursor_pointer().hover(move |style| {
-                    style.text_color(hsla(hover_text)).bg(hsla(hover).opacity(hover_opacity))
-                })
+                this.cursor_pointer()
+                    .hover(|style| {
+                        refine_slot_hover(
+                            style.text_color(hsla(hover_text)).bg(hsla(hover).opacity(hover_opacity)),
+                            ThemeSlot::Button,
+                            cx,
+                        )
+                    })
+                    .when(slot_has_active(ThemeSlot::Button, cx), |this| {
+                        this.active(|style| refine_slot_active(style, ThemeSlot::Button, cx))
+                    })
             })
             .when_some(self.icon, |this, icon| {
                 let svg = icon.svg().size(px(icon_size)).text_color(icon_color);
@@ -260,7 +271,7 @@ pub fn focusable(element: Stateful<Div>, key: ElementId, enabled: bool, window: 
 }
 
 pub fn tooltip_view(text: SharedString, window: &mut Window, cx: &mut App) -> AnyView {
-    Tooltip::new(text).build(window, cx)
+    Tooltip::new(text).theme_slot(ThemeSlot::TooltipPopup, cx).build(window, cx)
 }
 
 /// The segmented `ToggleGroup`: a quiet track with one pressed segment.

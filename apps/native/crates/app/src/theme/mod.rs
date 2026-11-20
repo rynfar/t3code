@@ -24,7 +24,8 @@ use t3_core::client_settings::{AppearanceMode, ChatWidth, DiffColorScheme, Theme
 pub use slots::{
     SlotStyleOverride, SlotStyleSet, SlotStylesheet, ThemeSlot, ThemeSlotExt, ThemeSlotHoverExt,
     ThemeSlotInteractiveExt, apply_slot_override, refine_slot_active, refine_slot_hover,
-    slot_style, slot_stylesheet, theme_slot_background_layer,
+    slot_border_color, slot_has_active, slot_has_background, slot_has_hover, slot_style,
+    slot_stylesheet, theme_slot_background_layer, theme_slot_clipped_background_layer,
 };
 pub use tokens::{BUILT_IN_THEMES, Palette, metrics};
 
@@ -400,6 +401,7 @@ fn install(cx: &mut App) {
             Rc::new(config(
                 if i == 0 { "T3 Code Light" } else { "T3 Code Dark" },
                 &palettes[i],
+                &slot_stylesheets[i],
                 i == 1,
                 preferences.interface_font_size,
                 &fonts[FontRole::Code as usize],
@@ -448,9 +450,11 @@ fn install(cx: &mut App) {
             } else {
                 palette
             };
+            let slot_stylesheet = Arc::new(slot_sheet);
             let config = Rc::new(config(
                 "Theme editor preview",
                 &palette,
+                &slot_stylesheet,
                 input.dark,
                 preferences.interface_font_size,
                 &saved.fonts[FontRole::Code as usize],
@@ -461,7 +465,7 @@ fn install(cx: &mut App) {
                 input: input.clone(),
                 saved: saved.clone(),
                 palette,
-                slot_stylesheet: Arc::new(slot_sheet),
+                slot_stylesheet,
                 config,
             };
             cx.global_mut::<ThemeState>().prepared_preview = Some(prepared.clone());
@@ -533,12 +537,92 @@ fn highlight(p: &Palette, dark: bool) -> serde_json::Value {
     json!({ "editor.background": hex(p.code_background), "editor.foreground": hex(p.code_foreground), "syntax": syntax })
 }
 
-fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str, sans: &str, code_size: f32) -> ThemeConfig {
+fn with_alpha_scale(rgba: u32, opacity: f32) -> u32 {
+    let alpha = ((rgba & 0xff) as f32 * opacity.clamp(0.0, 1.0)).round() as u32;
+    (rgba & 0xffff_ff00) | (alpha & 0xff)
+}
+
+fn slot_bg_rgba(ov: &SlotStyleOverride) -> Option<u32> {
+    if ov.display_none == Some(true) {
+        return Some(0x0000_0000);
+    }
+    match ov.background.as_ref()? {
+        t3_core::themes::slots::SlotBackground::Solid(c) => Some(*c),
+        t3_core::themes::slots::SlotBackground::Transparent => Some(0x0000_0000),
+        t3_core::themes::slots::SlotBackground::LinearGradient { stops, .. } => stops.first().map(|s| s.color),
+        t3_core::themes::slots::SlotBackground::ThemeBackgroundImage { overlay_color, .. } => *overlay_color,
+    }
+}
+
+fn slot_has_bg_or_opacity(ov: &SlotStyleOverride) -> bool {
+    ov.display_none == Some(true) || ov.background.is_some() || ov.opacity.is_some()
+}
+
+fn apply_slot_color_override(base: u32, ov: &SlotStyleOverride) -> u32 {
+    let color = slot_bg_rgba(ov).unwrap_or(base);
+    match ov.opacity {
+        Some(opacity) => with_alpha_scale(color, opacity),
+        None => color,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn config(
+    name: &str,
+    p: &Palette,
+    slots: &SlotStylesheet,
+    dark: bool,
+    font_size: f32,
+    mono: &str,
+    sans: &str,
+    code_size: f32,
+) -> ThemeConfig {
+    let mut input_border = p.input;
+    if let Some(set) = slots.get(ThemeSlot::Input) {
+        if let Some(border) = set.base.border_color {
+            input_border = match set.base.opacity {
+                Some(opacity) => with_alpha_scale(border, opacity),
+                None => border,
+            };
+        } else if let Some(bg) = slot_bg_rgba(&set.base).filter(|c| *c & 0xff > 0) {
+            input_border = match set.base.opacity {
+                Some(opacity) => with_alpha_scale(bg, opacity),
+                None => bg,
+            };
+        }
+    }
+
+    let mut scrollbar_thumb = p.scrollbar_thumb;
+    let mut scrollbar_thumb_hover = p.scrollbar_thumb_hover;
+    if let Some(set) = slots.get(ThemeSlot::ScrollAreaThumb) {
+        if slot_has_bg_or_opacity(&set.base) {
+            scrollbar_thumb = apply_slot_color_override(scrollbar_thumb, &set.base);
+            scrollbar_thumb_hover = scrollbar_thumb;
+        }
+        if slot_has_bg_or_opacity(&set.hover) {
+            scrollbar_thumb_hover = apply_slot_color_override(scrollbar_thumb_hover, &set.hover);
+        }
+    }
+
+    let mut scrollbar_bg = 0x0000_0000u32;
+    if let Some(set) = slots.get(ThemeSlot::ScrollAreaScrollbar) {
+        if slot_has_bg_or_opacity(&set.base) {
+            scrollbar_bg = apply_slot_color_override(scrollbar_bg, &set.base);
+        }
+        if set.base.display_none == Some(true) {
+            scrollbar_thumb = 0x0000_0000;
+            scrollbar_thumb_hover = 0x0000_0000;
+        } else if let Some(opacity) = set.base.opacity {
+            scrollbar_thumb = with_alpha_scale(scrollbar_thumb, opacity);
+            scrollbar_thumb_hover = with_alpha_scale(scrollbar_thumb_hover, opacity);
+        }
+    }
+
     let colors: serde_json::Map<String, serde_json::Value> = [
         ("background", hex(p.background)),
         ("foreground", hex(p.foreground)),
         ("border", hex(p.border)),
-        ("input.border", hex(p.input)),
+        ("input.border", hex(input_border)),
         ("ring", hex(p.ring)),
         ("caret", hex(p.foreground)),
         ("selection.background", hex(p.search_match_background)),
@@ -570,9 +654,9 @@ fn config(name: &str, p: &Palette, dark: bool, font_size: f32, mono: &str, sans:
         ("list.hover.background", hex(p.accent)),
         ("list.active.background", hex(p.accent)),
         ("list.active.border", hex(p.ring)),
-        ("scrollbar.background", "#00000000".to_owned()),
-        ("scrollbar.thumb.background", hex(p.scrollbar_thumb)),
-        ("scrollbar.thumb.hover.background", hex(p.scrollbar_thumb_hover)),
+        ("scrollbar.background", hex(scrollbar_bg)),
+        ("scrollbar.thumb.background", hex(scrollbar_thumb)),
+        ("scrollbar.thumb.hover.background", hex(scrollbar_thumb_hover)),
         ("sidebar.background", hex(p.sidebar)),
         ("sidebar.foreground", hex(p.sidebar_foreground)),
         ("sidebar.border", hex(p.sidebar_border)),
@@ -669,7 +753,8 @@ pub fn verify_preview_source(colors:&themes::Colors,dark:bool,cx:&App)->Result<(
 #[cfg(test)]
 pub(crate) fn test_syntax_theme(dark: bool) -> std::sync::Arc<gpui_component::highlighter::HighlightTheme> {
     let palette = if dark { tokens::DARK } else { tokens::LIGHT };
-    let config = config("test", &palette, dark, 16., "Menlo", "System", 13.);
+    let empty_slots = SlotStylesheet::empty();
+    let config = config("test", &palette, &empty_slots, dark, 16., "Menlo", "System", 13.);
     std::sync::Arc::new(gpui_component::highlighter::HighlightTheme { name: "test".into(), appearance: config.mode, style: config.highlight.unwrap() })
 }
 
@@ -744,6 +829,103 @@ mod tests {
             preview(None, cx);
             assert_eq!(palette(cx).background, before_bg);
             assert_eq!(palette(cx).primary, before_primary);
+        });
+    }
+
+    #[gpui::test]
+    fn scrollbar_and_input_slots_update_theme_config_live_and_restore_on_clear(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init(cx);
+            let colors = themes::standard(true);
+
+            // Establish stock dark baseline.
+            preview_with_css(Some((&colors, None, true)), cx);
+            let stock_scrollbar = cx.theme().scrollbar;
+            let stock_thumb = cx.theme().scrollbar_thumb;
+            let stock_thumb_hover = cx.theme().scrollbar_thumb_hover;
+            let stock_input = cx.theme().input;
+
+            // [data-slot="scroll-area-scrollbar"], [data-slot="scroll-area-thumb"](:hover), and [data-slot="input"] border.
+            preview_with_css(
+                Some((
+                    &colors,
+                    Some(
+                        r#"
+                        [data-slot="scroll-area-scrollbar"] { background: #102030; }
+                        [data-slot="scroll-area-thumb"] { background: #445566; }
+                        [data-slot="scroll-area-thumb"]:hover { background: #778899; }
+                        [data-slot="input"] { border-color: #33aa77; background: #111111; }
+                        "#,
+                    ),
+                    true,
+                )),
+                cx,
+            );
+            assert_eq!(cx.theme().scrollbar, hsla(0x1020_30ff));
+            assert_eq!(cx.theme().scrollbar_thumb, hsla(0x4455_66ff));
+            assert_eq!(cx.theme().scrollbar_thumb_hover, hsla(0x7788_99ff));
+            assert_eq!(cx.theme().input, hsla(0x33aa_77ff));
+
+            // Scrollbar container opacity scales both track and thumb; input background falls back when border-color omitted.
+            preview_with_css(
+                Some((
+                    &colors,
+                    Some(
+                        r#"
+                        [data-slot="scroll-area-scrollbar"] { background: #102030; opacity: 0.5; }
+                        [data-slot="scroll-area-thumb"] { background: #445566; }
+                        [data-slot="input"] { background: #224466; }
+                        "#,
+                    ),
+                    true,
+                )),
+                cx,
+            );
+            assert_eq!(cx.theme().scrollbar, hsla(0x1020_3080));
+            assert_eq!(cx.theme().scrollbar_thumb, hsla(0x4455_6680));
+            assert_eq!(cx.theme().scrollbar_thumb_hover, hsla(0x4455_6680));
+            assert_eq!(cx.theme().input, hsla(0x2244_66ff));
+
+            // ::-webkit-scrollbar and ::-webkit-scrollbar-thumb aliases map into ThemeConfig too.
+            preview_with_css(
+                Some((
+                    &colors,
+                    Some(
+                        r#"
+                        ::-webkit-scrollbar { background: #221133; }
+                        ::-webkit-scrollbar-thumb { background: #aa33cc; }
+                        ::-webkit-scrollbar-thumb:hover { background: #ff55ee; }
+                        "#,
+                    ),
+                    true,
+                )),
+                cx,
+            );
+            assert_eq!(cx.theme().scrollbar, hsla(0x2211_33ff));
+            assert_eq!(cx.theme().scrollbar_thumb, hsla(0xaa33_ccff));
+            assert_eq!(cx.theme().scrollbar_thumb_hover, hsla(0xff55_eeff));
+
+            // display: none hides scrollbar track and thumb cleanly.
+            preview_with_css(
+                Some((
+                    &colors,
+                    Some(r#"[data-slot="scroll-area-scrollbar"] { display: none; }"#),
+                    true,
+                )),
+                cx,
+            );
+            assert_eq!(cx.theme().scrollbar.a, 0.0);
+            assert_eq!(cx.theme().scrollbar_thumb.a, 0.0);
+            assert_eq!(cx.theme().scrollbar_thumb_hover.a, 0.0);
+
+            // Clearing CSS restores stock ThemeConfig colors cleanly.
+            preview_with_css(Some((&colors, None, true)), cx);
+            assert_eq!(cx.theme().scrollbar, stock_scrollbar);
+            assert_eq!(cx.theme().scrollbar_thumb, stock_thumb);
+            assert_eq!(cx.theme().scrollbar_thumb_hover, stock_thumb_hover);
+            assert_eq!(cx.theme().input, stock_input);
+            preview(None, cx);
         });
     }
 }
