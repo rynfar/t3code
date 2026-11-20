@@ -484,26 +484,26 @@ fn close(window: &mut Window, cx: &mut App) {
     finish_close(window, cx);
 }
 
-fn finish_close(window: &mut Window, cx: &mut App) {
+fn clear_closed_host(window: &mut Window, cx: &mut App) {
     let host = cx.global_mut::<Host>();
-    let closing = host.view.take();
+    let _closing = host.view.take();
     host.pending = None;
     host.pending_project = None;
     host.pending_scheduled_task = None;
     host.pending_provider = None;
     let previous = host.previous_focus.take();
-    if let Some(view) = closing {
-        view.update(cx, |view, cx| {
-            if let Some(dialog) = view.appearance_ui.import.take() {
-                dialog.update(cx, |dialog, cx| dialog.cancel_pending(cx));
-            }
-        });
-    }
     store::clear_error(cx);
     if let Some(previous) = previous {
         window.focus(&previous, cx);
     }
     cx.refresh_windows();
+}
+
+fn finish_close(window: &mut Window, cx: &mut App) {
+    if let Some(view) = cx.global::<Host>().view.clone() {
+        view.update(cx, |view, cx| view.cancel_pending_import(cx));
+    }
+    clear_closed_host(window, cx);
 }
 
 fn apply_pending(window: &mut Window, cx: &mut App) {
@@ -945,7 +945,14 @@ impl SettingsView {
         }
         self.commit_focused_field(window, cx);
         self.leave_voice(cx);
-        finish_close(window, cx);
+        self.cancel_pending_import(cx);
+        clear_closed_host(window, cx);
+    }
+
+    fn cancel_pending_import(&mut self, cx: &mut App) {
+        if let Some(dialog) = self.appearance_ui.import.take() {
+            dialog.update(cx, |dialog, cx| dialog.cancel_pending(cx));
+        }
     }
 
     /// Saves what a commit-on-blur field holds, before the modal unmounts it.

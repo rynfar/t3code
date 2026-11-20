@@ -732,6 +732,37 @@ fn pump(cx: &mut VisualTestAppContext, seconds: f32, done: impl Fn(&mut VisualTe
     }
 }
 
+/// Settles pending `on_next_frame` callbacks and forces a fresh full redraw
+/// (`window.refresh()`, bypassing `.cached()` view reuse) before reading pixels
+/// via `capture_screenshot`.
+fn settle_and_capture(
+    cx: &mut VisualTestAppContext,
+    window: AnyWindowHandle,
+) -> Result<image::RgbaImage, String> {
+    for _ in 0..4 {
+        let ran = cx
+            .update_window(window, |_, window, cx| window.simulate_next_frame(cx))
+            .map_err(|error| error.to_string())?;
+        cx.run_until_parked();
+        if ran == 0 {
+            break;
+        }
+    }
+    cx.update_window(window, |_, window, _| window.refresh())
+        .map_err(|error| error.to_string())?;
+    cx.run_until_parked();
+    let ran = cx
+        .update_window(window, |_, window, cx| window.simulate_next_frame(cx))
+        .map_err(|error| error.to_string())?;
+    if ran > 0 {
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, _| window.refresh())
+            .map_err(|error| error.to_string())?;
+        cx.run_until_parked();
+    }
+    cx.capture_screenshot(window).map_err(|error| error.to_string())
+}
+
 /// A private copy of the saved environments, so nothing the snapshot persists reaches the
 /// caller's home. A home with none renders the connect screen.
 fn isolated_home() -> Result<PathBuf, String> {
@@ -1359,6 +1390,8 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
             std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
             for frame in 0..8 {
                 pump(&mut cx, 0.034, |_| false);
+                cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;
+                cx.run_until_parked();
                 let image = cx.capture_screenshot(window).map_err(|error| error.to_string())?;
                 image.save(directory.join(format!("{frame:02}.png"))).map_err(|error| error.to_string())?;
             }
@@ -1450,8 +1483,7 @@ fn capture(options: &Options, runtime: tokio::runtime::Handle) -> Result<(), Str
         let values = cx.update(|cx| serde_json::to_vec_pretty(&serde_json::json!({"prose":&*cx.global::<MediaAudit>().sources.borrow(),"notifications":&*cx.global::<MediaAudit>().notifications.borrow(),"entities":&*cx.global::<MediaAudit>().pointers.borrow(),"idleSamples":media_idle,"selected":media_selections(cx),"cache":cx.try_global::<crate::media::Media>().map(|media|media.cache.read(cx).audit())}))).map_err(|e| e.to_string())?;
         std::fs::write(path, values).map_err(|e| e.to_string())?;
     }
-    cx.update_window(window, |_, window, _| window.refresh()).map_err(|error| error.to_string())?;
-    let image = cx.capture_screenshot(window).map_err(|error| error.to_string())?;
+    let image = settle_and_capture(&mut cx, window)?;
     if let Some(parent) = options.out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -1833,4 +1865,543 @@ fn apply_sidebar_fixture(
     }
     pump(cx, 0.2, |_| false);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{HeadlessAppContext, ScrollDelta, ScrollWheelEvent, TouchPhase};
+    use serde_json::json;
+    use t3_client::environments::{EnvironmentView, FleetView};
+    use t3_client::store::{SavedEnvironment, SavedEnvironments};
+    use t3_client::supervisor::ConnectionStatus;
+    use t3_core::server_config::ServerConfigState;
+    use t3_core::shell::ShellState;
+    use t3_core::sidebar::fleet::EnvironmentSummary;
+    use t3_core::sidebar::grouping::EnvironmentOwner;
+
+    fn seed_populated_workspace(state: &Entity<AppState>, cx: &mut HeadlessAppContext) {
+        let mut turn_items = Vec::new();
+        for i in 0..16u64 {
+            let is_user = i % 2 == 0;
+            let item = if is_user {
+                json!({
+                    "id": format!("item-{i}"),
+                    "threadId": "thread-repro",
+                    "runId": format!("run-{}", i / 2),
+                    "nodeId": null,
+                    "parentItemId": null,
+                    "ordinal": i + 1,
+                    "status": "completed",
+                    "title": null,
+                    "startedAt": "2026-04-01T10:00:00.000Z",
+                    "completedAt": "2026-04-01T10:00:01.000Z",
+                    "updatedAt": "2026-04-01T10:00:01.000Z",
+                    "type": "user_message",
+                    "messageId": format!("msg-{i}"),
+                    "text": format!("User question {i}: verify unchanged transcript text stays visible after preview scroll."),
+                    "attachments": [],
+                    "context": null
+                })
+            } else {
+                json!({
+                    "id": format!("item-{i}"),
+                    "threadId": "thread-repro",
+                    "runId": format!("run-{}", i / 2),
+                    "nodeId": null,
+                    "parentItemId": null,
+                    "ordinal": i + 1,
+                    "status": "completed",
+                    "title": null,
+                    "startedAt": "2026-04-01T10:00:02.000Z",
+                    "completedAt": "2026-04-01T10:00:05.000Z",
+                    "updatedAt": "2026-04-01T10:00:05.000Z",
+                    "type": "assistant_message",
+                    "messageId": format!("msg-{i}"),
+                    "streaming": false,
+                    "text": format!("Assistant answer {i}: static cached text on the left transcript pane must remain rendered across scroll and refresh cycles.")
+                })
+            };
+            turn_items.push(item);
+        }
+        let visible_turn_items: Vec<serde_json::Value> = turn_items
+            .iter()
+            .enumerate()
+            .map(|(position, item)| {
+                json!({
+                    "position": position,
+                    "visibility": "local",
+                    "sourceThreadId": "thread-repro",
+                    "sourceItemId": format!("item-{position}"),
+                    "item": item
+                })
+            })
+            .collect();
+
+        state.update(cx, |state, cx| {
+            state.stop_pump();
+            state.freeze_snapshot();
+            let mut config = ServerConfigState::default();
+            config.apply(
+                serde_json::from_value(json!({
+                    "type": "snapshot",
+                    "config": {
+                        "environment": {
+                            "environmentId": "env-repro",
+                            "label": "Studio Mac",
+                            "capabilities": {}
+                        },
+                        "providers": [{
+                            "instanceId": "codex",
+                            "driver": "codex",
+                            "displayName": "Codex",
+                            "models": [{
+                                "slug": "gpt-5.3-codex",
+                                "name": "GPT-5.3 Codex",
+                                "supportsReasoning": false
+                            }]
+                        }],
+                        "settings": {}
+                    }
+                }))
+                .expect("config"),
+            );
+            let mut shell = ShellState::default();
+            shell.synchronized = true;
+            shell.snapshot = Some(t3_core::shell::ShellSnapshot {
+                projects: vec![t3_core::shell::ProjectShell {
+                    id: "proj-repro".into(),
+                    title: "t3code".into(),
+                    has_custom_title: None,
+                    workspace_root: "/repo".into(),
+                    repository_identity: None,
+                    default_model_selection: None,
+                    pinned_at: None,
+                    archived_at: None,
+                    favicon_path: None,
+                    project_icon: None,
+                    scripts: Vec::new(),
+                    created_at: "2026-04-01T00:00:00.000Z".into(),
+                    updated_at: "2026-04-01T00:00:00.000Z".into(),
+                }],
+                threads: vec![serde_json::from_value(json!({
+                    "id": "thread-repro",
+                    "projectId": "proj-repro",
+                    "title": "Investigate missing cached text",
+                    "tags": [],
+                    "providerInstanceId": "codex",
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5.3-codex" },
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "branch": "main",
+                    "worktreePath": null,
+                    "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "thread-repro" },
+                    "latestRunId": null,
+                    "activeRunId": null,
+                    "status": "ready",
+                    "pendingRuntimeRequest": null,
+                    "latestVisibleMessage": null,
+                    "latestUserMessageAt": null,
+                    "hasActionableProposedPlan": false,
+                    "itemCount": 16,
+                    "visibleItemCount": 16,
+                    "createdAt": "2026-04-01T00:00:00.000Z",
+                    "updatedAt": "2026-04-01T10:00:05.000Z",
+                    "archivedAt": null,
+                    "settledOverride": null,
+                    "settledAt": null
+                }))
+                .expect("thread")],
+                archived_threads: Vec::new(),
+                older_settled: None,
+                snapshot_sequence: 1,
+            });
+            let owner = EnvironmentOwner {
+                saved_id: "env-repro".into(),
+                canonical_id: Some("env-repro".into()),
+                generation: 1,
+                connection_generation: 1,
+                shell_generation: 1,
+            };
+            let summary = Arc::new(EnvironmentSummary::from_shell(owner, &shell, &config));
+            state.environments = SavedEnvironments {
+                active: Some("env-repro".into()),
+                environments: vec![SavedEnvironment {
+                    id: "env-repro".into(),
+                    environment_id: Some("env-repro".into()),
+                    label: "Studio Mac".into(),
+                    http_base: "http://127.0.0.1:0".into(),
+                    access_token: Some("tok".into()),
+                    server_version: None,
+                    disabled: false,
+                    local: true,
+                    ssh: None,
+                }],
+            };
+            state.server_config = config.clone();
+            state.shell = shell;
+            state.apply_fleet_view(
+                Arc::new(FleetView {
+                    revision: 1,
+                    environments: vec![Arc::new(EnvironmentView {
+                        summary,
+                        status: ConnectionStatus::Connected,
+                        config,
+                        grants: None,
+                        settings_revision: 0,
+                        keybindings_revision: 0,
+                    })],
+                }),
+                cx,
+            );
+            state.set_phase(
+                crate::app_state::Phase::Online(ConnectionStatus::Connected),
+                cx,
+            );
+            state.selected_thread = Some("thread-repro".into());
+            let projection: t3_core::thread::ThreadProjection = serde_json::from_value(json!({
+                "thread": {
+                    "id": "thread-repro",
+                    "projectId": "proj-repro",
+                    "title": "Investigate missing cached text",
+                    "createdAt": "2026-04-01T00:00:00.000Z",
+                    "updatedAt": "2026-04-01T10:00:05.000Z",
+                    "archivedAt": null,
+                    "branch": "main",
+                    "worktreePath": null,
+                    "lastVisitedAt": null,
+                    "providerInstanceId": "codex",
+                    "modelSelection": { "instanceId": "codex", "model": "gpt-5.3-codex" },
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default",
+                    "lineage": { "rootThreadId": "thread-repro" }
+                },
+                "runs": [],
+                "attempts": [],
+                "nodes": [],
+                "subagents": [],
+                "providerSessions": [],
+                "providerThreads": [],
+                "providerTurns": [],
+                "runtimeRequests": [],
+                "messages": [],
+                "plans": [],
+                "turnItems": turn_items,
+                "checkpointScopes": [],
+                "checkpoints": [],
+                "contextHandoffs": [],
+                "contextTransfers": [],
+                "visibleTurnItems": visible_turn_items,
+                "updatedAt": "2026-04-01T10:00:05.000Z"
+            }))
+            .expect("projection");
+            state.thread.projection = Some(projection);
+            state.rebuild_sidebar(cx);
+            cx.emit(crate::app_state::AppEvent::Shell);
+            cx.emit(crate::app_state::AppEvent::Thread);
+        });
+    }
+
+    struct StaticChrome {
+        title: SharedString,
+    }
+
+    impl gpui::Render for StaticChrome {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::{ParentElement, Styled, div, rgb};
+            div()
+                .size_full()
+                .p(px(16.))
+                .bg(rgb(0x111114))
+                .text_color(rgb(0xf4f4f5))
+                .text_size(px(16.))
+                .child(self.title.clone())
+        }
+    }
+
+    struct ScrollableProse {
+        text: Arc<str>,
+        markdown: crate::transcript::markdown::MarkdownStore,
+        scope: crate::media::MediaScope,
+        _viewer: Entity<crate::media::MediaViewer>,
+    }
+
+    impl ScrollableProse {
+        fn new(fixture: &DocumentFixture, cx: &mut gpui::Context<Self>) -> Self {
+            use gpui::AppContext;
+            let viewer = cx.new(crate::media::MediaViewer::new);
+            Self {
+                text: fixture.text.clone().into(),
+                markdown: crate::transcript::markdown::MarkdownStore::new(cx.entity_id()),
+                scope: crate::media::MediaScope {
+                    owner: cx.entity_id(),
+                    thread_id: fixture.thread_id.clone(),
+                    workspace_root: fixture.base_dir.clone(),
+                    workspace_mutation_id: None,
+                    source_control_media: false,
+                    source_control_media_repository: None,
+                    viewer: viewer.downgrade(),
+                },
+                _viewer: viewer,
+            }
+        }
+    }
+
+    impl gpui::Render for ScrollableProse {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::{ParentElement, Styled, div};
+            crate::media::set_scope(self.scope.clone(), cx);
+            self.markdown.begin_frame();
+            let state = self.markdown.state("scrollable-prose", &self.text, cx);
+            div().w_full().p(px(24.)).child(crate::transcript::markdown::prose(&state, cx))
+        }
+    }
+
+    struct SplitHarness {
+        chrome: Entity<StaticChrome>,
+        thread: Entity<crate::thread_view::ThreadView>,
+        doc: Entity<ScrollableProse>,
+    }
+
+    impl gpui::Render for SplitHarness {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::{ParentElement, Styled, div, rgb};
+            div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .bg(rgb(0x0b0b0e))
+                .child(
+                    div()
+                        .w(px(240.))
+                        .h_full()
+                        .child(self.chrome.clone().cached(gpui::StyleRefinement::default().size_full())),
+                )
+                .child(div().flex_1().h_full().overflow_hidden().child(self.thread.clone()))
+                .child(
+                    div()
+                        .id("right-preview-scroll")
+                        .w(px(520.))
+                        .h_full()
+                        .overflow_y_scroll()
+                        .child(self.doc.clone()),
+                )
+        }
+    }
+
+    use gpui::{InteractiveElement, SharedString, StatefulInteractiveElement};
+
+    fn settle_headless_and_capture(
+        cx: &mut HeadlessAppContext,
+        window: AnyWindowHandle,
+    ) -> image::RgbaImage {
+        for _ in 0..4 {
+            let ran = cx
+                .update_window(window, |_, window, cx| window.simulate_next_frame(cx))
+                .expect("headless window open");
+            cx.run_until_parked();
+            if ran == 0 {
+                break;
+            }
+        }
+        cx.update_window(window, |_, window, _| window.refresh())
+            .expect("headless refresh");
+        cx.run_until_parked();
+        let ran = cx
+            .update_window(window, |_, window, cx| window.simulate_next_frame(cx))
+            .expect("headless next frame");
+        if ran > 0 {
+            cx.run_until_parked();
+            cx.update_window(window, |_, window, _| window.refresh())
+                .expect("headless final refresh");
+            cx.run_until_parked();
+        }
+        cx.capture_screenshot(window)
+            .expect("headless screenshot")
+    }
+
+    fn count_foreground_pixels(
+        img: &image::RgbaImage,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+        dark: bool,
+    ) -> usize {
+        let mut count = 0;
+        for y in y0.min(img.height())..y1.min(img.height()) {
+            for x in x0.min(img.width())..x1.min(img.width()) {
+                let p = img.get_pixel(x, y);
+                let is_text = if dark {
+                    p[0] > 80 || p[1] > 80 || p[2] > 80
+                } else {
+                    p[0] < 180 || p[1] < 180 || p[2] < 180
+                };
+                if is_text {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    fn count_differing_pixels(
+        a: &image::RgbaImage,
+        b: &image::RgbaImage,
+        x0: u32,
+        y0: u32,
+        x1: u32,
+        y1: u32,
+    ) -> usize {
+        let mut diffs = 0;
+        for y in y0.min(a.height()).min(b.height())..y1.min(a.height()).min(b.height()) {
+            for x in x0.min(a.width()).min(b.width())..x1.min(a.width()).min(b.width()) {
+                if a.get_pixel(x, y) != b.get_pixel(x, y) {
+                    diffs += 1;
+                }
+            }
+        }
+        diffs
+    }
+
+    #[test]
+    fn offscreen_capture_retains_static_and_cached_text_after_scroll_and_refresh() {
+        crate::webview::set_offscreen();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(crate::icons::Assets),
+            gpui_platform::current_headless_renderer,
+        );
+        cx.allow_parking();
+        let state = cx.update(|cx| crate::boot(runtime.handle().clone(), cx));
+        let mut body = String::from("# Long Markdown Preview\n\n");
+        for i in 0..80 {
+            body.push_str(&format!(
+                "## Section {i}\n\nParagraph {i} with scrollable content on the right panel.\n\n"
+            ));
+        }
+        let doc_fixture = DocumentFixture {
+            text: body,
+            thread_id: Some("thread-repro".into()),
+            base_dir: Some("/repo".into()),
+            after_text: None,
+        };
+        let window: AnyWindowHandle = cx
+            .open_window(size(px(1440.), px(900.)), |window, cx| {
+                use gpui::AppContext;
+                let current = crate::theme::preferences(cx).clone();
+                crate::theme::set_preferences(
+                    crate::theme::Preferences {
+                        mode: AppearanceMode::Dark,
+                        ..current
+                    },
+                    cx,
+                );
+                crate::media::cache(&state, cx);
+                let chrome = cx.new(|_| StaticChrome {
+                    title: "Static Sidebar Chrome Heading".into(),
+                });
+                let thread = cx.new(|cx| crate::thread_view::ThreadView::new(state.clone(), window, cx));
+                let doc = cx.new(|cx| ScrollableProse::new(&doc_fixture, cx));
+                cx.new(|_| SplitHarness { chrome, thread, doc })
+            })
+            .expect("open headless window")
+            .into();
+        seed_populated_workspace(&state, &mut cx);
+
+        let before = settle_headless_and_capture(&mut cx, window);
+
+        // Scroll right preview without forcing refresh so the cached left sidebar replays its scene.
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                gpui::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position: point(px(1200.), px(450.)),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(-400.))),
+                    modifiers: Modifiers::default(),
+                    touch_phase: TouchPhase::Moved,
+                }),
+                cx,
+            );
+            window.simulate_next_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let after_scroll_cached = cx.capture_screenshot(window).expect("after scroll cached");
+
+        // Settle and force a full refresh before offscreen capture.
+        let after_refresh = settle_headless_and_capture(&mut cx, window);
+
+        // Switch theme Light -> Dark and re-settle to verify glyph dilation/atlas switch retains text.
+        cx.update(|cx| {
+            let current = crate::theme::preferences(cx).clone();
+            crate::theme::set_preferences(
+                crate::theme::Preferences {
+                    mode: AppearanceMode::Light,
+                    ..current
+                },
+                cx,
+            );
+        });
+        let _light = settle_headless_and_capture(&mut cx, window);
+        cx.update(|cx| {
+            let current = crate::theme::preferences(cx).clone();
+            crate::theme::set_preferences(
+                crate::theme::Preferences {
+                    mode: AppearanceMode::Dark,
+                    ..current
+                },
+                cx,
+            );
+        });
+        let after_theme_cycle = settle_headless_and_capture(&mut cx, window);
+
+        // Regions in physical pixels (Retina 2x -> 2880x1800, or 1x -> 1440x900).
+        let sx = before.width() / 1440;
+        let sy = before.height() / 900;
+        let sidebar_before = count_foreground_pixels(&before, 10 * sx, 10 * sy, 230 * sx, 80 * sy, true);
+        let sidebar_cached = count_foreground_pixels(&after_scroll_cached, 10 * sx, 10 * sy, 230 * sx, 80 * sy, true);
+        let sidebar_refresh = count_foreground_pixels(&after_refresh, 10 * sx, 10 * sy, 230 * sx, 80 * sy, true);
+        let sidebar_theme = count_foreground_pixels(&after_theme_cycle, 10 * sx, 10 * sy, 230 * sx, 80 * sy, true);
+
+        let transcript_before = count_foreground_pixels(&before, 260 * sx, 60 * sy, 900 * sx, 840 * sy, true);
+        let transcript_cached = count_foreground_pixels(&after_scroll_cached, 260 * sx, 60 * sy, 900 * sx, 840 * sy, true);
+        let transcript_refresh = count_foreground_pixels(&after_refresh, 260 * sx, 60 * sy, 900 * sx, 840 * sy, true);
+        let transcript_theme = count_foreground_pixels(&after_theme_cycle, 260 * sx, 60 * sy, 900 * sx, 840 * sy, true);
+
+        let right_scroll_diffs = count_differing_pixels(
+            &before,
+            &after_refresh,
+            930 * sx,
+            40 * sy,
+            1420 * sx,
+            860 * sy,
+        );
+
+        assert!(right_scroll_diffs > 500, "right preview pane must actually scroll (diffs={right_scroll_diffs})");
+        assert!(sidebar_before > 100, "cached static sidebar must render text before scroll");
+        assert_eq!(sidebar_cached, sidebar_before, "cached static sidebar must retain text after scroll");
+        assert_eq!(sidebar_refresh, sidebar_before, "cached static sidebar must retain text after refresh");
+        assert_eq!(sidebar_theme, sidebar_before, "cached static sidebar must retain text after theme cycle");
+        assert!(transcript_before > 1000, "transcript must render text before scroll");
+        assert_eq!(transcript_cached, transcript_before, "transcript must retain text after preview scroll");
+        assert_eq!(transcript_refresh, transcript_before, "transcript must retain text after refresh");
+        assert_eq!(transcript_theme, transcript_before, "transcript must retain text after theme cycle");
+
+        state.update(&mut cx, |state, _| state.stop_pump());
+        drop(state);
+        cx.run_until_parked();
+    }
 }
