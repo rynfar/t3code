@@ -11,6 +11,7 @@
 //! settings in `hosts`.
 
 pub mod hosts;
+pub mod hub;
 pub mod stream;
 pub mod tools;
 
@@ -845,4 +846,60 @@ pub fn encode_component(value: &str) -> String {
         }
     }
     out
+}
+
+/// Tracks live device sessions across snapshots to detect agent-opened device tabs, porting
+/// `applyDeviceSnapshot` in `apps/web/src/components/preview/agentOpenedPreviews.ts`.
+///
+/// The first snapshot establishes the baseline without opening tabs for pre-existing sessions.
+/// A session without a matching `Device` summary yet stays out of the baseline so a later snapshot
+/// opens it once the device summary lands.
+#[derive(Debug, Default)]
+pub struct AgentSessionTracker {
+    baseline: Option<std::collections::HashSet<(String, String, String)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentOpenedSession {
+    pub thread_id: String,
+    pub host_id: String,
+    pub device_id: String,
+    pub platform: Platform,
+    pub name: String,
+}
+
+impl AgentSessionTracker {
+    pub fn reset(&mut self) {
+        self.baseline = None;
+    }
+
+    pub fn apply(&mut self, state: &ServiceState) -> Vec<AgentOpenedSession> {
+        let mut next = std::collections::HashSet::new();
+        let mut resolved = Vec::new();
+        for session in &state.sessions {
+            let Some(device) = state.device(&session.host_id, &session.device_id) else {
+                continue;
+            };
+            let key = (session.thread_id.clone(), session.host_id.clone(), session.device_id.clone());
+            next.insert(key.clone());
+            resolved.push((key, session, device));
+        }
+        let previous = self.baseline.replace(next);
+        let Some(previous) = previous else {
+            return Vec::new();
+        };
+        let mut opened = Vec::new();
+        for (key, session, device) in resolved {
+            if !previous.contains(&key) {
+                opened.push(AgentOpenedSession {
+                    thread_id: session.thread_id.clone(),
+                    host_id: session.host_id.clone(),
+                    device_id: session.device_id.clone(),
+                    platform: device.platform,
+                    name: device.name.clone(),
+                });
+            }
+        }
+        opened
+    }
 }

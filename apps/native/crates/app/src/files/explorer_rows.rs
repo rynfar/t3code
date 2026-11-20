@@ -137,9 +137,12 @@ impl Explorer {
                 let label: SharedString = dragged.label.clone().into();
                 cx.new(|_| DragMentionGhost { label, kind })
             })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                window.focus(&this.focus, cx);
-                this.activate_row(index, cx);
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                let modified = event.modifiers().modified();
+                if kind == EntryKind::Directory || modified {
+                    window.focus(&this.focus, cx);
+                }
+                this.activate_row(index, !modified, cx);
             }))
             .child(
                 icon.svg()
@@ -198,9 +201,12 @@ impl Render for Explorer {
         let no_matches = searching && self.rows.is_empty() && !loading && error.is_none();
         let count = self.rows.len();
         v_flex()
+            .id("file-explorer-root")
+            .key_context(CONTEXT)
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
+            .on_action(cx.listener(Self::on_focus_search))
             .child(self.render_subheader(cx))
             .children(error.map(|error| {
                 div()

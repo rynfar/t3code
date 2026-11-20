@@ -14,16 +14,21 @@
 mod tools;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     App, Bounds, Context, Corners, DispatchPhase, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, RenderOnce, SharedString, Styled, Task,
-    Window, canvas, div, point, prelude::*, px, size,
+    Window, canvas, div, point, prelude::*, px, quad, size,
 };
 use gpui_component::input::InputState;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{Selectable, v_flex};
-use t3_client::device_stream::{DeviceInput, DeviceStream, DeviceStreamEvent, DeviceTarget, Frame, InputSender, capture_screenshot};
+use t3_client::device_stream::{
+    DeviceInput, DeviceStream, DeviceStreamEvent, DeviceTarget, Frame, InputSender, capture_screenshot, fetch_ax_tree, read_android_fold, set_android_fold,
+    subscribe_event_log, subscribe_foreground,
+};
+use t3_core::device::hub::{AX_POLL_INTERVAL_MS, AndroidFoldState, AxElement, EventLogEntry, FoldActionPosture, ForegroundInfo};
 use t3_core::device::stream::{
     CONNECTING_VIDEO, HardwareButton, KeyPhase, Screen, StreamStatus, TouchPhase, fit_frame, input_disconnected_label, screen_aspect, screen_rotation,
     transport,
@@ -150,6 +155,21 @@ pub struct DeviceScreen {
     /// A capture always finishes, even if the tab hides meanwhile; the user asked for it.
     screenshot_pending: bool,
     screenshot_error: Option<String>,
+    /// Live foreground app from iOS SSE (`deviceForegroundAtom`); `None` falls back to detail.
+    live_foreground: Option<Option<ForegroundInfo>>,
+    _foreground_task: Option<Task<()>>,
+    /// Accessibility frame overlay (`deviceAxElementsAtom`).
+    pub(super) ax_overlay: bool,
+    ax_elements: Vec<AxElement>,
+    _ax_task: Option<Task<()>>,
+    /// Collapsible iOS event log (`deviceEventLogAtom`).
+    pub(super) event_log_open: bool,
+    pub(super) event_log: Vec<EventLogEntry>,
+    _event_log_task: Option<Task<()>>,
+    /// Android foldable posture (`deviceFold.ts`).
+    pub(super) android_fold: Option<AndroidFoldState>,
+    pub(super) fold_pending: bool,
+    pub(super) fold_error: Option<String>,
 }
 
 impl DeviceScreen {
@@ -184,6 +204,17 @@ impl DeviceScreen {
             form: None,
             screenshot_pending: false,
             screenshot_error: None,
+            live_foreground: None,
+            _foreground_task: None,
+            ax_overlay: false,
+            ax_elements: Vec::new(),
+            _ax_task: None,
+            event_log_open: false,
+            event_log: Vec::new(),
+            _event_log_task: None,
+            android_fold: None,
+            fold_pending: false,
+            fold_error: None,
         }
     }
 
@@ -203,9 +234,205 @@ impl DeviceScreen {
         if visible {
             self.connect(cx);
             self.read_detail(cx);
+            self.sync_hub_streams(cx);
         } else {
             self.disconnect(cx);
+            self.stop_hub_streams();
         }
+    }
+
+    pub(super) fn effective_foreground(&self) -> Option<String> {
+        match &self.live_foreground {
+            Some(Some(info)) => Some(info.id.clone()),
+            Some(None) => None,
+            None => self.controls.foreground_app().map(|app| app.id.clone()),
+        }
+    }
+
+    pub(super) fn has_hub_access(&self, cx: &App) -> bool {
+        self.state.read(cx).client_handle().is_some()
+    }
+
+    fn stop_hub_streams(&mut self) {
+        self._foreground_task = None;
+        self._ax_task = None;
+        self._event_log_task = None;
+    }
+
+    fn sync_hub_streams(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.stop_hub_streams();
+            return;
+        }
+        // Live foreground SSE on iOS while visible and host commands are available.
+        if self.device.platform == Platform::Ios && self.runs_host_commands(cx) {
+            if self._foreground_task.is_none()
+                && let Some(client) = self.state.read(cx).client_handle()
+            {
+                let credentials = Arc::new(client.credentials().clone());
+                let runtime = self.state.read(cx).runtime().clone();
+                let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
+                let mut rx = subscribe_foreground(&runtime, credentials, target);
+                self._foreground_task = Some(cx.spawn(async move |this, cx| {
+                    while rx.changed().await.is_ok() {
+                        let next = rx.borrow_and_update().clone();
+                        if this
+                            .update(cx, |this, cx| {
+                                if this.live_foreground != next {
+                                    this.live_foreground = next;
+                                    cx.notify();
+                                }
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }));
+            }
+        } else {
+            self._foreground_task = None;
+        }
+        self.sync_ax_overlay(cx);
+        self.sync_event_log(cx);
+    }
+
+    pub(super) fn set_ax_overlay(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.ax_overlay == enabled {
+            return;
+        }
+        self.ax_overlay = enabled;
+        if !enabled {
+            self.ax_elements.clear();
+            self._ax_task = None;
+        } else {
+            self.sync_ax_overlay(cx);
+        }
+        cx.notify();
+    }
+
+    fn sync_ax_overlay(&mut self, cx: &mut Context<Self>) {
+        if !self.visible || !self.ax_overlay {
+            self._ax_task = None;
+            return;
+        }
+        if self._ax_task.is_some() {
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else { return };
+        let credentials = Arc::new(client.credentials().clone());
+        let runtime = state.runtime().clone();
+        let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
+        let platform = self.device.platform;
+        self._ax_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let creds = Arc::clone(&credentials);
+                let tgt = target.clone();
+                let fetched = runtime.spawn(fetch_ax_tree(creds, tgt, platform)).await;
+                let keep = this.update(cx, |this, cx| {
+                    if !this.visible || !this.ax_overlay {
+                        return false;
+                    }
+                    if let Ok(Ok(tree)) = fetched {
+                        this.ax_elements = tree.elements;
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(keep, Ok(true)) {
+                    return;
+                }
+                cx.background_executor().timer(Duration::from_millis(AX_POLL_INTERVAL_MS)).await;
+            }
+        }));
+    }
+
+    pub(super) fn toggle_event_log(&mut self, cx: &mut Context<Self>) {
+        self.event_log_open = !self.event_log_open;
+        if !self.event_log_open {
+            self._event_log_task = None;
+        } else {
+            self.sync_event_log(cx);
+        }
+        cx.notify();
+    }
+
+    fn sync_event_log(&mut self, cx: &mut Context<Self>) {
+        if !self.visible || !self.tools_open || !self.event_log_open || self.device.platform != Platform::Ios {
+            self._event_log_task = None;
+            return;
+        }
+        if self._event_log_task.is_some() {
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else { return };
+        let credentials = Arc::new(client.credentials().clone());
+        let runtime = state.runtime().clone();
+        let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
+        let mut rx = subscribe_event_log(&runtime, credentials, target);
+        self._event_log_task = Some(cx.spawn(async move |this, cx| {
+            while rx.changed().await.is_ok() {
+                let entries = rx.borrow_and_update().clone();
+                if this
+                    .update(cx, |this, cx| {
+                        this.event_log = entries;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
+    }
+
+    pub(super) fn read_fold(&mut self, cx: &mut Context<Self>) {
+        if self.device.platform != Platform::Android || !self.controls_visible(cx) {
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else { return };
+        let credentials = Arc::new(client.credentials().clone());
+        let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
+        let task = state.runtime().spawn(read_android_fold(credentials, target));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(fold)) = task.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.android_fold = Some(fold);
+                    this.fold_error = None;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn set_fold(&mut self, posture: FoldActionPosture, cx: &mut Context<Self>) {
+        if self.fold_pending || !self.controls_visible(cx) {
+            return;
+        }
+        let state = self.state.read(cx);
+        let Some(client) = state.client_handle() else { return };
+        let credentials = Arc::new(client.credentials().clone());
+        let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
+        let task = state.runtime().spawn(set_android_fold(credentials, target, posture));
+        self.fold_pending = true;
+        self.fold_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|_| Err("Fold command failed.".to_owned()));
+            let _ = this.update(cx, |this, cx| {
+                this.fold_pending = false;
+                match result {
+                    Ok(fold) => this.android_fold = Some(fold),
+                    Err(error) => this.fold_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn runs_host_commands(&self, cx: &App) -> bool {
@@ -262,6 +489,10 @@ impl DeviceScreen {
         if self.tools_open && self.form.is_none() {
             self.form = Some(tools::Form::new(self.device.platform, window, cx));
         }
+        if self.tools_open {
+            self.read_fold(cx);
+        }
+        self.sync_event_log(cx);
         cx.notify();
     }
 
@@ -622,6 +853,26 @@ impl DeviceScreen {
                             .disabled(disabled)
                             .on_click(cx.listener(|this, _, _, _| this.send(DeviceInput::Button(HardwareButton::Home)))),
                     )
+                    .when(platform == Platform::Android, |this| {
+                        this.child(
+                            Button::new("device-back")
+                                .variant(Variant::Ghost)
+                                .size(Size::IconSm)
+                                .icon(Icon::ChevronLeft)
+                                .tooltip("Back")
+                                .disabled(disabled)
+                                .on_click(cx.listener(|this, _, _, _| this.send(DeviceInput::Button(HardwareButton::Back)))),
+                        )
+                        .child(
+                            Button::new("device-recents")
+                                .variant(Variant::Ghost)
+                                .size(Size::IconSm)
+                                .icon(Icon::Square)
+                                .tooltip("Recents")
+                                .disabled(disabled)
+                                .on_click(cx.listener(|this, _, _, _| this.send(DeviceInput::Button(HardwareButton::Recents)))),
+                        )
+                    })
                     .children(rotate)
                     .children(host_controls.into_iter().flatten())
                     .children(screenshot)
@@ -655,6 +906,26 @@ impl Render for DeviceScreen {
                         if let Some(fit) = fit(box_size, this.frame_size) {
                             let drawn = Bounds::new(frame.origin + point(px(fit.left as f32), px(fit.top as f32)), size(px(fit.width as f32), px(fit.height as f32)));
                             let _ = window.paint_image(drawn, Corners::default(), image, 0, false);
+                            // Accessibility element frame overlay (`Overlay element frames`).
+                            if this.ax_overlay && !this.ax_elements.is_empty() {
+                                let p = palette(cx);
+                                let border = hsla(p.primary).opacity(0.75);
+                                let fill = hsla(p.primary).opacity(0.08);
+                                for el in &this.ax_elements {
+                                    let x = drawn.origin.x + px((el.x * fit.width) as f32);
+                                    let y = drawn.origin.y + px((el.y * fit.height) as f32);
+                                    let w = px((el.width * fit.width).max(1.0) as f32);
+                                    let h = px((el.height * fit.height).max(1.0) as f32);
+                                    window.paint_quad(quad(
+                                        Bounds::new(point(x, y), size(w, h)),
+                                        Corners::all(px(2.)),
+                                        fill,
+                                        gpui::Edges::all(px(1.)),
+                                        border,
+                                        gpui::BorderStyle::Solid,
+                                    ));
+                                }
+                            }
                         }
                     }
                     // A drag keeps touching outside the screen; window-wide listeners see it.

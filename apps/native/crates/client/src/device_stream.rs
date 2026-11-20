@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+use t3_core::device::hub::{
+    AndroidFoldState, AxTree, EventLogEntry, FoldActionPosture, ForegroundInfo, SseParser, android_fold_path, append_event_log, ax_tree_path, event_log_path, foreground_path,
+    parse_android_fold, parse_ax_tree, parse_event_log_message, parse_foreground_event,
+};
 use t3_core::device::stream::{
     CloseAction, FIRST_FRAME_TIMEOUT_MS, HardwareButton, INPUT_UNAVAILABLE, IosMessage, KeyPhase, MjpegParser, NO_VIDEO, Orientation, RETRY_DELAY_MS,
     STREAM_FAILED, Screen, StreamStatus, TouchPhase, classify_close, close_detail, decode_ios_message, lease_ended,
@@ -379,6 +383,137 @@ pub async fn capture_screenshot(credentials: Arc<Credentials>, target: DeviceTar
     extract_png(&bytes).map(<[u8]>::to_vec).ok_or_else(|| SCREENSHOT_INCOMPLETE.to_owned())
 }
 
+async fn hub_access(credentials: &Credentials, host_id: &str) -> Result<HubAccess, String> {
+    let ticket = issue_media_ticket(credentials).await.map_err(|error| {
+        tracing::debug!(%error, "device hub ticket failed");
+        "Could not reach the device hub.".to_owned()
+    })?;
+    HubAccess::new(&credentials.http_base, &ticket, host_id).ok_or_else(|| "Could not reach the device hub.".to_owned())
+}
+
+/// Fetches one accessibility tree snapshot (`fetchDeviceAxTree` in `deviceHubApi.ts`).
+pub async fn fetch_ax_tree(credentials: Arc<Credentials>, target: DeviceTarget, platform: Platform) -> Result<AxTree, String> {
+    let access = hub_access(&credentials, &target.host_id).await?;
+    let (serve_sim, path) = ax_tree_path(platform, &target.device_id);
+    let url = access.http_url(serve_sim, &path);
+    let client = reqwest::Client::builder().timeout(OPEN_TIMEOUT).build().map_err(|_| "Could not read the device accessibility tree.".to_owned())?;
+    let response = client.get(&url).send().await.map_err(|_| "Could not read the device accessibility tree.".to_owned())?;
+    if !response.status().is_success() {
+        return Err(format!("{} {}", response.status().as_u16(), response.status().canonical_reason().unwrap_or("")).trim().to_owned());
+    }
+    let payload: serde_json::Value = response.json().await.map_err(|_| "Unexpected accessibility payload.".to_owned())?;
+    Ok(parse_ax_tree(platform, &payload))
+}
+
+/// Subscribes to iOS live foreground app SSE (`/appstate`, `subscribeDeviceForeground`).
+/// Stops cleanly when the returned receiver is dropped.
+pub fn subscribe_foreground(
+    runtime: &tokio::runtime::Handle,
+    credentials: Arc<Credentials>,
+    target: DeviceTarget,
+) -> watch::Receiver<Option<Option<ForegroundInfo>>> {
+    let (tx, rx) = watch::channel(None);
+    runtime.spawn(async move {
+        let Ok(access) = hub_access(&credentials, &target.host_id).await else { return };
+        let url = access.http_url(true, &foreground_path(&target.device_id));
+        let Ok(client) = reqwest::Client::builder().connect_timeout(OPEN_TIMEOUT).build() else { return };
+        let Ok(mut response) = client.get(&url).send().await else { return };
+        if !response.status().is_success() {
+            return;
+        }
+        let mut parser = SseParser::default();
+        loop {
+            let chunk = tokio::select! {
+                chunk = response.chunk() => chunk,
+                () = tx.closed() => return,
+            };
+            let Ok(Some(bytes)) = chunk else { break };
+            for data in parser.push(&bytes) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data)
+                    && let Some(app) = parse_foreground_event(&value)
+                {
+                    let _ = tx.send(Some(app));
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Subscribes to iOS event log SSE (`/api/event-log/events`, `subscribeDeviceEventLog`).
+/// Stops cleanly when the returned receiver is dropped.
+pub fn subscribe_event_log(
+    runtime: &tokio::runtime::Handle,
+    credentials: Arc<Credentials>,
+    target: DeviceTarget,
+) -> watch::Receiver<Vec<EventLogEntry>> {
+    let (tx, rx) = watch::channel(Vec::new());
+    runtime.spawn(async move {
+        let Ok(access) = hub_access(&credentials, &target.host_id).await else { return };
+        let url = access.http_url(true, &event_log_path(&target.device_id));
+        let Ok(client) = reqwest::Client::builder().connect_timeout(OPEN_TIMEOUT).build() else { return };
+        let Ok(mut response) = client.get(&url).send().await else { return };
+        if !response.status().is_success() {
+            return;
+        }
+        let mut parser = SseParser::default();
+        let mut entries = Vec::new();
+        loop {
+            let chunk = tokio::select! {
+                chunk = response.chunk() => chunk,
+                () = tx.closed() => return,
+            };
+            let Ok(Some(bytes)) = chunk else { break };
+            for data in parser.push(&bytes) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data)
+                    && let Some((incoming, reset)) = parse_event_log_message(&value)
+                {
+                    entries = append_event_log(&entries, &incoming, reset);
+                    let _ = tx.send(entries.clone());
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Reads Android foldable posture (`readAndroidFold` in `deviceFold.ts`).
+pub async fn read_android_fold(credentials: Arc<Credentials>, target: DeviceTarget) -> Result<AndroidFoldState, String> {
+    android_fold_request(credentials, target, None).await
+}
+
+/// Sets Android foldable posture (`setAndroidFold` in `deviceFold.ts`).
+pub async fn set_android_fold(credentials: Arc<Credentials>, target: DeviceTarget, posture: FoldActionPosture) -> Result<AndroidFoldState, String> {
+    android_fold_request(credentials, target, Some(posture)).await
+}
+
+async fn android_fold_request(
+    credentials: Arc<Credentials>,
+    target: DeviceTarget,
+    posture: Option<FoldActionPosture>,
+) -> Result<AndroidFoldState, String> {
+    let access = hub_access(&credentials, &target.host_id).await?;
+    let url = access.http_url(false, &android_fold_path(&target.device_id));
+    let client = reqwest::Client::builder().timeout(OPEN_TIMEOUT).build().map_err(|_| "Fold command failed.".to_owned())?;
+    let req = match posture {
+        Some(posture) => client.post(&url).json(&posture.body()),
+        None => client.get(&url),
+    };
+    let response = req.send().await.map_err(|_| "Fold command failed.".to_owned())?;
+    let status = response.status();
+    if !status.is_success() {
+        let error = response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("error").and_then(serde_json::Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| format!("Fold command failed ({}).", status.as_u16()));
+        return Err(error);
+    }
+    let payload: serde_json::Value = response.json().await.map_err(|_| "Unexpected Android fold response.".to_owned())?;
+    parse_android_fold(&payload)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -460,6 +595,26 @@ mod tests {
                             let body = [b"WARNING: two displays\n".as_slice(), &tiny_png(), b"\n"].concat();
                             let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).await;
                             let _ = stream.write_all(&body).await;
+                        } else if head.contains("/ax?") || head.contains("/api/accessibility?") {
+                            let body = if head.contains("serve-sim") {
+                                r#"[{"type":"Application","frame":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"Button","AXUniqueId":"ok","AXLabel":"OK","frame":{"x":39,"y":422,"width":195,"height":42.2}}]}]"#
+                            } else {
+                                r#"{"nodes":[{"id":0,"bounds":{"left":0,"top":0,"right":1080,"bottom":2400}},{"id":1,"text":"Go","className":"android.widget.Button","clickable":true,"bounds":{"left":108,"top":240,"right":540,"bottom":480}}]}"#
+                            };
+                            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                        } else if head.contains("/appstate?") {
+                            let body = "data: {\"bundleId\":\"com.acme.live\",\"pid\":99}\n\n";
+                            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                        } else if head.contains("/api/event-log/events?") {
+                            let body = "data: {\"events\":[{\"id\":1,\"timestamp\":\"2026-11-19T12:00:00.000Z\",\"kind\":\"tap\",\"summary\":\"Tapped OK\"}]}\n\ndata: {\"event\":{\"id\":2,\"timestamp\":\"2026-11-19T12:00:01.000Z\",\"kind\":\"nav\",\"summary\":\"Opened Home\"}}\n\n";
+                            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+                        } else if head.contains("/api/fold?") {
+                            let body = if head.starts_with("POST ") {
+                                r#"{"ok":true,"fold":{"supported":true,"posture":"closed","hingeAngle":0}}"#
+                            } else {
+                                r#"{"ok":true,"fold":{"supported":true,"posture":"opened","hingeAngle":180}}"#
+                            };
+                            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
                         } else if head.contains("/helper/ws?") {
                             let key = head.lines().find_map(|line| line.strip_prefix("Sec-WebSocket-Key: ").or_else(|| line.strip_prefix("sec-websocket-key: "))).unwrap_or_default().trim().to_owned();
                             let accept = derive_accept_key(key.as_bytes());
@@ -582,5 +737,50 @@ mod tests {
         let requests = hub.requests.lock().unwrap().clone();
         assert!(requests.iter().any(|line| line.starts_with("POST /api/device-hub/vendor/serve-sim/api/screenshot?device=SIM%201&wsTicket=tick&hostId=local ")), "{requests:?}");
         assert!(requests.iter().any(|line| line.starts_with("POST /api/device-hub/vendor/serve-emu/api/screenshot?device=emu&wsTicket=tick&hostId=mac ")), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn hub_endpoints_fetch_ax_tree_stream_foreground_event_log_and_fold() {
+        let hub = FakeHub::start(Mode::Live).await;
+        let target = DeviceTarget { host_id: "local".into(), device_id: "SIM 1".into() };
+
+        let ios_ax = fetch_ax_tree(hub.credentials(), target.clone(), Platform::Ios).await.unwrap();
+        assert_eq!(ios_ax.elements.len(), 1);
+        assert_eq!(ios_ax.elements[0].label, "OK");
+
+        let android_ax = fetch_ax_tree(hub.credentials(), DeviceTarget { host_id: "local".into(), device_id: "emu".into() }, Platform::Android).await.unwrap();
+        assert_eq!(android_ax.elements.len(), 1);
+        assert_eq!(android_ax.elements[0].label, "Go");
+
+        let mut fg_rx = subscribe_foreground(&tokio::runtime::Handle::current(), hub.credentials(), target.clone());
+        tokio::time::timeout(WAIT, async {
+            while fg_rx.borrow_and_update().is_none() {
+                fg_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let fg = fg_rx.borrow().clone().unwrap().unwrap();
+        assert_eq!(fg.id, "com.acme.live");
+        assert_eq!(fg.pid, Some(99));
+
+        let mut log_rx = subscribe_event_log(&tokio::runtime::Handle::current(), hub.credentials(), target.clone());
+        tokio::time::timeout(WAIT, async {
+            while log_rx.borrow_and_update().len() < 2 {
+                log_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let entries = log_rx.borrow().clone();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].summary, "Tapped OK");
+        assert_eq!(entries[1].summary, "Opened Home");
+
+        let fold = read_android_fold(hub.credentials(), DeviceTarget { host_id: "local".into(), device_id: "emu".into() }).await.unwrap();
+        assert!(fold.supported);
+        assert_eq!(fold.angle(), 180.0);
+        let closed = set_android_fold(hub.credentials(), DeviceTarget { host_id: "local".into(), device_id: "emu".into() }, FoldActionPosture::Closed).await.unwrap();
+        assert_eq!(closed.angle(), 0.0);
     }
 }

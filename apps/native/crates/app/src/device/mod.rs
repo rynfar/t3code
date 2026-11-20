@@ -15,8 +15,8 @@ use gpui::{App, AppContext, Context, Entity, EventEmitter, Global, Subscription,
 use serde_json::{Value, json};
 use t3_client::session::RpcError;
 use t3_core::device::tools::{Action, Detail, action_payload, detail_payload};
-use t3_core::device::{Device, DeviceFeed, Opened, Operation, Operations, SETTINGS_WRITE_SCOPE, ServiceState, close_payload, method, open_payload};
-use t3_core::right_panel::{DeviceTarget, RightPanels, Surface};
+use t3_core::device::{AgentSessionTracker, Device, DeviceFeed, Opened, Operation, Operations, SETTINGS_WRITE_SCOPE, ServiceState, close_payload, method, open_payload};
+use t3_core::right_panel::{DeviceTarget, RightPanels, Surface, SurfaceKind};
 
 pub use pane::DevicePane;
 pub(crate) use pane::{HostRetry, host_updates};
@@ -48,6 +48,8 @@ pub struct Devices {
     /// `None` until the session state answers; unknown counts as granted.
     can_configure: Option<bool>,
     operations: Operations,
+    /// Tracks new device sessions opened by agents (`agentOpenedPreviews.ts`).
+    agent_sessions: AgentSessionTracker,
     /// The thread the launcher asked to set devices up for.
     setup_requested: Option<String>,
     subscription: Option<(Abort, Task<()>)>,
@@ -116,6 +118,7 @@ impl Devices {
             feed: DeviceFeed::default(),
             can_configure: None,
             operations: Operations::default(),
+            agent_sessions: AgentSessionTracker::default(),
             setup_requested: None,
             subscription: None,
             grants: None,
@@ -157,6 +160,7 @@ impl Devices {
         self.feed = DeviceFeed::default();
         self.can_configure = None;
         self.operations.reset();
+        self.agent_sessions.reset();
         self.subscription = None;
         self.grants = None;
         if let Some(client) = state.client_handle() {
@@ -253,10 +257,42 @@ impl Devices {
     }
 
     fn apply(&mut self, next: Result<ServiceState, String>, cx: &mut Context<Self>) {
+        let newly_opened = match &next {
+            Ok(service) => self.agent_sessions.apply(service),
+            Err(_) => Vec::new(),
+        };
         let changed = match next {
             Ok(service) => self.feed.snapshot(service),
             Err(error) => self.feed.failed(error),
         };
+        if !newly_opened.is_empty() {
+            for opened in newly_opened {
+                let target = DeviceTarget {
+                    host_id: opened.host_id.clone(),
+                    device_id: opened.device_id.clone(),
+                    platform: opened.platform,
+                    name: opened.name,
+                };
+                self.state.update(cx, |state, cx| {
+                    let already_open = state
+                        .panels
+                        .panels
+                        .panel(&opened.thread_id)
+                        .surfaces
+                        .iter()
+                        .any(|surface| {
+                            matches!(
+                                &surface.kind,
+                                SurfaceKind::Device { target: Some(existing), .. }
+                                    if existing.host_id == target.host_id && existing.device_id == target.device_id
+                            )
+                        });
+                    if !already_open {
+                        edit_panels(state, &opened.thread_id, cx, |panels, thread| panels.open_device(thread, target));
+                    }
+                });
+            }
+        }
         if changed {
             cx.emit(DevicesEvent::Changed);
         }
@@ -383,5 +419,65 @@ impl Devices {
         if self.setup_requested.take().is_some() {
             cx.emit(DevicesEvent::Changed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use t3_core::device::{Platform, Session};
+
+    #[gpui::test]
+    fn agent_opened_device_session_opens_right_panel_tab_once(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, devices) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let devices = cx.new(|cx| Devices::new(state.clone(), cx));
+            (state, devices)
+        });
+
+        let mut initial = ServiceState::empty();
+        let sim = Device {
+            host_id: "local".into(),
+            id: "sim-1".into(),
+            platform: Platform::Ios,
+            name: "iPhone 16".into(),
+            version: "iOS 18".into(),
+            booted: true,
+        };
+        initial.devices.push(sim.clone());
+
+        // First snapshot sets baseline without opening any tabs.
+        devices.update(cx, |d, cx| d.apply(Ok(initial.clone()), cx));
+        state.read_with(cx, |s, _| {
+            assert!(s.panels.panels.panel("t-agent").surfaces.is_empty());
+        });
+
+        // Second snapshot adds an agent-opened session: opens a device tab on that thread.
+        let mut with_session = initial.clone();
+        with_session.sessions.push(Session {
+            thread_id: "t-agent".into(),
+            host_id: "local".into(),
+            device_id: "sim-1".into(),
+            platform: Platform::Ios,
+        });
+        devices.update(cx, |d, cx| d.apply(Ok(with_session.clone()), cx));
+        state.read_with(cx, |s, _| {
+            let surfaces = &s.panels.panels.panel("t-agent").surfaces;
+            assert_eq!(surfaces.len(), 1);
+            assert!(matches!(
+                &surfaces[0].kind,
+                SurfaceKind::Device { target: Some(t), .. } if t.device_id == "sim-1" && t.name == "iPhone 16"
+            ));
+        });
+
+        // Repeat snapshot does not duplicate the tab.
+        devices.update(cx, |d, cx| d.apply(Ok(with_session), cx));
+        state.read_with(cx, |s, _| {
+            assert_eq!(s.panels.panels.panel("t-agent").surfaces.len(), 1);
+        });
     }
 }

@@ -14,6 +14,8 @@ pub mod media_preview;
 pub mod mermaid;
 pub mod metadata;
 pub mod notebook;
+pub mod office;
+pub mod pdf;
 pub mod position;
 pub mod save;
 mod text;
@@ -573,6 +575,17 @@ pub fn is_audio(path: &str) -> bool {
 /// `isWorkspaceFontPreviewPath` (`packages/shared/src/filePreview.ts`).
 pub fn is_font(path: &str) -> bool {
     matches!(extension(path).as_deref(), Some("ttf" | "otf" | "woff" | "woff2"))
+}
+
+/// PDF documents (`packages/shared/src/filePreview.ts`: `.pdf`).
+pub fn is_pdf(path: &str) -> bool {
+    matches!(extension(path).as_deref(), Some("pdf"))
+}
+
+/// Office and rich document formats (`officePreviewKind` in `packages/shared/src/filePreview.ts`,
+/// excluding `.ipynb` which is handled by `is_notebook`).
+pub fn office_kind(path: &str) -> Option<office::OfficeKind> {
+    office::OfficeKind::from_extension(extension(path)?.as_str())
 }
 
 /// Binary container preview kinds (`binaryPreviewKind` in `packages/shared/src/filePreview.ts`).

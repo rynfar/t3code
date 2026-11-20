@@ -8,17 +8,22 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, AppContext, Context, Entity, IntoElement, ParentElement, Render, ScrollHandle, Styled, Task, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
+    ParentElement, Render, ScrollHandle, Styled, Task, Window, actions, div, prelude::*, px,
+};
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::text::TextViewState;
 use gpui_component::{ActiveTheme, Rope, h_flex, v_flex};
 use t3_client::session::RpcError;
+use t3_core::files::pdf::PdfPositionStore;
 use t3_core::files::save::FileSaveTarget;
 use t3_core::files::{
     FileContents, FileFailure, ImageKind, LineIndex, READ_FILE, ReadFailure, binary_container_kind,
     decode_read_file, delimited_separator, group_thousands, image_kind, is_audio, is_font, is_host_path,
-    is_markdown, is_mermaid, is_notebook, mask_frontmatter, read_file_request, syntax_language,
+    is_markdown, is_mermaid, is_notebook, is_pdf, mask_frontmatter, office_kind, read_file_request,
+    syntax_language,
 };
 
 use super::Root;
@@ -30,9 +35,19 @@ use super::font::{self, FontState};
 use super::image::{self, ImageState};
 use super::mermaid::MermaidView;
 use super::notebook::NotebookView;
+use super::office::{self, OfficeReady, OfficeState};
+use super::pdf::{self, PdfReady, PdfState};
 use super::table::TableView;
 use crate::app_state::AppState;
 use crate::theme::{hsla, palette};
+
+const PREVIEW_CONTEXT: &str = "FilePreview";
+
+actions!(file_preview, [FocusPreviewFind]);
+
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("secondary-f", FocusPreviewFind, Some(PREVIEW_CONTEXT))]);
+}
 
 /// Text files kept after leaving them, so tabbing back shows them at once.
 const CACHE_LIMIT: usize = 6;
@@ -100,6 +115,8 @@ enum Content {
     },
     Audio(AudioState),
     Font(FontState),
+    Pdf(PdfState),
+    Office(OfficeState),
     Binary(BinaryState),
 }
 
@@ -116,6 +133,9 @@ pub struct Preview {
     pub(super) table: TableView,
     pub(super) notebook: NotebookView,
     pub(super) mermaid: MermaidView,
+    pub(super) pdf_positions: PdfPositionStore,
+    pub(super) content_focus: FocusHandle,
+    pending_content_focus: bool,
     render_markdown: bool,
     render_mermaid: bool,
     render_table: bool,
@@ -149,6 +169,9 @@ impl Preview {
             table: TableView::new(),
             notebook: NotebookView::new(),
             mermaid: MermaidView::new(),
+            pdf_positions: PdfPositionStore::default(),
+            content_focus: cx.focus_handle().tab_stop(true),
+            pending_content_focus: false,
             render_markdown: false,
             render_mermaid: true,
             render_table: true,
@@ -163,6 +186,16 @@ impl Preview {
             handled_reveal: None,
             rendered_after_reveal: None,
         };
+        cx.on_release(|this: &mut Preview, cx| {
+            let prev = std::mem::replace(&mut this.content, Content::Empty);
+            match prev {
+                Content::Image(image) => image.release(cx),
+                Content::Audio(mut audio) => audio.stop(),
+                Content::Pdf(mut pdf) => pdf.release(cx),
+                _ => {}
+            }
+        })
+        .detach();
         preview.refresh_write_scope(cx);
         preview
     }
@@ -210,6 +243,10 @@ impl Preview {
         match previous {
             Content::Image(image) => image.release(cx),
             Content::Audio(mut audio) => audio.stop(),
+            Content::Pdf(mut pdf) => {
+                pdf.save_position(&mut self.pdf_positions);
+                pdf.release(cx);
+            }
             _ => {}
         }
         if !matches!(self.content, Content::Text(_)) {
@@ -285,6 +322,8 @@ impl Preview {
             || matches!(&self.content, Content::Image(image) if image.failed())
             || matches!(&self.content, Content::Audio(audio) if audio.failed())
             || matches!(&self.content, Content::Font(font) if font.failed())
+            || matches!(&self.content, Content::Pdf(pdf) if pdf.failed())
+            || matches!(&self.content, Content::Office(office) if office.failed())
             || matches!(&self.content, Content::Binary(binary) if binary.failed());
         if needs_retry {
             self.fetch(cx);
@@ -443,6 +482,58 @@ impl Preview {
                 let _ = this.update(cx, |this, cx| {
                     if this.generation == generation {
                         this.replace_content(Content::Image(ImageState::from(decoded)), cx);
+                        cx.notify();
+                    }
+                });
+            }));
+            return;
+        }
+
+        if is_pdf(&key.path) {
+            if !matches!(self.content, Content::Pdf(_)) {
+                self.replace_content(Content::Pdf(PdfState::Loading), cx);
+            }
+            let state = self.state.read(cx);
+            let doc_key = format!("{}:{}:{}", key.environment, key.cwd, key.path);
+            let task = pdf::load(state, &target.root, &key.path, self.mutation.as_deref());
+            self._fetch = Some(cx.spawn(async move |this, cx| {
+                let result = match task {
+                    Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+                    None => Err("Not connected to the server.".to_owned()),
+                };
+                let decoded = match result {
+                    Ok(bytes) => cx.background_executor().spawn(async move { pdf::decode(bytes) }).await,
+                    Err(error) => Err(error),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        let pdf_state = PdfState::from_decoded(doc_key, decoded, &this.pdf_positions);
+                        this.replace_content(Content::Pdf(pdf_state), cx);
+                        cx.notify();
+                    }
+                });
+            }));
+            return;
+        }
+
+        if let Some(kind) = office_kind(&key.path) {
+            if !matches!(self.content, Content::Office(_)) {
+                self.replace_content(Content::Office(OfficeState::Loading), cx);
+            }
+            let state = self.state.read(cx);
+            let task = office::load(state, &target.root, &key.path, self.mutation.as_deref());
+            self._fetch = Some(cx.spawn(async move |this, cx| {
+                let result = match task {
+                    Some(task) => task.await.unwrap_or_else(|error| Err(error.to_string())),
+                    None => Err("Not connected to the server.".to_owned()),
+                };
+                let decoded = match result {
+                    Ok(bytes) => cx.background_executor().spawn(async move { office::decode(kind, bytes) }).await,
+                    Err(error) => Err(error),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        this.replace_content(Content::Office(OfficeState::from_decoded(decoded)), cx);
                         cx.notify();
                     }
                 });
@@ -711,6 +802,90 @@ impl Preview {
         }
     }
 
+    pub(super) fn pdf_state(&self) -> Option<&PdfState> {
+        match &self.content {
+            Content::Pdf(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub(super) fn pdf_ready(&self) -> Option<&PdfReady> {
+        match &self.content {
+            Content::Pdf(PdfState::Ready(ready)) => Some(ready),
+            _ => None,
+        }
+    }
+
+    pub(super) fn pdf_ready_mut(&mut self) -> Option<&mut PdfReady> {
+        match &mut self.content {
+            Content::Pdf(PdfState::Ready(ready)) => Some(ready),
+            _ => None,
+        }
+    }
+
+    pub(super) fn office_state(&self) -> Option<&OfficeState> {
+        match &self.content {
+            Content::Office(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    pub(super) fn office_ready_mut(&mut self) -> Option<&mut OfficeReady> {
+        match &mut self.content {
+            Content::Office(OfficeState::Ready(ready)) => Some(ready),
+            _ => None,
+        }
+    }
+
+    /// Moves focus into the opened file's preview/editor (`pingdotgg/t3code#34360`).
+    pub fn request_content_focus(&mut self, cx: &mut Context<Self>) {
+        self.pending_content_focus = true;
+        cx.notify();
+    }
+
+    /// Handles `Cmd+F` / `preview.find` inside the open file preview (`#34360`, `#33956`).
+    pub fn focus_find(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.focus_pdf_find(window, cx) {
+            return true;
+        }
+        if self.editor.is_editing() {
+            if let Some(editor) = self.editor.editor.clone() {
+                editor.update(cx, |state, cx| state.focus(window, cx));
+            }
+            return true;
+        }
+        if matches!(self.content, Content::Text(_)) && !self.is_rendered_active() {
+            self.code.open_find();
+            if let Some(input) = self.code.find_input.clone() {
+                input.update(cx, |state, cx| state.focus(window, cx));
+                self.code.find_focus_pending = false;
+            }
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_pdf_for_test(&mut self, doc_key: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let decoded = pdf::decode(bytes);
+        let state = PdfState::from_decoded(doc_key.to_owned(), decoded, &self.pdf_positions);
+        self.replace_content(Content::Pdf(state), cx);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn load_office_for_test(
+        &mut self,
+        kind: t3_core::files::office::OfficeKind,
+        bytes: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        let decoded = office::decode(kind, bytes);
+        self.replace_content(Content::Office(OfficeState::from_decoded(decoded)), cx);
+        cx.notify();
+    }
+
     #[cfg(test)]
     pub(super) fn load_text_for_test(&mut self, target: Target, contents: &str, cx: &mut Context<Self>) {
         let key = Key::of(&target);
@@ -879,6 +1054,16 @@ fn loading(cx: &Context<Preview>) -> AnyElement {
 
 impl Render for Preview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.pending_content_focus) {
+            if self.editor.is_editing()
+                && let Some(editor) = self.editor.editor.clone()
+            {
+                let focus = editor.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            } else {
+                window.focus(&self.content_focus, cx);
+            }
+        }
         let body = match &self.content {
             Content::Empty | Content::Folder => div().into_any_element(),
             Content::Loading => loading(cx),
@@ -886,6 +1071,8 @@ impl Render for Preview {
             Content::Image(image) => image.render(cx),
             Content::Font(font) => font.render(cx),
             Content::Audio(_) => self.render_audio(cx),
+            Content::Pdf(_) => self.render_pdf(window, cx),
+            Content::Office(_) => self.render_office(cx),
             Content::Binary(_) => self.render_binary(cx),
             Content::Video { player, .. } => div()
                 .size_full()
@@ -919,7 +1106,18 @@ impl Render for Preview {
                 }
             }
         };
-        v_flex().relative().size_full().min_h_0().child(body).child(self.viewer.clone())
+        v_flex()
+            .id("file-preview-content")
+            .key_context(PREVIEW_CONTEXT)
+            .track_focus(&self.content_focus)
+            .on_action(cx.listener(|this, _: &FocusPreviewFind, window, cx| {
+                this.focus_find(window, cx);
+            }))
+            .relative()
+            .size_full()
+            .min_h_0()
+            .child(body)
+            .child(self.viewer.clone())
     }
 }
 
@@ -1055,7 +1253,81 @@ mod tests {
             window.draw(cx).clear();
         });
 
-        // 6. In-place editor + dirty state + unsaved dismissal guard + discard
+        // 6. PDF preview + progressive Find (`#33956`) and Office spreadsheet preview + row/col resize (`#35548`)
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                let sample_pdf = b"%PDF-1.4\n1 0 obj << /Type /Page /MediaBox [0 0 612 792] /Contents 2 0 R >> endobj\n2 0 obj << /Length 36 >>\nstream\nBT /F1 18 Tf (Quarterly needle) Tj ET\nendstream\nendobj\n";
+                p.load_pdf_for_test("env:repo:report.pdf", sample_pdf.to_vec(), cx);
+                assert!(p.pdf_ready().is_some());
+            });
+            window.draw(cx).clear();
+            preview.update(cx, |p, cx| {
+                assert!(p.focus_find(window, cx));
+                let find_input = p.pdf_ready().and_then(|r| r.find_input.clone()).expect("pdf find input");
+                assert!(find_input.read(cx).focus_handle(cx).is_focused(window));
+                // Blur before `TestWindow` repaints (`gpui-component` calls `set_text_content_type` on focused inputs).
+                window.blur();
+            });
+        });
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_office_for_test(t3_core::files::office::OfficeKind::Rtf, br"{\rtf1\ansi Hello\par World}".to_vec(), cx);
+                assert!(p.office_ready_mut().is_some());
+            });
+            window.draw(cx).clear();
+        });
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                let wb = t3_core::files::office::OfficeWorkbook {
+                    sheets: vec![t3_core::files::office::OfficeSheet {
+                        name: "Data".into(),
+                        rows: vec![vec!["Item".into(), "42".into()]],
+                        column_count: 2,
+                        col_widths: vec![100.0, 100.0],
+                        row_heights: vec![24.0],
+                        frozen_rows: 0,
+                        frozen_cols: 0,
+                        show_gridlines: true,
+                        truncated: false,
+                    }],
+                    truncated: false,
+                };
+                p.replace_content(
+                    Content::Office(OfficeState::from_decoded(Ok(t3_core::files::office::OfficePreview::Workbook(wb)))),
+                    cx,
+                );
+                let ready = p.office_ready_mut().expect("office workbook ready");
+                if let t3_core::files::office::OfficePreview::Workbook(wb) = &mut ready.preview {
+                    assert_eq!(wb.sheets[0].set_col_width(0, 180.0).unwrap(), 180.0);
+                    assert_eq!(wb.sheets[0].set_row_height(0, 48.0).unwrap(), 48.0);
+                } else {
+                    panic!("expected workbook preview");
+                }
+            });
+            window.draw(cx).clear();
+        });
+
+        // 7. Read-only code preview Cmd+F opens in-file find bar and matches lines (`#34360`)
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_text_for_test(test_target("src/find_me.rs"), "fn alpha() {}\nfn beta_target() {}\n", cx);
+                p.request_content_focus(cx);
+                p.code.find_open = true;
+                p.code.find_query = "beta".into();
+                p.code.recompute_find();
+                assert_eq!(p.code.find_matches, vec![1]);
+            });
+            window.draw(cx).clear();
+            preview.update(cx, |p, cx| {
+                assert!(p.content_focus.is_focused(window));
+                assert!(p.focus_find(window, cx));
+                let input = p.code.find_input.clone().expect("code find input");
+                assert!(input.read(cx).focus_handle(cx).is_focused(window));
+                window.blur();
+            });
+        });
+
+        // 8. In-place editor + dirty state + unsaved dismissal guard + discard
         vcx.update(|window, cx| {
             preview.update(cx, |p, cx| {
                 p.load_text_for_test(test_target("src/lib.rs"), "pub fn hi() {}\n", cx);
