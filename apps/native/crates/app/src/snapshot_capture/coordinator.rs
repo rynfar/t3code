@@ -662,6 +662,36 @@ mod gpui_tests {
             assert_eq!(staged[0].name, "snapshot-t3-code-docs.png");
         });
 
+        // When the active thread is deleted/cleared and `resolve_or_create_target` synchronously
+        // opens a fallback draft before `Composer::refresh` runs, `attach_snapshot_png` must stage
+        // onto the newly opened draft rather than the stale `composer.snapshot.target` thread.
+        let mut third_capture = mock.next_capture.lock().unwrap().clone().unwrap();
+        third_capture.capture_id = "snap-test-3".to_owned();
+        third_capture.window_title = "Fallback Draft Capture".to_owned();
+        mock.set_next_capture(Ok(third_capture));
+        vcx.update(|_, cx| {
+            state.update(cx, |state, _| {
+                // Intentionally clear selected_thread without emitting Selection so Composer keeps
+                // its stale `snapshot.target == Some(Thread("t-snap"))` when capture lands.
+                state.selected_thread = None;
+                state.draft_project = None;
+            });
+            coordinator.update(cx, |c, cx| c.capture_now(false, cx));
+        });
+        vcx.run_until_parked();
+        vcx.read(|cx| {
+            assert_eq!(state.read(cx).draft_project.as_deref(), Some("p-snap"));
+            let thread_staged = composer.read(cx).test_staged_thread_attachments("t-snap");
+            assert_eq!(thread_staged.len(), 1, "stale thread must not receive fallback capture");
+            let draft_staged = composer.read(cx).test_staged_draft_attachments("p-snap");
+            assert!(
+                draft_staged
+                    .iter()
+                    .any(|att| att.name == "snapshot-fallback-draft-capture.png"),
+                "fallback draft must receive the newly captured PNG"
+            );
+        });
+
         // Revoking screen recording permission tears down the shortcut and reports attention.
         mock.set_permissions(Some(MacSnapShotPermissions {
             screen_recording: false,

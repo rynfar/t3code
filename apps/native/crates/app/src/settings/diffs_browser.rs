@@ -104,6 +104,12 @@ impl BrowserState {
                 if !view.browser.snapshot.recording {
                     return;
                 }
+                let setup_open = crate::snapshot_capture::active_setup_dialog(cx)
+                    .is_some_and(|dialog| dialog.read(cx).is_open());
+                if view.section != t3_core::settings::search::Section::SnapShot || setup_open {
+                    view.stop_snapshot_recording(cx);
+                    return;
+                }
                 if event.keystroke.key == "tab" {
                     return;
                 }
@@ -118,6 +124,39 @@ impl BrowserState {
                 }
             });
         });
+        let self_sub = cx.observe_self(|view, cx| {
+            if view.browser.snapshot.recording
+                && view.section != t3_core::settings::search::Section::SnapShot
+            {
+                view.stop_snapshot_recording(cx);
+            }
+        });
+        let release_sub = cx.on_release(|view: &mut SettingsView, cx| {
+            if view.browser.snapshot.recording {
+                view.browser.snapshot.recording = false;
+                if let Some(coordinator) = crate::snapshot_capture::active_coordinator(cx) {
+                    coordinator.update(cx, |c, cx| c.set_shortcut_suppressed(false, cx));
+                }
+            }
+        });
+        let mut subscriptions = vec![url_sub, width_sub, height_sub, snap_key_sub, self_sub, release_sub];
+        if let Some(coordinator) = crate::snapshot_capture::active_coordinator(cx) {
+            subscriptions.push(cx.observe(&coordinator, |view, _, cx| {
+                if view.section == t3_core::settings::search::Section::SnapShot {
+                    cx.notify();
+                }
+            }));
+        }
+        if let Some(dialog) = crate::snapshot_capture::active_setup_dialog(cx) {
+            subscriptions.push(cx.observe(&dialog, |view, dialog, cx| {
+                if dialog.read(cx).is_open() && view.browser.snapshot.recording {
+                    view.stop_snapshot_recording(cx);
+                }
+                if view.section == t3_core::settings::search::Section::SnapShot {
+                    cx.notify();
+                }
+            }));
+        }
         Self {
             custom_url,
             viewport_width,
@@ -125,7 +164,7 @@ impl BrowserState {
             profile_inputs: HashMap::new(),
             advanced: false,
             snapshot: SnapShotPageState::default(),
-            _subscriptions: vec![url_sub, width_sub, height_sub, snap_key_sub],
+            _subscriptions: subscriptions,
         }
     }
 }
@@ -1161,11 +1200,16 @@ impl SettingsView {
         let setup_btn_label = snap_shot_setup_button_label(Some(&backend));
 
         let mut enable_controls = h_flex().items_center().gap(r(8.));
+        let weak_setup_btn = cx.entity().downgrade();
+        let weak_switch_setup = cx.entity().downgrade();
         if enabled {
             enable_controls = enable_controls.child(
                 Button::new("snap-shot-setup-btn", ButtonVariant::Outline, ButtonSize::Xs)
                     .label(setup_btn_label)
-                    .on_click(|_, _, cx| {
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_setup_btn.update(cx, |view, cx| {
+                            view.stop_snapshot_recording(cx);
+                        });
                         if let Some(dialog) = crate::snapshot_capture::active_setup_dialog(cx) {
                             dialog.update(cx, |d, cx| d.open(None, cx));
                         }
@@ -1175,6 +1219,9 @@ impl SettingsView {
         enable_controls = enable_controls.child(
             Switch::new("snap-shot-enabled-switch", enabled).on_change(move |checked, _, cx| {
                 if !checked {
+                    let _ = weak_switch_setup.update(cx, |view, cx| {
+                        view.stop_snapshot_recording(cx);
+                    });
                     store::update_client(
                         &switch_state,
                         ClientSettingChange::SnapShotEnabled(false),
@@ -1183,6 +1230,9 @@ impl SettingsView {
                 } else if !setup_complete
                     && let Some(dialog) = crate::snapshot_capture::active_setup_dialog(cx)
                 {
+                    let _ = weak_switch_setup.update(cx, |view, cx| {
+                        view.stop_snapshot_recording(cx);
+                    });
                     dialog.update(cx, |d, cx| d.open(None, cx));
                 } else {
                     store::update_client(
@@ -1568,7 +1618,7 @@ mod tests {
 
 #[cfg(all(test, feature = "snapshot"))]
 mod gpui_tests {
-    use gpui::{Context, IntoElement, ParentElement, Render, Window};
+    use gpui::{AppContext, Context, IntoElement, ParentElement, Render, Window};
     use serde_json::json;
     use t3_core::client_settings::ClientSettingChange;
     use t3_core::preview::viewport::{
@@ -1725,6 +1775,114 @@ mod gpui_tests {
             window.refresh();
             window.draw(cx).clear();
         });
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn snapshot_recorder_clears_suppression_on_section_switch_setup_open_and_settings_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mock = Arc::new(crate::snapshot_capture::MockSnapShotPlatform::macos_ready());
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::snapshot_capture::install_platform(mock.clone(), cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            let mut scratch = t3_core::client_settings::ClientSettingsDoc::default();
+            let patch = scratch.apply_change(&ClientSettingChange::SnapShotEnabled(true));
+            crate::settings::store::install_committed_client(&state, patch, cx);
+        });
+
+        let state_for_win = state.clone();
+        let window = cx.add_window(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state_for_win.clone(), window, cx));
+            let coordinator = cx.new(|cx| {
+                crate::snapshot_capture::SnapShotCoordinator::new(
+                    state_for_win.clone(),
+                    composer,
+                    window,
+                    cx,
+                )
+            });
+            let setup_dialog = cx.new(|cx| {
+                crate::snapshot_capture::SnapShotSetupDialog::new(
+                    state_for_win.clone(),
+                    coordinator.clone(),
+                    window,
+                    cx,
+                )
+            });
+            crate::snapshot_capture::register_workspace_handles(coordinator, setup_dialog, cx);
+            SettingsFrame
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| crate::settings::open_at(Section::SnapShot, None, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        assert!(!mock.active_listener_stopped.load(Ordering::SeqCst));
+
+        // 1. Start recording on SnapShot section -> global shortcut suppressed.
+        let settings_view = vcx.read(|cx| cx.global::<super::super::Host>().view.clone().expect("settings view"));
+        vcx.update(|_, cx| {
+            settings_view.update(cx, |view, cx| view.start_snapshot_recording(cx));
+        });
+        assert!(mock.active_listener_stopped.load(Ordering::SeqCst));
+
+        // 2. Switching to another section stops recording and restores the global shortcut.
+        vcx.update(|_, cx| {
+            settings_view.update(cx, |view, cx| view.navigate(Section::Diffs, None, cx));
+        });
+        vcx.run_until_parked();
+        assert!(!settings_view.read_with(&vcx, |view, _| view.browser.snapshot.recording));
+        assert!(!mock.active_listener_stopped.load(Ordering::SeqCst));
+
+        // 3. Opening SnapShotSetupDialog while recording stops Settings recording.
+        vcx.update(|_, cx| {
+            settings_view.update(cx, |view, cx| {
+                view.navigate(Section::SnapShot, None, cx);
+                view.start_snapshot_recording(cx);
+            });
+        });
+        assert!(mock.active_listener_stopped.load(Ordering::SeqCst));
+        vcx.update(|_, cx| {
+            let dialog = crate::snapshot_capture::active_setup_dialog(cx).expect("setup dialog");
+            dialog.update(cx, |d, cx| d.open(None, cx));
+        });
+        vcx.run_until_parked();
+        assert!(!settings_view.read_with(&vcx, |view, _| view.browser.snapshot.recording));
+        assert!(!mock.active_listener_stopped.load(Ordering::SeqCst));
+
+        // 4. Closing Settings while recording triggers `on_release` and restores the global shortcut.
+        vcx.update(|_, cx| {
+            let dialog = crate::snapshot_capture::active_setup_dialog(cx).expect("setup dialog");
+            dialog.update(cx, |d, cx| d.close(false, cx));
+            settings_view.update(cx, |view, cx| view.start_snapshot_recording(cx));
+        });
+        assert!(mock.active_listener_stopped.load(Ordering::SeqCst));
+        drop(settings_view);
+        vcx.update(|window, cx| {
+            super::super::finish_close(window, cx);
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+        assert!(!mock.active_listener_stopped.load(Ordering::SeqCst));
 
         state.update(&mut vcx, |state, _| state.stop_pump());
         vcx.run_until_parked();

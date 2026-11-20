@@ -460,6 +460,19 @@ impl Composer {
             .collect()
     }
 
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(crate) fn test_staged_draft_attachments(&self, project_id: &str) -> Vec<crate::app_state::RestoredAttachment> {
+        self.staged_for(&Target::Draft(project_id.to_owned()))
+            .iter()
+            .map(|entry| crate::app_state::RestoredAttachment {
+                kind: entry.attachment.kind,
+                name: entry.attachment.name.clone(),
+                mime_type: entry.attachment.mime_type.clone(),
+                bytes: entry.bytes.as_deref().cloned().unwrap_or_default(),
+            })
+            .collect()
+    }
+
     fn cancel_pending_routed_send_for(&mut self, target: &Target) -> bool {
         let matches = self.snapshot.target.as_ref() == Some(target)
             || self
@@ -552,16 +565,22 @@ impl Composer {
                 return Err(QUESTION_ATTACHMENTS_UNSUPPORTED_ERROR.to_owned());
             }
             q_target
-        } else if let Some(target) = self.snapshot.target.clone() {
-            target
         } else {
+            // Read live selection (`self.fixed` -> `state.selected_thread` -> `state.draft_project`)
+            // before falling back to `self.snapshot.target`, matching `Composer::read_snapshot`, so
+            // synchronous route switches from `SnapShotCoordinator::resolve_or_create_target` never
+            // stage onto a stale target before GPUI flushes `Composer::refresh`.
             let state = self.state.read(cx);
-            if let Some(thread_id) = state.selected_thread.clone() {
-                Target::Thread(thread_id)
-            } else if let Some(project_id) = state.draft_project.clone() {
-                Target::Draft(project_id)
-            } else {
-                return Err("No active thread or draft.".to_owned());
+            match (
+                self.fixed.as_ref().or(state.selected_thread.as_ref()),
+                &state.draft_project,
+            ) {
+                (Some(thread_id), _) => Target::Thread(thread_id.clone()),
+                (None, Some(project_id)) => Target::Draft(project_id.clone()),
+                _ => match self.snapshot.target.clone() {
+                    Some(target) => target,
+                    None => return Err("No active thread or draft.".to_owned()),
+                },
             }
         };
 
