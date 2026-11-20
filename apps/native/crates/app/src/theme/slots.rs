@@ -200,7 +200,8 @@ fn override_uses_raster_or_rim(ov: &SlotStyleOverride) -> bool {
         || matches!(
             &ov.background,
             Some(SlotBackground::LinearGradient { stops, .. })
-                if stops.len() >= 3 && all_stops_equal(stops).is_none()
+                if ov.background_color.is_some()
+                    || (stops.len() >= 3 && all_stops_equal(stops).is_none())
         )
 }
 
@@ -879,7 +880,8 @@ fn render_override_background_layer(
         SlotBackground::ThemeBackgroundImage { .. } => background_image(cx).is_some(),
         SlotBackground::RadialGradient { .. } => true,
         SlotBackground::LinearGradient { stops, .. } => {
-            stops.len() >= 3 && all_stops_equal(stops).is_none()
+            ov.background_color.is_some()
+                || (stops.len() >= 3 && all_stops_equal(stops).is_none())
         }
         SlotBackground::Solid(_) | SlotBackground::Transparent => false,
     };
@@ -1873,6 +1875,54 @@ mod tests {
         visual_cx.refresh().unwrap();
 
         cx.update(|cx| {
+            theme::preview(None, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn two_stop_linear_gradient_with_background_color_uses_layered_underlay(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let css = r#"
+            [data-slot="sidebar-inner"] {
+                background-color: #07080C;
+                background-image: linear-gradient(180deg, rgba(139, 116, 255, 0.3), transparent);
+                border-radius: 12px;
+            }
+            [data-slot="settings-group"] {
+                background-image: linear-gradient(180deg, rgba(139, 116, 255, 0.3), transparent);
+            }
+        "#;
+        let colors = themes::standard(true);
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::init(cx);
+            theme::preview_with_css(Some((&colors, Some(css), true)), cx);
+
+            // With `background-color` + 2-stop `linear-gradient(...)`, the slot delegates painting
+            // to the background layer (so the solid underlay is preserved beneath the gradient).
+            let sb_ov = slot_style(ThemeSlot::SidebarInner, cx).unwrap().base;
+            assert_eq!(sb_ov.background_color, Some(0x0708_0cff));
+            assert!(override_uses_raster_or_rim(&sb_ov));
+            let mut sb = div().theme_slot(ThemeSlot::SidebarInner, cx);
+            assert_eq!(
+                sb.style().background,
+                Some(Fill::Color(solid_background(transparent_black())))
+            );
+            assert!(theme_slot_background_layer(ThemeSlot::SidebarInner, cx).is_some());
+            assert!(
+                theme_slot_clipped_background_layer(ThemeSlot::SidebarInner, px(12.), cx)
+                    .is_some()
+            );
+
+            // Without `background-color`, a plain 2-stop `linear-gradient(...)` still uses native
+            // GPUI `linear_gradient` directly on the host style with no extra background layer.
+            let group_ov = slot_style(ThemeSlot::SettingsGroup, cx).unwrap().base;
+            assert!(group_ov.background_color.is_none());
+            assert!(!override_uses_raster_or_rim(&group_ov));
+            assert!(theme_slot_background_layer(ThemeSlot::SettingsGroup, cx).is_none());
+
             theme::preview(None, cx);
         });
     }

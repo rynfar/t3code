@@ -364,21 +364,130 @@ fn embedded_font_fingerprint(bytes: &[u8]) -> (u64, u64, usize) {
     (h1, h2, bytes.len())
 }
 
+/// Upper bound on decoded SFNT output bytes from an embedded `@font-face` payload (4x the 4 MiB
+/// compressed input cap). Guards against crafted WOFF1 headers declaring huge `origLength` or
+/// `totalSfntSize` values that would otherwise trigger unbounded `Vec::with_capacity` allocations
+/// inside `wuff::decompress_woff1`.
+const MAX_DECODED_SFNT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Validates WOFF1 header and table directory bounds before invoking `wuff::decompress_woff1`.
+///
+/// `wuff::decompress_woff1` passes each table's untrusted `origLength` straight to
+/// `Vec::with_capacity`, so we verify every table's bounds and the cumulative reconstructed SFNT
+/// size against [`MAX_DECODED_SFNT_BYTES`] up front.
+fn validate_woff1_bounds(bytes: &[u8]) -> bool {
+    const WOFF1_HEADER_LEN: usize = 44;
+    const WOFF1_TABLE_ENTRY_LEN: usize = 20;
+    const SFNT_HEADER_LEN: usize = 12;
+    const SFNT_TABLE_ENTRY_LEN: usize = 16;
+
+    if bytes.len() < WOFF1_HEADER_LEN || &bytes[0..4] != b"wOFF" {
+        return false;
+    }
+    let read_u16 = |offset: usize| u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+    let read_u32 = |offset: usize| {
+        u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+
+    let declared_len = read_u32(8) as usize;
+    let num_tables = read_u16(12) as usize;
+    let reserved = read_u16(14);
+    let total_sfnt_size = read_u32(16) as usize;
+
+    if declared_len != bytes.len()
+        || num_tables == 0
+        || reserved != 0
+        || total_sfnt_size == 0
+        || total_sfnt_size > MAX_DECODED_SFNT_BYTES
+    {
+        return false;
+    }
+
+    let Some(dir_end) = num_tables
+        .checked_mul(WOFF1_TABLE_ENTRY_LEN)
+        .and_then(|n| WOFF1_HEADER_LEN.checked_add(n))
+    else {
+        return false;
+    };
+    if dir_end > bytes.len() {
+        return false;
+    }
+
+    let Some(mut expected_sfnt_len) = num_tables
+        .checked_mul(SFNT_TABLE_ENTRY_LEN)
+        .and_then(|n| SFNT_HEADER_LEN.checked_add(n))
+    else {
+        return false;
+    };
+    if expected_sfnt_len > MAX_DECODED_SFNT_BYTES {
+        return false;
+    }
+
+    for i in 0..num_tables {
+        let entry = WOFF1_HEADER_LEN + i * WOFF1_TABLE_ENTRY_LEN;
+        let woff_offset = read_u32(entry + 4) as usize;
+        let woff_length = read_u32(entry + 8) as usize;
+        let orig_length = read_u32(entry + 12) as usize;
+
+        if woff_length > orig_length || orig_length > MAX_DECODED_SFNT_BYTES {
+            return false;
+        }
+        let Some(table_end) = woff_offset.checked_add(woff_length) else {
+            return false;
+        };
+        if table_end > bytes.len() {
+            return false;
+        }
+        let Some(padded_orig) = orig_length.checked_add(3).map(|n| n & !3) else {
+            return false;
+        };
+        let Some(next_total) = expected_sfnt_len.checked_add(padded_orig) else {
+            return false;
+        };
+        if next_total > MAX_DECODED_SFNT_BYTES {
+            return false;
+        }
+        expected_sfnt_len = next_total;
+    }
+
+    true
+}
+
+fn decode_woff1_bounded(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !validate_woff1_bounds(bytes) {
+        return None;
+    }
+    let sfnt = wuff::decompress_woff1(bytes).ok()?;
+    (sfnt.len() <= MAX_DECODED_SFNT_BYTES).then_some(sfnt)
+}
+
+fn decode_woff2_bounded(bytes: &[u8]) -> Option<Vec<u8>> {
+    let sfnt = wuff::decompress_woff2(bytes).ok()?;
+    (sfnt.len() <= MAX_DECODED_SFNT_BYTES).then_some(sfnt)
+}
+
 fn decode_embedded_font_sfnt(face: &EmbeddedFontFace) -> Option<Vec<u8>> {
     match face.format {
-        EmbeddedFontFormat::Woff2 => wuff::decompress_woff2(&face.bytes).ok(),
-        EmbeddedFontFormat::Woff => wuff::decompress_woff1(&face.bytes).ok(),
-        EmbeddedFontFormat::TrueType | EmbeddedFontFormat::OpenType => Some(face.bytes.clone()),
+        EmbeddedFontFormat::Woff2 => decode_woff2_bounded(&face.bytes),
+        EmbeddedFontFormat::Woff => decode_woff1_bounded(&face.bytes),
+        EmbeddedFontFormat::TrueType | EmbeddedFontFormat::OpenType => {
+            (face.bytes.len() <= MAX_DECODED_SFNT_BYTES).then(|| face.bytes.clone())
+        }
         EmbeddedFontFormat::Unknown => {
             if face.bytes.starts_with(b"wOF2") {
-                wuff::decompress_woff2(&face.bytes).ok()
+                decode_woff2_bounded(&face.bytes)
             } else if face.bytes.starts_with(b"wOFF") {
-                wuff::decompress_woff1(&face.bytes).ok()
+                decode_woff1_bounded(&face.bytes)
             } else if face.bytes.starts_with(b"OTTO")
                 || face.bytes.starts_with(&[0x00, 0x01, 0x00, 0x00])
                 || face.bytes.starts_with(b"true")
             {
-                Some(face.bytes.clone())
+                (face.bytes.len() <= MAX_DECODED_SFNT_BYTES).then(|| face.bytes.clone())
             } else {
                 None
             }
@@ -1066,5 +1175,69 @@ mod tests {
 
             preview(None, cx);
         });
+    }
+
+    fn build_test_woff1(total_sfnt_size: u32, orig_length: u32, table_data: &[u8]) -> Vec<u8> {
+        let table_offset: u32 = 44 + 20;
+        let padded_table_len = (table_data.len() + 3) & !3;
+        let total_len = table_offset as usize + padded_table_len;
+        let mut buf = Vec::with_capacity(total_len);
+        buf.extend_from_slice(b"wOFF");
+        buf.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // flavor
+        buf.extend_from_slice(&(total_len as u32).to_be_bytes()); // length
+        buf.extend_from_slice(&1u16.to_be_bytes()); // numTables
+        buf.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        buf.extend_from_slice(&total_sfnt_size.to_be_bytes()); // totalSfntSize
+        buf.extend_from_slice(&1u16.to_be_bytes()); // majorVersion
+        buf.extend_from_slice(&0u16.to_be_bytes()); // minorVersion
+        buf.extend_from_slice(&[0u8; 20]); // metaOffset..privLength
+        debug_assert_eq!(buf.len(), 44);
+        // Single table directory entry (20 bytes)
+        buf.extend_from_slice(b"head");
+        buf.extend_from_slice(&table_offset.to_be_bytes()); // offset
+        buf.extend_from_slice(&(table_data.len() as u32).to_be_bytes()); // compLength
+        buf.extend_from_slice(&orig_length.to_be_bytes()); // origLength
+        buf.extend_from_slice(&0u32.to_be_bytes()); // origChecksum
+        buf.extend_from_slice(table_data);
+        buf.resize(total_len, 0);
+        buf
+    }
+
+    #[test]
+    fn oversized_woff1_headers_are_rejected_without_allocating() {
+        // Crafted WOFF1 declaring `origLength = u32::MAX` (compressed because compLength < origLength)
+        // must be rejected before `wuff::decompress_woff1` attempts `Vec::with_capacity(u32::MAX)`.
+        let bogus_table = build_test_woff1(64, u32::MAX, &[0x78, 0x9c, 0x03, 0x00]);
+        for format in [EmbeddedFontFormat::Woff, EmbeddedFontFormat::Unknown] {
+            let face = EmbeddedFontFace {
+                family: "EvilWoff".to_owned(),
+                format,
+                bytes: bogus_table.clone(),
+            };
+            assert!(
+                decode_embedded_font_sfnt(&face).is_none(),
+                "expected oversized origLength WOFF1 ({format:?}) to be rejected"
+            );
+        }
+
+        // Oversized `totalSfntSize` is also rejected.
+        let bogus_total = build_test_woff1(u32::MAX, 4, &[1, 2, 3, 4]);
+        let face_total = EmbeddedFontFace {
+            family: "EvilTotal".to_owned(),
+            format: EmbeddedFontFormat::Woff,
+            bytes: bogus_total,
+        };
+        assert!(decode_embedded_font_sfnt(&face_total).is_none());
+
+        // A small valid uncompressed WOFF1 still decodes cleanly into an SFNT header + table.
+        let valid = build_test_woff1(12 + 16 + 4, 4, &[0xde, 0xad, 0xbe, 0xef]);
+        let face_valid = EmbeddedFontFace {
+            family: "SmallWoff".to_owned(),
+            format: EmbeddedFontFormat::Woff,
+            bytes: valid,
+        };
+        let sfnt = decode_embedded_font_sfnt(&face_valid).expect("valid minimal WOFF1 decodes");
+        assert_eq!(&sfnt[0..4], &[0x00, 0x01, 0x00, 0x00]);
+        assert!(sfnt.ends_with(&[0xde, 0xad, 0xbe, 0xef]));
     }
 }
