@@ -555,3 +555,47 @@ async fn capture_screenshot_attaches_full_frame_png_to_composer(cx: &mut gpui::T
     state.update(window_cx, |state, _| state.stop_pump());
     window_cx.run_until_parked();
 }
+
+#[gpui::test]
+async fn frame_view_reports_stalled_when_connected_without_frames_and_clears_on_disconnect(cx: &mut gpui::TestAppContext) {
+    cx.executor().allow_parking();
+    let (state, previews, _fixture, _runtime) = setup(cx);
+    previews.update(cx, |previews, cx| {
+        previews.seed_snapshot_for_test(snapshot("tab-stall", "https://example.com/", Some("default")), cx);
+    });
+
+    let (pane, window_cx) = cx.add_window_view(|window, cx| {
+        PreviewPane::new(
+            state.clone(),
+            previews.clone(),
+            "menu-thread".into(),
+            "browser:tab-stall".into(),
+            Some("tab-stall".into()),
+            window,
+            cx,
+        )
+    });
+
+    let frame = pane.read_with(window_cx, |pane, _| pane.frame_for_test().expect("frame view exists"));
+    frame.update(window_cx, |frame, cx| {
+        assert!(!frame.frames_stalled());
+        frame.inject_stream_event_for_test(StreamEvent::Connected(true), cx);
+        assert!(!frame.frames_stalled());
+    });
+
+    // Advancing the deterministic GPUI test clock past NO_FRAME_TIMEOUT_MS triggers the alert (`pingdotgg/t3code#38865`).
+    window_cx.executor().advance_clock(std::time::Duration::from_millis(t3_core::preview::stream::NO_FRAME_TIMEOUT_MS + 1));
+    window_cx.run_until_parked();
+    frame.read_with(window_cx, |frame, _| {
+        assert!(frame.frames_stalled(), "connected stream with zero frames should surface stalled alert");
+    });
+
+    // Disconnecting clears the stalled alert cleanly.
+    frame.update(window_cx, |frame, cx| {
+        frame.inject_stream_event_for_test(StreamEvent::Connected(false), cx);
+        assert!(!frame.frames_stalled());
+    });
+
+    state.update(window_cx, |state, _| state.stop_pump());
+    window_cx.run_until_parked();
+}

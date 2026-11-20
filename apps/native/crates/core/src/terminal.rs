@@ -18,9 +18,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub use focus::{LastThreadFocus, PendingFocus, TerminalFocusQueue, ThreadEnterFocusDecision};
-pub use input::{KeyInput, TerminalShortcut, encode_key, encode_paste, local_shortcut, paste_chunks, shortcut_data};
+pub use input::{
+    BRACKETED_PASTE_END, KeyInput, TerminalShortcut, encode_key, encode_paste, is_chunked_bracketed_paste, local_shortcut, paste_chunks,
+    shortcut_data,
+};
 pub use layout::{
-    MAX_TERMINALS_PER_GROUP, SplitDirection, TerminalGroup, TerminalLayouts, ThreadTerminalLayout,
+    MAX_TERMINALS_PER_GROUP, SnapshotId, SplitDirection, TerminalGroup, TerminalLayouts, ThreadTerminalLayout,
     pick_existing_terminal, should_reconcile,
 };
 

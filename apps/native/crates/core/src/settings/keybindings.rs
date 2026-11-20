@@ -166,6 +166,8 @@ pub struct BindingRow {
     pub when_ast: Option<KeybindingWhenNode>,
     pub shortcut: KeybindingShortcut,
     pub source: BindingSource,
+    /// A default shortcut overridden with `when: "false"` so it stays disabled (`pingdotgg/t3code#28687`).
+    pub is_unassigned: bool,
     pub default_key: Option<String>,
     pub default_when: String,
     /// Labels of the commands bound to the same chord where both can apply, sorted.
@@ -182,9 +184,14 @@ impl BindingRow {
         self.source == BindingSource::Custom && self.default_key.is_some()
     }
 
-    /// The row menu's "Remove": anything that is not a default.
+    /// The row menu's "Unassign": disables a default binding with `when: "false"` (`pingdotgg/t3code#28687`).
+    pub fn can_unassign(&self) -> bool {
+        self.source == BindingSource::Default
+    }
+
+    /// The row menu's "Remove": anything that is not a default; unassigned defaults use Reset instead.
     pub fn can_remove(&self) -> bool {
-        self.source != BindingSource::Default
+        self.source != BindingSource::Default && !self.is_unassigned
     }
 }
 
@@ -245,19 +252,32 @@ fn source_for(binding: &ResolvedKeybindingRule) -> BindingSource {
     }
 }
 
-/// `defaultBindingForBinding`: the identical default, else one with the same `when`, else any.
+/// `defaultBindingForBinding`: the identical default, else a default with the same key when
+/// unassigned (`when: "false"`), else one with the same `when`, else any.
 fn default_for(binding: &ResolvedKeybindingRule) -> Option<&'static ResolvedKeybindingRule> {
     let defaults = default_resolved_keybindings();
+    let key = shortcut_to_keybinding_input(&binding.shortcut);
     let when = when_ast_to_expression(binding.when_ast.as_ref());
     defaults
         .iter()
         .find(|entry| same_binding(entry, binding))
+        .or_else(|| {
+            (when == "false").then(|| {
+                defaults
+                    .iter()
+                    .find(|entry| entry.command == binding.command && shortcut_to_keybinding_input(&entry.shortcut) == key)
+            })?
+        })
         .or_else(|| defaults.iter().find(|entry| entry.command == binding.command && when_ast_to_expression(entry.when_ast.as_ref()) == when))
         .or_else(|| defaults.iter().find(|entry| entry.command == binding.command))
 }
 
-/// `conflictsWithWhen`: an unconditional binding overlaps everything; otherwise only equal clauses.
+/// `conflictsWithWhen`: `false` never triggers; an unconditional binding overlaps everything;
+/// otherwise only equal clauses.
 fn conflicts_with_when(left: &str, right: &str) -> bool {
+    if left == "false" || right == "false" {
+        return false;
+    }
     left.is_empty() || right.is_empty() || left == right
 }
 
@@ -286,9 +306,12 @@ pub fn binding_rows(server_keybindings: &Value, mac: bool) -> Vec<BindingRow> {
         let when = when_ast_to_expression(binding.when_ast.as_ref());
         let id = format!("{}\u{0}{key}\u{0}{when}", binding.command);
         let default = default_for(&binding);
+        let default_key = default.map(|entry| shortcut_to_keybinding_input(&entry.shortcut));
+        let is_unassigned = when == "false" && default_key.as_deref() == Some(key.as_str());
         let row = BindingRow {
             source: source_for(&binding),
-            default_key: default.map(|entry| shortcut_to_keybinding_input(&entry.shortcut)),
+            is_unassigned,
+            default_key,
             default_when: when_ast_to_expression(default.and_then(|entry| entry.when_ast.as_ref())),
             command: binding.command,
             shortcut: binding.shortcut,
@@ -532,6 +555,11 @@ pub fn reset_payload(row: &BindingRow) -> Option<Value> {
     row.default_key.as_deref().map(|key| upsert_payload(&row.command, key, &row.default_when, Some(row)))
 }
 
+/// `unassignKeybinding` (`pingdotgg/t3code#28687`): disables a default shortcut with `when: "false"`.
+pub fn unassign_payload(row: &BindingRow) -> Option<Value> {
+    (row.source == BindingSource::Default).then(|| upsert_payload(&row.command, &row.key, "false", Some(row)))
+}
+
 /// The `keybindings.json` key pill (`KeybindingPill`): one cap per part, platform glyphs for
 /// modifiers, single characters upper-cased.
 pub fn key_pill_parts(key: &str, mac: bool) -> Vec<String> {
@@ -541,6 +569,8 @@ pub fn key_pill_parts(key: &str, mac: bool) -> Vec<String> {
             "shift" => "⇧".to_owned(),
             "alt" => (if mac { "⌥" } else { "Alt" }).to_owned(),
             "ctrl" => "⌃".to_owned(),
+            "pageup" => "PageUp".to_owned(),
+            "pagedown" => "PageDown".to_owned(),
             part if part.chars().count() == 1 => part.to_uppercase(),
             part => part.to_owned(),
         })
@@ -834,5 +864,57 @@ mod toast_controller_tests {
         );
         assert_eq!(ctrl.handle(&[], 3_200), Some(KeybindingsUpdateToastDecision::Success));
         assert_eq!(ctrl.handle(&[], 4_000), None, "repeated success within 2s is suppressed");
+    }
+
+    #[test]
+    fn unassigned_default_shortcut_hides_conflicts_and_builds_unassign_and_reset_payloads() {
+        let defaults = binding_rows(&Value::Null, true);
+        let sidebar = defaults.iter().find(|row| row.command == "sidebar.toggle").expect("default sidebar.toggle");
+        assert!(sidebar.can_unassign());
+        assert!(!sidebar.can_reset());
+        assert!(!sidebar.can_remove());
+        assert!(!sidebar.is_unassigned);
+        assert_eq!(
+            unassign_payload(sidebar),
+            Some(json!({
+                "command": "sidebar.toggle",
+                "key": sidebar.key,
+                "when": "false",
+                "replace": { "command": "sidebar.toggle", "key": sidebar.key }
+            }))
+        );
+
+        let server = json!([
+            {
+                "command": "sidebar.toggle",
+                "shortcut": { "key": "b", "metaKey": false, "ctrlKey": false, "shiftKey": false, "altKey": false, "modKey": true },
+                "whenAst": { "type": "identifier", "name": "false" }
+            },
+            {
+                "command": "chat.newLocal",
+                "shortcut": { "key": "b", "metaKey": false, "ctrlKey": false, "shiftKey": false, "altKey": false, "modKey": true }
+            }
+        ]);
+        let rows = binding_rows(&server, true);
+        let unassigned = rows.iter().find(|row| row.command == "sidebar.toggle").expect("unassigned row");
+        assert!(unassigned.is_unassigned);
+        assert_eq!(unassigned.source, BindingSource::Custom);
+        assert!(unassigned.can_reset());
+        assert!(!unassigned.can_unassign());
+        assert!(!unassigned.can_remove());
+        assert!(unassigned.conflicts.is_empty(), "disabled when:false binding must not report conflicts");
+        let new_local = rows.iter().find(|row| row.command == "chat.newLocal" && row.key == "mod+b").expect("rebound row");
+        assert!(new_local.conflicts.is_empty(), "rebound shortcut must not conflict with unassigned default");
+        assert_eq!(
+            reset_payload(unassigned),
+            Some(json!({
+                "command": "sidebar.toggle",
+                "key": "mod+b",
+                "replace": { "command": "sidebar.toggle", "key": "mod+b", "when": "false" }
+            }))
+        );
+        assert_eq!(key_pill_parts("mod+pageup", false), vec!["Ctrl", "PageUp"]);
+        assert_eq!(key_pill_parts("ctrl+pageup", true), vec!["⌃", "PageUp"]);
+        assert_eq!(key_pill_parts("shift+pagedown", true), vec!["⇧", "PageDown"]);
     }
 }

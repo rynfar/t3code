@@ -17,7 +17,7 @@ use t3_client::store;
 use t3_core::composer::context::TerminalSelection;
 use t3_core::files::metadata::MetadataCache;
 use t3_core::terminal::{
-    self, LaunchLocation, MetadataEvent, SplitDirection, TerminalAccess, TerminalFocusQueue, TerminalLayouts, TerminalSummary,
+    self, LaunchLocation, MetadataEvent, SnapshotId, SplitDirection, TerminalAccess, TerminalFocusQueue, TerminalLayouts, TerminalSummary,
     ThreadEnterFocusDecision, ThreadTerminalLayout, method,
 };
 use tokio::sync::mpsc;
@@ -188,10 +188,20 @@ pub fn open_script_terminal(thread_id: String, terminal_id: String, cx: &mut App
 
 pub(super) type SharedMetadataCache = Rc<RefCell<(Instant, MetadataCache)>>;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct DrawerAnimation {
+    pub(super) seq: u64,
+    pub(super) duration_ms: u32,
+    pub(super) opening: bool,
+    pub(super) from_height: f32,
+}
+
 pub struct TerminalDrawer {
     pub(super) app: Entity<AppState>,
     pub(super) layouts: TerminalLayouts,
     summaries: Option<Vec<TerminalSummary>>,
+    metadata_snapshot_id: Option<SnapshotId>,
+    ephemeral_snapshot_seq: u64,
     panes: HashMap<String, Entity<TerminalPane>>,
     panes_thread: Option<String>,
     link_metadata: SharedMetadataCache,
@@ -202,6 +212,13 @@ pub struct TerminalDrawer {
     grants: Option<Task<()>>,
     save: Option<Task<()>>,
     pub(super) resize_from: Option<(f32, f32)>,
+    /// Tracks `(thread_id, is_open)` across frames so `panelAnimationDurationMs` animates
+    /// same-thread drawer open/close transitions without animating thread switches (`ST-APPEARANCE`).
+    pub(super) last_open_state: Option<(String, bool)>,
+    pub(super) last_rendered_height: f32,
+    pub(super) drawer_animation: Option<DrawerAnimation>,
+    pub(super) animation_seq: u64,
+    pub(super) _close_animation_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -225,6 +242,8 @@ impl TerminalDrawer {
             app,
             layouts,
             summaries: None,
+            metadata_snapshot_id: None,
+            ephemeral_snapshot_seq: 0,
             panes: HashMap::new(),
             panes_thread: None,
             link_metadata: Rc::new(RefCell::new((Instant::now(), MetadataCache::default()))),
@@ -234,6 +253,11 @@ impl TerminalDrawer {
             grants: None,
             save: None,
             resize_from: None,
+            last_open_state: None,
+            last_rendered_height: terminal::DEFAULT_DRAWER_HEIGHT,
+            drawer_animation: None,
+            animation_seq: 0,
+            _close_animation_task: None,
             _subscriptions: vec![subscription],
         };
         let weak = cx.entity().downgrade();
@@ -295,6 +319,7 @@ impl TerminalDrawer {
             self.grants = None;
             self.access = TerminalAccess::default();
             self.summaries = None;
+            self.metadata_snapshot_id = None;
             self.panes.clear();
             self.panes_thread = None;
             *self.link_metadata.borrow_mut() = (Instant::now(), MetadataCache::default());
@@ -383,6 +408,15 @@ impl TerminalDrawer {
                 let applied = this.update_in(cx, |drawer, window, cx| {
                     let summaries = drawer.summaries.get_or_insert_with(Vec::new);
                     for event in batch {
+                        if let MetadataEvent::Snapshot { manager_id, .. } = &event {
+                            drawer.metadata_snapshot_id = Some(match manager_id {
+                                Some(id) => SnapshotId::Manager(id.clone()),
+                                None => {
+                                    drawer.ephemeral_snapshot_seq = drawer.ephemeral_snapshot_seq.wrapping_add(1);
+                                    SnapshotId::Ephemeral(drawer.ephemeral_snapshot_seq)
+                                }
+                            });
+                        }
                         terminal::apply_metadata(summaries, event);
                     }
                     drawer.publish_running(cx);
@@ -469,17 +503,21 @@ impl TerminalDrawer {
 
     /// Adopts the server's terminal list for the selected thread (the drawer's reconcile effect),
     /// excluding terminals currently owned by right-panel terminal tabs
-    /// (`PersistentThreadTerminals.tsx:124-129`).
+    /// (`PersistentThreadTerminals.tsx`), dropping background terminals closed by another client
+    /// while keeping reopened/newly placed terminals (`pingdotgg/t3code#38998`, `pingdotgg/t3code#39260`).
     fn reconcile(&mut self, cx: &mut Context<Self>) {
-        let (Some(thread_id), Some(summaries)) = (self.selected_thread(cx), self.summaries.as_ref()) else { return };
+        let (Some(thread_id), Some(summaries), Some(snapshot_id)) =
+            (self.selected_thread(cx), self.summaries.as_ref(), self.metadata_snapshot_id.clone())
+        else {
+            return;
+        };
         let panel_ids = self.app.read(cx).panels.panels.panel_terminal_ids(&thread_id);
         let server_ids: Vec<String> = terminal::thread_terminals(summaries, &thread_id)
             .into_iter()
             .filter(|t| !panel_ids.contains(&t.terminal_id))
             .map(|t| t.terminal_id.clone())
             .collect();
-        let client_ids = self.layouts.get(&thread_id).normalized().terminal_ids;
-        if terminal::should_reconcile(&server_ids, &client_ids) && self.layouts.reconcile(&thread_id, &server_ids) {
+        if self.layouts.reconcile_with_snapshot(&thread_id, &server_ids, &snapshot_id) {
             self.drop_stale_panes(&thread_id);
             self.schedule_save(cx);
         }
@@ -743,10 +781,14 @@ impl TerminalDrawer {
         }
     }
 
-    /// Asks first, like `confirmTerminalClose`: closing stops the process and clears history.
+    /// Asks first when `confirmTerminalClose` is enabled (`pingdotgg/t3code#35305`).
     pub fn request_close(&mut self, terminal_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread_id) = self.selected_thread(cx) else { return };
         if !self.access.operate {
+            return;
+        }
+        if !crate::settings::store::try_client(cx).is_none_or(|doc| doc.confirm_terminal_close()) {
+            self.close_terminal(&thread_id, terminal_id, window, cx);
             return;
         }
         let (message, detail) = terminal::close_confirmation(&[self.label(&thread_id, terminal_id)]);
@@ -919,6 +961,58 @@ mod focus_tests {
         vcx.update(|window, cx| {
             assert!(composer.read(cx).has_focus(window, cx));
             assert_eq!(TerminalDrawer::last_focus_for_test("draft:checkout-a", cx), Some(LastThreadFocus::Composer));
+        });
+
+        // 6. Optional `confirmTerminalClose = false` (`pingdotgg/t3code#35305`) closes immediately
+        // without opening a confirmation prompt.
+        state.update(vcx, |state, cx| state.select_thread("menu-thread".into(), cx));
+        vcx.update(|_, cx| {
+            crate::settings::store::init(cx);
+            crate::settings::store::install_committed_client(
+                &state,
+                serde_json::from_value(json!({
+                    "confirmTerminalClose": false,
+                    "panelAnimationDurationMs": 180
+                }))
+                .unwrap(),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        drawer.update_in(vcx, |drawer, window, cx| {
+            assert!(drawer.layouts.get("menu-thread").terminal_ids.contains(&"term-1".to_owned()));
+            drawer.request_close("term-1", window, cx);
+            assert!(
+                !drawer.layouts.get("menu-thread").terminal_ids.contains(&"term-1".to_owned()),
+                "confirmTerminalClose=false must close terminal without waiting on prompt"
+            );
+        });
+
+        // 7. `panelAnimationDurationMs` (`#1`) drives drawer open/close height transitions on same thread.
+        drawer.update_in(vcx, |drawer, window, cx| {
+            // Seed closed state on menu-thread via render, then open and close.
+            drawer.layouts.set_open("menu-thread", false);
+            let _ = gpui::Render::render(drawer, window, cx);
+            assert!(drawer.drawer_animation.is_none());
+
+            drawer.layouts.ensure("menu-thread", "term-3", true, Some(true));
+            let _ = gpui::Render::render(drawer, window, cx);
+            assert!(
+                drawer.drawer_animation.is_some_and(|a| a.opening && a.duration_ms == 180),
+                "opening drawer with panelAnimationDurationMs=180 should start opening animation"
+            );
+
+            drawer.layouts.set_open("menu-thread", false);
+            let _ = gpui::Render::render(drawer, window, cx);
+            assert!(
+                drawer.drawer_animation.is_some_and(|a| !a.opening && a.duration_ms == 180 && a.from_height > 0.),
+                "closing drawer with panelAnimationDurationMs=180 should start closing animation"
+            );
+        });
+        vcx.executor().advance_clock(Duration::from_millis(210));
+        vcx.run_until_parked();
+        drawer.read_with(vcx, |drawer, _| {
+            assert!(drawer.drawer_animation.is_none(), "closing animation clears after duration elapses");
         });
 
         state.update(vcx, |state, _| state.stop_pump());

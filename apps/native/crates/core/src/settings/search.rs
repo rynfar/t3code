@@ -439,6 +439,7 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("unpin-confirmation", "Unpin confirmation", General, &["ask before thread pinned section"]),
         SearchItem::new("archive-confirmation", "Archive confirmation", General, &["ask before thread second click inline action"]),
         SearchItem::new("delete-confirmation", "Delete confirmation", General, &["ask before thread chat history"]),
+        SearchItem::new("terminal-close-confirmation", "Terminal close confirmation", General, &["ask before delete stop process shell console history"]),
         SearchItem::new("quit-confirmation", "Quit shortcut", General, &["confirmation desktop app exit direct hold double click press twice"]),
         SearchItem::new("text-generation-model", "Text generation model", Threads, &["generated thread titles source control content default provider"]).scope(ProjectDefaults),
         SearchItem::new("thread-title-instructions", "Thread title instructions", Threads, &["generated thread titles prompt custom style naming rename regenerate"]).scope(ProjectDefaults),

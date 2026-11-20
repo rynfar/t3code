@@ -14,6 +14,14 @@ pub const STREAM_BASE_PATH: &str = "/api/preview-stream";
 pub const STREAM_PATH: &str = "/api/preview-stream/ws";
 pub const STREAM_UPLOAD_PATH: &str = "/api/preview-stream/upload";
 pub const STREAM_DOWNLOAD_PATH: &str = "/api/preview-stream/download";
+/// Loopback tunnel WebSocket path for rendering other environments' localhost tabs (`pingdotgg/t3code#37948`).
+pub const PREVIEW_TUNNEL_PATH: &str = "/api/preview/tunnel";
+/// Media ticket refresh margin before expiry (`TICKET_REFRESH_MARGIN_MS` in `previewTunnel.ts`).
+pub const TICKET_REFRESH_MARGIN_MS: u64 = 30_000;
+/// Timeout after WebSocket connect before reporting Chromium draws no frames (`pingdotgg/t3code#38865`).
+pub const NO_FRAME_TIMEOUT_MS: u64 = 10_000;
+pub const NO_FRAME_STALLED_MESSAGE: &str =
+    "The server's browser loaded this page but is not drawing it. Try reloading, or open the page in a browser on this computer.";
 pub const ACK_MESSAGE: &str = r#"{"type":"ack"}"#;
 /// `TAB_GONE_CODE`: the tab closed; stop.
 pub const GONE_CLOSE_CODE: u16 = 4404;
@@ -596,6 +604,103 @@ pub fn dom_key(key: &str, key_char: Option<&str>, shortcut: bool) -> Option<DomK
     Some(DomKey { text: (!shortcut).then(|| dom.clone()), key: dom, code, key_code })
 }
 
+/// SOCKS5 reply codes for `LoopbackTunnel` (`apps/desktop/src/preview/LoopbackTunnel.ts`, `pingdotgg/t3code#37948`).
+pub const SOCKS_REPLY_SUCCEEDED: u8 = 0;
+pub const SOCKS_REPLY_FAILURE: u8 = 1;
+pub const SOCKS_REPLY_NOT_ALLOWED: u8 = 2;
+pub const SOCKS_REPLY_COMMAND_NOT_SUPPORTED: u8 = 7;
+pub const SOCKS_REPLY_ADDRESS_NOT_SUPPORTED: u8 = 8;
+
+pub const fn socks5_reply(code: u8) -> [u8; 10] {
+    [5, code, 0, 1, 0, 0, 0, 0, 0, 0]
+}
+
+/// Whether `typed` names a loopback address (`localhost`, `*.localhost`, trailing dot, `127.0.0.0/8`, `::1`).
+pub fn is_loopback_name(typed: &str) -> bool {
+    let trimmed = typed.trim().trim_start_matches('[').trim_end_matches(']');
+    let name = trimmed.strip_suffix('.').unwrap_or(trimmed).to_ascii_lowercase();
+    if name == "localhost" || name.ends_with(".localhost") {
+        return true;
+    }
+    name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Builds the environment's `/api/preview/tunnel` WebSocket URL with a live media ticket
+/// and optional target loopback `port` (`previewTunnel.ts`, `LoopbackTunnel.ts`).
+pub fn preview_tunnel_url(http_base: &str, ticket: &str, port: Option<u16>) -> Option<String> {
+    let base = crate::pairing::websocket_base(http_base);
+    let mut url = url::Url::parse(&format!("{}{PREVIEW_TUNNEL_PATH}", base.trim_end_matches("/ws"))).ok()?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("wsTicket", ticket);
+        if let Some(port) = port {
+            query.append_pair("port", &port.to_string());
+        }
+    }
+    Some(url.to_string())
+}
+
+/// Extracts `(host, port)` from a tunnel WebSocket URL.
+pub fn tunnel_endpoint(tunnel_url: &str) -> Option<(String, u16)> {
+    let parsed = url::Url::parse(tunnel_url).ok()?;
+    let host = parsed.host_str()?.trim_start_matches('[').trim_end_matches(']').to_owned();
+    let port = parsed.port_or_known_default()?;
+    Some((host, port))
+}
+
+/// Over an SSH forward, the environment's own origin is a loopback port on this machine —
+/// traffic to that port dials the endpoint directly instead of tunneling back into itself.
+pub fn is_tunnel_endpoint(tunnel_url: &str, port: u16) -> bool {
+    tunnel_endpoint(tunnel_url).is_some_and(|(host, endpoint_port)| is_loopback_name(&host) && endpoint_port == port)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Socks5Connect {
+    Port(u16),
+    Refusal(u8),
+}
+
+/// Parses a SOCKS5 CONNECT request, returning `None` until the complete request has arrived
+/// (`parseConnect` in `apps/desktop/src/preview/LoopbackTunnel.ts`).
+pub fn parse_socks5_connect(data: &[u8]) -> Option<Socks5Connect> {
+    if data.len() < 5 {
+        return None;
+    }
+    let atyp = data[3];
+    let host_len = match atyp {
+        1 => 4usize,
+        4 => 16usize,
+        3 => 1 + usize::from(data[4]),
+        _ => return Some(Socks5Connect::Refusal(SOCKS_REPLY_ADDRESS_NOT_SUPPORTED)),
+    };
+    if data.len() < 4 + host_len + 2 {
+        return None;
+    }
+    if data[0] != 5 || data[1] != 1 {
+        return Some(Socks5Connect::Refusal(SOCKS_REPLY_COMMAND_NOT_SUPPORTED));
+    }
+    let host = &data[4..4 + host_len];
+    let loopback = match atyp {
+        1 => std::net::Ipv4Addr::new(host[0], host[1], host[2], host[3]).is_loopback(),
+        4 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(host);
+            std::net::Ipv6Addr::from(octets).is_loopback()
+        }
+        3 => {
+            let domain: String = host[1..].iter().map(|&b| char::from(b)).collect();
+            is_loopback_name(&domain)
+        }
+        _ => false,
+    };
+    if loopback {
+        let port = u16::from_be_bytes([data[4 + host_len], data[4 + host_len + 1]]);
+        Some(Socks5Connect::Port(port))
+    } else {
+        Some(Socks5Connect::Refusal(SOCKS_REPLY_NOT_ALLOWED))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,5 +888,69 @@ mod tests {
         assert_eq!(key("f5", None, false), some("F5", "F5", Some(116), None));
         assert_eq!(key("shift", None, false), None);
         assert_eq!(modifiers(true, false, true, true), 13);
+    }
+
+    #[test]
+    fn preview_tunnel_helpers_and_socks5_parser_match_desktop_tunnel() {
+        assert!(is_loopback_name("localhost"));
+        assert!(is_loopback_name("LOCALHOST."));
+        assert!(is_loopback_name("app.localhost"));
+        assert!(is_loopback_name("127.0.0.1"));
+        assert!(is_loopback_name("127.2.3.4"));
+        assert!(is_loopback_name("::1"));
+        assert!(is_loopback_name("[::1]"));
+        assert!(!is_loopback_name("example.com"));
+        assert!(!is_loopback_name("192.168.1.1"));
+
+        assert_eq!(
+            preview_tunnel_url("https://remote.example:3773/", "tk-1", Some(5173)).as_deref(),
+            Some("wss://remote.example:3773/api/preview/tunnel?wsTicket=tk-1&port=5173")
+        );
+        assert_eq!(
+            preview_tunnel_url("http://127.0.0.1:4100", "tk-2", Some(3000)).as_deref(),
+            Some("ws://127.0.0.1:4100/api/preview/tunnel?wsTicket=tk-2&port=3000")
+        );
+
+        assert!(is_tunnel_endpoint("ws://127.0.0.1:4100/api/preview/tunnel?port=3000", 4100));
+        assert!(!is_tunnel_endpoint("ws://127.0.0.1:4100/api/preview/tunnel?port=3000", 3000));
+        assert!(!is_tunnel_endpoint("wss://remote.example:4100/api/preview/tunnel", 4100));
+
+        // Partial packet returns None.
+        assert_eq!(parse_socks5_connect(&[5, 1, 0, 1]), None);
+        assert_eq!(parse_socks5_connect(&[5, 1, 0, 1, 127, 0, 0, 1, 0x14]), None);
+
+        // IPv4 loopback -> Port(5173).
+        assert_eq!(parse_socks5_connect(&[5, 1, 0, 1, 127, 0, 0, 1, 0x14, 0x35]), Some(Socks5Connect::Port(5173)));
+        // IPv4 non-loopback -> NOT_ALLOWED.
+        assert_eq!(
+            parse_socks5_connect(&[5, 1, 0, 1, 10, 0, 0, 1, 0x00, 0x50]),
+            Some(Socks5Connect::Refusal(SOCKS_REPLY_NOT_ALLOWED))
+        );
+        // IPv6 ::1 -> Port(3000).
+        let mut ipv6 = vec![5, 1, 0, 4];
+        ipv6.extend_from_slice(&[0; 15]);
+        ipv6.push(1);
+        ipv6.extend_from_slice(&3000u16.to_be_bytes());
+        assert_eq!(parse_socks5_connect(&ipv6), Some(Socks5Connect::Port(3000)));
+
+        // Domain `app.localhost` -> Port(8080); `example.com` -> NOT_ALLOWED.
+        let mut dom = vec![5, 1, 0, 3, 13];
+        dom.extend_from_slice(b"app.localhost");
+        dom.extend_from_slice(&8080u16.to_be_bytes());
+        assert_eq!(parse_socks5_connect(&dom), Some(Socks5Connect::Port(8080)));
+        let mut ext = vec![5, 1, 0, 3, 11];
+        ext.extend_from_slice(b"example.com");
+        ext.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(parse_socks5_connect(&ext), Some(Socks5Connect::Refusal(SOCKS_REPLY_NOT_ALLOWED)));
+
+        // Non-CONNECT command & unsupported atyp.
+        assert_eq!(
+            parse_socks5_connect(&[5, 2, 0, 1, 127, 0, 0, 1, 0, 80]),
+            Some(Socks5Connect::Refusal(SOCKS_REPLY_COMMAND_NOT_SUPPORTED))
+        );
+        assert_eq!(
+            parse_socks5_connect(&[5, 1, 0, 9, 0, 0, 0, 0, 0, 80]),
+            Some(Socks5Connect::Refusal(SOCKS_REPLY_ADDRESS_NOT_SUPPORTED))
+        );
     }
 }

@@ -7,16 +7,22 @@
 //! Frames land in a `watch` channel, so a slow viewer only ever sees the newest one and nothing
 //! queues behind it; the server already holds back all but one frame per acknowledgement.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use t3_core::pairing::websocket_base;
 use t3_core::preview::stream::{
-    ACK_MESSAGE, CloseAction, Control, FileChooserOffer, FileChooserTracker, HostSetup, MAX_UNAUTHORIZED_REFUSALS, STREAM_PATH, StreamInput,
-    StreamMessage, UploadFile, classify_close, download_url, encode_multipart_files, may_send, reconnect_delay_ms, refusal_delay_ms, upload_url,
+    ACK_MESSAGE, CloseAction, Control, FileChooserOffer, FileChooserTracker, HostSetup, MAX_UNAUTHORIZED_REFUSALS,
+    SOCKS_REPLY_FAILURE, SOCKS_REPLY_SUCCEEDED, STREAM_PATH, Socks5Connect, StreamInput, StreamMessage,
+    TICKET_REFRESH_MARGIN_MS, UploadFile, classify_close, download_url, encode_multipart_files, is_tunnel_endpoint,
+    may_send, parse_socks5_connect, preview_tunnel_url, reconnect_delay_ms, refusal_delay_ms, socks5_reply,
+    tunnel_endpoint, upload_url,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
@@ -87,6 +93,211 @@ pub fn stream_url(credentials: &Credentials, target: &StreamTarget, ticket: &str
         .append_pair("maxHeight", &target.max_height.max(1).to_string())
         .append_pair("wsTicket", ticket);
     url.to_string()
+}
+
+/// Builds the environment's `/api/preview/tunnel` WebSocket URL (`pingdotgg/t3code#37948`).
+pub fn tunnel_url(credentials: &Credentials, ticket: &str, port: Option<u16>) -> Option<String> {
+    preview_tunnel_url(&credentials.http_base, ticket, port)
+}
+
+const TUNNEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default reuse window for cached media tickets (server tickets live >= 60s; refresh 30s early).
+const TUNNEL_TICKET_TTL: Duration = Duration::from_secs(60);
+
+/// Local SOCKS5 listener forwarding loopback connections over an environment's
+/// `/api/preview/tunnel` WebSocket (`apps/desktop/src/preview/LoopbackTunnel.ts`,
+/// `apps/web/src/state/previewTunnel.ts`, `pingdotgg/t3code#37948`).
+pub struct LoopbackTunnel {
+    addr: SocketAddr,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LoopbackTunnel {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+impl LoopbackTunnel {
+    /// Starts a SOCKS5 loopback tunnel backed by `credentials`, minting and caching `media`
+    /// tickets via `issue_media_ticket`.
+    pub async fn start(credentials: Arc<Credentials>) -> std::io::Result<Self> {
+        let cached: Arc<Mutex<Option<(String, Instant)>>> = Arc::new(Mutex::new(None));
+        let resolve = Arc::new(move || {
+            let credentials = credentials.clone();
+            let cached = cached.clone();
+            async move {
+                let margin = Duration::from_millis(TICKET_REFRESH_MARGIN_MS);
+                if let Some((url, expires_at)) = cached.lock().await.clone()
+                    && expires_at.saturating_duration_since(Instant::now()) > margin
+                {
+                    return Some(url);
+                }
+                let ticket = issue_media_ticket(&credentials).await.ok()?;
+                let url = tunnel_url(&credentials, &ticket, None)?;
+                *cached.lock().await = Some((url.clone(), Instant::now() + TUNNEL_TICKET_TTL));
+                Some(url)
+            }
+        });
+        Self::start_with_resolver(resolve).await
+    }
+
+    /// Starts a SOCKS5 loopback tunnel using an explicit tunnel URL resolver (used by tests and
+    /// callers that manage their own media ticket lifecycle).
+    pub async fn start_with_resolver<F, Fut>(resolve_url: Arc<F>) -> std::io::Result<Self>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<String>> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let accept_task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let resolver = resolve_url.clone();
+                tokio::spawn(async move {
+                    let _ = handle_socks5_client(socket, resolver).await;
+                });
+            }
+        });
+        Ok(LoopbackTunnel { addr, accept_task })
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+async fn read_socks5_request(socket: &mut TcpStream) -> std::io::Result<Option<Socks5Connect>> {
+    let mut received = Vec::with_capacity(64);
+    let mut buf = [0u8; 256];
+    let mut greeted = false;
+    loop {
+        let n = socket.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        received.extend_from_slice(&buf[..n]);
+        if !greeted {
+            if received.len() < 2 {
+                continue;
+            }
+            let methods = usize::from(received[1]);
+            if received.len() < 2 + methods {
+                continue;
+            }
+            if received[0] != 5 || !received[2..2 + methods].contains(&0) {
+                socket.write_all(&[5, 0xff]).await?;
+                return Ok(None);
+            }
+            socket.write_all(&[5, 0]).await?;
+            received.drain(..2 + methods);
+            greeted = true;
+        }
+        if let Some(request) = parse_socks5_connect(&received) {
+            return Ok(Some(request));
+        }
+        if received.len() > 1024 {
+            return Ok(None);
+        }
+    }
+}
+
+async fn handle_socks5_client<F, Fut>(mut client: TcpStream, resolve_url: Arc<F>) -> std::io::Result<()>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<String>> + Send + 'static,
+{
+    let Some(request) = read_socks5_request(&mut client).await? else {
+        return Ok(());
+    };
+    let port = match request {
+        Socks5Connect::Refusal(code) => {
+            let _ = client.write_all(&socks5_reply(code)).await;
+            return Ok(());
+        }
+        Socks5Connect::Port(port) => port,
+    };
+    let Some(base_tunnel_url) = resolve_url().await else {
+        let _ = client.write_all(&socks5_reply(SOCKS_REPLY_FAILURE)).await;
+        return Ok(());
+    };
+    if is_tunnel_endpoint(&base_tunnel_url, port) {
+        let Some((host, endpoint_port)) = tunnel_endpoint(&base_tunnel_url) else {
+            let _ = client.write_all(&socks5_reply(SOCKS_REPLY_FAILURE)).await;
+            return Ok(());
+        };
+        let Ok(Ok(mut upstream)) =
+            tokio::time::timeout(TUNNEL_CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), endpoint_port))).await
+        else {
+            let _ = client.write_all(&socks5_reply(SOCKS_REPLY_FAILURE)).await;
+            return Ok(());
+        };
+        client.write_all(&socks5_reply(SOCKS_REPLY_SUCCEEDED)).await?;
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        return Ok(());
+    }
+
+    let Ok(mut ws_url) = url::Url::parse(&base_tunnel_url) else {
+        let _ = client.write_all(&socks5_reply(SOCKS_REPLY_FAILURE)).await;
+        return Ok(());
+    };
+    ws_url.query_pairs_mut().append_pair("port", &port.to_string());
+    let config = WebSocketConfig { max_message_size: Some(MAX_MESSAGE_BYTES), max_frame_size: Some(MAX_MESSAGE_BYTES), ..Default::default() };
+    let Ok(Ok((ws, _))) = tokio::time::timeout(
+        TUNNEL_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(ws_url.as_str(), Some(config), false),
+    )
+    .await
+    else {
+        let _ = client.write_all(&socks5_reply(SOCKS_REPLY_FAILURE)).await;
+        return Ok(());
+    };
+    client.write_all(&socks5_reply(SOCKS_REPLY_SUCCEEDED)).await?;
+    let (mut tcp_read, mut tcp_write) = client.into_split();
+    let (mut ws_sink, mut ws_stream) = ws.split();
+    let to_ws = async {
+        let mut buf = vec![0u8; 16_384];
+        loop {
+            match tcp_read.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    let _ = ws_sink.close().await;
+                    break;
+                }
+                Ok(n) => {
+                    if ws_sink.send(Message::Binary(buf[..n].to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    let from_ws = async {
+        while let Some(Ok(msg)) = ws_stream.next().await {
+            match msg {
+                Message::Binary(bytes) => {
+                    if tcp_write.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Text(text) => {
+                    if tcp_write.write_all(text.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        let _ = tcp_write.shutdown().await;
+    };
+    tokio::select! {
+        () = to_ws => {}
+        () = from_ws => {}
+    }
+    Ok(())
 }
 
 /// Uploads files to answer an offered preview file picker (`uploadPreviewStreamFiles`).
@@ -472,5 +683,88 @@ mod tests {
             }
         }
         assert_eq!(remaining, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn loopback_tunnel_forwards_socks5_loopback_over_ws_and_refuses_non_loopback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Mock T3 server handling POST /api/auth/ws-ticket and WS /api/preview/tunnel.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (seen_uri_tx, seen_uri_rx) = tokio::sync::oneshot::channel::<String>();
+        let server_task = tokio::spawn(async move {
+            let mut seen_uri_tx = Some(seen_uri_tx);
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut peek_buf = vec![0u8; 1024];
+                let n = stream.peek(&mut peek_buf).await.unwrap();
+                let head = String::from_utf8_lossy(&peek_buf[..n]);
+                if head.starts_with("POST /api/auth/websocket-ticket/media") {
+                    let mut req_buf = vec![0u8; n];
+                    stream.read_exact(&mut req_buf).await.unwrap();
+                    let body = r#"{"ticket":"tk-tunnel","expiresAt":"2099-01-01T00:00:00.000Z"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(resp.as_bytes()).await.unwrap();
+                } else {
+                    let first_line = head.lines().next().unwrap_or("").to_owned();
+                    if let Some(tx) = seen_uri_tx.take() {
+                        let _ = tx.send(first_line);
+                    }
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if let Message::Binary(data) = msg {
+                            let mut echoed = b"echo:".to_vec();
+                            echoed.extend_from_slice(&data);
+                            ws.send(Message::Binary(echoed)).await.unwrap();
+                            break;
+                        }
+                    }
+                    let _ = ws.close(None).await;
+                }
+            }
+        });
+
+        let creds = Arc::new(Credentials { http_base: format!("http://{server_addr}"), access_token: "tok".into() });
+        assert_eq!(
+            tunnel_url(&creds, "tk-tunnel", Some(5173)).as_deref(),
+            Some(format!("ws://{server_addr}/api/preview/tunnel?wsTicket=tk-tunnel&port=5173").as_str())
+        );
+        let tunnel = LoopbackTunnel::start(creds).await.unwrap();
+        let proxy_addr = tunnel.addr();
+
+        // 1. Non-loopback SOCKS5 CONNECT is refused with SOCKS_REPLY_NOT_ALLOWED.
+        let mut refused = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        refused.write_all(&[5, 1, 0]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        refused.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 0]);
+        refused.write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80]).await.unwrap();
+        let mut reply = [0u8; 10];
+        refused.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], t3_core::preview::stream::SOCKS_REPLY_NOT_ALLOWED);
+
+        // 2. Loopback SOCKS5 CONNECT dials /api/preview/tunnel?wsTicket=...&port=5173 and relays bytes.
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 0]);
+        client.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, 0x14, 0x35]).await.unwrap();
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], t3_core::preview::stream::SOCKS_REPLY_SUCCEEDED);
+        client.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 10];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"echo:hello");
+
+        let uri_line = seen_uri_rx.await.unwrap();
+        assert!(uri_line.contains("/api/preview/tunnel?wsTicket=tk-tunnel&port=5173"), "unexpected uri: {uri_line}");
+        drop(client);
+        drop(tunnel);
+        server_task.await.unwrap();
     }
 }

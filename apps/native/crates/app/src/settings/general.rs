@@ -165,6 +165,12 @@ impl SettingsView {
                     .reset(!doc.confirm_thread_delete(), reset(state, ClientSettingChange::ConfirmThreadDelete(true)))
                     .control(switch(state, "delete-confirmation-switch", doc.confirm_thread_delete(), ClientSettingChange::ConfirmThreadDelete))
                     .into_any_element(),
+                Row::new("terminal-close-confirmation", t(cx, "Terminal close confirmation"))
+                    .description(t(cx, "Ask before closing terminals and stopping their running processes."))
+                    .highlighted(self.is_target("terminal-close-confirmation"))
+                    .reset(!doc.confirm_terminal_close(), reset(state, ClientSettingChange::ConfirmTerminalClose(true)))
+                    .control(switch(state, "terminal-close-confirmation-switch", doc.confirm_terminal_close(), ClientSettingChange::ConfirmTerminalClose))
+                    .into_any_element(),
                 Row::new("quit-confirmation", t(cx, "Quit shortcut"))
                     .description(t(cx, "Hold mode also quits on two quick presses."))
                     .highlighted(self.is_target("quit-confirmation"))
@@ -247,7 +253,7 @@ impl SettingsView {
         vec![
             Block::new(&["notifications", "thread-notifications", "in-app-notifications"], notifications),
             Block::new(&["sidebar", "project-grouping", "project-order", "working-shelf"], sidebar),
-            Block::new(&["confirmations", "unpin-confirmation", "archive-confirmation", "delete-confirmation", "quit-confirmation"], confirmations),
+            Block::new(&["confirmations", "unpin-confirmation", "archive-confirmation", "delete-confirmation", "terminal-close-confirmation", "quit-confirmation"], confirmations),
             Block::new(&["display", "language", "time-format"], display),
         ]
     }

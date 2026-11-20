@@ -341,6 +341,37 @@ impl BrowserHistory {
     }
 }
 
+/// `resolveExternalServerUrl` (`browserTargetResolver.ts`, `pingdotgg/t3code#37948`):
+/// resolves a preview URL for the system browser, which has no loopback tunnel and needs an
+/// address it can reach itself. Rewrites loopback (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`,
+/// `[::]`) hosts to the remote environment's host when `environment_http_base` is non-loopback.
+pub fn resolve_external_server_url(raw_url: &str, environment_http_base: Option<&str>) -> String {
+    let Ok(normalized) = normalize_preview_url(raw_url) else {
+        return raw_url.to_owned();
+    };
+    let Ok(mut parsed) = url::Url::parse(&normalized) else {
+        return normalized;
+    };
+    let Some(host) = parsed.host_str().map(normalize_hostname) else {
+        return normalized;
+    };
+    if !is_loopback_host(&host) {
+        return normalized;
+    }
+    let Some(base) = environment_http_base.and_then(|value| url::Url::parse(value).ok()) else {
+        return normalized;
+    };
+    let Some(env_host) = base.host_str() else {
+        return normalized;
+    };
+    let env_norm = normalize_hostname(env_host);
+    if is_loopback_host(&env_norm) {
+        return normalized;
+    }
+    let _ = parsed.set_host(Some(env_host));
+    parsed.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +461,27 @@ mod tests {
         .unwrap();
         assert!(history.record_settled_titles("p", &[normal_session]));
         assert_eq!(history.recent("p")[0].title.as_deref(), Some("Public Title"));
+    }
+
+    #[test]
+    fn resolve_external_server_url_rewrites_loopback_for_remote_environments() {
+        assert_eq!(
+            resolve_external_server_url("http://localhost:5173/app?a=1", Some("https://devbox.ts.net:3773")),
+            "http://devbox.ts.net:5173/app?a=1"
+        );
+        assert_eq!(
+            resolve_external_server_url("http://127.0.0.1:3000/", Some("http://10.0.0.9:3773")),
+            "http://10.0.0.9:3000/"
+        );
+        // Local environment keeps loopback intact.
+        assert_eq!(
+            resolve_external_server_url("http://localhost:5173/app", Some("http://127.0.0.1:3773")),
+            "http://localhost:5173/app"
+        );
+        // Public URLs are never rewritten.
+        assert_eq!(
+            resolve_external_server_url("https://example.com/docs", Some("https://devbox.ts.net:3773")),
+            "https://example.com/docs"
+        );
     }
 }

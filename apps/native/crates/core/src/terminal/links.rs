@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::files::position::{
-    format_file_path_position, parse_file_url_href, resolve_path_link_target, safe_decode_uri_component, split_file_path_position,
+    format_file_path_position, resolve_path_link_target, safe_decode_uri_component, split_file_path_position,
     strip_slash_prefixed_windows_drive,
 };
 
@@ -33,6 +33,7 @@ pub struct LinkMatch {
 }
 
 const C: &str = r"\p{L}\p{M}\p{N}._\-";
+const W: &str = r"\p{L}\p{M}\p{N}._\-$+@";
 
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).expect("valid terminal link pattern")
@@ -43,11 +44,13 @@ static IS_URL: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)^https?://"));
 static POWERSHELL_PROMPT_PATH: LazyLock<Regex> = LazyLock::new(|| re(r"^PS ((?:[A-Za-z]:[\\/]|\\\\|/)[^>\r\n]*)>"));
 /// `FILE_PATH_PATTERN`: group `word` is the bare-path alternative its lookbehind guards. A
 /// parenthesized segment must be followed by a separator, so it only ends a segment that
-/// another follows; group `ts` is the TypeScript `(line,col)` its lookahead guards.
+/// another follows; group `bare` is a separator-free `name.ext` that requires `:line:col` or a
+/// TypeScript diagnostic (`pingdotgg/t3code#37071`); group `ts` is the TypeScript `(line,col)` its
+/// lookahead guards.
 static FILE_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    let t = format!(r"(?:[{C}$+@]|\[{{1,2}}[{C}]+\]{{1,2}})");
+    let t = format!(r"(?:[{W}]|\[{{1,2}}[{C}]+\]{{1,2}})");
     re(&format!(
-        r#"(?:~[\\/]|\.{{1,2}}[\\/]|/|[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+|(?P<word>[{C}]+(?:[\\/]{t}*\([{C}]+\)|[\\/]{t}+)*[\\/]{t}+)(?:(?::[0-9]+){{1,2}}|(?P<ts>\([0-9]+,[0-9]+\)))?"#
+        r#"(?:~[\\/]|\.{{1,2}}[\\/]|/|[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+|(?P<word>[{W}]+(?:(?:[\\/]{t}*\([{C}]+\)|[\\/]{t}+)*[\\/]{t}+|(?P<bare>\.\p{{L}}[\p{{L}}\p{{M}}\p{{N}}_\-]*)))(?:(?P<linecol>:[0-9]+:[0-9]+)|:[0-9]+|(?P<ts>\([0-9]+,[0-9]+\)))?"#
     ))
 });
 static TS_DIAGNOSTIC: LazyLock<Regex> = LazyLock::new(|| re(r"^:\s+(?:error|warning) TS[0-9]+:"));
@@ -68,11 +71,11 @@ static REQUEST_ROUTE: LazyLock<Regex> = LazyLock::new(|| {
 static SCHEME_URL: LazyLock<Regex> = LazyLock::new(|| re(r#"[+-]?[A-Za-z][A-Za-z0-9+.-]+://[^\s"'`<>]+"#));
 static SCP_REMOTE: LazyLock<Regex> = LazyLock::new(|| re(r#"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:[^\s"'`<>]+"#));
 
-/// The bare-path lookbehind's class, `[\p{L}\p{M}\p{N}._-]`.
+/// The bare-path lookbehind's class, `[\p{L}\p{M}\p{N}._$+@-]`.
 fn is_word(c: char) -> bool {
-    static WORD: LazyLock<Regex> = LazyLock::new(|| re(&format!("^[{C}]$")));
+    static WORD: LazyLock<Regex> = LazyLock::new(|| re(&format!("^[{W}]$")));
     let mut buffer = [0; 4];
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') || (!c.is_ascii() && WORD.is_match(c.encode_utf8(&mut buffer)))
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '$' | '+' | '@') || (!c.is_ascii() && WORD.is_match(c.encode_utf8(&mut buffer)))
 }
 
 fn previous_char(line: &str, at: usize) -> Option<char> {
@@ -194,9 +197,15 @@ fn path_raws(line: &str) -> Vec<Raw> {
             at = next_boundary(line, whole.start());
             continue;
         }
+        let ts_valid = captures.name("ts").is_some_and(|ts| TS_DIAGNOSTIC.is_match(&line[ts.end()..]));
+        // Bare `name.ext` requires `:line:col` or a TypeScript diagnostic (`pingdotgg/t3code#37071`).
+        if captures.name("bare").is_some() && captures.name("linecol").is_none() && !ts_valid {
+            at = next_boundary(line, whole.start());
+            continue;
+        }
         let mut end = whole.end();
         if let Some(ts) = captures.name("ts")
-            && !TS_DIAGNOSTIC.is_match(&line[ts.end()..])
+            && !ts_valid
         {
             end = ts.start();
         }
@@ -252,14 +261,134 @@ pub fn is_url(value: &str) -> bool {
     IS_URL.is_match(value)
 }
 
+/// Parsed `file://` URI matching either `localhost` or the environment's `local_hostname`
+/// (`pingdotgg/t3code#37133`). Unmatched non-empty hosts remain UNC paths (`\\host\...`).
+pub fn parse_terminal_file_url(href: &str, local_hostname: Option<&str>) -> Option<(String, String)> {
+    let trimmed = href.trim();
+    if !trimmed.get(..5).is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")) {
+        return None;
+    }
+    let parsed = url::Url::parse(trimmed).ok()?;
+    if parsed.scheme() != "file" {
+        return None;
+    }
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let local_host = if !host.is_empty()
+        && let Some(raw_local) = local_hostname.filter(|h| !h.is_empty())
+    {
+        let encoded = raw_local
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => {
+                    (b as char).to_string()
+                }
+                byte => format!("%{byte:02X}"),
+            })
+            .collect::<String>();
+        url::Url::parse(&format!("file://{encoded}/"))
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let unc_hostname = if host.is_empty() || host == "localhost" || (!local_host.is_empty() && host == local_host) {
+        ""
+    } else {
+        parsed.host_str().unwrap_or("")
+    };
+    let path = if unc_hostname.is_empty() {
+        parsed.path().to_owned()
+    } else {
+        format!("\\\\{unc_hostname}{}", parsed.path().replace('/', "\\"))
+    };
+    if path.is_empty() {
+        return None;
+    }
+    let hash = parsed.fragment().map(|fragment| format!("#{fragment}")).unwrap_or_default();
+    Some((strip_slash_prefixed_windows_drive(&path).to_owned(), hash))
+}
+
+/// A resolved terminal file link preserving whether it came from an exact `file://` URI
+/// (`pingdotgg/t3code#37133`, `pingdotgg/t3code#37201`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLinkTarget {
+    /// Host path to query (`filesystem.getMetadata`) or open (`shell.openInEditor` `cwd`).
+    pub path: String,
+    /// `true` when resolved from a `file://` URI, where `path` is the exact filename and must not
+    /// have trailing `:digits` stripped by the launcher or metadata query.
+    pub exact_uri: bool,
+    pub line: Option<u64>,
+    pub column: Option<u64>,
+}
+
+/// Resolves a terminal link target with optional server hostname and exact-URI semantics.
+pub fn resolve_link_target_details(text: &str, cwd: &str, local_hostname: Option<&str>) -> ResolvedLinkTarget {
+    let file_url = text
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+        .then(|| parse_terminal_file_url(text, local_hostname))
+        .flatten();
+    if let Some((raw_path, hash)) = file_url {
+        let decoded = safe_decode_uri_component(&raw_path);
+        let path = strip_slash_prefixed_windows_drive(&decoded).to_owned();
+        // A URI's path is the exact filename, so only its `#L12C3` hash is a position (`#37201`).
+        let pos = split_file_path_position("", &hash);
+        return ResolvedLinkTarget { path, exact_uri: true, line: pos.line, column: pos.column };
+    }
+    let resolved = resolve_path_link_target(text, cwd);
+    let pos = split_file_path_position(&resolved, "");
+    ResolvedLinkTarget { path: resolved, exact_uri: false, line: pos.line, column: pos.column }
+}
+
+/// The path to send to `filesystem.getMetadata` for a terminal link (`useFileMetadata.ts`).
+pub fn metadata_query_path(text: &str, cwd: &str, local_hostname: Option<&str>) -> Option<String> {
+    let target = resolve_link_target_details(text, cwd, local_hostname);
+    if target.exact_uri {
+        let path = target.path.trim();
+        if path.is_empty() || crate::files::position::is_network_path(path) {
+            return None;
+        }
+        return (crate::files::position::is_absolute_path(path) || path.starts_with("~/")).then(|| path.to_owned());
+    }
+    crate::files::metadata::query_path(&target.path, Some(cwd))
+}
+
+/// Builds a `shell.openInEditor` payload preserving exact filenames (including numeric suffixes
+/// like `report:2026:11`) for `file://` URIs via explicit `position` (`pingdotgg/t3code#37201`).
+pub fn open_in_editor_payload(target: &ResolvedLinkTarget, editor: &str, project_root: Option<&str>) -> serde_json::Value {
+    let mut payload = crate::markdown::links::open_in_editor_request_with_root(&target.path, editor, project_root);
+    if target.exact_uri {
+        let mut position = serde_json::Map::new();
+        if let Some(line) = target.line {
+            position.insert("line".into(), serde_json::json!(line));
+        }
+        if let Some(column) = target.column {
+            position.insert("column".into(), serde_json::json!(column));
+        }
+        payload["position"] = serde_json::Value::Object(position);
+    }
+    payload
+}
+
 /// `resolveTerminalLinkTarget`: an explicit OSC 8 target may be a `file://` URI, which names its
 /// file directly; anything else is a path relative to `cwd`.
 pub fn resolve_link_target(text: &str, cwd: &str) -> String {
-    let file_url = text.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://")).then(|| parse_file_url_href(text)).flatten();
+    resolve_link_target_with_hostname(text, cwd, None)
+}
+
+pub fn resolve_link_target_with_hostname(text: &str, cwd: &str, local_hostname: Option<&str>) -> String {
+    let file_url = text
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+        .then(|| parse_terminal_file_url(text, local_hostname))
+        .flatten();
     match file_url {
         Some((path, hash)) => {
             let decoded = safe_decode_uri_component(&path);
-            format_file_path_position(&split_file_path_position(strip_slash_prefixed_windows_drive(&decoded), &hash))
+            let path = strip_slash_prefixed_windows_drive(&decoded).to_owned();
+            let pos = split_file_path_position("", &hash);
+            format_file_path_position(&crate::files::position::FilePathPosition { path, line: pos.line, column: pos.column, end_line: pos.end_line })
         }
         None => resolve_path_link_target(text, cwd),
     }

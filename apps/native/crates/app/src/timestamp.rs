@@ -1,12 +1,79 @@
-//! OS reads for `ElectronApp.systemLocale`; the resolved locale is cached like web's timestampLocale.
+//! OS reads for `ElectronApp.systemLocale` and live system time zone detection
+//! (`pingdotgg/t3code#32371`); the resolved locale is cached like web's `timestampLocale`, while
+//! the viewer's time zone refreshes when `TZ` or the OS zone changes.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::time::{Duration, Instant};
+
 use t3_core::client_settings::TimestampFormat;
 use t3_core::sidebar::time::{LocalTime, NamedZone};
 use t3_core::timeline::{IntlTimestampClock, TimestampLocale};
 
+/// Recheck the OS time zone at most once per second so feed rows share one system read
+/// (`ZONE_RECHECK_MS` in `pingdotgg/t3code#32371`).
+const ZONE_RECHECK: Duration = Duration::from_secs(1);
+
+struct ViewerZoneCache {
+    checked_at: Option<Instant>,
+    tz_env: Option<String>,
+    zone: Option<NamedZone>,
+}
+
+impl ViewerZoneCache {
+    const fn new() -> Self {
+        Self { checked_at: None, tz_env: None, zone: None }
+    }
+
+    fn resolve(
+        &mut self,
+        now: Instant,
+        tz_env: Option<String>,
+        read_os_zone: impl FnOnce() -> Option<String>,
+    ) -> NamedZone {
+        let tz_changed = self.tz_env != tz_env;
+        let fresh = !tz_changed
+            && self
+                .checked_at
+                .is_some_and(|at| now.saturating_duration_since(at) < ZONE_RECHECK);
+        if fresh && let Some(zone) = self.zone {
+            return zone;
+        }
+        let from_tz = tz_env
+            .as_deref()
+            .map(|value| value.trim().strip_prefix(':').unwrap_or(value.trim()))
+            .filter(|value| !value.is_empty())
+            .and_then(NamedZone::new);
+        let zone = from_tz
+            .or_else(|| read_os_zone().and_then(|name| NamedZone::new(&name)))
+            .unwrap_or_else(|| NamedZone::new("UTC").expect("UTC is a bundled zone"));
+        self.checked_at = Some(now);
+        self.tz_env = tz_env;
+        self.zone = Some(zone);
+        zone
+    }
+}
+
+fn read_os_timezone_name() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::NSTimeZone;
+        // CoreFoundation/NSTimeZone caches the system zone until explicitly reset; resetting on
+        // the 1s recheck lets live OS zone changes update rendered timestamps (`pingdotgg/t3code#32371`).
+        NSTimeZone::resetSystemTimeZone();
+        let name = NSTimeZone::systemTimeZone().name().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    iana_time_zone::get_timezone().ok()
+}
+
 pub fn viewer_zone() -> NamedZone {
-    iana_time_zone::get_timezone().ok().and_then(|name| NamedZone::new(&name)).unwrap_or_else(|| NamedZone::new("UTC").expect("UTC is a bundled zone"))
+    thread_local! {
+        static ZONE_CACHE: RefCell<ViewerZoneCache> = const { RefCell::new(ViewerZoneCache::new()) };
+    }
+    let tz_env = std::env::var("TZ").ok();
+    ZONE_CACHE.with(|cache| cache.borrow_mut().resolve(Instant::now(), tz_env, read_os_timezone_name))
 }
 
 pub struct SystemTimestampLocale;
@@ -91,6 +158,69 @@ impl TimestampLocale for SystemTimestampLocale {
     }
     fn numeric_date(&self, local: LocalTime, include_year: bool) -> String {
         with_locale(|locale| locale.numeric_date(local, include_year))
+    }
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::*;
+    use t3_core::sidebar::time::parse_iso;
+    use t3_core::timeline::{IntlTimestampClock, format_day_aware, format_upcoming};
+
+    #[test]
+    fn viewer_zone_follows_system_timezone_and_tz_env_changes() {
+        let mut cache = ViewerZoneCache::new();
+        let t0 = Instant::now();
+        let mut os_calls = 0usize;
+        let same_day = "2026-11-07T04:45:43.877Z";
+        let earlier = "2026-11-04T20:00:00.000Z";
+        let now = parse_iso(same_day).unwrap();
+        let en = IntlTimestampClock::new("en-US").unwrap();
+
+        struct Clock<'a>(&'a IntlTimestampClock);
+        impl TimestampLocale for Clock<'_> {
+            fn time(&self, local: LocalTime, format: TimestampFormat) -> String {
+                self.0.time(local, format)
+            }
+            fn numeric_date(&self, local: LocalTime, include_year: bool) -> String {
+                self.0.numeric_date(local, include_year)
+            }
+        }
+        let locale = Clock(&en);
+
+        // Initial OS zone: America/New_York (UTC-5 in Nov -> 11:45 PM / 23:45 on Nov 6).
+        let ny = cache.resolve(t0, None, || {
+            os_calls += 1;
+            Some("America/New_York".into())
+        });
+        assert_eq!(os_calls, 1);
+        assert_eq!(format_day_aware(same_day, now, &ny, TimestampFormat::TwentyFourHour, &locale), "23:45");
+
+        // Within 1 second, cached OS zone is reused without re-reading the OS.
+        let ny_cached = cache.resolve(t0 + Duration::from_millis(500), None, || {
+            os_calls += 1;
+            Some("Asia/Bangkok".into())
+        });
+        assert_eq!(os_calls, 1);
+        assert_eq!(format_day_aware(same_day, now, &ny_cached, TimestampFormat::TwentyFourHour, &locale), "23:45");
+
+        // After 1 second, OS zone change to Asia/Bangkok (UTC+7 -> 11:45 on Nov 7) takes effect.
+        let bkk = cache.resolve(t0 + Duration::from_secs(1), None, || {
+            os_calls += 1;
+            Some("Asia/Bangkok".into())
+        });
+        assert_eq!(os_calls, 2);
+        assert_eq!(format_day_aware(same_day, now, &bkk, TimestampFormat::TwentyFourHour, &locale), "11:45");
+        assert_eq!(format_day_aware(earlier, now, &bkk, TimestampFormat::TwentyFourHour, &locale), "11/5 03:00");
+        assert_eq!(format_upcoming("2026-11-08T04:45:43.877Z", now, &bkk, TimestampFormat::TwentyFourHour, &locale), "tomorrow at 11:45");
+
+        // An explicit TZ change takes effect immediately even within the 1s window.
+        let utc = cache.resolve(t0 + Duration::from_millis(1_100), Some(":UTC".into()), || {
+            os_calls += 1;
+            Some("Asia/Bangkok".into())
+        });
+        assert_eq!(os_calls, 2);
+        assert_eq!(format_day_aware(same_day, now, &utc, TimestampFormat::TwentyFourHour, &locale), "04:45");
     }
 }
 

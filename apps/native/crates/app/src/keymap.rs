@@ -377,4 +377,19 @@ mod tests {
         assert!(bg_keys.iter().any(|(k, pred, _)| k == mod_enter && pred.as_deref().is_some_and(|p| p.contains("!(!(!composerRequiresModifier))"))));
         assert!(bg_keys.iter().any(|(k, pred, _)| k == mod_shift_enter && pred.as_deref().is_some_and(|p| p.contains("!(!composerRequiresModifier)"))));
     }
+
+    #[test]
+    fn preview_zoom_shortcuts_require_preview_context() {
+        let keys = binding_keys(default_resolved_keybindings());
+        for command in ["preview.zoomIn", "preview.zoomOut", "preview.resetZoom"] {
+            let matches: Vec<_> = keys.iter().filter(|(_, _, cmd)| cmd == command).collect();
+            assert!(!matches.is_empty(), "missing default binding for {command}");
+            for (_, pred, _) in matches {
+                assert!(
+                    pred.as_deref().is_some_and(|p| p.contains("Preview")),
+                    "expected {command} to be scoped to Preview context (`pingdotgg/t3code#39207`), got {pred:?}"
+                );
+            }
+        }
+    }
 }

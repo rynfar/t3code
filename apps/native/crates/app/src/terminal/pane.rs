@@ -24,9 +24,8 @@ use t3_core::auth::ORCHESTRATION_OPERATE_SCOPE;
 use t3_core::client_settings::BrowserLinkTarget;
 use t3_core::composer::context::{normalize_text, selection_line_range};
 use t3_core::files::metadata::{self, GET_METADATA, Lookup};
-use t3_core::markdown::links::open_in_editor_request_with_root;
 use t3_core::project_search::{OPEN_IN_EDITOR, preferred_editor};
-use t3_core::terminal::emulator::{self, GridPoint, MouseAction, SelectionType, Side, TermMode, ThemeColors, hit_cell};
+use t3_core::terminal::emulator::{self, GridPoint, MouseAction, MouseReport, SelectionType, Side, TermMode, ThemeColors, hit_cell};
 use t3_core::terminal::links::{self, LinkHit};
 use t3_core::terminal::{
     self, Grid, KeyInput, TerminalShortcut, encode_key, encode_paste, local_shortcut, shortcut_data,
@@ -136,6 +135,7 @@ pub struct TerminalPane {
     /// The grid and cell size the emulator was last fitted to.
     fitted: Option<(Grid, (f32, f32))>,
     visible: bool,
+    focused: bool,
     marked: Option<String>,
     drag: Option<Drag>,
     /// The button whose press went to the program, and the cell it last reported.
@@ -213,6 +213,7 @@ impl TerminalPane {
             geometry: None,
             fitted: None,
             visible: true,
+            focused: false,
             marked: None,
             drag: None,
             reporting: None,
@@ -300,6 +301,10 @@ impl TerminalPane {
     }
 
     fn focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
         if !focused {
             self.dismiss_selection_menu(cx);
             self.clear_hovered_link(cx);
@@ -318,6 +323,15 @@ impl TerminalPane {
 
     /// Sends input and follows the output again, like typing into any terminal does.
     fn input(&mut self, data: &str, cx: &mut Context<Self>) {
+        self.send_input(data, false, cx);
+    }
+
+    /// Sends raw Latin-1 bytes (`binary: true`) for legacy binary mouse reports (`#37223`).
+    fn input_binary(&mut self, data: &str, cx: &mut Context<Self>) {
+        self.send_input(data, true, cx);
+    }
+
+    fn send_input(&mut self, data: &str, binary: bool, cx: &mut Context<Self>) {
         self.flush_resize();
         let scrolled = {
             let core = self.session.shared.lock();
@@ -329,14 +343,11 @@ impl TerminalPane {
         if scrolled {
             self.scroll_view(emulator::Emulator::scroll_to_bottom, cx);
         }
-        let writes = self.session.write(data);
-        if !writes.is_empty() {
+        let error_rx = if binary { self.session.write_binary(data) } else { self.session.write(data) };
+        if let Some(error_rx) = error_rx {
             cx.spawn(async move |this, cx| {
-                for write in writes {
-                    if let Ok(Err(RpcError::Failure(failure))) = write.await {
-                        let _ = this.update(cx, |pane, cx| pane.note(&failure.message, cx));
-                        return;
-                    }
+                if let Ok(RpcError::Failure(failure)) = error_rx.await {
+                    let _ = this.update(cx, |pane, cx| pane.note(&failure.message, cx));
                 }
             })
             .detach();
@@ -536,13 +547,21 @@ impl TerminalPane {
     }
 
     /// The report a pointer event sends to a program tracking the mouse, if it sends one.
-    fn mouse_report(&self, action: MouseAction, button: emulator::MouseButton, alt: bool, position: Point<Pixels>) -> Option<(String, (usize, usize))> {
+    fn mouse_report(&self, action: MouseAction, button: emulator::MouseButton, alt: bool, position: Point<Pixels>) -> Option<(MouseReport, (usize, usize))> {
         let (row, col, _) = self.cell_at(position)?;
         let core = self.session.shared.lock();
         if core.read_only {
             return None;
         }
         Some((core.emulator.mouse_report(action, button, alt, row, col)?, (row, col)))
+    }
+
+    fn send_mouse_report(&mut self, report: &MouseReport, cx: &mut Context<Self>) {
+        if report.binary {
+            self.input_binary(&report.data, cx);
+        } else {
+            self.input(&report.data, cx);
+        }
     }
 
     fn link_cell_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
@@ -560,10 +579,21 @@ impl TerminalPane {
         (col < geometry.cols && row < geometry.rows).then_some((row, col))
     }
 
-    fn link_query_path(&self, text: &str) -> Option<String> {
+    fn server_hostname(&self, cx: &App) -> Option<String> {
+        self.app
+            .as_ref()?
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()?
+            .hostname
+            .clone()
+    }
+
+    fn link_query_path(&self, text: &str, cx: &App) -> Option<String> {
         let cwd = &self.session.target.location.cwd;
-        let target = links::resolve_link_target(text, cwd);
-        metadata::query_path(&target, Some(cwd))
+        let hostname = self.server_hostname(cx);
+        links::metadata_query_path(text, cwd, hostname.as_deref())
     }
 
     fn has_link_scopes(&self, require_filesystem_read: bool, cx: &App) -> bool {
@@ -582,7 +612,7 @@ impl TerminalPane {
         if !self.has_link_scopes(true, cx) {
             return false;
         }
-        let Some(query) = self.link_query_path(text) else {
+        let Some(query) = self.link_query_path(text, cx) else {
             return false;
         };
         let mut cache = self.link_metadata.borrow_mut();
@@ -600,7 +630,7 @@ impl TerminalPane {
         if !self.has_link_scopes(true, cx) {
             return None;
         }
-        let query = self.link_query_path(&hit.text)?;
+        let query = self.link_query_path(&hit.text, cx)?;
         let mut cache = self.link_metadata.borrow_mut();
         let now = cache.0.elapsed().as_millis() as u64;
         let thread = self.session.target.thread_id.as_str();
@@ -619,7 +649,7 @@ impl TerminalPane {
         if !self.has_link_scopes(true, cx) {
             return LinkValidation::Ready(false);
         }
-        let Some(query) = self.link_query_path(text) else {
+        let Some(query) = self.link_query_path(text, cx) else {
             return LinkValidation::Ready(false);
         };
         {
@@ -718,7 +748,7 @@ impl TerminalPane {
         if links::is_url(&link.text) || !self.has_link_scopes(true, cx) {
             return;
         }
-        let Some(query) = self.link_query_path(&link.text) else { return };
+        let Some(query) = self.link_query_path(&link.text, cx) else { return };
         {
             let mut cache = self.link_metadata.borrow_mut();
             let now = cache.0.elapsed().as_millis() as u64;
@@ -849,7 +879,8 @@ impl TerminalPane {
             return;
         }
         let Some(app) = &self.app else { return };
-        let target = links::resolve_link_target(text, &self.session.target.location.cwd);
+        let hostname = self.server_hostname(cx);
+        let target = links::resolve_link_target_details(text, &self.session.target.location.cwd, hostname.as_deref());
         let project_root = self
             .session
             .target
@@ -866,7 +897,7 @@ impl TerminalPane {
                 .map(|config| config.available_editors.clone())
                 .unwrap_or_default();
             let (editor, _) = preferred_editor(&available, None)?;
-            Some(app.rpc(OPEN_IN_EDITOR, open_in_editor_request_with_root(&target, editor, Some(&project_root))))
+            Some(app.rpc(OPEN_IN_EDITOR, links::open_in_editor_payload(&target, editor, Some(&project_root))))
         });
         let Some(request) = request else {
             self.note("No editor is available to open this path.", cx);
@@ -917,7 +948,7 @@ impl TerminalPane {
         window.focus(&self.focus, cx);
         cx.emit(PaneEvent::Activated);
         self.reporting = Some((event.button, cell));
-        self.input(&report, cx);
+        self.send_mouse_report(&report, cx);
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -957,7 +988,7 @@ impl TerminalPane {
             self.reporting = Some((button, cell));
         }
         self.set_hovered_link(None, cx);
-        self.input(&report, cx);
+        self.send_mouse_report(&report, cx);
         true
     }
 
@@ -1010,7 +1041,7 @@ impl TerminalPane {
             let report = report_button(button)
                 .and_then(|button| self.mouse_report(MouseAction::Release, button, event.modifiers.alt, event.position));
             if let Some((report, _)) = report {
-                self.input(&report, cx);
+                self.send_mouse_report(&report, cx);
             }
             self.hover_pointer = Some(event.position);
             self.refresh_hovered_link(cx);
@@ -1043,7 +1074,7 @@ impl TerminalPane {
         };
         cx.stop_propagation();
         match input {
-            Some(input) => self.input(&input, cx),
+            Some(input) => self.send_mouse_report(&input, cx),
             None => {
                 self.scroll_view(|emulator| emulator.scroll(lines), cx);
                 cx.notify();

@@ -79,6 +79,7 @@ pub struct CellView {
     pub bold: bool,
     pub italic: bool,
     pub dim: bool,
+    pub hidden: bool,
     pub underline: bool,
     pub strikeout: bool,
     pub wide: bool,
@@ -87,6 +88,14 @@ pub struct CellView {
     /// Zero-width characters (combining marks, variation selectors) follow `c`; see
     /// [`Snapshot::combining`].
     pub combining: bool,
+}
+
+/// Mouse report input: UTF-8 text, or raw Latin-1 bytes (`binary: true`) for legacy X10/normal
+/// mouse reports above 0x7f (`pingdotgg/t3code#37223`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MouseReport {
+    pub data: String,
+    pub binary: bool,
 }
 
 /// A pointer button as mouse reports number them.
@@ -139,6 +148,10 @@ pub struct Snapshot {
     pub cursor: Option<CursorView>,
     pub display_offset: usize,
     pub history: usize,
+    /// Effective default colors after dynamic OSC 10/11/12 overrides (`pingdotgg/t3code#37193`).
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor_color: Rgb,
     /// Zero-width characters by cell index, in index order.
     pub combining: Vec<(usize, char)>,
 }
@@ -357,7 +370,7 @@ impl Emulator {
     /// modifiers let it, see `shouldReportTerminalMouse`), arrow keys for one that owns the
     /// alternate screen (as xterm sends), or `None` to scroll the scrollback. Positive `lines`
     /// scroll up.
-    pub fn wheel_input(&self, lines: i32, row: usize, col: usize, report: bool) -> Option<String> {
+    pub fn wheel_input(&self, lines: i32, row: usize, col: usize, report: bool) -> Option<MouseReport> {
         let mode = self.mode();
         let count = lines.unsigned_abs() as usize;
         if count == 0 {
@@ -365,7 +378,10 @@ impl Emulator {
         }
         if report && self.mouse_tracking() {
             let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
-            return self.mouse_report(MouseAction::Press, button, false, row, col).map(|report| report.repeat(count));
+            return self.mouse_report(MouseAction::Press, button, false, row, col).map(|r| MouseReport {
+                data: r.data.repeat(count),
+                binary: r.binary,
+            });
         }
         if mode.contains(TermMode::ALT_SCREEN) {
             let app = mode.contains(TermMode::APP_CURSOR);
@@ -375,7 +391,7 @@ impl Emulator {
                 (false, false) => "\x1b[B",
                 (false, true) => "\x1bOB",
             };
-            return Some(arrow.repeat(count));
+            return Some(MouseReport { data: arrow.repeat(count), binary: false });
         }
         None
     }
@@ -386,8 +402,9 @@ impl Emulator {
     }
 
     /// One pointer event at a visible cell, encoded the way the program asked: SGR (1006), UTF-8
-    /// coordinates (1005) or legacy bytes. `None` when its tracking mode skips the event.
-    pub fn mouse_report(&self, action: MouseAction, button: MouseButton, alt: bool, row: usize, col: usize) -> Option<String> {
+    /// coordinates (1005) or legacy raw bytes up to 255 (`pingdotgg/t3code#37223`). `None` when
+    /// its tracking mode skips the event.
+    pub fn mouse_report(&self, action: MouseAction, button: MouseButton, alt: bool, row: usize, col: usize) -> Option<MouseReport> {
         let mode = self.mode();
         let reports = match action {
             MouseAction::Press => mode.intersects(TermMode::MOUSE_MODE),
@@ -416,16 +433,24 @@ impl Emulator {
         let (x, y) = (col as u32 + 1, row as u32 + 1);
         if mode.contains(TermMode::SGR_MOUSE) {
             let end = if action == MouseAction::Release { 'm' } else { 'M' };
-            return Some(format!("\x1b[<{code};{x};{y}{end}"));
+            return Some(MouseReport { data: format!("\x1b[<{code};{x};{y}{end}"), binary: false });
         }
         if action == MouseAction::Release {
             code = 3 + if alt { 8 } else { 0 };
         }
-        // Input travels as text, so legacy coordinates stop at 7-bit bytes; UTF-8 mode goes on to
-        // xterm's limit of 2015.
-        let limit = if mode.contains(TermMode::UTF8_MOUSE) { 2047 } else { 127 };
-        let encode = |value: u32| char::from_u32(32 + value).filter(|_| 32 + value <= limit);
-        Some(format!("\x1b[M{}{}{}", encode(code)?, encode(x)?, encode(y)?))
+        if mode.contains(TermMode::UTF8_MOUSE) {
+            let encode = |value: u32| char::from_u32(32 + value).filter(|_| 32 + value <= 2047);
+            return Some(MouseReport {
+                data: format!("\x1b[M{}{}{}", encode(code)?, encode(x)?, encode(y)?),
+                binary: false,
+            });
+        }
+        // Legacy X10/normal bytes go up to 255 (col/row 223); bytes > 0x7f travel with `binary: true`
+        // (one UTF-16 code unit per raw byte, `pingdotgg/t3code#37223`).
+        let encode = |value: u32| char::from_u32(32 + value).filter(|_| 32 + value <= 255);
+        let (cb, cx, cy) = (encode(code)?, encode(x)?, encode(y)?);
+        let binary = 32 + code > 127 || 32 + x > 127 || 32 + y > 127;
+        Some(MouseReport { data: format!("\x1b[M{cb}{cx}{cy}"), binary })
     }
 
     /// The visible row `row` as link detection reads it (`terminalRowText`).
@@ -511,13 +536,21 @@ impl Emulator {
         out.history = self.term.grid().history_size();
         out.cells.clear();
         out.combining.clear();
+        let colors = content.colors;
+        let default_fg = colors[NamedColor::Foreground].unwrap_or(self.theme.foreground);
+        let default_bg = colors[NamedColor::Background].unwrap_or(self.theme.background);
+        let default_cursor = colors[NamedColor::Cursor].unwrap_or(self.theme.cursor);
+        out.foreground = default_fg;
+        out.background = default_bg;
+        out.cursor_color = default_cursor;
         let blank = CellView {
             c: ' ',
-            fg: self.theme.foreground,
+            fg: default_fg,
             bg: None,
             bold: false,
             italic: false,
             dim: false,
+            hidden: false,
             underline: false,
             strikeout: false,
             wide: false,
@@ -527,7 +560,6 @@ impl Emulator {
         };
         out.cells.resize(cols * rows, blank);
         let offset = content.display_offset as i32;
-        let colors = content.colors;
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + offset;
             if row < 0 || row as usize >= rows || indexed.point.column.0 >= cols {
@@ -541,16 +573,16 @@ impl Emulator {
                 other => Some(self.resolve(other, colors)),
             };
             if flags.contains(Flags::INVERSE) {
-                let background = bg.unwrap_or(self.theme.background);
+                let background = bg.unwrap_or(default_bg);
                 bg = Some(fg);
                 fg = background;
             }
-            if flags.contains(Flags::HIDDEN) {
-                fg = bg.unwrap_or(self.theme.background);
+            let hidden = flags.contains(Flags::HIDDEN);
+            if hidden {
+                fg = bg.unwrap_or(default_bg);
             }
             let selected = content.selection.is_some_and(|range| range.contains(indexed.point));
             let index = row as usize * cols + indexed.point.column.0;
-            let hidden = flags.contains(Flags::HIDDEN);
             let zerowidth = cell.zerowidth().filter(|_| !hidden).unwrap_or_default();
             out.combining.extend(zerowidth.iter().map(|&c| (index, c)));
             out.cells[index] = CellView {
@@ -560,8 +592,9 @@ impl Emulator {
                 bold: flags.contains(Flags::BOLD),
                 italic: flags.contains(Flags::ITALIC),
                 dim: flags.contains(Flags::DIM),
-                underline: flags.intersects(Flags::ALL_UNDERLINES),
-                strikeout: flags.contains(Flags::STRIKEOUT),
+                hidden,
+                underline: !hidden && flags.intersects(Flags::ALL_UNDERLINES),
+                strikeout: !hidden && flags.contains(Flags::STRIKEOUT),
                 wide: flags.contains(Flags::WIDE_CHAR),
                 spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
                 selected,
@@ -751,14 +784,15 @@ mod tests {
     #[test]
     fn wheel_goes_to_mouse_programs_and_the_alternate_screen() {
         let mut emulator = Emulator::new(Grid::new(20, 5), theme());
+        let txt = |s: &str| Some(MouseReport { data: s.into(), binary: false });
         assert_eq!(emulator.wheel_input(2, 0, 0, true), None);
         emulator.feed(b"\x1b[?1049h");
-        assert_eq!(emulator.wheel_input(-2, 0, 0, true).as_deref(), Some("\x1b[B\x1b[B"));
+        assert_eq!(emulator.wheel_input(-2, 0, 0, true), txt("\x1b[B\x1b[B"));
         emulator.feed(b"\x1b[?1000h");
-        assert_eq!(emulator.wheel_input(1, 2, 3, true).as_deref(), Some("\x1b[M`$#"));
-        assert_eq!(emulator.wheel_input(1, 2, 3, false).as_deref(), Some("\x1b[A"));
+        assert_eq!(emulator.wheel_input(1, 2, 3, true), txt("\x1b[M`$#"));
+        assert_eq!(emulator.wheel_input(1, 2, 3, false), txt("\x1b[A"));
         emulator.feed(b"\x1b[?1006h");
-        assert_eq!(emulator.wheel_input(1, 2, 3, true).as_deref(), Some("\x1b[<64;4;3M"));
+        assert_eq!(emulator.wheel_input(1, 2, 3, true), txt("\x1b[<64;4;3M"));
         assert_eq!(emulator.focus_input(true), None);
         emulator.feed(b"\x1b[?1004h");
         assert_eq!(emulator.focus_input(false), Some("\x1b[O"));
@@ -769,31 +803,67 @@ mod tests {
         use MouseAction::{Motion, Press, Release};
         let mut emulator = Emulator::new(Grid::new(300, 5), theme());
         let report = |emulator: &Emulator, action, button, alt, row, col| emulator.mouse_report(action, button, alt, row, col);
+        let txt = |s: &str| Some(MouseReport { data: s.into(), binary: false });
         assert!(!emulator.mouse_tracking());
         assert_eq!(report(&emulator, Press, MouseButton::Left, false, 0, 0), None);
 
         emulator.feed(b"\x1b[?1000h");
         assert!(emulator.mouse_tracking());
-        assert_eq!(report(&emulator, Press, MouseButton::Left, false, 2, 3).as_deref(), Some("\x1b[M $#"));
-        assert_eq!(report(&emulator, Release, MouseButton::Left, false, 2, 3).as_deref(), Some("\x1b[M#$#"));
+        assert_eq!(report(&emulator, Press, MouseButton::Left, false, 2, 3), txt("\x1b[M $#"));
+        assert_eq!(report(&emulator, Release, MouseButton::Left, false, 2, 3), txt("\x1b[M#$#"));
         assert_eq!(report(&emulator, Motion, MouseButton::Left, false, 2, 4), None);
-        assert_eq!(report(&emulator, Press, MouseButton::Left, false, 0, 200), None, "legacy bytes cannot reach column 201");
+        // Legacy X10/normal bytes above 0x7f travel with `binary: true` (`pingdotgg/t3code#37223`).
+        assert_eq!(
+            report(&emulator, Press, MouseButton::Left, false, 0, 200),
+            Some(MouseReport { data: "\x1b[M \u{e9}!".into(), binary: true }),
+            "legacy bytes reach col 201 via binary transport"
+        );
+        assert_eq!(report(&emulator, Press, MouseButton::Left, false, 0, 223), None, "legacy bytes stop at 255");
 
         emulator.feed(b"\x1b[?1002h");
-        assert_eq!(report(&emulator, Motion, MouseButton::Left, false, 2, 4).as_deref(), Some("\x1b[M@%#"));
+        assert_eq!(report(&emulator, Motion, MouseButton::Left, false, 2, 4), txt("\x1b[M@%#"));
         assert_eq!(report(&emulator, Motion, MouseButton::None, false, 2, 4), None);
 
         emulator.feed(b"\x1b[?1005h");
-        assert_eq!(report(&emulator, Press, MouseButton::Middle, false, 0, 200).as_deref(), Some("\x1b[M!\u{e9}!"));
+        assert_eq!(report(&emulator, Press, MouseButton::Middle, false, 0, 200), txt("\x1b[M!\u{e9}!"));
 
         emulator.feed(b"\x1b[?1003h\x1b[?1006h");
-        assert_eq!(report(&emulator, Press, MouseButton::Right, true, 1, 9).as_deref(), Some("\x1b[<10;10;2M"));
-        assert_eq!(report(&emulator, Release, MouseButton::Right, true, 1, 9).as_deref(), Some("\x1b[<10;10;2m"));
-        assert_eq!(report(&emulator, Motion, MouseButton::None, false, 0, 0).as_deref(), Some("\x1b[<35;1;1M"));
+        assert_eq!(report(&emulator, Press, MouseButton::Right, true, 1, 9), txt("\x1b[<10;10;2M"));
+        assert_eq!(report(&emulator, Release, MouseButton::Right, true, 1, 9), txt("\x1b[<10;10;2m"));
+        assert_eq!(report(&emulator, Motion, MouseButton::None, false, 0, 0), txt("\x1b[<35;1;1M"));
         assert_eq!(report(&emulator, Release, MouseButton::WheelUp, false, 0, 0), None);
 
         emulator.feed(b"\x1b[?1003l");
         assert!(!emulator.mouse_tracking());
+    }
+
+    #[test]
+    fn osc_default_color_changes_update_snapshot_colors_and_concealed_decorations_stay_hidden() {
+        let mut emulator = Emulator::new(Grid::new(20, 4), theme());
+        let light = ThemeColors {
+            foreground: Rgb { r: 0, g: 0, b: 0 },
+            background: Rgb { r: 255, g: 255, b: 255 },
+            cursor: Rgb { r: 0, g: 0, b: 0 },
+            ansi: [Rgb { r: 1, g: 1, b: 1 }; 16],
+        };
+        emulator.set_theme(light);
+        assert_eq!(emulator.feed(b"\x1b]11;?\x1b\\"), "\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+        assert_eq!(emulator.feed(b"\x1b]10;?\x1b\\"), "\x1b]10;rgb:0000/0000/0000\x1b\\");
+
+        // Dynamic OSC 10/11/12 changes repaint snapshot defaults (`pingdotgg/t3code#37193`).
+        emulator.feed(b"\x1b]10;rgb:1111/2222/3333\x07\x1b]11;rgb:aaaa/bbbb/cccc\x07\x1b]12;rgb:4444/5555/6666\x07");
+        // Concealed underlined/struck text stays hidden (`pingdotgg/t3code#37141`).
+        emulator.feed(b"\x1b[4;8;9mS\x1b[0m\x1b[4;9mV");
+        let mut snapshot = Snapshot::default();
+        emulator.snapshot(&mut snapshot);
+        assert_eq!(snapshot.foreground, Rgb { r: 0x11, g: 0x22, b: 0x33 });
+        assert_eq!(snapshot.background, Rgb { r: 0xaa, g: 0xbb, b: 0xcc });
+        assert_eq!(snapshot.cursor_color, Rgb { r: 0x44, g: 0x55, b: 0x66 });
+        let row = snapshot.row(0);
+        assert!(row[0].hidden && row[0].c == ' ' && !row[0].underline && !row[0].strikeout);
+        assert!(!row[1].hidden && row[1].c == 'V' && row[1].underline && row[1].strikeout);
+        // Fractional cell hit-testing lands on the exact drawn cell (`pingdotgg/t3code#37148`).
+        assert_eq!(hit_cell(120. * 7.4 + 1.0, 2. * 17.5 + 1.0, 7.4, 17.5, 200, 10), (2, 120, Side::Left));
     }
 
     #[test]
