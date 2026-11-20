@@ -444,6 +444,8 @@ pub fn items(features: Features) -> Vec<SearchItem> {
         SearchItem::new("text-generation-model", "Text generation model", Threads, &["generated thread titles source control content default provider"]).scope(ProjectDefaults),
         SearchItem::new("thread-title-instructions", "Thread title instructions", Threads, &["generated thread titles prompt custom style naming rename regenerate"]).scope(ProjectDefaults),
         SearchItem::new("app-version", "Version", About, &["about check for updates download install upgrade release"]),
+        SearchItem::new("update-track", "Update track", About, &["release channel stable latest nightly prerelease"]),
+        SearchItem::new("cli-command", "t3 command", About, &["cli terminal shell path install command line"]),
         SearchItem::new("mobile-app", "Mobile app", About, &["phone tablet iPhone iPad iOS Android App Store Google Play QR"]),
         SearchItem::new(
             "welcome-page",
@@ -751,5 +753,27 @@ mod search_parity_tests {
         assert!(search("mobile", &all).iter().any(|item| item.id == "browser-default-viewport"));
         assert!(search("percent", &all).iter().any(|item| item.id == "browser-default-zoom"));
         assert!(search("color scheme", &all).iter().any(|item| item.id == "browser-default-appearance"));
+
+        // About update-track & cli-command plus SnapShot rows are searchable.
+        let update_track = all.iter().find(|item| item.id == "update-track").expect("update-track item");
+        assert_eq!((update_track.section, update_track.title.as_str(), update_track.anchor()), (Section::About, "Update track", "update-track"));
+        assert!(search("nightly", &all).iter().any(|item| item.id == "update-track"));
+
+        let cli_cmd = all.iter().find(|item| item.id == "cli-command").expect("cli-command item");
+        assert_eq!((cli_cmd.section, cli_cmd.title.as_str(), cli_cmd.anchor()), (Section::About, "t3 command", "cli-command"));
+        assert!(search("command line", &all).iter().any(|item| item.id == "cli-command"));
+
+        for snap_id in [
+            "snap-shot-enabled",
+            "snap-shot-accessibility",
+            "snap-shot-shortcut",
+            "snap-shot-sound",
+            "snap-shot-flash",
+            "snap-shot-animations",
+        ] {
+            let item = all.iter().find(|item| item.id == snap_id).expect(snap_id);
+            assert_eq!(item.section, Section::SnapShot);
+            assert_eq!(item.anchor(), "snap-shot-enabled");
+        }
     }
 }

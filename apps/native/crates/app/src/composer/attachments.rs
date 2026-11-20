@@ -519,6 +519,106 @@ impl Composer {
         self.snapshot.target.clone()
     }
 
+    /// Draft key of the currently open question attachment target, if any, for SnapShot pinning.
+    pub(crate) fn active_question_draft_key(&self) -> Option<String> {
+        let (request, question) = self.active_question()?;
+        let target = self.question_target(&request, &question.id)?;
+        Some(super::drafts::key(&target))
+    }
+
+    /// Delivers a captured SnapShot PNG + optional `SnapShotSource` metadata into the active
+    /// thread/draft (or a pinned question attachment draft), enforcing
+    /// `PROVIDER_SEND_TURN_MAX_ATTACHMENTS` and `PROVIDER_SEND_TURN_MAX_IMAGE_BYTES`.
+    pub(crate) fn attach_snapshot_png(
+        &mut self,
+        capture_id: &str,
+        name: String,
+        png_bytes: Vec<u8>,
+        snapshot_source: Option<serde_json::Value>,
+        pinned_question_draft: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.editing_queued().is_some() || self.is_rewinding(cx) {
+            return Err("Finish editing before attaching a snapshot.".to_owned());
+        }
+        let target = if let Some(pinned) = pinned_question_draft
+            && let Some((request, question)) = self.active_question()
+            && let Some(q_target) = self.question_target(&request, &question.id)
+            && super::drafts::key(&q_target) == pinned
+        {
+            if let Target::Question(ref key) = q_target
+                && !self.question_can_attach(key, cx, IntakePhase::Start)
+            {
+                return Err(QUESTION_ATTACHMENTS_UNSUPPORTED_ERROR.to_owned());
+            }
+            q_target
+        } else if let Some(target) = self.snapshot.target.clone() {
+            target
+        } else {
+            let state = self.state.read(cx);
+            if let Some(thread_id) = state.selected_thread.clone() {
+                Target::Thread(thread_id)
+            } else if let Some(project_id) = state.draft_project.clone() {
+                Target::Draft(project_id)
+            } else {
+                return Err("No active thread or draft.".to_owned());
+            }
+        };
+
+        if matches!(target, Target::Thread(ref id) if self.state.read(cx).is_thread_rewinding(id)) {
+            return Err("This thread is rewinding. Try the capture again.".to_owned());
+        }
+
+        // Idempotent by capture ID (`SnapShotCoordinator.tsx`).
+        if self.staged_for(&target).iter().any(|entry| entry.attachment.id == capture_id) {
+            return Ok(());
+        }
+
+        if self.reserved_attachment_count(&target) >= rules::MAX_ATTACHMENTS {
+            return Err("Remove an attachment, then try this capture again.".to_owned());
+        }
+
+        let size = png_bytes.len() as u64;
+        if size == 0 || size > rules::MAX_IMAGE_BYTES {
+            return Err("The captured window is too large to attach.".to_owned());
+        }
+
+        if self.attachment_target().as_ref() == Some(&target) {
+            self.cancel_pending_send();
+        }
+        self.cancel_pending_routed_send_for(&target);
+
+        let preview = Some(Arc::new(Image::from_bytes(ImageFormat::Png, png_bytes.clone())));
+        let attachment = Attachment {
+            id: capture_id.to_owned(),
+            kind: AttachmentKind::Image,
+            name,
+            mime_type: "image/png".to_owned(),
+            size_bytes: size,
+            pasted_text: false,
+            upload: Upload::Uploading,
+        };
+        let id = attachment.id.clone();
+        self.attachments.staged.entry(target.clone()).or_default().push(Staged {
+            attachment,
+            preview,
+            bytes: Some(Arc::new(png_bytes)),
+            progress: 0.0,
+            show_progress: false,
+            upload_delay: None,
+            needs_reattach: false,
+            reattach_reason: None,
+            _copy_upload: None,
+            settled: Vec::new(),
+            source: None,
+            snapshot_source,
+        });
+        self.record_draft(&target, cx);
+        self.start_upload(target, id, cx);
+        cx.notify();
+        Ok(())
+    }
+
     pub(crate) fn can_attach(&self, cx: &App) -> bool {
         if self.editing_queued().is_some() || self.is_rewinding(cx) { return false; }
         if let Some(Target::Question(key)) = self.attachment_target() { return self.question_can_attach(&key, cx, IntakePhase::Start); }

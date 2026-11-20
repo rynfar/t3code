@@ -117,6 +117,8 @@ pub struct Workspace {
     project_dialogs: Entity<crate::projects::ProjectDialogs>,
     device_setup: Entity<crate::device::DeviceSetupDialog>,
     ssh_prompt: Entity<crate::ssh_prompt::SshPromptDialog>,
+    snapshot_coordinator: Entity<crate::snapshot_capture::SnapShotCoordinator>,
+    snapshot_setup: Entity<crate::snapshot_capture::SnapShotSetupDialog>,
     /// A rail drag is live; `has_active_drag` alone also matches row and tab drags.
     rail_dragging: bool,
     /// Tracks inline sidebar visibility across frames for `panelAnimationDurationMs` (`ST-APPEARANCE`).
@@ -177,6 +179,27 @@ impl Workspace {
         let project_dialogs = cx.new(|cx| crate::projects::ProjectDialogs::new(state.clone(), window, cx));
         let device_setup = cx.new(|cx| crate::device::DeviceSetupDialog::new(state.clone(), cx));
         let ssh_prompt = cx.new(|cx| crate::ssh_prompt::SshPromptDialog::new(state.clone(), window, cx));
+        let snapshot_coordinator = cx.new(|cx| {
+            crate::snapshot_capture::SnapShotCoordinator::new(
+                state.clone(),
+                composer.clone(),
+                window,
+                cx,
+            )
+        });
+        let snapshot_setup = cx.new(|cx| {
+            crate::snapshot_capture::SnapShotSetupDialog::new(
+                state.clone(),
+                snapshot_coordinator.clone(),
+                window,
+                cx,
+            )
+        });
+        crate::snapshot_capture::register_workspace_handles(
+            snapshot_coordinator.clone(),
+            snapshot_setup.clone(),
+            cx,
+        );
         let focus_observer = cx.new(|cx| crate::announcements::FocusObserver::new(state.clone(), window, cx));
         let star_root = focus_observer.read(cx).root.clone();
         let star_focus = cx.new(|cx| crate::github_star_prompt::FocusObserver::new(state.clone(), &star_root, window, cx));
@@ -226,6 +249,8 @@ impl Workspace {
                 this.state.update(cx, |state, cx| state.set_sidebar_viewport(width, cx));
             }),
             cx.observe(&terminal, |_, _, cx| cx.notify()),
+            cx.observe(&snapshot_coordinator, |_, _, cx| cx.notify()),
+            cx.observe(&snapshot_setup, |_, _, cx| cx.notify()),
             cx.subscribe_in(&composer, window, |this, _, event: &crate::composer::SendAndNewThreadCompleted, window, cx| {
                 this.finish_send_and_new_thread(&event.thread_id, window, cx);
             }),
@@ -257,6 +282,9 @@ impl Workspace {
                     });
                     t3_client::wakeups::emit_wakeup(wakeup);
                     this.sync_theme_background(cx);
+                    this.snapshot_coordinator.update(cx, |coordinator, cx| {
+                        coordinator.refresh_state(cx);
+                    });
                 } else {
                     this.inactive_since = Some(Instant::now());
                     crate::voice::handle_window_blur(cx);
@@ -334,6 +362,8 @@ impl Workspace {
             project_dialogs,
             device_setup,
             ssh_prompt,
+            snapshot_coordinator,
+            snapshot_setup,
             rail_dragging: false,
             last_sidebar_open: None,
             last_sidebar_width: layout::DEFAULT_WIDTH,
@@ -712,7 +742,8 @@ impl Render for Workspace {
                 crate::voice::record_key_down(&event.keystroke.key, event.is_held, cx);
                 if event.keystroke.key == "escape"
                     && (crate::voice::handle_escape(window, cx)
-                        || crate::voice::handle_setup_escape(cx))
+                        || crate::voice::handle_setup_escape(cx)
+                        || this.snapshot_setup.update(cx, |dialog, cx| dialog.handle_escape(cx)))
                 {
                     cx.stop_propagation();
                 }
@@ -833,6 +864,7 @@ impl Render for Workspace {
                         || this.project_dialogs.read(cx).is_open()
                         || crate::updates::overlay(cx).is_some()
                         || crate::voice::is_setup_modal_open(cx)
+                        || this.snapshot_setup.read(cx).is_open()
                         || this.welcome.read(cx).is_open()
                         || crate::settings::overlay(window, cx).is_some()
                         || crate::usage::overlay(window, cx).is_some()
@@ -859,6 +891,7 @@ impl Render for Workspace {
                         || this.project_dialogs.read(cx).is_open()
                         || crate::updates::overlay(cx).is_some()
                         || crate::voice::is_setup_modal_open(cx)
+                        || this.snapshot_setup.read(cx).is_open()
                         || this.welcome.read(cx).is_open()
                         || crate::settings::overlay(window, cx).is_some()
                         || crate::usage::overlay(window, cx).is_some()
@@ -997,6 +1030,8 @@ impl Render for Workspace {
             .children(settings)
             .children(theme_editor)
             .children(usage)
+            .children(self.snapshot_coordinator.read(cx).render_flash_overlay(cx))
+            .child(self.snapshot_setup.clone())
             .children(crate::quit_hold::hint(cx))
             .into_any_element()
     }
