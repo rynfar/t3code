@@ -113,6 +113,33 @@ fn suppress_background_phone_io(cx: &App) -> bool {
     crate::snapshot_capture::is_os_side_effects_disabled() || crate::chatgpt_setup::fixture_active(cx)
 }
 
+fn should_refresh_cloud_on_phone_open(
+    cloud_configured: bool,
+    cloud_busy: bool,
+    signed_in: bool,
+    cloud_checked: bool,
+) -> bool {
+    cloud_configured && !cloud_busy && (signed_in || !cloud_checked)
+}
+
+fn should_refresh_phone_link_on_phase(
+    wizard_open: bool,
+    phone_open: bool,
+    connected: bool,
+    signed_in: bool,
+    has_link_state: bool,
+    link_pending: bool,
+    has_link_error: bool,
+) -> bool {
+    wizard_open
+        && phone_open
+        && connected
+        && signed_in
+        && !has_link_state
+        && !link_pending
+        && !has_link_error
+}
+
 pub(super) struct PhoneState {
     pub(super) open: bool,
     pub(super) generation: u64,
@@ -210,17 +237,24 @@ impl WelcomeWizard {
         if cloud_ready {
             self.phone.cloud_checked = true;
         }
-        if !connected || connection_changed {
+        if !connected {
             self.reset_phone(false);
             return;
         }
+        if connection_changed {
+            self.reset_phone(false);
+        }
         if self.open && self.phone.open && !suppress_background_phone_io(cx) {
             let signed_in = self.state.read(cx).cloud.identity.is_some();
-            if signed_in
-                && self.phone.link_state.is_none()
-                && !self.phone.link_pending
-                && self.phone.link_error.is_none()
-            {
+            if should_refresh_phone_link_on_phase(
+                self.open,
+                self.phone.open,
+                connected,
+                signed_in,
+                self.phone.link_state.is_some(),
+                self.phone.link_pending,
+                self.phone.link_error.is_some(),
+            ) {
                 self.refresh_phone_link_state(cx);
             }
             self.ensure_phone_poll(cx);
@@ -231,11 +265,16 @@ impl WelcomeWizard {
         self.phone.open = !self.phone.open;
         if self.phone.open {
             if !suppress_background_phone_io(cx) {
-                let need_cloud_check = {
+                let need_cloud_refresh = {
                     let cloud = &self.state.read(cx).cloud;
-                    !self.phone.cloud_checked && cloud.identity.is_none() && !cloud.busy
+                    should_refresh_cloud_on_phone_open(
+                        self.phone.cloud_configured,
+                        cloud.busy,
+                        cloud.identity.is_some(),
+                        self.phone.cloud_checked,
+                    )
                 };
-                if need_cloud_check && self.phone.cloud_configured {
+                if need_cloud_refresh {
                     self.state.update(cx, |state, cx| state.refresh_cloud(cx));
                 }
                 self.refresh_phone_link_state(cx);
@@ -635,4 +674,34 @@ pub(crate) struct PhoneFixtureState {
     pub(crate) link_state: Option<CloudLinkState>,
     pub(crate) link_pending: bool,
     pub(crate) link_error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_refresh_cloud_on_phone_open, should_refresh_phone_link_on_phase};
+
+    #[test]
+    fn phone_open_refreshes_cloud_when_signed_in_even_after_initial_check() {
+        // Signed in at startup with `cloud_checked = true` and potentially stale discovery: must refresh.
+        assert!(should_refresh_cloud_on_phone_open(true, false, true, true));
+        // Signed out before initial check: must load stored credential once.
+        assert!(should_refresh_cloud_on_phone_open(true, false, false, false));
+        // Signed out after initial check: no redundant refresh.
+        assert!(!should_refresh_cloud_on_phone_open(true, false, false, true));
+        // Busy or unconfigured: never start a duplicate refresh.
+        assert!(!should_refresh_cloud_on_phone_open(true, true, true, true));
+        assert!(!should_refresh_cloud_on_phone_open(false, false, true, false));
+    }
+
+    #[test]
+    fn phone_phase_change_refreshes_when_connected_after_reset() {
+        // After connection switch resets link_state while phone stays open & connected: must refresh.
+        assert!(should_refresh_phone_link_on_phase(true, true, true, true, false, false, false));
+        // Disconnected or collapsed or already loaded/pending/errored: do not fetch.
+        assert!(!should_refresh_phone_link_on_phase(true, true, false, true, false, false, false));
+        assert!(!should_refresh_phone_link_on_phase(true, false, true, true, false, false, false));
+        assert!(!should_refresh_phone_link_on_phase(true, true, true, true, true, false, false));
+        assert!(!should_refresh_phone_link_on_phase(true, true, true, true, false, true, false));
+        assert!(!should_refresh_phone_link_on_phase(true, true, true, true, false, false, true));
+    }
 }

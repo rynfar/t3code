@@ -82,7 +82,10 @@ mod ui_tests {
     use t3_client::supervisor::ConnectionStatus;
     use t3_core::client_settings::ClientSettingChange;
     use t3_core::mcp::gate::{CloudLinkState, ConnectReachability};
-    use t3_core::onboarding::PhoneConnectState;
+    use t3_core::onboarding::{
+        PRIVACY_POLICY_LINK_LABEL, PhoneConnectState, TELEMETRY_NOTICE_DEFAULT,
+        TELEMETRY_NOTICE_SEE_POLICY,
+    };
 
     use super::super::phone::PhoneFixtureState;
     use super::super::{Step, WelcomeWizard};
@@ -488,10 +491,35 @@ mod ui_tests {
             "navigating to Sharing & access does not prematurely complete onboarding"
         );
 
+        // Regression test: events emitted while configuring T3 Connect in Settings must NOT
+        // cause WelcomeWizard::evaluate() to re-open over Settings (even with a fresh workspace).
+        state.update(&mut vcx, |state, cx| {
+            state.phase = Phase::Unpaired;
+            state.environments.environments.clear();
+            cx.emit(AppEvent::Phase);
+            cx.emit(AppEvent::Shell);
+            cx.emit(AppEvent::ServerConfig);
+            cx.emit(AppEvent::Selection);
+        });
+        draw(&mut vcx);
+        assert!(
+            !wizard.read_with(&vcx, |w, _| w.is_open()),
+            "WelcomeWizard must stay dismissed over Settings when AppEvents arrive"
+        );
+        assert!(
+            settings_rendered.load(Ordering::SeqCst),
+            "Settings overlay must remain visible while configuring T3 Connect"
+        );
+
         // Dismiss Settings via backdrop click so SettingsView drops cleanly before TestAppContext exits.
         vcx.simulate_click(point(px(2.), px(2.)), Default::default());
         draw(&mut vcx);
         assert!(!settings_rendered.load(Ordering::SeqCst));
+
+        // Explicit reopen (e.g. About -> Welcome page) still opens WelcomeWizard cleanly.
+        wizard.update(&mut vcx, |w, cx| w.show(Step::Connection, cx));
+        draw(&mut vcx);
+        assert!(wizard.read_with(&vcx, |w, _| w.is_open()));
 
         teardown(vcx, state, wizard, runtime, cx);
     }
@@ -527,6 +555,35 @@ mod ui_tests {
         vcx.simulate_keystrokes("space");
         draw(&mut vcx);
         assert_eq!(wizard.read_with(&vcx, |w, _| w.privacy_policy_clicks()), 2);
+
+        // Non-English locales translate TelemetryNotice using the real catalog keys (incl. ja word order).
+        vcx.update(|_, cx| {
+            crate::settings::store::update_client(&state, ClientSettingChange::Language("de".into()), cx);
+        });
+        draw(&mut vcx);
+        vcx.read(|cx| {
+            assert_eq!(crate::i18n::active_locale(cx), "de");
+            assert_ne!(crate::i18n::t(cx, TELEMETRY_NOTICE_DEFAULT), TELEMETRY_NOTICE_DEFAULT);
+            assert_ne!(crate::i18n::t(cx, TELEMETRY_NOTICE_SEE_POLICY), TELEMETRY_NOTICE_SEE_POLICY);
+            assert_eq!(crate::i18n::t(cx, PRIVACY_POLICY_LINK_LABEL), "Datenschutzerklärung");
+        });
+        assert!(vcx.debug_bounds("welcome-telemetry-notice").is_some());
+        assert!(vcx.debug_bounds("welcome-privacy-policy").is_some());
+
+        vcx.update(|_, cx| {
+            crate::settings::store::update_client(&state, ClientSettingChange::Language("ja".into()), cx);
+        });
+        draw(&mut vcx);
+        vcx.read(|cx| {
+            assert_eq!(crate::i18n::active_locale(cx), "ja");
+            assert_eq!(crate::i18n::t(cx, PRIVACY_POLICY_LINK_LABEL), "プライバシーポリシー");
+        });
+        assert!(vcx.debug_bounds("welcome-privacy-policy").is_some());
+
+        vcx.update(|_, cx| {
+            crate::settings::store::update_client(&state, ClientSettingChange::Language("en".into()), cx);
+        });
+        draw(&mut vcx);
 
         // Managed telemetry-off policy still renders TelemetryNotice with keyboard-accessible link.
         state.update(&mut vcx, |state, cx| {

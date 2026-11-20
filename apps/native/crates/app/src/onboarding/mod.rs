@@ -129,6 +129,9 @@ pub struct WelcomeWizard {
     chatgpt_subscriptions: Vec<Subscription>,
     state: Entity<AppState>,
     open: bool,
+    /// Set when the user navigated from Welcome -> Settings (e.g. `PhoneConnectLink`), so
+    /// `evaluate()` never pops Welcome back open over Settings when `Phase`/`ServerConfig` fire.
+    dismissed_for_settings: bool,
     step: Step,
     focus: FocusHandle,
     privacy_focus: FocusHandle,
@@ -184,6 +187,7 @@ impl WelcomeWizard {
             chatgpt: Default::default(),created_chatgpt:None,chatgpt_subscriptions:Vec::new(),
             state,
             open: false,
+            dismissed_for_settings: false,
             step: Step::Connection,
             focus: cx.focus_handle(),
             privacy_focus: cx.focus_handle().tab_stop(true),
@@ -293,7 +297,10 @@ impl WelcomeWizard {
     /// `FirstRunGate`: opens the wizard for a first launch or a confirmed fresh workspace, and
     /// saves onboarding as done once the server confirms an established one.
     fn evaluate(&mut self, cx: &mut Context<Self>) {
-        if self.open || crate::settings::client_settings(cx).onboarding_completed() {
+        if self.open
+            || self.dismissed_for_settings
+            || crate::settings::client_settings(cx).onboarding_completed()
+        {
             self.welcome = None;
             return;
         }
@@ -375,6 +382,7 @@ impl WelcomeWizard {
 
     fn show(&mut self, step: Step, cx: &mut Context<Self>) {
         self.open = true;
+        self.dismissed_for_settings = false;
         self.step = step;
         self.focus_pending = true;
         self.welcome = None;
@@ -407,6 +415,7 @@ impl WelcomeWizard {
         self.cancel_projects();
         self.reset_phone(true);
         self.open = false;
+        self.dismissed_for_settings = false;
         self.connected_for_welcome = None;
         self.cli_path_task = None;
         self.setup = None;
@@ -424,6 +433,7 @@ impl WelcomeWizard {
         self.cancel_projects();
         self.reset_phone(true);
         self.open = false;
+        self.dismissed_for_settings = true;
         self.connected_for_welcome = None;
         self.cli_path_task = None;
         self.setup = None;

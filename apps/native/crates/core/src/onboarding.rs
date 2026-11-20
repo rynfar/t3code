@@ -33,6 +33,51 @@ pub const SUBSCRIBE_SERVER_LIFECYCLE: &str = "subscribeServerLifecycle";
 /// `PRIVACY_POLICY_URL` (`web/src/legalLinks.ts`).
 pub const PRIVACY_POLICY_URL: &str = "https://t3.codes/privacy-policy";
 
+/// Catalog keys for `TelemetryNotice` (`apps/web/src/components/onboarding/WelcomePage.tsx`,
+/// matching flattened rich entries `71f3822326109c8e`, `b33f35083757b42c`, and `3188bc3b3c4508bc`).
+pub const TELEMETRY_NOTICE_DEFAULT: &str =
+    "T3 Code collects anonymous usage data to improve the app. To opt out, see the privacy policy.";
+pub const TELEMETRY_NOTICE_SEE_POLICY: &str = "See the privacy policy.";
+pub const PRIVACY_POLICY_LINK_LABEL: &str = "Privacy policy";
+
+/// Splits a localized telemetry notice sentence around the localized privacy-policy link phrase
+/// (`before`, `link`, `after`) using UTF-8-safe case-insensitive character matching so every
+/// locale (including languages like Japanese that place text after the link) preserves natural
+/// word order and exact sentence casing. Falls back to `(sentence, link_phrase, "")` when the
+/// sentence uses an inflected or alternate form of `link_phrase`.
+pub fn split_telemetry_notice_link(sentence: &str, link_phrase: &str) -> (String, String, String) {
+    let needle = link_phrase.trim();
+    if needle.is_empty() {
+        return (sentence.to_owned(), String::new(), String::new());
+    }
+    if let Some(start) = sentence.find(needle) {
+        let end = start + needle.len();
+        return (
+            sentence[..start].to_owned(),
+            sentence[start..end].to_owned(),
+            sentence[end..].to_owned(),
+        );
+    }
+    let needle_lower = needle.to_lowercase();
+    let needle_chars = needle.chars().count();
+    let starts: Vec<usize> = sentence.char_indices().map(|(idx, _)| idx).collect();
+    if needle_chars > 0 && starts.len() >= needle_chars {
+        for i in 0..=starts.len() - needle_chars {
+            let start = starts[i];
+            let end = starts.get(i + needle_chars).copied().unwrap_or(sentence.len());
+            let candidate = &sentence[start..end];
+            if candidate.to_lowercase() == needle_lower {
+                return (
+                    sentence[..start].to_owned(),
+                    candidate.to_owned(),
+                    sentence[end..].to_owned(),
+                );
+            }
+        }
+    }
+    (sentence.to_owned(), needle.to_owned(), String::new())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstRunDecision {
     Pending,

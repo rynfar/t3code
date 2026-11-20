@@ -218,6 +218,45 @@ fn the_privacy_line_names_an_administrator_that_turned_usage_data_off() {
     );
 }
 
+#[test]
+fn telemetry_notice_link_splitting_translates_across_locales_and_word_orders() {
+    // English preserves lowercase "privacy policy" inside the sentence.
+    assert_eq!(
+        split_telemetry_notice_link(TELEMETRY_NOTICE_DEFAULT, PRIVACY_POLICY_LINK_LABEL),
+        (
+            "T3 Code collects anonymous usage data to improve the app. To opt out, see the ".into(),
+            "privacy policy".into(),
+            ".".into(),
+        )
+    );
+
+    // German translates both sentence and link label via the real catalog keys.
+    let de_sentence = crate::i18n::translate("de", TELEMETRY_NOTICE_DEFAULT);
+    let de_link = crate::i18n::translate("de", PRIVACY_POLICY_LINK_LABEL);
+    assert_ne!(de_sentence, TELEMETRY_NOTICE_DEFAULT);
+    assert_eq!(de_link, "Datenschutzerklärung");
+    let (de_before, de_matched, de_after) = split_telemetry_notice_link(de_sentence, de_link);
+    assert!(!de_before.is_empty());
+    assert_eq!(de_matched, "Datenschutzerklärung");
+    assert_eq!(de_after, ".");
+
+    // Japanese places trailing text after the link.
+    let ja_sentence = crate::i18n::translate("ja", TELEMETRY_NOTICE_DEFAULT);
+    let ja_link = crate::i18n::translate("ja", PRIVACY_POLICY_LINK_LABEL);
+    let (ja_before, ja_matched, ja_after) = split_telemetry_notice_link(ja_sentence, ja_link);
+    assert!(!ja_before.is_empty());
+    assert_eq!(ja_matched, "プライバシーポリシー");
+    assert!(ja_after.contains("をご覧ください。"), "unexpected ja_after: {ja_after:?}");
+
+    // Inflected form fallback keeps the full translated sentence plus the translated link label.
+    let ru_sentence = crate::i18n::translate("ru", TELEMETRY_NOTICE_DEFAULT);
+    let ru_link = crate::i18n::translate("ru", PRIVACY_POLICY_LINK_LABEL);
+    let (ru_before, ru_matched, ru_after) = split_telemetry_notice_link(ru_sentence, ru_link);
+    assert_eq!(ru_before, ru_sentence);
+    assert_eq!(ru_matched, ru_link);
+    assert!(ru_after.is_empty());
+}
+
 fn settings_with_binary(instance_id: &str, driver: &str, binary_path: &str) -> ServerSettings {
     serde_json::from_value(json!({"providerInstances": {instance_id: {"driver": driver, "config": {"binaryPath": binary_path}}}})).unwrap()
 }

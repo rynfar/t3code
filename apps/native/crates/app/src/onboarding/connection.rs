@@ -13,7 +13,8 @@ use t3_client::status::ConnectionPhase;
 use t3_client::store::SavedEnvironment;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::onboarding::{
-    INSTALL_T3_COMMAND_NPX, INSTALL_T3_COMMAND_UNIX, privacy_notice,
+    INSTALL_T3_COMMAND_NPX, INSTALL_T3_COMMAND_UNIX, PRIVACY_POLICY_LINK_LABEL,
+    TELEMETRY_NOTICE_DEFAULT, TELEMETRY_NOTICE_SEE_POLICY, split_telemetry_notice_link,
 };
 
 use super::{WelcomeWizard, key_stop, key_stop_with_focus, row_card, section_heading};
@@ -431,7 +432,7 @@ impl WelcomeWizard {
         let app = self.state.read(cx);
         let connected = app.phase == Phase::Online(ConnectionStatus::Connected) && app.connect.pairing.is_none();
         let policy = app.server_config.config.as_ref().and_then(|config| config.managed_policy.clone());
-        let notice = match policy.as_ref().filter(|policy| policy["limits"]["telemetry"] == false) {
+        let sentence = match policy.as_ref().filter(|policy| policy["limits"]["telemetry"] == false) {
             Some(policy) => {
                 let org = t3_core::managed_policy::organization(policy);
                 let off = crate::i18n::t_fmt(
@@ -439,18 +440,20 @@ impl WelcomeWizard {
                     "{organization} turned off anonymous usage data.",
                     &[("organization", org.into())],
                 );
-                format!("{off} {}", crate::i18n::t(cx, "See the"))
+                let see = crate::i18n::t(cx, TELEMETRY_NOTICE_SEE_POLICY);
+                format!("{off} {see}")
             }
-            None => privacy_notice(None),
+            None => crate::i18n::t(cx, TELEMETRY_NOTICE_DEFAULT).to_owned(),
         };
-        let link_label = crate::i18n::t(cx, "privacy policy");
+        let link_phrase = crate::i18n::t(cx, PRIVACY_POLICY_LINK_LABEL);
+        let (before, link_label, after) = split_telemetry_notice_link(&sentence, link_phrase);
         let open_policy = cx.listener(|this, _: &(), _, cx| this.open_privacy_policy(cx));
         let privacy_link = key_stop_with_focus(
             div()
                 .id("welcome-privacy-policy")
                 .debug_selector(|| "welcome-privacy-policy".to_owned())
                 .role(gpui::Role::Link)
-                .aria_label(link_label)
+                .aria_label(link_label.clone())
                 .rounded(r(3.))
                 .underline()
                 .text_color(hsla(p.muted_foreground))
@@ -461,6 +464,11 @@ impl WelcomeWizard {
             window,
             cx,
         );
+        let before_trimmed = before.trim_end();
+        let link_group = h_flex()
+            .items_baseline()
+            .child(privacy_link)
+            .when(!after.is_empty(), |row| row.child(after));
         let telemetry_notice = h_flex()
             .debug_selector(|| "welcome-telemetry-notice".to_owned())
             .flex_1()
@@ -471,8 +479,8 @@ impl WelcomeWizard {
             .text_xs()
             .line_height(r(19.5))
             .text_color(hsla(p.muted_foreground))
-            .child(notice)
-            .child(h_flex().items_baseline().child(privacy_link).child("."));
+            .when(!before_trimmed.is_empty(), |row| row.child(before_trimmed.to_owned()))
+            .child(link_group);
         h_flex()
             .pt(r(12.))
             .border_t_1()
