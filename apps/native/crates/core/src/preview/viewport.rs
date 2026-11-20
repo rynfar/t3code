@@ -6,10 +6,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::{DEFAULT_ZOOM, ZOOM_LEVELS};
+use super::{DEFAULT_ZOOM, normalize_zoom_level};
 
 pub const DEFAULT_BROWSER_PROFILE_ID: &str = "default";
 pub const INCOGNITO_BROWSER_PROFILE_ID: &str = "incognito";
+pub const BROWSER_PROFILE_ID_MAX_LENGTH: usize = 64;
+pub const BROWSER_PROFILE_NAME_MAX_LENGTH: usize = 48;
+pub const BROWSER_PROFILE_MAX_COUNT: usize = 24;
+pub const RESPONSIVE_SEED_SIZE: (u32, u32) = (1280, 800);
 
 pub const PREVIEW_VIEWPORT_MIN_DIMENSION: u32 = 240;
 pub const PREVIEW_VIEWPORT_MAX_DIMENSION: u32 = 3840;
@@ -99,25 +103,44 @@ impl ViewportSetting {
         }
     }
 
+    /// Normalizes out-of-bounds viewports back to `Fill`.
+    pub fn validated(&self) -> Self {
+        match self {
+            ViewportSetting::Fill => ViewportSetting::Fill,
+            ViewportSetting::Freeform { width, height } | ViewportSetting::Preset { width, height, .. }
+                if validate_viewport_dimensions(*width, *height) =>
+            {
+                self.clone()
+            }
+            _ => ViewportSetting::Fill,
+        }
+    }
+
     /// Parses a `PreviewViewportSetting` JSON object, falling back to `Fill` on unknown or
     /// out-of-bounds shapes for forward compatibility.
     pub fn from_value(value: &Value) -> Self {
         let Ok(setting) = serde_json::from_value::<ViewportSetting>(value.clone()) else {
             return ViewportSetting::Fill;
         };
-        match &setting {
-            ViewportSetting::Fill => setting,
-            ViewportSetting::Freeform { width, height } | ViewportSetting::Preset { width, height, .. }
-                if validate_viewport_dimensions(*width, *height) =>
-            {
-                setting
-            }
-            _ => ViewportSetting::Fill,
-        }
+        setting.validated()
     }
 
     pub fn to_value(&self) -> Value {
-        serde_json::to_value(self).unwrap_or_else(|_| json!({ "_tag": "fill" }))
+        serde_json::to_value(self.validated()).unwrap_or_else(|_| json!({ "_tag": "fill" }))
+    }
+}
+
+/// Formats a zoom factor as an integer percentage (`zoomLabel` in `IntegrationsSettings.tsx`).
+pub fn zoom_label(zoom_factor: f64) -> String {
+    format!("{}%", (zoom_factor * 100.).round() as u32)
+}
+
+/// Select value token for the Default browser viewport picker (`viewportSelectValue`).
+pub fn viewport_select_value(viewport: &ViewportSetting) -> &str {
+    match viewport {
+        ViewportSetting::Fill => "fill",
+        ViewportSetting::Preset { preset_id, .. } if find_viewport_preset(preset_id).is_some() => preset_id.as_str(),
+        ViewportSetting::Freeform { .. } | ViewportSetting::Preset { .. } => "responsive",
     }
 }
 
@@ -304,26 +327,65 @@ pub fn built_in_browser_profiles() -> Vec<BrowserProfile> {
     ]
 }
 
+pub fn is_built_in_browser_profile_id(id: &str) -> bool {
+    matches!(id, DEFAULT_BROWSER_PROFILE_ID | INCOGNITO_BROWSER_PROFILE_ID)
+}
+
+pub fn is_valid_browser_profile_id(id: &str) -> bool {
+    let trimmed = id.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().count() <= BROWSER_PROFILE_ID_MAX_LENGTH
+        && !trimmed.chars().any(char::is_control)
+}
+
+/// Sanitizes persisted user-defined profiles (`browserProfiles`): trims ids/names, drops built-in
+/// or invalid/duplicate ids, truncates names to `BROWSER_PROFILE_NAME_MAX_LENGTH`, forces
+/// `Persistent`, and caps at `BROWSER_PROFILE_MAX_COUNT`.
+pub fn sanitize_user_profiles(user_profiles: &[BrowserProfile]) -> Vec<BrowserProfile> {
+    let mut sanitized = Vec::new();
+    for profile in user_profiles {
+        if sanitized.len() >= BROWSER_PROFILE_MAX_COUNT {
+            break;
+        }
+        let id = profile.id.trim();
+        let name = profile.name.trim();
+        if !is_valid_browser_profile_id(id) || is_built_in_browser_profile_id(id) || name.is_empty() {
+            continue;
+        }
+        if sanitized.iter().any(|existing: &BrowserProfile| existing.id == id) {
+            continue;
+        }
+        sanitized.push(BrowserProfile {
+            id: id.to_owned(),
+            name: name.chars().take(BROWSER_PROFILE_NAME_MAX_LENGTH).collect(),
+            kind: BrowserProfileKind::Persistent,
+        });
+    }
+    sanitized
+}
+
 /// `resolveBrowserProfiles`: built-in profiles first, then deduplicated user profiles forced to
 /// persistent (only the built-in incognito profile is ephemeral).
 pub fn resolve_browser_profiles(user_profiles: &[BrowserProfile]) -> Vec<BrowserProfile> {
     let mut resolved = built_in_browser_profiles();
-    for profile in user_profiles {
-        let id = profile.id.trim();
-        let name = profile.name.trim();
-        if id.is_empty() || id.len() > 64 || id.chars().any(char::is_control) || name.is_empty() {
-            continue;
-        }
-        if resolved.iter().any(|existing| existing.id == id) {
-            continue;
-        }
-        resolved.push(BrowserProfile {
-            id: id.to_owned(),
-            name: name.chars().take(48).collect(),
-            kind: BrowserProfileKind::Persistent,
-        });
-    }
+    resolved.extend(sanitize_user_profiles(user_profiles));
     resolved
+}
+
+/// Picks the next unused profile name (`"New profile"`, `"New profile 2"`, …).
+pub fn next_unique_profile_name(profiles: &[BrowserProfile], base_name: &str) -> String {
+    let base = base_name.trim();
+    let base = if base.is_empty() { "New profile" } else { base };
+    if !profiles.iter().any(|profile| profile.name == base) {
+        return base.chars().take(BROWSER_PROFILE_NAME_MAX_LENGTH).collect();
+    }
+    for index in 2.. {
+        let candidate = format!("{base} {index}");
+        if !profiles.iter().any(|profile| profile.name == candidate) {
+            return candidate.chars().take(BROWSER_PROFILE_NAME_MAX_LENGTH).collect();
+        }
+    }
+    base.chars().take(BROWSER_PROFILE_NAME_MAX_LENGTH).collect()
 }
 
 pub fn profile_name(profiles: &[BrowserProfile], profile_id: &str) -> String {
@@ -335,6 +397,20 @@ pub fn profile_name(profiles: &[BrowserProfile], profile_id: &str) -> String {
 
 pub fn is_incognito_profile(profile_id: Option<&str>) -> bool {
     profile_id == Some(INCOGNITO_BROWSER_PROFILE_ID)
+}
+
+/// Builds the `preview.reportProfiles` RPC payload (`PreviewReportProfilesInput`).
+pub fn report_profiles_payload(user_profiles: &[BrowserProfile], default_profile_id: &str) -> Value {
+    let profiles = sanitize_user_profiles(user_profiles);
+    let resolved = resolve_browser_profiles(&profiles);
+    let default_id = resolved
+        .iter()
+        .find(|profile| profile.id == default_profile_id && profile.kind != BrowserProfileKind::Incognito)
+        .map_or(DEFAULT_BROWSER_PROFILE_ID, |profile| profile.id.as_str());
+    json!({
+        "profiles": profiles,
+        "defaultProfileId": default_id,
+    })
 }
 
 /// `BrowserDefaults` from `apps/web/src/browser/browserDefaults.ts`.
@@ -370,7 +446,7 @@ impl BrowserDefaults {
         let zoom_factor = entries
             .get("browserDefaultZoomFactor")
             .and_then(Value::as_f64)
-            .and_then(|z| ZOOM_LEVELS.iter().copied().find(|level| (*level - z).abs() < 1e-9))
+            .and_then(normalize_zoom_level)
             .unwrap_or(DEFAULT_ZOOM);
         let appearance = entries
             .get("browserDefaultAppearance")
@@ -414,7 +490,7 @@ pub fn open_session_payload(thread_id: &str, defaults: &BrowserDefaults, overrid
     let profile_id = overrides.profile_id.as_deref().unwrap_or(&defaults.profile_id);
     let zoom_factor = overrides
         .zoom_factor
-        .and_then(|z| ZOOM_LEVELS.iter().copied().find(|level| (*level - z).abs() < 1e-9))
+        .and_then(normalize_zoom_level)
         .unwrap_or(defaults.zoom_factor);
     let color_scheme = overrides.color_scheme.unwrap_or(defaults.appearance);
     let mut payload = json!({
@@ -545,5 +621,55 @@ mod tests {
         assert!(validate_viewport_dimensions(3840, 2160));
         assert!(!validate_viewport_dimensions(3840, 3840));
         assert!(!validate_viewport_dimensions(200, 600));
+    }
+
+    #[test]
+    fn profile_helpers_zoom_label_and_report_payload_match_web() {
+        let base = built_in_browser_profiles();
+        assert_eq!(next_unique_profile_name(&base, "New profile"), "New profile");
+        let with_one = resolve_browser_profiles(&[BrowserProfile {
+            id: "p1".into(),
+            name: "New profile".into(),
+            kind: BrowserProfileKind::Persistent,
+        }]);
+        assert_eq!(next_unique_profile_name(&with_one, "New profile"), "New profile 2");
+
+        assert_eq!(zoom_label(1.0), "100%");
+        assert_eq!(zoom_label(0.67), "67%");
+        assert_eq!(zoom_label(1.25), "125%");
+        assert_eq!(viewport_select_value(&ViewportSetting::Fill), "fill");
+        assert_eq!(viewport_select_value(&preset_setting("ipad-pro").unwrap()), "ipad-pro");
+        assert_eq!(
+            viewport_select_value(&ViewportSetting::Preset {
+                width: 1920,
+                height: 1080,
+                preset_id: "desktop-1920x1080".into(),
+            }),
+            "responsive"
+        );
+        assert_eq!(
+            viewport_select_value(&ViewportSetting::Freeform { width: 1280, height: 800 }),
+            "responsive"
+        );
+
+        let payload = report_profiles_payload(
+            &[BrowserProfile { id: "work".into(), name: "Work".into(), kind: BrowserProfileKind::Persistent }],
+            "work",
+        );
+        assert_eq!(
+            payload,
+            json!({
+                "profiles": [{ "id": "work", "name": "Work", "kind": "persistent" }],
+                "defaultProfileId": "work",
+            })
+        );
+        let fallback_payload = report_profiles_payload(&[], "incognito");
+        assert_eq!(
+            fallback_payload,
+            json!({
+                "profiles": [],
+                "defaultProfileId": "default",
+            })
+        );
     }
 }

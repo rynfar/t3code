@@ -25,7 +25,9 @@ use serde_json::{Value, json};
 use t3_client::session::RpcError;
 use t3_client::store;
 use t3_core::preview::address::{BrowserHistory, HistoryEntry, is_history_profile};
-use t3_core::preview::viewport::{BrowserDefaults, OpenPreviewOverrides, ViewportSetting, open_session_payload};
+use t3_core::preview::viewport::{
+    BrowserDefaults, OpenPreviewOverrides, ViewportSetting, open_session_payload, report_profiles_payload,
+};
 use t3_core::preview::{ListResult, PREVIEW_OPERATE_SCOPE, PreviewEvent, PreviewThreads, SessionSnapshot, TabsEdit, method};
 
 pub use pane::PreviewPane;
@@ -100,6 +102,10 @@ pub struct Previews {
     /// `None` until the server config arrives.
     server_browser: Option<bool>,
     connection: Option<u64>,
+    /// Last `(connection, payload)` reported via `preview.reportProfiles` (`BrowserProfileReporter.ts`).
+    last_reported_profiles: Option<(Option<u64>, Value)>,
+    #[cfg(all(test, feature = "snapshot"))]
+    report_settled: Option<tokio::sync::oneshot::Sender<bool>>,
     events: Option<(Abort, Task<()>)>,
     grants: Option<Task<()>>,
     listing: Option<Task<()>>,
@@ -187,6 +193,9 @@ impl Previews {
             can_operate: None,
             server_browser: None,
             connection: None,
+            last_reported_profiles: None,
+            #[cfg(all(test, feature = "snapshot"))]
+            report_settled: None,
             events: None,
             grants: None,
             listing: None,
@@ -232,6 +241,7 @@ impl Previews {
         self.listing = None;
         self.can_operate = None;
         self.server_browser = None;
+        self.last_reported_profiles = None;
         self.history_store = state.environments.active.as_deref().map(|environment| format!("preview-history-{environment}"));
         self.history = self
             .history_store
@@ -254,6 +264,11 @@ impl Previews {
                 let updated = this.update(cx, |this, cx| {
                     if this.can_operate != can_operate {
                         this.can_operate = can_operate;
+                        if can_operate == Some(true) {
+                            this.report_profiles_if_needed(cx);
+                        } else {
+                            this.last_reported_profiles = None;
+                        }
                         this.emit_all(cx);
                     }
                 });
@@ -270,6 +285,38 @@ impl Previews {
         }
     }
 
+    /// Reports the client's `browserProfiles` and `browserDefaultProfileId` to the active
+    /// server-browser environment (`BrowserProfileReporter.ts`), deduplicated per connection.
+    pub fn report_profiles_if_needed(&mut self, cx: &mut Context<Self>) {
+        if self.server_browser != Some(true) || self.can_operate != Some(true) {
+            self.last_reported_profiles = None;
+            return;
+        }
+        let Some(doc) = crate::settings::store::try_client(cx) else { return };
+        let payload = report_profiles_payload(&doc.browser_user_profiles(), &doc.browser_default_profile_id());
+        let key = (self.connection, payload.clone());
+        if self.last_reported_profiles.as_ref() == Some(&key) {
+            return;
+        }
+        let Some(task) = self.state.read(cx).request(method::REPORT_PROFILES, payload, Ok) else {
+            return;
+        };
+        self.last_reported_profiles = Some(key.clone());
+        cx.spawn(async move |this, cx| {
+            let succeeded = matches!(task.await, Ok(Ok(_)));
+            let _ = this.update(cx, |this, _| {
+                if !succeeded && this.last_reported_profiles.as_ref() == Some(&key) {
+                    this.last_reported_profiles = None;
+                }
+                #[cfg(all(test, feature = "snapshot"))]
+                if let Some(tx) = this.report_settled.take() {
+                    let _ = tx.send(succeeded);
+                }
+            });
+        })
+        .detach();
+    }
+
     fn sync_server_browser(&mut self, cx: &mut Context<Self>) {
         let config = self.state.read(cx).server_config.config.as_ref().map(|config| config.environment.capabilities.server_browser == Some(true));
         if config.is_none() || config == self.server_browser {
@@ -279,8 +326,10 @@ impl Previews {
         if config == Some(true) {
             self.start_events(cx);
             self.list_selected(cx);
+            self.report_profiles_if_needed(cx);
         } else {
             self.events = None;
+            self.last_reported_profiles = None;
         }
         self.emit_all(cx);
     }
@@ -658,5 +707,17 @@ impl Previews {
     pub(super) fn set_server_browser_for_test(&mut self, enabled: bool) {
         self.server_browser = Some(enabled);
         self.can_operate = Some(true);
+        self.history = BrowserHistory::default();
+        self.history_store = None;
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn set_can_operate_for_test(&mut self, can_operate: Option<bool>) {
+        self.can_operate = can_operate;
+    }
+
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) fn set_report_settled_for_test(&mut self, tx: tokio::sync::oneshot::Sender<bool>) {
+        self.report_settled = Some(tx);
     }
 }

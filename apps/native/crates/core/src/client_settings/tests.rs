@@ -586,3 +586,108 @@ fn confirm_terminal_close_and_speech_streaming_default_true_and_round_trip() {
     assert!(invalid.confirm_terminal_close());
     assert!(invalid.speech_streaming());
 }
+
+#[test]
+fn browser_default_viewport_zoom_appearance_and_profiles_round_trip_and_validate() {
+    use crate::preview::viewport::{
+        AppearancePreference, BROWSER_PROFILE_MAX_COUNT, BrowserProfile, BrowserProfileKind,
+        DEFAULT_BROWSER_PROFILE_ID, INCOGNITO_BROWSER_PROFILE_ID, ViewportSetting, preset_setting,
+    };
+
+    let mut doc = ClientSettingsDoc::from_json(r#"{"futureSetting": 99}"#);
+    assert_eq!(doc.browser_default_viewport(), ViewportSetting::Fill);
+    assert_eq!(doc.browser_default_zoom_factor(), crate::preview::DEFAULT_ZOOM);
+    assert_eq!(doc.browser_default_appearance(), AppearancePreference::System);
+    assert!(doc.browser_user_profiles().is_empty());
+    assert_eq!(doc.browser_default_profile_id(), DEFAULT_BROWSER_PROFILE_ID);
+
+    // Preset viewport round-trips and matches BrowserDefaults.
+    let preset = preset_setting("iphone-12-pro").unwrap();
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultViewport(preset.clone())).is_empty());
+    assert!(doc.apply_change(&ClientSettingChange::BrowserDefaultViewport(preset.clone())).is_empty());
+    assert_eq!(doc.browser_default_viewport(), preset);
+    assert_eq!(
+        doc.entries()["browserDefaultViewport"],
+        serde_json::json!({ "_tag": "preset", "width": 390, "height": 844, "presetId": "iphone-12-pro" })
+    );
+
+    // Out-of-bounds freeform viewport normalizes back to Fill.
+    let invalid_vp = ViewportSetting::Freeform { width: 100, height: 800 };
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultViewport(invalid_vp)).is_empty());
+    assert_eq!(doc.browser_default_viewport(), ViewportSetting::Fill);
+    let freeform = ViewportSetting::Freeform { width: 1280, height: 800 };
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultViewport(freeform.clone())).is_empty());
+    assert_eq!(doc.browser_default_viewport(), freeform);
+
+    // Allowed zoom level persists; unsupported zoom falls back to 1.0.
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultZoomFactor(1.25)).is_empty());
+    assert!(doc.apply_change(&ClientSettingChange::BrowserDefaultZoomFactor(1.25)).is_empty());
+    assert_eq!(doc.browser_default_zoom_factor(), 1.25);
+    assert_eq!(doc.entries()["browserDefaultZoomFactor"], serde_json::json!(1.25));
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultZoomFactor(1.37)).is_empty());
+    assert_eq!(doc.browser_default_zoom_factor(), 1.0);
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultZoomFactor(0.8)).is_empty());
+    assert_eq!(doc.browser_default_zoom_factor(), 0.8);
+
+    // Appearance preference round-trips across all 3 variants.
+    for (pref, wire) in [
+        (AppearancePreference::Dark, "dark"),
+        (AppearancePreference::Light, "light"),
+        (AppearancePreference::System, "system"),
+        (AppearancePreference::Dark, "dark"),
+    ] {
+        assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultAppearance(pref)).is_empty());
+        assert!(doc.apply_change(&ClientSettingChange::BrowserDefaultAppearance(pref)).is_empty());
+        assert_eq!(doc.browser_default_appearance(), pref);
+        assert_eq!(doc.entries()["browserDefaultAppearance"], serde_json::json!(wire));
+    }
+
+    // Profiles sanitize built-ins, duplicates, incognito kind, and cap at BROWSER_PROFILE_MAX_COUNT.
+    let mut raw_profiles = vec![
+        BrowserProfile { id: "default".into(), name: "Spoof".into(), kind: BrowserProfileKind::Persistent },
+        BrowserProfile { id: "incognito".into(), name: "Spoof".into(), kind: BrowserProfileKind::Incognito },
+        BrowserProfile { id: " work ".into(), name: " Work ".into(), kind: BrowserProfileKind::Incognito },
+        BrowserProfile { id: "work".into(), name: "Duplicate".into(), kind: BrowserProfileKind::Persistent },
+        BrowserProfile { id: "bad\nid".into(), name: "Control".into(), kind: BrowserProfileKind::Persistent },
+    ];
+    for idx in 0..30 {
+        raw_profiles.push(BrowserProfile {
+            id: format!("p-{idx}"),
+            name: format!("Profile {idx}"),
+            kind: BrowserProfileKind::Persistent,
+        });
+    }
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserProfiles(raw_profiles)).is_empty());
+    let saved_profiles = doc.browser_user_profiles();
+    assert_eq!(saved_profiles.len(), BROWSER_PROFILE_MAX_COUNT);
+    assert_eq!(saved_profiles[0], BrowserProfile { id: "work".into(), name: "Work".into(), kind: BrowserProfileKind::Persistent });
+
+    // Default profile accepts persistent profile, rejects incognito/control chars.
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultProfileId("work".into())).is_empty());
+    assert_eq!(doc.browser_default_profile_id(), "work");
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultProfileId(INCOGNITO_BROWSER_PROFILE_ID.into())).is_empty());
+    assert_eq!(doc.browser_default_profile_id(), DEFAULT_BROWSER_PROFILE_ID);
+    assert!(!doc.apply_change(&ClientSettingChange::BrowserDefaultProfileId(" work ".into())).is_empty());
+    assert_eq!(doc.browser_default_profile_id(), "work");
+
+    // JSON round-trip preserves everything + unknown keys and agrees with BrowserDefaults.
+    let reread = ClientSettingsDoc::from_json(&doc.to_json());
+    assert_eq!(reread.entries()["futureSetting"], 99);
+    let defaults = reread.browser_defaults();
+    assert_eq!(defaults.viewport, freeform);
+    assert_eq!(defaults.zoom_factor, 0.8);
+    assert_eq!(defaults.appearance, AppearancePreference::Dark);
+    assert_eq!(defaults.profile_id, "work");
+    assert_eq!(defaults.profiles.len(), BROWSER_PROFILE_MAX_COUNT + 2);
+
+    // Invalid stored JSON falls back per-key without dropping unknown fields.
+    let invalid = ClientSettingsDoc::from_json(
+        r#"{"browserDefaultViewport":{"_tag":"freeform","width":3840,"height":3840},"browserDefaultZoomFactor":99,"browserDefaultAppearance":"sepia","browserProfiles":"nope","browserDefaultProfileId":"missing","futureSetting":7}"#,
+    );
+    assert_eq!(invalid.browser_default_viewport(), ViewportSetting::Fill);
+    assert_eq!(invalid.browser_default_zoom_factor(), 1.0);
+    assert_eq!(invalid.browser_default_appearance(), AppearancePreference::System);
+    assert!(invalid.browser_user_profiles().is_empty());
+    assert_eq!(invalid.browser_default_profile_id(), DEFAULT_BROWSER_PROFILE_ID);
+    assert_eq!(invalid.entries()["futureSetting"], 7);
+}

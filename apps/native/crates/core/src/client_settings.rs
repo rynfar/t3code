@@ -393,6 +393,11 @@ pub enum ClientSettingChange {
     BrowserLinkTarget(BrowserLinkTarget),
     PullRequestLinksOpenInApp(bool),
     BrowserCustomSearchUrl(String),
+    BrowserDefaultViewport(crate::preview::viewport::ViewportSetting),
+    BrowserDefaultZoomFactor(f64),
+    BrowserDefaultAppearance(crate::preview::viewport::AppearancePreference),
+    BrowserProfiles(Vec<crate::preview::viewport::BrowserProfile>),
+    BrowserDefaultProfileId(String),
     NotificationMode(NotificationMode),
     InAppNotifications(bool),
     ProjectGrouping(ProjectGroupingMode),
@@ -482,6 +487,34 @@ impl ClientSettingChange {
                 "browserCustomSearchUrl",
                 text(&url.trim().chars().take(2048).collect::<String>()),
             ),
+            ClientSettingChange::BrowserDefaultViewport(viewport) => (
+                "browserDefaultViewport",
+                viewport.to_value(),
+            ),
+            ClientSettingChange::BrowserDefaultZoomFactor(zoom) => (
+                "browserDefaultZoomFactor",
+                serde_json::json!(crate::preview::normalize_zoom_level(*zoom).unwrap_or(crate::preview::DEFAULT_ZOOM)),
+            ),
+            ClientSettingChange::BrowserDefaultAppearance(appearance) => (
+                "browserDefaultAppearance",
+                text(appearance.as_str()),
+            ),
+            ClientSettingChange::BrowserProfiles(profiles) => (
+                "browserProfiles",
+                serde_json::to_value(crate::preview::viewport::sanitize_user_profiles(profiles))
+                    .unwrap_or_else(|_| Value::Array(Vec::new())),
+            ),
+            ClientSettingChange::BrowserDefaultProfileId(profile_id) => {
+                let trimmed = profile_id.trim();
+                let normalized = if crate::preview::viewport::is_valid_browser_profile_id(trimmed)
+                    && trimmed != crate::preview::viewport::INCOGNITO_BROWSER_PROFILE_ID
+                {
+                    trimmed
+                } else {
+                    crate::preview::viewport::DEFAULT_BROWSER_PROFILE_ID
+                };
+                ("browserDefaultProfileId", text(normalized))
+            }
             ClientSettingChange::NotificationMode(mode) => ("notificationMode", text(notification_mode_value(*mode))),
             ClientSettingChange::InAppNotifications(on) => ("inAppNotificationsEnabled", Value::Bool(*on)),
             ClientSettingChange::ProjectGroupingOverride { .. } => unreachable!("grouping overrides apply to the current record"),
@@ -730,6 +763,49 @@ impl ClientSettingsDoc {
         self.text("browserCustomSearchUrl")
             .filter(|url| url.chars().count() <= 2048)
             .unwrap_or("")
+    }
+
+    pub fn browser_defaults(&self) -> crate::preview::viewport::BrowserDefaults {
+        crate::preview::viewport::BrowserDefaults::from_settings_entries(&self.entries)
+    }
+
+    pub fn browser_default_viewport(&self) -> crate::preview::viewport::ViewportSetting {
+        self.entries
+            .get("browserDefaultViewport")
+            .map(crate::preview::viewport::ViewportSetting::from_value)
+            .unwrap_or(crate::preview::viewport::ViewportSetting::Fill)
+    }
+
+    pub fn browser_default_zoom_factor(&self) -> f64 {
+        self.entries
+            .get("browserDefaultZoomFactor")
+            .and_then(Value::as_f64)
+            .and_then(crate::preview::normalize_zoom_level)
+            .unwrap_or(crate::preview::DEFAULT_ZOOM)
+    }
+
+    pub fn browser_default_appearance(&self) -> crate::preview::viewport::AppearancePreference {
+        self.text("browserDefaultAppearance")
+            .and_then(crate::preview::viewport::AppearancePreference::parse)
+            .unwrap_or(crate::preview::viewport::AppearancePreference::System)
+    }
+
+    pub fn browser_user_profiles(&self) -> Vec<crate::preview::viewport::BrowserProfile> {
+        let raw: Vec<crate::preview::viewport::BrowserProfile> = self
+            .entries
+            .get("browserProfiles")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(|item| serde_json::from_value(item.clone()).ok()).collect())
+            .unwrap_or_default();
+        crate::preview::viewport::sanitize_user_profiles(&raw)
+    }
+
+    pub fn browser_profiles(&self) -> Vec<crate::preview::viewport::BrowserProfile> {
+        self.browser_defaults().profiles
+    }
+
+    pub fn browser_default_profile_id(&self) -> String {
+        self.browser_defaults().profile_id
     }
 
     pub fn browser_search_template(&self) -> &str {

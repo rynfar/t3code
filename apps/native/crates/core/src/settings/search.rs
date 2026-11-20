@@ -730,5 +730,26 @@ mod search_parity_tests {
             !restricted.iter().any(|item| item.id == "welcome-page"),
             "welcome-page should be gated when no environment is connected"
         );
+
+        // Browser defaults & profiles search items match web anchors and terms.
+        for expected_id in [
+            "browser-profiles",
+            "browser-default-profile",
+            "browser-default-viewport",
+            "browser-default-zoom",
+            "browser-default-appearance",
+        ] {
+            assert!(
+                all.iter().any(|item| item.id == expected_id && item.section == Section::Browser),
+                "missing browser search item {expected_id}"
+            );
+        }
+        assert_eq!(
+            all.iter().find(|item| item.id == "browser-default-profile").unwrap().anchor(),
+            "browser-profiles"
+        );
+        assert!(search("mobile", &all).iter().any(|item| item.id == "browser-default-viewport"));
+        assert!(search("percent", &all).iter().any(|item| item.id == "browser-default-zoom"));
+        assert!(search("color scheme", &all).iter().any(|item| item.id == "browser-default-appearance"));
     }
 }
