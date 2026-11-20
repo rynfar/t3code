@@ -524,8 +524,8 @@ mod native {
                 NSSound::initWithData(NSSound::alloc(), &NSData::with_bytes(bytes))
             };
             Self {
-                whoosh: load(include_bytes!("../../../../../web/src/assets/snap-shot-whoosh.mp3")),
-                click: load(include_bytes!("../../../../../web/src/assets/snap-shot-click.mp3")),
+                whoosh: load(include_bytes!("assets/snap-shot-whoosh.mp3")),
+                click: load(include_bytes!("assets/snap-shot-click.mp3")),
             }
         }
     }

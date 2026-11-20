@@ -431,17 +431,7 @@ fn set_stage(
 }
 
 pub(super) fn target_version() -> &'static str {
-    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        // Native's crate version is independent of the server release it was built alongside.
-        serde_json::from_str::<serde_json::Value>(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../server/package.json"
-        )))
-        .ok()
-        .and_then(|v| v["version"].as_str().map(str::to_owned))
-        .unwrap_or_default()
-    });
-    &VERSION
+    include_str!("TARGET_SERVER_VERSION").trim()
 }
 
 fn connected(state: &AppState) -> bool {
