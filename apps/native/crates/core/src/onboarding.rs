@@ -11,8 +11,15 @@
 //! nothing saved the wizard opens at once, since there is no workspace to inspect
 //! (`resolve_unpaired`).
 
+pub mod phone;
 pub mod projects;
 pub mod terminal;
+
+pub use phone::{
+    MOBILE_APP_URL, PHONE_LINK_REFRESH_INTERVAL_SECS, PhoneCloudAccount, PhoneConnectInput,
+    PhoneConnectState, WelcomePhoneOfferInput, phone_account_for_identity, phone_is_shared,
+    resolve_phone_connect_state, welcome_offers_phone,
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -219,15 +226,13 @@ pub fn managed_driver_allowed(policy: Option<&Value>, driver: &str) -> bool {
     }
 }
 
-/// The connection step's privacy line up to its link ("…see our"), with
-/// `managedTelemetryOffMessage` when an administrator turned usage data off.
+/// The footer's telemetry notice up to its link ("…see the" / "…See the"), matching
+/// `TelemetryNotice` (`WelcomePage.tsx`) and `managedTelemetryOffMessage`
+/// (`web/src/state/managedPolicy.ts`).
 pub fn privacy_notice(policy: Option<&Value>) -> String {
-    let telemetry_off = policy
-        .filter(|policy| policy.pointer("/limits/telemetry") == Some(&Value::Bool(false)))
-        .map(|policy| format!("{} turned off anonymous usage data.", policy.get("organization").and_then(Value::as_str).unwrap_or_default()));
-    match telemetry_off {
-        Some(message) => format!("{message} To read more about how your data is used, see our"),
-        None => "T3 Code collects anonymous usage data to help us improve it. To read more about how your data is used and how to opt out, see our".to_owned(),
+    match crate::managed_policy::managed_telemetry_off_message(policy) {
+        Some(message) => format!("{message} See the"),
+        None => "T3 Code collects anonymous usage data to improve the app. To opt out, see the".to_owned(),
     }
 }
 

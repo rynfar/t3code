@@ -1,14 +1,14 @@
 //! The first-run welcome wizard (ledger CN-WELCOME). When it opens follows
-//! `web/src/components/onboarding/FirstRunGate.tsx`, the wizard follows `WelcomeWizard.tsx` in the
-//! frame of `ui/wizard.tsx`; the gate and agent readiness are `t3_core::onboarding`, and connecting
-//! reuses the connect screen's pairing (`environments.rs`). One environment is connected at a
-//! time, so the connection step picks the computer to set up. Pending evidence never blocks the
-//! app as the web's blank gate does: the wizard opens over it once a fresh workspace is confirmed.
-//! Not here yet: T3 Connect (CN-RELAY) and simultaneous multi-computer selection.
+//! `web/src/components/onboarding/FirstRunGate.tsx`, and the single scrollable Welcome page
+//! follows `WelcomePage.tsx` (agents, project import, collapsible Phone QR + T3 Connect link
+//! status, computer connection, CLI setup, and keyboard-accessible telemetry/privacy footer).
+//! The gate, agent readiness, and phone connect state are pure logic in `t3_core::onboarding`,
+//! and connecting reuses the connect screen's pairing (`environments.rs`).
 
 mod agents;
 mod agent_terminal;
 mod connection;
+mod phone;
 mod projects;
 #[cfg(test)]
 mod tests;
@@ -66,12 +66,22 @@ fn key_stop(
     cx: &mut App,
 ) -> Stateful<gpui::Div> {
     let focus = focus_handle(id, window, cx);
+    key_stop_with_focus(element, &focus, activate, window, cx)
+}
+
+fn key_stop_with_focus(
+    element: Stateful<gpui::Div>,
+    focus: &FocusHandle,
+    activate: impl Fn(&(), &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<gpui::Div> {
     let ring = focus.is_focused(window) && window.last_input_was_keyboard();
     let color = hsla(palette(cx).ring);
     let activate = std::rc::Rc::new(activate);
     let on_key = activate.clone();
     element
-        .track_focus(&focus)
+        .track_focus(focus)
         .cursor_pointer()
         .when(ring, |this| this.shadow(vec![BoxShadow { color, offset: point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: true }]))
         .on_click(move |event, window, cx| {
@@ -121,6 +131,7 @@ pub struct WelcomeWizard {
     open: bool,
     step: Step,
     focus: FocusHandle,
+    privacy_focus: FocusHandle,
     focus_pending: bool,
     welcome: Option<WelcomeFetch>,
     link: Entity<InputState>,
@@ -141,7 +152,12 @@ pub struct WelcomeWizard {
     /// Connection ID for which the open Welcome page has already initialized provider refresh + project scan.
     connected_for_welcome: Option<u64>,
     terminal_access: bool,
+    can_read_relay: bool,
+    can_write_relay: bool,
     terminal_grants: Option<(u64, Task<()>)>,
+    phone: phone::PhoneState,
+    #[cfg(test)]
+    privacy_policy_clicks: usize,
     copied: Option<(String, Task<()>)>,
     projects: projects::Projects,
     _subscriptions: Vec<Subscription>,
@@ -170,6 +186,7 @@ impl WelcomeWizard {
             open: false,
             step: Step::Connection,
             focus: cx.focus_handle(),
+            privacy_focus: cx.focus_handle().tab_stop(true),
             focus_pending: false,
             welcome: None,
             link,
@@ -185,7 +202,12 @@ impl WelcomeWizard {
             cli_path_task: None,
             connected_for_welcome: None,
             terminal_access: false,
+            can_read_relay: false,
+            can_write_relay: false,
             terminal_grants: None,
+            phone: phone::PhoneState::new(),
+            #[cfg(test)]
+            privacy_policy_clicks: 0,
             copied: None,
             projects: projects::Projects::default(),
             _subscriptions: subscriptions,
@@ -228,6 +250,7 @@ impl WelcomeWizard {
         }
         if event == AppEvent::Phase {
             self.chatgpt.clear();self.created_chatgpt=None;self.chatgpt_subscriptions.clear();
+            let previous_connection = self.connected_for_welcome;
             self.watch_terminal_grants(cx);
             let (pairing, failed, unpaired, connected, connection_id) = {
                 let app = self.state.read(cx);
@@ -249,6 +272,7 @@ impl WelcomeWizard {
             if unpaired && self.step != Step::Connection {
                 self.step = Step::Connection;
             }
+            let connection_changed = previous_connection.is_some() && previous_connection != connection_id;
             if !connected {
                 self.connected_for_welcome = None;
             } else if self.open && self.connected_for_welcome != connection_id {
@@ -256,6 +280,7 @@ impl WelcomeWizard {
                 self.refresh_providers(cx);
                 self.enter_projects(cx);
             }
+            self.on_phone_phase_change(connection_changed, connected, cx);
         }
         if matches!(event, AppEvent::Phase | AppEvent::Shell | AppEvent::ServerConfig | AppEvent::Selection) {
             self.evaluate(cx);
@@ -380,6 +405,7 @@ impl WelcomeWizard {
         self.chatgpt.clear();self.created_chatgpt=None;self.chatgpt_subscriptions.clear();
         if !crate::chatgpt_setup::fixture_active(cx) {t3_client::store::save_ui_state("welcome-resume", &serde_json::Value::Null);}
         self.cancel_projects();
+        self.reset_phone(true);
         self.open = false;
         self.connected_for_welcome = None;
         self.cli_path_task = None;
@@ -387,6 +413,43 @@ impl WelcomeWizard {
         self.complete(cx);
         cx.emit(Visibility);
         cx.notify();
+    }
+
+    /// Leaves the Welcome modal to open a Settings destination (such as Sharing & access from
+    /// PhoneSection) without marking onboarding complete, matching `<Link to="/settings/access" />`.
+    pub(super) fn dismiss_for_settings(&mut self, cx: &mut Context<Self>) {
+        self.chatgpt.clear();
+        self.created_chatgpt = None;
+        self.chatgpt_subscriptions.clear();
+        self.cancel_projects();
+        self.reset_phone(true);
+        self.open = false;
+        self.connected_for_welcome = None;
+        self.cli_path_task = None;
+        self.setup = None;
+        cx.emit(Visibility);
+        cx.notify();
+    }
+
+    pub(super) fn open_privacy_policy(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.privacy_policy_clicks += 1;
+        }
+        if !crate::snapshot_capture::is_os_side_effects_disabled() {
+            cx.open_url(t3_core::onboarding::PRIVACY_POLICY_URL);
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn privacy_policy_clicks(&self) -> usize {
+        self.privacy_policy_clicks
+    }
+
+    #[cfg(test)]
+    pub(crate) fn privacy_focus_handle(&self) -> FocusHandle {
+        self.privacy_focus.clone()
     }
 
     fn go_to(&mut self, step: Step, cx: &mut Context<Self>) {
@@ -555,6 +618,9 @@ impl Render for WelcomeWizard {
         if connected {
             sections.push(self.render_agents(window, cx));
             sections.push(self.render_projects(window, cx));
+            if let Some(phone) = self.render_phone(cx) {
+                sections.push(phone);
+            }
             sections.push(self.render_connection(window, cx));
         } else {
             sections.push(self.render_connection(window, cx));
@@ -562,7 +628,7 @@ impl Render for WelcomeWizard {
         if let Some(cli) = self.render_cli_setup(cx) {
             sections.push(cli);
         }
-        sections.push(self.render_welcome_footer(cx));
+        sections.push(self.render_welcome_footer(window, cx));
 
         let header = v_flex()
             .gap(r(4.))

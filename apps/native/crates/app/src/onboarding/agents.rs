@@ -164,22 +164,35 @@ impl WelcomeWizard {
         self.setup = None;
         self.terminal_grants = None;
         self.terminal_access = false;
+        self.can_read_relay = false;
+        self.can_write_relay = false;
         let (Some(connection), Some(client)) = (connection, app.client_handle()) else {
             return;
         };
         let mut grants = client.session_state();
-        self.terminal_access =
-            t3_core::terminal::TerminalAccess::of(grants.borrow_and_update().as_ref()).operate;
+        let read_grants = |session: Option<&t3_core::auth::AuthSessionState>| {
+            (
+                t3_core::terminal::TerminalAccess::of(session).operate,
+                session.is_some_and(|s| s.grants(t3_core::auth::RELAY_READ_SCOPE)),
+                session.is_some_and(|s| s.grants(t3_core::auth::RELAY_WRITE_SCOPE)),
+            )
+        };
+        let (terminal_access, can_read_relay, can_write_relay) =
+            read_grants(grants.borrow_and_update().as_ref());
+        self.terminal_access = terminal_access;
+        self.can_read_relay = can_read_relay;
+        self.can_write_relay = can_write_relay;
         self.terminal_grants = Some((
             connection,
             cx.spawn(async move |this, cx| {
                 while grants.changed().await.is_ok() {
-                    let access =
-                        t3_core::terminal::TerminalAccess::of(grants.borrow_and_update().as_ref())
-                            .operate;
+                    let (access, relay_read, relay_write) =
+                        read_grants(grants.borrow_and_update().as_ref());
                     if this
                         .update(cx, |this, cx| {
                             this.terminal_access = access;
+                            this.can_read_relay = relay_read;
+                            this.can_write_relay = relay_write;
                             if let Some(setup) = &this.setup {
                                 setup.terminal.update(cx, |_, cx| cx.notify());
                             }
