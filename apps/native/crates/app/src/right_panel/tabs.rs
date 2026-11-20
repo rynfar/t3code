@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, ElementId, Entity, FontWeight, Hsla, Image, ImageFormat, IntoElement,
@@ -401,136 +402,213 @@ pub fn tab_bar(
 }
 
 type DismissHandler = Rc<dyn Fn(bool, &mut App)>;
+type KeyDownHandler = Rc<dyn Fn(&gpui::KeyDownEvent, &mut Window, &mut App)>;
 
-#[derive(IntoElement)]
-struct BrowserAddMenuRow {
-    index: usize,
-    state: Entity<AppState>,
+const EMPTY_PROFILE_REOPEN_GUARD: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct EmptyProfileMenuState {
+    open: bool,
+    dismissed_at: Option<Instant>,
+}
+
+struct OwnedAddMenuEntry {
     label: &'static str,
     icon: Icon,
     shortcut: &'static str,
     open: fn(&mut AppState, &mut gpui::Context<AppState>),
-    active: bool,
-    profiles: Vec<BrowserProfile>,
-    dismiss: DismissHandler,
+    unavailable: Option<&'static str>,
 }
 
-impl RenderOnce for BrowserAddMenuRow {
+#[derive(IntoElement)]
+struct AddMenuPopup {
+    state: Entity<AppState>,
+    entries: Vec<OwnedAddMenuEntry>,
+    highlighted: usize,
+    focus: gpui::FocusHandle,
+    profiles: Vec<BrowserProfile>,
+    on_dismiss: DismissHandler,
+    on_key_down: KeyDownHandler,
+}
+
+impl RenderOnce for AddMenuPopup {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let p = palette(cx);
         let sub_open = window.use_keyed_state("right-panel-add-browser-sub", cx, |_, _| false);
-        let is_open = *sub_open.read(cx);
-        let hover_state = sub_open.clone();
-        let chevron_state = sub_open.clone();
-        let state = self.state.clone();
-        let open = self.open;
-        let dismiss = self.dismiss.clone();
+        let is_sub_open = *sub_open.read(cx);
+        let dismiss_out = self.on_dismiss.clone();
+        let sub_dismiss_out = sub_open.clone();
+        let on_key = self.on_key_down.clone();
+        let sub_key = sub_open.clone();
 
-        let submenu = is_open.then(|| {
-            let items = self.profiles.iter().enumerate().map(|(pi, profile)| {
+        let rows = self.entries.iter().enumerate().map(|(index, entry)| {
+            let active = index == self.highlighted && entry.unavailable.is_none();
+            if entry.label == "Browser" && entry.unavailable.is_none() {
                 let state = self.state.clone();
-                let dismiss = self.dismiss.clone();
-                let sub_close = sub_open.clone();
-                let profile_id = profile.id.clone();
-                let profile_name = profile.name.clone();
-                let debug_id = format!("right-panel-browser-profile-{}", profile.id);
-                h_flex()
-                    .id(("right-panel-browser-profile", pi))
-                    .debug_selector(move || debug_id.clone())
-                    .h(px(28.))
-                    .w_full()
-                    .px(px(8.))
-                    .gap(px(6.))
-                    .rounded(px(6.))
-                    .text_xs()
-                    .text_color(hsla(p.foreground))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(hsla(p.accent)))
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        sub_close.update(cx, |open, _| *open = false);
-                        dismiss(false, cx);
-                        let id = profile_id.clone();
-                        state.update(cx, move |state, cx| open_browser_in_profile(state, id, cx));
-                    })
-                    .child(div().flex_1().min_w_0().truncate().child(profile_name))
-            });
-            div()
-                .absolute()
-                .top_0()
-                .left_full()
-                .pl(px(4.))
-                .child(
-                    crate::composer::controls::popup_surface(cx)
-                        .id("right-panel-browser-profiles-submenu")
-                        .debug_selector(|| "right-panel-browser-profiles-submenu".to_owned())
-                        .occlude()
-                        .w(px(184.))
-                        .p(px(4.))
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(v_flex().gap(px(2.)).children(items)),
-                )
-        });
-
-        div()
-            .id(("right-panel-add-browser-wrap", self.index))
-            .relative()
-            .w_full()
-            .on_hover(move |hovered, _, cx| {
-                hover_state.update(cx, |open, cx| {
-                    if *open != *hovered {
-                        *open = *hovered;
-                        cx.notify();
-                    }
-                });
-            })
-            .child(
-                h_flex()
-                    .id(("right-panel-add-item", self.index))
-                    .h(px(30.))
-                    .w_full()
-                    .px(px(8.))
-                    .gap(px(8.))
-                    .rounded(px(6.))
-                    .text_xs()
-                    .text_color(hsla(p.foreground))
-                    .when(self.active || is_open, |this| this.bg(hsla(p.accent)))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(hsla(p.accent)))
-                    .on_click(move |_, _, cx| {
-                        sub_open.update(cx, |open, _| *open = false);
-                        dismiss(false, cx);
-                        state.update(cx, open);
-                    })
-                    .child(self.icon.svg().size(px(14.)).text_color(hsla(p.foreground)))
-                    .child(div().flex_1().min_w_0().truncate().child(self.label))
-                    .child(kbd(self.shortcut, cx))
-                    .child(
-                        div()
-                            .id("right-panel-add-browser-chevron")
-                            .debug_selector(|| "right-panel-add-browser-chevron".to_owned())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(18.))
-                            .rounded(px(4.))
-                            .hover(|style| style.bg(hsla(p.muted)))
+                let open = entry.open;
+                let dismiss = self.on_dismiss.clone();
+                let sub_row_click = sub_open.clone();
+                let sub_chevron = sub_open.clone();
+                let sub_hover = sub_open.clone();
+                let profiles_list = is_sub_open.then(|| {
+                    let items = self.profiles.iter().enumerate().map(|(pi, profile)| {
+                        let state = self.state.clone();
+                        let dismiss = self.on_dismiss.clone();
+                        let sub_close = sub_open.clone();
+                        let profile_id = profile.id.clone();
+                        let profile_name = profile.name.clone();
+                        let debug_id = format!("right-panel-browser-profile-{}", profile.id);
+                        h_flex()
+                            .id(("right-panel-browser-profile", pi))
+                            .debug_selector(move || debug_id.clone())
+                            .h(px(26.))
+                            .w_full()
+                            .px(px(8.))
+                            .rounded(px(5.))
+                            .text_xs()
+                            .text_color(hsla(p.foreground))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hsla(p.accent)))
                             .on_click(move |_, _, cx| {
                                 cx.stop_propagation();
-                                chevron_state.update(cx, |open, cx| {
-                                    *open = !*open;
-                                    cx.notify();
-                                });
+                                sub_close.update(cx, |open, _| *open = false);
+                                dismiss(false, cx);
+                                let id = profile_id.clone();
+                                state.update(cx, move |state, cx| open_browser_in_profile(state, id, cx));
                             })
+                            .child(div().flex_1().min_w_0().truncate().child(profile_name))
+                    });
+                    // Rendered inside `right-panel-add-menu`'s hitbox so clicks never trip
+                    // Capture-phase `on_mouse_down_out`, and constrained within the 216px menu
+                    // width so it never clips inside 360px narrow panels.
+                    v_flex()
+                        .id("right-panel-browser-profiles-submenu")
+                        .debug_selector(|| "right-panel-browser-profiles-submenu".to_owned())
+                        .ml(px(14.))
+                        .mt(px(2.))
+                        .mb(px(2.))
+                        .pl(px(6.))
+                        .border_l_1()
+                        .border_color(hsla(p.border).opacity(0.6))
+                        .gap(px(1.))
+                        .children(items)
+                });
+                return v_flex()
+                    .id(("right-panel-add-browser-wrap", index))
+                    .w_full()
+                    .on_hover(move |hovered, _, cx| {
+                        if *hovered {
+                            sub_hover.update(cx, |open, cx| {
+                                if !*open {
+                                    *open = true;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .child(
+                        h_flex()
+                            .id(("right-panel-add-item", index))
+                            .h(px(30.))
+                            .w_full()
+                            .px(px(8.))
+                            .gap(px(8.))
+                            .rounded(px(6.))
+                            .text_xs()
+                            .text_color(hsla(p.foreground))
+                            .when(active || is_sub_open, |this| this.bg(hsla(p.accent)))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hsla(p.accent)))
+                            .on_click(move |_, _, cx| {
+                                sub_row_click.update(cx, |open, _| *open = false);
+                                dismiss(false, cx);
+                                state.update(cx, open);
+                            })
+                            .child(entry.icon.svg().size(px(14.)).text_color(hsla(p.foreground)))
+                            .child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(cx, entry.label)))
+                            .child(kbd(entry.shortcut, cx))
                             .child(
-                                Icon::ChevronRight
-                                    .svg()
-                                    .size(px(12.))
-                                    .text_color(hsla(p.muted_foreground)),
+                                div()
+                                    .id("right-panel-add-browser-chevron")
+                                    .debug_selector(|| "right-panel-add-browser-chevron".to_owned())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(18.))
+                                    .rounded(px(4.))
+                                    .hover(|style| style.bg(hsla(p.muted)))
+                                    .on_click(move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        sub_chevron.update(cx, |open, cx| {
+                                            *open = !*open;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child(
+                                        if is_sub_open {
+                                            Icon::ChevronDown
+                                        } else {
+                                            Icon::ChevronRight
+                                        }
+                                        .svg()
+                                        .size(px(12.))
+                                        .text_color(hsla(p.muted_foreground)),
+                                    ),
                             ),
-                    ),
-            )
-            .children(submenu)
+                    )
+                    .children(profiles_list)
+                    .into_any_element();
+            }
+            let state = self.state.clone();
+            let open = entry.open;
+            let dismiss = self.on_dismiss.clone();
+            let sub_reset = sub_open.clone();
+            h_flex()
+                .id(("right-panel-add-item", index))
+                .h(px(30.))
+                .w_full()
+                .px(px(8.))
+                .gap(px(8.))
+                .rounded(px(6.))
+                .text_xs()
+                .text_color(hsla(p.foreground))
+                .when(active, |this| this.bg(hsla(p.accent)))
+                .when(entry.unavailable.is_some(), |this| this.opacity(0.5))
+                .when(entry.unavailable.is_none(), |this| {
+                    this.cursor_pointer()
+                        .hover(|style| style.bg(hsla(p.accent)))
+                        .on_click(move |_, _, cx| {
+                            sub_reset.update(cx, |open, _| *open = false);
+                            dismiss(false, cx);
+                            state.update(cx, open);
+                        })
+                })
+                .when_some(entry.unavailable, |this, reason| {
+                    this.tooltip(move |window, cx| super::tooltip_view(crate::i18n::t(cx, reason).into(), window, cx))
+                })
+                .child(entry.icon.svg().size(px(14.)).text_color(hsla(p.foreground)))
+                .child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(cx, entry.label)))
+                .child(kbd(entry.shortcut, cx))
+                .into_any_element()
+        });
+
+        crate::composer::controls::popup_surface(cx)
+            .id("right-panel-add-menu")
+            .track_focus(&self.focus)
+            .occlude()
+            .w(px(216.))
+            .p(px(4.))
+            .on_mouse_down_out(move |_, _, cx| {
+                sub_dismiss_out.update(cx, |open, _| *open = false);
+                dismiss_out(true, cx);
+            })
+            .on_key_down(move |event, window, cx| {
+                if !matches!(event.keystroke.key.as_str(), "up" | "down") {
+                    sub_key.update(cx, |open, _| *open = false);
+                }
+                on_key(event, window, cx);
+            })
+            .child(v_flex().gap(px(2.)).children(rows))
     }
 }
 
@@ -543,65 +621,24 @@ pub(super) fn render_add_menu(
     on_key_down: impl Fn(&gpui::KeyDownEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> AnyElement {
-    let p = palette(cx);
-    let dismiss_out = on_dismiss.clone();
-    let dismiss_rc: DismissHandler = Rc::new(on_dismiss);
-    let browser_profiles = browser_profiles_for_menu(cx);
-    let rows = entries.iter().enumerate().map(|(index, entry)| {
-        let active = index == highlighted && entry.unavailable.is_none();
-        if entry.label == "Browser" && entry.unavailable.is_none() {
-            return BrowserAddMenuRow {
-                index,
-                state: state.clone(),
+    let menu = AddMenuPopup {
+        state,
+        entries: entries
+            .iter()
+            .map(|entry| OwnedAddMenuEntry {
                 label: entry.label,
                 icon: entry.icon,
                 shortcut: entry.shortcut,
                 open: entry.open,
-                active,
-                profiles: browser_profiles.clone(),
-                dismiss: dismiss_rc.clone(),
-            }
-            .into_any_element();
-        }
-        let state = state.clone();
-        let open = entry.open;
-        let dismiss = dismiss_rc.clone();
-        h_flex()
-            .id(("right-panel-add-item", index))
-            .h(px(30.))
-            .w_full()
-            .px(px(8.))
-            .gap(px(8.))
-            .rounded(px(6.))
-            .text_xs()
-            .text_color(hsla(p.foreground))
-            .when(active, |this| this.bg(hsla(p.accent)))
-            .when(entry.unavailable.is_some(), |this| this.opacity(0.5))
-            .when(entry.unavailable.is_none(), |this| {
-                this.cursor_pointer()
-                    .hover(|style| style.bg(hsla(p.accent)))
-                    .on_click(move |_, _, cx| {
-                        dismiss(false, cx);
-                        state.update(cx, open);
-                    })
+                unavailable: entry.unavailable,
             })
-            .when_some(entry.unavailable, |this, reason| {
-                this.tooltip(move |window, cx| super::tooltip_view(reason.into(), window, cx))
-            })
-            .child(entry.icon.svg().size(px(14.)).text_color(hsla(p.foreground)))
-            .child(div().flex_1().min_w_0().truncate().child(entry.label))
-            .child(kbd(entry.shortcut, cx))
-            .into_any_element()
-    });
-    let menu = crate::composer::controls::popup_surface(cx)
-        .id("right-panel-add-menu")
-        .track_focus(focus)
-        .occlude()
-        .w(px(216.))
-        .p(px(4.))
-        .on_mouse_down_out(move |_, _, cx| dismiss_out(true, cx))
-        .on_key_down(move |event, window, cx| on_key_down(event, window, cx))
-        .child(v_flex().gap(px(2.)).children(rows));
+            .collect(),
+        highlighted,
+        focus: focus.clone(),
+        profiles: browser_profiles_for_menu(cx),
+        on_dismiss: Rc::new(on_dismiss),
+        on_key_down: Rc::new(on_key_down),
+    };
     gpui::deferred(
         div()
             .absolute()
@@ -786,8 +823,9 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
     let p = palette(cx);
     let side_chat = side_chat_entry(state.read(cx));
     let browser_profiles = browser_profiles_for_menu(cx);
-    let profile_menu_open = window.use_keyed_state("right-panel-empty-browser-profiles", cx, |_, _| false);
-    let is_profile_menu_open = *profile_menu_open.read(cx);
+    let profile_menu_state =
+        window.use_keyed_state("right-panel-empty-browser-profiles", cx, |_, _| EmptyProfileMenuState::default());
+    let is_profile_menu_open = profile_menu_state.read(cx).open;
     let mut rows: Vec<AnyElement> = SURFACE_ACTIONS.iter().enumerate().map(|(index, action)| {
         let state_click = state.clone();
         let open = action.open;
@@ -810,7 +848,7 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
             .child(action.icon.svg().size(px(16.)).text_color(hsla(p.foreground)))
             .child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(cx, action.label)))
             .when(has_profile_menu, |this| {
-                let toggle = profile_menu_open.clone();
+                let toggle = profile_menu_state.clone();
                 this.child(
                     div()
                         .id("empty-browser-profile-trigger")
@@ -821,11 +859,17 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
                         .size(px(22.))
                         .rounded(px(6.))
                         .hover(|style| style.bg(hsla(p.accent)))
-                        .tooltip(|window, cx| super::tooltip_view("Open browser in a profile".into(), window, cx))
+                        .tooltip(|window, cx| {
+                            super::tooltip_view(crate::i18n::t(cx, "Open browser in a profile").into(), window, cx)
+                        })
                         .on_click(move |_, _, cx| {
                             cx.stop_propagation();
-                            toggle.update(cx, |open, cx| {
-                                *open = !*open;
+                            toggle.update(cx, |menu, cx| {
+                                let just_dismissed = menu
+                                    .dismissed_at
+                                    .take()
+                                    .is_some_and(|at| at.elapsed() < EMPTY_PROFILE_REOPEN_GUARD);
+                                menu.open = !just_dismissed && !menu.open;
                                 cx.notify();
                             });
                         })
@@ -834,14 +878,16 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
             })
             .child(kbd(action.shortcut, cx));
         if has_profile_menu && is_profile_menu_open {
-            let dismiss_out = profile_menu_open.clone();
+            let dismiss_out = profile_menu_state.clone();
             let items = browser_profiles.iter().enumerate().map(|(pi, profile)| {
                 let state = state.clone();
-                let close = profile_menu_open.clone();
+                let close = profile_menu_state.clone();
                 let profile_id = profile.id.clone();
                 let profile_name = profile.name.clone();
+                let debug_id = format!("empty-browser-profile-{}", profile.id);
                 h_flex()
                     .id(("empty-browser-profile-item", pi))
+                    .debug_selector(move || debug_id.clone())
                     .h(px(28.))
                     .w_full()
                     .px(px(8.))
@@ -852,8 +898,9 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
                     .hover(|style| style.bg(hsla(p.accent)))
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
-                        close.update(cx, |open, cx| {
-                            *open = false;
+                        close.update(cx, |menu, cx| {
+                            menu.open = false;
+                            menu.dismissed_at = None;
                             cx.notify();
                         });
                         let id = profile_id.clone();
@@ -875,13 +922,17 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
                             .child(
                                 crate::composer::controls::popup_surface(cx)
                                     .id("empty-browser-profiles-popup")
+                                    .debug_selector(|| "empty-browser-profiles-popup".to_owned())
                                     .occlude()
                                     .w(px(196.))
                                     .p(px(4.))
                                     .on_mouse_down_out(move |_, _, cx| {
-                                        dismiss_out.update(cx, |open, cx| {
-                                            *open = false;
-                                            cx.notify();
+                                        dismiss_out.update(cx, |menu, cx| {
+                                            if menu.open {
+                                                menu.open = false;
+                                                menu.dismissed_at = Some(Instant::now());
+                                                cx.notify();
+                                            }
                                         });
                                     })
                                     .child(v_flex().gap(px(2.)).children(items)),
@@ -1089,6 +1140,8 @@ mod snapshot_tests {
         struct TabsHarness {
             state: Entity<AppState>,
             focus: gpui::FocusHandle,
+            add_menu_open: bool,
+            show_empty: bool,
         }
         impl Render for TabsHarness {
             fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1100,15 +1153,20 @@ mod snapshot_tests {
                         .unwrap_or_default()
                 };
                 let entries = add_menu_entries(self.state.read(cx), cx);
+                let weak_dismiss = cx.entity().downgrade();
+                let weak_key = cx.entity().downgrade();
                 div()
                     .relative()
-                    .size_full()
+                    .w(px(360.))
+                    .h(px(480.))
+                    .flex()
+                    .flex_col()
                     .child(tab_bar(
                         self.state.clone(),
                         &panel,
                         false,
                         false,
-                        true,
+                        self.add_menu_open,
                         None,
                         |_, _| {},
                         |_, _, _, _| {},
@@ -1116,22 +1174,42 @@ mod snapshot_tests {
                         window,
                         cx,
                     ))
-                    .child(render_add_menu(
-                        self.state.clone(),
-                        &entries,
-                        0,
-                        &self.focus,
-                        |_, _| {},
-                        |_, _, _| {},
-                        cx,
-                    ))
+                    .when(self.show_empty, |this| {
+                        this.child(empty_state(self.state.clone(), window, cx))
+                    })
+                    .when(self.add_menu_open, |this| {
+                        this.child(render_add_menu(
+                            self.state.clone(),
+                            &entries,
+                            0,
+                            &self.focus,
+                            move |_, cx| {
+                                let _ = weak_dismiss.update(cx, |this, cx| {
+                                    this.add_menu_open = false;
+                                    cx.notify();
+                                });
+                            },
+                            move |event, _, cx| {
+                                if event.keystroke.key == "escape" {
+                                    let _ = weak_key.update(cx, |this, cx| {
+                                        this.add_menu_open = false;
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                            cx,
+                        ))
+                    })
             }
         }
 
         let window = cx.add_window(|_, cx| TabsHarness {
             state: state.clone(),
             focus: cx.focus_handle(),
+            add_menu_open: true,
+            show_empty: false,
         });
+        let harness = window.entity(cx).unwrap();
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         vcx.update(|window, cx| {
             window.refresh();
@@ -1143,7 +1221,8 @@ mod snapshot_tests {
         assert!(vcx.debug_bounds("device-tab-icon-android").is_some());
         assert!(vcx.debug_bounds("device-tab-icon-generic").is_some());
 
-        // Clicking Browser submenu chevron reveals Default, Work, and Incognito profiles.
+        // Clicking Browser submenu chevron reveals Default, Work, and Incognito profiles within
+        // the 360px narrow panel bounds, and keeps the real stateful add_menu open.
         let chevron = vcx
             .debug_bounds("right-panel-add-browser-chevron")
             .expect("browser profile submenu chevron")
@@ -1154,17 +1233,28 @@ mod snapshot_tests {
             window.refresh();
             window.draw(cx).clear();
         });
+        harness.read_with(&vcx, |h, _| assert!(h.add_menu_open));
+        let submenu_bounds = vcx
+            .debug_bounds("right-panel-browser-profiles-submenu")
+            .expect("submenu bounds");
+        assert!(
+            f32::from(submenu_bounds.right()) <= 360.0,
+            "submenu must fit within 360px narrow panel, got right={:?}",
+            submenu_bounds.right()
+        );
         assert!(vcx.debug_bounds("right-panel-browser-profile-default").is_some());
         assert!(vcx.debug_bounds("right-panel-browser-profile-work").is_some());
         assert!(vcx.debug_bounds("right-panel-browser-profile-incognito").is_some());
 
-        // Clicking the `work` profile dispatches `preview.open` with `profileId: "work"`.
+        // Clicking `work` with a real stateful `on_dismiss` must NOT be eaten by Capture-phase
+        // `on_mouse_down_out`: it dispatches `preview.open` with `profileId: "work"` and closes menu.
         let work_center = vcx
             .debug_bounds("right-panel-browser-profile-work")
             .unwrap()
             .center();
         vcx.simulate_click(work_center, Default::default());
         vcx.run_until_parked();
+        harness.read_with(&vcx, |h, _| assert!(!h.add_menu_open));
 
         let mut saw_work_open = false;
         for _ in 0..8 {
@@ -1177,6 +1267,102 @@ mod snapshot_tests {
             }
         }
         assert!(saw_work_open, "clicking Work profile must dispatch preview.open with profileId=work");
+
+        // Reopening the `+` menu after dismissal starts with the Browser submenu closed,
+        // and dismissing outside while submenu is open also resets submenu state on next reopen.
+        vcx.update(|window, cx| {
+            harness.update(cx, |h, cx| {
+                h.add_menu_open = true;
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("right-panel-browser-profiles-submenu").is_none());
+        let chevron = vcx.debug_bounds("right-panel-add-browser-chevron").unwrap().center();
+        vcx.simulate_click(chevron, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("right-panel-browser-profiles-submenu").is_some());
+        // Click outside the menu (at x=340, y=450) -> closes menu and resets submenu state.
+        vcx.simulate_click(gpui::point(px(340.), px(450.)), Default::default());
+        vcx.run_until_parked();
+        harness.read_with(&vcx, |h, _| assert!(!h.add_menu_open));
+        vcx.update(|window, cx| {
+            harness.update(cx, |h, cx| {
+                h.add_menu_open = true;
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("right-panel-browser-profiles-submenu").is_none(),
+            "submenu must reset closed after outside-click dismissal"
+        );
+
+        // Empty-state Browser profile trigger: open -> click trigger again stays closed (reopen guard)
+        // -> open -> click Incognito dispatches `preview.open` with `profileId: "incognito"`.
+        vcx.update(|window, cx| {
+            harness.update(cx, |h, cx| {
+                h.add_menu_open = false;
+                h.show_empty = true;
+                cx.notify();
+            });
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let trigger = vcx
+            .debug_bounds("empty-browser-profile-trigger")
+            .expect("empty-state browser profile trigger")
+            .center();
+        vcx.simulate_click(trigger, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(vcx.debug_bounds("empty-browser-profiles-popup").is_some());
+
+        // Second click on the open trigger closes instead of immediately reopening on mouse-up.
+        vcx.simulate_click(trigger, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            vcx.debug_bounds("empty-browser-profiles-popup").is_none(),
+            "second click on empty-browser-profile-trigger must stay closed"
+        );
+
+        // Re-open (after guard clears) and click Incognito -> dispatches preview.open(incognito).
+        vcx.simulate_click(trigger, Default::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let incognito_center = vcx
+            .debug_bounds("empty-browser-profile-incognito")
+            .expect("empty-state incognito profile item")
+            .center();
+        vcx.simulate_click(incognito_center, Default::default());
+        vcx.run_until_parked();
+        let mut saw_incognito_open = false;
+        for _ in 0..8 {
+            let (method, params, reply) = fixture.next_request().await;
+            let _ = reply.send(Err(t3_client::session::RpcError::Closed));
+            if method == t3_core::preview::method::OPEN {
+                assert_eq!(params["profileId"], "incognito");
+                saw_incognito_open = true;
+                break;
+            }
+        }
+        assert!(saw_incognito_open, "clicking empty-state Incognito must dispatch preview.open with profileId=incognito");
 
         state.update(&mut vcx, |s, _| s.stop_pump());
         drop(vcx);

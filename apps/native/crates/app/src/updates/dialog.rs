@@ -881,7 +881,9 @@ impl UpdateTrackSwitchDialog {
 impl Render for UpdateTrackSwitchDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let label = channel_switch_label(self.channel);
+        let label = crate::i18n::t(cx, channel_switch_label(self.channel));
+        let switch_to_title = crate::i18n::t_fmt(cx, "Switch to {label}", &[("label", label.into())]);
+        let switch_to_question = crate::i18n::t_fmt(cx, "Switch to {label}?", &[("label", label.into())]);
         let button = |id, text: String, primary: bool, focus: &FocusHandle| {
             div()
                 .id(id)
@@ -917,7 +919,7 @@ impl Render for UpdateTrackSwitchDialog {
         let (title, description, body_rows, warning, show_confirm, confirm_disabled) =
             match &self.phase {
                 TrackSwitchPhase::Loading => (
-                    format!("Switch to {label}"),
+                    switch_to_title.clone(),
                     crate::i18n::t(cx, "Checking releases…").to_owned(),
                     None,
                     None,
@@ -925,9 +927,11 @@ impl Render for UpdateTrackSwitchDialog {
                     true,
                 ),
                 TrackSwitchPhase::NotFound => (
-                    format!("Switch to {label}"),
-                    format!(
-                        "Could not find the latest {label} release in this environment's npm registry."
+                    switch_to_title.clone(),
+                    crate::i18n::t_fmt(
+                        cx,
+                        "Could not find the latest {label} release in this environment's npm registry.",
+                        &[("label", label.into())],
                     ),
                     None,
                     None,
@@ -935,7 +939,7 @@ impl Render for UpdateTrackSwitchDialog {
                     true,
                 ),
                 TrackSwitchPhase::Error(message) => (
-                    format!("Switch to {label}"),
+                    switch_to_title.clone(),
                     message.clone(),
                     None,
                     None,
@@ -1106,7 +1110,7 @@ impl Render for UpdateTrackSwitchDialog {
                     let is_disabled = disabled.is_some();
                     let warning = disabled.or_else(|| thread_warning(stopped, continuing));
                     (
-                        format!("Switch to {label}?"),
+                        switch_to_question,
                         format!("T3 Code {}", release.version),
                         Some(rows),
                         warning,
@@ -1229,7 +1233,7 @@ impl Render for UpdateTrackSwitchDialog {
                                     this.child(
                                         button(
                                             "track-switch-confirm",
-                                            format!("Switch to {label}"),
+                                            switch_to_title,
                                             true,
                                             &self.confirm_focus.clone().tab_stop(!confirm_disabled),
                                         )
