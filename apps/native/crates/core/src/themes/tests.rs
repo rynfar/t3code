@@ -482,4 +482,49 @@ fn resolve_supports_legacy_builtin_theme_aliases() {
     assert_eq!(resolve("t3-chat-dark", &[], &[]).map(|t| t.id.as_str()), Some("t3-chat"));
     assert_eq!(canonical_theme_preference("t3-grove"), "grove");
     assert_eq!(canonical_theme_preference("t3-chat-dark"), "t3-chat-dark");
+    // Published theme IDs that are not aliases are preserved verbatim (`pingdotgg/t3code#31318`).
+    assert_eq!(normalize_theme_id("constructor"), "constructor");
+    assert_eq!(normalize_theme_id("to-string"), "to-string");
+}
+
+#[test]
+fn decode_uses_top_level_canvas_and_accent_seeds_when_present() {
+    let seeded = decode(
+        &json!({
+            "version": 1,
+            "name": "Seeded",
+            "appearance": "dark",
+            "canvas": "#141824",
+            "accent": "#ff5599",
+            "colors": { "text": "#f0f4ff" }
+        }),
+        false,
+    )
+    .unwrap();
+    let unseeded = decode(
+        &json!({
+            "version": 1,
+            "name": "Unseeded",
+            "appearance": "dark",
+            "colors": { "text": "#f0f4ff" }
+        }),
+        false,
+    )
+    .unwrap();
+    assert_ne!(seeded.colors["canvas"], unseeded.colors["canvas"]);
+    assert_eq!(seeded.colors["text"], "#f0f4ff");
+    // Invalid seed color is rejected (`pingdotgg/t3code#37982`).
+    let err = decode(
+        &json!({
+            "version": 1,
+            "name": "Bad Seed",
+            "appearance": "dark",
+            "canvas": "not-a-color",
+            "accent": "#ff5599",
+            "colors": { "text": "#f0f4ff" }
+        }),
+        false,
+    )
+    .unwrap_err();
+    assert!(err.contains("canvas"));
 }

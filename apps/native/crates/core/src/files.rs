@@ -327,9 +327,13 @@ fn is_windows_drive_path(path: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
-/// `isHostPath`: absolute on any platform, or under `~/`.
+/// `isHostPath` (`pingdotgg/t3code#38510`): absolute on any platform, or under `~/` or `~\`.
 pub fn is_host_path(path: &str) -> bool {
-    path.starts_with('/') || path.starts_with("\\\\") || path.starts_with("~/") || is_windows_drive_path(path)
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || path.starts_with("~/")
+        || path.starts_with("~\\")
+        || is_windows_drive_path(path)
 }
 
 /// `workspaceRelativeFilePath`: `path` relative to `root` with `/` separators, `"."` for the root
@@ -494,7 +498,15 @@ pub fn breadcrumbs(project_name: &str, relative_path: &str) -> Vec<Crumb> {
     } else {
         ""
     };
-    let parts: Vec<&str> = relative_path.split(['/', '\\']).filter(|part| !part.is_empty()).collect();
+    // The server reads `~\` as home; normalize its prefix while keeping `/` separators outside
+    // Windows paths (`pingdotgg/t3code#38510`).
+    let normalized_home = relative_path.strip_prefix("~\\").map(|rest| format!("~/{rest}"));
+    let source = normalized_home.as_deref().unwrap_or(relative_path);
+    let parts: Vec<&str> = if windows {
+        source.split(['/', '\\']).filter(|part| !part.is_empty()).collect()
+    } else {
+        source.split('/').filter(|part| !part.is_empty()).collect()
+    };
     let mut crumbs = Vec::with_capacity(parts.len() + 1);
     if !host {
         crumbs.push(Crumb { label: project_name.to_owned(), path: String::new(), is_last: parts.is_empty() });

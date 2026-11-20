@@ -588,3 +588,32 @@ fn provider_pill_sorts_by_recency_and_ties_favor_failure_over_warning_and_succes
     let after_dismiss = provider_pill(&[failed, newer_success], None, &HashSet::from([pill.key])).unwrap();
     assert_eq!(after_dismiss.tone, Tone::Error);
 }
+
+#[test]
+fn does_not_offer_nightly_build_to_stable_desktop_app() {
+    let stable_desktop = config(json!({
+        "environment": {
+            "serverVersion": "0.1.9",
+            "capabilities": {
+                "serverSelfUpdate": "desktop-managed",
+                "desktopAppUpdate": true
+            }
+        }
+    }));
+    let plan = collect(
+        &[Machine {
+            id: "stable-desktop",
+            label: "stable-desktop",
+            config: Some(&stable_desktop),
+            connected: true,
+            hosted_by_this_app: false,
+            can_maintain: true,
+            can_manage_providers: true,
+            updating: false,
+        }],
+        "0.1.10-nightly.20261116.4761",
+    );
+    assert!(plan.servers.is_empty());
+    assert_eq!(plan.rows.len(), 1);
+    assert_eq!(plan.rows[0].skipped.as_deref(), Some("on the stable channel"));
+}

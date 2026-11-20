@@ -506,7 +506,7 @@ impl SettingsView {
                                         this.open_ssh_editor(SshHostConfig::new(&new_host_id("ssh")), true, window, cx);
                                     })))
                                     .when(show_eas, |menu| {
-                                        menu.child(menu_item("add-device-eas", "EAS Simulator").on_click(cx.listener(|this, _, window, cx| {
+                                        menu.child(menu_item("add-device-eas", "Expo Simulators").on_click(cx.listener(|this, _, window, cx| {
                                             this.devices.add_menu_open = false;
                                             this.open_eas_editor(EasHostConfig::new(&new_host_id("eas")), true, window, cx);
                                         })))
@@ -633,7 +633,7 @@ impl SettingsView {
                     .control(
                         h_flex()
                             .gap(r(6.))
-                            .child(tone_badge("EAS", Tone::Secondary, cx))
+                            .child(tone_badge("Expo", Tone::Secondary, cx))
                             .children(status_badge(status, cx))
                             .when(show_retry, |h| {
                                 h.child(
@@ -901,7 +901,7 @@ impl SettingsView {
             SecretValue::Reference { provider, reference } => (provider, reference, false),
             SecretValue::Literal(lit) => (STORED_SECRET.to_owned(), lit, true),
         };
-        let label = cx.new(|cx| InputState::new(window, cx).default_value(host.label.clone()).placeholder("EAS Simulator"));
+        let label = cx.new(|cx| InputState::new(window, cx).default_value(host.label.clone()).placeholder("Expo Simulators"));
         let token = cx.new(|cx| {
             let input = InputState::new(window, cx).default_value(initial_token).placeholder(if token_editor.configured() {
                 "Token saved — enter a new token to replace"
@@ -1053,7 +1053,7 @@ impl SettingsView {
         let label = host.label.clone();
         crate::dialog::ask(
             format!("Remove \"{label}\"?"),
-            "EAS cloud simulators from this host will no longer appear in the Device panel.",
+            "Expo cloud simulators from this host will no longer appear in the Device panel.",
             "Remove",
             move |_, cx| {
                 let host = host.clone();
@@ -1350,7 +1350,7 @@ impl SettingsView {
                 Some(v_flex().gap(r(10.)).child(section(title, rows, cx)).child(footer).into_any_element())
             }
             HostEditor::Eas(ed) => {
-                let title = if ed.is_new { "Add EAS Simulator" } else { "Edit EAS Simulator" };
+                let title = if ed.is_new { "Add Expo host" } else { "Edit Expo host" };
                 let draft = Self::read_eas_draft(ed, cx);
                 let problem = ed.token_editor.problem(&draft);
                 let can_check = ed.token_editor.can_check() && !ed.checking && !ed.saving;
@@ -1472,8 +1472,8 @@ impl SettingsView {
                                 .children(account_status),
                         )
                         .into_any_element(),
-                    Row::new("eas-ed-app", "EAS project")
-                        .description("Used when the thread's project has no app.json / app.config EAS project id.")
+                    Row::new("eas-ed-app", "Expo project")
+                        .description("Used when the thread's project has no app.json / app.config Expo project id.")
                         .control(app_select)
                         .into_any_element(),
                     Row::new("eas-ed-sessions", "Max concurrent sessions")

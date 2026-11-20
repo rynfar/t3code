@@ -692,3 +692,36 @@ fn removal_plans_follow_enablement_defaults_and_cleanup_only_custom_managed_acp(
         assert!(state.request("custom", false, &context));
     }
 }
+
+#[test]
+fn custom_model_save_queue_layers_successive_saves_and_handles_races() {
+    let mut queue = CustomModelSaveQueue::default();
+    let stored: Vec<Value> = vec![];
+    queue.reconcile_stored("codex", &stored);
+
+    // First save adds model-a; second save layers model-b before config stream echoes.
+    let first_entries = custom_entries_with_added(queue.current_entries(&stored), "model-a");
+    let first_id = queue.push("codex", first_entries.clone());
+    let second_entries = custom_entries_with_added(queue.current_entries(&stored), "model-b");
+    let second_id = queue.push("codex", second_entries.clone());
+    assert_eq!(queue.current_entries(&stored), second_entries.as_slice());
+
+    // First save succeeds and echoes; second save still holds both models.
+    queue.settle(first_id, true);
+    queue.reconcile_stored("codex", &first_entries);
+    assert_eq!(queue.current_entries(&first_entries), second_entries.as_slice());
+
+    // Second save fails -> drops back to stored [model-a].
+    queue.settle(second_id, false);
+    assert!(queue.is_empty());
+    assert_eq!(queue.current_entries(&first_entries), first_entries.as_slice());
+
+    // External writer races an in-flight save -> raced save is dropped when it settles.
+    let third_entries = custom_entries_with_added(&first_entries, "model-c");
+    let third_id = queue.push("codex", third_entries);
+    let external = vec![json!("model-a"), json!("model-other")];
+    queue.reconcile_stored("codex", &external);
+    queue.settle(third_id, true);
+    assert!(queue.is_empty());
+    assert_eq!(queue.current_entries(&external), external.as_slice());
+}

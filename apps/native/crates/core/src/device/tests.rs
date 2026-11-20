@@ -77,7 +77,7 @@ fn platform_setup_status_explains_each_platform_in_the_web_words() {
     assert_eq!(remote.platform_setup_status(Platform::Android).message, "Android support was not detected.");
     assert!(remote.local_platforms_unavailable());
     let eas = state(json!({ "hosts": [host("eas", "eas", json!([{ "platform": "android", "available": true }]))] }));
-    assert_eq!(eas.platform_setup_status(Platform::Android).message, "eas host starts Android emulators in the cloud with EAS Simulator.");
+    assert_eq!(eas.platform_setup_status(Platform::Android).message, "eas host starts Android emulators in the cloud with Expo Simulators.");
     let uncertain = state(json!({ "hostStatuses": { "local": { "status": "ready", "androidDiscoveryIncomplete": true } } }));
     assert!(uncertain.platform_setup_status(Platform::Android).message.starts_with("The Android device list may be incomplete"));
     assert!(!uncertain.show_android_hint());

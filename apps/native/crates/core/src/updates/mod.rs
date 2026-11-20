@@ -193,18 +193,14 @@ pub fn collect(machines: &[Machine<'_>], target_version: &str) -> Plan {
             && !config.is_some_and(|c| c.environment.capabilities.desktop_app_update == Some(true))
         {
             Some("needs a newer desktop app".into())
-        } else if capability != Some("desktop-managed")
-            && config
-                .is_some_and(|c| channel(&c.environment.server_version) != channel(target_version))
+        } else if let Some(server_channel) = config.map(|c| channel(&c.environment.server_version))
+            && server_channel != channel(target_version)
+            && (capability != Some("desktop-managed") || server_channel == "stable")
         {
-            Some(format!(
-                "on the {} channel",
-                channel(
-                    config
-                        .map(|c| c.environment.server_version.as_str())
-                        .unwrap_or_default()
-                )
-            ))
+            // A desktop app installs its own track's newest release. Nightly builds run ahead of
+            // Stable, so a Nightly host behind a Stable target has something newer; a Stable host
+            // may not (`pingdotgg/t3code#37490`).
+            Some(format!("on the {server_channel} channel"))
         } else {
             None
         };

@@ -728,5 +728,40 @@ pub fn next_host_account_choices(
     next
 }
 
+/// `issueTrackerSummary` (`packages/client-runtime/src/state/issueTrackers.ts`,
+/// `pingdotgg/t3code#19274`): describes one standalone issue tracker's connection and linked
+/// project count.
+pub fn issue_tracker_summary(
+    tracker: &crate::issues::wire::IssueTrackerConnection,
+    bindings: &std::collections::HashMap<String, crate::issues::wire::IssueTrackerProjectBinding>,
+) -> String {
+    if !tracker.connected {
+        return format!(
+            "Not connected. Add a {} to list its issues.",
+            tracker.credential.label.to_lowercase()
+        );
+    }
+    let Some(account) = tracker.account.as_deref().filter(|s| !s.is_empty()) else {
+        return tracker
+            .detail
+            .clone()
+            .unwrap_or_else(|| "The saved credential was rejected.".to_owned());
+    };
+    let linked = bindings
+        .values()
+        .filter(|binding| binding.tracker == tracker.tracker)
+        .count();
+    if linked == 0 {
+        format!(
+            "Connected as {account} \u{00b7} no projects linked yet. Pick a {} for a project to list its issues.",
+            tracker.scope_noun
+        )
+    } else if linked == 1 {
+        format!("Connected as {account} \u{00b7} 1 project linked")
+    } else {
+        format!("Connected as {account} \u{00b7} {linked} projects linked")
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -156,6 +156,14 @@ impl ThemeImportDialog {
     pub(super) fn is_open(&self) -> bool {
         self.open
     }
+    /// Cancels any pending file read or Open VSX theme install when leaving Appearance
+    /// (`pingdotgg/t3code#38021`).
+    pub(super) fn cancel_pending(&mut self, cx: &mut Context<Self>) {
+        self.search.cancel();
+        self.session.cancel();
+        self.open = false;
+        cx.notify();
+    }
     pub(super) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving {
             return;

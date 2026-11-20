@@ -46,6 +46,7 @@ struct Telemetry {
     saving: bool,
     message: Option<&'static str>,
     checks: HashMap<OtlpSignal, EndpointCheck>,
+    check_seq: HashMap<OtlpSignal, u64>,
     /// Seeded once per visit from what runs or is saved, then sent once checks are allowed.
     seeded: bool,
     sent: bool,
@@ -106,7 +107,7 @@ impl DiagnosticsState {
             copied: None,
             form_ready: false,
             pending_scroll: false,
-            telemetry: Telemetry { inputs, drafts: HashMap::new(), saving: false, message: None, checks: HashMap::new(), seeded: false, sent: false, invalid: Vec::new() },
+            telemetry: Telemetry { inputs, drafts: HashMap::new(), saving: false, message: None, checks: HashMap::new(), check_seq: HashMap::new(), seeded: false, sent: false, invalid: Vec::new() },
             ticker: None,
             grants: None,
             _subscriptions: subscriptions,
@@ -133,6 +134,7 @@ impl DiagnosticsState {
         self.telemetry.drafts.clear();
         self.telemetry.message = None;
         self.telemetry.checks.clear();
+        self.telemetry.check_seq.clear();
         self.telemetry.seeded = false;
         self.telemetry.sent = false;
         self.telemetry.invalid.clear();
@@ -1228,14 +1230,19 @@ impl SettingsView {
     }
 
     fn send_check(&mut self, signal: OtlpSignal, url: String, cx: &mut Context<Self>) {
+        // Track each attempt by sequence so testing a corrected URL while an earlier check is
+        // still in flight supersedes the earlier attempt (`pingdotgg/t3code#39067`).
+        let seq = self.diagnostics.telemetry.check_seq.entry(signal).or_insert(0);
+        *seq = seq.wrapping_add(1);
+        let attempt_seq = *seq;
         let task = self.state.read(cx).rpc(model::CHECK_OTLP_ENDPOINT, signal.check_payload(&url));
         cx.spawn(async move |this, cx| {
             let result = task.await.ok().and_then(|reply| model::decode_check(&reply));
             let _ = this.update(cx, |this, cx| {
-                let checks = &mut this.diagnostics.telemetry.checks;
-                if checks.get(&signal).is_none_or(|check| check.url != url || check.result.is_some()) {
+                if this.diagnostics.telemetry.check_seq.get(&signal).copied() != Some(attempt_seq) {
                     return;
                 }
+                let checks = &mut this.diagnostics.telemetry.checks;
                 match result {
                     Some(result) => {
                         checks.insert(signal, EndpointCheck { url, result: Some(result) });
@@ -1305,7 +1312,7 @@ impl SettingsView {
             let url = found.as_ref().map_or_else(|| value.trim().to_owned(), |found| found.url.clone());
             let check = self.diagnostics.telemetry.checks.get(&signal);
             let status = model::signal_status(found.as_ref(), can_check.then(|| model::endpoint_status(&url, check)));
-            let checking = check.is_some_and(|check| check.result.is_none());
+            let checking_same_url = check.is_some_and(|check| check.url == url && check.result.is_none());
             let running_line = model::running_line(signal, &saved, running.as_ref());
             let refused = self.diagnostics.telemetry.invalid.contains(&signal);
             let test_url = url.clone();
@@ -1332,7 +1339,7 @@ impl SettingsView {
                                 this.child(
                                     Button::new(SharedString::from(format!("telemetry-test-{}", signal.as_str())), ButtonVariant::Outline, ButtonSize::Sm)
                                         .label("Test")
-                                        .disabled(!model::is_http_url(&url) || checking)
+                                        .disabled(!model::is_http_url(&url) || checking_same_url)
                                         .on_click(cx.listener(move |this, _, _, cx| this.check_endpoint(signal, test_url.clone(), cx))),
                                 )
                             }),

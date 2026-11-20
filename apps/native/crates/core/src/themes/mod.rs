@@ -1,6 +1,7 @@
 //! Theme library, decoding and palette application from `web/src/themePalette.ts`,
 //! `ThemeSettings.tsx`, `appearanceContrast.ts` and `index.css`.
 mod color;
+pub mod background;
 pub mod css;
 pub mod default_sync;
 pub mod editor;
@@ -41,6 +42,9 @@ pub struct ThemeDefinition {
     pub managed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub css: Option<String>,
+    /// Revision of the background image published beside an environment theme (`pingdotgg/t3code#36680`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
 }
 impl ThemeDefinition {
     pub fn half(&self, dark: bool) -> Option<&Colors> {
@@ -137,6 +141,13 @@ fn overrides(v: &Value, strict: bool) -> Result<Colors, String> {
     }
     Ok(colors)
 }
+fn parse_seed_color<'a>(name: &str, value: &'a Value) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .filter(|s| color::parse(s).is_ok())
+        .ok_or_else(|| format!("The theme's \"{name}\" must be a literal CSS color."))
+}
+
 #[cfg(test)]
 thread_local! { static STORED_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 pub fn decode(value: &Value, stored: bool) -> Result<ThemeDefinition, String> {
@@ -163,7 +174,15 @@ pub fn decode(value: &Value, stored: bool) -> Result<ThemeDefinition, String> {
     if reserved(&id) {
         return Err(format!("The theme id \"{id}\" is reserved."));
     }
-    let mut colors = defaults(appearance == "dark");
+    let mut colors = match (v.get("canvas").filter(|v| !v.is_null()), v.get("accent").filter(|v| !v.is_null())) {
+        (Some(canvas), Some(accent)) if !stored => {
+            let canvas = parse_seed_color("canvas", canvas)?;
+            let accent = parse_seed_color("accent", accent)?;
+            vivid::derive(appearance == "dark", canvas, accent)
+                .ok_or_else(|| "The theme's \"canvas\" must be a literal CSS color.".to_owned())?
+        }
+        _ => defaults(appearance == "dark"),
+    };
     colors.extend(overrides(v.get("colors").ok_or("Theme files need a colors object.")?, !stored)?);
     let mut variants = BTreeMap::new();
     if let Some(value) = v.get("variants") {
@@ -209,6 +228,12 @@ pub fn decode(value: &Value, stored: bool) -> Result<ThemeDefinition, String> {
             ));
         }
     };
+    let background = v
+        .get("background")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= background::MAX_BACKGROUND_REVISION_LEN)
+        .map(str::to_owned);
     Ok(ThemeDefinition {
         id,
         label: name.trim().into(),
@@ -218,7 +243,26 @@ pub fn decode(value: &Value, stored: bool) -> Result<ThemeDefinition, String> {
         collection,
         managed: v.get("managed") == Some(&Value::Bool(true)),
         css: theme_css,
+        background,
     })
+}
+
+/// A copy of `theme` under `name` and the id it derives (`renameTheme` in `themePalette.ts`).
+/// The collection and any published background revision stay behind, while custom CSS is kept
+/// (`pingdotgg/t3code#37493`, `pingdotgg/t3code#38139`).
+pub fn rename_theme(theme: &ThemeDefinition, name: &str) -> Result<ThemeDefinition, String> {
+    let mut file = serde_json::json!({
+        "version": 1,
+        "name": name.chars().take(48).collect::<String>(),
+        "appearance": theme.appearance,
+        "colors": theme.colors,
+        "variants": theme.variants,
+        "managed": theme.managed,
+    });
+    if let Some(css) = &theme.css {
+        file["css"] = Value::String(css.clone());
+    }
+    decode(&file, false)
 }
 pub fn library(doc: &ClientSettingsDoc) -> Vec<ThemeDefinition> {
     let mut out = Vec::new();
@@ -259,7 +303,7 @@ pub fn duplicate(doc: &ClientSettingsDoc, theme: &ThemeDefinition) -> ThemeDefin
         id = format!("{}-{n}", base.chars().take(43).collect::<String>());
         n += 1;
     }
-    ThemeDefinition { id, label, collection: None, ..theme.clone() }
+    ThemeDefinition { id, label, collection: None, background: None, ..theme.clone() }
 }
 pub fn environment(values: &[Value]) -> Vec<ThemeDefinition> {
     values
@@ -491,6 +535,7 @@ pub fn serialize(theme: &ThemeDefinition) -> String {
     v["version"] = 1.into();
     v["name"] = theme.label.clone().into();
     v.as_object_mut().unwrap().remove("label");
+    v.as_object_mut().unwrap().remove("background");
     format!("{}\n", serde_json::to_string_pretty(&v).expect("serializable theme"))
 }
 

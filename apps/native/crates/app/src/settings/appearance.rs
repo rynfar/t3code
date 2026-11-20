@@ -87,7 +87,7 @@ impl AppearanceState {
 }
 
 impl SettingsView {
-    pub(super) fn appearance(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
+    pub(super) fn appearance(&mut self, window: &Window, cx: &mut Context<Self>) -> Vec<Block> {
         let doc = store::client(cx).clone();
         let mode = doc.appearance_mode();
         let theme = doc.theme();
@@ -550,7 +550,7 @@ impl SettingsView {
         }
         let interface = section("Interface", interface_rows, cx);
 
-        let typography = self.typography_rows(cx);
+        let typography = self.typography_rows(window, cx);
 
         vec![
             Block::new(&["appearance", "color-scheme", "theme"], colors),

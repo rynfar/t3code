@@ -301,4 +301,9 @@ fn webhook_settings_validation_filters_and_deliveries_match_web() {
     let relay = Webhook { path: hook.path.clone(), url: Some("https://hooks.t3.codes/task-1/abc".into()), has_secret: true };
     assert_eq!(webhook_address(&relay, None), ("https://hooks.t3.codes/task-1/abc".to_owned(), true, ""));
     assert!(valid_time_of_day("9:05") && valid_time_of_day("23:59") && !valid_time_of_day("24:00") && !valid_time_of_day("9:5"));
+
+    let mut fixed_draft = Draft::from_task(&decode_task(&task(json!({ "type": "fixed", "timeOfDay": "09:00", "daysOfWeek": ["mon"] }))).unwrap(), |_| None);
+    fixed_draft.time_of_day.clear();
+    let err = fixed_draft.upsert_input_with_thread_modes(true, true, None, |_| None).unwrap_err();
+    assert_eq!(err.description, "Pick a time.");
 }

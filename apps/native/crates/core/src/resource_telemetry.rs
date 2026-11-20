@@ -364,14 +364,16 @@ fn fixed(value: f64, digits: usize) -> String {
 }
 pub fn cpu_time(ms: f64) -> String {
     let seconds = ms / 1000.;
-    if seconds < 60. {
-        format!("{}s", fixed(seconds, if seconds >= 10. { 1 } else { 2 }))
-    } else if seconds < 3600. {
-        let minutes = seconds / 60.;
-        format!("{}m", fixed(minutes, if minutes >= 10. { 1 } else { 2 }))
-    } else {
-        format!("{}h", fixed(seconds / 3600., 2))
+    let short_seconds = fixed(seconds, if seconds >= 10. { 1 } else { 2 });
+    if short_seconds.parse::<f64>().unwrap_or(seconds) < 60. {
+        return format!("{short_seconds}s");
     }
+    let minutes = seconds / 60.;
+    let short_minutes = fixed(minutes, if minutes >= 10. { 1 } else { 2 });
+    if short_minutes.parse::<f64>().unwrap_or(minutes) < 60. {
+        return format!("{short_minutes}m");
+    }
+    format!("{}h", fixed(seconds / 3600., 2))
 }
 pub fn attribution_time(ms: f64) -> String {
     format!("{}s", fixed(ms / 1000., 2))
@@ -387,6 +389,15 @@ pub fn duration_micros(value: f64) -> String {
 }
 pub fn sample_interval(ms: u64) -> String {
     if ms < 1000 { format!("{ms} ms") } else { format!("{} {}", fixed(ms as f64 / 1000., 1), if ms == 1000 { "second" } else { "seconds" }) }
+}
+/// `formatSamplingStatus` (`pingdotgg/t3code#29749`): reports `"Sampling on demand"` when the
+/// monitor is idle (`sampleIntervalMs == 0`) instead of `"Sampling every 0 ms"`.
+pub fn sampling_status(ms: u64) -> String {
+    if ms == 0 {
+        "Sampling on demand".to_owned()
+    } else {
+        format!("Sampling every {}", sample_interval(ms))
+    }
 }
 pub fn bytes(value: f64) -> String {
     if value.round() < 1024. {

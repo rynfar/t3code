@@ -1080,8 +1080,8 @@ impl Draft {
         let Some(model) = model else { return Err(invalid("Scheduled task is incomplete", "Add a title, prompt, project, and model.")) };
         let schedule = match self.schedule_mode {
             ScheduleMode::Fixed => {
-                if !valid_time_of_day(self.time_of_day.trim()) {
-                    return Err(invalid("Invalid run time", "Pick a date and time."));
+                if self.time_of_day.trim().is_empty() || !valid_time_of_day(self.time_of_day.trim()) {
+                    return Err(invalid("Invalid run time", "Pick a time."));
                 }
                 let mut schedule = json!({ "type": "fixed_time", "timeOfDay": self.time_of_day.trim() });
                 if !self.weekdays.is_empty() && self.weekdays.len() < 7 {

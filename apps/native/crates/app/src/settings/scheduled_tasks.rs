@@ -1148,16 +1148,31 @@ impl SettingsView {
             WorkspaceMode::Root => None,
         };
 
+        let bound_model = draft.thread_id.as_deref().and_then(|thread_id| {
+            self.state
+                .read(cx)
+                .thread_shell(thread_id)
+                .map(|thread| thread.model_selection.clone())
+        });
+        let model_locked_to_thread = draft.thread_id.is_some();
+        // Bound runs use the thread's current model, so the locked picker shows that one
+        // (`pingdotgg/t3code#36628`).
+        let shown_model = if model_locked_to_thread {
+            bound_model.as_ref()
+        } else {
+            draft.model.as_ref()
+        };
         let options = model_options(config, None);
         let model_state = cx.entity().downgrade();
-        let model: AnyElement = match &draft.model {
-            _ if options.is_empty() => muted_text("No providers available", cx).into_any_element(),
+        let model: AnyElement = match shown_model {
+            _ if options.is_empty() && !model_locked_to_thread => muted_text("No providers available", cx).into_any_element(),
             selection => Select::new("scheduled-task-model", options)
-                .selected(selection.as_ref().map(selection_value).unwrap_or_default())
-                .label(selection.as_ref().map_or_else(|| "Select a model".to_owned(), |selection| selection_label(config, selection)))
+                .selected(selection.map(selection_value).unwrap_or_default())
+                .label(selection.map_or_else(|| "Select a model".to_owned(), |selection| selection_label(config, selection)))
                 .width(240.)
                 .popup_width(260.)
                 .show_check()
+                .disabled(model_locked_to_thread)
                 .on_change(move |value, _, cx| {
                     let Some(selection) = parse_selection(&value) else { return };
                     let _ = model_state.update(cx, |this, cx| {

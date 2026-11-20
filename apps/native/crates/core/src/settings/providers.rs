@@ -496,6 +496,7 @@ pub enum InstanceEdit {
     Accent(String),
     AddCustomModel(String),
     RemoveCustomModel(String),
+    SetCustomModels(Vec<Value>),
 }
 
 impl InstanceEdit {
@@ -513,6 +514,7 @@ impl InstanceEdit {
             InstanceEdit::Accent(accent) => with_accent(instance, accent),
             InstanceEdit::AddCustomModel(slug) => with_custom_model_added(instance, slug),
             InstanceEdit::RemoveCustomModel(slug) => with_custom_model_removed(instance, slug),
+            InstanceEdit::SetCustomModels(entries) => with_custom_entries(instance, entries.clone()),
         }
     }
 }
@@ -620,19 +622,19 @@ fn custom_model_slug(entry: &Value) -> Option<String> {
     Some(slug.trim().to_owned()).filter(|slug| !slug.is_empty())
 }
 
-fn custom_model_entries(instance: &ProviderInstanceConfig) -> Vec<Value> {
+pub fn custom_model_entries(instance: &ProviderInstanceConfig) -> Vec<Value> {
     instance.config.as_ref().and_then(|config| config.get("customModels")).and_then(Value::as_array).cloned().unwrap_or_default()
 }
 
-/// `readCustomModelEntries`. Antigravity has no custom models.
-pub fn custom_models(instance: &ProviderInstanceConfig) -> Vec<CustomModel> {
-    if instance.driver == "antigravity" {
+/// Decodes raw `config.customModels` entries into deduplicated `CustomModel` rows.
+pub fn custom_models_from_entries(driver: &str, entries: &[Value]) -> Vec<CustomModel> {
+    if driver == "antigravity" {
         return Vec::new();
     }
     let mut seen = Vec::new();
     let mut models = Vec::new();
-    for entry in custom_model_entries(instance) {
-        let Some(slug) = custom_model_slug(&entry) else { continue };
+    for entry in entries {
+        let Some(slug) = custom_model_slug(entry) else { continue };
         if seen.contains(&slug) {
             continue;
         }
@@ -642,6 +644,135 @@ pub fn custom_models(instance: &ProviderInstanceConfig) -> Vec<CustomModel> {
         models.push(CustomModel { slug, name, capabilities });
     }
     models
+}
+
+/// `readCustomModelEntries`. Antigravity has no custom models.
+pub fn custom_models(instance: &ProviderInstanceConfig) -> Vec<CustomModel> {
+    custom_models_from_entries(&instance.driver, &custom_model_entries(instance))
+}
+
+/// Appends a custom model slug to raw `customModels` entries.
+pub fn custom_entries_with_added(entries: &[Value], slug: &str) -> Vec<Value> {
+    let mut next = entries.to_vec();
+    next.push(json!(slug));
+    next
+}
+
+/// Removes a custom model slug from raw `customModels` entries.
+pub fn custom_entries_with_removed(entries: &[Value], slug: &str) -> Vec<Value> {
+    entries.iter().filter(|entry| custom_model_slug(entry).as_deref() != Some(slug)).cloned().collect()
+}
+
+/// Canonical JSON key for a custom models list so config-stream echoes match pending saves.
+pub fn custom_models_key(driver: &str, entries: &[Value]) -> String {
+    if driver == "antigravity" {
+        return "[]".to_owned();
+    }
+    let mut seen = Vec::new();
+    let mut normalized = Vec::new();
+    for entry in entries {
+        let Some(slug) = custom_model_slug(entry) else { continue };
+        if seen.contains(&slug) {
+            continue;
+        }
+        seen.push(slug.clone());
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| slug.clone(), str::to_owned);
+        let capabilities = entry.get("capabilities").filter(|value| !value.is_null()).cloned();
+        if name == slug && capabilities.is_none() {
+            normalized.push(Value::String(slug));
+        } else {
+            let mut obj = Map::new();
+            obj.insert("slug".into(), Value::String(slug));
+            obj.insert("name".into(), Value::String(name));
+            if let Some(caps) = capabilities {
+                obj.insert("capabilities".into(), caps);
+            }
+            normalized.push(Value::Object(obj));
+        }
+    }
+    serde_json::to_string(&normalized).unwrap_or_default()
+}
+
+/// One in-flight or echo-pending custom model save (`customModelSaves.logic.ts`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingCustomModelSave {
+    pub id: u64,
+    pub entries: Vec<Value>,
+    pub key: String,
+    /// The server accepted it; only its config-stream echo is outstanding.
+    pub replied: bool,
+    /// Another writer changed the list while this save was in flight, so its echo may never come.
+    pub raced: bool,
+}
+
+/// Tracks pending custom-model saves per provider instance so successive adds/removes layer
+/// on top of the latest pending list before the config stream echoes (`customModelSaves.logic.ts`).
+#[derive(Debug, Clone, Default)]
+pub struct CustomModelSaveQueue {
+    next_id: u64,
+    last_stored_key: Option<String>,
+    saves: Vec<PendingCustomModelSave>,
+}
+
+impl CustomModelSaveQueue {
+    /// Reconciles pending saves against the latest stored list from `server_config`.
+    pub fn reconcile_stored(&mut self, driver: &str, stored_entries: &[Value]) {
+        let stored_key = custom_models_key(driver, stored_entries);
+        if self.last_stored_key.as_deref() == Some(stored_key.as_str()) {
+            return;
+        }
+        self.last_stored_key = Some(stored_key.clone());
+        if let Some(echoed) = self.saves.iter().rposition(|entry| entry.key == stored_key) {
+            self.saves.drain(..=echoed);
+        } else {
+            self.saves.retain_mut(|entry| {
+                if entry.replied {
+                    false
+                } else {
+                    entry.raced = true;
+                    true
+                }
+            });
+        }
+    }
+
+    /// The effective `customModels` entries: the latest pending save, or `stored_entries`.
+    pub fn current_entries<'a>(&'a self, stored_entries: &'a [Value]) -> &'a [Value] {
+        self.saves.last().map_or(stored_entries, |entry| entry.entries.as_slice())
+    }
+
+    /// Records a newly dispatched save built on top of `current_entries`. Returns its save id.
+    pub fn push(&mut self, driver: &str, entries: Vec<Value>) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        let key = custom_models_key(driver, &entries);
+        self.saves.push(PendingCustomModelSave { id, entries, key, replied: false, raced: false });
+        id
+    }
+
+    /// Settles an in-flight save: failed or raced saves are dropped; accepted ones wait for echo.
+    pub fn settle(&mut self, id: u64, saved: bool) {
+        self.saves.retain_mut(|entry| {
+            if entry.id != id {
+                return true;
+            }
+            if saved && !entry.raced {
+                entry.replied = true;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.saves.is_empty()
+    }
 }
 
 /// `MAX_CUSTOM_MODEL_LENGTH`.

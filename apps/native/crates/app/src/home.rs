@@ -42,7 +42,23 @@ impl AppState {
     }
 
     pub fn is_scratch_project(&self, project_id: &str) -> bool {
-        self.shell.project(project_id).is_some_and(|project| is_scratch_project(&project.workspace_root, self.scratch_root()))
+        // Keep recognizing a loaded scratch folder even if the environment temporarily disconnects
+        // (`pingdotgg/t3code#30597`); `scratch_root()` still gates creating new scratch threads.
+        let active_id = self.environments.active.as_deref();
+        if self.fleet.environments.iter().any(|env| {
+            active_id.is_none_or(|id| env.summary.owner.saved_id == id)
+                && env.summary.projects.iter().any(|p| p.project.id == project_id && p.is_scratch)
+        }) {
+            return true;
+        }
+        let known_scratch_root = self
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|config| config.scratch_workspace_root.as_deref());
+        self.shell
+            .project(project_id)
+            .is_some_and(|project| is_scratch_project(&project.workspace_root, known_scratch_root))
     }
 
     /// `startScratchThread`: ensures the scratch project, then opens a draft in it.

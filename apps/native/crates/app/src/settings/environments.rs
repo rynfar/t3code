@@ -297,6 +297,23 @@ impl SettingsView {
         out
     }
 
+    /// Refreshes peer links for every peer-link host when showing Connections or returning to the
+    /// window so links created outside the app appear immediately without interrupting an in-flight
+    /// load (`pingdotgg/t3code#28907`).
+    pub(super) fn refresh_visible_peer_links(&mut self, cx: &mut Context<Self>) {
+        let hosts: Vec<String> = self
+            .peer_link_hosts(cx)
+            .into_iter()
+            .map(|host| host.saved_id)
+            .collect();
+        for host_id in hosts {
+            if matches!(self.environments.peer_links.get(&host_id), Some(PeerLinksLoad::Loading)) {
+                continue;
+            }
+            self.refresh_peer_links(&host_id, true, cx);
+        }
+    }
+
     fn refresh_peer_links(&mut self, host_saved_id: &str, force: bool, cx: &mut Context<Self>) {
         if !force {
             match self.environments.peer_links.get(host_saved_id) {

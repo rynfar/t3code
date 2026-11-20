@@ -28,7 +28,12 @@ pub fn default_theme_to_apply(
     applied_generation: Option<&str>,
     resolves: bool,
 ) -> Option<String> {
-    if environment_id.is_none_or(str::is_empty) || default_theme.is_empty() {
+    // Empty with a set time means the stock theme was set (`pingdotgg/t3code#36724`);
+    // with neither set, no default theme was configured.
+    if environment_id.is_none_or(str::is_empty) {
+        return None;
+    }
+    if default_theme.is_empty() && default_theme_set_at.is_empty() {
         return None;
     }
     let generation = default_theme_generation(default_theme, default_theme_set_at);
@@ -94,25 +99,33 @@ pub fn adopt_defaults_patch(
     // 1. adoptDefaultTheme()
     let theme_key = format!("{APPLIED_DEFAULT_THEME_STORAGE_PREFIX}{}", settings.environment_id);
     let applied_theme = working.entries().get(&theme_key).and_then(Value::as_str);
-    let definition = resolve(settings.default_theme, &custom, environment).cloned();
+    let definition = (!settings.default_theme.is_empty())
+        .then(|| resolve(settings.default_theme, &custom, environment).cloned())
+        .flatten();
     if let Some(generation) = default_theme_to_apply(
         Some(settings.environment_id),
         settings.default_theme,
         settings.default_theme_set_at,
         applied_theme,
-        definition.is_some(),
-    ) && let Some(def) = definition
-    {
-        let canonical = super::canonical_theme_preference(settings.default_theme);
-        patch.extend(working.apply_change(&ClientSettingChange::Theme(ThemePreference::Named(canonical))));
-        if let Some(half) = single_appearance_of(&def)
-            && theme_sets_own_mode(
-                settings.default_theme_set_at,
-                settings.default_appearance,
-                settings.default_appearance_set_at,
-            )
-        {
-            patch.extend(working.apply_change(&ClientSettingChange::AppearanceMode(half)));
+        definition.is_some() || settings.default_theme.is_empty(),
+    ) {
+        if let Some(def) = definition {
+            let canonical = super::canonical_theme_preference(settings.default_theme);
+            patch.extend(working.apply_change(&ClientSettingChange::Theme(ThemePreference::Named(canonical))));
+            if let Some(half) = single_appearance_of(&def)
+                && theme_sets_own_mode(
+                    settings.default_theme_set_at,
+                    settings.default_appearance,
+                    settings.default_appearance_set_at,
+                )
+            {
+                patch.extend(working.apply_change(&ClientSettingChange::AppearanceMode(half)));
+            }
+        } else {
+            // The stock theme keeps the client's own light, dark, or system mode (`pingdotgg/t3code#36724`).
+            patch.extend(working.apply_change(&ClientSettingChange::Theme(ThemePreference::Default(
+                working.appearance_mode(),
+            ))));
         }
         let gen_patch = Map::from_iter([(theme_key, Value::String(generation))]);
         patch.extend(working.apply_change(&ClientSettingChange::ThemePatch(gen_patch)));
@@ -290,5 +303,31 @@ mod tests {
         assert!(environment_themes_patch(&doc, &[nightfall.clone()]).is_empty());
         let loaded = stored_environment_themes(&doc);
         assert_eq!(loaded, vec![nightfall]);
+    }
+
+    #[test]
+    fn reverts_to_stock_theme_only_when_environment_explicitly_set_it() {
+        // Unset default theme (empty theme + empty set_at) does not apply (`pingdotgg/t3code#36724`).
+        assert_eq!(default_theme_to_apply(Some("env-1"), "", "", None, true), None);
+        // Empty theme WITH a set_at timestamp means the agent reverted to stock.
+        assert!(default_theme_to_apply(Some("env-1"), "", "2026-11-16T10:00:00.000Z", None, true).is_some());
+
+        let mut doc = ClientSettingsDoc::default();
+        doc.apply_change(&ClientSettingChange::Theme(ThemePreference::Named("grove".into())));
+        doc.apply_change(&ClientSettingChange::AppearanceMode(AppearanceMode::Dark));
+
+        let revert = DefaultThemeSettings {
+            environment_id: "env-1",
+            default_theme: "",
+            default_theme_set_at: "2026-11-16T10:00:00.000Z",
+            default_appearance: "",
+            default_appearance_set_at: "",
+        };
+        let patch = adopt_defaults_patch(&doc, &revert, &[]);
+        assert!(!patch.is_empty());
+        doc.apply_change(&ClientSettingChange::ThemePatch(patch));
+        // Stock theme keeps the client's own Dark appearance mode.
+        assert_eq!(doc.theme(), ThemePreference::Default(AppearanceMode::Dark));
+        assert_eq!(doc.appearance_mode(), AppearanceMode::Dark);
     }
 }

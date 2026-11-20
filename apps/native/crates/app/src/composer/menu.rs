@@ -71,9 +71,10 @@ pub(super) struct Menu {
     pr_detail_search: Option<(String, String, u64, Task<()>)>,
     prs_unavailable: bool,
     prs_failed: bool,
-    snapshots: HashMap<SnapshotKey, WorkspaceSnapshot>,
-    /// When each snapshot was last asked for; one scan per TTL.
-    requested: HashMap<SnapshotKey, i64>,
+    snapshots: HashMap<SnapshotKey, (Option<String>, WorkspaceSnapshot)>,
+    /// When each snapshot was last asked for (along with its `workspaceRescannedAt` basis);
+    /// a server rescan invalidates both cache and TTL immediately (`pingdotgg/t3code#37165`).
+    requested: HashMap<SnapshotKey, (i64, Option<String>)>,
     scanning: HashSet<SnapshotKey>,
     /// The caret and length the menu last read, so cursor blinks cost a comparison.
     caret: Option<(usize, usize)>,
@@ -242,7 +243,10 @@ impl Composer {
     }
 
     pub(super) fn workspace_snapshot_for<'a>(&'a self, provider: &'a ServerProvider, cwd: Option<&str>) -> Option<&'a WorkspaceSnapshot> {
-        let fetched = cwd.and_then(|cwd| self.menu.snapshots.get(&(provider.instance_id.clone(), cwd.to_owned())));
+        let fetched = cwd
+            .and_then(|cwd| self.menu.snapshots.get(&(provider.instance_id.clone(), cwd.to_owned())))
+            .filter(|(rescanned_at, _)| *rescanned_at == provider.workspace_rescanned_at)
+            .map(|(_, snapshot)| snapshot);
         rules::workspace_snapshot(provider, fetched, cwd)
     }
 
@@ -252,7 +256,7 @@ impl Composer {
             .snapshots
             .iter()
             .filter(|((_, snap_cwd), _)| snap_cwd == cwd)
-            .map(|((instance_id, _), snapshot)| (instance_id.clone(), snapshot.clone()))
+            .map(|((instance_id, _), (_, snapshot))| (instance_id.clone(), snapshot.clone()))
             .collect()
     }
 
@@ -758,7 +762,11 @@ impl Composer {
         let provider = resolved.model.as_ref().and_then(|model| state.server_config.config.as_ref()?.provider(&model.instance_id)).cloned();
         let Some(provider) = provider else { return (Vec::new(), false) };
         let key = cwd.as_ref().map(|cwd| (provider.instance_id.clone(), cwd.clone()));
-        let fetched = key.as_ref().and_then(|key| self.menu.snapshots.get(key));
+        let fetched = key
+            .as_ref()
+            .and_then(|key| self.menu.snapshots.get(key))
+            .filter(|(rescanned_at, _)| *rescanned_at == provider.workspace_rescanned_at)
+            .map(|(_, snapshot)| snapshot);
         let snapshot = rules::workspace_snapshot(&provider, fetched, cwd.as_deref());
         let (skills, commands) = rules::skills_and_commands(&provider, snapshot);
         let now = now_ms();
@@ -784,14 +792,25 @@ impl Composer {
         (items, !complete && self.menu.scanning.contains(&key))
     }
 
-    /// `useProviderWorkspaceSnapshotRefresh`: one scan per TTL, a short cooldown after a failure.
+    /// `useProviderWorkspaceSnapshotRefresh`: one scan per TTL, a short cooldown after a failure,
+    /// and immediate rescan when `provider.workspace_rescanned_at` advances (`pingdotgg/t3code#37165`).
     fn refresh_snapshot(&mut self, key: SnapshotKey, now: i64, cx: &mut Context<Self>) {
+        let started_rescanned_at = self
+            .state
+            .read(cx)
+            .server_config
+            .config
+            .as_ref()
+            .and_then(|config| config.provider(&key.0))
+            .and_then(|provider| provider.workspace_rescanned_at.clone());
         if self.menu.scanning.contains(&key)
-            || self.menu.requested.get(&key).is_some_and(|at| now - at < rules::WORKSPACE_SNAPSHOT_TTL_MS)
+            || self.menu.requested.get(&key).is_some_and(|(at, basis)| {
+                *basis == started_rescanned_at && now - at < rules::WORKSPACE_SNAPSHOT_TTL_MS
+            })
         {
             return;
         }
-        self.menu.requested.insert(key.clone(), now);
+        self.menu.requested.insert(key.clone(), (now, started_rescanned_at.clone()));
         self.menu.scanning.insert(key.clone());
         let environment = self.state.read(cx).environments.active.clone();
         let request = self.state.read(cx).rpc(rules::REFRESH_PROVIDERS, rules::refresh_providers_request(&key.0, &key.1));
@@ -800,12 +819,30 @@ impl Composer {
             let _ = this.update(cx, |this, cx| {
                 if this.state.read(cx).environments.active != environment {return;}
                 this.menu.scanning.remove(&key);
+                let current_rescanned_at = this
+                    .state
+                    .read(cx)
+                    .server_config
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.provider(&key.0))
+                    .and_then(|provider| provider.workspace_rescanned_at.clone());
+                let rescan_raced = current_rescanned_at != started_rescanned_at;
                 match reply.ok().and_then(|reply| rules::refreshed_snapshot(&reply, &key.0, &key.1)) {
-                    Some(snapshot) => {
-                        this.menu.snapshots.insert(key, snapshot);
+                    Some(snapshot) if !rescan_raced => {
+                        this.menu.snapshots.insert(key, (started_rescanned_at, snapshot));
+                    }
+                    Some(_) => {
+                        // A SessionStart rescan landed while this request was in flight; drop the
+                        // stale reply and immediately re-scan with zero cooldown (`#37165`).
+                        this.menu.requested.remove(&key);
+                        this.refresh_snapshot(key, now_ms(), cx);
                     }
                     None => {
-                        this.menu.requested.insert(key, now_ms() - rules::WORKSPACE_SNAPSHOT_TTL_MS + SNAPSHOT_RETRY_MS);
+                        this.menu.requested.insert(
+                            key,
+                            (now_ms() - rules::WORKSPACE_SNAPSHOT_TTL_MS + SNAPSHOT_RETRY_MS, started_rescanned_at),
+                        );
                     }
                 }
                 if this.menu_open() {

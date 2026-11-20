@@ -560,6 +560,8 @@ pub struct EnvironmentCapabilities {
     #[serde(default)]
     pub server_self_update_progress: Option<bool>,
     #[serde(default)]
+    pub server_update_staging: Option<bool>,
+    #[serde(default)]
     pub desktop_app_update: Option<bool>,
     #[serde(default)]
     pub desktop_app_channel_switch: Option<bool>,

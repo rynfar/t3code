@@ -267,6 +267,7 @@ impl Session {
                 collection: None,
                 managed: !self.advanced,
                 css: css_for_save,
+                background: None,
             }
         };
         let mut file = serde_json::to_value(&theme).expect("theme");

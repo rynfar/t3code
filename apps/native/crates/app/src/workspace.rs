@@ -111,6 +111,8 @@ pub struct Workspace {
     ssh_prompt: Entity<crate::ssh_prompt::SshPromptDialog>,
     /// A rail drag is live; `has_active_drag` alone also matches row and tab drags.
     rail_dragging: bool,
+    theme_background: t3_core::themes::background::ThemeBackgroundTracker,
+    theme_background_task: Option<Task<()>>,
     _save_sidebar_width: Option<Task<()>>,
     _slow_rpc_task: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -193,6 +195,7 @@ impl Workspace {
                 if matches!(event, AppEvent::ServerConfig | AppEvent::Phase | AppEvent::Shell) {
                     this.handle_host_freeze_toasts(cx);
                     this.handle_permission_update_toasts(cx);
+                    this.sync_theme_background(cx);
                     if matches!(event, AppEvent::ServerConfig) {
                         state.read(cx).sync_learned_environment_routes();
                     }
@@ -239,6 +242,7 @@ impl Workspace {
                         }
                     });
                     t3_client::wakeups::emit_wakeup(wakeup);
+                    this.sync_theme_background(cx);
                 } else {
                     this.inactive_since = Some(Instant::now());
                     crate::voice::handle_window_blur(cx);
@@ -317,12 +321,15 @@ impl Workspace {
             device_setup,
             ssh_prompt,
             rail_dragging: false,
+            theme_background: t3_core::themes::background::ThemeBackgroundTracker::new(),
+            theme_background_task: None,
             _save_sidebar_width: None,
             _slow_rpc_task: slow_rpc_task,
             _subscriptions: subscriptions,
         };
         workspace.handle_host_freeze_toasts(cx);
         workspace.handle_permission_update_toasts(cx);
+        workspace.sync_theme_background(cx);
         workspace.sync_window_title(window, cx);
         workspace
     }
@@ -606,6 +613,7 @@ impl Render for Workspace {
         }
         let swipe_indicator = self.history_swipe.indicator();
         let pane_height = f32::from(window.viewport_size().height);
+        self.sync_theme_background(cx);
         self.sync_window_title(window, cx);
         let theme = cx.theme();
         let state = self.state.read(cx);
@@ -837,6 +845,15 @@ impl Render for Workspace {
                     .flex_1()
                     .h_full()
                     .min_w_0()
+                    .when_some(crate::theme::background_image(cx), |this, image| {
+                        this.child(
+                            gpui::img(image)
+                                .object_fit(gpui::ObjectFit::Cover)
+                                .size_full()
+                                .absolute()
+                                .inset_0(),
+                        )
+                    })
                     .on_scroll_wheel(cx.listener(Self::handle_history_swipe_wheel))
                     .child(self.render_titlebar(window, cx))
                     .when(has_thread, |this| {
@@ -1740,6 +1757,98 @@ impl Workspace {
         });
     }
 
+    /// Syncs the published theme background image for the active theme (`themeBackground.ts`:
+    /// `pingdotgg/t3code#36680`, `pingdotgg/t3code#37843`, `pingdotgg/t3code#37981`,
+    /// `pingdotgg/t3code#38132`).
+    fn sync_theme_background(&mut self, cx: &mut Context<Self>) {
+        use t3_core::themes::background::{BackgroundAction, RetryDecision};
+
+        let (environment_id, client, runtime) = {
+            let state = self.state.read(cx);
+            let env_id = state
+                .server_config
+                .config
+                .as_ref()
+                .map(|c| c.environment.environment_id.clone())
+                .filter(|id| !id.is_empty())
+                .or_else(|| state.environments.active.clone());
+            (env_id, state.client_handle(), state.runtime().clone())
+        };
+        let theme_id = crate::theme::active_theme_id(cx);
+        let custom = crate::theme::preferences(cx).custom.clone();
+        let environment = crate::theme::environment_themes(cx).to_vec();
+
+        let action = self.theme_background.apply(
+            environment_id.as_deref(),
+            theme_id.as_deref(),
+            &custom,
+            &environment,
+            client.is_some(),
+        );
+        match action {
+            BackgroundAction::NoChange => {}
+            BackgroundAction::Clear => {
+                self.theme_background_task = None;
+                crate::theme::set_background_image(None, cx);
+            }
+            BackgroundAction::Fetch { generation, key } => {
+                // Clear previous wallpaper immediately so it never shows under the next theme while loading.
+                crate::theme::set_background_image(None, cx);
+                let Some(client) = client else {
+                    self.theme_background_task = None;
+                    return;
+                };
+                let theme_id = key.theme_id;
+                let svg = cx.svg_renderer();
+                self.theme_background_task = Some(cx.spawn(async move |this, cx| {
+                    loop {
+                        let fetch_client = client.clone();
+                        let fetch_theme_id = theme_id.clone();
+                        let fetched = runtime
+                            .spawn(async move {
+                                t3_client::assets::fetch_theme_background(&fetch_client, &fetch_theme_id).await
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                        let decoded = match fetched {
+                            Some(bytes) => {
+                                let svg = svg.clone();
+                                cx.background_executor()
+                                    .spawn(async move { decode_theme_background(&bytes, 4096, &svg) })
+                                    .await
+                            }
+                            None => None,
+                        };
+                        let next_delay_ms = this
+                            .update(cx, |this, cx| match decoded {
+                                Some(image) => {
+                                    if this.theme_background.on_loaded(generation) {
+                                        crate::theme::set_background_image(Some(image), cx);
+                                    }
+                                    None
+                                }
+                                None => match this.theme_background.on_failed(generation) {
+                                    RetryDecision::RetryAfterMs(delay_ms) => Some(delay_ms),
+                                    RetryDecision::Stale | RetryDecision::Exhausted => None,
+                                },
+                            })
+                            .ok()
+                            .flatten();
+                        match next_delay_ms {
+                            Some(delay_ms) => {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(delay_ms))
+                                    .await;
+                            }
+                            None => break,
+                        }
+                    }
+                }));
+            }
+        }
+    }
+
     /// `rightPanel.new`: opens the right panel's add-surface menu while the panel is open and no
     /// blocking overlay is shown (`RightPanelTabs.tsx`).
     fn open_right_panel_add_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1747,6 +1856,32 @@ impl Workspace {
             return;
         }
         self.right_panel.update(cx, |panel, cx| panel.open_add_surface_menu(window, cx));
+    }
+}
+
+/// Decodes fetched theme background image bytes into a GPU-ready `RenderImage` off the UI thread.
+fn decode_theme_background(
+    bytes: &[u8],
+    max_edge: u32,
+    svg: &gpui::SvgRenderer,
+) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    if image::guess_format(bytes).is_ok() {
+        let img = image::load_from_memory(bytes).ok()?;
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (target_w, target_h) = t3_core::media::fit_within(w, h, max_edge);
+        let img = if (target_w, target_h) == (w, h) { img } else { img.thumbnail_exact(target_w, target_h) };
+        let mut pixels = img.into_rgba8();
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        Some(std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(pixels)])))
+    } else {
+        let img = svg.render_single_frame(bytes, 2.0).ok()?;
+        let size = img.size(0);
+        (size.width.0 > 0 && size.height.0 > 0).then_some(img)
     }
 }
 

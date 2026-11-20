@@ -66,7 +66,13 @@ fn workspace_relative_paths_follow_shared_path_rules() {
     assert_eq!(workspace_relative_path("/repository/a", "/repo"), None);
     assert_eq!(workspace_relative_path("/repo/../etc/passwd", "/repo"), None);
     assert_eq!(workspace_relative_path("c:\\Repo\\Src\\A.rs", "C:\\repo").as_deref(), Some("Src/A.rs"));
-    assert!(is_host_path("/a") && is_host_path("~/a") && is_host_path("C:\\a") && !is_host_path("src/a"));
+    assert!(
+        is_host_path("/a")
+            && is_host_path("~/a")
+            && is_host_path("~\\a")
+            && is_host_path("C:\\a")
+            && !is_host_path("src/a")
+    );
 }
 
 #[test]
@@ -91,6 +97,12 @@ fn breadcrumbs_lead_with_the_project_except_for_host_paths() {
     assert_eq!(summary, vec![("t3", "", false), ("src", "src", false), ("lib", "src/lib", false), ("a.rs", "src/lib/a.rs", true)]);
     let host = breadcrumbs("t3", "/etc/hosts");
     assert_eq!(host.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), vec!["/etc", "/etc/hosts"]);
+    // `~\` home paths open as read-only host files with normalized home crumbs (`pingdotgg/t3code#38510`).
+    let home_backslash = breadcrumbs("t3", "~\\notes/todo.md");
+    assert_eq!(
+        home_backslash.iter().map(|c| (c.label.as_str(), c.path.as_str())).collect::<Vec<_>>(),
+        vec![("~", "~"), ("notes", "~/notes"), ("todo.md", "~/notes/todo.md")]
+    );
 }
 
 #[test]

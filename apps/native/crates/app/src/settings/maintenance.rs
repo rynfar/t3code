@@ -15,7 +15,7 @@ use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
 use serde_json::json;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::device::SETTINGS_WRITE_SCOPE;
-use t3_core::server_config::ServerConfig;
+use t3_core::server_config::{DEFAULT_USAGE_HISTORY_RETENTION_DAYS, ServerConfig, ServerSettings, UsageHistoryRetentionDays};
 use t3_core::settings::ServerSettingChange;
 use t3_core::settings::diagnostics::ENVIRONMENT_MAINTAIN_SCOPE;
 use t3_core::settings::maintenance::{
@@ -32,18 +32,26 @@ use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
-/// The two retention fields on this page (`RetentionControl`, minimum one day).
+/// The retention fields on this page (`RetentionControl`, minimum one day).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
     Artifacts,
     Logs,
+    UsageHistory,
 }
 
 impl Field {
-    fn saved(self, retention: &Retention) -> Option<u32> {
+    const ALL: [Self; 3] = [Self::Artifacts, Self::Logs, Self::UsageHistory];
+
+    fn saved(self, settings: &ServerSettings) -> Option<u32> {
+        let retention = Retention::of(settings);
         match self {
             Field::Artifacts => retention.browser_artifacts_after_days,
             Field::Logs => retention.logs_after_days,
+            Field::UsageHistory => match settings.usage_history_retention_days {
+                UsageHistoryRetentionDays::Days(days) => Some(days),
+                UsageHistoryRetentionDays::Unlimited => None,
+            },
         }
     }
 
@@ -51,6 +59,23 @@ impl Field {
         match self {
             Field::Artifacts => MaintenanceChange::BrowserArtifactsAfterDays(days),
             Field::Logs => MaintenanceChange::LogsAfterDays(days),
+            Field::UsageHistory => MaintenanceChange::UsageHistoryRetentionDays(
+                days.map_or(UsageHistoryRetentionDays::Unlimited, UsageHistoryRetentionDays::Days),
+            ),
+        }
+    }
+
+    fn default_when_enabled(self) -> Option<u32> {
+        match self {
+            Field::UsageHistory => Some(DEFAULT_USAGE_HISTORY_RETENTION_DAYS),
+            Field::Artifacts | Field::Logs => None,
+        }
+    }
+
+    fn off_label(self) -> &'static str {
+        match self {
+            Field::UsageHistory => "Unlimited",
+            Field::Artifacts | Field::Logs => "Off",
         }
     }
 
@@ -58,6 +83,7 @@ impl Field {
         match self {
             Field::Artifacts => 0,
             Field::Logs => 1,
+            Field::UsageHistory => 2,
         }
     }
 }
@@ -68,8 +94,9 @@ const INLINE_RESULTS: usize = 20;
 pub(crate) struct MaintenanceState {
     artifacts_days: Entity<InputState>,
     logs_days: Entity<InputState>,
-    retention_drafts: [RetentionDraft; 2],
-    retention_switch_pressed: [bool; 2],
+    usage_history_days: Entity<InputState>,
+    retention_drafts: [RetentionDraft; 3],
+    retention_switch_pressed: [bool; 3],
     retention_seq: u64,
     intervals: [Entity<InputState>; 4],
     last_run: LastRun,
@@ -96,10 +123,15 @@ impl MaintenanceState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
         let artifacts_days = cx.new(|cx| InputState::new(window, cx));
         let logs_days = cx.new(|cx| InputState::new(window, cx));
+        let usage_history_days = cx.new(|cx| InputState::new(window, cx));
         let intervals = [(); 4].map(|_| cx.new(|cx| InputState::new(window, cx)));
         let commit_on = |event: &InputEvent| matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur);
         let mut subscriptions = Vec::new();
-        for (input, field) in [(&artifacts_days, Field::Artifacts), (&logs_days, Field::Logs)] {
+        for (input, field) in [
+            (&artifacts_days, Field::Artifacts),
+            (&logs_days, Field::Logs),
+            (&usage_history_days, Field::UsageHistory),
+        ] {
             subscriptions.push(cx.subscribe_in(input, window, move |this, _, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => this.maintenance.retention_drafts[field.index()].mark_edited(),
                 InputEvent::PressEnter { .. } => {
@@ -125,8 +157,9 @@ impl MaintenanceState {
         MaintenanceState {
             artifacts_days,
             logs_days,
-            retention_drafts: [RetentionDraft::Closed; 2],
-            retention_switch_pressed: [false; 2],
+            usage_history_days,
+            retention_drafts: [RetentionDraft::Closed; 3],
+            retention_switch_pressed: [false; 3],
             retention_seq: 0,
             intervals,
             last_run: LastRun::Loading,
@@ -145,13 +178,16 @@ impl MaintenanceState {
     }
 
     pub(super) fn inputs(&self) -> impl Iterator<Item = &Entity<InputState>> {
-        [&self.artifacts_days, &self.logs_days].into_iter().chain(self.intervals.iter())
+        [&self.artifacts_days, &self.logs_days, &self.usage_history_days]
+            .into_iter()
+            .chain(self.intervals.iter())
     }
 
     fn input(&self, field: Field) -> &Entity<InputState> {
         match field {
             Field::Artifacts => &self.artifacts_days,
             Field::Logs => &self.logs_days,
+            Field::UsageHistory => &self.usage_history_days,
         }
     }
 
@@ -163,8 +199,8 @@ impl MaintenanceState {
         self.background_dialog = None;
         self.reclaim_confirming = None;
         self.reclaim_requested = false;
-        self.retention_drafts = [RetentionDraft::Closed; 2];
-        self.retention_switch_pressed = [false; 2];
+        self.retention_drafts = [RetentionDraft::Closed; 3];
+        self.retention_switch_pressed = [false; 3];
     }
 
     pub(super) fn dismiss(&mut self) -> bool {
@@ -311,7 +347,7 @@ impl SettingsView {
         if self.is_project_scope(cx) {
             return;
         }
-        let Some(saved) = self.scoped_representative_config(cx).map(|config| field.saved(&Retention::of(&config.settings))) else {
+        let Some(saved) = self.scoped_representative_config(cx).map(|config| field.saved(&config.settings)) else {
             return;
         };
         let input = self.maintenance.input(field).clone();
@@ -341,7 +377,7 @@ impl SettingsView {
     }
 
     pub(super) fn dismiss_maintenance_retention(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        for field in [Field::Artifacts, Field::Logs] {
+        for field in Field::ALL {
             let input = self.maintenance.input(field).clone();
             if self.maintenance.retention_drafts[field.index()].cancel() {
                 if input.focus_handle(cx).is_focused(window) {
@@ -350,7 +386,7 @@ impl SettingsView {
                 return true;
             }
             if input.focus_handle(cx).is_focused(window)
-                && let Some(saved) = self.scoped_representative_config(cx).and_then(|config| field.saved(&Retention::of(&config.settings)))
+                && let Some(saved) = self.scoped_representative_config(cx).and_then(|config| field.saved(&config.settings))
             {
                 input.update(cx, |input, cx| input.set_value(saved.to_string(), window, cx));
                 self.focus.focus(window, cx);
@@ -379,7 +415,7 @@ impl SettingsView {
     }
 
     pub(super) fn commit_focused_maintenance_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for field in [Field::Artifacts, Field::Logs] {
+        for field in Field::ALL {
             if self.maintenance.input(field).focus_handle(cx).is_focused(window) {
                 self.commit_artifact_retention(field, false, window, cx);
             }
@@ -489,9 +525,55 @@ impl SettingsView {
             ],
             cx,
         );
+        let usage_retention_days = Field::UsageHistory.saved(settings);
+        self.maintenance.retention_drafts[Field::UsageHistory.index()].reconcile_saved(usage_retention_days);
+        if let Some(days) = usage_retention_days {
+            Self::sync_input(self.maintenance.input(Field::UsageHistory), &days.to_string(), window, cx);
+        }
+        let usage_lock = self.managed_setting_lock(&["usageHistoryRetentionDays"], cx);
+        let usage_unavail = usage_lock.clone().or_else(|| env_only.clone());
+        let usage_history = section(
+            "Usage history",
+            vec![
+                Row::new("usage-history-retention", "Keep usage history")
+                    .description("How many days of per-turn token usage history to keep on this server. Turn off to keep all history indefinitely.")
+                    .highlighted(self.is_target("usage-history-retention"))
+                    .unavailable(usage_unavail.clone())
+                    .reset(
+                        usage_lock.is_none()
+                            && settings.usage_history_retention_days != UsageHistoryRetentionDays::default(),
+                        {
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.update_scoped_server(
+                                        ServerSettingChange::Prepared(
+                                            MaintenanceChange::UsageHistoryRetentionDays(
+                                                UsageHistoryRetentionDays::default(),
+                                            )
+                                            .payload(),
+                                        ),
+                                        cx,
+                                    );
+                                });
+                            }
+                        },
+                    )
+                    .control(self.maintenance_retention(
+                        Field::UsageHistory,
+                        "usage-history-retention-switch",
+                        usage_retention_days,
+                        usage_unavail.is_some(),
+                        cx,
+                    ))
+                    .into_any_element(),
+            ],
+            cx,
+        );
         let mut blocks = vec![
             Block::new(&["provider-update-checks", "continue-threads-after-server-update"], updates),
             Block::new(&["background-activity", "git-fetch-interval", "keep-awake-while-agents-work"], background),
+            Block::new(&["usage-history-retention"], usage_history),
         ];
         blocks.extend(self.storage_blocks(&config, env_only, window, cx));
         let diagnostics = section(
@@ -706,7 +788,7 @@ impl SettingsView {
                             .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("days")),
                     )
                 } else {
-                    this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Off"))
+                    this.child(div().text_xs().text_color(hsla(p.muted_foreground)).child(field.off_label()))
                 }
             })
             .child(self.retention_switch(
@@ -715,11 +797,12 @@ impl SettingsView {
                 disabled,
                 move |this, pressed| this.maintenance.retention_switch_pressed[idx] = pressed,
                 move |this, next, window, cx| {
-                    let saved = this.scoped_representative_config(cx).and_then(|config| field.saved(&Retention::of(&config.settings)));
+                    let saved = this.scoped_representative_config(cx).and_then(|config| field.saved(&config.settings));
                     match this.maintenance.retention_drafts[idx].toggle(saved, next) {
                         RetentionToggle::OpenDraft(days) => {
+                            let initial = field.default_when_enabled().unwrap_or(days);
                             this.maintenance.input(field).update(cx, |input, cx| {
-                                input.set_value(days.to_string(), window, cx);
+                                input.set_value(initial.to_string(), window, cx);
                                 input.focus(window, cx);
                             });
                             cx.notify();

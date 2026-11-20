@@ -289,10 +289,26 @@ impl SettingsView {
                 div().text_xs().text_color(hsla(p.muted_foreground)).child("Live native counters for the server, providers, terminals, desktop processes, and the monitor itself."),
             )
             .child(
-                div()
+                h_flex()
+                    .gap(r(6.))
+                    .items_center()
                     .text_size(r(10.))
                     .text_color(hsla(p.muted_foreground))
-                    .child(format!("Sampling every {}", snapshot.map(|s| monitor::sample_interval(s.sample_interval_ms)).unwrap_or_else(|| "...".into()))),
+                    .child(
+                        div()
+                            .size(r(6.))
+                            .rounded_full()
+                            .bg(if snapshot.is_some_and(|s| s.sample_interval_ms > 0) {
+                                hsla(p.success)
+                            } else {
+                                hsla(p.muted_foreground).opacity(0.55)
+                            }),
+                    )
+                    .child(
+                        snapshot
+                            .map(|s| monitor::sampling_status(s.sample_interval_ms))
+                            .unwrap_or_else(|| "Sampling every ...".into()),
+                    ),
             );
         let stats = [
             ("Current CPU", dots(all.map(|a| format!("{:.1}%", a.current_cpu_percent))), all.map(|a| format!("{} observed CPU time", monitor::cpu_time(a.cpu_time_ms)))),

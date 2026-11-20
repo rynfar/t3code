@@ -68,6 +68,7 @@ struct ThemeState {
     preview: Option<themes::editor::Preview>,
     saved: Option<Rc<SavedTheme>>,
     prepared_preview: Option<PreparedPreview>,
+    background_image: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
 #[derive(Clone)]
@@ -102,6 +103,7 @@ pub fn init(cx: &mut App) {
         preview: None,
         saved: None,
         prepared_preview: None,
+        background_image: None,
     });
     cache_font_inventory(cx);
     install(cx);
@@ -211,6 +213,41 @@ fn is_dark(cx: &App) -> bool {
 pub fn environment_themes(cx: &App) -> &[ThemeDefinition] {
     &cx.global::<ThemeState>().environment
 }
+
+/// The currently active saved/published theme id for the active appearance half, ignoring any
+/// live editor draft preview so wallpaper retries stay bound to the applied theme
+/// (`pingdotgg/t3code#38132`).
+pub fn active_theme_id(cx: &App) -> Option<String> {
+    let state = cx.global::<ThemeState>();
+    let prefs = &state.preferences;
+    let dark = themes::resolved_dark(
+        &prefs.theme,
+        &prefs.halves,
+        themes::mode_dark(prefs.mode, state.system_dark),
+        &prefs.custom,
+        &state.environment,
+    );
+    themes::half_theme(&prefs.theme, &prefs.halves, dark, &prefs.custom, &state.environment)
+        .map(|definition| definition.id.clone())
+}
+
+pub fn background_image(cx: &App) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    cx.global::<ThemeState>().background_image.clone()
+}
+
+pub fn set_background_image(image: Option<std::sync::Arc<gpui::RenderImage>>, cx: &mut App) {
+    let state = cx.global_mut::<ThemeState>();
+    let changed = match (&state.background_image, &image) {
+        (None, None) => false,
+        (Some(a), Some(b)) => !std::sync::Arc::ptr_eq(a, b),
+        _ => true,
+    };
+    if changed {
+        state.background_image = image;
+        cx.refresh_windows();
+    }
+}
+
 pub fn set_environment_themes(values: &[ThemeDefinition], cx: &mut App) {
     if cx.global::<ThemeState>().environment == values {
         return;

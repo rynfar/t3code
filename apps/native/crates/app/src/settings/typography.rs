@@ -80,8 +80,31 @@ impl TypographyState {
     }
 }
 
+/// Synthetic Apple font labels (`"SF Pro"`, `"SF Mono"`) are not registered as named system font
+/// families, so map them to the real UI/monospace stacks instead of falling back to serif
+/// (`displayFontFamily` in `appearanceFonts.ts`, `pingdotgg/t3code#24082`).
+fn display_font_family(family: &str, role: FontRole, cx: &App) -> gpui::SharedString {
+    if family.is_empty() {
+        return theme::font_family(role, cx);
+    }
+    let trimmed = family.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(trimmed)
+        .trim();
+    if unquoted.eq_ignore_ascii_case("sf pro") {
+        gpui::SharedString::from(".SystemUIFont")
+    } else if unquoted.eq_ignore_ascii_case("sf mono") {
+        theme::default_mono_family(cx).to_owned().into()
+    } else {
+        family.to_owned().into()
+    }
+}
+
 impl SettingsView {
-    pub(super) fn typography_rows(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn typography_rows(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let targeted = ["separate-fonts"].iter().any(|id| self.is_target(id));
         let separate = store::client(cx).separate_fonts();
         let roles: &[FontRole] = if separate {
@@ -89,7 +112,7 @@ impl SettingsView {
         } else {
             &[FontRole::Interface, FontRole::Code]
         };
-        let mut rows: Vec<AnyElement> = roles.iter().map(|role| self.font_row(*role, separate, cx)).collect();
+        let mut rows: Vec<AnyElement> = roles.iter().map(|role| self.font_row(*role, separate, window, cx)).collect();
         let doc = store::client(cx);
         let wrap = doc.word_wrap();
         let state = self.state.clone();
@@ -148,7 +171,7 @@ impl SettingsView {
         section("Typography", rows, cx).into_any_element()
     }
 
-    fn font_row(&mut self, role: FontRole, separate: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn font_row(&mut self, role: FontRole, separate: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let doc = store::client(cx);
         let size = doc.font_size(role);
         let reset = !doc.font_family(role).is_empty() || size != role.default_size();
@@ -164,7 +187,7 @@ impl SettingsView {
         } else {
             role.description()
         };
-        let control = h_flex().gap(r(8.)).child(self.font_picker(role, cx)).child(
+        let control = h_flex().gap(r(8.)).child(self.font_picker(role, window, cx)).child(
             Select::new(
                 ElementId::Name(format!("{}-size", role.id()).into()),
                 role.range()
@@ -201,7 +224,7 @@ impl SettingsView {
         row.below(previews).into_any_element()
     }
 
-    fn font_picker(&mut self, role: FontRole, cx: &mut Context<Self>) -> AnyElement {
+    fn font_picker(&mut self, role: FontRole, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let doc = store::client(cx);
         let family = doc.font_family(role).to_owned();
         let default = match role {
@@ -265,6 +288,12 @@ impl SettingsView {
         let keyboard_choices = choices.clone();
         let selected = family;
         let highlighted = self.typography.highlighted;
+        // Short windows cap the popup; shrink the list viewport so every font stays scrollable
+        // (`pingdotgg/t3code#22795`).
+        let viewport_height = f32::from(window.viewport_size().height);
+        let max_list_height = (viewport_height - 96.).clamp(56., 288.);
+        let desired_list_height = (count.clamp(1, 9) * 28) as f32;
+        let list_height = desired_list_height.min(max_list_height);
         let list = uniform_list(
             ElementId::Name(format!("{}-font-options", role.id()).into()),
             count,
@@ -294,11 +323,7 @@ impl SettingsView {
                                 div()
                                     .flex_1()
                                     .truncate()
-                                    .font_family(if family.is_empty() {
-                                        theme::font_family(role, cx)
-                                    } else {
-                                        family.clone().into()
-                                    })
+                                    .font_family(display_font_family(&family, role, cx))
                                     .child(label),
                             )
                             .when(selected, |this| {
@@ -311,7 +336,8 @@ impl SettingsView {
             }),
         )
         .track_scroll(&self.typography.scroll)
-        .h(r((count.clamp(1, 9) * 28) as f32));
+        .min_h_0()
+        .h(r(list_height));
         let popup = crate::composer::controls::popup_surface(cx)
             .id("font-picker-popup")
             .w(r(320.))
