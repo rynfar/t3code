@@ -1,15 +1,15 @@
-//! Theme CSS sanitization, custom-property evaluation, and editor indentation helpers from
-//! `packages/shared/src/themeCss.ts`, `apps/web/src/themeCss.ts`, `apps/web/src/index.css`,
-//! and `apps/web/src/components/settings/ThemeCssEditor.tsx`.
+//! Theme CSS sanitization, custom-property evaluation, `THEME_CSS_HOOKS` slot compilation, and
+//! editor indentation helpers from `packages/shared/src/themeCss.ts`, `apps/web/src/themeCss.ts`,
+//! `apps/web/src/index.css`, and `apps/web/src/components/settings/ThemeCssEditor.tsx`.
 //!
-//! Arbitrary DOM selectors (such as `svg.lucide` or `[data-slot="button"]`) have no GPUI
-//! equivalent and are counted as unmapped DOM rules while semantic/role CSS custom properties
-//! apply live to the native palette.
+//! Supported `THEME_CSS_HOOKS` selectors compile into typed GPUI slot overrides (`SlotStylesheet`),
+//! semantic/role custom properties apply live to the native palette, and arbitrary DOM selectors
+//! (such as `svg.lucide`) or unsupported properties are counted as unmapped DOM rules.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use super::{Colors, color};
+use super::{Colors, color, slots};
 
 /// `THEME_CSS_MAX_LENGTH` from `packages/contracts/src/server.ts`.
 pub const MAX_CSS_LEN: usize = 100_000;
@@ -139,14 +139,14 @@ pub fn loads_remote_files(css: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppearanceScope {
+pub(crate) enum AppearanceScope {
     Any,
     Light,
     Dark,
 }
 
 impl AppearanceScope {
-    fn matches(self, dark: bool) -> bool {
+    pub(crate) fn matches(self, dark: bool) -> bool {
         match self {
             Self::Any => true,
             Self::Light => !dark,
@@ -177,12 +177,15 @@ pub struct CssDiagnostics {
     pub loads_remote_files: bool,
     pub exceeds_max_length: bool,
     pub applied_variables: usize,
+    pub applied_slot_rules: usize,
     pub unmapped_dom_rules: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedCss {
     declarations: Vec<CustomDecl>,
+    slot_declarations: Vec<slots::SlotDecl>,
+    slot_vars: Vec<slots::SlotVarDecl>,
     diagnostics: CssDiagnostics,
 }
 
@@ -197,16 +200,22 @@ impl ParsedCss {
             pos: 0,
             order: 0,
             declarations: Vec::new(),
+            slot_declarations: Vec::new(),
+            slot_vars: Vec::new(),
+            applied_slot_rules: 0,
             unmapped_dom_rules: 0,
             recognized_vars: BTreeSet::new(),
         };
         parser.parse_block(&[]);
         Self {
             declarations: parser.declarations,
+            slot_declarations: parser.slot_declarations,
+            slot_vars: parser.slot_vars,
             diagnostics: CssDiagnostics {
                 loads_remote_files: remote,
                 exceeds_max_length,
                 applied_variables: parser.recognized_vars.len(),
+                applied_slot_rules: parser.applied_slot_rules,
                 unmapped_dom_rules: parser.unmapped_dom_rules,
             },
         }
@@ -214,6 +223,25 @@ impl ParsedCss {
 
     pub fn diagnostics(&self) -> CssDiagnostics {
         self.diagnostics
+    }
+
+    /// Compiles all matched `THEME_CSS_HOOKS` declarations for `dark` using the active roles and
+    /// resolved palette tokens for `var(--...)` expansion.
+    pub fn slot_stylesheet(
+        &self,
+        dark: bool,
+        roles: &Colors,
+        palette: &BTreeMap<String, u32>,
+    ) -> slots::SlotStylesheet {
+        let root_vars = self.collect_vars(dark, TargetScope::Root);
+        slots::compile_slot_stylesheet(
+            &self.slot_declarations,
+            &self.slot_vars,
+            &root_vars,
+            dark,
+            roles,
+            palette,
+        )
     }
 
     /// Collects the winning value per custom property for the requested appearance and scope.
@@ -318,6 +346,9 @@ struct Parser<'a> {
     pos: usize,
     order: usize,
     declarations: Vec<CustomDecl>,
+    slot_declarations: Vec<slots::SlotDecl>,
+    slot_vars: Vec<slots::SlotVarDecl>,
+    applied_slot_rules: usize,
     unmapped_dom_rules: usize,
     recognized_vars: BTreeSet<String>,
 }
@@ -455,18 +486,38 @@ impl<'a> Parser<'a> {
             return;
         }
         if !prop.starts_with("--") {
-            self.unmapped_dom_rules += 1;
+            let slot_targets = slots::classify_slot_selectors(selectors);
+            if slot_targets.is_empty() || !slots::is_supported_slot_property(prop) {
+                self.unmapped_dom_rules += 1;
+                return;
+            }
+            self.applied_slot_rules += 1;
+            for target in slot_targets {
+                self.order += 1;
+                self.slot_declarations.push(slots::SlotDecl {
+                    slot: target.slot,
+                    row_kind: target.row_kind,
+                    state: target.state,
+                    appearance: target.appearance,
+                    specificity: target.specificity,
+                    property: prop.to_owned(),
+                    value: val.to_owned(),
+                    important,
+                    order: self.order,
+                });
+            }
             return;
         }
         let targets = classify_selectors(selectors);
-        if targets.is_empty() {
+        let slot_targets = slots::classify_slot_selectors(selectors);
+        if targets.is_empty() && slot_targets.is_empty() {
             self.unmapped_dom_rules += 1;
             return;
         }
         let recognized = custom_prop_to_role(prop).is_some()
             || !root_prop_to_tokens(prop).is_empty()
             || !sidebar_prop_to_tokens(prop).is_empty();
-        if recognized {
+        if recognized && !targets.is_empty() {
             self.recognized_vars.insert(prop.to_owned());
         }
         for (scope, appearance) in targets {
@@ -474,6 +525,19 @@ impl<'a> Parser<'a> {
             self.declarations.push(CustomDecl {
                 scope,
                 appearance,
+                name: prop.to_owned(),
+                value: val.to_owned(),
+                important,
+                order: self.order,
+            });
+        }
+        for target in slot_targets {
+            self.order += 1;
+            self.slot_vars.push(slots::SlotVarDecl {
+                slot: target.slot,
+                row_kind: target.row_kind,
+                appearance: target.appearance,
+                specificity: target.specificity,
                 name: prop.to_owned(),
                 value: val.to_owned(),
                 important,
@@ -534,7 +598,7 @@ fn classify_selectors(selectors: &[String]) -> Vec<(TargetScope, AppearanceScope
     results
 }
 
-fn split_selector_list(s: &str) -> Vec<&str> {
+pub(crate) fn split_selector_list(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0usize;
     let mut bracket = 0usize;
@@ -615,7 +679,7 @@ fn classify_single_selector(selector: &str) -> Option<(TargetScope, AppearanceSc
     None
 }
 
-fn resolve_var_expr(expr: &str, vars: &BTreeMap<String, String>, visiting: &mut BTreeSet<String>) -> String {
+pub(crate) fn resolve_var_expr(expr: &str, vars: &BTreeMap<String, String>, visiting: &mut BTreeSet<String>) -> String {
     let mut out = String::with_capacity(expr.len());
     let mut i = 0;
     let bytes = expr.as_bytes();
@@ -653,7 +717,7 @@ fn resolve_var_expr(expr: &str, vars: &BTreeMap<String, String>, visiting: &mut 
     out
 }
 
-fn take_balanced_parens(s: &str, start: usize) -> Option<(usize, &str)> {
+pub(crate) fn take_balanced_parens(s: &str, start: usize) -> Option<(usize, &str)> {
     let mut depth = 1usize;
     let mut i = start;
     let bytes = s.as_bytes();
@@ -1020,12 +1084,16 @@ mod tests {
             [data-slot="button"] {
                 border-radius: 999px;
             }
+            svg.lucide {
+                stroke-width: 2px;
+            }
         "#;
         let parsed = ParsedCss::parse(css);
         let diag = parsed.diagnostics();
         assert!(diag.loads_remote_files);
         assert!(!diag.exceeds_max_length);
         assert!(diag.applied_variables >= 5);
+        assert_eq!(diag.applied_slot_rules, 1);
         assert_eq!(diag.unmapped_dom_rules, 1);
 
         let light_roles = parsed.role_overrides(false, &themes::standard(false));
