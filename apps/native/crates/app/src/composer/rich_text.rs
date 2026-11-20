@@ -16,32 +16,50 @@ use crate::theme::{hsla, palette};
 
 pub(super) struct RichTextState {
     pub(super) decorations: TextDecorationCollection,
-    cache_key: Option<(String, Range<usize>, usize, bool)>,
+    cache_key: Option<(String, Range<usize>, usize, bool, bool)>,
+    #[cfg(all(test, feature = "snapshot"))]
+    pub(super) decoration_count: usize,
 }
 
 impl RichTextState {
     pub(super) fn new(decorations: TextDecorationCollection) -> Self {
-        Self { decorations, cache_key: None }
+        Self {
+            decorations,
+            cache_key: None,
+            #[cfg(all(test, feature = "snapshot"))]
+            decoration_count: 0,
+        }
     }
 }
 
 impl Composer {
+    /// Whether `composerRichTextEnabled` is on (`SettingsPanels.tsx`, `ST-CHAT`).
+    pub(super) fn rich_text_enabled(&self, cx: &App) -> bool {
+        crate::settings::store::try_client(cx)
+            .is_none_or(t3_core::client_settings::ClientSettingsDoc::composer_rich_text)
+    }
+
     /// Syncs inline Markdown decorations, editable source-marker visibility (`#277`), fenced code
     /// block syntax highlighting, and inline chip/mention styling onto the `EditorState`.
     pub(super) fn sync_rich_decorations(&mut self, cx: &mut Context<Self>) {
+        let rich_text_enabled = self.rich_text_enabled(cx);
         let (text, selection) = {
             let input = self.input.read(cx);
             (input.value().to_string(), input.selected_range())
         };
         let rev = crate::theme::revision(cx);
         let dark = cx.theme().is_dark();
-        if self.rich_text.cache_key.as_ref() == Some(&(text.clone(), selection.clone(), rev, dark)) {
+        if self.rich_text.cache_key.as_ref() == Some(&(text.clone(), selection.clone(), rev, dark, rich_text_enabled)) {
             return;
         }
-        self.rich_text.cache_key = Some((text.clone(), selection.clone(), rev, dark));
+        self.rich_text.cache_key = Some((text.clone(), selection.clone(), rev, dark, rich_text_enabled));
 
-        if text.is_empty() {
+        if !rich_text_enabled || text.is_empty() {
             self.rich_text.decorations.clear(cx);
+            #[cfg(all(test, feature = "snapshot"))]
+            {
+                self.rich_text.decoration_count = 0;
+            }
             return;
         }
 
@@ -144,6 +162,10 @@ impl Composer {
             ));
         }
 
+        #[cfg(all(test, feature = "snapshot"))]
+        {
+            self.rich_text.decoration_count = decos.len();
+        }
         self.rich_text.decorations.set(decos, cx);
     }
 
@@ -181,11 +203,14 @@ impl Composer {
         if self.is_rewinding(cx) || self.answering.is_some() {
             return false;
         }
+        let rich_text_enabled = self.rich_text_enabled(cx);
         let (prompt, sel) = {
             let input = self.input.read(cx);
             (input.value().to_string(), input.selected_range())
         };
-        if let Some(edit) = rules::code_block_indent(&prompt, sel.start, sel.end, false) {
+        if rich_text_enabled
+            && let Some(edit) = rules::code_block_indent(&prompt, sel.start, sel.end, false)
+        {
             self.apply_rich_edit(edit, window, cx);
             return true;
         }
@@ -201,7 +226,7 @@ impl Composer {
     }
 
     pub(super) fn toggle_inline_format(&mut self, format: InlineFormat, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_rewinding(cx) || self.answering.is_some() {
+        if !self.rich_text_enabled(cx) || self.is_rewinding(cx) || self.answering.is_some() {
             return;
         }
         let (prompt, sel) = {

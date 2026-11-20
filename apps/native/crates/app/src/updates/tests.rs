@@ -1236,3 +1236,300 @@ fn production_update_dialog_checking_frame() {
         .save(out.join("update-dialog-checking.png"))
         .unwrap();
 }
+
+#[gpui::test]
+async fn track_switch_dialog_fetches_via_rpc_renders_skipped_and_dispatches_switch(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _base_fixture) = cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+        let (state, fixture) =
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+        crate::settings::init(state.clone(), cx);
+        init(cx);
+        (state, fixture)
+    });
+
+    // Eligible machine on stable + skipped machine (manual update).
+    let (mut fixture_ok, _) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-ok",
+        "Eligible",
+        json!({
+            "environment": {
+                "environmentId": "env-ok",
+                "label": "Eligible",
+                "serverVersion": "0.1.3",
+                "databaseMigration": 69,
+                "capabilities": { "serverSelfUpdate": "boot-service" }
+            },
+            "providers": []
+        }),
+        &["environment:maintain"],
+    )
+    .await;
+    let (_fixture_skip, _) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-skip",
+        "ManualBox",
+        json!({
+            "environment": {
+                "environmentId": "env-skip",
+                "label": "ManualBox",
+                "serverVersion": "0.1.3",
+                "databaseMigration": 69,
+                "capabilities": {}
+            },
+            "providers": []
+        }),
+        &["environment:maintain"],
+    )
+    .await;
+
+    let control = cx.new(|cx| UpdateControl::new(state.clone(), cx));
+    let closed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let closed_flag = closed.clone();
+
+    struct SwitchHarness {
+        dialog: Entity<UpdateTrackSwitchDialog>,
+        control: Entity<UpdateControl>,
+    }
+    impl Render for SwitchHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .child(self.control.clone())
+                .child(self.dialog.clone())
+        }
+    }
+
+    let window = cx.add_window(|window, cx| {
+        let dialog = cx.new(|cx| {
+            UpdateTrackSwitchDialog::new(
+                state.clone(),
+                updates::UpdateTrack::Nightly,
+                move |_, _| closed_flag.set(true),
+                window,
+                cx,
+            )
+        });
+        SwitchHarness {
+            dialog,
+            control: control.clone(),
+        }
+    });
+    let dialog = window.read_with(cx, |h, _| h.dialog.clone()).unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let mut ready_tx = Some(ready_tx);
+    let _obs = cx.update(|cx| {
+        cx.observe(&dialog, move |dlg, cx| {
+            if !matches!(dlg.read(cx).phase, dialog::TrackSwitchPhase::Loading)
+                && let Some(tx) = ready_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        })
+    });
+
+    // Answer server.getNpmRelease deterministically via ClientFixture (no live network).
+    let (method, params, reply) = fixture_ok.next_request().await;
+    assert_eq!(method, "server.getNpmRelease");
+    assert_eq!(params["spec"], "nightly");
+    let _ = reply.send(Ok(json!({
+        "version": "0.2.0-nightly.20261119.1",
+        "databaseMigration": 70
+    })));
+    ready_rx.await.unwrap();
+    cx.run_until_parked();
+
+    dialog.read_with(cx, |dlg, cx| {
+        let dialog::TrackSwitchPhase::Ready { release, switch, .. } = &dlg.phase else {
+            panic!("expected Ready phase, got {:?}", dlg.phase);
+        };
+        assert_eq!(release.version, "0.2.0-nightly.20261119.1");
+        assert_eq!(switch.targets.len(), 1);
+        assert_eq!(switch.targets[0].server.environment_id, "env-ok");
+        assert!(switch.plan.rows.iter().any(|r| r.environment_id == "env-skip" && r.skipped.is_some()));
+        assert!(dlg.disabled_reason(cx).is_none());
+    });
+
+    // Render via VisualTestContext to exercise layout, then confirm -> persists track & dispatches server.updateServer.
+    let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+    vcx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear();
+    });
+    vcx.update(|window, cx| {
+        dialog.update(cx, |dlg, cx| dlg.confirm(window, cx));
+    });
+    vcx.run_until_parked();
+
+    assert!(closed.get());
+    assert_eq!(vcx.read(saved_update_track), updates::UpdateTrack::Nightly);
+
+    let (update_method, update_params, update_reply) = fixture_ok.next_request().await;
+    assert_eq!(update_method, "server.updateServer");
+    assert_eq!(update_params["targetVersion"], "0.2.0-nightly.20261119.1");
+    assert_eq!(update_params["targetDatabaseMigration"], 70);
+    let _ = update_reply.send(Err(t3_client::session::RpcError::Failure(
+        t3_core::rpc::RpcFailure {
+            tag: None,
+            message: "test stop".into(),
+            error: serde_json::Value::Null,
+        },
+    )));
+    vcx.run_until_parked();
+    drop(vcx);
+}
+
+#[gpui::test]
+async fn track_switch_dialog_handles_offline_rpc_error_and_nothing_to_move(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (state, _base_fixture) = cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+        let (state, fixture) =
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+        crate::settings::init(state.clone(), cx);
+        init(cx);
+        (state, fixture)
+    });
+
+    // Offline (no connected fleet env): settles immediately to Error without live network.
+    let window = cx.add_window(|window, cx| {
+        UpdateTrackSwitchDialog::new(
+            state.clone(),
+            updates::UpdateTrack::Nightly,
+            |_, _| {},
+            window,
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    window
+        .read_with(cx, |dlg, _| {
+            assert!(
+                matches!(&dlg.phase, dialog::TrackSwitchPhase::Error(msg) if msg.contains("Connect")),
+                "offline dialog must enter clean Error state, got {:?}",
+                dlg.phase
+            );
+        })
+        .unwrap();
+
+    // Connected env already on Nightly: RPC error -> Error, null -> NotFound, valid -> nothing_to_move.
+    let (mut fx, _) = install_env(
+        &runtime,
+        cx,
+        &state,
+        "env-already",
+        "AlreadyNightly",
+        json!({
+            "environment": {
+                "environmentId": "env-already",
+                "label": "AlreadyNightly",
+                "serverVersion": "0.2.0-nightly.20261119.1",
+                "databaseMigration": 70,
+                "capabilities": { "serverSelfUpdate": "boot-service" }
+            },
+            "providers": []
+        }),
+        &["environment:maintain"],
+    )
+    .await;
+
+    let window2 = cx.add_window(|window, cx| {
+        UpdateTrackSwitchDialog::new(
+            state.clone(),
+            updates::UpdateTrack::Nightly,
+            |_, _| {},
+            window,
+            cx,
+        )
+    });
+    let dlg2 = window2.entity(cx).unwrap();
+    let (err_tx, err_rx) = tokio::sync::oneshot::channel();
+    let mut err_tx = Some(err_tx);
+    let _obs2 = cx.update(|cx| {
+        cx.observe(&dlg2, move |dlg, cx| {
+            if !matches!(dlg.read(cx).phase, dialog::TrackSwitchPhase::Loading)
+                && let Some(tx) = err_tx.take()
+            {
+                let _ = tx.send(());
+            }
+        })
+    });
+    let (_, _, reply) = fx.next_request().await;
+    let _ = reply.send(Err(t3_client::session::RpcError::Failure(
+        t3_core::rpc::RpcFailure {
+            tag: None,
+            message: "registry unreachable".into(),
+            error: serde_json::Value::Null,
+        },
+    )));
+    err_rx.await.unwrap();
+    cx.run_until_parked();
+    window2
+        .read_with(cx, |dlg, _| {
+            assert_eq!(
+                dlg.phase,
+                dialog::TrackSwitchPhase::Error("registry unreachable".into())
+            );
+        })
+        .unwrap();
+
+    // Null response -> NotFound.
+    window2
+        .update(cx, |dlg, _, cx| dlg.apply_release_result(Ok(None), cx))
+        .unwrap();
+    window2
+        .read_with(cx, |dlg, _| {
+            assert_eq!(dlg.phase, dialog::TrackSwitchPhase::NotFound);
+        })
+        .unwrap();
+
+    // Already on track while saved track is still Stable -> confirm enabled (save-only).
+    cx.update(|cx| set_saved_update_track(updates::UpdateTrack::Latest, cx));
+    window2
+        .update(cx, |dlg, _, cx| {
+            dlg.apply_release_result(
+                Ok(Some(updates::ChannelSwitchRelease {
+                    channel: updates::UpdateTrack::Nightly,
+                    version: "0.2.0-nightly.20261119.1".into(),
+                    database_migration: Some(70),
+                })),
+                cx,
+            );
+        })
+        .unwrap();
+    window2
+        .read_with(cx, |dlg, cx| {
+            assert!(
+                dlg.disabled_reason(cx).is_none(),
+                "switching saved track must remain enabled"
+            );
+        })
+        .unwrap();
+
+    // Once saved track matches Nightly too -> disabled with nothing_to_move reason.
+    cx.update(|cx| set_saved_update_track(updates::UpdateTrack::Nightly, cx));
+    window2
+        .read_with(cx, |dlg, cx| {
+            let reason = dlg.disabled_reason(cx).expect("confirm must disable when track is already saved and no machine moves");
+            assert!(
+                reason.contains("already on Nightly") || reason.contains("No machine can switch to Nightly now."),
+                "unexpected disabled reason: {reason}"
+            );
+        })
+        .unwrap();
+}

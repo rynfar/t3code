@@ -4,11 +4,30 @@
 mod dialog;
 #[cfg(all(test, feature = "snapshot"))]
 mod tests;
+pub(crate) use dialog::UpdateTrackSwitchDialog;
 use crate::settings::controls::{activates, focus_handle};
 use gpui::{Div, FontWeight, KeyBinding, KeyDownEvent, MouseButton, Stateful, actions, anchored, deferred};
 actions!(updates, [FocusNextUpdate, FocusPreviousUpdate, CloseCapsulePopover]);
 const DIALOG_CONTEXT: &str = "UpdateEverythingDialog";
 const CONTROL_CONTEXT: &str = "SidebarUpdates";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ManualCheckStatus {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    UpdateAvailable,
+}
+
+#[derive(Default)]
+struct TrackPreferences {
+    saved_track: Option<updates::UpdateTrack>,
+    manual_check: ManualCheckStatus,
+    manual_check_epoch: u64,
+}
+impl Global for TrackPreferences {}
+
 pub fn init(cx: &mut App) {
     for context in [DIALOG_CONTEXT, CONTROL_CONTEXT] {
         cx.bind_keys([
@@ -21,6 +40,244 @@ pub fn init(cx: &mut App) {
         CloseCapsulePopover,
         Some(CONTROL_CONTEXT),
     )]);
+    let saved_track = t3_client::store::load_ui_state(updates::UPDATE_TRACK_STORE_KEY)
+        .as_ref()
+        .and_then(updates::decode_saved_update_track);
+    cx.set_global(TrackPreferences {
+        saved_track,
+        manual_check: ManualCheckStatus::Idle,
+        manual_check_epoch: 0,
+    });
+}
+
+pub(crate) fn raw_saved_update_track(cx: &App) -> Option<updates::UpdateTrack> {
+    cx.try_global::<TrackPreferences>().and_then(|prefs| prefs.saved_track)
+}
+
+pub(crate) fn saved_update_track(cx: &App) -> updates::UpdateTrack {
+    raw_saved_update_track(cx).unwrap_or_else(|| updates::UpdateTrack::from_version(target_version()))
+}
+
+pub(crate) fn set_saved_update_track(track: updates::UpdateTrack, cx: &mut App) {
+    if !cx.has_global::<TrackPreferences>() {
+        cx.set_global(TrackPreferences::default());
+    }
+    cx.global_mut::<TrackPreferences>().saved_track = Some(track);
+    t3_client::store::save_ui_state(
+        updates::UPDATE_TRACK_STORE_KEY,
+        &updates::encode_saved_update_track(track),
+    );
+    cx.refresh_windows();
+}
+
+pub(crate) fn manual_check_status(cx: &App) -> ManualCheckStatus {
+    cx.try_global::<TrackPreferences>()
+        .map_or(ManualCheckStatus::Idle, |prefs| prefs.manual_check)
+}
+
+pub(crate) fn has_active_update_run(cx: &App) -> bool {
+    cx.try_global::<Host>()
+        .and_then(|h| h.control.upgrade())
+        .is_some_and(|ctrl| ctrl.read(cx).run.is_some())
+}
+
+pub(crate) fn has_available_updates(state: &AppState, cx: &App) -> bool {
+    if let Some(ctrl) = cx.try_global::<Host>().and_then(|h| h.control.upgrade()) {
+        return ctrl.read(cx).plan.has_updates();
+    }
+    plan_with(state, |_| false).has_updates()
+}
+
+pub(crate) fn unswitched_machine_count(state: &AppState, track: updates::UpdateTrack) -> usize {
+    collect_with(state, |_| false, |machines| {
+        machines
+            .iter()
+            .filter(|machine| {
+                machine.connected
+                    && machine.can_maintain
+                    && updates::awaits_track_switch(machine, track)
+            })
+            .count()
+    })
+}
+
+/// Checks connected environments for provider/server updates (`AboutVersionSection` Check for updates).
+/// If updates are already available and the update dialog is mounted, opens it immediately.
+pub(crate) fn check_for_updates(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
+    if !cx.has_global::<TrackPreferences>() {
+        cx.set_global(TrackPreferences::default());
+    }
+    if let Some(ctrl) = cx.try_global::<Host>().and_then(|h| h.control.upgrade()) {
+        let has_plan = ctrl.read(cx).plan.has_updates();
+        if has_plan {
+            ctrl.update(cx, |this, cx| {
+                let plan = this.plan.clone();
+                this.dialog.update(cx, |dialog, cx| {
+                    dialog.open(plan, this.fixture, window, cx);
+                });
+                this.refresh_providers_for_dialog(cx);
+            });
+            cx.global_mut::<TrackPreferences>().manual_check = ManualCheckStatus::UpdateAvailable;
+            cx.refresh_windows();
+            return;
+        }
+    }
+    let epoch = {
+        let prefs = cx.global_mut::<TrackPreferences>();
+        if prefs.manual_check == ManualCheckStatus::Checking {
+            return;
+        }
+        prefs.manual_check_epoch = prefs.manual_check_epoch.wrapping_add(1);
+        prefs.manual_check = ManualCheckStatus::Checking;
+        prefs.manual_check_epoch
+    };
+    cx.refresh_windows();
+
+    let (lookups, runtime) = {
+        let app = state.read(cx);
+        let lookups: Vec<_> = app
+            .fleet
+            .environments
+            .iter()
+            .filter(|entry| {
+                entry.status == t3_client::supervisor::ConnectionStatus::Connected
+                    && entry.summary.synchronized
+                    && entry.summary.config_loaded
+                    && entry
+                        .grants
+                        .as_ref()
+                        .is_some_and(|s| s.grants(t3_core::usage::PROVIDERS_MANAGE_SCOPE))
+            })
+            .map(|entry| {
+                app.connections
+                    .destination(&entry.summary.owner, t3_core::usage::PROVIDERS_MANAGE_SCOPE)
+            })
+            .collect();
+        (lookups, app.runtime().clone())
+    };
+
+    let state_entity = state.clone();
+    if lookups.is_empty() {
+        let available = has_available_updates(state_entity.read(cx), cx);
+        let prefs = cx.global_mut::<TrackPreferences>();
+        if prefs.manual_check_epoch == epoch {
+            prefs.manual_check = if available {
+                ManualCheckStatus::UpdateAvailable
+            } else {
+                ManualCheckStatus::UpToDate
+            };
+        }
+        cx.refresh_windows();
+        return;
+    }
+
+    let task = runtime.spawn(async move {
+        let mut set = tokio::task::JoinSet::new();
+        for lookup in lookups {
+            set.spawn(async move {
+                if let Ok(dest) = lookup.await {
+                    let _ = dest
+                        .client
+                        .request(
+                            t3_core::settings::providers::SERVER_REFRESH_PROVIDERS,
+                            serde_json::json!({ "refreshModels": true }),
+                        )
+                        .await;
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+    });
+
+    cx.spawn(async move |cx| {
+        let _ = task.await;
+        cx.update(|cx| {
+            let available = has_available_updates(state_entity.read(cx), cx);
+            if cx.has_global::<TrackPreferences>() {
+                let prefs = cx.global_mut::<TrackPreferences>();
+                if prefs.manual_check_epoch == epoch {
+                    prefs.manual_check = if available {
+                        ManualCheckStatus::UpdateAvailable
+                    } else {
+                        ManualCheckStatus::UpToDate
+                    };
+                }
+            }
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
+pub(crate) fn dispatch_channel_switch(
+    state: &Entity<AppState>,
+    switch: updates::ChannelSwitchPlan,
+    release_channel: updates::UpdateTrack,
+    captures: Vec<CapturedUpdateOwner>,
+    cx: &mut App,
+) {
+    if let Some(ctrl) = cx.try_global::<Host>().and_then(|h| h.control.upgrade()) {
+        ctrl.update(cx, |ctrl, cx| {
+            ctrl.start_channel_switch(switch, release_channel, captures, cx);
+        });
+        return;
+    }
+    if switch.targets.is_empty() {
+        return;
+    }
+    let mut lookups = Vec::new();
+    let (view, runtime) = {
+        let app = state.read(cx);
+        for capture in &captures {
+            let receipt = app
+                .connections
+                .destination(&capture.owner, "environment:maintain");
+            lookups.push((capture.clone(), "environment:maintain", receipt));
+        }
+        (app.connections.view(), app.runtime().clone())
+    };
+    let state_entity = state.clone();
+    let task = runtime.spawn(async move {
+        let mut destinations = Vec::new();
+        for (capture, scope, receipt) in lookups {
+            destinations.push(UpdateDestination {
+                capture,
+                scope,
+                receipt: receipt.await,
+            });
+        }
+        t3_client::updates::run_channel_switch_with_progress(
+            switch,
+            release_channel,
+            destinations,
+            view,
+            None,
+        )
+        .await
+    });
+    cx.spawn(async move |cx| {
+        if let Ok(result) = task.await
+            && let Some(view) = updates::update_everything_toast_view(&result)
+        {
+            cx.update(|cx| {
+                state_entity.update(cx, |state, cx| {
+                    let mut toast = Toast::new(
+                        if view.is_error {
+                            ToastKind::Error
+                        } else {
+                            ToastKind::Success
+                        },
+                        view.title,
+                    );
+                    if let Some(description) = view.description {
+                        toast = toast.description(description);
+                    }
+                    state.show_toast(toast, cx);
+                });
+            });
+        }
+    })
+    .detach();
 }
 
 fn keyboard_button(
@@ -173,7 +430,7 @@ fn set_stage(
     }
 }
 
-fn target_version() -> &'static str {
+pub(super) fn target_version() -> &'static str {
     static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         // Native's crate version is independent of the server release it was built alongside.
         serde_json::from_str::<serde_json::Value>(include_str!(concat!(
@@ -204,7 +461,6 @@ pub(super) fn plan_with(state: &AppState, is_updating: impl FnMut(&str) -> bool)
     })
 }
 
-#[cfg(all(test, feature = "snapshot"))]
 pub(super) fn channel_switch_plan_with(
     state: &AppState,
     release: &updates::ChannelSwitchRelease,
@@ -736,7 +992,6 @@ impl UpdateControl {
         );
     }
 
-    #[cfg(all(test, feature = "snapshot"))]
     pub(super) fn start_channel_switch(
         &mut self,
         switch: updates::ChannelSwitchPlan,

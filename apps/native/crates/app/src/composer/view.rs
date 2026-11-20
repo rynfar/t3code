@@ -706,6 +706,9 @@ impl Render for Composer {
                 // Formatting shortcuts run in bubble phase so app keybindings (like Mod+B sidebar
                 // toggle) always take precedence first (#29445, #34493).
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if !this.rich_text_enabled(cx) {
+                        return;
+                    }
                     let mod_key = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
                     if !mod_key || event.keystroke.modifiers.alt || !this.input.read(cx).focus_handle(cx).is_focused(window) {
                         return;
