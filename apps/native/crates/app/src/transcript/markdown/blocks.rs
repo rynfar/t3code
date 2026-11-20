@@ -26,7 +26,7 @@ use t3_core::markdown::table::{ColumnAlignment, TableData};
 use super::links::MarkdownActionContext;
 use crate::icons::Icon;
 use crate::selectable_text::{SelectableText, SelectableTextHandle};
-use crate::theme::{hsla, palette};
+use crate::theme::{SlotStyleOverride, ThemeSlot, apply_slot_override, hsla, palette, slot_style, theme_slot_background_layer};
 use crate::transcript::{media, parts};
 
 pub const ALERT_NODE: &str = "t3-alert";
@@ -1185,13 +1185,40 @@ fn render_code_block(
         code_meta.clone(),
         cx,
     );
-    div()
+    let mut card = div()
         .id(SharedString::from(format!("code-block-scroll-guard:{}", data.key)))
+        .relative()
         .w_full()
         .min_w_0()
-        .on_scroll_wheel(stop_horizontal_wheel)
-        .child(code_view)
-        .into_any_element()
+        .on_scroll_wheel(stop_horizontal_wheel);
+    let slot_set = slot_style(ThemeSlot::ChatMarkdownCodeblock, cx);
+    if let Some(bg_layer) = theme_slot_background_layer(ThemeSlot::ChatMarkdownCodeblock, cx) {
+        let mut radius_style = gpui::StyleRefinement::default().rounded(px(8.));
+        if let Some(set) = &slot_set {
+            let corners_only = SlotStyleOverride { border_radii: set.base.border_radii, ..SlotStyleOverride::default() };
+            apply_slot_override(&mut radius_style, &corners_only, cx);
+        }
+        card.style().corner_radii = radius_style.corner_radii;
+        card = card.overflow_hidden().child(bg_layer);
+    }
+    if let Some(set) = slot_set {
+        if set.base.display_none == Some(true) {
+            card.style().display = Some(gpui::Display::None);
+        }
+        if !set.hover.is_empty() {
+            card = card.hover(|mut style| {
+                apply_slot_override(&mut style, &set.hover, cx);
+                style
+            });
+        }
+        if !set.active.is_empty() {
+            card = card.active(|mut style| {
+                apply_slot_override(&mut style, &set.active, cx);
+                style
+            });
+        }
+    }
+    card.child(code_view).into_any_element()
 }
 
 fn render_media_table_grid(
