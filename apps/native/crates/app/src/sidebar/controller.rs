@@ -484,6 +484,7 @@ impl AppState {
                     })
             });
         }
+        let selected_row_id = self.active_sidebar_row_id();
         let build_model = |snapshot, tracker: &mut _, dragging| {
             SidebarModel::build_with_launching(
                 &ModelInput {
@@ -493,7 +494,7 @@ impl AppState {
                     older_settled: older.as_ref().map(|older| OlderSettledShelf { older, frontier }),
                     settings: &self.sidebar.settings,
                     shelves: &self.sidebar.shelves,
-                    selected_thread_id: self.selected_thread.as_deref(),
+                    selected_thread_id: selected_row_id.as_deref(),
                     project_scope: self.sidebar.project_scope.as_ref(),
                     hidden_thread_ids: Some(&self.sidebar.hidden_thread_ids),
                     now,
@@ -590,13 +591,17 @@ impl AppState {
             self.prepare_scoped_threads();
         }
         let environments: Vec<_> = self.fleet.environments.iter().map(|entry| entry.summary.as_ref()).collect();
-        let selected = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id));
         let hidden = self.notifications.visibility.hidden.union(&self.notifications.visibility.delegated_under_parent).cloned().collect();
         let older_values: Vec<_> = self.sidebar.owner_omitted.iter().filter_map(|(owner, omitted)| omitted.older().map(|older| (owner, older))).collect();
         let older: Vec<_> = older_values.iter().map(|(owner, older)| t3_core::sidebar::fleet::ScopedOlderSettled {
             owner, older, frontier: self.sidebar.owner_omitted.get(*owner).and_then(|omitted| omitted.pages.listing_frontier(Some(older))),
         }).collect();
         let extras = self.sidebar.owner_extra_threads.iter().map(|(owner, threads)| t3_core::sidebar::fleet::ScopedExtraThreads { owner, threads }).collect::<Vec<_>>();
+        let selected = self
+            .selected_thread
+            .as_deref()
+            .and_then(|id| self.active_thread_key(id))
+            .map(|key| t3_core::sidebar::fleet::resolve_listed_ancestor_thread_key(&key, &environments, &extras));
         if !self.sidebar.history.launching_threads().is_empty() {
             self.sidebar.history.retain_launching(|id| {
                 environments
@@ -802,14 +807,54 @@ impl AppState {
         self.sidebar.undo.active_drafts = drafts;
     }
 
+    /// Nearest listed sidebar ancestor for the active single-environment thread (`pingdotgg/t3code#37500`).
+    pub(crate) fn active_sidebar_row_id(&self) -> Option<String> {
+        let selected = self.selected_thread.as_deref()?;
+        let canonical = self.server_config.config.as_ref().map(|c| c.environment.environment_id.as_str());
+        let threads: Vec<&t3_core::shell::ThreadShell> = self
+            .shell
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .threads
+                    .iter()
+                    .chain(&snapshot.archived_threads)
+                    .chain(self.omitted.mounts.extras(&self.shell))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(t3_core::sidebar::resolve_listed_ancestor_thread_id(selected, canonical, &threads))
+    }
+
+    /// Nearest listed sidebar ancestor key for the active fleet thread (`pingdotgg/t3code#37500`).
+    pub(crate) fn active_sidebar_row_key(&self) -> Option<t3_core::sidebar::tag_filter::ThreadKey> {
+        let selected = self.selected_thread.as_deref().and_then(|id| self.active_thread_key(id))?;
+        let environments: Vec<_> = self.fleet.environments.iter().map(|entry| entry.summary.as_ref()).collect();
+        let extras: Vec<_> = self
+            .sidebar
+            .owner_extra_threads
+            .iter()
+            .map(|(owner, threads)| t3_core::sidebar::fleet::ScopedExtraThreads { owner, threads })
+            .collect();
+        Some(t3_core::sidebar::fleet::resolve_listed_ancestor_thread_key(&selected, &environments, &extras))
+    }
+
     pub(crate) fn scoped_undo_claim(&mut self, owner: &crate::context_menu::ThreadMenuOwner, command: &str) -> Option<(actions::Claim, UndoAction, Vec<UndoStep>)> {
         let thread = self.scoped_thread(&owner.key()?)?.thread.clone();
         let store = &mut self.sidebar.undo;
         for kind in match command { "thread.pin" => vec![UndoKind::Pin, UndoKind::Settle, UndoKind::Snooze], "thread.unsettle" => vec![UndoKind::Settle], "thread.unsnooze" => vec![UndoKind::Snooze], "thread.settle" => vec![UndoKind::Pin, UndoKind::Snooze], _ => Vec::new() } { store.invalidate_owned(kind, owner); }
         if matches!(command, "thread.archive" | "thread.delete") { store.expire_owned(owner, command == "thread.delete"); }
+        let snapshot = actions::SettleUndoSnapshot {
+            pinned: thread.pinned,
+            pin_order_key: thread.pin_order_key.as_deref(),
+            active_order_key: thread.active_order_key.as_deref(),
+            unsettled_at: thread.unsettled_at_iso.as_deref(),
+            snoozed_until: thread.snoozed_until,
+        };
         let (kind, action, plan) = match command {
-            "thread.settle" => (UndoKind::Settle, UndoAction::Settled, actions::plan_undo(PlanFor::Settle, thread.pinned, thread.pin_order_key.as_deref(), thread.snoozed_until)),
-            "thread.unpin" => (UndoKind::Pin, UndoAction::Unpinned, actions::plan_undo(PlanFor::Unpin, thread.pinned, thread.pin_order_key.as_deref(), thread.snoozed_until)),
+            "thread.settle" => (UndoKind::Settle, UndoAction::Settled, actions::plan_undo_for_thread(PlanFor::Settle, Some(&snapshot))),
+            "thread.unpin" => (UndoKind::Pin, UndoAction::Unpinned, actions::plan_undo_for_thread(PlanFor::Unpin, Some(&snapshot))),
             "thread.snooze" => (UndoKind::Snooze, UndoAction::Snoozed, vec![UndoStep::Unsnooze]),
             "thread.archive" => (UndoKind::Archive, UndoAction::Archived, vec![UndoStep::Unarchive]), _ => return None,
         };
@@ -1352,7 +1397,14 @@ impl AppState {
         let Some(thread) = self.snapshot_thread(thread_id) else { return };
         let now = now_ms();
         let woke = settled::woke_at(&thread, now);
-        let plan = actions::plan_undo(PlanFor::Settle, thread.pinned, thread.pin_order_key.as_deref(), thread.snoozed_until);
+        let snapshot = actions::SettleUndoSnapshot {
+            pinned: thread.pinned,
+            pin_order_key: thread.pin_order_key.as_deref(),
+            active_order_key: thread.active_order_key.as_deref(),
+            unsettled_at: thread.unsettled_at_iso.as_deref(),
+            snoozed_until: thread.snoozed_until,
+        };
+        let plan = actions::plan_undo_for_thread(PlanFor::Settle, Some(&snapshot));
         self.sidebar.undo.invalidate(UndoKind::Pin, thread_id);
         self.sidebar.undo.invalidate(UndoKind::Snooze, thread_id);
         let claim = self.sidebar.undo.begin(UndoKind::Settle, thread_id);
@@ -1546,7 +1598,18 @@ impl AppState {
             return then(self, false, cx);
         };
         let id = thread_id.to_owned();
-        if let Some(candidate) = self.orphaned_worktree_candidate(thread, &deletion.doomed) {
+        // Deleting a thread also deletes its side chats, which share its worktree (`pingdotgg/t3code#36800`).
+        let mut removed_ids = (*deletion.doomed).clone();
+        if let Some(snapshot) = self.shell.snapshot.as_ref() {
+            for entry in &snapshot.threads {
+                if entry.lineage.side_chat == Some(true)
+                    && entry.lineage.parent_thread_id.as_deref() == Some(thread.id.as_str())
+                {
+                    removed_ids.insert(entry.id.clone());
+                }
+            }
+        }
+        if let Some(candidate) = self.orphaned_worktree_candidate(thread, &removed_ids) {
             let check_server = self
                 .server_config
                 .config
@@ -1567,7 +1630,7 @@ impl AppState {
                             return then(state, false, cx);
                         }
                         let still_orphaned = occupants.is_some_and(|ids| {
-                            !t3_core::vcs::worktree_cleanup::has_other_worktree_occupants(&ids, &id, &deletion.doomed)
+                            !t3_core::vcs::worktree_cleanup::has_other_worktree_occupants(&ids, &id, &removed_ids)
                         });
                         if still_orphaned {
                             state.prompt_worktree_cleanup_and_delete(id, deletion, candidate, failure_title, cx, then);
@@ -2562,8 +2625,11 @@ impl AppState {
                         break;
                     }
                     let command = match step {
-                        UndoStep::Unsettle => actions::unsettle(&uuid(),&owner.thread), UndoStep::Unsnooze => actions::unsnooze(&uuid(),&owner.thread),
+                        UndoStep::Unsettle => actions::unsettle(&uuid(),&owner.thread),
+                        UndoStep::UnsettleRestore { restore_unsettled_at } => actions::unsettle_with_restore(&uuid(), &owner.thread, Some(restore_unsettled_at.as_deref())),
+                        UndoStep::Unsnooze => actions::unsnooze(&uuid(),&owner.thread),
                         UndoStep::Pin { order_key } => actions::pin(&uuid(),&owner.thread,order_key.as_deref()),
+                        UndoStep::ReorderActive { order_key } => actions::reorder_active(&uuid(), &owner.thread, &order_key),
                         UndoStep::Snooze { snoozed_until } => actions::snooze(&uuid(),&owner.thread,snoozed_until),
                         UndoStep::Unarchive => actions::unarchive(&uuid(),&owner.thread), UndoStep::RestoreDraft => continue,
                     };

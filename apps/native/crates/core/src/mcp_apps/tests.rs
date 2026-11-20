@@ -332,7 +332,7 @@ fn parses_permissions_and_forwards_message_context_download_and_display_modes() 
         operation,
         &Operation::DownloadFile {
             files: vec![
-                DownloadItem::Embedded { name: "rt.csv".into(), mime_type: "text/csv".into(), bytes: b"a,b".to_vec() },
+                DownloadItem::Embedded { name: "re-po".into(), mime_type: "text/csv".into(), bytes: b"a,b".to_vec() },
                 DownloadItem::Link { name: "bad-name-.txt".into(), uri: "ui://todos/ex*port".into(), mime_type: None },
             ]
         }
@@ -375,4 +375,37 @@ fn download_name_caps_utf16_length_without_splitting_emoji_and_color_scheme_meta
     );
     let frag = inject_color_scheme_meta("<div>bare</div>", true);
     assert!(frag.starts_with(r#"<meta name="color-scheme" content="dark">"#), "{frag}");
+}
+
+#[test]
+fn download_name_ignores_query_and_fragment_suffixes_and_normalize_filters_stripped_images() {
+    // URI query/fragment suffixes are stripped before taking the path basename (`pingdotgg/t3code#30712`).
+    assert_eq!(download_name(Some("https://example.com/files/report.pdf?download=1#page=2"), None), "report.pdf");
+    assert_eq!(download_name(Some("https://example.com/export?format=csv#top"), None), "export");
+    assert_eq!(download_name(Some("?only-query=1"), None), "download");
+    assert_eq!(download_name(Some("https://example.com/dir/?token=abc"), None), "dir");
+
+    // Stripped image blocks (missing data) and unknown block types are filtered out (`pingdotgg/t3code#31338`).
+    let normalized = host::normalize_result(&json!({
+        "content": [
+            { "type": "text", "text": "hello" },
+            { "type": "image", "mimeType": "image/png" },
+            { "type": "image", "mimeType": "image/png", "data": "iVBORw==" },
+            { "type": "resource", "resource": { "uri": "file:///a.txt", "text": "ok" } },
+            { "type": "resource", "resource": { "uri": "file:///empty.bin" } },
+            { "type": "resource_link", "uri": "https://example.com/a", "name": "a" },
+            { "type": "custom_stripped", "foo": "bar" }
+        ],
+        "_meta": null,
+        "structuredContent": { "count": 1 }
+    }));
+    let blocks = normalized["content"].as_array().expect("content array");
+    assert_eq!(blocks.len(), 4);
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[1]["type"], "image");
+    assert_eq!(blocks[1]["data"], "iVBORw==");
+    assert_eq!(blocks[2]["type"], "resource");
+    assert_eq!(blocks[3]["type"], "resource_link");
+    assert!(normalized.get("_meta").is_none());
+    assert_eq!(normalized["structuredContent"]["count"], 1);
 }

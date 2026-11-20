@@ -543,6 +543,26 @@ pub fn tool_group_summary_kind(entries: &[&WorkLogEntry]) -> SummaryKind {
     }
 }
 
+fn is_windows_absolute_path(path: &str) -> bool {
+    if path.starts_with("\\\\") {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || matches!(bytes[2], b'/' | b'\\'))
+}
+
+/// `isHostPath` (`packages/shared/src/path.ts`, `pingdotgg/t3code#39146`):
+/// absolute paths and home-relative `~/` or `~\` paths sit outside the workspace folder.
+pub fn is_host_path(path: &str) -> bool {
+    path.starts_with('/')
+        || is_windows_absolute_path(path)
+        || path.starts_with("~/")
+        || path.starts_with("~\\")
+}
+
 /// `formatWorkspaceRelativePath`, without line positions.
 pub fn format_workspace_relative_path(path: &str, workspace_root: Option<&str>) -> String {
     let normalized = path.replace('\\', "/");
@@ -556,7 +576,7 @@ pub fn format_workspace_relative_path(path: &str, workspace_root: Option<&str>) 
     if let Some(rest) = normalized.strip_prefix(&format!("{root}/")) {
         return format!("{label}/{rest}");
     }
-    if !normalized.starts_with('/') {
+    if !is_host_path(&normalized) {
         let relative = normalized.trim_start_matches("./");
         return if normalized.starts_with(&format!("{label}/")) { normalized.clone() } else { format!("{label}/{relative}") };
     }
@@ -582,7 +602,7 @@ pub fn work_entry_read_output(entry: &WorkLogEntry, workspace_root: Option<&str>
     for path in read_raw_paths(entry) {
         let trimmed = path.trim().replace('\\', "/");
         let full = match workspace_root {
-            Some(root) if !trimmed.starts_with('/') => {
+            Some(root) if !is_host_path(&trimmed) => {
                 format!("{}/{}", root.replace('\\', "/").trim_end_matches('/'), trimmed.trim_start_matches("./").trim_start_matches('/'))
             }
             _ => trimmed,

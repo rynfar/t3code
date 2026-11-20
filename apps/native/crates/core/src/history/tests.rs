@@ -143,6 +143,7 @@ fn work_anchor_paging_resumes_from_updated_cursor_and_clears_when_done() {
         items: vec![serde_json::from_value(row("w-item-1", 2, 0)).unwrap()],
         next_cursor: Some("w2".into()),
         has_more_history: true,
+        subagents: Vec::new(),
         has_user_turn: false,
     };
     assert_eq!(state.apply_work_page("a", "w1", partial), HistoryStep::Continue("w2".into()));
@@ -167,6 +168,7 @@ fn work_anchor_paging_resumes_from_updated_cursor_and_clears_when_done() {
         items: vec![serde_json::from_value(row("w-item-2", 3, 0)).unwrap()],
         next_cursor: None,
         has_more_history: false,
+        subagents: Vec::new(),
         has_user_turn: false,
     };
     assert_eq!(state.apply_work_page("a", "w2", final_page), HistoryStep::Done);
@@ -208,6 +210,7 @@ fn non_advancing_complete_page_fails_even_when_auto_page_is_off() {
         items: vec![serde_json::from_value(row("old-1", 1, 0)).unwrap()],
         next_cursor: Some(cursor.clone()),
         has_more_history: true,
+        subagents: Vec::new(),
         has_user_turn: false,
     };
     let PageOutcome::Step(step) = state.begin_history_merge_with(&cursor, stuck, true, false) else {
@@ -326,4 +329,32 @@ fn decode_history_page_treats_notification_and_non_steer_messages_as_turn_starts
         "type": "notification", "source": { "kind": "delegated_task", "taskIds": [] },
         "outcome": "completed", "summary": "Checks finished"
     })));
+}
+
+#[test]
+fn older_history_pages_merge_older_subagents_without_overwriting_newer_ones() {
+    // Subagents from earlier turns keep their model after loading history (`pingdotgg/t3code#38724`).
+    let (mut state, cursor) = loading_state();
+    state.projection.as_mut().unwrap().subagents.push(crate::thread::Entity {
+        id: "sub-shared".into(),
+        value: json!({ "id": "sub-shared", "model": "newer-model" }),
+    });
+    let page = decode_history_page(json!({
+        "snapshotSequence": 5,
+        "items": [row("old-1", 1, 0)],
+        "nextCursor": null,
+        "hasMoreHistory": false,
+        "subagents": [
+            { "id": "sub-old", "model": "claude-haiku-4-5" },
+            { "id": "sub-shared", "model": "stale-model" }
+        ]
+    }))
+    .unwrap();
+    assert_eq!(state.apply_history_page(&cursor, page), HistoryStep::Done);
+    let subagents = &state.projection.as_ref().unwrap().subagents;
+    assert_eq!(subagents.len(), 2);
+    assert_eq!(subagents[0].id, "sub-old");
+    assert_eq!(subagents[0].value["model"], "claude-haiku-4-5");
+    assert_eq!(subagents[1].id, "sub-shared");
+    assert_eq!(subagents[1].value["model"], "newer-model");
 }

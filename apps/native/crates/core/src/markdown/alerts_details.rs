@@ -96,6 +96,7 @@ pub struct CustomOrderedList {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetailsBlock {
     pub open: bool,
+    pub rtl: bool,
     pub summary: String,
     pub body_markdown: String,
 }
@@ -216,8 +217,16 @@ pub fn parse_details_fence(lang: Option<&str>, meta: Option<&str>, code: &str) -
             serde_json::from_str::<String>(raw).ok()
         })
         .unwrap_or_else(|| "Details".to_owned());
+    let rtl = if meta.contains("rtl=true") {
+        true
+    } else if meta.contains("rtl=false") {
+        false
+    } else {
+        super::is_rtl_text(&summary)
+    };
     Some(DetailsBlock {
         open,
+        rtl,
         summary,
         body_markdown: code.trim().to_owned(),
     })
@@ -1093,10 +1102,25 @@ fn rewrite_details_block(input: &str, is_dark: bool) -> Option<(String, usize)> 
         ("Details".to_owned(), inner.trim().to_owned())
     };
     let body = preprocess_html_containers(&body, is_dark);
+    let explicit_dir = extract_html_attr(open_tag, "dir").map(|d| d.trim().to_ascii_lowercase());
+    let is_rtl = match explicit_dir.as_deref() {
+        Some("rtl") => true,
+        Some("ltr") => false,
+        _ => {
+            super::is_rtl_text(&summary)
+                || (super::text_direction(&summary).is_none() && super::is_rtl_text(&body))
+        }
+    };
 
     let fence_ticks = "`".repeat(max_backtick_run(&body).max(3) + 1);
     let summary_json = serde_json::to_string(&summary).unwrap_or_else(|_| "\"Details\"".to_owned());
-    let encoded = format!("\n{fence_ticks}t3-details open={is_open} summary={summary_json}\n{body}\n{fence_ticks}\n");
+    let rtl_attr = match explicit_dir.as_deref() {
+        Some("rtl") => " rtl=true",
+        Some("ltr") => " rtl=false",
+        _ if is_rtl => " rtl=true",
+        _ => "",
+    };
+    let encoded = format!("\n{fence_ticks}t3-details open={is_open}{rtl_attr} summary={summary_json}\n{body}\n{fence_ticks}\n");
     Some((encoded, consumed))
 }
 
@@ -1447,5 +1471,32 @@ mod tests {
         );
         assert!(out.contains("a < b > c and <https://example.com>"), "literal comparisons preserved: {out}");
         assert!(out.contains("<img src=\"first.png\">\n\n<video src=\"second.mp4\"></video>"), "blank line fence untouched: {out}");
+    }
+
+    #[test]
+    fn details_block_detects_rtl_from_dir_attribute_or_arabic_hebrew_summary() {
+        // Explicit dir="rtl" and Arabic/Hebrew summaries set rtl=true (`pingdotgg/t3code#36876`).
+        let arabic = "<details><summary>تفاصيل إضافية</summary>\nمحتوى عربي</details>";
+        let out_ar = preprocess_markdown_for_display(arabic, true, None);
+        assert!(out_ar.contains("rtl=true"), "{out_ar}");
+        let meta_ar = out_ar.lines().find(|l| l.contains("t3-details")).unwrap().split_once("t3-details ").unwrap().1;
+        let parsed_ar = parse_details_fence(Some("t3-details"), Some(meta_ar), "محتوى عربي").unwrap();
+        assert!(parsed_ar.rtl);
+
+        let hebrew = "<details><summary>פרטים נוספים</summary>\nתוכן בעברית</details>";
+        let out_he = preprocess_markdown_for_display(hebrew, true, None);
+        assert!(out_he.contains("rtl=true"), "{out_he}");
+
+        let forced_ltr = "<details dir=\"ltr\"><summary>تفاصيل إضافية</summary>\nbody</details>";
+        let out_ltr = preprocess_markdown_for_display(forced_ltr, true, None);
+        assert!(out_ltr.contains("rtl=false"), "{out_ltr}");
+        let meta_ltr = out_ltr.lines().find(|l| l.contains("t3-details")).unwrap().split_once("t3-details ").unwrap().1;
+        assert!(!parse_details_fence(Some("t3-details"), Some(meta_ltr), "body").unwrap().rtl);
+
+        let english = "<details><summary>More info</summary>\nbody</details>";
+        let out_en = preprocess_markdown_for_display(english, true, None);
+        assert!(!out_en.contains("rtl=true"), "{out_en}");
+        let meta_en = out_en.lines().find(|l| l.contains("t3-details")).unwrap().split_once("t3-details ").unwrap().1;
+        assert!(!parse_details_fence(Some("t3-details"), Some(meta_en), "body").unwrap().rtl);
     }
 }

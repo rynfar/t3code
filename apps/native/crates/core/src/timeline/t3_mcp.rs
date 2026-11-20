@@ -83,6 +83,15 @@ pub enum T3McpSummaryAction {
     UnwatchPr,
     WritePrGuides,
     ReadPrGuide,
+    ReadPr,
+    ListRepoPrs,
+    CreatePr,
+    UpdatePr,
+    RespondPr,
+    MergePr,
+    ReviewPr,
+    CiLogs,
+    CiRerun,
     Browser,
     Device,
     HtmlPreview,
@@ -153,6 +162,15 @@ const T3_MCP_TOOLS: &[T3McpToolDefinition] = &[
     pr_tool("unwatch_pull_request", "Stop watching", "Unwatching", "Stopped watching", "a pull request", T3McpSummaryAction::UnwatchPr),
     pr_tool("write_pull_request_guides", "Write", "Writing", "Started writing", "review guides", T3McpSummaryAction::WritePrGuides),
     pr_tool("read_pull_request_guide", "Read", "Reading", "Read", "a review guide", T3McpSummaryAction::ReadPrGuide),
+    pr_tool("pull_request_read", "Read", "Reading", "Read", "a pull request", T3McpSummaryAction::ReadPr),
+    pr_tool("pull_request_list", "List", "Listing", "Listed", "pull requests", T3McpSummaryAction::ListRepoPrs),
+    pr_tool("pull_request_create", "Open", "Opening", "Opened", "a pull request", T3McpSummaryAction::CreatePr),
+    pr_tool("pull_request_update", "Update", "Updating", "Updated", "a pull request", T3McpSummaryAction::UpdatePr),
+    pr_tool("pull_request_respond", "Respond", "Responding", "Responded", "on a pull request", T3McpSummaryAction::RespondPr),
+    pr_tool("pull_request_review", "Review", "Reviewing", "Reviewed", "a pull request", T3McpSummaryAction::ReviewPr),
+    pr_tool("ci_logs", "Read", "Reading", "Read", "CI logs", T3McpSummaryAction::CiLogs),
+    pr_tool("ci_rerun", "Re-run", "Re-running", "Re-ran", "CI", T3McpSummaryAction::CiRerun),
+    pr_tool("pull_request_merge", "Merge", "Merging", "Merged", "a pull request", T3McpSummaryAction::MergePr),
     t3_tool("orchestrator_capabilities", "Get", "Getting", "Got", "orchestration capabilities", T3McpSummaryAction::Capabilities),
     t3_tool("delegate_task", "Delegate", "Delegating", "Delegated", "a child task", T3McpSummaryAction::Delegate),
     t3_tool("task_status", "Get", "Getting", "Got", "delegated task status", T3McpSummaryAction::TaskStatus),
@@ -843,6 +861,72 @@ pub fn summarize_t3_tool_calls(action: T3McpSummaryAction, calls: &[T3ToolSummar
             }
         }
         ReadPrGuide => phrase("Read", "read", &quantity(selected.len(), "review guide")),
+        ReadPr => phrase("Read", "read", &quantity(selected.len(), "pull request")),
+        ListRepoPrs => phrase("Listed", "list", &format!("pull requests {times}")),
+        CreatePr => {
+            // An open PR for the branch is returned rather than duplicated (`pingdotgg/t3code#26751`).
+            let existing = selected.iter().filter(|call| call.output.as_ref().and_then(|o| o.get("created")) == Some(&Value::Bool(false))).count();
+            let opened = selected.len() - existing;
+            if !any_completed {
+                format!("Tried to open {}", quantity(selected.len(), "pull request"))
+            } else if opened == 0 {
+                format!("Found {} open {}", existing, if existing == 1 { "pull request" } else { "pull requests" })
+            } else if existing == 0 {
+                format!("Opened {}", quantity(opened, "pull request"))
+            } else {
+                format!("Opened {}, found {existing} open", quantity(opened, "pull request"))
+            }
+        }
+        UpdatePr => phrase("Updated", "update", &quantity(selected.len(), "pull request")),
+        RespondPr => phrase("Responded on", "respond on", &format!("pull requests {times}")),
+        MergePr => {
+            // Auto-merge and merge queues leave the PR open until it lands (`pingdotgg/t3code#26751`).
+            let queued = selected
+                .iter()
+                .filter(|call| match call.output.as_ref().and_then(|o| o.get("state")) {
+                    None => call.input.as_ref().and_then(|i| i.get("auto")) == Some(&Value::Bool(true)),
+                    Some(state) => state.as_str() != Some("merged"),
+                })
+                .count();
+            let merged = selected.len() - queued;
+            if !any_completed {
+                format!("Tried to merge {}", quantity(selected.len(), "pull request"))
+            } else if merged == 0 {
+                format!("Queued {} to merge", quantity(queued, "pull request"))
+            } else if queued == 0 {
+                format!("Merged {}", quantity(merged, "pull request"))
+            } else {
+                format!("Merged {}, queued {queued}", quantity(merged, "pull request"))
+            }
+        }
+        ReviewPr => phrase("Reviewed", "review", &quantity(selected.len(), "pull request")),
+        CiLogs => phrase("Read", "read", &format!("CI logs {times}")),
+        CiRerun => {
+            // A host can refuse a check it cannot re-run, such as one outside its CI (`pingdotgg/t3code#26752`).
+            let outcomes: Vec<bool> = selected
+                .iter()
+                .flat_map(|call| call.output.as_ref().and_then(|o| o.get("checks")).and_then(Value::as_array).into_iter().flatten())
+                .map(|check| check.as_object().and_then(|c| c.get("rerun")) == Some(&Value::Bool(true)))
+                .collect();
+            let rerun = outcomes.iter().filter(|ok| **ok).count();
+            let refused = outcomes.len() - rerun;
+            failed_count += refused;
+            if !any_completed {
+                format!("Tried to re-run CI {times}")
+            } else if outcomes.is_empty() {
+                if selected.iter().any(|call| call.output.as_ref().and_then(|o| o.get("checks")).is_some_and(Value::is_array)) {
+                    "Found no failed checks to re-run".to_owned()
+                } else {
+                    format!("Re-ran CI {times}")
+                }
+            } else if rerun == 0 {
+                format!("Could not re-run {}", quantity(refused, "check"))
+            } else if refused == 0 {
+                format!("Re-ran {}", quantity(rerun, "check"))
+            } else {
+                format!("Re-ran {}, {refused} refused", quantity(rerun, "check"))
+            }
+        }
         Browser => phrase("Used", "use", &format!("browser {times}")),
         Device => phrase("Used", "use", &format!("device controls {times}")),
         HtmlPreview => phrase("Previewed", "preview", &quantity(selected.len(), "HTML page")),
@@ -912,5 +996,73 @@ mod tests {
         assert_eq!(resolve_t3_mcp_tool_definition(Some("send_to_user"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::SendToUser));
         assert_eq!(summarize_t3_tool_calls(T3McpSummaryAction::ThemeSet, &[T3ToolSummaryCall { input: None, output: None, outcome: T3ToolOutcome::Completed }]).0, "Set the theme 1 time");
         assert_eq!(summarize_t3_tool_calls(T3McpSummaryAction::SendToUser, &[T3ToolSummaryCall { input: None, output: None, outcome: T3ToolOutcome::Completed }]).0, "Sent 1 message");
+    }
+
+    #[test]
+    fn summarizes_pull_request_and_ci_mcp_tools() {
+        // Pull request MCP tools (`pingdotgg/t3code#26751`).
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("pull_request_read"), None).map(|d| (d.summary_action, d.icon)), Some((T3McpSummaryAction::ReadPr, T3McpToolIcon::PullRequest)));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("pull_request_list"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::ListRepoPrs));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("pull_request_create"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::CreatePr));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("pull_request_update"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::UpdatePr));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("pull_request_respond"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::RespondPr));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("pull_request_review"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::ReviewPr));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("pull_request_merge"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::MergePr));
+
+        let created_false = json!({ "created": false });
+        let created_true = json!({ "created": true });
+        assert_eq!(
+            summarize_t3_tool_calls(T3McpSummaryAction::CreatePr, &[
+                T3ToolSummaryCall { input: None, output: Some(&created_true), outcome: T3ToolOutcome::Completed },
+                T3ToolSummaryCall { input: None, output: Some(&created_false), outcome: T3ToolOutcome::Completed },
+            ]),
+            ("Opened 1 pull request, found 1 open".into(), 0)
+        );
+        assert_eq!(
+            summarize_t3_tool_calls(T3McpSummaryAction::CreatePr, &[
+                T3ToolSummaryCall { input: None, output: Some(&created_false), outcome: T3ToolOutcome::Completed },
+            ]),
+            ("Found 1 open pull request".into(), 0)
+        );
+        let auto_in = json!({ "auto": true });
+        let merged_out = json!({ "state": "merged" });
+        assert_eq!(
+            summarize_t3_tool_calls(T3McpSummaryAction::MergePr, &[
+                T3ToolSummaryCall { input: Some(&auto_in), output: None, outcome: T3ToolOutcome::Completed },
+                T3ToolSummaryCall { input: None, output: Some(&merged_out), outcome: T3ToolOutcome::Completed },
+            ]),
+            ("Merged 1 pull request, queued 1".into(), 0)
+        );
+
+        // CI MCP tools (`pingdotgg/t3code#26752`).
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("ci_logs"), None).map(|d| (d.summary_action, d.icon)), Some((T3McpSummaryAction::CiLogs, T3McpToolIcon::PullRequest)));
+        assert_eq!(resolve_t3_mcp_tool_definition(Some("ci_rerun"), None).map(|d| d.summary_action), Some(T3McpSummaryAction::CiRerun));
+        assert_eq!(
+            summarize_t3_tool_calls(T3McpSummaryAction::CiLogs, &[
+                T3ToolSummaryCall { input: None, output: None, outcome: T3ToolOutcome::Completed },
+            ]),
+            ("Read CI logs 1 time".into(), 0)
+        );
+        let empty_checks = json!({ "checks": [] });
+        assert_eq!(
+            summarize_t3_tool_calls(T3McpSummaryAction::CiRerun, &[
+                T3ToolSummaryCall { input: None, output: Some(&empty_checks), outcome: T3ToolOutcome::Completed },
+            ]),
+            ("Found no failed checks to re-run".into(), 0)
+        );
+        let mixed_checks = json!({ "checks": [{ "rerun": true }, { "rerun": false }] });
+        assert_eq!(
+            summarize_t3_tool_calls(T3McpSummaryAction::CiRerun, &[
+                T3ToolSummaryCall { input: None, output: Some(&mixed_checks), outcome: T3ToolOutcome::Completed },
+            ]),
+            ("Re-ran 1 check, 1 refused".into(), 1)
+        );
+        let all_refused = json!({ "checks": [{ "rerun": false }, { "rerun": false }] });
+        assert_eq!(
+            summarize_t3_tool_calls(T3McpSummaryAction::CiRerun, &[
+                T3ToolSummaryCall { input: None, output: Some(&all_refused), outcome: T3ToolOutcome::Completed },
+            ]),
+            ("Could not re-run 2 checks".into(), 2)
+        );
     }
 }

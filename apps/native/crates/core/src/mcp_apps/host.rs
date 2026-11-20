@@ -46,8 +46,38 @@ pub struct Host {
     pending: HashMap<u64, (Value, bool)>,
 }
 
+fn is_mcp_content_block(block: &Value) -> bool {
+    let Some(obj) = block.as_object() else { return false };
+    let Some(kind) = obj.get("type").and_then(Value::as_str) else { return false };
+    match kind {
+        "text" => obj.get("text").is_some_and(Value::is_string),
+        "image" | "audio" => {
+            obj.get("data").is_some_and(Value::is_string)
+                && obj.get("mimeType").is_some_and(Value::is_string)
+        }
+        "resource_link" => {
+            obj.get("uri").is_some_and(Value::is_string)
+                && obj.get("name").is_some_and(Value::is_string)
+        }
+        "resource" => obj.get("resource").and_then(Value::as_object).is_some_and(|res| {
+            res.get("uri").is_some_and(Value::is_string)
+                && (res.get("text").is_some_and(Value::is_string)
+                    || res.get("blob").is_some_and(Value::is_string))
+        }),
+        _ => false,
+    }
+}
+
+/// The MCP Apps SDK rejects the whole notification or response over one field it does not accept:
+/// `null` for an absent field, or a content block MCP does not define such as an image whose
+/// bytes storage stripped (`pingdotgg/t3code#31338`).
 pub fn normalize_result(result: &Value) -> Value {
-    let mut value = json!({"content":result.get("content").filter(|v| v.is_array()).cloned().unwrap_or(json!([]))});
+    let content: Vec<Value> = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter(|block| is_mcp_content_block(block)).cloned().collect())
+        .unwrap_or_default();
+    let mut value = json!({"content": content});
     for key in ["structuredContent", "_meta"] {
         if let Some(field) = result.get(key).filter(|v| v.is_object() || v.is_array()) {
             value[key] = field.clone();

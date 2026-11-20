@@ -17,7 +17,10 @@ use gpui::{App, AppContext, ClipboardItem, Entity, EntityId, FontWeight, Highlig
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::{ActiveTheme, h_flex};
 use t3_core::markdown::mentions::{collect_composer_model_mentions, link_model_mentions};
-use t3_core::markdown::{DisplayMarkdownOptions, prepare_display_markdown_for_surface};
+use t3_core::markdown::{
+    DisplayMarkdownOptions, prepare_display_markdown_for_surface, prepare_display_markdown_for_user,
+    strip_code_fence_trailing_newline,
+};
 
 use self::blocks::{
     CodeFenceMetaMap, NestedSelection, NestedViews, RichMarkdownMedia, SharedActionContext, SharedCodeMeta, SharedMathEnabled,
@@ -127,8 +130,8 @@ impl MarkdownState {
             Some(_) => None,
             None => (parent == quote).then_some(parent),
         };
-        if matched.is_some() {
-            return matched;
+        if let Some(matched) = matched {
+            return Some(t3_core::markdown::clipboard::strip_preserved_leading_whitespace(&matched));
         }
         let nested = self.nested_views.lock().unwrap();
         for child in nested.values() {
@@ -382,7 +385,11 @@ fn prepare_surface_markdown(
     let after_mentions = with_mentions.as_deref().unwrap_or(text);
     let (with_threads, threads_hash) = rewrite_thread_links_and_prefetch(after_mentions, action_ctx, cx);
     let effective = with_threads.as_deref().unwrap_or(after_mentions);
-    let prepared = Arc::from(prepare_display_markdown_for_surface(effective, options, parse_raw_html, render_insights));
+    let prepared = Arc::from(if key.starts_with("user:") {
+        prepare_display_markdown_for_user(effective, options)
+    } else {
+        prepare_display_markdown_for_surface(effective, options, parse_raw_html, render_insights)
+    });
     (prepared, mentions_hash ^ threads_hash.rotate_left(17))
 }
 
@@ -735,7 +742,7 @@ fn style_markdown_with_source(
             ) && action_ctx.as_ref().is_some_and(|c| c.cwd.is_some() && c.thread_id.is_some());
             let run_ctx = action_ctx.clone();
             let run_code = code.to_string();
-            let copy_code = t3_core::markdown::normalize_clipboard_text(&code);
+            let copy_code = strip_code_fence_trailing_newline(&code);
             h_flex()
                 .gap(px(4.))
                 .items_center()

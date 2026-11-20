@@ -96,15 +96,17 @@ pub fn woke_at(thread: &SidebarThread, now: Ms) -> Option<Ms> {
 
 /// `snoozeWakeLabel`.
 pub fn snooze_wake_label(snoozed_until: Ms, now: Ms) -> String {
-    let remaining = snoozed_until - now;
-    if remaining <= 0 {
-        "now".to_owned()
-    } else if remaining < HOUR_MS {
-        format!("{}m", ((remaining + MINUTE_MS - 1) / MINUTE_MS).max(1))
-    } else if remaining < DAY_MS {
-        format!("{}h", (remaining + HOUR_MS - 1) / HOUR_MS)
+    if snoozed_until <= now {
+        return "now".to_owned();
+    }
+    // Count clock minutes: callers pass a minute-floored or live `now`, and durations keep seconds.
+    let minutes = (snoozed_until.div_euclid(MINUTE_MS) - now.div_euclid(MINUTE_MS)).max(1);
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else if minutes < 24 * 60 {
+        format!("{}h", (minutes + 59) / 60)
     } else {
-        format!("{}d", (remaining + DAY_MS - 1) / DAY_MS)
+        format!("{}d", (minutes + 24 * 60 - 1) / (24 * 60))
     }
 }
 

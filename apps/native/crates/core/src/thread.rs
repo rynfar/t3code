@@ -117,6 +117,8 @@ pub struct Run {
     pub queue_position: Option<u64>,
     #[serde(default)]
     pub fresh_context: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_continuation_of_run_id: Option<String>,
 }
 
 impl Run {
@@ -131,6 +133,10 @@ pub struct RunAttempt {
     pub id: String,
     pub run_id: String,
     pub root_node_id: String,
+    #[serde(default)]
+    pub attempt_ordinal: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
     pub status: String,
     #[serde(default)]
     pub completed_at: Option<String>,

@@ -112,6 +112,8 @@ pub struct SidebarPane {
     pub(crate) project_filter_order: std::cell::RefCell<Vec<String>>,
     pub(crate) project_filter_highlighted: Option<String>,
     jump_hints: bool,
+    jump_hold_met: bool,
+    last_modifiers: gpui::Modifiers,
     jump_hint_timer: Option<Task<()>>,
     pub(crate) now: Ms,
     #[cfg(feature = "snapshot")]
@@ -594,6 +596,8 @@ impl SidebarPane {
             project_filter_order: Default::default(),
             project_filter_highlighted: None,
             jump_hints: false,
+            jump_hold_met: false,
+            last_modifiers: gpui::Modifiers::default(),
             jump_hint_timer: None,
             now: now_ms(),
             #[cfg(feature = "snapshot")]
@@ -883,15 +887,48 @@ impl SidebarPane {
     }
 
     /// Jump hints appear once the jump modifier has been held for a moment, so a quick shortcut
-    /// never flashes them (`useThreadJumpHintsVisible`), and hide when it is released.
+    /// never flashes them (`useThreadJumpHintsVisible`), and re-check whenever modifiers change
+    /// even if the hold delay was already met (`pingdotgg/t3code#38545`).
     pub fn set_modifiers(&mut self, modifiers: gpui::Modifiers, cx: &mut Context<Self>) {
+        self.last_modifiers = modifiers;
         let mac = cfg!(target_os = "macos");
+        let any_modifier = modifiers.platform || modifiers.control || modifiers.shift || modifiers.alt;
         let state = ShortcutModifierState { meta_key: modifiers.platform, ctrl_key: modifiers.control, shift_key: modifiers.shift, alt_key: modifiers.alt };
         let rules = cx.try_global::<crate::keymap::Keymap>().map(|keymap| keymap.rules.clone()).unwrap_or_default();
         let show = should_show_thread_jump_hints_for_modifiers(&state, &rules, &ShortcutMatchContext::default(), mac);
-        if !show {
+        if !any_modifier {
+            self.jump_hold_met = false;
             self.jump_hint_timer = None;
             if std::mem::take(&mut self.jump_hints) {
+                cx.notify();
+            }
+            return;
+        }
+        if !show {
+            if std::mem::take(&mut self.jump_hints) {
+                cx.notify();
+            }
+            if !self.jump_hold_met && self.jump_hint_timer.is_none() {
+                self.jump_hint_timer = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(JUMP_HINT_SHOW_DELAY_MS)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.jump_hint_timer = None;
+                        this.jump_hold_met = true;
+                        let m = this.last_modifiers;
+                        let current = ShortcutModifierState { meta_key: m.platform, ctrl_key: m.control, shift_key: m.shift, alt_key: m.alt };
+                        let rules = cx.try_global::<crate::keymap::Keymap>().map(|keymap| keymap.rules.clone()).unwrap_or_default();
+                        if should_show_thread_jump_hints_for_modifiers(&current, &rules, &ShortcutMatchContext::default(), cfg!(target_os = "macos")) {
+                            this.jump_hints = true;
+                            cx.notify();
+                        }
+                    });
+                }));
+            }
+            return;
+        }
+        if self.jump_hold_met {
+            self.jump_hint_timer = None;
+            if !std::mem::replace(&mut self.jump_hints, true) {
                 cx.notify();
             }
             return;
@@ -903,8 +940,15 @@ impl SidebarPane {
             cx.background_executor().timer(Duration::from_millis(JUMP_HINT_SHOW_DELAY_MS)).await;
             let _ = this.update(cx, |this, cx| {
                 this.jump_hint_timer = None;
-                this.jump_hints = true;
-                cx.notify();
+                this.jump_hold_met = true;
+                let m = this.last_modifiers;
+                let current = ShortcutModifierState { meta_key: m.platform, ctrl_key: m.control, shift_key: m.shift, alt_key: m.alt };
+                let rules = cx.try_global::<crate::keymap::Keymap>().map(|keymap| keymap.rules.clone()).unwrap_or_default();
+                let show_now = should_show_thread_jump_hints_for_modifiers(&current, &rules, &ShortcutMatchContext::default(), cfg!(target_os = "macos"));
+                if this.jump_hints != show_now {
+                    this.jump_hints = show_now;
+                    cx.notify();
+                }
             });
         }));
     }

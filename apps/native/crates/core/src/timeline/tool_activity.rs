@@ -272,6 +272,23 @@ const SYNTAX_PROGRAMS: [&str; 16] =
     ["if", "then", "for", "while", "until", "case", "function", "[[", "[", "test", "{", "(", "((", "true", "return", "repeat"];
 const WRAPPERS: [&str; 8] = ["sudo", "env", "timeout", "nice", "nohup", "time", "command", "exec"];
 
+fn is_windows_path_prefix(current: &str) -> bool {
+    if current.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let bytes = current.as_bytes();
+    let rest = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        &current[2..]
+    } else if let Some(after) = current.strip_prefix("..") {
+        after
+    } else if let Some(after) = current.strip_prefix('.') {
+        after
+    } else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('\\')
+}
+
 /// Shell-style tokens. Operators (`&&`, `||`, `;`, `|`, newline) are their own tokens.
 /// `None` when quoting does not balance.
 fn tokenize(command: &str) -> Option<Vec<String>> {
@@ -295,16 +312,25 @@ fn tokenize(command: &str) -> Option<Vec<String>> {
                 loop {
                     match chars.next()? {
                         '"' => break,
-                        '\\' => current.push(chars.next()?),
+                        '\\' => match chars.peek().copied() {
+                            Some('"' | '\\' | '$' | '`' | '\n') => current.push(chars.next()?),
+                            Some(_) => current.push('\\'),
+                            None => return None,
+                        },
                         other => current.push(other),
                     }
                 }
             }
             '\\' => {
                 has_token = true;
-                match chars.next() {
-                    Some('\n') | None => {}
-                    Some(next) => current.push(next),
+                let is_win_path = is_windows_path_prefix(&current);
+                if is_win_path && !matches!(chars.peek().copied(), None | Some('"' | '\\' | '$' | '`' | '\n')) {
+                    current.push('\\');
+                } else {
+                    match chars.next() {
+                        Some('\n') | None => {}
+                        Some(next) => current.push(next),
+                    }
                 }
             }
             '`' => {
@@ -820,19 +846,61 @@ pub fn command_program_name(command: &str) -> Option<String> {
     command_program_name_at(command, 0)
 }
 
-/// `commandDisplayText`: drops a `bash -lc '…'` wrapper and shows control characters.
-pub fn command_display_text(command: &str) -> String {
-    let trimmed = command.trim();
-    let unwrapped = tokenize(trimmed)
-        .filter(|tokens| !tokens.iter().any(|t| is_operator(t)))
-        .and_then(|tokens| {
-            let program = program_basename(tokens.first()?);
-            if !SHELL_PROGRAMS.contains(&program.as_str()) {
+fn windows_shell_script_index(shell: &str, tokens: &[String]) -> Option<usize> {
+    let mut index = 1;
+    while index < tokens.len() {
+        let option = tokens[index].to_ascii_lowercase();
+        if shell == "cmd" {
+            if option == "/c" {
+                return Some(index + 1);
+            }
+            if !option.starts_with('/') {
                 return None;
             }
-            shell_script(&tokens).map(|script| script.trim().to_owned()).filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| trimmed.to_owned());
+            index += 1;
+            continue;
+        }
+        if option == "-command" || option == "-c" {
+            return Some(index + 1);
+        }
+        if POWERSHELL_OPTIONS_WITH_VALUE.contains(&option.as_str()) {
+            index += 2;
+            continue;
+        }
+        if !POWERSHELL_FLAGS.contains(&option.as_str()) {
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+/// `commandDisplayText`: drops a `bash -lc '…'`, `pwsh -Command '…'`, or `cmd /c '…'` wrapper
+/// (`pingdotgg/t3code#38946`) and shows control characters.
+pub fn command_display_text(command: &str) -> String {
+    let trimmed = command.trim();
+    let unwrapped = if split_first_command_segment(trimmed).1.is_some() {
+        trimmed.to_owned()
+    } else {
+        tokenize(trimmed)
+            .filter(|tokens| !tokens.iter().any(|t| is_operator(t)))
+            .and_then(|tokens| {
+                let first = tokens.first()?;
+                let executable = token_basename(first);
+                let program = program_basename(first);
+                let script = if SHELL_PROGRAMS.contains(&program.as_str()) {
+                    shell_script(&tokens)
+                } else if WINDOWS_SHELL_PROGRAMS.contains(&executable.to_ascii_lowercase().as_str()) {
+                    windows_shell_script_index(&program.to_ascii_lowercase(), &tokens)
+                        .filter(|&idx| idx == tokens.len() - 1)
+                        .and_then(|idx| tokens.get(idx).map(String::as_str))
+                } else {
+                    None
+                };
+                script.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| trimmed.to_owned())
+    };
     with_visible_control_characters(&unwrapped)
 }
 
