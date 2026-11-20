@@ -1390,11 +1390,14 @@ impl Composer {
         if self.is_rewinding(cx) {
             return;
         }
+        let rich_text_enabled = self.rich_text_enabled(cx);
         let (value, range) = {
             let input = self.input.read(cx);
             (input.value().to_string(), input.selected_range())
         };
-        if let Some(edit) = rules::rich_text::code_block_indent(&value, range.start, range.end, true) {
+        if rich_text_enabled
+            && let Some(edit) = rules::rich_text::code_block_indent(&value, range.start, range.end, true)
+        {
             self.apply_rich_edit(edit, window, cx);
             return;
         }
@@ -1569,13 +1572,15 @@ impl Composer {
 
     fn on_enter(&mut self, modifier: bool, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.open && self.workspace_enabled() {return;}
+        let rich_text_enabled = self.rich_text_enabled(cx);
         let composing = self.input.update(cx, |input, cx| input.marked_text_range(window, cx).is_some());
         let key = EnterKey { modifier, repeat: std::mem::take(&mut self.enter_repeat), composing };
         let (prompt, sel) = {
             let input = self.input.read(cx);
             (input.value().to_string(), input.selected_range())
         };
-        if !composing
+        if rich_text_enabled
+            && !composing
             && !modifier
             && self.answering.is_none()
             && let Some(edit) = rules::rich_text::code_block_enter(&prompt, sel.start, sel.end)
@@ -1607,7 +1612,8 @@ impl Composer {
             // The input method commits its composition on Enter.
             None if composing => {}
             None => {
-                if !modifier
+                if rich_text_enabled
+                    && !modifier
                     && self.answering.is_none()
                     && sel.start == sel.end
                     && let Some(edit) = lists::continuation_for_enter(&prompt, sel.start)
@@ -3485,6 +3491,110 @@ mod stream_error_tests {
                 assert!(!composer.fresh_session_available(cx));
             });
         });
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn composer_rich_text_setting_clears_decorations_live_and_gates_shortcuts(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        cx.update(|cx| {
+            crate::settings::store::init(cx);
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::SendShortcut(rules::SendShortcut::ModEnter),
+                cx,
+            );
+        });
+        struct Host(Entity<Composer>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+                // Mirror `Composer::render`'s live decoration sync without hitting TestWindow's
+                // unimplemented platform window handle in `webview::occluder`.
+                self.0.update(cx, |composer, cx| composer.sync_rich_decorations(cx));
+                gpui::div()
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| Composer::new(state.clone(), window, cx))));
+        let composer = host.read_with(vcx, |host, _| host.0.clone());
+
+        // Enabled by default: rich decorations populate and inline/code/list helpers run.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("Hello **world**", window, cx);
+                composer.sync_rich_decorations(cx);
+                assert!(composer.rich_text.decoration_count > 0);
+            });
+        });
+
+        // Disabling ComposerRichText clears decorations immediately on next render (live update)
+        // and skips inline formatting, code-block indent/enter, and list continuation.
+        vcx.update(|window, cx| {
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::ComposerRichText(false),
+                cx,
+            );
+            window.refresh();
+            window.draw(cx).clear();
+            composer.update(cx, |composer, cx| {
+                assert_eq!(composer.rich_text.decoration_count, 0, "decorations must clear live when disabled");
+
+                // Inline formatting shortcuts (Bold/Italic/Code/Strike) are skipped.
+                composer.set_prompt("hello", window, cx);
+                composer.input.update(cx, |input, cx| input.set_selected_range(0..5, cx));
+                composer.toggle_inline_format(rules::rich_text::InlineFormat::Bold, window, cx);
+                composer.toggle_inline_format(rules::rich_text::InlineFormat::Italic, window, cx);
+                composer.toggle_inline_format(rules::rich_text::InlineFormat::Code, window, cx);
+                composer.toggle_inline_format(rules::rich_text::InlineFormat::Strike, window, cx);
+                assert_eq!(composer.prompt(cx), "hello");
+
+                // Code-block indent and enter are skipped.
+                composer.set_prompt("```rust\n  let x = 1;\n```", window, cx);
+                let caret = "```rust\n  let x = 1;".len();
+                composer.input.update(cx, |input, cx| input.set_selected_range(caret..caret, cx));
+                assert!(!composer.indent_list_or_code(window, cx));
+                composer.on_enter(false, true, window, cx);
+                assert_eq!(composer.prompt(cx), "```rust\n  let x = 1;\n\n```");
+
+                // List continuation on Enter is skipped (inserts plain newline).
+                composer.set_prompt("- first", window, cx);
+                let end = "- first".len();
+                composer.input.update(cx, |input, cx| input.set_selected_range(end..end, cx));
+                composer.on_enter(false, false, window, cx);
+                assert_eq!(composer.prompt(cx), "- first\n");
+            });
+        });
+
+        // Re-enabling ComposerRichText restores live decorations and formatting behavior.
+        vcx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_prompt("Hello **world**", window, cx);
+            });
+            crate::settings::store::update_client(
+                &state,
+                t3_core::client_settings::ClientSettingChange::ComposerRichText(true),
+                cx,
+            );
+            window.refresh();
+            window.draw(cx).clear();
+            composer.update(cx, |composer, cx| {
+                assert!(composer.rich_text.decoration_count > 0, "decorations must restore live when re-enabled");
+                composer.set_prompt("hello", window, cx);
+                composer.input.update(cx, |input, cx| input.set_selected_range(0..5, cx));
+                composer.toggle_inline_format(rules::rich_text::InlineFormat::Bold, window, cx);
+                assert_eq!(composer.prompt(cx), "**hello**");
+            });
+        });
+
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {
             cx.shutdown();

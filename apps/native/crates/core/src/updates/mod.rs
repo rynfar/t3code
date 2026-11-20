@@ -141,6 +141,24 @@ pub fn behind(server: &str, target: &str) -> bool {
     }
 }
 
+pub fn managed_updates_message(organization: &str) -> String {
+    format!("{organization} manages T3 Code updates.")
+}
+
+pub fn managed_updates_off_denial(policy: Option<&Value>) -> Option<String> {
+    managed_denial(policy, None)
+}
+
+pub fn nightly_denied_by(policy: Option<&Value>) -> Option<String> {
+    let policy = policy?;
+    (policy["limits"]["updates"]["allowNightly"] == false).then(|| {
+        policy["organization"]
+            .as_str()
+            .unwrap_or("Your organization")
+            .to_owned()
+    })
+}
+
 pub fn managed_denial(policy: Option<&Value>, target: Option<&str>) -> Option<String> {
     let policy = policy?;
     let limits = &policy["limits"]["updates"];
@@ -148,11 +166,12 @@ pub fn managed_denial(policy: Option<&Value>, target: Option<&str>) -> Option<St
         .as_str()
         .unwrap_or("Your organization");
     if limits["mode"] == "off" {
-        return Some(format!("{organization} manages T3 Code updates."));
+        return Some(managed_updates_message(organization));
     }
     if limits["allowNightly"] == false && target.is_some_and(|v| channel(v) != "stable") {
         return Some(format!(
-            "{organization} manages T3 Code updates. Only stable releases can be installed."
+            "{} Only stable releases can be installed.",
+            managed_updates_message(organization)
         ));
     }
     None
@@ -405,6 +424,8 @@ pub fn ready_outcome(result: &Value, event: &Value) -> Option<Result<(), String>
     (payload["environment"]["serverVersion"] == result["targetVersion"]).then_some(Ok(()))
 }
 
+pub const UPDATE_TRACK_STORE_KEY: &str = "update-track";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateTrack {
@@ -413,10 +434,36 @@ pub enum UpdateTrack {
 }
 
 impl UpdateTrack {
+    pub const ALL: [UpdateTrack; 2] = [UpdateTrack::Latest, UpdateTrack::Nightly];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Latest => "latest",
             Self::Nightly => "nightly",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "latest" | "stable" => Some(Self::Latest),
+            "nightly" => Some(Self::Nightly),
+            _ => None,
+        }
+    }
+
+    /// `desktopUpdateChannelOf`: preview builds have no feed and read as Stable (`Latest`).
+    pub fn from_version(version: &str) -> Self {
+        if channel(version) == "nightly" {
+            Self::Nightly
+        } else {
+            Self::Latest
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::Latest => Self::Nightly,
+            Self::Nightly => Self::Latest,
         }
     }
 
@@ -433,6 +480,125 @@ impl UpdateTrack {
             Self::Nightly => "Nightly",
         }
     }
+}
+
+pub fn channel_switch_label(channel: UpdateTrack) -> &'static str {
+    channel.label()
+}
+
+pub fn decode_saved_update_track(value: &Value) -> Option<UpdateTrack> {
+    if let Some(raw) = value.as_str() {
+        return UpdateTrack::parse(raw);
+    }
+    value
+        .get("channel")
+        .and_then(Value::as_str)
+        .and_then(UpdateTrack::parse)
+}
+
+pub fn encode_saved_update_track(track: UpdateTrack) -> Value {
+    Value::String(track.as_str().to_owned())
+}
+
+/// Local desktop updater status for `local_updater_stays_put` (`updateTrackSwitch.logic.ts`).
+/// Externally built GPUI native binaries have no in-app self-updater (`LocalUpdaterState::NATIVE`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalUpdaterState {
+    pub enabled: bool,
+    pub channel_blocked_by_policy: bool,
+}
+
+impl LocalUpdaterState {
+    pub const NATIVE: Self = Self {
+        enabled: false,
+        channel_blocked_by_policy: false,
+    };
+}
+
+/// `localUpdaterStaysPut`: whether this app stays put while connected machines move.
+/// Always returns `true` for externally built GPUI native binaries (`None` or `LocalUpdaterState::NATIVE`).
+pub fn local_updater_stays_put(state: Option<LocalUpdaterState>, target: UpdateTrack) -> bool {
+    let Some(state) = state else {
+        return true;
+    };
+    !state.enabled && !(target == UpdateTrack::Latest && state.channel_blocked_by_policy)
+}
+
+/// `nothingToMove` outcome (`updateTrackSwitch.logic.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NothingToMove {
+    pub note: Option<String>,
+    pub disabled_reason: Option<String>,
+}
+
+/// When no machine moves, confirming only saves the track; when that track is already saved too,
+/// confirming would do nothing. Track-only hosts are not rows but still get a request.
+pub fn nothing_to_move(
+    channel: UpdateTrack,
+    saved_channel: Option<UpdateTrack>,
+    switches_local: bool,
+    crosses_local: bool,
+    rows: &[Row],
+    has_targets: bool,
+) -> NothingToMove {
+    if switches_local || rows.iter().any(|row| row.skipped.is_none()) {
+        return NothingToMove {
+            note: None,
+            disabled_reason: None,
+        };
+    }
+    let label = channel_switch_label(channel);
+    let all_on_track = rows.is_empty() && !crosses_local;
+    if !has_targets && saved_channel == Some(channel) {
+        return NothingToMove {
+            note: None,
+            disabled_reason: Some(if all_on_track {
+                format!("Every connected machine is already on {label}.")
+            } else {
+                format!("No machine can switch to {label} now.")
+            }),
+        };
+    }
+    NothingToMove {
+        note: Some(if all_on_track {
+            format!("Every connected machine is already on {label}. This only saves the track.")
+        } else {
+            format!("No machine can switch to {label} now. This only saves the track.")
+        }),
+        disabled_reason: None,
+    }
+}
+
+/// Parses either a `server.getNpmRelease` RPC reply (`null` or `{ version, databaseMigration? }`)
+/// or a public npm registry dist-tag manifest (`{ version, t3code?: { databaseMigration? } }`).
+pub fn parse_npm_release_response(
+    value: &Value,
+    channel: UpdateTrack,
+) -> Result<Option<ChannelSwitchRelease>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let version = value
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && version_parts(v).is_some())
+        .ok_or_else(|| "npm returned invalid release metadata.".to_owned())?
+        .to_owned();
+    let database_migration = value
+        .get("databaseMigration")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("t3code")
+                .and_then(|t3| t3.get("databaseMigration"))
+                .and_then(Value::as_u64)
+        });
+    Ok(Some(ChannelSwitchRelease {
+        channel,
+        version,
+        database_migration,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1292,4 +1458,155 @@ pub fn decode_fresh_saved_result(
 ) -> Option<SavedUpdateEverythingResult> {
     let saved: SavedUpdateEverythingResult = serde_json::from_value(value).ok()?;
     (now_ms - saved.saved_at_ms < SAVED_RESULT_MAX_AGE_MS).then_some(saved)
+}
+
+#[cfg(test)]
+mod track_switch_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn track_persistence_and_helpers_round_trip() {
+        assert_eq!(UpdateTrack::parse("latest"), Some(UpdateTrack::Latest));
+        assert_eq!(UpdateTrack::parse("stable"), Some(UpdateTrack::Latest));
+        assert_eq!(UpdateTrack::parse("nightly"), Some(UpdateTrack::Nightly));
+        assert_eq!(UpdateTrack::parse("preview"), None);
+        assert_eq!(UpdateTrack::from_version("0.1.3-nightly.20261001.1"), UpdateTrack::Nightly);
+        assert_eq!(UpdateTrack::from_version("0.1.3-preview.20261001.1"), UpdateTrack::Latest);
+        assert_eq!(UpdateTrack::from_version("0.1.3"), UpdateTrack::Latest);
+        assert_eq!(channel_switch_label(UpdateTrack::Latest), "Stable");
+        assert_eq!(channel_switch_label(UpdateTrack::Nightly), "Nightly");
+
+        let encoded = encode_saved_update_track(UpdateTrack::Nightly);
+        assert_eq!(decode_saved_update_track(&encoded), Some(UpdateTrack::Nightly));
+        assert_eq!(decode_saved_update_track(&json!({ "channel": "latest" })), Some(UpdateTrack::Latest));
+        assert_eq!(decode_saved_update_track(&Value::Null), None);
+    }
+
+    #[test]
+    fn local_updater_stays_put_matches_web_and_native_binaries() {
+        // Externally built GPUI native binaries always stay put.
+        assert!(local_updater_stays_put(None, UpdateTrack::Latest));
+        assert!(local_updater_stays_put(None, UpdateTrack::Nightly));
+        assert!(local_updater_stays_put(Some(LocalUpdaterState::NATIVE), UpdateTrack::Latest));
+        assert!(local_updater_stays_put(Some(LocalUpdaterState::NATIVE), UpdateTrack::Nightly));
+        // Policy-blocked nightly moves back to stable if enabled==false only due to policy.
+        assert!(!local_updater_stays_put(
+            Some(LocalUpdaterState { enabled: false, channel_blocked_by_policy: true }),
+            UpdateTrack::Latest
+        ));
+        assert!(local_updater_stays_put(
+            Some(LocalUpdaterState { enabled: false, channel_blocked_by_policy: true }),
+            UpdateTrack::Nightly
+        ));
+        assert!(!local_updater_stays_put(
+            Some(LocalUpdaterState { enabled: true, channel_blocked_by_policy: false }),
+            UpdateTrack::Nightly
+        ));
+    }
+
+    #[test]
+    fn nothing_to_move_covers_save_only_disabled_and_active_moves() {
+        // Active remote row -> neither note nor disabled.
+        let moving = Row {
+            environment_id: "e1".into(),
+            label: "Box".into(),
+            app: Some("Server".into()),
+            providers: vec![],
+            skipped: None,
+        };
+        assert_eq!(
+            nothing_to_move(UpdateTrack::Nightly, Some(UpdateTrack::Latest), false, false, &[moving], true),
+            NothingToMove { note: None, disabled_reason: None }
+        );
+
+        // No rows, not yet saved on target -> save-only note.
+        assert_eq!(
+            nothing_to_move(UpdateTrack::Nightly, Some(UpdateTrack::Latest), false, false, &[], false),
+            NothingToMove {
+                note: Some("Every connected machine is already on Nightly. This only saves the track.".into()),
+                disabled_reason: None,
+            }
+        );
+
+        // No rows, already saved on target, no targets -> disabled.
+        assert_eq!(
+            nothing_to_move(UpdateTrack::Nightly, Some(UpdateTrack::Nightly), false, false, &[], false),
+            NothingToMove {
+                note: None,
+                disabled_reason: Some("Every connected machine is already on Nightly.".into()),
+            }
+        );
+
+        // All rows skipped, already saved on target -> disabled with "No machine can switch".
+        let skipped = Row {
+            environment_id: "e1".into(),
+            label: "Box".into(),
+            app: None,
+            providers: vec![],
+            skipped: Some("needs a manual update".into()),
+        };
+        assert_eq!(
+            nothing_to_move(
+                UpdateTrack::Latest,
+                Some(UpdateTrack::Latest),
+                false,
+                false,
+                std::slice::from_ref(&skipped),
+                false,
+            ),
+            NothingToMove {
+                note: None,
+                disabled_reason: Some("No machine can switch to Stable now.".into()),
+            }
+        );
+
+        // All rows skipped, switching from another track -> save-only note.
+        assert_eq!(
+            nothing_to_move(UpdateTrack::Latest, Some(UpdateTrack::Nightly), false, false, &[skipped], false),
+            NothingToMove {
+                note: Some("No machine can switch to Stable now. This only saves the track.".into()),
+                disabled_reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_npm_release_response_handles_rpc_registry_and_null() {
+        assert_eq!(parse_npm_release_response(&Value::Null, UpdateTrack::Latest), Ok(None));
+        assert_eq!(
+            parse_npm_release_response(
+                &json!({ "version": "0.2.0", "databaseMigration": 71 }),
+                UpdateTrack::Latest
+            ),
+            Ok(Some(ChannelSwitchRelease {
+                channel: UpdateTrack::Latest,
+                version: "0.2.0".into(),
+                database_migration: Some(71),
+            }))
+        );
+        assert_eq!(
+            parse_npm_release_response(
+                &json!({ "version": "0.2.0-nightly.20261119.1", "t3code": { "databaseMigration": 72 } }),
+                UpdateTrack::Nightly
+            ),
+            Ok(Some(ChannelSwitchRelease {
+                channel: UpdateTrack::Nightly,
+                version: "0.2.0-nightly.20261119.1".into(),
+                database_migration: Some(72),
+            }))
+        );
+        assert!(parse_npm_release_response(&json!({ "version": "not-semver" }), UpdateTrack::Latest).is_err());
+    }
+
+    #[test]
+    fn managed_policy_helpers_decode_updates_off_and_allow_nightly() {
+        let off = json!({ "organization": "Acme", "limits": { "updates": { "mode": "off" } } });
+        assert_eq!(managed_updates_off_denial(Some(&off)).as_deref(), Some("Acme manages T3 Code updates."));
+        assert_eq!(nightly_denied_by(Some(&off)), None);
+
+        let no_nightly = json!({ "organization": "Acme", "limits": { "updates": { "allowNightly": false } } });
+        assert_eq!(managed_updates_off_denial(Some(&no_nightly)), None);
+        assert_eq!(nightly_denied_by(Some(&no_nightly)).as_deref(), Some("Acme"));
+    }
 }

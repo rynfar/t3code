@@ -19,7 +19,7 @@ use t3_core::settings::ServerSettingChange;
 use t3_core::settings::search::Section;
 
 use super::controls::{
-    Button, ButtonSize, ButtonVariant, InlineButton, InlineTone, Row, Select, SelectOption, Switch, r, section, unavailable_group,
+    Button, ButtonSize, ButtonVariant, InlineButton, InlineTone, Row, Select, SelectOption, Switch, r, section,
 };
 use super::{Block, SettingsView, store};
 use crate::app_state::AppState;
@@ -28,7 +28,6 @@ use crate::icons::Icon;
 use crate::theme::{hsla, palette};
 
 const MODIFIER: &str = if cfg!(target_os = "macos") { "\u{2318}" } else { "Ctrl" };
-const RICH_TEXT_UNAVAILABLE: &str = "Rich text formatting in the composer isn't available in the native client yet.";
 const SIMLOCK_URL: &str = "https://incubator.callstack.com/simlock/";
 
 #[derive(Default)]
@@ -285,18 +284,16 @@ impl SettingsView {
         let advanced = self.chat_ui.advanced || self.is_target("skills-in-slash-menu");
         let weak = cx.entity().downgrade();
         let mut composer_rows = vec![
-            unavailable_group(
-                RICH_TEXT_UNAVAILABLE,
-                vec![
-                    Row::new("composer-rich-text", "Rich text composer")
-                        .description("Show formatted Markdown as you type.")
-                        .highlighted(self.is_target("composer-rich-text"))
-                        .control(Switch::new("composer-rich-text-switch", false).disabled(true))
-                        .into_any_element(),
-                ],
-                cx,
-            )
-            .into_any_element(),
+            Row::new("composer-rich-text", "Rich text composer")
+                .description("Show formatted Markdown as you type.")
+                .highlighted(self.is_target("composer-rich-text"))
+                .reset(!doc.composer_rich_text(), reset(state, ClientSettingChange::ComposerRichText(true)))
+                .control(
+                    div()
+                        .debug_selector(|| "composer-rich-text-switch".to_owned())
+                        .child(switch(state, "composer-rich-text-switch", doc.composer_rich_text(), ClientSettingChange::ComposerRichText)),
+                )
+                .into_any_element(),
             Row::new("send-shortcut", "Send shortcut")
                 .description("Choose when Enter sends a prompt or inserts a new line")
                 .highlighted(self.is_target("send-shortcut"))
@@ -952,6 +949,51 @@ mod tests {
 
         open_and_draw(&mut vcx, Section::Voice);
         assert!(vcx.debug_bounds("speech-project-dictionary-below-unavailable").is_some());
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        drop(vcx);
+        drop(fixture);
+        runtime.shutdown_background();
+    }
+
+    #[gpui::test]
+    fn chat_rich_text_switch_toggles_and_resets_client_setting(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+        });
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| crate::settings::open(Section::Chat, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        assert!(vcx.read(|cx| crate::settings::store::client(cx).composer_rich_text()));
+        let switch_center = vcx
+            .debug_bounds("composer-rich-text-switch")
+            .expect("live Rich text composer switch bounds")
+            .center();
+        vcx.simulate_click(switch_center, Default::default());
+        vcx.run_until_parked();
+        assert!(!vcx.read(|cx| crate::settings::store::client(cx).composer_rich_text()));
+
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.simulate_click(switch_center, Default::default());
+        vcx.run_until_parked();
+        assert!(vcx.read(|cx| crate::settings::store::client(cx).composer_rich_text()));
 
         state.update(&mut vcx, |state, _| state.stop_pump());
         drop(vcx);
