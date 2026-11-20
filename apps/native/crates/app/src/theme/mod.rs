@@ -6,9 +6,11 @@
 
 mod tokens;
 pub mod html_render;
+pub mod slots;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use t3_core::themes::{self, ThemeDefinition};
 
 use gpui::{App, Global, Hsla, Rems, Window, WindowAppearance, px, rems};
@@ -17,6 +19,13 @@ use serde_json::json;
 use t3_core::client_settings::typography::{FontDefaults, FontRole, MONO_STACK, Typography, resolve_font_stack};
 use t3_core::client_settings::{AppearanceMode, ChatWidth, DiffColorScheme, ThemePreference};
 
+// Part 1 of #457 exports the slot engine API for Wave H4B's UI call-site wiring.
+#[allow(unused_imports)]
+pub use slots::{
+    SlotStyleOverride, SlotStyleSet, SlotStylesheet, ThemeSlot, ThemeSlotExt, ThemeSlotHoverExt,
+    ThemeSlotInteractiveExt, apply_slot_override, refine_slot_active, refine_slot_hover,
+    slot_style, slot_stylesheet, theme_slot_background_layer,
+};
 pub use tokens::{BUILT_IN_THEMES, Palette, metrics};
 
 /// The web's `text-white` on solid destructive buttons (design-system §6.1); not a theme role.
@@ -75,6 +84,7 @@ struct ThemeState {
 struct SavedTheme {
     preferences: Preferences,
     palettes: [Palette; 2],
+    slot_stylesheets: [Arc<SlotStylesheet>; 2],
     configs: [Rc<ThemeConfig>; 2],
     fonts: [gpui::SharedString; 4],
 }
@@ -83,6 +93,7 @@ struct PreparedPreview {
     input: themes::editor::Preview,
     saved: Rc<SavedTheme>,
     palette: Palette,
+    slot_stylesheet: Arc<SlotStylesheet>,
     config: Rc<ThemeConfig>,
 }
 impl Global for ThemeState {}
@@ -260,7 +271,12 @@ pub fn set_environment_themes(values: &[ThemeDefinition], cx: &mut App) {
     cx.refresh_windows();
 }
 
-fn derived(theme: &ThemePreference, dark: bool, prefs: &Preferences, environment: &[ThemeDefinition]) -> Palette {
+fn derived(
+    theme: &ThemePreference,
+    dark: bool,
+    prefs: &Preferences,
+    environment: &[ThemeDefinition],
+) -> (Palette, Arc<SlotStylesheet>) {
     let definition = themes::half_theme(theme, &prefs.halves, dark, &prefs.custom, environment);
     let selected = definition.map(|t| t.id.as_str());
     let roles = definition.and_then(|t| t.half(dark));
@@ -269,19 +285,22 @@ fn derived(theme: &ThemePreference, dark: bool, prefs: &Preferences, environment
         .and_then(|id| BUILT_IN_THEMES.iter().find(|t| t.id == id))
         .and_then(|t| if dark { t.dark } else { t.light })
         .unwrap_or(if dark { tokens::DARK } else { tokens::LIGHT });
-    let Ok(colors) = themes::palette_for_with_css(selected, roles, theme_css, dark, prefs.contrast, prefs.glass) else {
-        return base;
+    let Ok((colors, slot_sheet)) =
+        themes::palette_and_slots_for_with_css(selected, roles, theme_css, dark, prefs.contrast, prefs.glass)
+    else {
+        return (base, Arc::new(SlotStylesheet::empty()));
     };
     let mut value = serde_json::to_value(base).expect("serializable palette");
     if let Some(map) = value.as_object_mut() {
         map.extend(colors.into_iter().map(|(k, v)| (k, v.into())));
     }
     let p = serde_json::from_value(value).unwrap_or(base);
-    if prefs.diff_color_scheme == DiffColorScheme::BlueOrange {
+    let p = if prefs.diff_color_scheme == DiffColorScheme::BlueOrange {
         blue_orange(p)
     } else {
         p
-    }
+    };
+    (p, Arc::new(slot_sheet))
 }
 
 fn blue_orange(mut palette: Palette) -> Palette {
@@ -373,7 +392,10 @@ fn install(cx: &mut App) {
         let preferences = preferences(cx).clone();
         let fonts = FontRole::ALL.map(|role| resolve_family(role, cx));
         let environment = cx.global::<ThemeState>().environment.clone();
-        let palettes = [false, true].map(|dark| derived(&preferences.theme, dark, &preferences, &environment));
+        let [(light_palette, light_slots), (dark_palette, dark_slots)] =
+            [false, true].map(|dark| derived(&preferences.theme, dark, &preferences, &environment));
+        let palettes = [light_palette, dark_palette];
+        let slot_stylesheets = [light_slots, dark_slots];
         let configs = std::array::from_fn(|i| {
             Rc::new(config(
                 if i == 0 { "T3 Code Light" } else { "T3 Code Dark" },
@@ -388,6 +410,7 @@ fn install(cx: &mut App) {
         let saved = Rc::new(SavedTheme {
             preferences,
             palettes,
+            slot_stylesheets,
             configs,
             fonts,
         });
@@ -397,6 +420,7 @@ fn install(cx: &mut App) {
     let preferences = &saved.preferences;
     cx.set_global(ActiveFonts(saved.fonts.clone()));
     let mut palettes = saved.palettes;
+    let mut slot_stylesheets = saved.slot_stylesheets.clone();
     let mut configs = saved.configs.clone();
     if let Some(input) = cx.global::<ThemeState>().preview.clone() {
         let cached = cx
@@ -406,7 +430,7 @@ fn install(cx: &mut App) {
             .filter(|p| p.input == input && Rc::ptr_eq(&p.saved, &saved))
             .cloned();
         let prepared = cached.or_else(|| {
-            let values = themes::palette_for_with_css(
+            let (values, slot_sheet) = themes::palette_and_slots_for_with_css(
                 None,
                 Some(&input.colors),
                 input.css.as_deref(),
@@ -437,6 +461,7 @@ fn install(cx: &mut App) {
                 input: input.clone(),
                 saved: saved.clone(),
                 palette,
+                slot_stylesheet: Arc::new(slot_sheet),
                 config,
             };
             cx.global_mut::<ThemeState>().prepared_preview = Some(prepared.clone());
@@ -445,11 +470,13 @@ fn install(cx: &mut App) {
         if let Some(prepared) = prepared {
             let i = usize::from(input.dark);
             palettes[i] = prepared.palette;
+            slot_stylesheets[i] = prepared.slot_stylesheet;
             configs[i] = prepared.config;
         }
     }
     let revision = cx.try_global::<ActivePalette>().map_or(0, |p| p.1.wrapping_add(1));
     cx.set_global(ActivePalette(palettes[usize::from(dark)], revision));
+    cx.set_global(slots::ActiveSlotStylesheet(Arc::clone(&slot_stylesheets[usize::from(dark)])));
     let theme = Theme::global_mut(cx);
     [theme.light_theme, theme.dark_theme] = configs;
     theme.font_size = px(preferences.interface_font_size);

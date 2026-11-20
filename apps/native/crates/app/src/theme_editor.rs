@@ -502,10 +502,31 @@ impl Render for Editor {
             let (line, col) = css::line_and_column(&css_value, css_range.start);
             let diag = css::summarize_diagnostics(&css_value);
             let code_font = theme::font_family(FontRole::Code, cx);
-            let status_note = if diag.exceeds_max_length {
-                Some(("Exceeds 20,000 char limit", hsla(p.destructive)))
+            let status_note: Option<(String, gpui::Hsla)> = if diag.exceeds_max_length {
+                Some(("Exceeds 100,000 char limit".into(), hsla(p.destructive)))
             } else if diag.loads_remote_files {
-                Some(("Remote fetches ignored", hsla(p.warning_foreground)))
+                Some(("Remote fetches ignored".into(), hsla(p.warning_foreground)))
+            } else if diag.applied_slot_rules > 0 && diag.unmapped_dom_rules > 0 {
+                Some((
+                    format!(
+                        "{} slot {} · {} unsupported",
+                        diag.applied_slot_rules,
+                        if diag.applied_slot_rules == 1 { "rule" } else { "rules" },
+                        diag.unmapped_dom_rules
+                    ),
+                    hsla(p.muted_foreground),
+                ))
+            } else if diag.applied_slot_rules > 0 {
+                Some((
+                    format!(
+                        "{} slot {}",
+                        diag.applied_slot_rules,
+                        if diag.applied_slot_rules == 1 { "rule" } else { "rules" }
+                    ),
+                    hsla(p.muted_foreground),
+                ))
+            } else if diag.unmapped_dom_rules > 0 {
+                Some((format!("{} unsupported", diag.unmapped_dom_rules), hsla(p.muted_foreground)))
             } else {
                 None
             };
@@ -582,7 +603,7 @@ impl Render for Editor {
                     div()
                         .text_xs()
                         .text_color(hsla(p.muted_foreground))
-                        .child("Saved with this theme and included when you export it. Custom properties apply live here; DOM selectors apply on web and desktop. Rules that load remote files are ignored."),
+                        .child("Saved with this theme and included when you export it. Custom properties and theme CSS hooks apply live here. Rules that load remote files are ignored."),
                 )
                 .child(editor_box)
                 .child(

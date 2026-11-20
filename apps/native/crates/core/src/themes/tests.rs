@@ -528,3 +528,358 @@ fn decode_uses_top_level_canvas_and_accent_seeds_when_present() {
     .unwrap_err();
     assert!(err.contains("canvas"));
 }
+
+#[test]
+fn slot_engine_parses_all_29_theme_css_hooks_and_scrollbar_aliases() {
+    use slots::{SlotBackground, SlotLength, ThemeSlot};
+
+    assert_eq!(ThemeSlot::ALL.len(), 29);
+
+    let mut css = String::new();
+    for (idx, slot) in ThemeSlot::ALL.iter().enumerate() {
+        let color = format!("#{:02x}{:02x}{:02x}", (idx * 7 + 10) & 0xff, (idx * 11 + 20) & 0xff, (idx * 13 + 30) & 0xff);
+        css.push_str(&format!("{} {{ background-color: {}; padding: {}px; }}\n", slot.selector(), color, idx + 1));
+    }
+
+    let parsed = css::ParsedCss::parse(&css);
+    let diag = parsed.diagnostics();
+    assert_eq!(diag.applied_slot_rules, 58);
+    assert_eq!(diag.unmapped_dom_rules, 0);
+
+    let roles = standard(true);
+    let pal = palette(Some(&roles), true, 100, 80).unwrap();
+    let sheet = parsed.slot_stylesheet(true, &roles, &pal);
+    assert!(!sheet.is_empty());
+    assert!(!sheet.has_scoped_background_image());
+
+    for (idx, slot) in ThemeSlot::ALL.iter().enumerate() {
+        let set = sheet.get(*slot).unwrap_or_else(|| panic!("missing compiled slot {slot:?}"));
+        let r = ((idx * 7 + 10) & 0xff) as u32;
+        let g = ((idx * 11 + 20) & 0xff) as u32;
+        let b = ((idx * 13 + 30) & 0xff) as u32;
+        let expected_color = (r << 24) | (g << 16) | (b << 8) | 0xff;
+        assert_eq!(set.base.background, Some(SlotBackground::Solid(expected_color)), "{slot:?}");
+        assert_eq!(set.base.padding.top, Some(SlotLength::Px((idx + 1) as f32)), "{slot:?}");
+    }
+
+    // WebKit scrollbar aliases map onto ScrollAreaScrollbar and ScrollAreaThumb.
+    let alias_css = r#"
+        ::-webkit-scrollbar { width: 10px; }
+        ::-webkit-scrollbar-thumb { background: #445566; border-radius: 50%; }
+        ::-webkit-scrollbar-thumb:hover { background: #667788; }
+    "#;
+    let alias_parsed = css::ParsedCss::parse(alias_css);
+    assert_eq!(alias_parsed.diagnostics().applied_slot_rules, 4);
+    assert_eq!(alias_parsed.diagnostics().unmapped_dom_rules, 0);
+    let alias_sheet = alias_parsed.slot_stylesheet(true, &roles, &pal);
+    assert_eq!(
+        alias_sheet.get(ThemeSlot::ScrollAreaScrollbar).unwrap().base.width,
+        Some(SlotLength::Px(10.0))
+    );
+    let thumb = alias_sheet.get(ThemeSlot::ScrollAreaThumb).unwrap();
+    assert_eq!(thumb.base.background, Some(SlotBackground::Solid(0x4455_66ff)));
+    assert_eq!(thumb.base.border_radii.top_left, Some(SlotLength::Px(slots::PILL_RADIUS_PX)));
+    assert_eq!(thumb.hover.background, Some(SlotBackground::Solid(0x6677_88ff)));
+}
+
+#[test]
+fn slot_engine_handles_appearance_cascade_specificity_important_pseudo_states_and_row_kinds() {
+    use slots::{SlotBackground, SlotLength, ThemeSlot};
+
+    let css = r#"
+        .dark [data-slot="button"] {
+            background: #111111;
+            padding-left: 4px;
+        }
+        html.dark [data-slot="button"] {
+            border-color: #222222;
+        }
+        [data-slot="button"] {
+            background: #aaaaaa;
+            border-color: #bbbbbb;
+            padding: 8px 16px;
+            opacity: 0.7 !important;
+        }
+        .dark [data-slot="button"] {
+            opacity: 0.9;
+        }
+        :root:not(.dark) [data-slot="button"] {
+            background: #f0f0f0;
+        }
+        [data-slot="button"], [data-slot="select-trigger"] {
+            border-radius: 10px;
+        }
+        [data-slot="button"]:hover {
+            background: #333333;
+        }
+        [data-slot="button"]:active {
+            background: #444444;
+        }
+        [data-timeline-row-kind] {
+            padding: 6px;
+        }
+        [data-timeline-row-kind="message"] {
+            padding-left: 18px;
+            background: #123456;
+        }
+        [data-timeline-row-kind="work"] {
+            display: none;
+        }
+    "#;
+    let parsed = css::ParsedCss::parse(css);
+    let dark_roles = standard(true);
+    let dark_pal = palette(Some(&dark_roles), true, 100, 80).unwrap();
+    let dark_sheet = parsed.slot_stylesheet(true, &dark_roles, &dark_pal);
+
+    let btn = dark_sheet.get(ThemeSlot::Button).unwrap();
+    // `.dark [data-slot="button"]` (0,2,0) beats later `[data-slot="button"]` (0,1,0).
+    assert_eq!(btn.base.background, Some(SlotBackground::Solid(0x1111_11ff)));
+    // `html.dark [data-slot="button"]` (0,2,1) beats later `[data-slot="button"]` (0,1,0).
+    assert_eq!(btn.base.border_color, Some(0x2222_22ff));
+    // Higher-specificity `padding-left: 4px` survives lower-specificity `padding: 8px 16px` shorthand.
+    assert_eq!(btn.base.padding.top, Some(SlotLength::Px(8.0)));
+    assert_eq!(btn.base.padding.right, Some(SlotLength::Px(16.0)));
+    assert_eq!(btn.base.padding.bottom, Some(SlotLength::Px(8.0)));
+    assert_eq!(btn.base.padding.left, Some(SlotLength::Px(4.0)));
+    // `!important` wins over higher-specificity non-important declaration.
+    assert_eq!(btn.base.opacity, Some(0.7));
+    // Comma-separated list applies to both Button and SelectTrigger.
+    assert_eq!(btn.base.border_radii.top_left, Some(SlotLength::Px(10.0)));
+    assert_eq!(
+        dark_sheet.get(ThemeSlot::SelectTrigger).unwrap().base.border_radii.top_left,
+        Some(SlotLength::Px(10.0))
+    );
+    // Pseudo-states stay isolated from base.
+    assert_eq!(btn.hover.background, Some(SlotBackground::Solid(0x3333_33ff)));
+    assert_eq!(btn.active.background, Some(SlotBackground::Solid(0x4444_44ff)));
+
+    // Light mode activates `:root:not(.dark)` instead of `.dark`.
+    let light_roles = standard(false);
+    let light_pal = palette(Some(&light_roles), false, 100, 80).unwrap();
+    let light_sheet = parsed.slot_stylesheet(false, &light_roles, &light_pal);
+    let light_btn = light_sheet.get(ThemeSlot::Button).unwrap();
+    assert_eq!(light_btn.base.background, Some(SlotBackground::Solid(0xf0f0_f0ff)));
+
+    // Timeline row kind matching inherits generic rules and falls back cleanly.
+    let msg_row = dark_sheet.timeline_row("message").unwrap();
+    assert_eq!(msg_row.base.padding.top, Some(SlotLength::Px(6.0)));
+    assert_eq!(msg_row.base.padding.left, Some(SlotLength::Px(18.0)));
+    assert_eq!(msg_row.base.background, Some(SlotBackground::Solid(0x1234_56ff)));
+    let work_row = dark_sheet.timeline_row("work").unwrap();
+    assert_eq!(work_row.base.display_none, Some(true));
+    assert_eq!(work_row.base.padding.top, Some(SlotLength::Px(6.0)));
+    let other_row = dark_sheet.timeline_row("checkpoint").unwrap();
+    assert_eq!(other_row.base.padding.top, Some(SlotLength::Px(6.0)));
+    assert_eq!(other_row.base.display_none, None);
+}
+
+#[test]
+fn slot_engine_parses_vars_gradients_shadows_layout_typography_and_wallpaper_scoping() {
+    use slots::{
+        BackgroundImageSize, SlotAlignItems, SlotBackground, SlotFlexDirection,
+        SlotJustifyContent, SlotLength, SlotLineHeight, SlotSizeConstraint, ThemeSlot,
+    };
+
+    let css = r#"
+        :root {
+            --card-accent: #ff5599;
+            --card-radius: 1rem;
+        }
+        [data-user-message-bubble] {
+            --local-border: var(--card-accent);
+            background: linear-gradient(to right, #112233 10%, #445566, #778899 90%);
+            color: var(--app-theme-text);
+            border: 2px solid var(--local-border);
+            border-top: 4px dashed #aabbcc;
+            border-radius: var(--card-radius) 8px 4px 2px;
+            padding: 4px 8px 12px 16px;
+            margin: 1px 2px auto -4px;
+            gap: 6px 12px;
+            width: 50%;
+            min-width: 120px;
+            max-width: none;
+            height: auto;
+            min-height: 2rem;
+            max-height: 400px;
+            box-shadow: inset 0 1px 4px rgba(255, 255, 255, 0.2), 0 8px 24px -4px #00000080;
+            font-family: "JetBrains Mono", monospace;
+            font-size: 1.25rem;
+            font-weight: bold;
+            line-height: 1.6;
+            flex-direction: column-reverse;
+            align-items: flex-end;
+            justify-content: space-evenly;
+        }
+        [data-slot="dialog-popup"] {
+            box-shadow: none;
+            background: transparent;
+        }
+        [data-slot="popover-popup"] {
+            background: linear-gradient(90deg, #ff0066, #6600ff) no-repeat;
+        }
+        [data-slot="menu-popup"] {
+            background: linear-gradient(180deg, #112233, #445566), #111111;
+        }
+        [data-slot="tooltip-popup"] {
+            background: linear-gradient(not-a-valid-gradient), #223344;
+        }
+        [data-workspace-area="conversation"] {
+            background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)), var(--theme-background-image) center / contain no-repeat;
+        }
+    "#;
+
+    let (_, sheet) = palette_and_slots_for_with_css(None, None, Some(css), true, 100, 80).unwrap();
+    assert!(sheet.has_scoped_background_image());
+
+    let bubble = &sheet.get(ThemeSlot::UserMessageBubble).unwrap().base;
+    match &bubble.background {
+        Some(SlotBackground::LinearGradient { angle_deg, stops }) => {
+            assert_eq!(*angle_deg, 90.0);
+            assert_eq!(stops.len(), 3);
+            assert_eq!(stops[0].color, 0x1122_33ff);
+            assert_eq!(stops[0].position, Some(0.1));
+            assert_eq!(stops[1].color, 0x4455_66ff);
+            assert!((stops[1].position.unwrap() - 0.5).abs() < 1e-5);
+            assert_eq!(stops[2].color, 0x7788_99ff);
+            assert_eq!(stops[2].position, Some(0.9));
+        }
+        other => panic!("expected linear gradient, got {other:?}"),
+    }
+    assert!(bubble.color.is_some());
+    assert_eq!(bubble.border_color, Some(0xaabb_ccff));
+    assert_eq!(bubble.border_widths.top, Some(4.0));
+    assert_eq!(bubble.border_widths.right, Some(2.0));
+    assert_eq!(bubble.border_widths.bottom, Some(2.0));
+    assert_eq!(bubble.border_widths.left, Some(2.0));
+    assert_eq!(bubble.border_radii.top_left, Some(SlotLength::Rem(1.0)));
+    assert_eq!(bubble.border_radii.top_right, Some(SlotLength::Px(8.0)));
+    assert_eq!(bubble.border_radii.bottom_right, Some(SlotLength::Px(4.0)));
+    assert_eq!(bubble.border_radii.bottom_left, Some(SlotLength::Px(2.0)));
+    assert_eq!(bubble.padding.top, Some(SlotLength::Px(4.0)));
+    assert_eq!(bubble.padding.right, Some(SlotLength::Px(8.0)));
+    assert_eq!(bubble.padding.bottom, Some(SlotLength::Px(12.0)));
+    assert_eq!(bubble.padding.left, Some(SlotLength::Px(16.0)));
+    assert_eq!(bubble.margin.top, Some(SlotLength::Px(1.0)));
+    assert_eq!(bubble.margin.right, Some(SlotLength::Px(2.0)));
+    assert_eq!(bubble.margin.bottom, Some(SlotLength::Auto));
+    assert_eq!(bubble.margin.left, Some(SlotLength::Px(-4.0)));
+    assert_eq!(bubble.row_gap, Some(SlotLength::Px(6.0)));
+    assert_eq!(bubble.column_gap, Some(SlotLength::Px(12.0)));
+    assert_eq!(bubble.width, Some(SlotLength::Fraction(0.5)));
+    assert_eq!(bubble.min_width, Some(SlotLength::Px(120.0)));
+    assert_eq!(bubble.max_width, Some(SlotSizeConstraint::None));
+    assert_eq!(bubble.height, Some(SlotLength::Auto));
+    assert_eq!(bubble.min_height, Some(SlotLength::Rem(2.0)));
+    assert_eq!(bubble.max_height, Some(SlotSizeConstraint::Px(400.0)));
+    let shadows = bubble.box_shadows.as_ref().unwrap();
+    assert_eq!(shadows.len(), 2);
+    assert!(shadows[0].inset);
+    assert_eq!(shadows[0].blur_radius, 4.0);
+    assert!(!shadows[1].inset);
+    assert_eq!(shadows[1].spread_radius, -4.0);
+    assert_eq!(shadows[1].color, 0x0000_0080);
+    assert_eq!(bubble.font_family.as_deref(), Some("\"JetBrains Mono\", monospace"));
+    assert_eq!(bubble.font_size, Some(20.0));
+    assert_eq!(bubble.font_weight, Some(700));
+    assert_eq!(bubble.line_height, Some(SlotLineHeight::Relative(1.6)));
+    assert_eq!(bubble.flex_direction, Some(SlotFlexDirection::ColumnReverse));
+    assert_eq!(bubble.align_items, Some(SlotAlignItems::FlexEnd));
+    assert_eq!(bubble.justify_content, Some(SlotJustifyContent::SpaceEvenly));
+
+    let dialog = &sheet.get(ThemeSlot::DialogPopup).unwrap().base;
+    assert_eq!(dialog.box_shadows, Some(Vec::new()));
+    assert_eq!(dialog.background, Some(SlotBackground::Transparent));
+
+    // Gradient shorthand with trailing keywords and comma-separated layers/fallback colors.
+    match &sheet.get(ThemeSlot::PopoverPopup).unwrap().base.background {
+        Some(SlotBackground::LinearGradient { angle_deg, stops }) => {
+            assert_eq!(*angle_deg, 90.0);
+            assert_eq!(stops.len(), 2);
+            assert_eq!(stops[0].color, 0xff00_66ff);
+            assert_eq!(stops[1].color, 0x6600_ffff);
+        }
+        other => panic!("expected gradient with trailing no-repeat, got {other:?}"),
+    }
+    match &sheet.get(ThemeSlot::MenuPopup).unwrap().base.background {
+        Some(SlotBackground::LinearGradient { angle_deg, stops }) => {
+            assert_eq!(*angle_deg, 180.0);
+            assert_eq!(stops[0].color, 0x1122_33ff);
+            assert_eq!(stops[1].color, 0x4455_66ff);
+        }
+        other => panic!("expected gradient from comma-separated layer, got {other:?}"),
+    }
+    assert_eq!(
+        sheet.get(ThemeSlot::TooltipPopup).unwrap().base.background,
+        Some(SlotBackground::Solid(0x2233_44ff))
+    );
+
+    let conv = &sheet.get(ThemeSlot::ConversationArea).unwrap().base;
+    assert_eq!(
+        conv.background,
+        Some(SlotBackground::ThemeBackgroundImage {
+            size: BackgroundImageSize::Contain,
+            overlay_color: Some(0x0000_0080),
+        })
+    );
+}
+
+#[test]
+fn slot_engine_enforces_safety_clamps_blocks_remote_fetches_and_separates_diagnostics() {
+    use slots::ThemeSlot;
+
+    let css = r#"
+        @import url("https://evil.example/a.css");
+        :root {
+            --sneaky: url(https://evil.example/leak.png);
+        }
+        [data-slot="button"] {
+            border-width: 999px;
+            box-shadow: 0 0 900px #000000;
+            font-size: 400px;
+            opacity: 2.5;
+            background: url(https://evil.example/bg.png);
+            background-image: image-set(url(https://evil.example/x.png) 1x);
+            color: var(--sneaky);
+            backdrop-filter: blur(12px);
+        }
+        [data-slot="input"] {
+            font-size: 2px;
+            opacity: -0.5;
+        }
+        [data-slot="button"] svg {
+            color: #ff0000;
+        }
+        [data-slot="button"]::before {
+            background: #ff0000;
+        }
+        svg.lucide {
+            stroke-width: 2px;
+        }
+    "#;
+
+    let parsed = css::ParsedCss::parse(css);
+    let diag = parsed.diagnostics();
+    assert!(diag.loads_remote_files);
+    // Supported declarations on Button (border-width, box-shadow, font-size, opacity, color) + Input (font-size, opacity) = 7.
+    // Remote `background: url(...)` & `background-image: image-set(...)` are dropped before counting.
+    assert_eq!(diag.applied_slot_rules, 7);
+    // Unmapped: `backdrop-filter` on Button + `[data-slot="button"] svg` + `::before` + `svg.lucide` = 4.
+    assert_eq!(diag.unmapped_dom_rules, 4);
+
+    let roles = standard(true);
+    let pal = palette(Some(&roles), true, 100, 80).unwrap();
+    let sheet = parsed.slot_stylesheet(true, &roles, &pal);
+
+    let btn = &sheet.get(ThemeSlot::Button).unwrap().base;
+    assert_eq!(btn.border_widths.top, Some(slots::MAX_BORDER_WIDTH_PX));
+    assert_eq!(btn.box_shadows.as_ref().unwrap()[0].blur_radius, slots::MAX_BLUR_PX);
+    assert_eq!(btn.font_size, Some(slots::MAX_FONT_SIZE_PX));
+    assert_eq!(btn.opacity, Some(1.0));
+    // Remote fetch declarations were completely dropped.
+    assert_eq!(btn.background, None);
+    assert_eq!(btn.color, None);
+
+    let input = &sheet.get(ThemeSlot::Input).unwrap().base;
+    assert_eq!(input.font_size, Some(slots::MIN_FONT_SIZE_PX));
+    assert_eq!(input.opacity, Some(0.0));
+}

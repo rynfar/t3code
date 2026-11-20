@@ -7,6 +7,7 @@ pub mod default_sync;
 pub mod editor;
 pub mod importer;
 pub mod json_field;
+pub mod slots;
 pub mod transaction;
 #[cfg(test)]
 mod tests;
@@ -394,8 +395,20 @@ pub fn palette_for_with_css(
     contrast: u32,
     glass: u32,
 ) -> Result<BTreeMap<String, u32>, String> {
+    palette_and_slots_for_with_css(id, roles, theme_css, dark, contrast, glass).map(|(p, _)| p)
+}
+
+/// Evaluates palette tokens and compiles `THEME_CSS_HOOKS` slot overrides in a single CSS parse.
+pub fn palette_and_slots_for_with_css(
+    id: Option<&str>,
+    roles: Option<&Colors>,
+    theme_css: Option<&str>,
+    dark: bool,
+    contrast: u32,
+    glass: u32,
+) -> Result<(BTreeMap<String, u32>, slots::SlotStylesheet), String> {
     let Some(raw_css) = theme_css.filter(|s| !s.trim().is_empty()) else {
-        return palette_for(id, roles, dark, contrast, glass);
+        return Ok((palette_for(id, roles, dark, contrast, glass)?, slots::SlotStylesheet::empty()));
     };
     let parsed = css::ParsedCss::parse(raw_css);
     let base_roles = roles.unwrap_or(&DATA.standard[usize::from(dark)]);
@@ -410,9 +423,11 @@ pub fn palette_for_with_css(
         Some(&merged_roles)
     };
     let mut out = palette_for(id, effective_roles, dark, contrast, glass)?;
-    let token_overrides = parsed.token_overrides(dark, effective_roles.unwrap_or(&DATA.standard[usize::from(dark)]));
+    let final_roles = effective_roles.unwrap_or(&DATA.standard[usize::from(dark)]);
+    let token_overrides = parsed.token_overrides(dark, final_roles);
     out.extend(token_overrides);
-    Ok(out)
+    let slot_sheet = parsed.slot_stylesheet(dark, final_roles, &out);
+    Ok((out, slot_sheet))
 }
 pub fn palette_for(
     id: Option<&str>,

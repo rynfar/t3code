@@ -929,15 +929,20 @@ impl Render for Workspace {
                     .flex_1()
                     .h_full()
                     .min_w_0()
-                    .when_some(crate::theme::background_image(cx), |this, image| {
-                        this.child(
-                            gpui::img(image)
-                                .object_fit(gpui::ObjectFit::Cover)
-                                .size_full()
-                                .absolute()
-                                .inset_0(),
-                        )
-                    })
+                    .when_some(
+                        (!crate::theme::slot_stylesheet(cx).has_scoped_background_image())
+                            .then(|| crate::theme::background_image(cx))
+                            .flatten(),
+                        |this, image| {
+                            this.child(
+                                gpui::img(image)
+                                    .object_fit(gpui::ObjectFit::Cover)
+                                    .size_full()
+                                    .absolute()
+                                    .inset_0(),
+                            )
+                        },
+                    )
                     .on_scroll_wheel(cx.listener(Self::handle_history_swipe_wheel))
                     .child(self.render_titlebar(window, cx))
                     .when(has_thread, |this| {
