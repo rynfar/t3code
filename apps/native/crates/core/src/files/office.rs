@@ -63,47 +63,6 @@ impl OfficeKind {
     }
 }
 
-/// Spreadsheet viewport geometry (`office/sheet-viewport.ts`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SheetViewport {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
-/// `cachedViewport` (`office/sheet-viewport.ts`).
-pub fn cached_viewport(frame: SheetViewport, viewport: SheetViewport) -> (f32, f32) {
-    let x = viewport.x.min(frame.x + (frame.width - viewport.width).max(0.0)).max(frame.x);
-    let y = viewport.y.min(frame.y + (frame.height - viewport.height).max(0.0)).max(frame.y);
-    (x, y)
-}
-
-/// `bufferedViewport` (`office/sheet-viewport.ts`).
-pub fn buffered_viewport(viewport: SheetViewport) -> SheetViewport {
-    let margin_x = 128.0_f32.min(viewport.width / 4.0);
-    let margin_y = 256.0_f32.min(viewport.height / 3.0);
-    let x = (viewport.x - margin_x).max(0.0);
-    let y = (viewport.y - margin_y).max(0.0);
-    SheetViewport {
-        x,
-        y,
-        width: viewport.width + viewport.x - x + margin_x,
-        height: viewport.height + viewport.y - y + margin_y,
-    }
-}
-
-/// `retainCachedViewport` (`office/sheet-viewport.ts`).
-pub fn retain_cached_viewport(cached: SheetViewport, incoming: SheetViewport, current: SheetViewport) -> bool {
-    let covers = |frame: SheetViewport| {
-        frame.x <= current.x
-            && frame.y <= current.y
-            && frame.x + frame.width >= current.x + current.width
-            && frame.y + frame.height >= current.y + current.height
-    };
-    covers(cached) && !covers(incoming)
-}
-
 /// `columnName` (`office/sheet-cells.ts`): 0 -> `"A"`, 25 -> `"Z"`, 26 -> `"AA"`.
 pub fn column_name(mut col: usize) -> String {
     let mut name = String::new();

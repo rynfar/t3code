@@ -95,12 +95,15 @@ impl CodeView {
         self.find_focus_pending = true;
     }
 
-    pub fn close_find(&mut self) {
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Preview>) {
         self.find_open = false;
         self.find_focus_pending = false;
         self.find_query.clear();
         self.find_matches.clear();
         self.find_active = 0;
+        if let Some(input) = self.find_input.clone() {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
     }
 
     pub fn recompute_find(&mut self) {
@@ -352,8 +355,8 @@ impl Preview {
                         .size(Size::IconXs)
                         .icon(Icon::X)
                         .tooltip("Close find")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.code.close_find();
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.code.close_find(window, cx);
                             cx.notify();
                         })),
                 )

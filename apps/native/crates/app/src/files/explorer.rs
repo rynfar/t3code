@@ -25,7 +25,7 @@ pub(super) const CONTEXT: &str = "FileTree";
 const MAX_IN_FLIGHT: usize = 4;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
-actions!(file_tree, [SelectPrevious, SelectNext, ExpandSelected, CollapseSelected, OpenSelected, FocusFileSearch]);
+actions!(file_tree, [SelectPrevious, SelectNext, ExpandSelected, CollapseSelected, OpenSelected]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -34,7 +34,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("right", ExpandSelected, Some(CONTEXT)),
         KeyBinding::new("left", CollapseSelected, Some(CONTEXT)),
         KeyBinding::new("enter", OpenSelected, Some(CONTEXT)),
-        KeyBinding::new("secondary-f", FocusFileSearch, Some(CONTEXT)),
     ]);
 }
 
@@ -389,7 +388,7 @@ impl Explorer {
         });
     }
 
-    pub(super) fn on_focus_search(&mut self, _: &FocusFileSearch, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn on_focus_search(&mut self, _: &crate::preview::Find, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_search(window, cx);
     }
 

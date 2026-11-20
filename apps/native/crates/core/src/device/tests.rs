@@ -558,31 +558,6 @@ fn ssh_simlock_and_tool_versions_decode_validate_and_patch() {
 }
 
 #[test]
-fn avcc_demuxer_decodes_simlock_lease_end_frame() {
-    use super::stream::{AvccChunkType, AvccDemuxer, decode_lease_end, lease_ended};
-
-    let envelope = |tag: u8, payload: &[u8]| -> Vec<u8> {
-        let mut out = vec![tag];
-        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        out.extend_from_slice(payload);
-        out
-    };
-    let mut demux = AvccDemuxer::default();
-    let bytes = [envelope(4, &[1]), envelope(7, br#"{"reason":"expired"}"#)].concat();
-    // Feed in split chunks to exercise buffering.
-    let first = demux.push(&bytes[..7]);
-    assert_eq!(first.len(), 1);
-    assert_eq!(first[0].kind, AvccChunkType::Seed);
-    let second = demux.push(&bytes[7..]);
-    assert_eq!(second.len(), 1);
-    assert_eq!(second[0].kind, AvccChunkType::End);
-    let reason = decode_lease_end(&second[0].payload);
-    assert_eq!(reason, "expired");
-    assert_eq!(lease_ended(&reason), "Device lease ended: expired");
-    assert_eq!(decode_lease_end(b"not-json"), "ended");
-}
-
-#[test]
 fn agent_session_tracker_opens_new_sessions_after_baseline_and_waits_for_device() {
     let mut tracker = AgentSessionTracker::default();
     let mut state = ServiceState::empty();

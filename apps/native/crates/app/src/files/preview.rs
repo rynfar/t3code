@@ -9,8 +9,8 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
-    ParentElement, Render, ScrollHandle, Styled, Task, Window, actions, div, prelude::*, px,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement,
+    ParentElement, Render, ScrollHandle, Styled, Task, Window, div, prelude::*, px,
 };
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::scroll::ScrollableElement;
@@ -40,14 +40,6 @@ use super::pdf::{self, PdfReady, PdfState};
 use super::table::TableView;
 use crate::app_state::AppState;
 use crate::theme::{hsla, palette};
-
-const PREVIEW_CONTEXT: &str = "FilePreview";
-
-actions!(file_preview, [FocusPreviewFind]);
-
-pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("secondary-f", FocusPreviewFind, Some(PREVIEW_CONTEXT))]);
-}
 
 /// Text files kept after leaving them, so tabbing back shows them at once.
 const CACHE_LIMIT: usize = 6;
@@ -1108,10 +1100,12 @@ impl Render for Preview {
         };
         v_flex()
             .id("file-preview-content")
-            .key_context(PREVIEW_CONTEXT)
+            .key_context("Preview")
             .track_focus(&self.content_focus)
-            .on_action(cx.listener(|this, _: &FocusPreviewFind, window, cx| {
-                this.focus_find(window, cx);
+            .on_action(cx.listener(|this, _: &crate::preview::Find, window, cx| {
+                if !this.focus_find(window, cx) {
+                    cx.propagate();
+                }
             }))
             .relative()
             .size_full()
@@ -1323,6 +1317,11 @@ mod tests {
                 assert!(p.focus_find(window, cx));
                 let input = p.code.find_input.clone().expect("code find input");
                 assert!(input.read(cx).focus_handle(cx).is_focused(window));
+                input.update(cx, |state, cx| state.set_value("beta", window, cx));
+                assert_eq!(input.read(cx).value().as_str(), "beta");
+                p.code.close_find(window, cx);
+                assert!(!p.code.find_open);
+                assert!(input.read(cx).value().is_empty(), "closing code find must clear the input text");
                 window.blur();
             });
         });

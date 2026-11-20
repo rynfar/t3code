@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, Context, Corners, Entity, FocusHandle, IntoElement,
-    ParentElement, RenderImage, ScrollHandle, SharedString, Styled, Subscription, Task, Window,
-    canvas, div, point, prelude::*, px,
+    AnyElement, App, AppContext, Bounds, Context, Corners, Entity, IntoElement, ParentElement,
+    RenderImage, ScrollHandle, SharedString, Styled, Subscription, Task, Window, canvas, div,
+    point, prelude::*, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
@@ -256,31 +256,59 @@ mod native_pdf {
         doc.render_page(page_index, width)
     }
 
-    pub fn extract_page_text_native(bytes: &[u8], page_index: usize) -> Option<String> {
-        let cls = AnyClass::get(c"PDFDocument")?;
-        let data = NSData::with_bytes(bytes);
-        let doc: Option<Retained<AnyObject>> = unsafe {
-            let alloc: *mut AnyObject = msg_send![cls, alloc];
-            let init: *mut AnyObject = msg_send![alloc, initWithData: &*data];
-            Retained::from_raw(init)
-        };
-        let doc = doc?;
-        let page: *mut AnyObject = unsafe { msg_send![&*doc, pageAtIndex: page_index] };
-        if page.is_null() {
-            return None;
-        }
-        let text: *mut NSString = unsafe { msg_send![page, string] };
-        if text.is_null() {
-            return Some(String::new());
-        }
-        let text_ref: &NSString = unsafe { &*text };
-        Some(text_ref.to_string())
+    /// Single-parse PDF scan handle reused across every page of a progressive Find pass.
+    /// Wraps ObjC allocations (`NSData`, `PDFDocument`, `PDFPage`, `NSString`) in explicit
+    /// autorelease pools so background executor threads never accumulate autoreleased objects.
+    pub struct PdfScanSession {
+        cg_doc: Option<CgPdfDoc>,
+        pdfkit_doc: Option<Retained<AnyObject>>,
     }
 
-    pub fn measure_page_ratio(bytes: &Arc<Vec<u8>>, page_index: usize) -> Option<f32> {
-        let doc = CgPdfDoc::open(bytes)?;
-        let (w, h) = doc.page_dimensions(page_index)?;
-        Some(h / w)
+    impl Drop for PdfScanSession {
+        fn drop(&mut self) {
+            objc2::rc::autoreleasepool(|_| {
+                drop(self.pdfkit_doc.take());
+            });
+        }
+    }
+
+    impl PdfScanSession {
+        pub fn open(bytes: &Arc<Vec<u8>>) -> Self {
+            let cg_doc = CgPdfDoc::open(bytes);
+            let pdfkit_doc = objc2::rc::autoreleasepool(|_| {
+                let cls = AnyClass::get(c"PDFDocument")?;
+                let data = NSData::with_bytes(bytes);
+                unsafe {
+                    let alloc: *mut AnyObject = msg_send![cls, alloc];
+                    let init: *mut AnyObject = msg_send![alloc, initWithData: &*data];
+                    Retained::from_raw(init)
+                }
+            });
+            Self { cg_doc, pdfkit_doc }
+        }
+
+        pub fn page_ratio_and_text(&self, page_index: usize) -> (Option<f32>, Option<String>) {
+            let ratio = self
+                .cg_doc
+                .as_ref()
+                .and_then(|doc| doc.page_dimensions(page_index))
+                .map(|(w, h)| h / w);
+            let text = self.pdfkit_doc.as_ref().and_then(|doc| {
+                objc2::rc::autoreleasepool(|_| {
+                    let page: *mut AnyObject = unsafe { msg_send![&**doc, pageAtIndex: page_index] };
+                    if page.is_null() {
+                        return None;
+                    }
+                    let text: *mut NSString = unsafe { msg_send![page, string] };
+                    if text.is_null() {
+                        return Some(String::new());
+                    }
+                    let text_ref: &NSString = unsafe { &*text };
+                    Some(text_ref.to_string())
+                })
+            });
+            (ratio, text)
+        }
     }
 }
 
@@ -300,14 +328,21 @@ mod native_pdf {
         None
     }
 
-    pub fn extract_page_text_native(bytes: &[u8], page_index: usize) -> Option<String> {
-        let parsed = t3_core::files::pdf::parse_basic_pdf(bytes).ok()?;
-        parsed.pages.get(page_index).map(|p| p.text.clone())
+    pub struct PdfScanSession {
+        parsed: Option<t3_core::files::pdf::BasicPdfDocument>,
     }
 
-    pub fn measure_page_ratio(bytes: &Arc<Vec<u8>>, page_index: usize) -> Option<f32> {
-        let parsed = t3_core::files::pdf::parse_basic_pdf(bytes).ok()?;
-        parsed.pages.get(page_index).map(|p| p.height / p.width)
+    impl PdfScanSession {
+        pub fn open(bytes: &Arc<Vec<u8>>) -> Self {
+            Self { parsed: t3_core::files::pdf::parse_basic_pdf(bytes).ok() }
+        }
+
+        pub fn page_ratio_and_text(&self, page_index: usize) -> (Option<f32>, Option<String>) {
+            match self.parsed.as_ref().and_then(|doc| doc.pages.get(page_index)) {
+                Some(page) => (Some(page.height / page.width), Some(page.text.clone())),
+                None => (None, None),
+            }
+        }
     }
 }
 
@@ -551,12 +586,13 @@ impl Preview {
         ready._find_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(FIND_DEBOUNCE).await;
             let scanner = executor.spawn(async move {
+                let session = native_pdf::PdfScanSession::open(&bytes);
                 for index in 0..page_count {
                     if tx.is_closed() {
                         break;
                     }
-                    let ratio = native_pdf::measure_page_ratio(&bytes, index);
-                    let text = native_pdf::extract_page_text_native(&bytes, index)
+                    let (ratio, native_text) = session.page_ratio_and_text(index);
+                    let text = native_text
                         .or_else(|| fallback_text.get(index).cloned())
                         .unwrap_or_default();
                     if tx.send((index, ratio, text)).is_err() {
@@ -948,10 +984,4 @@ impl Preview {
             )
             .into_any_element()
     }
-}
-
-/// Kept for type-checking focus requests from `FilesPanel`.
-#[allow(dead_code)]
-pub fn pdf_focus_handle(focus: &FocusHandle, window: &mut Window, cx: &mut App) {
-    window.focus(focus, cx);
 }

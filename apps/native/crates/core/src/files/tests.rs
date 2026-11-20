@@ -772,15 +772,6 @@ fn office_parsers_and_spreadsheet_row_col_resize_match_web() {
     assert_eq!(column_name(26), "AA");
     assert_eq!(parse_cell_ref("BC12"), Some((11, 54)));
 
-    // Viewport helpers (`office/sheet-viewport.ts`).
-    let vp = SheetViewport { x: 200.0, y: 300.0, width: 400.0, height: 300.0 };
-    let buf = buffered_viewport(vp);
-    assert_eq!(buf.x, 100.0);
-    assert_eq!(buf.y, 200.0);
-    assert_eq!(cached_viewport(buf, vp), (200.0, 300.0));
-    let small = SheetViewport { x: 250.0, y: 300.0, width: 200.0, height: 200.0 };
-    assert!(retain_cached_viewport(buf, small, vp));
-
     let make_zip = |files: &[(&str, &str)]| -> Vec<u8> {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {

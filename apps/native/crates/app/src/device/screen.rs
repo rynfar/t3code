@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use gpui::{
     App, Bounds, Context, Corners, DispatchPhase, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, RenderOnce, SharedString, Styled, Task,
-    Window, canvas, div, point, prelude::*, px, quad, size,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, RenderImage, RenderOnce, SharedString, Styled,
+    Subscription, Task, Window, canvas, div, point, prelude::*, px, quad, size,
 };
 use gpui_component::input::InputState;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -41,7 +41,7 @@ use t3_core::preview::stream::{dom_key, fit};
 
 use super::pane::{Stage, loading_view};
 use super::{Abort, Devices};
-use crate::app_state::AppState;
+use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::right_panel::{Button, Size, Variant};
 use crate::settings::controls::{Button as ActionButton, ButtonSize, ButtonVariant};
@@ -170,10 +170,19 @@ pub struct DeviceScreen {
     pub(super) android_fold: Option<AndroidFoldState>,
     pub(super) fold_pending: bool,
     pub(super) fold_error: Option<String>,
+    /// Tracks environment/connection switches so hub SSE/poll tasks restart with fresh credentials.
+    connection_id: Option<u64>,
+    _state_sub: Subscription,
 }
 
 impl DeviceScreen {
     pub fn new(state: Entity<AppState>, devices: Entity<Devices>, thread_id: String, surface_id: String, device: Device, cx: &mut Context<Self>) -> Self {
+        let connection_id = state.read(cx).connection_id();
+        let state_sub = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
+            if *event == AppEvent::Phase {
+                this.sync_connection(cx);
+            }
+        });
         cx.on_release(|this: &mut DeviceScreen, cx| {
             for image in [this.image.take(), this.retired.take()].into_iter().flatten() {
                 cx.drop_image(image, None);
@@ -215,7 +224,32 @@ impl DeviceScreen {
             android_fold: None,
             fold_pending: false,
             fold_error: None,
+            connection_id,
+            _state_sub: state_sub,
         }
+    }
+
+    fn sync_connection(&mut self, cx: &mut Context<Self>) {
+        let next = self.state.read(cx).connection_id();
+        if next == self.connection_id {
+            return;
+        }
+        self.connection_id = next;
+        self.live_foreground = None;
+        self.ax_elements.clear();
+        self.event_log.clear();
+        self.android_fold = None;
+        self.fold_pending = false;
+        self.fold_error = None;
+        self.stop_hub_streams();
+        if self.visible {
+            self.sync_hub_streams(cx);
+            self.read_detail(cx);
+            if self.tools_open {
+                self.read_fold(cx);
+            }
+        }
+        cx.notify();
     }
 
     pub fn shows(&self, device: &Device) -> bool {
@@ -394,15 +428,18 @@ impl DeviceScreen {
         }
         let state = self.state.read(cx);
         let Some(client) = state.client_handle() else { return };
+        let conn = self.connection_id;
         let credentials = Arc::new(client.credentials().clone());
         let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
         let task = state.runtime().spawn(read_android_fold(credentials, target));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(fold)) = task.await {
                 let _ = this.update(cx, |this, cx| {
-                    this.android_fold = Some(fold);
-                    this.fold_error = None;
-                    cx.notify();
+                    if this.connection_id == conn {
+                        this.android_fold = Some(fold);
+                        this.fold_error = None;
+                        cx.notify();
+                    }
                 });
             }
         })
@@ -415,6 +452,7 @@ impl DeviceScreen {
         }
         let state = self.state.read(cx);
         let Some(client) = state.client_handle() else { return };
+        let conn = self.connection_id;
         let credentials = Arc::new(client.credentials().clone());
         let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
         let task = state.runtime().spawn(set_android_fold(credentials, target, posture));
@@ -424,6 +462,9 @@ impl DeviceScreen {
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|_| Err("Fold command failed.".to_owned()));
             let _ = this.update(cx, |this, cx| {
+                if this.connection_id != conn {
+                    return;
+                }
                 this.fold_pending = false;
                 match result {
                     Ok(fold) => this.android_fold = Some(fold),

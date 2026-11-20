@@ -43,7 +43,6 @@ pub use actions::FileWorkspace;
 pub fn init(cx: &mut App) {
     explorer::init(cx);
     editor::init(cx);
-    preview::init(cx);
 }
 
 use crate::app_state::{AppEvent, AppState, Phase};
@@ -679,13 +678,15 @@ impl Render for FilesPanel {
         let subheader_path = path.as_deref().or(has_trail.then_some(""));
         v_flex()
             .id("files-panel-root")
+            .key_context("Preview")
             .size_full()
             .min_h_0()
             .bg(hsla(p.background))
             .on_action(cx.listener(move |this, _: &crate::preview::Find, window, cx| {
                 // `pingdotgg/t3code#34346` & `#34360`: when browsing files with no file open,
                 // panel Find focuses the explorer search; when previewing a file, focus the file's
-                // find bar (PDF / code / editor).
+                // find bar (PDF / code / editor), falling back to explorer search when the preview
+                // has no in-file find bar.
                 if !previewing {
                     this.explorer.update(cx, |explorer, cx| explorer.focus_search(window, cx));
                 } else {
@@ -1041,6 +1042,24 @@ mod tests {
             window.draw(cx).clear();
             let content_focus = preview_entity.read(cx).content_focus.clone();
             assert!(content_focus.is_focused(window), "opening a read-only file must focus preview content");
+
+            // Dispatching `preview.find` on a non-searchable preview (e.g. RTF Office doc)
+            // propagates out of `Preview` to `FilesPanel` and falls back to explorer search.
+            preview_entity.update(cx, |preview, cx| {
+                preview.load_office_for_test(t3_core::files::office::OfficeKind::Rtf, br"{\rtf1\ansi Hi}".to_vec(), cx);
+                preview.request_content_focus(cx);
+            });
+            window.draw(cx).clear();
+            let content_focus = preview_entity.read(cx).content_focus.clone();
+            assert!(content_focus.is_focused(window));
+            content_focus.dispatch_action(&crate::preview::Find, window, cx);
+            let search_focus = gpui::Focusable::focus_handle(explorer_entity.read(cx).search_input.read(cx), cx);
+            assert!(
+                search_focus.is_focused(window),
+                "preview.find on non-searchable preview must fall back to focusing explorer search"
+            );
+            // Blur before `TestWindow` repaints (`gpui-component` calls `set_text_content_type` on focused inputs).
+            window.blur();
         });
 
         state.update(vcx, |state, _| state.stop_pump());
