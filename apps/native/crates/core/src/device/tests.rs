@@ -154,7 +154,7 @@ fn payloads_and_hub_urls_match_the_web_client() {
 
 #[test]
 fn ios_input_frames_match_serve_sim() {
-    let portrait = Screen { width: 1170., height: 2532., orientation: Orientation::Portrait, input_unavailable: false };
+    let portrait = Screen::new(1170., 2532., Orientation::Portrait);
     let touch_frame = touch(TouchPhase::Begin, 0.25, 0.5, Some(&portrait));
     assert_eq!(touch_frame[0], 0x03);
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&touch_frame[1..]).unwrap(), json!({ "type": "begin", "x": 0.25, "y": 0.5 }));
@@ -180,9 +180,43 @@ fn ios_input_frames_match_serve_sim() {
 fn ios_socket_messages_decode_and_closes_classify() {
     assert_eq!(decode_ios_message(&[0x83]), IosMessage::InputAdmitted);
     let config = [&[0x82][..], br#"{"width":1170,"height":2532,"orientation":"landscape_left","inputUnavailable":true,"screenId":1}"#].concat();
-    assert_eq!(decode_ios_message(&config), IosMessage::Screen(Screen { width: 1170., height: 2532., orientation: Orientation::LandscapeLeft, input_unavailable: true }));
+    assert_eq!(
+        decode_ios_message(&config),
+        IosMessage::Screen(Screen {
+            input_unavailable: true,
+            screen_id: Some(1),
+            ..Screen::new(1170., 2532., Orientation::LandscapeLeft)
+        })
+    );
+    let duo_config = [&[0x82][..], br#"{"width":1200,"height":2000,"orientation":"portrait","screenId":3,"supportsHingeAngle":true,"supportsPhysicalOrientation":true,"hingeAngle":90,"hingePose":"book","tableMode":false,"tableModeAvailable":true}"#].concat();
+    assert_eq!(
+        decode_ios_message(&duo_config),
+        IosMessage::Screen(Screen {
+            screen_id: Some(3),
+            supports_hinge_angle: true,
+            supports_physical_orientation: true,
+            hinge_angle: Some(90.0),
+            hinge_pose: Some(DuoPose::Book),
+            table_mode: Some(false),
+            table_mode_available: Some(true),
+            ..Screen::new(1200., 2000., Orientation::Portrait)
+        })
+    );
+    // Out-of-range hingeAngle is rejected.
+    assert_eq!(
+        decode_ios_message(&[&[0x82][..], br#"{"width":100,"height":200,"orientation":"portrait","hingeAngle":200}"#].concat()),
+        IosMessage::Other
+    );
     assert_eq!(decode_ios_message(&[&[0x82][..], br#"{"width":0,"height":2532,"orientation":"portrait"}"#].concat()), IosMessage::Other);
     assert_eq!(decode_ios_message(&[&[0x82][..], br#"{"width":1,"height":2,"orientation":"sideways"}"#].concat()), IosMessage::Other);
+    assert_eq!(
+        decode_ios_message(&[&[0x90][..], br#"{"requestId":7,"ok":true}"#].concat()),
+        IosMessage::ControlReply(ControlReply { request_id: 7, ok: true, error: None })
+    );
+    assert_eq!(
+        decode_ios_message(&[&[0x90][..], br#"{"requestId":8,"ok":false,"error":"busy"}"#].concat()),
+        IosMessage::ControlReply(ControlReply { request_id: 8, ok: false, error: Some("busy".into()) })
+    );
     assert_eq!(decode_ios_message(&[0x90, b'{', b'}']), IosMessage::Other);
     assert_eq!(decode_ios_message(&[]), IosMessage::Other);
     assert_eq!((classify_close(Some(4401)), classify_close(Some(1008)), classify_close(Some(1006)), classify_close(None)), (CloseAction::Unauthorized, CloseAction::Unauthorized, CloseAction::Retry, CloseAction::Retry));
@@ -196,15 +230,25 @@ fn ios_socket_messages_decode_and_closes_classify() {
 
 #[test]
 fn transports_follow_platform_and_host() {
-    assert_eq!(transport(Platform::Ios, Some(HostKind::Local)), Ok(Transport::Mjpeg));
-    assert_eq!(transport(Platform::Ios, None), Ok(Transport::Mjpeg));
-    assert!(transport(Platform::Android, Some(HostKind::Local)).unwrap_err().contains("Android stream"));
-    assert!(transport(Platform::Ios, Some(HostKind::Simlock)).unwrap_err().contains("this device's stream"));
+    assert_eq!(transport_with_h264(Platform::Ios, Some(HostKind::Local), true), Ok(Transport::Mjpeg));
+    assert_eq!(transport_with_h264(Platform::Ios, None, false), Ok(Transport::Mjpeg));
+    assert_eq!(transport_with_h264(Platform::Android, Some(HostKind::Local), true), Ok(Transport::ServeEmu));
+    assert_eq!(transport_with_h264(Platform::Ios, Some(HostKind::Simlock), true), Ok(Transport::Avcc));
+    assert_eq!(transport_with_h264(Platform::Android, Some(HostKind::Simlock), true), Ok(Transport::Avcc));
+    assert!(transport_with_h264(Platform::Android, Some(HostKind::Local), false).unwrap_err().contains("Android stream"));
+    assert!(transport_with_h264(Platform::Ios, Some(HostKind::Simlock), false).unwrap_err().contains("this device's stream"));
+    if cfg!(target_os = "macos") {
+        assert_eq!(transport(Platform::Android, Some(HostKind::Local)), Ok(Transport::ServeEmu));
+        assert_eq!(transport(Platform::Ios, Some(HostKind::Simlock)), Ok(Transport::Avcc));
+    } else {
+        assert!(transport(Platform::Android, Some(HostKind::Local)).is_err());
+        assert!(transport(Platform::Ios, Some(HostKind::Simlock)).is_err());
+    }
 }
 
 #[test]
 fn the_frame_fits_its_aspect_and_rotates_raw_portrait_frames() {
-    let portrait = Screen { width: 1170., height: 2532., orientation: Orientation::Portrait, input_unavailable: false };
+    let portrait = Screen::new(1170., 2532., Orientation::Portrait);
     let left = Screen { orientation: Orientation::LandscapeLeft, ..portrait };
     assert!((screen_aspect(Platform::Ios, Some(&portrait)) - 1170. / 2532.).abs() < 1e-9);
     assert!((screen_aspect(Platform::Ios, Some(&left)) - 2532. / 1170.).abs() < 1e-9);
@@ -668,4 +712,188 @@ fn device_hub_parsers_cover_ax_tree_foreground_event_log_sse_and_fold() {
     assert!(fold.supported);
     assert_eq!(fold.angle(), 0.0);
     assert_eq!(FoldActionPosture::Opened.body(), json!({ "posture": "opened" }));
+}
+
+#[test]
+fn avcc_demuxer_handles_split_chunks_all_tags_and_simlock_lease_end() {
+    let frame = |tag: u8, payload: &[u8]| {
+        let len = (1 + payload.len()) as u32;
+        [len.to_be_bytes().as_slice(), &[tag], payload].concat()
+    };
+    let wire = [
+        frame(1, b"\x01\x42\xc0\x1e"),
+        frame(4, b"\xff\xd8seed\xff\xd9"),
+        frame(2, b"\x00\x00\x00\x02\x65\x88"),
+        frame(3, b"\x00\x00\x00\x02\x41\x9a"),
+        frame(99, b"unknown-ignored"),
+        frame(7, br#"{"reason":"lease expired"}"#),
+        frame(7, b"not-json"),
+    ]
+    .concat();
+
+    // Feed byte-by-byte to exercise partial header & partial payload reassembly.
+    let mut demuxer = AvccDemuxer::new();
+    let mut out = Vec::new();
+    for byte in &wire {
+        out.extend(demuxer.push(std::slice::from_ref(byte)));
+    }
+    assert_eq!(
+        out,
+        vec![
+            AvccChunk::Description(b"\x01\x42\xc0\x1e".to_vec()),
+            AvccChunk::Seed(b"\xff\xd8seed\xff\xd9".to_vec()),
+            AvccChunk::Keyframe(b"\x00\x00\x00\x02\x65\x88".to_vec()),
+            AvccChunk::Delta(b"\x00\x00\x00\x02\x41\x9a".to_vec()),
+            AvccChunk::End { reason: "lease expired".into() },
+            AvccChunk::End { reason: "ended".into() },
+        ]
+    );
+    assert_eq!(avc_codec_string(b"\x01\x42\xc0\x1e"), "avc1.42c01e");
+    assert_eq!(avc_codec_string(b"\x01"), "avc1.42E01E");
+    assert_eq!(avcc_stream_path("SIM 1", None), "/helper/SIM%201/stream.avcc");
+    assert_eq!(avcc_stream_path("SIM 1", Some(1)), "/helper/SIM%201/panel/1/stream.avcc");
+    assert_eq!(avcc_stream_path("SIM 1", Some(3)), "/helper/SIM%201/panel/3/stream.avcc");
+
+    // Reset drops partial buffered data cleanly.
+    let mut demuxer = AvccDemuxer::new();
+    assert!(demuxer.push(&[0, 0, 0, 10, 2, 1, 2]).is_empty());
+    demuxer.reset();
+    assert_eq!(demuxer.push(&frame(2, b"ok")), vec![AvccChunk::Keyframe(b"ok".to_vec())]);
+}
+
+#[test]
+fn annex_b_conversion_and_avcc_config_extract_sps_pps_and_idr() {
+    let sps = [0x67, 0x42, 0xc0, 0x0a, 0xd9];
+    let pps = [0x68, 0xcb, 0x83, 0xcb, 0x20];
+    let idr = [0x65, 0x88, 0x84, 0x0a];
+    let sei = [0x06, 0x05, 0x01];
+    // Mix 4-byte and 3-byte start codes.
+    let annex_b = [
+        &[0x00, 0x00, 0x00, 0x01][..],
+        &sps,
+        &[0x00, 0x00, 0x01],
+        &pps,
+        &[0x00, 0x00, 0x01],
+        &sei,
+        &[0x00, 0x00, 0x00, 0x01],
+        &idr,
+    ]
+    .concat();
+
+    let converted = annex_b_to_avcc(&annex_b);
+    assert_eq!(converted.sps, vec![sps.to_vec()]);
+    assert_eq!(converted.pps, vec![pps.to_vec()]);
+    assert!(converted.is_key);
+    let expected_avcc = [
+        &(sei.len() as u32).to_be_bytes()[..],
+        &sei,
+        &(idr.len() as u32).to_be_bytes()[..],
+        &idr,
+    ]
+    .concat();
+    assert_eq!(converted.avcc_data, expected_avcc);
+
+    let avcc_cfg = build_avcc_config(&sps, &pps).unwrap();
+    let parsed = parse_avcc_config(&avcc_cfg).unwrap();
+    assert_eq!(parsed.nal_length_size, 4);
+    assert_eq!(parsed.sps, vec![sps.to_vec()]);
+    assert_eq!(parsed.pps, vec![pps.to_vec()]);
+    assert_eq!(parse_avcc_config(&[0, 1, 2]), None);
+
+    // SEMU v1 packet header parsing.
+    let mut semu = Vec::new();
+    semu.extend_from_slice(&SEMU_MAGIC.to_be_bytes());
+    semu.push(1); // version
+    semu.push(SEMU_FLAG_KEY); // flags
+    semu.extend_from_slice(&[0, 0]);
+    semu.extend_from_slice(&123_456u64.to_be_bytes());
+    semu.extend_from_slice(&annex_b);
+    let packet = parse_semu_packet(&semu);
+    assert_eq!(packet.is_key, Some(true));
+    assert_eq!(packet.timestamp_us, Some(123_456));
+    assert_eq!(packet.data, annex_b.as_slice());
+
+    // Raw Annex-B without SEMU header passes through unchanged.
+    let raw = parse_semu_packet(&annex_b);
+    assert_eq!(raw.is_key, None);
+    assert_eq!(raw.timestamp_us, None);
+    assert_eq!(raw.data, annex_b.as_slice());
+
+    assert!(is_video_session_message(r#"{"type":"video-session","width":1080}"#));
+    assert!(!is_video_session_message(r#"{"type":"other"}"#));
+    assert!(!is_video_session_message("not json"));
+}
+
+#[test]
+fn serve_emu_input_and_duo_control_serialize_to_wire_format() {
+    assert_eq!(android_ws_path("emu 1"), "/ws?device=emu%201&frame-meta=1");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_reset_video()).unwrap(), json!({ "type": "reset-video", "ack": false }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_touch(TouchPhase::Begin, 0.2, 0.8)).unwrap(), json!({ "type": "touch", "action": "down", "x": 0.2, "y": 0.8 }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_touch(TouchPhase::Move, 0.3, 0.7)).unwrap(), json!({ "type": "touch", "action": "move", "x": 0.3, "y": 0.7 }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_touch(TouchPhase::End, 0.4, 0.6)).unwrap(), json!({ "type": "touch", "action": "up", "x": 0.4, "y": 0.6 }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_button(HardwareButton::Home)).unwrap(), json!({ "type": "home" }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_button(HardwareButton::AppSwitcher)).unwrap(), json!({ "type": "recents" }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_button(HardwareButton::Back)).unwrap(), json!({ "type": "back" }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_key(KeyPhase::Down, "Escape", false, false).unwrap()).unwrap(), json!({ "type": "back" }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_key(KeyPhase::Down, "Enter", false, false).unwrap()).unwrap(), json!({ "type": "key", "keycode": 66 }));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_key(KeyPhase::Down, "a", false, false).unwrap()).unwrap(), json!({ "type": "text", "text": "a" }));
+    assert_eq!(android_key(KeyPhase::Down, "a", true, false), None);
+    assert_eq!(android_key(KeyPhase::Up, "Enter", false, false), None);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&android_key_from_code(KeyPhase::Down, "Backspace").unwrap()).unwrap(), json!({ "type": "key", "keycode": 67 }));
+
+    // UTF-8 multi-byte chunking respects 300-byte packets and 64-chunk cap.
+    let emoji = "😀".repeat(100); // 400 UTF-8 bytes -> 75 emojis (300 bytes) + 25 emojis (100 bytes)
+    let chunks = android_text_chunks(&emoji);
+    assert_eq!(chunks.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(&chunks[0]).unwrap();
+    let second: serde_json::Value = serde_json::from_str(&chunks[1]).unwrap();
+    assert_eq!(first["text"].as_str().unwrap().len(), 300);
+    assert_eq!(second["text"].as_str().unwrap().len(), 100);
+    let huge = "a".repeat(ANDROID_MAX_TEXT_BYTES * (ANDROID_MAX_TEXT_CHUNKS + 5));
+    assert_eq!(android_text_chunks(&huge).len(), ANDROID_MAX_TEXT_CHUNKS);
+
+    // Synthesized Android screen infers orientation from aspect.
+    assert_eq!(android_screen_for_dimensions(1080, 2400).orientation, Orientation::Portrait);
+    assert_eq!(android_screen_for_dimensions(2400, 1080).orientation, Orientation::LandscapeLeft);
+
+    // Duo commands serialize to tagged 0x10 JSON (except Orientation which uses 0x07).
+    let angle_frame = duo_control_frame(1, DuoCommand::Angle(90.0));
+    assert_eq!(angle_frame[0], 0x10);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&angle_frame[1..]).unwrap(), json!({ "requestId": 1, "command": { "control": "angle", "value": 90.0 } }));
+    let pose_frame = duo_control_frame(2, DuoCommand::Pose(DuoPose::Tent));
+    assert_eq!(pose_frame[0], 0x10);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&pose_frame[1..]).unwrap(), json!({ "requestId": 2, "command": { "control": "pose", "value": "tent" } }));
+    let orient_frame = duo_control_frame(3, DuoCommand::Orientation(Orientation::LandscapeLeft));
+    assert_eq!(orient_frame[0], 0x07);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&orient_frame[1..]).unwrap(), json!({ "orientation": "landscape_left" }));
+
+    // DuoControlQueue enforces single-in-flight, coalesces queued commands, handles reply/timeout.
+    let mut queue = DuoControlQueue::default();
+    assert_eq!(queue.enqueue(DuoCommand::Angle(200.0)), None, "invalid angle dropped");
+    let r1 = queue.enqueue(DuoCommand::Angle(90.0)).unwrap();
+    assert_eq!(r1.request_id, 1);
+    assert!(queue.state().pending);
+    assert_eq!(queue.enqueue(DuoCommand::Angle(30.0)), None);
+    assert_eq!(queue.enqueue(DuoCommand::Pose(DuoPose::Laptop)), None, "latest queued command replaces previous");
+    assert_eq!(queue.state().requested, Some(DuoCommand::Pose(DuoPose::Laptop)));
+    let r2 = queue.receive(&ControlReply { request_id: 1, ok: true, error: None }).unwrap();
+    assert_eq!(r2, DuoControlRequest { request_id: 2, command: DuoCommand::Pose(DuoPose::Laptop) });
+    assert_eq!(queue.receive(&ControlReply { request_id: 2, ok: false, error: Some("jammed".into()) }), None);
+    assert!(!queue.state().pending);
+    assert_eq!(queue.state().error.as_deref(), Some("jammed"));
+    let r3 = queue.enqueue(DuoCommand::Angle(180.0)).unwrap();
+    assert!(queue.timeout(r3.request_id));
+    assert!(queue.state().error.unwrap().contains("timed out"));
+
+    // Duo fold state & hold orientation match duoControl.ts.
+    let cover_closed = Screen { screen_id: Some(1), hinge_angle: Some(0.0), ..Screen::new(1080., 2400., Orientation::Portrait) };
+    assert_eq!(duo_fold_state(&cover_closed), DuoFoldState { fold: DuoFoldShape::Closed, stand: false, phone_vertical: true, settled: true });
+    let inner_book = Screen { screen_id: Some(3), hinge_angle: Some(90.0), hinge_pose: Some(DuoPose::Book), ..Screen::new(2000., 2200., Orientation::LandscapeLeft) };
+    assert_eq!(duo_fold_state(&inner_book), DuoFoldState { fold: DuoFoldShape::Half, stand: false, phone_vertical: true, settled: true });
+    let stand_laptop = Screen { screen_id: Some(3), hinge_angle: Some(110.0), hinge_pose: Some(DuoPose::Laptop), ..Screen::new(2000., 2200., Orientation::Portrait) };
+    assert!(duo_fold_state(&stand_laptop).stand);
+    assert_eq!(duo_hold_orientation(true, Some(1)), Orientation::Portrait);
+    assert_eq!(duo_hold_orientation(false, Some(1)), Orientation::LandscapeLeft);
+    assert_eq!(duo_hold_orientation(true, Some(3)), Orientation::LandscapeLeft);
+    assert_eq!(duo_hold_orientation(false, Some(3)), Orientation::PortraitUpsideDown);
 }
