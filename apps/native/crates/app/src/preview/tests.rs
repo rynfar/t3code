@@ -31,6 +31,18 @@ fn setup(cx: &mut gpui::TestAppContext) -> (Entity<AppState>, Entity<Previews>, 
         install_memory_voice_consent(SavedAudioChoice::Unset, false, cx);
         let installed = crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
         crate::settings::store::init(cx);
+        crate::settings::store::install_committed_client(
+            &installed.0,
+            serde_json::from_value(json!({
+                "browserDefaultViewport": { "_tag": "fill" },
+                "browserDefaultZoomFactor": 1.0,
+                "browserDefaultAppearance": "system",
+                "browserProfiles": [],
+                "browserDefaultProfileId": "default"
+            }))
+            .unwrap(),
+            cx,
+        );
         installed
     });
     state.update(cx, |state, cx| {
@@ -598,4 +610,248 @@ async fn frame_view_reports_stalled_when_connected_without_frames_and_clears_on_
 
     state.update(window_cx, |state, _| state.stop_pump());
     window_cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn settings_updates_flow_live_into_browser_defaults_open_reopen_and_device_toolbar(
+    cx: &mut gpui::TestAppContext,
+) {
+    use t3_core::client_settings::{ClientSettingChange, ClientSettingsDoc};
+    use t3_core::preview::viewport::{
+        AppearancePreference, BrowserProfile, BrowserProfileKind, ViewportSetting, preset_setting,
+    };
+
+    cx.executor().allow_parking();
+    let (state, previews, mut fixture, _runtime) = setup(cx);
+
+    let preset = preset_setting("iphone-12-pro").unwrap();
+    let mut patch = serde_json::Map::new();
+    let mut scratch = ClientSettingsDoc::default();
+    for change in [
+        ClientSettingChange::BrowserProfiles(vec![BrowserProfile {
+            id: "work".into(),
+            name: "Work".into(),
+            kind: BrowserProfileKind::Persistent,
+        }]),
+        ClientSettingChange::BrowserDefaultProfileId("work".into()),
+        ClientSettingChange::BrowserDefaultViewport(preset.clone()),
+        ClientSettingChange::BrowserDefaultZoomFactor(1.25),
+        ClientSettingChange::BrowserDefaultAppearance(AppearancePreference::Dark),
+    ] {
+        patch.extend(scratch.apply_change(&change));
+    }
+    cx.update(|cx| {
+        crate::settings::store::install_committed_client(&state, patch, cx);
+    });
+
+    previews.read_with(cx, |previews, cx| {
+        let defaults = previews.browser_defaults(cx);
+        assert_eq!(defaults.viewport, preset);
+        assert_eq!(defaults.zoom_factor, 1.25);
+        assert_eq!(defaults.appearance, AppearancePreference::Dark);
+        assert_eq!(defaults.profile_id, "work");
+    });
+
+    // New preview session immediately consumes live Settings defaults.
+    previews.update(cx, |previews, cx| {
+        previews.open_session("menu-thread".into(), Some("https://example.org/".into()), cx);
+    });
+    let (open_method, open_payload, open_reply) = next_preview_request(&mut fixture).await;
+    assert_eq!(open_method, method::OPEN);
+    assert_eq!(
+        open_payload["viewport"],
+        json!({ "_tag": "preset", "width": 390, "height": 844, "presetId": "iphone-12-pro" })
+    );
+    assert_eq!(open_payload["zoomFactor"], 1.25);
+    assert_eq!(open_payload["colorScheme"], "dark");
+    assert_eq!(open_payload["profileId"], "work");
+    let _ = open_reply.send(Ok(json!({
+        "threadId": "menu-thread",
+        "tabId": "tab-live-1",
+        "navStatus": { "_tag": "Success", "url": "https://example.org/", "title": "Example" },
+        "canGoBack": false,
+        "canGoForward": false,
+        "runtime": "server",
+        "updatedAt": "2026-11-14T00:00:10Z"
+    })));
+    cx.run_until_parked();
+
+    // Seed a tab with omitted snapshot fields (viewport/zoom/colorScheme/profileId), open it in
+    // the right panel, flush so Previews tracks it, then close it and change defaults before reopen.
+    let partial_snapshot = SessionSnapshot::decode(json!({
+        "threadId": "menu-thread",
+        "tabId": "tab-fallback",
+        "navStatus": { "_tag": "Success", "url": "https://fallback.example/", "title": "Fallback" },
+        "canGoBack": false,
+        "canGoForward": false,
+        "runtime": "server",
+        "updatedAt": "2026-11-14T00:00:11Z"
+    }))
+    .unwrap();
+    previews.update(cx, |previews, cx| {
+        previews.seed_snapshot_for_test(partial_snapshot, cx);
+    });
+    state.update(cx, |state, cx| {
+        state.mutate_panels(cx, |panels, thread| panels.panels.open_browser(thread, Some("tab-fallback")));
+    });
+    cx.run_until_parked();
+    state.update(cx, |state, cx| {
+        state.close_surface("browser:tab-fallback", cx);
+        assert_eq!(state.panels.panels.closed_views().len(), 1);
+    });
+    let (close_method, _, close_reply) = next_preview_request(&mut fixture).await;
+    assert_eq!(close_method, method::CLOSE);
+    let _ = close_reply.send(Ok(json!({})));
+
+    let freeform = ViewportSetting::Freeform { width: 1280, height: 800 };
+    let mut patch2 = serde_json::Map::new();
+    for change in [
+        ClientSettingChange::BrowserDefaultViewport(freeform.clone()),
+        ClientSettingChange::BrowserDefaultZoomFactor(0.9),
+        ClientSettingChange::BrowserDefaultAppearance(AppearancePreference::Light),
+        ClientSettingChange::BrowserDefaultProfileId("default".into()),
+    ] {
+        patch2.extend(scratch.apply_change(&change));
+    }
+    cx.update(|cx| {
+        crate::settings::store::install_committed_client(&state, patch2, cx);
+    });
+
+    state.update(cx, |state, cx| {
+        state.reopen_closed_view(cx);
+    });
+    let (reopen_method, reopen_payload, reopen_reply) = next_preview_request(&mut fixture).await;
+    assert_eq!(reopen_method, method::OPEN);
+    assert_eq!(reopen_payload["url"], "https://fallback.example/");
+    assert_eq!(reopen_payload["viewport"], json!({ "_tag": "freeform", "width": 1280, "height": 800 }));
+    assert_eq!(reopen_payload["zoomFactor"], 0.9);
+    assert_eq!(reopen_payload["colorScheme"], "light");
+    assert_eq!(reopen_payload["profileId"], "default");
+    let _ = reopen_reply.send(Ok(json!({
+        "threadId": "menu-thread",
+        "tabId": "tab-fallback-2",
+        "navStatus": { "_tag": "Success", "url": "https://fallback.example/", "title": "Fallback" },
+        "canGoBack": false,
+        "canGoForward": false,
+        "runtime": "server",
+        "viewport": { "_tag": "fill" },
+        "updatedAt": "2026-11-14T00:00:12Z"
+    })));
+    cx.run_until_parked();
+
+    // Toggling device toolbar from Fill uses the updated non-fill default viewport (1280x800).
+    previews.update(cx, |previews, cx| {
+        previews.seed_snapshot_for_test(snapshot("tab-dt", "https://example.org/", Some("default")), cx);
+    });
+    let (pane, window_cx) = cx.add_window_view(|window, cx| {
+        PreviewPane::new(
+            state.clone(),
+            previews.clone(),
+            "menu-thread".into(),
+            "browser:tab-dt".into(),
+            Some("tab-dt".into()),
+            window,
+            cx,
+        )
+    });
+    pane.update(window_cx, |pane, cx| pane.toggle_device_toolbar_for_test(cx));
+    let (resize_method, resize_payload, resize_reply) = next_preview_request(&mut fixture).await;
+    assert_eq!(resize_method, method::RESIZE);
+    assert_eq!(resize_payload["viewport"], json!({ "_tag": "freeform", "width": 1280, "height": 800 }));
+    let _ = resize_reply.send(Ok(json!({
+        "threadId": "menu-thread",
+        "tabId": "tab-dt",
+        "navStatus": { "_tag": "Success", "url": "https://example.org/", "title": "Example" },
+        "canGoBack": false,
+        "canGoForward": false,
+        "runtime": "server",
+        "viewport": { "_tag": "freeform", "width": 1280, "height": 800 },
+        "updatedAt": "2026-11-14T00:00:13Z"
+    })));
+
+    state.update(window_cx, |state, _| state.stop_pump());
+    window_cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn report_profiles_if_needed_sends_and_deduplicates_preview_report_profiles(
+    cx: &mut gpui::TestAppContext,
+) {
+    use t3_core::client_settings::{ClientSettingChange, ClientSettingsDoc};
+    use t3_core::preview::viewport::{BrowserProfile, BrowserProfileKind};
+
+    cx.executor().allow_parking();
+    let (state, previews, mut fixture, _runtime) = setup(cx);
+
+    let mut patch = serde_json::Map::new();
+    let mut scratch = ClientSettingsDoc::default();
+    patch.extend(scratch.apply_change(&ClientSettingChange::BrowserProfiles(vec![BrowserProfile {
+        id: "work".into(),
+        name: "Work".into(),
+        kind: BrowserProfileKind::Persistent,
+    }])));
+    patch.extend(scratch.apply_change(&ClientSettingChange::BrowserDefaultProfileId("work".into())));
+    cx.update(|cx| {
+        crate::settings::store::install_committed_client(&state, patch, cx);
+    });
+
+    // Pending grants (`can_operate == None`) must NOT send or cache a report.
+    let (err_settled_tx, err_settled_rx) = tokio::sync::oneshot::channel();
+    previews.update(cx, |previews, cx| {
+        previews.set_can_operate_for_test(None);
+        previews.report_profiles_if_needed(cx);
+        previews.set_can_operate_for_test(Some(true));
+        previews.set_report_settled_for_test(err_settled_tx);
+        previews.report_profiles_if_needed(cx);
+        // Immediate repeat while in flight with identical profiles/default is deduplicated.
+        previews.report_profiles_if_needed(cx);
+    });
+
+    // A failed RPC clears the cached key so a subsequent call retries cleanly instead of wedging.
+    let (rpc_method_err, payload_err, reply_err) = next_preview_request(&mut fixture).await;
+    assert_eq!(rpc_method_err, method::REPORT_PROFILES);
+    assert_eq!(
+        payload_err,
+        json!({
+            "profiles": [{ "id": "work", "name": "Work", "kind": "persistent" }],
+            "defaultProfileId": "work",
+        })
+    );
+    let _ = reply_err.send(Err(t3_client::session::RpcError::Closed));
+    assert!(!err_settled_rx.await.unwrap());
+
+    let (ok_settled_tx, ok_settled_rx) = tokio::sync::oneshot::channel();
+    previews.update(cx, |previews, cx| {
+        previews.set_report_settled_for_test(ok_settled_tx);
+        previews.report_profiles_if_needed(cx);
+        // Immediate repeat with identical profiles/default is deduplicated.
+        previews.report_profiles_if_needed(cx);
+    });
+
+    let (rpc_method, payload, reply) = next_preview_request(&mut fixture).await;
+    assert_eq!(rpc_method, method::REPORT_PROFILES);
+    assert_eq!(
+        payload,
+        json!({
+            "profiles": [{ "id": "work", "name": "Work", "kind": "persistent" }],
+            "defaultProfileId": "work",
+        })
+    );
+    let _ = reply.send(Ok(json!({})));
+    assert!(ok_settled_rx.await.unwrap());
+
+    // Repeat after success stays deduplicated, and changing default profile sends a fresh report.
+    let patch2 = scratch.apply_change(&ClientSettingChange::BrowserDefaultProfileId("default".into()));
+    previews.update(cx, |previews, cx| previews.report_profiles_if_needed(cx));
+    cx.update(|cx| {
+        crate::settings::store::install_committed_client(&state, patch2, cx);
+    });
+    previews.update(cx, |previews, cx| previews.report_profiles_if_needed(cx));
+    let (rpc_method2, payload2, reply2) = next_preview_request(&mut fixture).await;
+    assert_eq!(rpc_method2, method::REPORT_PROFILES);
+    assert_eq!(payload2["defaultProfileId"], "default");
+    let _ = reply2.send(Ok(json!({})));
+
+    state.update(cx, |state, _| state.stop_pump());
+    cx.run_until_parked();
 }

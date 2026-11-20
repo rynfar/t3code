@@ -531,7 +531,7 @@ impl PreviewPane {
         let defaults = self.previews.read(cx).browser_defaults(cx);
         let active_profile_id = snapshot.map_or(defaults.profile_id.as_str(), SessionSnapshot::profile_id_or_default);
         let show_profile_badge = active_profile_id != defaults.profile_id;
-        let active_profile_name = profile_name(&defaults.profiles, active_profile_id);
+        let active_profile_name = crate::i18n::t(cx, &profile_name(&defaults.profiles, active_profile_id)).to_owned();
         let annotate_active = self.pick_active || self.annotation.is_some();
         let annotate_disabled = self.tab_id.is_none() || empty || is_unreachable || frame.is_none_or(|frame| !frame.has_frame());
         let p = palette(cx);
@@ -685,7 +685,7 @@ impl PreviewPane {
         let device_toolbar_visible = snapshot.is_some_and(|s| !s.fills_panel());
         let defaults = self.previews.read(cx).browser_defaults(cx);
         let active_profile_id = snapshot.map_or(defaults.profile_id.as_str(), SessionSnapshot::profile_id_or_default);
-        let active_profile_name = profile_name(&defaults.profiles, active_profile_id);
+        let active_profile_name = crate::i18n::t(cx, &profile_name(&defaults.profiles, active_profile_id)).to_owned();
         let has_closed = !self.state.read(cx).panels.panels.closed_views().is_empty();
         let p = palette(cx);
 
@@ -794,10 +794,10 @@ impl PreviewPane {
                                 .truncate()
                                 .text_xs()
                                 .text_color(hsla(p.muted_foreground))
-                                .child(format!("Profile: {active_profile_name}")),
+                                .child(format!("{}{active_profile_name}", crate::i18n::t(cx, "Profile: "))),
                         )
                         .child(
-                            MenuItem::new("preview-menu-clear-cookies", "Clear cookies")
+                            MenuItem::new("preview-menu-clear-cookies", crate::i18n::t(cx, "Clear cookies"))
                                 .disabled(!enabled)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.more_menu_open = false;
@@ -806,7 +806,7 @@ impl PreviewPane {
                                 })),
                         )
                         .child(
-                            MenuItem::new("preview-menu-clear-cache", "Clear cache")
+                            MenuItem::new("preview-menu-clear-cache", crate::i18n::t(cx, "Clear cache"))
                                 .disabled(!enabled)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.more_menu_open = false;
@@ -844,24 +844,24 @@ impl PreviewPane {
                         .bg(hsla(p.card))
                         .child(Icon::Globe.svg().size(px(18.)).text_color(hsla(p.muted_foreground))),
                 )
-                .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child("No preview yet"))
+                .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "No preview yet")))
                 .child(
                     div()
                         .mt(px(4.))
                         .max_w(px(384.))
                         .text_sm()
                         .text_color(hsla(p.muted_foreground))
-                        .child("Type a URL above, or run a dev script. Local servers this thread starts will show up here automatically."),
+                        .child(crate::i18n::t(cx, "Type a URL above, or run a dev script. Local servers this thread starts will show up here automatically.")),
                 )
                 .into_any_element();
         }
-        let header = |icon: Icon, label: &'static str| {
+        let header = |icon: Icon, label: &'static str, cx: &App| {
             h_flex()
                 .gap(px(8.))
                 .text_sm()
                 .text_color(hsla(p.muted_foreground))
                 .child(icon.svg().size(px(16.)).text_color(hsla(p.muted_foreground)))
-                .child(div().font_weight(FontWeight::MEDIUM).child(label))
+                .child(div().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, label)))
         };
         let list = || v_flex().overflow_hidden().rounded(px(12.)).border_1().border_color(hsla(p.border).opacity(0.7)).bg(hsla(p.background));
         let now = crate::sidebar::controller::now_ms();
@@ -935,14 +935,14 @@ impl PreviewPane {
                     .w_full()
                     .max_w(px(576.))
                     .gap(px(24.))
-                    .when(!recent_rows.is_empty(), |this| this.child(v_flex().gap(px(12.)).child(header(Icon::History, "Recently used")).child(list().children(recent_rows))))
+                    .when(!recent_rows.is_empty(), |this| this.child(v_flex().gap(px(12.)).child(header(Icon::History, "Recently used", cx)).child(list().children(recent_rows))))
                     .when(!server_rows.is_empty(), |this| {
                         this.child(
                             v_flex()
                                 .gap(px(12.))
-                                .child(header(Icon::RadioTower, "Local servers"))
+                                .child(header(Icon::RadioTower, "Local servers", cx))
                                 .child(list().children(server_rows))
-                                .child(div().px(px(4.)).text_xs().text_color(hsla(p.muted_foreground)).child("Select a live local server to open it in this browser tab.")),
+                                .child(div().px(px(4.)).text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Select a live local server to open it in this browser tab."))),
                         )
                     }),
             )
@@ -1018,7 +1018,7 @@ impl PreviewPane {
                     .px(px(32.))
                     .py(px(64.))
                     .child(Icon::PreviewError.svg().mb(px(24.)).size(px(48.)).text_color(hsla(p.muted_foreground).opacity(0.7)))
-                    .child(div().mb(px(12.)).text_2xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child("This file can\u{2019}t be shown here"))
+                    .child(div().mb(px(12.)).text_2xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "This file can\u{2019}t be shown here")))
                     .child(
                         div()
                             .text_sm()

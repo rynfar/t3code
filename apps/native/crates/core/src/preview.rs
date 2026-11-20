@@ -26,6 +26,7 @@ pub mod method {
     pub const ADJUST: &str = "preview.adjust";
     pub const CLOSE: &str = "preview.close";
     pub const CLEAR_PROFILE: &str = "preview.clearProfile";
+    pub const REPORT_PROFILES: &str = "preview.reportProfiles";
     pub const LIST: &str = "preview.list";
     pub const SUBSCRIBE_EVENTS: &str = "subscribePreviewEvents";
     pub const SUBSCRIBE_DISCOVERED_SERVERS: &str = "subscribeDiscoveredLocalServers";
@@ -38,6 +39,14 @@ pub const PREVIEW_OPERATE_SCOPE: &str = "preview:operate";
 /// `PREVIEW_ZOOM_LEVELS`, shared with desktop Chromium's zoom steps.
 pub const ZOOM_LEVELS: [f64; 17] = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
 pub const DEFAULT_ZOOM: f64 = 1.0;
+
+/// Matches a raw float against the allowed `ZOOM_LEVELS` steps within floating-point tolerance.
+pub fn normalize_zoom_level(zoom_factor: f64) -> Option<f64> {
+    if !zoom_factor.is_finite() {
+        return None;
+    }
+    ZOOM_LEVELS.iter().copied().find(|level| (*level - zoom_factor).abs() < 1e-9)
+}
 
 /// `PREVIEW_RECENT_URL_LIMIT`.
 const RECENT_URL_LIMIT: usize = 10;
