@@ -1600,15 +1600,12 @@ impl AppState {
         let id = thread_id.to_owned();
         // Deleting a thread also deletes its side chats, which share its worktree (`pingdotgg/t3code#36800`).
         let mut removed_ids = (*deletion.doomed).clone();
-        if let Some(snapshot) = self.shell.snapshot.as_ref() {
-            for entry in &snapshot.threads {
-                if entry.lineage.side_chat == Some(true)
-                    && entry.lineage.parent_thread_id.as_deref() == Some(thread.id.as_str())
-                {
-                    removed_ids.insert(entry.id.clone());
-                }
-            }
+        let mut local_side_chats = Vec::new();
+        self.collect_side_chats_for_deleted_thread(&thread.id, &mut local_side_chats);
+        for doomed_id in deletion.doomed.iter() {
+            self.collect_side_chats_for_deleted_thread(doomed_id, &mut local_side_chats);
         }
+        removed_ids.extend(local_side_chats);
         if let Some(candidate) = self.orphaned_worktree_candidate(thread, &removed_ids) {
             let check_server = self
                 .server_config
@@ -1622,9 +1619,17 @@ impl AppState {
                     |value| t3_core::vcs::decode_worktree_thread_ids(&value),
                 )
             {
+                let family_fetch = self.fetch_family_side_chats(&id);
                 let connection = self.connection_id();
                 cx.spawn(async move |this, cx| {
-                    let occupants = request.await.ok().and_then(Result::ok);
+                    let (occupants, family_side_chats) = match family_fetch {
+                        Some(fetch) => {
+                            let (occ, side_chats) = futures::future::join(request, fetch).await;
+                            (occ.ok().and_then(Result::ok), side_chats)
+                        }
+                        None => (request.await.ok().and_then(Result::ok), Vec::new()),
+                    };
+                    removed_ids.extend(family_side_chats);
                     let _ = this.update(cx, |state, cx| {
                         if state.connection_id() != connection || !deletion.target.same_scope(&state.delete_target()) {
                             return then(state, false, cx);
@@ -4230,6 +4235,190 @@ mod deletion_tests {
             assert_eq!(undone.message, "Undid discard of 1 draft");
             state.stop_pump();
         });
+        runtime.shutdown_background();
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn worktree_cleanup_prompt_excludes_omitted_family_side_chats(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        use t3_client::supervisor::ClientFixture;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, _old_fixture) = cx.update(|cx| {
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        let dialog = cx.update(|cx| cx.new(|cx| crate::dialog::ConfirmDialog::new(state.clone(), cx)));
+        let (client, mut fixture) = ClientFixture::handle(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read", "orchestration:operate", "source-control:write"]
+            }))
+            .unwrap(),
+        );
+        let (mut shell, mut config, connection) = state.read_with(cx, |state, _| {
+            (state.shell.clone(), state.server_config.clone(), state.connection_id())
+        });
+        let make_shell = |id: &str, worktree: &str, root: &str, parent: Option<&str>, side_chat: Option<bool>| {
+            serde_json::json!({
+                "id": id,
+                "projectId": "proj-1",
+                "title": id,
+                "worktreePath": worktree,
+                "createdAt": "2026-04-01T00:00:00Z",
+                "updatedAt": "2026-04-01T00:00:00Z",
+                "lastVisitedAt": null,
+                "providerInstanceId": "replay",
+                "modelSelection": {"instanceId": "replay", "model": "replay"},
+                "runtimeMode": "auto",
+                "interactionMode": "default",
+                "lineage": {
+                    "rootThreadId": root,
+                    "parentThreadId": parent,
+                    "sideChat": side_chat
+                },
+                "status": "idle",
+                "hasActionableProposedPlan": false,
+                "itemCount": 0,
+                "visibleItemCount": 0
+            })
+        };
+        shell.snapshot = Some(
+            serde_json::from_value(serde_json::json!({
+                "snapshotSequence": 1,
+                "projects": [{
+                    "id": "proj-1",
+                    "title": "Repo",
+                    "workspaceRoot": "/repo",
+                    "createdAt": "2026-04-01T00:00:00Z",
+                    "updatedAt": "2026-04-01T00:00:00Z",
+                    "projectIcon": {"kind": "monogram", "text": "R", "color": "blue"}
+                }],
+                "threads": [
+                    make_shell("parent-only-side", "/repo/.worktrees/wt-side", "parent-only-side", None, None),
+                    make_shell("parent-with-fork", "/repo/.worktrees/wt-fork", "parent-with-fork", None, None),
+                ]
+            }))
+            .unwrap(),
+        );
+        config.config.as_mut().unwrap().shell_thread_families = true;
+        let (ready, loaded) = tokio::sync::oneshot::channel();
+        let mut ready = Some(ready);
+        let _loaded = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if *event == AppEvent::Shell && state.scoped_environment("saved-fixture").is_some() {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(());
+                    }
+                }
+            })
+        });
+        let install = state.update(cx, |state, _| {
+            state.connections.install_fixture("saved-fixture", client, shell, config, ConnectionStatus::Connected)
+        });
+        let events = runtime.spawn(install).await.unwrap();
+        loaded.await.unwrap();
+
+        let (ready, activated) = tokio::sync::oneshot::channel();
+        let mut ready = Some(ready);
+        let _activated = state.update(cx, |_, cx| {
+            cx.subscribe(&state, move |state, _, event, _| {
+                if matches!(*event, AppEvent::Shell | AppEvent::ServerConfig)
+                    && state.connection_id() != connection
+                    && state.thread_shell("parent-only-side").is_some()
+                    && state.server_config.config.as_ref().is_some_and(|c| c.shell_thread_families)
+                {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(());
+                    }
+                }
+            })
+        });
+        state.read_with(cx, |state, _| state.connections.activate(Some("saved-fixture")));
+        activated.await.unwrap();
+
+        // 1. Non-side-chat fork sharing the worktree skips the worktree prompt and proceeds directly to delete.
+        state.update(cx, |state, cx| state.delete_thread("parent-with-fork", cx));
+        for _ in 0..2 {
+            let (method, _, reply) = fixture.next_request().await;
+            if method == t3_core::vcs::method::ORCHESTRATION_GET_WORKTREE_THREAD_IDS {
+                reply
+                    .send(Ok(serde_json::json!({"threadIds": ["parent-with-fork", "omitted-side-2", "real-fork"]})))
+                    .unwrap();
+            } else if method == t3_core::families::GET_THREAD_FAMILY {
+                reply
+                    .send(Ok(serde_json::json!({
+                        "snapshotSequence": 1,
+                        "threads": [
+                            make_shell("parent-with-fork", "/repo/.worktrees/wt-fork", "parent-with-fork", None, None),
+                            make_shell("omitted-side-2", "/repo/.worktrees/wt-fork", "parent-with-fork", Some("parent-with-fork"), Some(true)),
+                            make_shell("real-fork", "/repo/.worktrees/wt-fork", "parent-with-fork", Some("parent-with-fork"), Some(false)),
+                        ]
+                    })))
+                    .unwrap();
+            } else {
+                panic!("unexpected RPC while evaluating fork occupants: {method}");
+            }
+        }
+        let mut saw_delete = false;
+        for _ in 0..2 {
+            let (method, params, reply) = fixture.next_request().await;
+            if method == t3_core::families::GET_THREAD_FAMILY {
+                reply.send(Ok(serde_json::json!({"snapshotSequence": 1, "threads": []}))).unwrap();
+            } else if method == t3_core::commands::method::DISPATCH_COMMAND {
+                assert_eq!(params["type"], "thread.delete");
+                assert_eq!(params["threadId"], "parent-with-fork");
+                saw_delete = true;
+                reply.send(Ok(serde_json::json!({"sequence": 2}))).unwrap();
+                break;
+            }
+        }
+        assert!(saw_delete, "non-side-chat occupant must skip worktree prompt and delete thread directly");
+        assert!(!dialog.read_with(cx, |d, _| d.is_open()), "worktree prompt must not open when a non-side-chat fork shares the worktree");
+
+        // 2. Omitted side chat shares the worktree: fetching family side chats excludes it, so worktree prompt opens.
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let mut opened_tx = Some(opened_tx);
+        let _dialog_obs = cx.update(|cx| {
+            cx.observe(&dialog, move |dialog, cx| {
+                if dialog.read(cx).is_open() {
+                    if let Some(tx) = opened_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            })
+        });
+        state.update(cx, |state, cx| state.delete_thread("parent-only-side", cx));
+        let mut saw_worktree_req = false;
+        let mut saw_family_req = false;
+        for _ in 0..2 {
+            let (method, params, reply) = fixture.next_request().await;
+            if method == t3_core::vcs::method::ORCHESTRATION_GET_WORKTREE_THREAD_IDS {
+                assert_eq!(params["worktreePath"], "/repo/.worktrees/wt-side");
+                saw_worktree_req = true;
+                reply.send(Ok(serde_json::json!({"threadIds": ["parent-only-side", "omitted-side-chat"]}))).unwrap();
+            } else if method == t3_core::families::GET_THREAD_FAMILY {
+                saw_family_req = true;
+                reply
+                    .send(Ok(serde_json::json!({
+                        "snapshotSequence": 1,
+                        "threads": [
+                            make_shell("parent-only-side", "/repo/.worktrees/wt-side", "parent-only-side", None, None),
+                            make_shell("omitted-side-chat", "/repo/.worktrees/wt-side", "parent-only-side", Some("parent-only-side"), Some(true)),
+                        ]
+                    })))
+                    .unwrap();
+            } else {
+                panic!("unexpected RPC before worktree decision: {method}");
+            }
+        }
+        assert!(saw_worktree_req && saw_family_req);
+        opened_rx.await.unwrap();
+        assert!(dialog.read_with(cx, |d, _| d.is_open()), "omitted side chat must not suppress worktree cleanup prompt");
+
+        state.update(cx, |state, _| state.stop_pump());
+        drop(events);
         runtime.shutdown_background();
     }
 }

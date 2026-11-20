@@ -1913,13 +1913,9 @@ mod tests {
     #[gpui::test]
     async fn late_teardown_does_not_close_replacement_host(cx: &mut gpui::TestAppContext) {
         // A replacement document mounted while the prior host wound down stays open (`pingdotgg/t3code#30387`).
-        cx.update(gpui_component::init);
-        let rt = std::sync::Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
-        let env: Arc<str> = Arc::from("env-a");
-        let state = cx.update(|cx| cx.new(|cx| AppState::new(rt.clone(), cx)));
-        let client = t3_client::supervisor::ClientHandle::disconnected();
+        let (_runtime, state, client, env, _fixture) = setup_test_state(cx);
         let frame = cx.update(|cx| {
-            cx.new(|cx| McpFrame::new(env.clone(), "thread-1".into(), None, state.clone(), &client, test_entry("item-race"), cx))
+            cx.new(|cx| McpFrame::new(env, "thread-1".into(), None, state.clone(), &client, test_entry("item-race"), cx))
         });
 
         cx.update(|cx| {

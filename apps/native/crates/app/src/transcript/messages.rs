@@ -25,7 +25,7 @@ use t3_core::timeline::{
     split_codex_assistant_segments, strip_displayed_plan_markdown, user_message_file_label,
 };
 
-use super::markdown::{MarkdownStore, markdown_view, prose};
+use super::markdown::{MarkdownStore, prose, user_markdown_view};
 use super::notices::{SubagentLiveElapsed, plain_detail, provider_marks, subagent_avatar};
 use super::parts::{CopyButton, DividerTone, ROW_GROUP, Clock, focusable, ghost_button, ghost_icon_button, ghost_text_button, mono_frame, system_divider, tooltip_icon_button};
 use super::RowEnv;
@@ -948,7 +948,7 @@ pub fn user_row(
     } else {
         let source: Arc<str> = Arc::from(with_line_breaks(display_text));
         let state = markdown.state_in_context(&format!("user:{id}"), &source, Some(action_ctx), cx);
-        Some(markdown_view(&state, cx))
+        Some(user_markdown_view(&state, &source, cx))
     };
     let images = t3_core::media::image_attachments(attachments);
     let videos = t3_core::media::video_attachments(&partitioned.videos);

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::prelude::FluentBuilder;
-use gpui::{App, AppContext, ClipboardItem, Entity, EntityId, FontWeight, HighlightStyle, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, Subscription, Task, div, px, rems};
+use gpui::{AnyElement, App, AppContext, ClipboardItem, Entity, EntityId, FontWeight, HighlightStyle, InteractiveElement, IntoElement, ParentElement, SharedString, StyleRefinement, Styled, Subscription, Task, div, px, rems};
 use gpui_component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_component::{ActiveTheme, h_flex};
 use t3_core::markdown::mentions::{collect_composer_model_mentions, link_model_mentions};
@@ -130,8 +130,13 @@ impl MarkdownState {
             Some(_) => None,
             None => (parent == quote).then_some(parent),
         };
+        let is_user = self.source_key.as_deref().is_some_and(|key| key.starts_with("user:"));
         if let Some(matched) = matched {
-            return Some(t3_core::markdown::clipboard::strip_preserved_leading_whitespace(&matched));
+            return Some(if is_user {
+                t3_core::markdown::clipboard::restore_preserved_leading_whitespace(&matched, source)
+            } else {
+                matched
+            });
         }
         let nested = self.nested_views.lock().unwrap();
         for child in nested.values() {
@@ -700,6 +705,38 @@ pub fn markdown_view(state: impl Into<MarkdownState>, cx: &App) -> TextView {
     };
     let action_ctx = state.action_ctx.lock().unwrap().clone();
     style_markdown_with_source(view, action_ctx, state.code_meta, state.source_key, cx)
+}
+
+/// Renders a user-authored markdown message (`user:*`) while intercepting `Copy` (`Cmd+C`)
+/// so NBSP indentation injected by `preserve_user_leading_whitespace` is restored back to
+/// ASCII spaces/tabs while preserving any literal user-typed NBSPs (`pingdotgg/t3code#38079`).
+pub fn user_markdown_view(state: impl Into<MarkdownState>, raw_source: &Arc<str>, cx: &App) -> AnyElement {
+    let state = state.into();
+    let entity = state.entity.clone();
+    let raw_source = raw_source.clone();
+    div()
+        .w_full()
+        .capture_action(move |_: &gpui_component::input::Copy, window, cx| {
+            let own = entity.read(cx).selected_text();
+            if own.trim().is_empty() {
+                cx.propagate();
+                return;
+            }
+            let cleaned_own = t3_core::markdown::clipboard::restore_preserved_leading_whitespace(&own, &raw_source);
+            let window_selected = gpui_base::TextSelection::selected_text(window, cx);
+            let copied = if window_selected.is_empty() || window_selected.trim() == own.trim() {
+                cleaned_own
+            } else if window_selected.contains(&own) {
+                window_selected.replacen(&own, &cleaned_own, 1)
+            } else {
+                t3_core::markdown::clipboard::restore_preserved_leading_whitespace(&window_selected, &raw_source)
+            };
+            let copied = copied.trim_end_matches(['\r', '\n']).to_owned();
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied));
+            cx.stop_propagation();
+        })
+        .child(markdown_view(state, cx))
+        .into_any_element()
 }
 
 pub fn style_markdown(view: TextView, cx: &App) -> TextView {
@@ -1361,5 +1398,45 @@ mod context_tests {
             assert!(prepared.contains("[Fix diff viewer scroll](t3-thread://v1/thr-unloaded)"), "got: {prepared}");
             assert!(prepared.contains("[Thread on another machine](t3-thread://v1/env-offline/thr-remote)"), "got: {prepared}");
         });
+    }
+
+    #[gpui::test]
+    fn user_markdown_copy_restores_leading_spaces_and_preserves_literal_nbsp(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+        });
+        struct UserCopyHost {
+            state: MarkdownState,
+            raw: Arc<str>,
+        }
+        impl gpui::Render for UserCopyHost {
+            fn render(&mut self, _window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                div().size_full().child(user_markdown_view(&self.state, &self.raw, cx))
+            }
+        }
+        let raw: Arc<str> = Arc::from("  indented line\n\tsecond line\n\u{00A0}\u{00A0}literal nbsp");
+        let (view, visual_cx) = cx.add_window_view(|_, cx| {
+            let mut store = MarkdownStore::new(cx.entity_id());
+            let state = store.state_in_context("user:copy-test", &raw, None, cx);
+            UserCopyHost { state, raw: raw.clone() }
+        });
+        visual_cx.run_until_parked();
+        visual_cx.update(|window, cx| {
+            window.resize(gpui::size(px(420.), px(200.)));
+            window.draw(cx).clear();
+        });
+        visual_cx.run_until_parked();
+        visual_cx.simulate_click(gpui::point(px(12.), px(12.)), gpui::Modifiers::default());
+        visual_cx.update(|window, cx| {
+            let entity = view.read(cx).state.entity.clone();
+            entity.update(cx, |tv, cx| tv.select_all(cx));
+            window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
+        });
+        let copied = visual_cx
+            .update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+            .expect("Copy on user_markdown_view must populate clipboard");
+        assert_eq!(copied, "  indented line\n\tsecond line\n\u{00A0}\u{00A0}literal nbsp");
     }
 }
