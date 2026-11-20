@@ -3,7 +3,7 @@
 use std::fmt;
 use icu_calendar::{Date, Gregorian};
 use icu_datetime::{
-    DateTimeFormatterPreferences, FixedCalendarDateTimeFormatter, NoCalendarFormatter,
+    DateTimeFormatter, DateTimeFormatterPreferences, NoCalendarFormatter,
     fieldsets::{MD, T, YMD},
     input::Time,
     options::YearStyle,
@@ -21,6 +21,25 @@ use crate::sidebar::time::LocalTime;
 enum Cycle { H11, H12, H23, H24 }
 
 include!("timestamp_patterns.rs");
+
+/// Maps exact, language-only, and explicit-default-script tags whose V8 `Intl.DateTimeFormat`
+/// clock patterns match the generated regional supplement (Node v22.22.3 / ICU 78.2).
+/// Regional tags with distinct V8 patterns (e.g. `tr-CY`, `es`, `es-ES`, `es-MX`, `es-Latn-CO`)
+/// are intentionally excluded.
+fn best_patterns_key(id: &icu_locale_core::LanguageIdentifier) -> Option<&'static str> {
+    let lang = id.language.as_str();
+    let script = id.script.as_ref().map(|s| s.as_str());
+    let region = id.region.as_ref().map(|r| r.as_str());
+    match (lang, script, region) {
+        ("es", None, Some("CO")) => Some("es-CO"),
+        ("lt", None | Some("Latn"), None | Some("LT")) => Some("lt-LT"),
+        ("ug", None | Some("Arab"), None | Some("CN")) => Some("ug-CN"),
+        ("mr", None | Some("Deva"), None | Some("IN")) => Some("mr-IN"),
+        ("bg", None | Some("Cyrl"), None | Some("BG")) => Some("bg-BG"),
+        ("tr", None | Some("Latn"), None | Some("TR")) => Some("tr-TR"),
+        _ => None,
+    }
+}
 
 impl Cycle {
     fn twelve(self) -> bool { matches!(self, Self::H11 | Self::H12) }
@@ -45,8 +64,8 @@ struct ClockFormat {
 pub struct IntlTimestampClock {
     formats: [ClockFormat; 3],
     hours: [String; 25],
-    md: FixedCalendarDateTimeFormatter<Gregorian, MD>,
-    ymd: FixedCalendarDateTimeFormatter<Gregorian, YMD>,
+    md: DateTimeFormatter<MD>,
+    ymd: DateTimeFormatter<YMD>,
 }
 
 fn pattern_fields(formatter: &NoCalendarFormatter<T>) -> (Option<Cycle>, Option<DayPeriodNameLength>) {
@@ -79,7 +98,7 @@ impl IntlTimestampClock {
         });
         let prefs = DateTimeFormatterPreferences::from(&locale);
         let regional = NoCalendarFormatter::try_new(prefs, T::hm()).ok()?;
-        let best = best_patterns(&locale.id.to_string());
+        let best = best_patterns_key(&locale.id).and_then(best_patterns);
         let base_cycle = best.as_ref().map(|(cycle, _)| *cycle).or_else(|| pattern_fields(&regional).0)?;
         let regional_twelve = NoCalendarFormatter::try_new({ let mut p = prefs; p.hour_cycle = Some(HourCycle::Clock12); p }, T::hm()).ok()?;
         let locale_cycle = requested.unwrap_or(base_cycle);
@@ -110,8 +129,8 @@ impl IntlTimestampClock {
             Some(ClockFormat { formatter, best_pattern, cycle, width, day_periods })
         };
         let decimal = DecimalFormatter::try_new((&locale).into(), Default::default()).ok()?;
-        let md = FixedCalendarDateTimeFormatter::try_new(prefs, MD::short()).ok()?;
-        let ymd = FixedCalendarDateTimeFormatter::try_new(prefs, YMD::short().with_year_style(YearStyle::Full)).ok()?;
+        let md = DateTimeFormatter::try_new(prefs, MD::short()).ok()?;
+        let ymd = DateTimeFormatter::try_new(prefs, YMD::short().with_year_style(YearStyle::Full)).ok()?;
         Some(Self {
             formats: [make(cycles[0])?, make(cycles[1])?, make(cycles[2])?],
             hours: std::array::from_fn(|hour| decimal.format(&Decimal::from(hour as u8)).to_string()),
@@ -121,18 +140,19 @@ impl IntlTimestampClock {
     }
 
     pub fn numeric_date(&self, local: LocalTime, include_year: bool) -> String {
-        let Ok(date) = Date::try_new_gregorian(local.year as i32, local.month as u8, local.day as u8) else {
+        let Ok(date) = Date::try_new_iso(local.year as i32, local.month as u8, local.day as u8) else {
             return if include_year {
                 format!("{}/{}/{}", local.month, local.day, local.year)
             } else {
                 format!("{}/{}", local.month, local.day)
             };
         };
-        if include_year {
+        let formatted = if include_year {
             self.ymd.format(&date).to_string()
         } else {
             self.md.format(&date).to_string()
-        }
+        };
+        formatted.replace(['\u{202f}', '\u{a0}'], " ")
     }
 
     pub fn time(&self, local: LocalTime, format: TimestampFormat) -> String {
@@ -243,5 +263,20 @@ mod tests {
         let ar_eg = IntlTimestampClock::new("ar-EG").unwrap();
         assert!(ar_eg.numeric_date(local, false).contains('٣'));
         assert!(ar_eg.numeric_date(local, true).contains("٢٠٢٦"));
+
+        // fa-IR: Persian calendar & Extended Arabic-Indic numerals (matches Node Intl)
+        let fa_ir = IntlTimestampClock::new("fa-IR").unwrap();
+        assert_eq!(fa_ir.numeric_date(local, false), "۴/۱۲");
+        assert_eq!(fa_ir.numeric_date(local, true), "۱۴۰۵/۴/۱۲");
+
+        // th-TH: Buddhist calendar year 2569 (matches Node Intl)
+        let th_th = IntlTimestampClock::new("th-TH").unwrap();
+        assert_eq!(th_th.numeric_date(local, false), "3/7");
+        assert_eq!(th_th.numeric_date(local, true), "3/7/2569");
+
+        // bg-BG: regular space before г. (normalized from NNBSP to match Node Intl)
+        let bg_bg = IntlTimestampClock::new("bg-BG").unwrap();
+        assert_eq!(bg_bg.numeric_date(local, false), "3.07");
+        assert_eq!(bg_bg.numeric_date(local, true), "3.07.2026 г.");
     }
 }

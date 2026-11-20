@@ -2746,3 +2746,73 @@ fn home_paths_do_not_prefix_with_workspace_folder() {
         Some("~/.claude/CLAUDE.md\n/Users/me/repo/src/lib.rs")
     );
 }
+
+#[test]
+fn explicit_script_and_language_only_locale_timestamps_match_node_intl() {
+    use crate::client_settings::TimestampFormat::{Locale, TwelveHour, TwentyFourHour};
+    use crate::sidebar::time::{FixedZone, parse_iso, to_local};
+
+    let afternoon = to_local(parse_iso("2026-07-03T13:05:00Z").unwrap(), &FixedZone(0));
+    let midnight = to_local(parse_iso("2026-07-03T00:30:00Z").unwrap(), &FixedZone(0));
+
+    // Verified against Node v22.22.3 / ICU 78.2 `Intl.DateTimeFormat`.
+    let clock_cases = [
+        ("zh-Hans-CN", "13:05", "下午1:05", "13:05", "0:30"),
+        ("zh-Hant-TW", "下午1:05", "下午1:05", "13:05", "上午12:30"),
+        ("zh-Hans", "13:05", "下午1:05", "13:05", "0:30"),
+        ("zh-Hant", "下午1:05", "下午1:05", "13:05", "上午12:30"),
+        ("sr-Latn-RS", "13:05", "1:05 PM", "13:05", "0:30"),
+        ("sr-Cyrl-RS", "13:05", "1:05 PM", "13:05", "0:30"),
+        ("az-Latn-AZ", "13:05", "1:05 PM", "13:05", "0:30"),
+        ("en", "1:05 PM", "1:05 PM", "13:05", "12:30 AM"),
+        ("fr", "13:05", "1:05 PM", "13:05", "0:30"),
+        ("de", "13:05", "1:05 PM", "13:05", "0:30"),
+        ("bg", "13:05", "1:05 ч. pm", "13:05", "0:30"),
+        ("bg-Cyrl-BG", "13:05", "1:05 ч. pm", "13:05", "0:30"),
+        ("tr", "13:05", "ÖS 1:05", "13:05", "0:30"),
+        ("tr-Latn-TR", "13:05", "ÖS 1:05", "13:05", "0:30"),
+        // tr-CY keeps its distinct regional 12-hour cycle & trailing day period (not broadened from tr-TR).
+        ("tr-CY", "1:05 ÖS", "1:05 ÖS", "13:05", "12:30 ÖÖ"),
+        ("lt", "13:05", "01:05 popiet", "13:05", "0:30"),
+        ("lt-Latn-LT", "13:05", "01:05 popiet", "13:05", "0:30"),
+        ("ug", "13:05", "1:05 چ.ك", "13:05", "0:30"),
+        ("ug-Arab-CN", "13:05", "1:05 چ.ك", "13:05", "0:30"),
+        ("mr", "१:०५ PM", "१:०५ PM", "१३:०५", "१२:३० AM"),
+        ("mr-Deva-IN", "१:०५ PM", "१:०५ PM", "१३:०५", "१२:३० AM"),
+        // es stays 24-hour (not broadened from es-CO's 12-hour supplement).
+        ("es", "13:05", "1:05 p. m.", "13:05", "0:30"),
+        ("ja", "13:05", "午後1:05", "13:05", "0:30"),
+        ("ko", "PM 1:05", "PM 1:05", "13:05", "AM 12:30"),
+        ("pt", "13:05", "1:05 PM", "13:05", "0:30"),
+    ];
+    for (tag, locale_pm, twelve_pm, twenty_four_pm, locale_midnight) in clock_cases {
+        let clock = IntlTimestampClock::new(tag).unwrap_or_else(|| panic!("clock for {tag}"));
+        assert_eq!(clock.time(afternoon, Locale), locale_pm, "{tag} locale 13:05");
+        assert_eq!(clock.time(afternoon, TwelveHour), twelve_pm, "{tag} 12h 13:05");
+        assert_eq!(clock.time(afternoon, TwentyFourHour), twenty_four_pm, "{tag} 24h 13:05");
+        assert_eq!(clock.time(midnight, Locale), locale_midnight, "{tag} locale 00:30");
+    }
+
+    let date_cases = [
+        ("zh-Hans-CN", "7/3", "2026/7/3"),
+        ("zh-Hant-TW", "7/3", "2026/7/3"),
+        ("zh-Hans", "7/3", "2026/7/3"),
+        ("zh-Hant", "7/3", "2026/7/3"),
+        ("sr-Latn-RS", "3. 7.", "3. 7. 2026."),
+        ("sr-Cyrl-RS", "3. 7.", "3. 7. 2026."),
+        ("az-Latn-AZ", "03.07", "03.07.2026"),
+        ("en", "7/3", "7/3/2026"),
+        ("fr", "03/07", "03/07/2026"),
+        ("bg", "3.07", "3.07.2026 г."),
+        ("es", "3/7", "3/7/2026"),
+        ("ko", "7. 3.", "2026. 7. 3."),
+        ("pt", "03/07", "03/07/2026"),
+        ("fa-IR", "۴/۱۲", "۱۴۰۵/۴/۱۲"),
+        ("th-TH", "3/7", "3/7/2569"),
+    ];
+    for (tag, md, ymd) in date_cases {
+        let clock = IntlTimestampClock::new(tag).unwrap_or_else(|| panic!("clock for {tag}"));
+        assert_eq!(clock.numeric_date(midnight, false), md, "{tag} MD");
+        assert_eq!(clock.numeric_date(midnight, true), ymd, "{tag} YMD");
+    }
+}

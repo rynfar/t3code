@@ -9,9 +9,10 @@ use std::hash::Hash;
 use serde::Deserialize;
 
 use crate::shell::{ShellState, ThreadShell};
-use crate::sidebar::tag_filter::ThreadKey;
+use crate::sidebar::settled::effective_snoozed;
 use crate::sidebar::status::{ThreadStatus, resolve_status};
-use crate::sidebar::thread::{SubagentRequest, pending_subagent_requests, present_thread};
+use crate::sidebar::tag_filter::ThreadKey;
+use crate::sidebar::thread::{SidebarThread, SubagentRequest, pending_subagent_requests, present_thread};
 use crate::sidebar::time::Ms;
 
 mod linked;
@@ -203,6 +204,25 @@ pub enum NotificationKind {
 /// Matches the push relay's completion confirmation: a final wake can start right after a progress wake.
 pub const RELEASED_COMPLETION_GRACE_MS: Ms = 5_000;
 
+/// `isSnoozedForNotification` (`ThreadNotificationCoordinator.logic.ts`): completion notifications
+/// are suppressed while snoozed or when a completion landed during the snooze window.
+pub fn is_snoozed_for_notification(thread: &SidebarThread, completed_at: Option<Ms>, now: Ms) -> bool {
+    if effective_snoozed(thread, now) {
+        return true;
+    }
+    completed_while_snoozed(thread, completed_at)
+}
+
+fn completed_while_snoozed(thread: &SidebarThread, completed_at: Option<Ms>) -> bool {
+    let Some(completed_at) = completed_at else {
+        return false;
+    };
+    if thread.snoozed_at.is_some_and(|snoozed_at| completed_at < snoozed_at) {
+        return false;
+    }
+    effective_snoozed(thread, completed_at)
+}
+
 /// `ThreadNotificationObservation`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Observation {
@@ -271,9 +291,23 @@ impl<K: Eq + Hash + Clone> NotificationGate<K> {
         quiet: bool,
         now: Ms,
     ) -> Option<NotificationKind> {
+        self.observe_with_snooze_at(key, prior, next, archived, quiet, false, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_with_snooze_at(
+        &mut self,
+        key: &K,
+        prior: Option<&Observation>,
+        next: &Observation,
+        archived: bool,
+        quiet: bool,
+        snoozed: bool,
+        now: Ms,
+    ) -> Option<NotificationKind> {
+        let silenced = archived || quiet || snoozed;
         // The grace survives updates that keep the wake's completion; anything else cancels it.
-        if !archived
-            && !quiet
+        if !silenced
             && let Some(pending) = self.releases.get_mut(key)
             && Some(pending.at) == next.completed_at
         {
@@ -283,7 +317,7 @@ impl<K: Eq + Hash + Clone> NotificationGate<K> {
             return None;
         }
         self.releases.remove(key);
-        if prior.is_none() || archived || quiet {
+        if prior.is_none() || silenced {
             self.skip(key, next.completed_at);
         }
         let fresh = self.attend(key, prior, next);
@@ -378,6 +412,7 @@ struct Observed {
     observation: Observation,
     status: ThreadStatus,
     title: String,
+    snoozed_at_completion: bool,
 }
 
 fn status_key(status: ThreadStatus) -> &'static str {
@@ -431,6 +466,7 @@ fn observe_row(raw: &ThreadShell, request: Option<SubagentRequest>, revision: Op
     let completed = status == ThreadStatus::Ready && run.is_some_and(|run| run.status == "completed");
     let settled = completed && !monitor_holds_wake_completion(raw);
     let completed_at = run.and_then(|run| run.completed_at).filter(|_| settled);
+    let snoozed_at_completion = completed_while_snoozed(&thread, completed_at);
     let background_wake = raw.latest_run_background_wake == Some(true);
     Observed {
         revision,
@@ -438,6 +474,7 @@ fn observe_row(raw: &ThreadShell, request: Option<SubagentRequest>, revision: Op
         observation: Observation { attention, request_id, settled, completed_at, background_wake },
         status,
         title: raw.title.clone(),
+        snoozed_at_completion,
     }
 }
 
@@ -532,7 +569,15 @@ impl ThreadNotifications {
             let Some(state) = self.previous.get(&raw.id) else { continue };
             let archived = raw.archived_at.is_some();
             let quiet = raw.latest_run_stop_requested == Some(true);
-            if let Some(kind) = self.gate.observe_at(&raw.id, prior.as_ref(), &state.observation, archived, quiet, now) {
+            if let Some(kind) = self.gate.observe_with_snooze_at(
+                &raw.id,
+                prior.as_ref(),
+                &state.observation,
+                archived,
+                quiet,
+                state.snoozed_at_completion,
+                now,
+            ) {
                 notifications.push(ThreadNotification {
                     thread_id: raw.id.clone(),
                     kind,

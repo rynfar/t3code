@@ -57,6 +57,11 @@ impl AppState {
 
     pub(crate) fn present_notification(&mut self, environment: &str, notification: ThreadNotification, cx: &mut Context<Self>) {
         let target = ThreadKey::new(environment, &notification.thread_id);
+        if notification.kind == NotificationKind::Completion
+            && self.notification_snoozed(&target, crate::sidebar::controller::now_ms())
+        {
+            return;
+        }
         let plan = presentation(
             self.client_settings.notification_mode,
             self.client_settings.in_app_notifications_enabled,
@@ -99,7 +104,9 @@ impl AppState {
                 let posted = this.update(cx, |state, cx| {
                     state.sync_notification_state(cx);
                     state.retire_hidden_notifications(cx);
-                    state.notifications.pending.is_current(&attempt).then(|| delivery::post(system_notification, cx))
+                    state.notifications.pending.is_current(&attempt).then(|| {
+                        delivery::post(system_notification, state.runtime().clone(), cx)
+                    })
                 }).ok().flatten();
                 let Some(posted) = posted else { return };
                 posted.await
@@ -119,6 +126,18 @@ impl AppState {
 
     fn notification_target(&self, thread_id: &str) -> ThreadKey {
         ThreadKey::new(self.environments.active.as_deref().unwrap_or("local"), thread_id)
+    }
+
+    fn notification_snoozed(&self, target: &ThreadKey, now: i64) -> bool {
+        if self.environments.active.as_deref() == Some(target.environment_id.as_str())
+            && let Some(thread) = self.sidebar.model.thread(&target.thread_id)
+        {
+            return t3_core::sidebar::settled::effective_snoozed(thread, now);
+        }
+        self.fleet
+            .environment(&target.environment_id)
+            .and_then(|env| env.summary.threads.iter().find(|row| row.thread.id == target.thread_id))
+            .is_some_and(|row| t3_core::sidebar::settled::effective_snoozed(&row.thread, now))
     }
 
     fn notification_visible(&self, target: &ThreadKey) -> bool {
