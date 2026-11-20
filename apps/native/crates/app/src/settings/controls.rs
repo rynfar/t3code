@@ -16,9 +16,9 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 
 use crate::icons::Icon;
 use crate::theme::{
-    ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
+    SlotState, ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
     slot_border_color, slot_has_active, slot_has_background, slot_has_hover,
-    theme_slot_background_layer, theme_slot_clipped_background_layer,
+    theme_slot_clipped_background_layer, theme_slot_state_background_layer,
 };
 
 const DISABLED_OPACITY: f32 = 0.64;
@@ -43,7 +43,30 @@ pub fn icon(glyph: Icon, size: f32, color: Hsla) -> Svg {
 }
 
 pub fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
-    move |window, cx| Tooltip::new(text.clone()).theme_slot(ThemeSlot::TooltipPopup, cx).build(window, cx)
+    move |window, cx| {
+        if theme_slot_clipped_background_layer(ThemeSlot::TooltipPopup, px(9.), cx).is_some() {
+            let label = text.clone();
+            return Tooltip::element(move |_, cx| {
+                let p = palette(cx);
+                div()
+                    .relative()
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(px(9.))
+                    .text_xs()
+                    .text_color(hsla(p.popover_foreground))
+                    .theme_slot(ThemeSlot::TooltipPopup, cx)
+                    .children(theme_slot_clipped_background_layer(ThemeSlot::TooltipPopup, px(9.), cx))
+                    .child(div().relative().child(label.clone()))
+            })
+            .p_0()
+            .border_0()
+            .bg(gpui::transparent_black())
+            .shadow_none()
+            .build(window, cx);
+        }
+        Tooltip::new(text.clone()).theme_slot(ThemeSlot::TooltipPopup, cx).build(window, cx)
+    }
 }
 
 fn control_shadow() -> Vec<BoxShadow> {
@@ -294,8 +317,12 @@ impl RenderOnce for Switch {
         let next = !self.checked;
         let disabled = self.disabled;
         let handler = self.on_change.filter(|_| !disabled);
+        let switch_state = if self.checked { SlotState::Selected } else { SlotState::Unchecked };
+        let switch_bg_layer =
+            theme_slot_state_background_layer(ThemeSlot::Switch, switch_state, r(9999.), cx);
         h_flex()
             .id(self.id)
+            .relative()
             .when_some(focus, |this, focus| this.track_focus(&focus))
             .flex_none()
             .w(r(30.))
@@ -305,6 +332,8 @@ impl RenderOnce for Switch {
             .bg(if self.checked { hsla(p.primary) } else { hsla(p.input) })
             .when(focused, |this| this.shadow(focus_ring(hsla(p.ring))))
             .theme_slot(ThemeSlot::Switch, cx)
+            .theme_slot_state(ThemeSlot::Switch, switch_state, cx)
+            .when(focused, |this| this.theme_slot_state(ThemeSlot::Switch, SlotState::FocusWithin, cx))
             .when(disabled, |this| this.opacity(0.64))
             .when(!disabled, |this| {
                 this.cursor_pointer()
@@ -315,8 +344,10 @@ impl RenderOnce for Switch {
                         this.active(|style| refine_slot_active(style, ThemeSlot::Switch, cx))
                     })
             })
+            .children(switch_bg_layer)
             .child(
                 div()
+                    .relative()
                     .size(r(14.))
                     .rounded_full()
                     .bg(thumb)
@@ -327,7 +358,9 @@ impl RenderOnce for Switch {
                         blur_radius: px(3.),
                         spread_radius: px(0.),
                         inset: false,
-                    }]),
+                    }])
+                    .theme_slot(ThemeSlot::SwitchThumb, cx)
+                    .theme_slot_state(ThemeSlot::SwitchThumb, switch_state, cx),
             )
             .when_some(handler, |this, handler| {
                 let on_key = handler.clone();
@@ -571,6 +604,9 @@ impl RenderOnce for Select {
             .text_sm()
             .text_color(hsla(p.foreground))
             .theme_slot(ThemeSlot::SelectTrigger, cx)
+            .when(focused || open, |this| {
+                this.theme_slot_state(ThemeSlot::SelectTrigger, SlotState::FocusWithin, cx)
+            })
             .when(disabled, |v| v.opacity(DISABLED_OPACITY))
             .cursor_pointer()
             .when(!disabled && slot_has_hover(ThemeSlot::SelectTrigger, cx), |this| {
@@ -779,13 +815,16 @@ pub fn group(rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
     let divider = hsla(p.border).opacity(0.5);
     let count = rows.len();
     v_flex()
+        .relative()
         .rounded(r(12.))
         .border_1()
         .border_color(hsla(p.border).opacity(0.6))
         .bg(hsla(p.card).opacity(0.4))
         .shadow(control_shadow())
+        .theme_slot(ThemeSlot::SettingsGroup, cx)
+        .children(theme_slot_clipped_background_layer(ThemeSlot::SettingsGroup, r(12.), cx))
         .children(rows.into_iter().enumerate().map(move |(index, row)| {
-            div().when(index > 0 && index < count, |this| this.border_t_1().border_color(divider)).child(row)
+            div().relative().when(index > 0 && index < count, |this| this.border_t_1().border_color(divider)).child(row)
         }))
 }
 
@@ -1158,7 +1197,7 @@ impl DialogFrame {
             .when(has_custom_bg, |this| {
                 this.bg(hsla(p.dialog_surface)).border_1().border_color(backdrop_border)
             })
-            .children(theme_slot_background_layer(ThemeSlot::DialogPopup, cx))
+            .children(theme_slot_state_background_layer(ThemeSlot::DialogPopup, SlotState::Base, r(16.), cx))
             .shadow(vec![BoxShadow {
                 color: gpui::black().opacity(if dark { 0.9 } else { 0.65 }),
                 offset: point(px(0.), px(24.)),

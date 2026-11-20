@@ -26,7 +26,10 @@ use t3_core::markdown::table::{ColumnAlignment, TableData};
 use super::links::MarkdownActionContext;
 use crate::icons::Icon;
 use crate::selectable_text::{SelectableText, SelectableTextHandle};
-use crate::theme::{SlotStyleOverride, ThemeSlot, apply_slot_override, hsla, palette, slot_style, theme_slot_background_layer};
+use crate::theme::{
+    SlotState, SlotStyleOverride, ThemeSlot, apply_slot_override, hsla, palette, slot_style,
+    theme_slot_state_background_layer,
+};
 use crate::transcript::{media, parts};
 
 pub const ALERT_NODE: &str = "t3-alert";
@@ -1192,7 +1195,12 @@ fn render_code_block(
         .min_w_0()
         .on_scroll_wheel(stop_horizontal_wheel);
     let slot_set = slot_style(ThemeSlot::ChatMarkdownCodeblock, cx);
-    if let Some(bg_layer) = theme_slot_background_layer(ThemeSlot::ChatMarkdownCodeblock, cx) {
+    if let Some(bg_layer) = theme_slot_state_background_layer(
+        ThemeSlot::ChatMarkdownCodeblock,
+        SlotState::Base,
+        px(8.),
+        cx,
+    ) {
         let mut radius_style = gpui::StyleRefinement::default().rounded(px(8.));
         if let Some(set) = &slot_set {
             let corners_only = SlotStyleOverride { border_radii: set.base.border_radii, ..SlotStyleOverride::default() };

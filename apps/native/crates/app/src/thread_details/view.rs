@@ -27,8 +27,8 @@ use crate::git::{BranchPicker, GitDialogs, GitEvent, GitStore};
 use crate::icons::Icon;
 use crate::terminal::TerminalDrawer;
 use crate::theme::{
-    ThemeSlot, ThemeSlotInteractiveExt as _, hsla, metrics, palette, slot_style,
-    theme_slot_background_layer,
+    SlotState, ThemeSlot, ThemeSlotInteractiveExt as _, hsla, metrics, palette, slot_style,
+    theme_slot_state_background_layer,
 };
 use crate::thread_view::ThreadView;
 
@@ -424,6 +424,7 @@ impl Render for DetailsView {
         let card_slot = slot_style(ThemeSlot::ThreadDetailsCard, cx);
         let custom_surface = card_slot.as_ref().is_some_and(|set| {
             set.base.background.is_some()
+                || set.base.border_gradient.is_some()
                 || set.base.border_color.is_some()
                 || !set.base.border_widths.is_empty()
                 || !set.base.border_radii.is_empty()
@@ -446,7 +447,12 @@ impl Render for DetailsView {
             .when(!custom_surface, |this| {
                 this.child(crate::glass::backdrop(16., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
             })
-            .children(theme_slot_background_layer(ThemeSlot::ThreadDetailsCard, cx))
+            .children(theme_slot_state_background_layer(
+                ThemeSlot::ThreadDetailsCard,
+                SlotState::Base,
+                px(16.),
+                cx,
+            ))
             .child(crate::webview::occluder("thread-details-cover", crate::webview::Layer::TranscriptChrome))
             .when(popover, |this| {
                 this.occlude()

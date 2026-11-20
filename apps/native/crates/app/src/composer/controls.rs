@@ -13,8 +13,9 @@ use gpui_component::{ActiveTheme, h_flex};
 
 use crate::icons::Icon;
 use crate::theme::{
-    ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
+    SlotState, ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
     slot_border_color, slot_has_active, slot_has_background, theme_slot_clipped_background_layer,
+    theme_slot_state_background_layer,
 };
 
 type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -22,7 +23,30 @@ type Handler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 const DISABLED_OPACITY: f32 = 0.64;
 
 fn tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
-    move |window, cx| Tooltip::new(text.clone()).theme_slot(ThemeSlot::TooltipPopup, cx).build(window, cx)
+    move |window, cx| {
+        if theme_slot_clipped_background_layer(ThemeSlot::TooltipPopup, px(9.), cx).is_some() {
+            let label = text.clone();
+            return Tooltip::element(move |_, cx| {
+                let p = palette(cx);
+                div()
+                    .relative()
+                    .px(px(10.))
+                    .py(px(5.))
+                    .rounded(px(9.))
+                    .text_xs()
+                    .text_color(hsla(p.popover_foreground))
+                    .theme_slot(ThemeSlot::TooltipPopup, cx)
+                    .children(theme_slot_clipped_background_layer(ThemeSlot::TooltipPopup, px(9.), cx))
+                    .child(div().relative().child(label.clone()))
+            })
+            .p_0()
+            .border_0()
+            .bg(gpui::transparent_black())
+            .shadow_none()
+            .build(window, cx);
+        }
+        Tooltip::new(text.clone()).theme_slot(ThemeSlot::TooltipPopup, cx).build(window, cx)
+    }
 }
 
 /// A footer control (`ComposerControl.tsx`): 28 tall, 16px icon, label at 80% foreground.
@@ -718,7 +742,13 @@ pub fn radio(checked: bool, cx: &App) -> gpui::Div {
 pub fn checkbox(checked: bool, cx: &App) -> gpui::Div {
     let p = palette(cx);
     let dark = cx.theme().is_dark();
+    let state = if checked { SlotState::Selected } else { SlotState::Base };
+    let check_color = crate::theme::slot_style(ThemeSlot::Checkbox, cx)
+        .and_then(|s| (checked).then_some(s.selected.color).flatten().or(s.base.color))
+        .map(hsla)
+        .unwrap_or_else(|| hsla(p.primary_foreground));
     div()
+        .relative()
         .size(px(16.))
         .flex_none()
         .flex()
@@ -727,9 +757,13 @@ pub fn checkbox(checked: bool, cx: &App) -> gpui::Div {
         .rounded(px(4.))
         .border_1()
         .map(|this| match checked {
-            true => this.border_color(hsla(p.primary)).bg(hsla(p.primary)).child(Icon::Check.render(px(12.), hsla(p.primary_foreground))),
+            true => this.border_color(hsla(p.primary)).bg(hsla(p.primary)),
             false => this.border_color(hsla(p.input)).bg(if dark { hsla(p.input).opacity(0.32) } else { hsla(p.background) }),
         })
+        .theme_slot(ThemeSlot::Checkbox, cx)
+        .when(checked, |this| this.theme_slot_state(ThemeSlot::Checkbox, SlotState::Selected, cx))
+        .children(theme_slot_state_background_layer(ThemeSlot::Checkbox, state, px(4.), cx))
+        .when(checked, |this| this.child(div().relative().child(Icon::Check.render(px(12.), check_color))))
 }
 
 /// A segmented radio track (permissions, speed): `input` at 40%, 2px padding.
