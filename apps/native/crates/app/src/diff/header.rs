@@ -271,7 +271,7 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                             .size(Size::IconSm)
                             .icon(Icon::RefreshCw)
                             .icon_size(14.)
-                            .tooltip(if panel.pending || panel.review().is_some_and(|r| r.states.values().any(|s| s.pending)) { "Refreshing diff…" } else { "Refresh diff" })
+                            .tooltip(crate::i18n::t(cx, if panel.pending || panel.review().is_some_and(|r| r.states.values().any(|s| s.pending)) { "Refreshing diff…" } else { "Refresh diff" }))
                             .on_click(act(DiffPanel::refresh)),
                     )
                 })
@@ -282,14 +282,14 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                             .size(Size::IconSm)
                             .icon(if all_collapsed { Icon::ChevronsUpDown } else { Icon::ChevronsDownUp })
                             .icon_size(14.)
-                            .tooltip(if all_collapsed { "Expand all files" } else { "Collapse all files" })
+                            .tooltip(crate::i18n::t(cx, if all_collapsed { "Expand all files" } else { "Collapse all files" }))
                             .on_click(act(DiffPanel::toggle_all_files)),
                     )
                 })
                 .child(
                     segmented("diff-layout", cx)
-                        .child(segment("diff-stacked", Icon::Rows3, layout == Layout::Stacked, "Stacked diff view", window, cx).on_click(stacked))
-                        .child(segment("diff-split", Icon::Columns2, layout == Layout::Split, "Split diff view", window, cx).on_click(split)),
+                        .child(segment("diff-stacked", Icon::Rows3, layout == Layout::Stacked, crate::i18n::t(cx, "Stacked diff view"), window, cx).on_click(stacked))
+                        .child(segment("diff-split", Icon::Columns2, layout == Layout::Split, crate::i18n::t(cx, "Split diff view"), window, cx).on_click(split)),
                 )
                 .child(
                     Button::new("diff-wrap")
@@ -298,7 +298,7 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                         .icon(Icon::TextWrap)
                         .icon_size(14.)
                         .pressed(panel.wrap)
-                        .tooltip(if panel.wrap { "Disable line wrapping" } else { "Enable line wrapping" })
+                        .tooltip(crate::i18n::t(cx, if panel.wrap { "Disable line wrapping" } else { "Enable line wrapping" }))
                         .on_click(act(DiffPanel::toggle_wrap)),
                 )
                 .when(!external, |this| this.child(
@@ -308,7 +308,7 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                         .icon(Icon::Pilcrow)
                         .icon_size(14.)
                         .pressed(panel.ignore_whitespace)
-                        .tooltip(if panel.ignore_whitespace { "Show whitespace changes" } else { "Hide whitespace changes" })
+                        .tooltip(crate::i18n::t(cx, if panel.ignore_whitespace { "Show whitespace changes" } else { "Hide whitespace changes" }))
                         .on_click(act(DiffPanel::toggle_whitespace)),
                 ))
                 .when(test_files > 0, |this| this.child(
@@ -318,7 +318,11 @@ pub fn render(panel: &mut DiffPanel, window: &mut Window, cx: &mut Context<DiffP
                         .icon(Icon::FlaskConical)
                         .icon_size(14.)
                         .pressed(hides_tests)
-                        .tooltip(if hides_tests { format!("Show {test_files} hidden test {}", if test_files == 1 { "file" } else { "files" }) } else { "Hide test files".to_owned() })
+                        .tooltip(if hides_tests {
+                            crate::i18n::t_fmt(cx, "{count, plural, one {Show {count} hidden test file} other {Show {count} hidden test files}}", &[("count", test_files.into())])
+                        } else {
+                            crate::i18n::t(cx, "Hide test files").to_owned()
+                        })
                         .on_click(act(DiffPanel::toggle_hide_test_files)),
                 ))
                 .when(has_files, |this| {

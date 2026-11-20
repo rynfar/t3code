@@ -87,9 +87,9 @@ pub fn decode(bytes: Vec<u8>, svg: bool) -> Result<Decoded, String> {
     Ok(Decoded::Raster { image: Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])), width, height })
 }
 
-/// `toLocaleString` for a dimension.
-fn grouped(value: u32) -> String {
-    t3_core::files::group_thousands(u64::from(value))
+/// `toLocaleString` for a dimension, honoring the app's regional `formattingLocale`.
+fn grouped(value: u32, cx: &App) -> String {
+    crate::i18n::format_integer(cx, i64::from(value))
 }
 
 impl ImageState {
@@ -126,7 +126,7 @@ impl ImageState {
             )
         };
         match self {
-            ImageState::Loading => v_flex().flex_1().child(header("Loading image…".to_owned())).into_any_element(),
+            ImageState::Loading => v_flex().flex_1().child(header(crate::i18n::t(cx, "Loading image…").to_owned())).into_any_element(),
             ImageState::Failed(error) => div()
                 .flex_1()
                 .flex()
@@ -142,7 +142,7 @@ impl ImageState {
             ImageState::Raster { image, width, height } => v_flex()
                 .flex_1()
                 .min_h_0()
-                .child(header(format!("{} × {}", grouped(*width), grouped(*height))))
+                .child(header(format!("{} × {}", grouped(*width, cx), grouped(*height, cx))))
                 .child(frame(img(image.clone()), *width as f32, *height as f32))
                 .into_any_element(),
             ImageState::Svg(image) => v_flex()

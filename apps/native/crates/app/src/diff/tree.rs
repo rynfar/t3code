@@ -32,7 +32,7 @@ pub fn render(panel: &mut DiffPanel, cx: &mut Context<DiffPanel>) -> impl IntoEl
                 .gap(px(4.))
                 .text_xs()
                 .text_color(hsla(p.muted_foreground))
-                .child(div().px(px(4.)).font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Files"))
+                .child(div().px(px(4.)).font_weight(gpui::FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Files")))
                 .child(div().ml_auto().child(count.to_string())),
         )
         .child(

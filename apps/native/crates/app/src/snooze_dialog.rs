@@ -829,7 +829,7 @@ impl Render for SnoozeDialog {
                             div()
                                 .text_sm()
                                 .font_weight(FontWeight::MEDIUM)
-                                .child("Date"),
+                                .child(crate::i18n::t(cx, "Date")),
                         )
                         .child(
                             div()
@@ -868,19 +868,19 @@ impl Render for SnoozeDialog {
                             )
                         }),
                 )
-                .child(Self::field("Time", &self.time, cx))
+                .child(Self::field(crate::i18n::t(cx, "Time"), &self.time, cx))
                 .into_any_element(),
             Mode::Duration => div()
                 .flex()
                 .gap(px(12.))
                 .items_end()
-                .child(Self::field("Snooze for", &self.amount, cx))
+                .child(Self::field(crate::i18n::t(cx, "Snooze for"), &self.amount, cx))
                 .child(div().flex_1().child(self.segmented(
                     "snooze-unit",
                     &[
-                        (DurationUnit::Minutes, "Minutes"),
-                        (DurationUnit::Hours, "Hours"),
-                        (DurationUnit::Days, "Days"),
+                        (DurationUnit::Minutes, crate::i18n::t(cx, "Minutes")),
+                        (DurationUnit::Hours, crate::i18n::t(cx, "Hours")),
+                        (DurationUnit::Days, crate::i18n::t(cx, "Days")),
                     ],
                     self.unit,
                     |this, unit| this.unit = unit,
@@ -948,13 +948,13 @@ impl Render for SnoozeDialog {
                                         .line_height(px(20.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(hsla(p.popover_foreground))
-                                        .child("Custom snooze"),
+                                        .child(crate::i18n::t(cx, "Custom snooze")),
                                 )
                                 .child(
                                     div()
                                         .text_sm()
                                         .text_color(hsla(p.muted_foreground))
-                                        .child("Choose when snoozed threads return to your inbox."),
+                                        .child(crate::i18n::t(cx, "Choose when snoozed threads return to your inbox.")),
                                 ),
                         )
                         .child(
@@ -966,7 +966,7 @@ impl Render for SnoozeDialog {
                                 .gap(px(16.))
                                 .child(self.segmented(
                                     "snooze-mode",
-                                    &[(Mode::Date, "Date and time"), (Mode::Duration, "Duration")],
+                                    &[(Mode::Date, crate::i18n::t(cx, "Date and time")), (Mode::Duration, crate::i18n::t(cx, "Duration"))],
                                     self.mode,
                                     |this, mode| this.mode = mode,
                                     window,
@@ -974,7 +974,7 @@ impl Render for SnoozeDialog {
                                 ))
                                 .child(body)
                                 .children(self.error.map(|error| {
-                                    div().text_sm().text_color(hsla(p.destructive)).child(error)
+                                    div().text_sm().text_color(hsla(p.destructive)).child(crate::i18n::t(cx, error))
                                 })),
                         )
                         .child(
@@ -996,7 +996,7 @@ impl Render for SnoozeDialog {
                                             ButtonSize::Sm,
                                         )
                                         .focus_handle(self.footer_focus[0].clone())
-                                        .label("Edit snooze options")
+                                        .label(crate::i18n::t(cx, "Edit snooze options"))
                                         .icon(Icon::Settings2)
                                         .on_click(
                                             cx.listener(|this, _, window, cx| {
@@ -1013,7 +1013,7 @@ impl Render for SnoozeDialog {
                                         ButtonSize::Default,
                                     )
                                     .focus_handle(self.footer_focus[1].clone())
-                                    .label("Cancel")
+                                    .label(crate::i18n::t(cx, "Cancel"))
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.close(window, cx)),
                                     ),
@@ -1025,7 +1025,7 @@ impl Render for SnoozeDialog {
                                         ButtonSize::Default,
                                     )
                                     .focus_handle(self.footer_focus[2].clone())
-                                    .label("Snooze")
+                                    .label(crate::i18n::t(cx, "Snooze"))
                                     .on_click(
                                         cx.listener(|this, _, window, cx| this.submit(window, cx)),
                                     ),

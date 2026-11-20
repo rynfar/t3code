@@ -64,7 +64,7 @@ impl Explorer {
                     .variant(Variant::Ghost)
                     .size(Size::IconXs)
                     .icon(Icon::RefreshCw)
-                    .tooltip(if refreshing { "Refreshing…" } else { "Refresh files" })
+                    .tooltip(crate::i18n::t(cx, if refreshing { "Refreshing…" } else { "Refresh files" }))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             )
             .child(
@@ -84,7 +84,7 @@ impl Explorer {
                         .variant(Variant::Ghost)
                         .size(Size::IconXs)
                         .icon(if all_open { Icon::ChevronsDownUp } else { Icon::ChevronsUpDown })
-                        .tooltip(if all_open { "Collapse all folders" } else { "Expand all folders" })
+                        .tooltip(crate::i18n::t(cx, if all_open { "Collapse all folders" } else { "Expand all folders" }))
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_all(cx))),
                 )
             })
@@ -159,15 +159,15 @@ impl Explorer {
                     PopupMenuItem::new(label).on_click(move |_, _, cx| state.update(cx, |state, cx| run(state, &path, cx)))
                 };
                 let menu = if let Some(editor) = state.read(cx).preferred_editor_label() {
-                    menu.item(item(format!("Open in {editor}").into(), |state, path, cx| {
+                    menu.item(item(crate::i18n::t_fmt(cx, "Open in {editor}", &[("editor", editor.into())]).into(), |state, path, cx| {
                         state.open_file_in_preferred_editor(path, None, cx);
                     }))
                 } else {
                     menu
                 };
-                menu.item(item("Copy path".into(), |state, path, cx| state.copy_file_path(path, cx)))
-                    .item(item("Copy mention".into(), |state, path, cx| state.copy_file_mention(path, cx)))
-                    .item(item("Add to chat".into(), |state, path, cx| state.add_file_to_chat(path, cx)))
+                menu.item(item(crate::i18n::t(cx, "Copy path").into(), |state, path, cx| state.copy_file_path(path, cx)))
+                    .item(item(crate::i18n::t(cx, "Copy mention").into(), |state, path, cx| state.copy_file_mention(path, cx)))
+                    .item(item(crate::i18n::t(cx, "Add to chat").into(), |state, path, cx| state.add_file_to_chat(path, cx)))
             })
             .into_any_element()
     }
@@ -218,13 +218,13 @@ impl Render for Explorer {
                     .text_color(hsla(p.destructive))
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
-                    .child(format!("{error} Click to retry."))
+                    .child(crate::i18n::t_fmt(cx, "{error} Click to retry.", &[("error", error.into())]))
             }))
             .when(searching && self.search.truncated && !self.search.pending, |this| {
-                this.child(self.render_status("More matches available. Refine your search.".to_owned(), false, cx))
+                this.child(self.render_status(crate::i18n::t(cx, "More matches available. Refine your search.").to_owned(), false, cx))
             })
-            .when(loading && count == 0, |this| this.child(self.render_status("Loading files…".to_owned(), false, cx)))
-            .when(no_matches, |this| this.child(self.render_status("No matching files.".to_owned(), true, cx)))
+            .when(loading && count == 0, |this| this.child(self.render_status(crate::i18n::t(cx, "Loading files…").to_owned(), false, cx)))
+            .when(no_matches, |this| this.child(self.render_status(crate::i18n::t(cx, "No matching files.").to_owned(), true, cx)))
             .when(!no_matches, |this| {
                 this.child(
                     div()

@@ -148,7 +148,7 @@ fn trigger_favicons(mut icons: Vec<AnyElement>, p: &Palette) -> AnyElement {
 }
 
 fn pin_tooltip_label(pinned: bool, label: &str, cx: &App) -> String {
-    let action = if pinned { "Unpin" } else { "Pin" };
+    let action = crate::i18n::t(cx, if pinned { "Unpin" } else { "Pin" });
     match crate::keymap::label("thread.pin", cx) {
         Some(shortcut) => format!("{action} {label} ({shortcut})"),
         None => format!("{action} {label}"),
@@ -406,11 +406,12 @@ impl SidebarPane {
             let fleet_keys = state.scoped_project_scope(&fleet_groups);
             let selected: Vec<_> = fleet_groups.iter().filter(|group| fleet_keys.contains(&group.key)).collect();
             let label = if selected.is_empty() {
-                "Filter threads by project".to_owned()
+                crate::i18n::t(cx, "Filter threads by project").to_owned()
             } else {
                 format!(
-                    "Filter threads by project: {}",
-                    selected.iter().map(|group| group.label.as_str()).collect::<Vec<_>>().join(", ")
+                    "{}: {}",
+                    crate::i18n::t(cx, "Filter threads by project"),
+                    selected.iter().map(|group| if group.is_scratch { crate::i18n::t(cx, "No project") } else { group.label.as_str() }).collect::<Vec<_>>().join(", ")
                 )
             };
             let content = if selected.is_empty() {
@@ -441,11 +442,12 @@ impl SidebarPane {
             .filter(|group| state.sidebar.project_filter_scope.is_selected(group))
             .collect();
         let label = if scoped.is_empty() {
-            "Filter threads by project".to_owned()
+            crate::i18n::t(cx, "Filter threads by project").to_owned()
         } else {
             format!(
-                "Filter threads by project: {}",
-                scoped.iter().map(|group| group.label.as_str()).collect::<Vec<_>>().join(", ")
+                "{}: {}",
+                crate::i18n::t(cx, "Filter threads by project"),
+                scoped.iter().map(|group| if state.is_scratch_project(&group.representative_id) { crate::i18n::t(cx, "No project") } else { group.label.as_str() }).collect::<Vec<_>>().join(", ")
             )
         };
         let content = if scoped.is_empty() {
@@ -484,7 +486,7 @@ impl SidebarPane {
                 .justify_center()
                 .text_xs()
                 .text_color(hsla(p.muted_foreground))
-                .child("No matching projects.")
+                .child(crate::i18n::t(cx, "No matching projects."))
                 .into_any_element()
         } else {
             div()
@@ -680,7 +682,7 @@ impl SidebarPane {
                             .when(highlighted, |s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
                             .hover(|s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
                             .child(scope_row_icon(folder, all_selected, &p))
-                            .child(div().min_w_0().truncate().child("All projects"))
+                            .child(div().min_w_0().truncate().child(crate::i18n::t(cx, "All projects")))
                             .child(div().ml_auto().size(px(24.)).flex_none())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.state.update(cx, |state, cx| state.set_project_scope(Default::default(), cx));
@@ -874,7 +876,7 @@ impl SidebarPane {
                             .when(highlighted, |s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
                             .hover(|s| s.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
                             .child(scope_row_icon(folder, all_selected, &p))
-                            .child(div().min_w_0().truncate().child("All projects"))
+                            .child(div().min_w_0().truncate().child(crate::i18n::t(cx, "All projects")))
                             .child(div().ml_auto().size(px(24.)).flex_none())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.state.update(cx, |state, cx| state.set_scoped_project_scope(Vec::new(), cx));

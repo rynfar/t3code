@@ -112,7 +112,11 @@ impl Render for HomeView {
         }
         let p = palette(cx);
         let scratch = app.scratch_root().is_some();
-        let description = if scratch { "Add a project, or start without one." } else { "Add a project to start your first thread." };
+        let description = crate::i18n::t(cx, if scratch {
+            "Add a project, or start without one."
+        } else {
+            "Add a project to start your first thread."
+        });
         let state = self.state.clone();
         v_flex()
             .size_full()
@@ -133,7 +137,7 @@ impl Render for HomeView {
                             .line_height(px(36.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(hsla(p.foreground))
-                            .child("What should we work on?"),
+                            .child(crate::i18n::t(cx, "What should we work on?")),
                     )
                     .child(div().mt(px(4.)).text_sm().text_color(hsla(p.muted_foreground)).child(description))
                     .child(
@@ -144,14 +148,14 @@ impl Render for HomeView {
                             .child(
                                 Button::new("home-add-project", ButtonVariant::Default, ButtonSize::Sm)
                                     .icon(Icon::Plus)
-                                    .label("Add project")
+                                    .label(crate::i18n::t(cx, "Add project"))
                                     .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx)),
                             )
                             .when(scratch, |this| {
                                 this.child(
                                     Button::new("home-start-without-project", ButtonVariant::Outline, ButtonSize::Sm)
                                         .icon(Icon::MessageSquareDashed)
-                                        .label("Start without a project")
+                                        .label(crate::i18n::t(cx, "Start without a project"))
                                         .on_click(move |_, _, cx| state.update(cx, |state, cx| state.start_without_project(cx))),
                                 )
                             }),

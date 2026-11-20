@@ -139,14 +139,23 @@ impl AppState {
         self.omitted.pages.status == PageStatus::Pending || self.sidebar.owner_omitted.values().any(|omitted| omitted.pages.status == PageStatus::Pending)
     }
 
-    /// The Settled shelf's "Show more" button, as the web words it.
-    pub fn settled_show_more_label(&self, count: usize) -> String {
-        let status = if self.sidebar.owner_omitted.values().any(|omitted| omitted.pages.status == PageStatus::Pending) { PageStatus::Pending }
-            else if self.sidebar.owner_omitted.values().any(|omitted| omitted.pages.status == PageStatus::Failed) { PageStatus::Failed } else { self.omitted.pages.status };
+    /// The Settled shelf's "Show more" button, localized for the active language.
+    pub fn settled_show_more_label(&self, count: usize, cx: &gpui::App) -> String {
+        let status = if self.sidebar.owner_omitted.values().any(|omitted| omitted.pages.status == PageStatus::Pending) {
+            PageStatus::Pending
+        } else if self.sidebar.owner_omitted.values().any(|omitted| omitted.pages.status == PageStatus::Failed) {
+            PageStatus::Failed
+        } else {
+            self.omitted.pages.status
+        };
         match status {
-            PageStatus::Pending => "Loading".into(),
-            PageStatus::Failed => "Could not load older threads. Retry".into(),
-            PageStatus::Ready => format!("Show {count} more"),
+            PageStatus::Pending => crate::i18n::t(cx, "Loading").to_owned(),
+            PageStatus::Failed => crate::i18n::t(cx, "Could not load older threads. Retry").to_owned(),
+            PageStatus::Ready => crate::i18n::t_fmt(
+                cx,
+                "{count, plural, one {Show {count} more} other {Show {count} more}}",
+                &[("count", count.into())],
+            ),
         }
     }
 

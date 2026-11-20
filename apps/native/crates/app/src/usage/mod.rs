@@ -545,9 +545,9 @@ mod tests {
 
         // Trigger prepare/render and assert merged totals across both environments.
         view.update(vcx, |view, cx| view.data.prepare(&view.state, cx));
-        view.read_with(vcx, |view, _| {
+        view.read_with(vcx, |view, cx| {
             assert_eq!(view.data.envs.len(), 2);
-            assert_eq!(view.data.environment_filter_label(), "All environments");
+            assert_eq!(view.data.environment_filter_label(cx), "All environments");
             assert!((view.data.merged.cost_usd - 20.0).abs() < 1e-6);
             assert_eq!(view.data.merged.total_tokens, 3_000);
             assert_eq!(view.data.merged.sessions, 4);
@@ -559,8 +559,8 @@ mod tests {
             view.toggle_environment("env-linux", cx);
             view.data.prepare(&view.state, cx);
         });
-        view.read_with(vcx, |view, _| {
-            assert_eq!(view.data.environment_filter_label(), "Mac Studio");
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(view.data.environment_filter_label(cx), "Mac Studio");
             assert!((view.data.merged.cost_usd - 12.5).abs() < 1e-6);
             assert_eq!(view.data.merged.total_tokens, 1_000);
         });
@@ -570,8 +570,8 @@ mod tests {
             view.set_all_environments(false, cx);
             view.data.prepare(&view.state, cx);
         });
-        view.read_with(vcx, |view, _| {
-            assert_eq!(view.data.environment_filter_label(), "0 environments");
+        view.read_with(vcx, |view, cx| {
+            assert_eq!(view.data.environment_filter_label(cx), "0 environments");
             assert_eq!(view.data.merged.total_tokens, 0);
         });
 

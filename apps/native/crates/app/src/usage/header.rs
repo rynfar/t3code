@@ -110,7 +110,7 @@ impl UsageView {
         let width = Self::page_width(window);
         let limits = self.data.preferences.metric == UsageMetric::Limits;
         let separator = || div().flex_none().text_color(hsla(p.icon_muted)).child("/");
-        let refresh_label: SharedString = if limits { "Refresh limits" } else { "Refresh usage" }.into();
+        let refresh_label: SharedString = crate::i18n::t(cx, if limits { "Refresh limits" } else { "Refresh usage" }).into();
         let refresh_disabled = self.data.refreshing || (!limits && !self.data.any_can_read_diagnostics());
         let refresh = focusable(div().id("usage-refresh"), "usage-refresh".into(), !refresh_disabled, window, cx)
             .flex()
@@ -169,7 +169,7 @@ impl UsageView {
                             .gap(r(12.))
                             .text_size(r(14.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(div().flex_none().text_color(hsla(p.muted_foreground)).child("Usage"))
+                            .child(div().flex_none().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Usage")))
                             .child(separator())
                             .child(div().min_w(r(40.)).text_color(hsla(p.muted_foreground)).child(self.render_environment_filter(!limits, window, cx)))
                             .child(separator())
@@ -184,7 +184,7 @@ impl UsageView {
                     .variant(Variant::Ghost)
                     .size(Size::IconSm)
                     .icon(Icon::X)
-                    .tooltip("Close (Esc)")
+                    .tooltip(crate::i18n::t(cx, "Close (Esc)"))
                     .on_click(|_, _, cx| close(cx)),
             )
     }
@@ -192,8 +192,9 @@ impl UsageView {
     fn render_period_toggles(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.data.preferences.period;
         segmented("usage-period", cx).children(UsagePeriod::ALL.map(|period| {
-            let tooltip = shortcut_title(period.label(), period.command(), cx);
-            text_segment(("usage-period", period.days() as usize), period.label(), period == current, Some(tooltip), window, cx)
+            let localized = crate::i18n::t(cx, period.label());
+            let tooltip = shortcut_title(localized, period.command(), cx);
+            text_segment(("usage-period", period.days() as usize), localized, period == current, Some(tooltip), window, cx)
                 .on_click(cx.listener(move |this, _, _, cx| this.select_period(period, cx)))
         }))
     }
@@ -202,8 +203,9 @@ impl UsageView {
         let current = self.data.preferences.metric;
         segmented("usage-metric", cx).children(UsageMetric::ALL.iter().enumerate().map(|(index, metric)| {
             let metric = *metric;
-            let tooltip = shortcut_title(metric.label(), metric.command(), cx);
-            text_segment(("usage-metric", index), metric.label(), metric == current, Some(tooltip), window, cx)
+            let localized = crate::i18n::t(cx, metric.label());
+            let tooltip = shortcut_title(localized, metric.command(), cx);
+            text_segment(("usage-metric", index), localized, metric == current, Some(tooltip), window, cx)
                 .on_click(cx.listener(move |this, _, _, cx| this.select_metric(metric, cx)))
         }))
     }
@@ -212,10 +214,13 @@ impl UsageView {
     fn render_compact_menu(&mut self, kind: MenuKind, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let open = self.menu == Some(kind);
-        let label = match kind {
-            MenuKind::Period => self.data.preferences.period.label(),
-            _ => self.data.preferences.metric.label(),
-        };
+        let label = crate::i18n::t(
+            cx,
+            match kind {
+                MenuKind::Period => self.data.preferences.period.label(),
+                _ => self.data.preferences.metric.label(),
+            },
+        );
         let trigger = menu_trigger(if kind == MenuKind::Period { "usage-period-menu" } else { "usage-metric-menu" }, label, None, open, window, cx)
             .h(r(28.))
             .px(r(9.))
@@ -227,7 +232,7 @@ impl UsageView {
                 MenuKind::Period => UsagePeriod::ALL
                     .map(|period| {
                         let checked = period == self.data.preferences.period;
-                        check_item(("usage-period-item", period.days() as usize), checked, div().child(period.label()).into_any_element(), cx)
+                        check_item(("usage-period-item", period.days() as usize), checked, div().child(crate::i18n::t(cx, period.label())).into_any_element(), cx)
                             .on_click(cx.listener(move |this, _, _, cx| this.select_period(period, cx)))
                             .into_any_element()
                     })
@@ -238,7 +243,7 @@ impl UsageView {
                     .enumerate()
                     .map(|(index, metric)| {
                         let metric = *metric;
-                        check_item(("usage-metric-item", index), metric == self.data.preferences.metric, div().child(metric.label()).into_any_element(), cx)
+                        check_item(("usage-metric-item", index), metric == self.data.preferences.metric, div().child(crate::i18n::t(cx, metric.label())).into_any_element(), cx)
                             .on_click(cx.listener(move |this, _, _, cx| this.select_metric(metric, cx)))
                             .into_any_element()
                     })
@@ -254,7 +259,7 @@ impl UsageView {
         let open = self.menu == Some(MenuKind::Environment);
         let selected_usages = self.data.selected_environment_usages();
         let has_issue = selected_usages.iter().any(|env| env.error.is_some()) || !self.data.merged.contract_mismatches.is_empty();
-        let label = self.data.environment_filter_label();
+        let label = self.data.environment_filter_label(cx);
         let leading = (show_status && has_issue).then(|| icon(Icon::CircleAlert, 14., hsla(p.warning_foreground)).into_any_element());
         let trigger = menu_trigger("usage-environment-filter", label, leading, open, window, cx)
             .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(MenuKind::Environment, cx)));
@@ -309,14 +314,14 @@ impl UsageView {
             let empty_envs = env_rows.is_empty();
             let panel = menu_panel("usage-environment-menu", cx)
                 .child(
-                    check_item("usage-environment-all", all_selected, div().child("All environments").into_any_element(), cx)
+                    check_item("usage-environment-all", all_selected, div().child(crate::i18n::t(cx, "All environments")).into_any_element(), cx)
                         .on_click(cx.listener(move |this, _, _, cx| this.set_all_environments(!all_selected, cx))),
                 )
                 .child(menu_separator(cx))
                 .children(env_rows)
-                .when(empty_envs, |this| this.child(menu_note("No environments connected.", cx)))
+                .when(empty_envs, |this| this.child(menu_note(crate::i18n::t(cx, "No environments connected."), cx)))
                 .when(show_status && is_partial, |this| {
-                    this.child(menu_note("Totals are partial while selected environments scan.", cx))
+                    this.child(menu_note(crate::i18n::t(cx, "Totals are partial while selected environments scan."), cx))
                 })
                 .when(show_status && !coverage.is_empty(), |this| {
                     this.child(
@@ -347,7 +352,7 @@ impl UsageView {
                             .cursor_pointer()
                             .hover(|style| style.bg(hsla(p.accent)))
                             .on_click(cx.listener(|this, _, window, cx| this.open_price_overrides(None, window, cx)))
-                            .child("Model prices"),
+                            .child(crate::i18n::t(cx, "Model prices")),
                     )
                 });
             popup(gpui::Anchor::TopLeft, panel)
@@ -359,12 +364,26 @@ impl UsageView {
         let p = palette(cx);
         let open = self.menu == Some(MenuKind::Provider);
         let hidden = self.data.hidden().clone();
-        let trigger = menu_trigger("usage-provider-filter", usage::provider_filter_label(&hidden), None, open, window, cx)
+        let visible: Vec<UsageProvider> = UsageProvider::ORDER.into_iter().filter(|provider| !hidden.contains(provider)).collect();
+        let filter_label = if visible.len() == UsageProvider::ORDER.len() {
+            crate::i18n::t(cx, "All providers").to_owned()
+        } else if visible.is_empty() {
+            crate::i18n::t(cx, "No providers").to_owned()
+        } else if visible.len() == 1 {
+            visible[0].label().to_owned()
+        } else {
+            crate::i18n::t_fmt(
+                cx,
+                "{count, plural, one {{count} providers} other {{count} providers}}",
+                &[("count", visible.len().into())],
+            )
+        };
+        let trigger = menu_trigger("usage-provider-filter", filter_label, None, open, window, cx)
             .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(MenuKind::Provider, cx)));
         let popup = open.then(|| {
             let all = hidden.is_empty();
             let panel = menu_panel("usage-provider-menu", cx)
-                .child(check_item("usage-provider-all", all, div().child("All providers").into_any_element(), cx).on_click(cx.listener(move |this, _, _, cx| {
+                .child(check_item("usage-provider-all", all, div().child(crate::i18n::t(cx, "All providers")).into_any_element(), cx).on_click(cx.listener(move |this, _, _, cx| {
                     let next = if all { UsageProvider::ORDER.into_iter().collect() } else { Default::default() };
                     this.set_hidden(next, cx);
                 })))

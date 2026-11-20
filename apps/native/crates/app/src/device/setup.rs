@@ -293,7 +293,7 @@ impl Render for DeviceSetupDialog {
             let diagnostics = service.setup_diagnostics();
             let checking = pending == Some(Pending::Check);
             let check = Button::new("device-setup-check", ButtonVariant::Outline, ButtonSize::Compact)
-                .label(if checking { "Checking…" } else { "Check again" })
+                .label(crate::i18n::t(cx, if checking { "Checking…" } else { "Check again" }))
                 .disabled(!enabled || locked)
                 .on_click(cx.listener(|this, _, _, cx| this.check_again(cx)));
             let check = if checking { check.icon(Icon::LoaderCircle) } else { check };

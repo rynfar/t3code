@@ -207,7 +207,7 @@ impl Render for UpdateDialog {
             if !description.is_empty() {
                 description.push_str(" · ");
             }
-            description.push_str("Checking for more…");
+            description.push_str(crate::i18n::t(cx, "Checking for more…"));
         }
         let mut rows = div()
             .id("update-machine-rows")
@@ -256,9 +256,9 @@ impl Render for UpdateDialog {
                 .border_b_1()
                 .border_color(hsla(p.border))
                 .pb(rem(6.))
-                .child(div().w(rem(128.)).child("Machine"))
+                .child(div().w(rem(128.)).child(crate::i18n::t(cx, "Machine")))
                 .child(div().w(rem(84.)).child("T3 Code"))
-                .child(div().flex_1().child("Providers"))
+                .child(div().flex_1().child(crate::i18n::t(cx, "Providers")))
                 .child(div().w(rem(70.))),
         );
         for row in plan.updating_rows() {
@@ -271,7 +271,7 @@ impl Render for UpdateDialog {
                 row.label.clone(),
                 row.app.clone().unwrap_or_else(|| {
                     if row.skipped.is_some() {
-                        "Skipped".into()
+                        crate::i18n::t(cx, "Skipped").into()
                     } else {
                         String::new()
                     }
@@ -466,7 +466,7 @@ impl Render for UpdateDialog {
                                         .child(s)
                                 }))
                                 .child(
-                                    button("updates-cancel", "Cancel", false, &self.cancel_focus)
+                                    button("updates-cancel", crate::i18n::t(cx, "Cancel"), false, &self.cancel_focus)
                                         .on_click(cx.listener(
                                             |this, event: &gpui::ClickEvent, window, cx| {
                                                 if !event.is_keyboard() {
@@ -486,7 +486,7 @@ impl Render for UpdateDialog {
                                 .child(
                                     button(
                                         "updates-confirm",
-                                        "Update",
+                                        crate::i18n::t(cx, "Update"),
                                         true,
                                         &self.update_focus.clone().tab_stop(disabled.is_none()),
                                     )

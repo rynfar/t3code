@@ -1423,8 +1423,8 @@ impl PullRequestsPage {
                     if let Some(ed) = self.saved_view_editor.as_mut() {
                         ed.editing_id = None;
                     }
-                    let toast = Toast::new(ToastKind::Error, "This saved view was removed")
-                        .description("Your name has been kept. Save it as a new view or cancel.");
+                    let toast = Toast::new(ToastKind::Error, crate::i18n::t(cx, "This saved view was removed"))
+                        .description(crate::i18n::t(cx, "Your name has been kept. Save it as a new view or cancel."));
                     self.state.update(cx, |state, cx| state.show_toast(toast, cx));
                     cx.notify();
                 }

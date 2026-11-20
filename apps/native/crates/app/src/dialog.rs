@@ -427,9 +427,9 @@ impl Render for ConfirmDialog {
                                 .flex_col()
                                 .gap(px(8.))
                                 // `leading-snug` (`pingdotgg/t3code#30527`): keeps multi-line titles readable.
-                                .child(div().text_xl().line_height(px(27.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(pending.title.clone()))
+                                .child(div().text_xl().line_height(px(27.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(crate::i18n::t(cx, pending.title.as_ref()).to_owned()))
                                 .when(!pending.description.is_empty(), |this| {
-                                    this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(pending.description.clone()))
+                                    this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, pending.description.as_ref()).to_owned()))
                                 }),
                         )
                         .child(
@@ -443,8 +443,8 @@ impl Render for ConfirmDialog {
                                 .border_color(hsla(p.border))
                                 .rounded_b(px(15.))
                                 .bg(hsla(p.muted))
-                                .child(button("confirm-dialog-cancel", "Cancel".into(), InitialFocus::Cancel).on_click(cx.listener(|this, _, window, cx| this.resolve(false, window, cx))))
-                                .child(button("confirm-dialog-confirm", pending.confirm_label.clone(), InitialFocus::Confirm).on_click(cx.listener(|this, _, window, cx| this.resolve(true, window, cx)))),
+                                .child(button("confirm-dialog-cancel", crate::i18n::t(cx, "Cancel").into(), InitialFocus::Cancel).on_click(cx.listener(|this, _, window, cx| this.resolve(false, window, cx))))
+                                .child(button("confirm-dialog-confirm", crate::i18n::t(cx, pending.confirm_label.as_ref()).to_owned().into(), InitialFocus::Confirm).on_click(cx.listener(|this, _, window, cx| this.resolve(true, window, cx)))),
                         ),
                 ),
         )

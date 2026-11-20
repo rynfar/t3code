@@ -760,7 +760,7 @@ impl ContextMenu {
                 this.child(div().w(px(16.)).flex_none().children(item.checked.filter(|c| *c).map(|_| Icon::Check.sized(px(14.)).text_color(hsla(text)))))
             })
             .children(item.icon.and_then(Icon::from_name).map(|icon| div().opacity(0.8).child(icon.sized(px(16.)).text_color(hsla(icon_color)))))
-            .child(div().flex_1().min_w_0().truncate().child(item.label.clone()))
+            .child(div().flex_1().min_w_0().truncate().child(localize_context_menu_label(cx, &item.label)))
             .when(has_children, |this| this.child(Icon::ChevronRight.sized(px(14.)).text_color(hsla(p.muted_foreground))))
             .when(!disabled, |this| {
                 this.on_mouse_move(cx.listener(move |this, _, _, cx| {
@@ -813,6 +813,24 @@ impl ContextMenu {
         }
         children
     }
+}
+
+/// Localizes context-menu labels at render time (`pingdotgg/t3code#39224`), including dynamic
+/// `"Filter by <project>"` and `"New thread on <branch>"` items while leaving `MenuItem.label`
+/// canonical for tests and key routing.
+fn localize_context_menu_label(cx: &App, label: &str) -> String {
+    let translated = crate::i18n::t(cx, label);
+    if translated != label {
+        return translated.to_owned();
+    }
+    if let Some(project) = label.strip_prefix("Filter by ") {
+        let project = if project == "No project" { crate::i18n::t(cx, "No project") } else { project };
+        return crate::i18n::t_fmt(cx, "Filter by {project}", &[("project", project.into())]);
+    }
+    if let Some(branch) = label.strip_prefix("New thread on ") {
+        return crate::i18n::t_fmt(cx, "New thread on {branch}", &[("branch", branch.into())]);
+    }
+    label.to_owned()
 }
 
 /// The y offset of item `index` inside a panel, counting separators.

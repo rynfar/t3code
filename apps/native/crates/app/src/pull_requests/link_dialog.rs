@@ -151,12 +151,12 @@ impl Render for LinkPullRequestDialog {
                                 .flex()
                                 .flex_col()
                                 .gap(px(8.))
-                                .child(div().text_xl().line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child("Link pull request"))
+                                .child(div().text_xl().line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(crate::i18n::t(cx, "Link pull request")))
                                 .child(
                                     div()
                                         .text_sm()
                                         .text_color(hsla(p.muted_foreground))
-                                        .child("Attach a pull request to this thread by its URL, or by its number for this thread's repository."),
+                                        .child(crate::i18n::t(cx, "Attach a pull request to this thread by its URL, or by its number for this thread's repository.")),
                                 ),
                         )
                         .child(
@@ -180,10 +180,10 @@ impl Render for LinkPullRequestDialog {
                                 .border_color(hsla(p.border))
                                 .rounded_b(px(15.))
                                 .bg(hsla(p.muted).opacity(0.72))
-                                .child(Button::new("link-pr-cancel", Variant::Outline, Size::Sm).label("Cancel").disabled(self.pending).on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+                                .child(Button::new("link-pr-cancel", Variant::Outline, Size::Sm).label(crate::i18n::t(cx, "Cancel")).disabled(self.pending).on_click(cx.listener(|this, _, _, cx| this.close(cx))))
                                 .child(
                                     Button::new("link-pr-submit", Variant::Default, Size::Sm)
-                                        .label(if self.pending { "Linking..." } else { "Link" })
+                                        .label(crate::i18n::t(cx, if self.pending { "Linking..." } else { "Link" }))
                                         .disabled(!can_link)
                                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                                 ),

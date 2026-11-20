@@ -63,14 +63,14 @@ fn elapsed_label(started_at: &str, now_ms: i64) -> Option<String> {
 }
 
 impl Render for WorkingTimer {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.painted.set(true);
         let now_ms = self.now_ms();
         let label = match (self.kind, elapsed_label(&self.started_at, now_ms)) {
-            (TimerKind::Compacting, Some(elapsed)) => format!("Compacting for {elapsed}"),
-            (TimerKind::Compacting, None) => "Compacting…".to_owned(),
-            (TimerKind::Working, Some(elapsed)) => format!("Working for {elapsed}"),
-            (TimerKind::Working, None) => "Working...".to_owned(),
+            (TimerKind::Compacting, Some(elapsed)) => format!("{}{elapsed}", crate::i18n::t(cx, "Compacting for ")),
+            (TimerKind::Compacting, None) => crate::i18n::t(cx, "Compacting…").to_owned(),
+            (TimerKind::Working, Some(elapsed)) => format!("{}{elapsed}", crate::i18n::t(cx, "Working for ")),
+            (TimerKind::Working, None) => crate::i18n::t(cx, "Working...").to_owned(),
             (TimerKind::Elapsed, _) => elapsed_since(&self.started_at, now_ms).unwrap_or_default(),
             (TimerKind::SetupStage, _) => t3_core::worktree_setup::live_label(&self.started_at, now_ms).unwrap_or_default(),
         };

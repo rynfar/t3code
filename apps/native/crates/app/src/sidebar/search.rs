@@ -683,11 +683,11 @@ impl SidebarPane {
         let p = palette(cx);
         if self.search.results.is_empty() {
             let label = if self.search.is_pending() {
-                "Searching thread messages…"
+                crate::i18n::t(cx, "Searching thread messages…")
             } else if self.search.is_failed() {
-                "Couldn't search thread messages"
+                crate::i18n::t(cx, "Couldn't search thread messages")
             } else {
-                "No threads found"
+                crate::i18n::t(cx, "No threads found")
             };
             return div()
                 .flex()
@@ -784,8 +784,8 @@ impl SidebarPane {
 
         let excerpt = self.search.content_match(&id).filter(|hit| !hit.snippet.is_empty()).map(|hit| {
             let prefix = match hit.source.as_deref() {
-                Some("user") => Some(("You:", hsla(p.info_foreground).opacity(0.85))),
-                Some(_) => Some(("Agent:", hsla(p.success_foreground).opacity(0.85))),
+                Some("user") => Some((crate::i18n::t(cx, "You:"), hsla(p.info_foreground).opacity(0.85))),
+                Some(_) => Some((crate::i18n::t(cx, "Agent:"), hsla(p.success_foreground).opacity(0.85))),
                 None => None,
             };
             let ranges = char_ranges_to_bytes(&hit.snippet, &find_search_token_ranges(&hit.snippet, &self.search.settled_query));

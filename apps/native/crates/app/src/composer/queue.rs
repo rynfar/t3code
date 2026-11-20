@@ -381,7 +381,10 @@ impl Composer {
                 .flatten();
             let edit_tooltip = blocked
                 .map(str::to_owned)
-                .unwrap_or_else(|| edit_shortcut.map_or_else(|| "Edit in the composer".to_owned(), |shortcut| format!("Edit in the composer ({shortcut})")));
+                .unwrap_or_else(|| edit_shortcut.map_or_else(
+                    || crate::i18n::t(cx, "Edit in the composer").to_owned(),
+                    |shortcut| crate::i18n::t_fmt(cx, "Edit in the composer ({shortcut})", &[("shortcut", shortcut.into())]),
+                ));
             let can_send_this_run = queue.can_send_run(run.fresh_context);
             let open_thread_id = source_thread_id.clone();
             let open_thread_env = linked_env_id.clone();
@@ -397,7 +400,7 @@ impl Composer {
                     this.child(
                         Button::new(("queued-open-thread", position), ButtonVariant::Ghost, ButtonSize::Xs)
                             .icon(Icon::ExternalLink)
-                            .label("Open thread")
+                            .label(crate::i18n::t(cx, "Open thread"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let tid = tid.clone();
                                 let env_id = env_id.clone();
@@ -426,7 +429,7 @@ impl Composer {
                     this.child(
                         Button::new(("queued-open-automation", position), ButtonVariant::Ghost, ButtonSize::Xs)
                             .icon(Icon::ExternalLink)
-                            .label("Open automation")
+                            .label(crate::i18n::t(cx, "Open automation"))
                             .on_click(move |_, _, cx| crate::settings::open_scheduled_task(&task_id, cx)),
                     )
                 })
@@ -434,7 +437,7 @@ impl Composer {
                     this.child(
                         Button::new(("queued-send", position), ButtonVariant::Ghost, ButtonSize::Xs)
                             .icon(Icon::ArrowUp)
-                            .label("Send now")
+                            .label(crate::i18n::t(cx, "Send now"))
                             .tooltip(send_tooltip)
                             .disabled(busy)
                             .on_click(cx.listener(move |this, _, _, cx| this.send_queued_now(run_for_send.clone(), cx))),
@@ -442,9 +445,9 @@ impl Composer {
                 })
                 .map(|this| {
                     if editing {
-                        this.child(div().px(px(4.)).text_color(hsla(p.foreground)).child("Editing in the composer")).child(
+                        this.child(div().px(px(4.)).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Editing in the composer"))).child(
                             Button::new(("queued-cancel-edit", position), ButtonVariant::Ghost, ButtonSize::Xs)
-                                .label("Cancel")
+                                .label(crate::i18n::t(cx, "Cancel"))
                                 .disabled(busy)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     if this.is_rewinding(cx) {
@@ -464,7 +467,7 @@ impl Composer {
                         .child(
                             Button::new(("queued-remove", position), ButtonVariant::Ghost, ButtonSize::IconXs)
                                 .icon(Icon::X)
-                                .tooltip("Remove from queue")
+                                .tooltip(crate::i18n::t(cx, "Remove from queue"))
                                 .disabled(busy)
                                 .on_click(cx.listener(move |this, _, _, cx| this.remove_queued(run_for_remove.clone(), cx))),
                         )
@@ -475,7 +478,7 @@ impl Composer {
                 .items_end()
                 .gap(px(4.))
                 .when(attribution == Some(Attribution::T3Code), |this| {
-                    this.child(div().mr(px(4.)).text_size(px(11.)).text_color(hsla(p.muted_foreground).opacity(0.7)).child("Sent by T3 Code"))
+                    this.child(div().mr(px(4.)).text_size(px(11.)).text_color(hsla(p.muted_foreground).opacity(0.7)).child(crate::i18n::t(cx, "Sent by T3 Code")))
                 })
                 .when_some(run.guest_name.as_ref().filter(|_| attribution == Some(Attribution::Guest)).cloned(), |this, name| {
                     this.child(div().mr(px(4.)).text_size(px(11.)).text_color(hsla(p.guest_foreground)).child(SharedString::from(name)))

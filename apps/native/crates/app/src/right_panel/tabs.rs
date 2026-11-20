@@ -382,7 +382,7 @@ fn tab(
                 .rounded(px(4.))
                 .hover(|style| style.bg(hsla(p.muted)))
                 .tooltip({
-                    let label: SharedString = format!("Close {title}").into();
+                    let label: SharedString = crate::i18n::t_fmt(cx, "Close {title}", &[("title", title.as_str().into())]).into();
                     move |window, cx| super::tooltip_view(label.clone(), window, cx)
                 })
                 .on_click(move |_, window, cx| {
@@ -413,18 +413,18 @@ fn tab(
                 .children(dot.map(|dot| div().absolute().top(px(0.)).right(px(0.)).size(px(6.)).rounded_full().bg(dot))),
         )
         .child(label_el)
-        .context_menu(move |menu, _, _| {
+        .context_menu(move |menu, _, cx| {
             let item = |label: &'static str, disabled: bool, run: fn(&mut AppState, &str, &mut Window, &mut gpui::Context<AppState>)| {
                 let state = state.clone();
                 let id = id.clone();
-                PopupMenuItem::new(label)
+                PopupMenuItem::new(crate::i18n::t(cx, label))
                     .disabled(disabled)
                     .on_click(move |_, window, cx| state.update(cx, |state, cx| run(state, &id, window, cx)))
             };
             let menu = match file_path.clone() {
                 Some(path) => {
                     let state = state.clone();
-                    menu.item(PopupMenuItem::new("Copy path").on_click(move |_, _, cx| state.update(cx, |state, cx| state.copy_file_path(&path, cx))))
+                    menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Copy path")).on_click(move |_, _, cx| state.update(cx, |state, cx| state.copy_file_path(&path, cx))))
                 }
                 None => menu,
             };
@@ -432,7 +432,7 @@ fn tab(
                 let on_rename = on_rename_menu.clone();
                 let rename_id = rename_id_menu.clone();
                 let rename_title = rename_title_menu.clone();
-                menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Rename")).on_click(move |_, window, cx| {
                     on_rename(rename_id.clone(), rename_title.clone(), window, cx);
                 }))
             } else {
@@ -467,9 +467,9 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
             .when(reason.is_none(), |this| {
                 this.cursor_pointer().hover(|style| style.bg(hsla(p.accent).opacity(0.6))).on_click(move |_, _, cx| state.update(cx, open))
             })
-            .when_some(reason, |this, reason| this.tooltip(move |window, cx| super::tooltip_view(reason.into(), window, cx)))
+            .when_some(reason, |this, reason| this.tooltip(move |window, cx| super::tooltip_view(crate::i18n::t(cx, reason).into(), window, cx)))
             .child(action.icon.svg().size(px(16.)).text_color(hsla(p.foreground)))
-            .child(div().flex_1().min_w_0().truncate().child(action.label))
+            .child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(cx, action.label)))
             .child(kbd(action.shortcut, cx))
     }).collect();
     if let Some(reason) = side_chat {
@@ -490,9 +490,9 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
                         .hover(|style| style.bg(hsla(p.accent).opacity(0.6)))
                         .on_click(move |_, _, cx| open_state.update(cx, open_side_chat))
                 })
-                .when_some(reason, |this, reason| this.tooltip(move |window, cx| super::tooltip_view(reason.into(), window, cx)))
+                .when_some(reason, |this, reason| this.tooltip(move |window, cx| super::tooltip_view(crate::i18n::t(cx, reason).into(), window, cx)))
                 .child(Icon::MessagesSquare.svg().size(px(16.)).text_color(hsla(p.foreground)))
-                .child(div().flex_1().min_w_0().truncate().child("Side chat"))
+                .child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(cx, "Side chat")))
                 .child(kbd("S", cx)),
         );
     }
@@ -515,7 +515,7 @@ pub fn empty_state(state: Entity<AppState>, window: &mut Window, cx: &mut App) -
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(hsla(p.foreground))
-                        .child("Open a surface"),
+                        .child(crate::i18n::t(cx, "Open a surface")),
                 )
                 .child(v_flex().gap(px(2.)).children(rows)),
         )

@@ -21,7 +21,6 @@ use super::{
     settle, state_glyph,
 };
 use crate::app_state::AppState;
-use crate::i18n::t;
 use crate::pull_requests::controls::avatar;
 use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
@@ -264,7 +263,11 @@ pub fn render_issue_preview_card(detail: &IssueDetail, cx: &App) -> AnyElement {
                         .child(
                             div()
                                 .flex_none()
-                                .child(format!("{} {opened}", t(cx, "opened"))),
+                                .child(crate::i18n::t_fmt(
+                                    cx,
+                                    "opened {_gt_value_1}",
+                                    &[("_gt_value_1", opened.into())],
+                                )),
                         ),
                 ),
         )
@@ -328,7 +331,11 @@ pub fn render_issue_preview_entry(entry: &IssueListEntry, cx: &App) -> AnyElemen
                         .child(
                             div()
                                 .flex_none()
-                                .child(format!("{} {opened}", t(cx, "opened"))),
+                                .child(crate::i18n::t_fmt(
+                                    cx,
+                                    "opened {_gt_value_1}",
+                                    &[("_gt_value_1", opened.into())],
+                                )),
                         ),
                 ),
         )

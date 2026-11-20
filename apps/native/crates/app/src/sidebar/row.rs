@@ -719,7 +719,7 @@ impl SidebarPane {
             .debug_selector(move || debug_id.clone())
             .flex_none()
             .child(Icon::SquarePen.render(px(12.), hsla(palette(cx).warning_foreground)))
-            .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Unsent draft").build(window, cx))
+            .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new(crate::i18n::t(cx, "Unsent draft")).build(window, cx))
             .into_any_element()
     }
 
@@ -751,7 +751,7 @@ impl SidebarPane {
             .font_weight(FontWeight::MEDIUM)
             .text_color(hsla(color))
             .child(Icon::AlarmClock.render(icon_size, hsla(color)))
-            .child("Woke")
+            .child(crate::i18n::t(cx, "Woke"))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 if let Some(woke_at) = woke_at {
@@ -856,7 +856,7 @@ impl SidebarPane {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(hsla(tone_color(top.tone, p)))
                     .child(status_icon(top.icon).render(px(16.), hsla(tone_color(top.tone, p))))
-                    .child(top.label)
+                    .child(crate::i18n::t(cx, top.label))
                     .children(duration)
                     .into_any_element()
             }
@@ -882,7 +882,7 @@ impl SidebarPane {
                     hover_action(SharedString::from(debug_id.clone()), p)
                         .debug_selector(move || debug_id.clone())
                         .child(Icon::X.render(px(14.), hsla(p.muted_foreground)))
-                        .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Discard draft").build(window, cx))
+                        .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new(crate::i18n::t(cx, "Discard draft")).build(window, cx))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
@@ -906,7 +906,7 @@ impl SidebarPane {
                     .debug_selector(move || debug_id.clone())
                     .mr(px(-4.))
                     .child(Icon::Check.render(px(14.), hsla(p.muted_foreground)))
-                    .child("Settle")
+                    .child(crate::i18n::t(cx, "Settle"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.state.update(cx, |state, cx| match &settle_key {
@@ -1017,7 +1017,7 @@ impl SidebarPane {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(tone)
                     .child(status_icon(top.icon).render(px(12.), tone))
-                    .child(top.label)
+                    .child(crate::i18n::t(cx, top.label))
                     .into_any_element()
             }),
             Section::Settled => settled_timestamp(thread).map(|at| div().text_xs().text_color(hsla(p.sidebar_secondary_label)).child(compact_relative_label(at, now)).into_any_element()),
@@ -1203,7 +1203,7 @@ impl SidebarPane {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(tone)
                     .hover(|this| this.text_color(hsla(p.sidebar_foreground)))
-                    .child(shelf.label())
+                    .child(crate::i18n::t(cx, shelf.label()))
                     .child(div().flex_1())
                     .child(div().font_weight(FontWeight::NORMAL).child(count.to_string()))
                     .child(if expanded { Icon::ChevronDown.render(px(12.), tone) } else { Icon::ChevronRight.render(px(12.), tone) })
@@ -1214,6 +1214,7 @@ impl SidebarPane {
 
     fn render_show_more(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let label = self.state.read(cx).settled_show_more_label(count, cx);
         div()
             .px(px(8.))
             .child(
@@ -1231,7 +1232,7 @@ impl SidebarPane {
                     .text_color(hsla(p.sidebar_muted_foreground))
                     .hover(|this| this.bg(hsla(p.sidebar_row_hover)).text_color(hsla(p.sidebar_foreground)))
                     .child(div().flex_none().child(Icon::ChevronDown.render(px(16.), hsla(p.sidebar_muted_foreground))))
-                    .child(div().flex_1().min_w_0().child(self.state.read(cx).settled_show_more_label(count)))
+                    .child(div().flex_1().min_w_0().child(label))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.state.update(cx, |state, cx| if !state.settled_shelf_loading() { state.show_more_settled(cx) })
                     })),

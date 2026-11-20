@@ -62,6 +62,7 @@ pub fn init(cx: &mut App) {
     theme::set_preferences(preferences(&doc), cx);
     terminal::set_typography(terminal::typography(doc.entries()), cx);
     cx.set_global(ClientPrefs { doc, versions: Default::default(), library_versions: Default::default(), error: None, saving: false, queue: VecDeque::new() });
+    crate::menus::install(cx);
 }
 
 fn preferences(doc: &ClientSettingsDoc) -> Preferences {
@@ -149,8 +150,10 @@ fn apply_client(
         .flatten();
     let grouping_override = matches!(&change, ClientSettingChange::ProjectGroupingOverride { .. }).then(|| prefs.doc.clone());
     let before_visibility = prefs.doc.tool_call_visibility();
+    let before_language = prefs.doc.language().to_owned();
     let patch = prefs.doc.apply_change(&change);
     let after_visibility = prefs.doc.tool_call_visibility();
+    let language_changed = prefs.doc.language() != before_language;
     if patch.is_empty() && !(persist && grouping_override.is_some()) {
         return;
     }
@@ -201,7 +204,16 @@ fn apply_client(
         ) {
             cx.emit(AppEvent::RightPanel);
         }
+        if language_changed {
+            state.rebuild_sidebar(cx);
+            cx.emit(AppEvent::Shell);
+            cx.emit(AppEvent::Thread);
+            cx.emit(AppEvent::RightPanel);
+        }
     });
+    if language_changed {
+        crate::menus::install(cx);
+    }
     theme::set_preferences(next, cx);
     terminal::set_typography(typography, cx);
     cx.refresh_windows();

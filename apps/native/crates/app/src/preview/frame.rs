@@ -1096,7 +1096,7 @@ impl FrameView {
                             .text_color(hsla(p.foreground))
                             .child(setup.command.clone()),
                     )
-                    .child(Button::new("preview-host-retry", ButtonVariant::Outline, ButtonSize::Sm).label("Try again").on_click(cx.listener(|this, _, _, cx| {
+                    .child(Button::new("preview-host-retry", ButtonVariant::Outline, ButtonSize::Sm).label(crate::i18n::t(cx, "Try again")).on_click(cx.listener(|this, _, _, cx| {
                         this.host_setup = None;
                         this.connect(cx);
                         cx.emit(FrameEvent::Changed);
@@ -1107,8 +1107,8 @@ impl FrameView {
         self.refused.then(|| {
             base()
                 .gap(px(8.))
-                .child(div().text_xs().text_color(hsla(p.muted_foreground)).child("Browser connection was refused."))
-                .child(Button::new("preview-reconnect", ButtonVariant::Outline, ButtonSize::Sm).label("Reconnect").on_click(cx.listener(|this, _, _, cx| {
+                .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Browser connection was refused.")))
+                .child(Button::new("preview-reconnect", ButtonVariant::Outline, ButtonSize::Sm).label(crate::i18n::t(cx, "Reconnect")).on_click(cx.listener(|this, _, _, cx| {
                     this.refused = false;
                     this.connect(cx);
                     cx.emit(FrameEvent::Changed);

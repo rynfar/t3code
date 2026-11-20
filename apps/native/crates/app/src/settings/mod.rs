@@ -637,7 +637,7 @@ pub(super) fn folded_section(
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(hsla(p.foreground))
-                .child(title),
+                .child(t(cx, title)),
         )
         .when_some(summary.filter(|s| !open && !s.is_empty()), |this, text| {
             this.child(

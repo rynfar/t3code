@@ -402,7 +402,7 @@ impl ConnectView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let link = cx.new(|cx| InputState::new(window, cx).placeholder("https://your-server:3773/pair#token=… or host:3773"));
         let code = cx.new(|cx| InputState::new(window, cx).placeholder("Optional pairing code"));
-        let ssh_host = cx.new(|cx| InputState::new(window, cx).placeholder("Search hosts or type devbox"));
+        let ssh_host = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search hosts or type devbox")));
         let ssh_username = cx.new(|cx| InputState::new(window, cx).placeholder("root"));
         let ssh_port = cx.new(|cx| InputState::new(window, cx).placeholder("22"));
         let mut subscriptions = vec![
@@ -668,7 +668,7 @@ impl ConnectView {
         let actions = h_flex().gap(px(8.)).child(auth).when(signing_in, |this| {
             this.child(
                 Button::new("cloud-cancel", ButtonVariant::GhostMuted, ButtonSize::Sm)
-                    .label("Cancel")
+                    .label(crate::i18n::t(cx, "Cancel"))
                     .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.cancel_cloud_sign_in(cx)))),
             )
         });
@@ -686,7 +686,7 @@ impl ConnectView {
                             .child("T3 Connect"),
                     )
                     .child(muted(
-                        cloud.identity.clone().unwrap_or_else(|| "Sign in to view your T3 Connect environments.".into()),
+                        cloud.identity.clone().unwrap_or_else(|| crate::i18n::t(cx, "Sign in to T3 Connect to connect this environment.").into()),
                         cx,
                     )),
             )

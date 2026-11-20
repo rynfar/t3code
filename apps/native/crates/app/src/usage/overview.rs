@@ -209,11 +209,20 @@ impl UsageView {
             cx,
         );
         let summary = self.render_summary(&merged, metric, &loading, &active, cx);
+        let chart_title = crate::i18n::t(
+            cx,
+            match (hourly, metric == ChartMetric::Tokens) {
+                (true, true) => "Hourly processed tokens",
+                (true, false) => "Hourly cost",
+                (false, true) => "Daily processed tokens",
+                (false, false) => "Daily cost",
+            },
+        );
         let chart_section = v_flex()
             .min_w_0()
             .flex_1()
             .gap(r(12.))
-            .child(heading(format!("{} {}", if hourly { "Hourly" } else { "Daily" }, if metric == ChartMetric::Tokens { "processed tokens" } else { "cost" }), cx))
+            .child(heading(chart_title, cx))
             .child(chart_view);
         let top = if wide {
             h_flex().items_start().gap(r(24.)).child(div().w(r(288.)).flex_none().child(summary)).child(chart_section).into_any_element()
@@ -231,15 +240,15 @@ impl UsageView {
         let shares: Vec<AnyElement> = if merged.total_tokens == 0 {
             Vec::new()
         } else if metric == ChartMetric::Tokens {
-            share_bar("usage-token-types", "Tokens by type", &merge::token_type_segments(&merged.token_totals()), format_tokens, None, cx)
+            share_bar("usage-token-types", crate::i18n::t(cx, "Tokens by type"), &merge::token_type_segments(&merged.token_totals()), format_tokens, None, cx)
                 .into_iter()
                 .collect()
         } else {
-            let mut bars: Vec<AnyElement> = share_bar("usage-cost-types", "Cost by type", &merge::cost_type_segments(&merged.category_cost), format_usd, None, cx).into_iter().collect();
+            let mut bars: Vec<AnyElement> = share_bar("usage-cost-types", crate::i18n::t(cx, "Cost by type"), &merge::cost_type_segments(&merged.category_cost), format_usd, None, cx).into_iter().collect();
             if merged.speed_cost.fast + merged.speed_cost.ultrafast > 0. {
                 bars.extend(share_bar(
                     "usage-cost-speed",
-                    "Cost by speed",
+                    crate::i18n::t(cx, "Cost by speed"),
                     &merge::speed_cost_segments(&merged.speed_cost),
                     format_usd,
                     Some(speed_premium(merged.speed_cost.premium, cx)),
@@ -255,10 +264,10 @@ impl UsageView {
             .child(
                 v_flex()
                     .gap(r(8.))
-                    .child(heading("Totals", cx))
+                    .child(heading(crate::i18n::t(cx, "Totals"), cx))
                     .child(
                         div().grid().grid_cols(columns).gap_x(r(24.)).gap_y(r(16.)).py(r(4.)).children(
-                            TOTAL_LABELS.iter().zip(totals).map(|(label, value)| metric_cell(label, value, loading.partial, cx)),
+                            TOTAL_LABELS.iter().zip(totals).map(|(label, value)| metric_cell(crate::i18n::t(cx, label), value, loading.partial, cx)),
                         ),
                     ),
             )
@@ -534,10 +543,10 @@ impl UsageView {
                     ),
             )
             .child(
-                v_flex().gap(r(8.)).child(heading("Totals", cx)).child(div().grid().grid_cols(5).gap_x(r(24.)).gap_y(r(16.)).py(r(4.)).children(TOTAL_LABELS.map(|label| {
+                v_flex().gap(r(8.)).child(heading(crate::i18n::t(cx, "Totals"), cx)).child(div().grid().grid_cols(5).gap_x(r(24.)).gap_y(r(16.)).py(r(4.)).children(TOTAL_LABELS.map(|label| {
                     v_flex()
                         .gap(r(2.))
-                        .child(div().text_size(r(12.)).text_color(hsla(p.muted_foreground)).child(label))
+                        .child(div().text_size(r(12.)).text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, label)))
                         .child(skeleton(Some(64.), 24., cx))
                 }))),
             )
@@ -545,7 +554,7 @@ impl UsageView {
             .child(
                 v_flex()
                     .gap(r(12.))
-                    .child(h_flex().justify_between().child(heading("Breakdown", cx)).child(skeleton(Some(112.), 28., cx).rounded(r(8.))))
+                    .child(h_flex().justify_between().child(heading(crate::i18n::t(cx, "Breakdown"), cx)).child(skeleton(Some(112.), 28., cx).rounded(r(8.))))
                     .child(skeleton(None, 176., cx)),
             )
     }
@@ -562,7 +571,7 @@ fn render_time_table(merged: &MergedUsage, hourly: bool, time_zone: &str, hour12
         .border_color(hsla(p.border))
         .text_size(r(12.))
         .text_color(hsla(p.muted_foreground))
-        .child(div().w(relative(0.4)).flex_none().child(if hourly { "Hour" } else { "Day" }))
+        .child(div().w(relative(0.4)).flex_none().child(crate::i18n::t(cx, if hourly { "Hour" } else { "Day" })))
         .children(active.iter().map(|provider| cell().child(provider.label())))
         .child(cell().child("Total"))
         .child(cell().child("Tokens"));

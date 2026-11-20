@@ -527,7 +527,7 @@ pub(crate) fn render_header_controls<V: 'static>(
                 menu = menu.label(t(cx, "Linked threads").to_owned());
                 if menu_threads.is_empty() {
                     return menu.item(
-                        PopupMenuItem::new(t(cx, "No linked threads loaded").to_owned())
+                        PopupMenuItem::new(t(cx, "No threads found").to_owned())
                             .disabled(true),
                     );
                 }

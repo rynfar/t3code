@@ -138,6 +138,10 @@ pub fn hint(cx: &mut App) -> Option<impl IntoElement> {
     let visible = cx.try_global::<QuitHold>()?.visible?;
     let p = palette(cx);
     let shortcut = if cfg!(target_os = "macos") { "\u{2318}Q" } else { "Ctrl+Q" };
+    let message = match visible {
+        QuitHint::Hold => crate::i18n::t_fmt(cx, "Hold {shortcut} or press twice to quit", &[("shortcut", shortcut.into())]),
+        QuitHint::DoublePress => crate::i18n::t_fmt(cx, "Press {shortcut} again to quit", &[("shortcut", shortcut.into())]),
+    };
     Some(gpui::deferred(
         div().absolute().top(gpui::relative(0.22)).left_0().right_0().flex().justify_center().child(
             div()
@@ -156,7 +160,7 @@ pub fn hint(cx: &mut App) -> Option<impl IntoElement> {
                     spread_radius: px(-5.),
                     inset: false,
                 }])
-                .child(visible.message(shortcut)),
+                .child(message),
         ),
     )
     .with_priority(70))

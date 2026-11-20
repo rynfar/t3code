@@ -151,18 +151,19 @@ fn filters_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, c
             })
             .unwrap_or_default()
     };
-    Button::new("pr-filters", Variant::Outline, Size::Default).icon(Icon::ListFilter).label("Filters").count(prefs.filter_count()).dropdown_menu(move |menu, window, cx| {
-        let menu = radio(menu, Radio { label: "State", options: ListState::ALL.iter().map(|s| (*s, s.label().to_owned())).collect(), current: prefs.state, set: |p, v| p.state = v }, &entity, window, cx);
-        let menu = radio(menu, Radio { label: "Involvement", options: Involvement::ALL.iter().map(|i| (*i, i.label().to_owned())).collect(), current: prefs.involvement, set: |p, v| p.involvement = v }, &entity, window, cx)
+    Button::new("pr-filters", Variant::Outline, Size::Default).icon(Icon::ListFilter).label(crate::i18n::t(cx, "Filters")).count(prefs.filter_count()).dropdown_menu(move |menu, window, cx| {
+        let all_label = crate::i18n::t(cx, "All");
+        let menu = radio(menu, Radio { label: crate::i18n::t(cx, "State"), options: ListState::ALL.iter().map(|s| (*s, crate::i18n::t(cx, s.label()).to_owned())).collect(), current: prefs.state, set: |p, v| p.state = v }, &entity, window, cx);
+        let menu = radio(menu, Radio { label: crate::i18n::t(cx, "Involvement"), options: Involvement::ALL.iter().map(|i| (*i, crate::i18n::t(cx, i.label()).to_owned())).collect(), current: prefs.involvement, set: |p, v| p.involvement = v }, &entity, window, cx)
             .separator();
         let author_options: Vec<(Option<usize>, String)> =
-            std::iter::once((None, "All".to_owned())).chain(authors.iter().enumerate().map(|(index, actor)| (Some(index), actor.login.clone()))).collect();
+            std::iter::once((None, all_label.to_owned())).chain(authors.iter().enumerate().map(|(index, actor)| (Some(index), actor.login.clone()))).collect();
         let current_author = prefs.author.as_ref().and_then(|author| authors.iter().position(|actor| actor.login.eq_ignore_ascii_case(author)));
         let author_entity = entity.clone();
         let author_logins: Vec<String> = authors.iter().map(|actor| actor.login.clone()).collect();
-        let shown_author = prefs.author.clone().unwrap_or_else(|| "All".into());
+        let shown_author = prefs.author.clone().unwrap_or_else(|| all_label.to_owned());
         let author_set = prefs.author.is_some();
-        let menu = menu.submenu(format!("Author · {shown_author}"), window, cx, move |menu, _, _| {
+        let menu = menu.submenu(format!("{} · {shown_author}", crate::i18n::t(cx, "Author")), window, cx, move |menu, _, _| {
             author_options.iter().fold(menu, |menu, (index, text)| {
                 let login = index.and_then(|index| author_logins.get(index).cloned());
                 let entity = author_entity.clone();
@@ -178,10 +179,10 @@ fn filters_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, c
         let label_entity = entity.clone();
         let selected_labels = prefs.labels.clone();
         let label_names: Vec<String> = labels.iter().map(|label| label.name.clone()).collect();
-        let shown_labels = if selected_labels.is_empty() { "All".to_owned() } else { selected_labels.len().to_string() };
-        let menu = menu.submenu(format!("Labels · {shown_labels}"), window, cx, move |menu, _, _| {
+        let shown_labels = if selected_labels.is_empty() { all_label.to_owned() } else { selected_labels.len().to_string() };
+        let menu = menu.submenu(format!("{} · {shown_labels}", crate::i18n::t(cx, "Labels")), window, cx, move |menu, _, cx| {
             if label_names.is_empty() {
-                return menu.item(PopupMenuItem::new("No labels found").disabled(true));
+                return menu.item(PopupMenuItem::new(crate::i18n::t(cx, "No labels found")).disabled(true));
             }
             label_names.iter().fold(menu, |menu, name| {
                 let checked = selected_labels.iter().any(|label| label.eq_ignore_ascii_case(name));
@@ -203,13 +204,13 @@ fn filters_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, c
         let draft_typed = typed.clone();
         let draft_options: [(Option<DraftFilter>, &str); 3] = [(None, "All"), (Some(DraftFilter::Only), "Drafts only"), (Some(DraftFilter::Hide), "Hide drafts")];
         let draft_current = t3_core::pull_requests::query::parse_query(&typed).filters.draft.or(prefs.draft);
-        let draft_label = draft_options.iter().find(|(value, _)| *value == draft_current).map_or("All", |(_, label)| label);
-        let menu = menu.submenu(format!("Draft · {draft_label}"), window, cx, move |menu, _, _| {
+        let draft_label = crate::i18n::t(cx, draft_options.iter().find(|(value, _)| *value == draft_current).map_or("All", |(_, label)| label));
+        let menu = menu.submenu(format!("{} · {draft_label}", crate::i18n::t(cx, "Draft")), window, cx, move |menu, _, cx| {
             draft_options.iter().fold(menu, |menu, (value, text)| {
                 let value = *value;
                 let entity = draft_entity.clone();
                 let typed = draft_typed.clone();
-                menu.item(PopupMenuItem::new(*text).checked(value == draft_current).on_click(move |_, window, cx| {
+                menu.item(PopupMenuItem::new(crate::i18n::t(cx, text)).checked(value == draft_current).on_click(move |_, window, cx| {
                     if let Some(entity) = entity.upgrade() {
                         entity.update(cx, |page, cx| page.set_draft(&typed, value, window, cx));
                     }
@@ -217,15 +218,19 @@ fn filters_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, c
             })
         });
         let review_options = vec![
-            (None, "All".to_owned()),
-            (Some(ReviewFilter::Approved), "Approved".to_owned()),
-            (Some(ReviewFilter::ChangesRequested), "Changes requested".to_owned()),
-            (Some(ReviewFilter::ReviewRequired), "Review required".to_owned()),
-            (Some(ReviewFilter::None), "No reviews".to_owned()),
+            (None, all_label.to_owned()),
+            (Some(ReviewFilter::Approved), crate::i18n::t(cx, "Approved").to_owned()),
+            (Some(ReviewFilter::ChangesRequested), crate::i18n::t(cx, "Changes requested").to_owned()),
+            (Some(ReviewFilter::ReviewRequired), crate::i18n::t(cx, "Review required").to_owned()),
+            (Some(ReviewFilter::None), crate::i18n::t(cx, "No reviews").to_owned()),
         ];
-        let menu = radio(menu, Radio { label: "Review", options: review_options, current: prefs.review, set: |p, v| p.review = v }, &entity, window, cx);
-        let checks_options = vec![(None, "All".to_owned()), (Some(ChecksFilter::Passing), "Passing".to_owned()), (Some(ChecksFilter::Failing), "Failing".to_owned())];
-        let mut menu = radio(menu, Radio { label: "Checks", options: checks_options, current: prefs.checks, set: |p, v| p.checks = v }, &entity, window, cx);
+        let menu = radio(menu, Radio { label: crate::i18n::t(cx, "Review"), options: review_options, current: prefs.review, set: |p, v| p.review = v }, &entity, window, cx);
+        let checks_options = vec![
+            (None, all_label.to_owned()),
+            (Some(ChecksFilter::Passing), crate::i18n::t(cx, "Passing").to_owned()),
+            (Some(ChecksFilter::Failing), crate::i18n::t(cx, "Failing").to_owned()),
+        ];
+        let mut menu = radio(menu, Radio { label: crate::i18n::t(cx, "Checks"), options: checks_options, current: prefs.checks, set: |p, v| p.checks = v }, &entity, window, cx);
         if hosts.len() > 1 {
             let host_options: Vec<(Option<usize>, String)> = std::iter::once((None, "All".to_owned())).chain(hosts.iter().enumerate().map(|(i, h)| (Some(i), h.clone()))).collect();
             let current = prefs.host.as_ref().and_then(|host| hosts.iter().position(|h| h == host));
@@ -281,7 +286,7 @@ impl PullRequestsPage {
 }
 
 /// Saved named pull request views menu (`SavedViewsMenu.tsx`, `pingdotgg/t3code#29387`).
-fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, _cx: &App) -> impl IntoElement {
+fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, cx: &App) -> impl IntoElement {
     let views = page.saved_views.clone();
     let prefs = page.current_saved_preferences();
     let selected = resolve_selected_view(&views, page.selected_view_id.as_deref(), &prefs, pull_request_view_matches).cloned();
@@ -289,18 +294,24 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
     let trigger_label = match &selected {
         Some(view) if modified => format!("{}*", view.name),
         Some(view) => view.name.clone(),
-        None => "Views".to_owned(),
+        None => crate::i18n::t(cx, "Views").to_owned(),
     };
     let tooltip_text = selected
         .as_ref()
         .map(|view| view.name.clone())
-        .unwrap_or_else(|| "Saved pull request views".to_owned());
+        .unwrap_or_else(|| {
+            crate::i18n::t_fmt(
+                cx,
+                "{list, select, pullRequest {Saved pull request views} other {Saved issue views}}",
+                &[("list", "pullRequest".into())],
+            )
+        });
 
     Button::new("pr-saved-views", Variant::Outline, Size::Default)
         .icon(Icon::Bookmark)
         .label(trigger_label)
         .tooltip(tooltip_text)
-        .dropdown_menu(move |mut menu, _, _| {
+        .dropdown_menu(move |mut menu, _, cx| {
             for view in &views {
                 let is_active = selected.as_ref().is_some_and(|active| active.id == view.id && !modified);
                 let view_id = view.id.clone();
@@ -319,7 +330,7 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
             }
             let save_entity = entity.clone();
             let suggested = pull_request_view_suggested_name(&prefs);
-            menu = menu.item(PopupMenuItem::new("Save current view…").on_click(move |_, window, cx| {
+            menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Save current view…").to_owned()).on_click(move |_, window, cx| {
                 if let Some(page) = save_entity.upgrade() {
                     let initial = suggested.to_owned();
                     page.update(cx, |page, cx| page.open_saved_view_editor(None, initial, window, cx));
@@ -329,7 +340,7 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
                 if modified {
                     let update_entity = entity.clone();
                     let active_id = active.id.clone();
-                    menu = menu.item(PopupMenuItem::new("Update saved view").on_click(move |_, _, cx| {
+                    menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Update saved view").to_owned()).on_click(move |_, _, cx| {
                         if let Some(page) = update_entity.upgrade() {
                             let active_id = active_id.clone();
                             page.update(cx, |page, cx| page.update_active_saved_view(&active_id, cx));
@@ -339,7 +350,7 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
                 let rename_entity = entity.clone();
                 let active_id = active.id.clone();
                 let active_name = active.name.clone();
-                menu = menu.item(PopupMenuItem::new("Rename view…").on_click(move |_, window, cx| {
+                menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Rename view…").to_owned()).on_click(move |_, window, cx| {
                     if let Some(page) = rename_entity.upgrade() {
                         let active_id = active_id.clone();
                         let active_name = active_name.clone();
@@ -348,7 +359,7 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
                 }));
                 let delete_entity = entity.clone();
                 let active_id = active.id.clone();
-                menu = menu.item(PopupMenuItem::new("Delete view").on_click(move |_, _, cx| {
+                menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Delete view").to_owned()).on_click(move |_, _, cx| {
                     if let Some(page) = delete_entity.upgrade() {
                         let active_id = active_id.clone();
                         page.update(cx, |page, cx| page.delete_active_saved_view(&active_id, cx));
@@ -370,9 +381,17 @@ pub(super) fn render_saved_view_dialog(
     let typed_name = editor.input.read(cx).value().to_string();
     let name_error = saved_view_name_error(&typed_name, &page.saved_views, editor.editing_id.as_deref());
     let title = if editor.editing_id.is_some() {
-        "Rename pull request view"
+        crate::i18n::t_fmt(
+            cx,
+            "{list, select, pullRequest {Rename PR view} other {Rename issue view}}",
+            &[("list", "pullRequest".into())],
+        )
     } else {
-        "Save pull request view"
+        crate::i18n::t_fmt(
+            cx,
+            "{list, select, pullRequest {Save PR view} other {Save issue view}}",
+            &[("list", "pullRequest".into())],
+        )
     };
     let show_error = !typed_name.is_empty() && name_error.is_some();
 
@@ -412,7 +431,7 @@ pub(super) fn render_saved_view_dialog(
                             div()
                                 .text_xs()
                                 .text_color(hsla(p.muted_foreground))
-                                .child("Save your search, filters, and sort order on this device."),
+                                .child(crate::i18n::t(cx, "Save your search, filters, and sort order on this device.")),
                         ),
                 )
                 .child(
@@ -423,7 +442,7 @@ pub(super) fn render_saved_view_dialog(
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(hsla(p.foreground))
-                                .child("View name"),
+                                .child(crate::i18n::t(cx, "View name")),
                         )
                         .child(
                             h_flex()
@@ -445,7 +464,7 @@ pub(super) fn render_saved_view_dialog(
                                 div()
                                     .text_xs()
                                     .text_color(hsla(p.destructive_foreground))
-                                    .child(error.message()),
+                                    .child(crate::i18n::t(cx, error.message())),
                             )
                         }),
                 )
@@ -455,12 +474,12 @@ pub(super) fn render_saved_view_dialog(
                         .gap(px(8.))
                         .child(
                             Button::new("pr-view-cancel", Variant::Outline, Size::Sm)
-                                .label("Cancel")
+                                .label(crate::i18n::t(cx, "Cancel"))
                                 .on_click(cx.listener(|this, _, _, cx| this.close_saved_view_editor(cx))),
                         )
                         .child(
                             Button::new("pr-view-save", Variant::Default, Size::Sm)
-                                .label("Save")
+                                .label(crate::i18n::t(cx, "Save"))
                                 .disabled(name_error.is_some())
                                 .on_click(cx.listener(|this, _, _, cx| this.submit_saved_view_editor(cx))),
                         ),

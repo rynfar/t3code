@@ -623,36 +623,46 @@ impl ThreadPullRequestsPanel {
             .child(
                 Button::new(SharedString::from(format!("thread-pr-menu-{index}")), Variant::GhostMuted, Size::IconSm)
                     .icon(Icon::Ellipsis)
-                    .tooltip("Pull request actions")
-                    .dropdown_menu(move |menu, _, _| {
+                    .tooltip(crate::i18n::t_fmt(
+                        cx,
+                        "More {term, select, mr {merge request} cr {change request} other {pull request}} actions",
+                        &[("term", "pr".into())],
+                    ))
+                    .dropdown_menu(move |menu, _, cx| {
                         let mut menu = menu;
                         if let Some(reference) = menu_ref.clone() {
                             let panel = panel_entity.clone();
                             let ref_here = reference.clone();
-                            menu = menu.item(PopupMenuItem::new("Open details here").on_click(move |_, _, cx| {
+                            menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Open in right panel").to_owned()).on_click(move |_, _, cx| {
                                 panel.update(cx, |this, cx| this.open_detail(ref_here.clone(), None, cx));
                             }));
                             let ref_page = reference;
-                            menu = menu.item(PopupMenuItem::new("Open in Pull Requests").on_click(move |_, window, cx| {
+                            let open_in_prs = crate::i18n::t_fmt(
+                                cx,
+                                "Open in {_gt_value_1}",
+                                &[("_gt_value_1", crate::i18n::t(cx, "Pull requests").into())],
+                            );
+                            menu = menu.item(PopupMenuItem::new(open_in_prs).on_click(move |_, window, cx| {
                                 cx.set_global(PendingSelection(Some((ref_page.clone(), None))));
                                 window.dispatch_action(Box::new(OpenPullRequests), cx);
                             }));
                         }
                         let copy_url = menu_link.url.clone();
                         let state_copy = panel_entity.clone();
-                        menu = menu.item(PopupMenuItem::new("Copy link").on_click(move |_, _, cx| {
+                        menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Copy link").to_owned()).on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
                             let state = state_copy.read(cx).state.clone();
-                            state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Info, "Link copied"), cx));
+                            let message = crate::i18n::t(cx, "PR link copied").to_owned();
+                            state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Info, message), cx));
                         }));
                         let open_url = menu_link.url.clone();
-                        menu = menu.item(PopupMenuItem::new("Open on host").on_click(move |_, _, cx| {
+                        menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Open on host").to_owned()).on_click(move |_, _, cx| {
                             cx.open_url(&open_url);
                         }));
                         if can_watch {
                             let watch_link = menu_link.clone();
                             let panel = panel_entity.clone();
-                            let watch_label = if is_watching { "Stop watching" } else { "Watch for changes" };
+                            let watch_label = crate::i18n::t(cx, if is_watching { "Stop watching" } else { "Watch for changes" }).to_owned();
                             menu = menu.item(PopupMenuItem::new(watch_label).on_click(move |_, _, cx| {
                                 panel.update(cx, |this, cx| this.toggle_watch(&watch_link, cx));
                             }));
@@ -702,14 +712,18 @@ impl Render for ThreadPullRequestsPanel {
                         .child(
                             Button::new("thread-pr-detail-back", Variant::Ghost, Size::Xs)
                                 .icon(Icon::ArrowLeft)
-                                .label("Linked pull requests")
+                                .label(crate::i18n::t(cx, "Linked pull requests"))
                                 .on_click(cx.listener(|this, _, _, cx| this.close_detail(cx))),
                         )
                         .child(
                             Button::new("thread-pr-detail-popout", Variant::GhostMuted, Size::Xs)
                                 .icon(Icon::ExternalLink)
-                                .label("Pull Requests")
-                                .tooltip("Open in Pull Requests page")
+                                .label(crate::i18n::t(cx, "Pull requests"))
+                                .tooltip(crate::i18n::t_fmt(
+                                    cx,
+                                    "Open in {_gt_value_1}",
+                                    &[("_gt_value_1", crate::i18n::t(cx, "Pull requests").into())],
+                                ))
                                 .on_click(move |_, window, cx| {
                                     cx.set_global(PendingSelection(Some((pop_out_ref.clone(), None))));
                                     window.dispatch_action(Box::new(OpenPullRequests), cx);
@@ -738,18 +752,18 @@ impl Render for ThreadPullRequestsPanel {
                         .p(px(24.))
                         .text_center()
                         .child(Icon::Link2.sized(px(24.)).text_color(hsla(p.muted_foreground).opacity(0.6)))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("No linked pull requests"))
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "No linked pull requests")))
                         .child(
                             div()
                                 .max_w(px(240.))
                                 .text_xs()
                                 .text_color(hsla(p.muted_foreground))
-                                .child("Pull requests the agent opens from this thread land here. Link one yourself from a URL or a number."),
+                                .child(crate::i18n::t(cx, "Pull requests the agent opens from this thread land here. Link one yourself from a URL or a number.")),
                         )
                         .child(
                             Button::new("thread-pr-link-empty", Variant::Outline, Size::Sm)
                                 .icon(Icon::Plus)
-                                .label("Link pull request")
+                                .label(crate::i18n::t(cx, "Link pull request"))
                                 .on_click(cx.listener(|this, _, window, cx| this.toggle_inline_picker(window, cx))),
                         ),
                 )
@@ -790,7 +804,7 @@ impl Render for ThreadPullRequestsPanel {
                     .child(
                         Button::new("thread-pr-link", Variant::Ghost, Size::Xs)
                             .icon(Icon::Plus)
-                            .label(if self.picker_open { "Cancel" } else { "Link" })
+                            .label(crate::i18n::t(cx, if self.picker_open { "Cancel" } else { "Link" }))
                             .on_click(cx.listener(|this, _, window, cx| this.toggle_inline_picker(window, cx))),
                     ),
             )

@@ -263,15 +263,19 @@ impl UsageData {
         self.selected_ids.is_none()
     }
 
-    pub fn environment_filter_label(&self) -> String {
+    pub fn environment_filter_label(&self, cx: &gpui::App) -> String {
         if self.all_selected() {
-            return "All environments".to_owned();
+            return crate::i18n::t(cx, "All environments").to_owned();
         }
         let selected = self.selected_envs();
         if selected.len() == 1 {
             selected[0].label.clone()
         } else {
-            format!("{} environments", selected.len())
+            crate::i18n::t_fmt(
+                cx,
+                "{count, plural, one {{count} environments} other {{count} environments}}",
+                &[("count", selected.len().into())],
+            )
         }
     }
 

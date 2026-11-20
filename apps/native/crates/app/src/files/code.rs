@@ -329,7 +329,7 @@ impl Preview {
                         .variant(Variant::Ghost)
                         .size(Size::IconXs)
                         .icon(Icon::ChevronUp)
-                        .tooltip("Previous match")
+                        .tooltip(crate::i18n::t(cx, "Previous match"))
                         .disabled(!has_matches)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.code.step_find(false);
@@ -341,7 +341,7 @@ impl Preview {
                         .variant(Variant::Ghost)
                         .size(Size::IconXs)
                         .icon(Icon::ChevronDown)
-                        .tooltip("Next match")
+                        .tooltip(crate::i18n::t(cx, "Next match"))
                         .disabled(!has_matches)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.code.step_find(true);
@@ -354,7 +354,7 @@ impl Preview {
                         .variant(Variant::Ghost)
                         .size(Size::IconXs)
                         .icon(Icon::X)
-                        .tooltip("Close find")
+                        .tooltip(crate::i18n::t(cx, "Close find"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.code.close_find(window, cx);
                             cx.notify();

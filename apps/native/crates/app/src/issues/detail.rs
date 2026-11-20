@@ -1026,7 +1026,7 @@ impl IssueDetailPanel {
                 Size::Xs,
             )
             .icon(Icon::Plus)
-            .tooltip(t(cx, "Add reaction").to_owned())
+            .tooltip(t(cx, "Add a reaction").to_owned())
             .dropdown_menu(move |mut menu, _, _| {
                 for content in REACTION_ORDER {
                     let reacted = existing
@@ -1973,10 +1973,21 @@ impl Render for IssueDetailPanel {
                                     .text_color(hsla(p.muted_foreground))
                                     .child(avatar(&author_login, 16., cx))
                                     .child(author_login)
-                                    .child(format!("{} {opened}", t(cx, "opened")))
-                                    .children(
-                                        closed.map(|when| format!("· {} {when}", t(cx, "closed"))),
-                                    )
+                                    .child(crate::i18n::t_fmt(
+                                        cx,
+                                        "opened {_gt_value_1}",
+                                        &[("_gt_value_1", opened.into())],
+                                    ))
+                                    .children(closed.map(|when| {
+                                        format!(
+                                            "· {}",
+                                            crate::i18n::t_fmt(
+                                                cx,
+                                                "closed {_gt_value_1}",
+                                                &[("_gt_value_1", when.into())],
+                                            )
+                                        )
+                                    }))
                                     .when(!detail.writable, |this| {
                                         this.child(format!("· {}", t(cx, "Read-only")))
                                     }),

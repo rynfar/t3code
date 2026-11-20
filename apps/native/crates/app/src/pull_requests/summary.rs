@@ -40,12 +40,12 @@ pub fn render(view: &mut DetailView, window: &mut Window, cx: &mut Context<Detai
     let desc_heading = h_flex()
         .justify_between()
         .pr(px(16.))
-        .child(section_heading("Description", None, cx))
+        .child(section_heading(crate::i18n::t(cx, "Description"), None, cx))
         .when(can_edit_desc && !editing_desc, |this| {
             this.child(
                 Button::new("pr-desc-edit", Variant::GhostMuted, Size::Xs)
                     .icon(Icon::Pencil)
-                    .label("Edit")
+                    .label(crate::i18n::t(cx, "Edit"))
                     .on_click(cx.listener(|this, _, window, cx| this.start_description_edit(window, cx))),
             )
         });
@@ -98,7 +98,7 @@ pub fn render(view: &mut DetailView, window: &mut Window, cx: &mut Context<Detai
                 .children(pr_reactions),
         )
         .children(maintainer_edits)
-        .child(section_heading("Checks", Some(open), cx).id("pr-checks-toggle").cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
+        .child(section_heading(crate::i18n::t(cx, "Checks"), Some(open), cx).id("pr-checks-toggle").cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
             this.checks_open = !this.checks_open;
             cx.notify();
         })))
@@ -120,13 +120,13 @@ fn description(view: &mut DetailView, detail: &Detail, window: &mut Window, cx: 
                 h_flex()
                     .justify_end()
                     .gap(px(8.))
-                    .child(Button::new("pr-desc-cancel", Variant::Ghost, Size::Xs).label("Cancel").disabled(saving).on_click(cx.listener(|this, _, _, cx| {
+                    .child(Button::new("pr-desc-cancel", Variant::Ghost, Size::Xs).label(crate::i18n::t(cx, "Cancel")).disabled(saving).on_click(cx.listener(|this, _, _, cx| {
                         this.description_editing = false;
                         cx.notify();
                     })))
                     .child(
                         Button::new("pr-desc-save", Variant::Outline, Size::Xs)
-                            .label(if saving { "Saving..." } else { "Save" })
+                            .label(crate::i18n::t(cx, if saving { "Saving..." } else { "Save" }))
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.commit_description_edit(cx))),
                     ),
