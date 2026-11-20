@@ -422,8 +422,7 @@ pub fn verify_dpop_proof(
 }
 
 /// Process-wide cache of loaded device keys keyed by native home directory.
-pub fn device_key() -> Result<Arc<DpopDeviceKey>, String> {
-    let base = crate::store::base();
+fn device_key_for(base: Option<PathBuf>) -> Result<Arc<DpopDeviceKey>, String> {
     static KEYS: OnceLock<Mutex<HashMap<Option<PathBuf>, Arc<DpopDeviceKey>>>> = OnceLock::new();
     let cache = KEYS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -439,8 +438,26 @@ pub fn device_key() -> Result<Arc<DpopDeviceKey>, String> {
     Ok(arc)
 }
 
+/// Process-wide cache of loaded device keys for the active native home directory.
+pub fn device_key() -> Result<Arc<DpopDeviceKey>, String> {
+    device_key_for(crate::store::base())
+}
+
+/// Loads (or creates and caches) the DPoP device key inside an explicit home directory.
+pub fn device_key_in(base: &Path) -> Result<Arc<DpopDeviceKey>, String> {
+    device_key_for(Some(base.to_path_buf()))
+}
+
 fn normalize_host_key(http_base: &str) -> String {
     http_base.trim().trim_end_matches('/').to_owned()
+}
+
+/// Maps a relay `wsBaseUrl` (`wss://host/ws` / `ws://host/ws`) to its normalized HTTP(S) base origin.
+pub fn ws_base_to_http_base(ws_base: &str) -> Option<String> {
+    let parsed = Url::parse(ws_base).ok()?;
+    let mut http = Url::parse(&ws_url_to_http_htu(&parsed)?).ok()?;
+    http.set_path("");
+    Some(normalize_host_key(http.as_str()))
 }
 
 type HostCredentialMap = HashMap<String, DpopConnectionCredential>;
@@ -466,15 +483,19 @@ fn save_credentials_file(base: &Path, map: &HashMap<String, DpopConnectionCreden
     }
 }
 
-/// Returns the stored direct DPoP credential for `http_base`, if that host paired with a DPoP key.
-pub fn get_direct_credential(http_base: &str) -> Option<DpopConnectionCredential> {
+/// Returns the stored direct DPoP credential for `http_base` under an explicit home directory.
+pub fn get_direct_credential_in(base: Option<PathBuf>, http_base: &str) -> Option<DpopConnectionCredential> {
     let key = normalize_host_key(http_base);
-    let base = crate::store::base();
     let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
     let map = guard
         .entry(base.clone())
         .or_insert_with(|| base.as_deref().map(load_credentials_file).unwrap_or_default());
     map.get(&key).cloned()
+}
+
+/// Returns the stored direct DPoP credential for `http_base`, if that host paired with a DPoP key.
+pub fn get_direct_credential(http_base: &str) -> Option<DpopConnectionCredential> {
+    get_direct_credential_in(crate::store::base(), http_base)
 }
 
 /// Resolves the stored direct DPoP credential for `(http_base, access_token)` across route switches,
@@ -539,17 +560,37 @@ pub fn update_direct_credential(store_key: &str, mut credential: DpopConnectionC
 
 /// Migrates a stored DPoP credential when a saved environment moves to a new address (e.g., an SSH
 /// tunnel reserving a new ephemeral port or a local server restarting on a different port).
+/// If a fresh credential is already registered under `new_http_base` (such as a relay tunnel move
+/// where `Prepare` registered the new endpoint's credential before returning `Moved`), preserves
+/// that credential and only cleans up the stale `old_http_base` entry.
 pub fn relocate_direct_credential(old_http_base: &str, new_http_base: &str, access_token: Option<&str>) {
+    relocate_direct_credential_in(crate::store::base(), old_http_base, new_http_base, access_token);
+}
+
+/// Explicit-home variant of [`relocate_direct_credential`].
+pub fn relocate_direct_credential_in(
+    base: Option<PathBuf>,
+    old_http_base: &str,
+    new_http_base: &str,
+    access_token: Option<&str>,
+) {
     let old_key = normalize_host_key(old_http_base);
     let new_key = normalize_host_key(new_http_base);
     if old_key == new_key {
         return;
     }
-    let base = crate::store::base();
     let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
     let map = guard
         .entry(base.clone())
         .or_insert_with(|| base.as_deref().map(load_credentials_file).unwrap_or_default());
+    if map.contains_key(&new_key) {
+        if map.remove(&old_key).is_some()
+            && let Some(dir) = base.as_deref()
+        {
+            save_credentials_file(dir, map);
+        }
+        return;
+    }
     let existing = map.remove(&old_key).or_else(|| {
         let token = access_token.filter(|t| !t.is_empty())?;
         let found_key = map
@@ -563,6 +604,90 @@ pub fn relocate_direct_credential(old_http_base: &str, new_http_base: &str, acce
         if let Some(dir) = base.as_deref() {
             save_credentials_file(dir, map);
         }
+    }
+}
+
+/// Registers or refreshes a relay-minted DPoP credential bound to `http_base` (and the normalized
+/// HTTP(S) base of `ws_base` if it differs). Preserves `seed_token` across refreshes so an active
+/// supervisor holding the initial saved token keeps resolving the fresh credential.
+pub fn register_relay_credential(
+    http_base: &str,
+    ws_base: Option<&str>,
+    access_token: String,
+    expires_at_epoch_ms: i64,
+    environment_id: Option<String>,
+    seed_token: Option<&str>,
+) {
+    register_relay_credential_in(
+        crate::store::base(),
+        http_base,
+        ws_base,
+        access_token,
+        expires_at_epoch_ms,
+        environment_id,
+        seed_token,
+    );
+}
+
+/// Explicit-home variant of [`register_relay_credential`].
+pub fn register_relay_credential_in(
+    base: Option<PathBuf>,
+    http_base: &str,
+    ws_base: Option<&str>,
+    access_token: String,
+    expires_at_epoch_ms: i64,
+    environment_id: Option<String>,
+    seed_token: Option<&str>,
+) {
+    let primary_key = normalize_host_key(http_base);
+    let ws_key = ws_base
+        .and_then(ws_base_to_http_base)
+        .filter(|candidate| !candidate.is_empty() && *candidate != primary_key);
+    let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard
+        .entry(base.clone())
+        .or_insert_with(|| base.as_deref().map(load_credentials_file).unwrap_or_default());
+
+    let upsert_key = |map: &mut HostCredentialMap, key: String| {
+        let existing = map.get(&key).cloned().or_else(|| {
+            let seed = seed_token.filter(|t| !t.is_empty())?;
+            map.values().find(|cred| cred.matches_token(seed)).cloned()
+        });
+        let next = match existing {
+            Some(prev) => {
+                let mut renewed = prev.renewed(access_token.clone(), expires_at_epoch_ms);
+                if renewed.environment_id.is_none() {
+                    renewed.environment_id = environment_id.clone();
+                }
+                if let Some(seed) = seed_token.filter(|t| !t.is_empty())
+                    && renewed.seed_token.is_none()
+                {
+                    renewed.seed_token = Some(seed.to_owned());
+                }
+                renewed
+            }
+            None => DpopConnectionCredential {
+                seed_token: Some(
+                    seed_token
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or(&access_token)
+                        .to_owned(),
+                ),
+                previous_access_token: None,
+                environment_id: environment_id.clone(),
+                access_token: access_token.clone(),
+                expires_at_epoch_ms,
+            },
+        };
+        map.insert(key, next);
+    };
+
+    upsert_key(map, primary_key);
+    if let Some(extra_key) = ws_key {
+        upsert_key(map, extra_key);
+    }
+    if let Some(dir) = base.as_deref() {
+        save_credentials_file(dir, map);
     }
 }
 
@@ -759,5 +884,68 @@ mod tests {
         // Removal by matching token cleans up regardless of base.
         remove_direct_credential_matching(&initial_base, Some(&seed));
         assert!(find_direct_credential(&relocated_base, &seed).is_none());
+    }
+
+    #[test]
+    fn relay_credential_registration_binds_http_and_ws_origins_and_preserves_seed_token() {
+        let dir = std::env::temp_dir().join(format!("t3-dpop-relay-{}", uuid::Uuid::new_v4()));
+        let http_base = "https://env-1.t3.codes";
+        let ws_base = "wss://ws.env-1.t3.codes/ws";
+        register_relay_credential_in(
+            Some(dir.clone()),
+            http_base,
+            Some(ws_base),
+            "relay-cred-1".into(),
+            1_800_000_000_000,
+            Some("env-1".into()),
+            None,
+        );
+        let first = get_direct_credential_in(Some(dir.clone()), http_base).expect("http base stored");
+        assert_eq!(first.access_token, "relay-cred-1");
+        assert_eq!(first.seed_token.as_deref(), Some("relay-cred-1"));
+        let ws_stored = get_direct_credential_in(Some(dir.clone()), "https://ws.env-1.t3.codes")
+            .expect("distinct ws origin stored");
+        assert_eq!(ws_stored.access_token, "relay-cred-1");
+
+        // Re-registering with a rotated relay credential preserves seed_token so the supervisor resolves it.
+        register_relay_credential_in(
+            Some(dir.clone()),
+            http_base,
+            Some(ws_base),
+            "relay-cred-2".into(),
+            1_900_000_000_000,
+            Some("env-1".into()),
+            Some("relay-cred-1"),
+        );
+        let refreshed = get_direct_credential_in(Some(dir.clone()), http_base).expect("refreshed");
+        assert_eq!(refreshed.access_token, "relay-cred-2");
+        assert!(refreshed.matches_token("relay-cred-1"));
+        assert!(refreshed.matches_token("relay-cred-2"));
+
+        // Relay tunnel move (`PrepareError::Moved`): `Prepare` registers the fresh credential at the
+        // new tunnel URL before `SavedEnvironments::relocate` runs. Relocation must preserve the
+        // fresh credential at `moved_http_base` and remove the stale old-tunnel entry.
+        let moved_http_base = "https://env-1-reallocated.t3.codes";
+        register_relay_credential_in(
+            Some(dir.clone()),
+            moved_http_base,
+            Some("wss://env-1-reallocated.t3.codes/ws"),
+            "relay-cred-moved-3".into(),
+            2_000_000_000_000,
+            Some("env-1".into()),
+            Some("relay-cred-1"),
+        );
+        relocate_direct_credential_in(Some(dir.clone()), http_base, moved_http_base, Some("relay-cred-1"));
+        assert!(
+            get_direct_credential_in(Some(dir.clone()), http_base).is_none(),
+            "old tunnel origin entry should be removed on move"
+        );
+        let moved = get_direct_credential_in(Some(dir.clone()), moved_http_base)
+            .expect("fresh credential at moved tunnel origin must be preserved");
+        assert_eq!(moved.access_token, "relay-cred-moved-3");
+        assert!(moved.matches_token("relay-cred-1"));
+        assert_eq!(moved.expires_at_epoch_ms, 2_000_000_000_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

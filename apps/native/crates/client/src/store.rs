@@ -79,6 +79,11 @@ impl SavedEnvironment {
         let access_token = self.access_token.clone()?;
         Some(Credentials { http_base: self.http_base.clone(), access_token })
     }
+
+    /// Whether this saved environment is reached through a T3 Connect managed relay tunnel.
+    pub fn is_relay_managed(&self) -> bool {
+        is_relay_managed_environment(&self.id)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +147,53 @@ impl SavedEnvironments {
     /// `upsert` for a pairing made over SSH.
     pub fn upsert_ssh(&mut self, paired: &Paired, target: t3_core::ssh::SshTarget) -> String {
         self.upsert_route(paired, false, Some(target))
+    }
+
+    /// Saves or refreshes a T3 Connect relay-managed environment and makes it active.
+    pub fn upsert_relay(&mut self, environment_id: &str, label: &str, http_base: &str, access_token: &str) -> String {
+        self.upsert_relay_in(base(), environment_id, label, http_base, access_token)
+    }
+
+    fn upsert_relay_in(
+        &mut self,
+        dir: Option<PathBuf>,
+        environment_id: &str,
+        label: &str,
+        http_base: &str,
+        access_token: &str,
+    ) -> String {
+        let env_id = (!environment_id.trim().is_empty()).then(|| environment_id.trim().to_owned());
+        let existing = self.find(env_id.as_deref(), http_base).map(|environment| environment.id.clone());
+        let id = existing.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let previous = existing.and_then(|id| self.get(&id).cloned());
+        let resolved_label = (!label.trim().is_empty())
+            .then(|| label.trim().to_owned())
+            .or_else(|| previous.as_ref().map(|environment| environment.label.clone()))
+            .unwrap_or_else(|| host_label(http_base));
+        let environment = SavedEnvironment {
+            id: id.clone(),
+            environment_id: env_id.or_else(|| previous.as_ref().and_then(|environment| environment.environment_id.clone())),
+            label: resolved_label,
+            disabled: false,
+            http_base: http_base.to_owned(),
+            access_token: Some(access_token.to_owned()),
+            server_version: previous.as_ref().and_then(|environment| environment.server_version.clone()),
+            local: false,
+            ssh: None,
+        };
+        if let Some(prev) = previous.as_ref()
+            && prev.http_base != http_base
+            && prev.access_token.as_deref() != Some(access_token)
+        {
+            crate::dpop::remove_direct_credential_matching(&prev.http_base, prev.access_token.as_deref());
+        }
+        match self.environments.iter_mut().find(|entry| entry.id == id) {
+            Some(entry) => *entry = environment,
+            None => self.environments.push(environment),
+        }
+        set_relay_managed_environment_in(dir, &id, true);
+        self.active = Some(id.clone());
+        id
     }
 
     /// `EnvironmentRegistry.assertKnownAddress` for untargeted SSH onboarding
@@ -212,6 +264,7 @@ impl SavedEnvironments {
             Some(entry) => *entry = environment,
             None => self.environments.push(environment),
         }
+        set_relay_managed_environment(&id, false);
         self.active = Some(id.clone());
         id
     }
@@ -274,11 +327,16 @@ impl SavedEnvironments {
 
     /// Forgets an environment and its credential. Returns whether it was saved.
     pub fn remove(&mut self, id: &str) -> bool {
+        self.remove_in(base(), id)
+    }
+
+    fn remove_in(&mut self, dir: Option<PathBuf>, id: &str) -> bool {
         let before = self.environments.len();
         if let Some(removed) = self.environments.iter().find(|environment| environment.id == id) {
             crate::dpop::remove_direct_credential_matching(&removed.http_base, removed.access_token.as_deref());
         }
         self.environments.retain(|environment| environment.id != id);
+        set_relay_managed_environment_in(dir, id, false);
         if self.active.as_deref() == Some(id) {
             self.active = None;
         }
@@ -827,6 +885,73 @@ pub(crate) fn clear_cloud_token(base: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(base.join("cloud-oauth.json")) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), result => result }
 }
 
+// Clerk Native Frontend API sessions are persisted privately (0o600) in `cloud-clerk.json`.
+pub(crate) fn load_clerk_session(base: &Path) -> std::io::Result<Option<t3_core::connect::ClerkSession>> {
+    match std::fs::read(base.join("cloud-clerk.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(std::io::Error::other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+pub(crate) fn save_clerk_session(base: &Path, session: &t3_core::connect::ClerkSession) -> std::io::Result<()> {
+    write_private(base, "cloud-clerk.json", &serde_json::to_string(session).map_err(std::io::Error::other)?)
+}
+pub(crate) fn clear_clerk_session(base: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(base.join("cloud-clerk.json")) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), result => result }
+}
+
+const RELAY_MANAGED_FILE: &str = "relay-managed.json";
+
+type RelayManagedMap = std::collections::HashMap<Option<PathBuf>, std::collections::HashSet<String>>;
+
+fn relay_managed_store() -> &'static std::sync::Mutex<RelayManagedMap> {
+    static STORE: OnceLock<std::sync::Mutex<RelayManagedMap>> = OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn load_relay_managed_file(base: &Path) -> std::collections::HashSet<String> {
+    match std::fs::read_to_string(base.join(RELAY_MANAGED_FILE)) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// Returns whether `id` is a T3 Connect relay-managed saved environment.
+pub fn is_relay_managed_environment(id: &str) -> bool {
+    is_relay_managed_environment_in(base(), id)
+}
+
+fn is_relay_managed_environment_in(base: Option<PathBuf>, id: &str) -> bool {
+    let mut guard = relay_managed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let set = guard
+        .entry(base.clone())
+        .or_insert_with(|| base.as_deref().map(load_relay_managed_file).unwrap_or_default());
+    set.contains(id)
+}
+
+/// Persists whether saved environment `id` is managed via T3 Connect relay.
+pub fn set_relay_managed_environment(id: &str, relay_managed: bool) {
+    set_relay_managed_environment_in(base(), id, relay_managed);
+}
+
+fn set_relay_managed_environment_in(base: Option<PathBuf>, id: &str, relay_managed: bool) {
+    let mut guard = relay_managed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let set = guard
+        .entry(base.clone())
+        .or_insert_with(|| base.as_deref().map(load_relay_managed_file).unwrap_or_default());
+    let changed = if relay_managed {
+        set.insert(id.to_owned())
+    } else {
+        set.remove(id)
+    };
+    if changed
+        && let Some(dir) = base.as_deref()
+        && let Ok(text) = serde_json::to_string_pretty(set)
+    {
+        let _ = write_private(dir, RELAY_MANAGED_FILE, &text);
+    }
+}
+
 /// Saved alternate/learned routes keyed by saved environment ID (`CN-SESSION`).
 pub fn load_alternate_routes() -> std::collections::HashMap<String, Vec<crate::routes::CandidateRoute>> {
     load_ui_state("environment-routes")
@@ -1212,5 +1337,40 @@ mod tests {
         let paired_ssh = paired("http://127.0.0.1:41200", "tok-2", "env-ssh", "SSH Box");
         saved.upsert_ssh(&paired_ssh, ssh_target.clone());
         assert!(saved.check_ssh_onboarding_conflict(Some("env-ssh"), &ssh_target).is_ok());
+    }
+
+    #[test]
+    fn clerk_session_storage_is_owner_only_and_relay_upsert_tracks_relay_managed_state() {
+        let dir = std::env::temp_dir().join(format!("t3-clerk-store-test-{}", uuid::Uuid::new_v4()));
+        let session = t3_core::connect::ClerkSession {
+            client_token: "clerk-client-jwt".into(),
+            session_id: "sess_123".into(),
+            identity: Some("user@example.test".into()),
+        };
+        save_clerk_session(&dir, &session).unwrap();
+        assert_eq!(load_clerk_session(&dir).unwrap(), Some(session));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("cloud-clerk.json")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        clear_clerk_session(&dir).unwrap();
+        assert_eq!(load_clerk_session(&dir).unwrap(), None);
+
+        let mut saved = SavedEnvironments::default();
+        let id = saved.upsert_relay_in(
+            Some(dir.clone()),
+            "env-relay-1",
+            "Studio",
+            "https://studio.t3.codes",
+            "relay-tok",
+        );
+        assert!(is_relay_managed_environment_in(Some(dir.clone()), &id));
+        assert!(dir.join(RELAY_MANAGED_FILE).exists());
+        assert_eq!(saved.get(&id).unwrap().environment_id.as_deref(), Some("env-relay-1"));
+        assert!(saved.remove_in(Some(dir.clone()), &id));
+        assert!(!is_relay_managed_environment_in(Some(dir.clone()), &id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
