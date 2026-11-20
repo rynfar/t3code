@@ -47,11 +47,14 @@ fn tracker_header(page: &IssuesPage, group_idx: usize, cx: &App) -> AnyElement {
     let provider_name = group.tracker.tracker.display_name();
     let show_host = !provider_name.eq_ignore_ascii_case(&group.tracker.host);
     let count = group.tracker.project_count;
-    let project_label = if count == 1 {
-        format!("· {count} {}", t(cx, "project"))
-    } else {
-        format!("· {count} {}", t(cx, "projects"))
-    };
+    let project_label = format!(
+        "· {}",
+        crate::i18n::t_fmt(
+            cx,
+            "{count, plural, one {{count} project} other {{count} projects}}",
+            &[("count", count.into())],
+        )
+    );
     h_flex()
         .gap(px(6.))
         .px(px(12.))
@@ -223,7 +226,7 @@ fn entry_row(
                             Size::IconSm,
                         )
                         .icon(Icon::Copy)
-                        .tooltip(t(cx, "Copy issue key").to_owned())
+                        .tooltip(t(cx, "Copy ID").to_owned())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.copy_text(copy_text.clone(), "Issue key", cx);
                         })),
@@ -523,7 +526,7 @@ pub fn unavailable(
 ) -> impl IntoElement {
     empty_box(
         Icon::CircleDot,
-        t(cx, "Could not load issues").to_owned(),
+        t(cx, "Could not load issue trackers").to_owned(),
         error,
         cx,
     )

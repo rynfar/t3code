@@ -464,7 +464,7 @@ impl Composer {
         let tooltip: SharedString = if resolved.model.is_none() && resolved.multi_models.is_empty() {
             t(cx, "No provider available").into()
         } else if rewinding {
-            t(cx, "Reverting checkpoint...").into()
+            t(cx, "Rewinding conversation").into()
         } else if self.snapshot.setup_blocks_send {
             t(cx, t3_core::worktree_setup::SEND_BLOCKED).into()
         } else if let Some(reason) = attachment_block {

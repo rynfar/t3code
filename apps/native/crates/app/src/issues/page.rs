@@ -1083,7 +1083,7 @@ impl IssuesPage {
         let first_error = self.read_tracker.first_error().map(str::to_owned);
 
         if none_answered && pending {
-            return super::row::ghost(t(cx, "Loading issues…"), cx).into_any_element();
+            return super::row::ghost(t(cx, "Loading…"), cx).into_any_element();
         }
         if let Some(error) = first_error.filter(|_| none_answered) {
             let retry = cx.listener(|this, _, _, cx| this.retry_failed(cx));
@@ -1139,7 +1139,11 @@ impl Render for IssuesPage {
                     .bg(hsla(p.warning_surface))
                     .text_xs()
                     .text_color(hsla(p.foreground))
-                    .child(format!("{error} {}", t(cx, "Showing the issues that loaded.")))
+                    .child(crate::i18n::t_fmt(
+                        cx,
+                        "{_gt_value_1} Showing the issues that loaded.",
+                        &[("_gt_value_1", error.into())],
+                    ))
                     .child(
                         Button::new("issues-partial-retry", Variant::Outline, Size::Xs)
                             .label(t(cx, "Retry").to_owned())

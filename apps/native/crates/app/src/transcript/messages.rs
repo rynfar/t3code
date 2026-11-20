@@ -1694,7 +1694,7 @@ impl RenderOnce for PlanCard {
                                     .relative()
                                     .flex_none()
                                     .gap(px(4.))
-                                    .child(CopyButton::new(SharedString::from(format!("copy-plan:{id}")), crate::i18n::t(cx, "Copy plan"), move |_, cx| {
+                                    .child(CopyButton::new(SharedString::from(format!("copy-plan:{id}")), crate::i18n::t(cx, "Copy"), move |_, cx| {
                                         crate::composer::clipboard::write(copy_for_btn.clone(), String::new(), cx);
                                     }))
                                     .child(ghost_icon_button(

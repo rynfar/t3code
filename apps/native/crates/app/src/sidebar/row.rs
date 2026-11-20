@@ -1214,6 +1214,7 @@ impl SidebarPane {
 
     fn render_show_more(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
+        let label = self.state.read(cx).settled_show_more_label(count, cx);
         div()
             .px(px(8.))
             .child(
@@ -1231,7 +1232,7 @@ impl SidebarPane {
                     .text_color(hsla(p.sidebar_muted_foreground))
                     .hover(|this| this.bg(hsla(p.sidebar_row_hover)).text_color(hsla(p.sidebar_foreground)))
                     .child(div().flex_none().child(Icon::ChevronDown.render(px(16.), hsla(p.sidebar_muted_foreground))))
-                    .child(div().flex_1().min_w_0().child(crate::i18n::t(cx, &self.state.read(cx).settled_show_more_label(count)).to_owned()))
+                    .child(div().flex_1().min_w_0().child(label))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.state.update(cx, |state, cx| if !state.settled_shelf_loading() { state.show_more_settled(cx) })
                     })),

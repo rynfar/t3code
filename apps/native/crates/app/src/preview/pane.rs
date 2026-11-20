@@ -637,7 +637,7 @@ impl PreviewPane {
                             .variant(Variant::Ghost)
                             .size(Size::IconXs)
                             .icon(Icon::Image)
-                            .tooltip(crate::i18n::t(cx, "Attach screenshot to chat"))
+                            .tooltip(crate::i18n::t(cx, "Capture screenshot"))
                             .disabled(annotate_disabled)
                             .on_click(cx.listener(|this, _, _, cx| this.capture_screenshot(cx))),
                     )
@@ -729,7 +729,7 @@ impl PreviewPane {
                             })),
                         )
                         .when(has_closed, |this| {
-                            this.child(MenuItem::new("preview-menu-reopen-closed", crate::i18n::t(cx, "Reopen closed tab")).on_click(cx.listener(|this, _, _, cx| {
+                            this.child(MenuItem::new("preview-menu-reopen-closed", crate::i18n::t(cx, "Reopen Closed Tab")).on_click(cx.listener(|this, _, _, cx| {
                                 this.more_menu_open = false;
                                 this.state.update(cx, |state, cx| state.reopen_closed_view(cx));
                                 cx.notify();
@@ -1077,18 +1077,18 @@ impl PreviewPane {
                     .px(px(32.))
                     .py(px(64.))
                     .child(Icon::PreviewError.svg().mb(px(24.)).size(px(48.)).text_color(hsla(p.muted_foreground).opacity(0.7)))
-                    .child(div().mb(px(12.)).text_2xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child("This site can\u{2019}t be reached"))
+                    .child(div().mb(px(12.)).text_2xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "This site can\u{2019}t be reached")))
                     .child(
                         div()
                             .text_sm()
                             .text_color(hsla(p.muted_foreground))
-                            .child(gpui::StyledText::new(format!("{host}: {}.", describe_error(description))).with_highlights([(
+                            .child(gpui::StyledText::new(format!("{host}: {}.", crate::i18n::t(cx, describe_error(description)))).with_highlights([(
                                 0..host.len(),
                                 gpui::HighlightStyle { font_weight: Some(FontWeight::SEMIBOLD), color: Some(hsla(p.foreground)), ..Default::default() },
                             )])),
                     )
                     .when(details, |this| {
-                        let item = |text: &'static str| h_flex().gap(px(8.)).child("•").child(text);
+                        let item = |text: &'static str| h_flex().gap(px(8.)).child("•").child(crate::i18n::t(cx, text));
                         this.child(
                             v_flex()
                                 .mt(px(24.))
@@ -1100,7 +1100,7 @@ impl PreviewPane {
                                 .bg(hsla(p.muted).opacity(0.4))
                                 .text_sm()
                                 .text_color(hsla(p.muted_foreground))
-                                .child(div().mb(px(4.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Try:"))
+                                .child(div().mb(px(4.)).font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Try:")))
                                 .child(item("Checking your connection"))
                                 .child(item("Confirming the dev server is running"))
                                 .child(item("Checking the proxy and the firewall")),
@@ -1112,7 +1112,7 @@ impl PreviewPane {
                             .mt_auto()
                             .pt(px(32.))
                             .gap(px(8.))
-                            .child(ActionButton::new("preview-details", ButtonVariant::Outline, ButtonSize::Sm).label(if details { "Hide details" } else { "Details" }).on_click(
+                            .child(ActionButton::new("preview-details", ButtonVariant::Outline, ButtonSize::Sm).label(crate::i18n::t(cx, if details { "Hide details" } else { "Details" })).on_click(
                                 cx.listener(|this, _, _, cx| {
                                     this.unreachable_details = !this.unreachable_details;
                                     cx.notify();
@@ -1121,7 +1121,7 @@ impl PreviewPane {
                             .child(div().flex_1())
                             .child(
                                 ActionButton::new("preview-reload", ButtonVariant::Default, ButtonSize::Sm)
-                                    .label("Reload")
+                                    .label(crate::i18n::t(cx, "Reload"))
                                     .on_click(cx.listener(|this, _, _, cx| this.send(StreamInput::Reload { ignore_cache: None }, cx))),
                             ),
                     ),

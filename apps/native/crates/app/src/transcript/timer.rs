@@ -67,9 +67,9 @@ impl Render for WorkingTimer {
         self.painted.set(true);
         let now_ms = self.now_ms();
         let label = match (self.kind, elapsed_label(&self.started_at, now_ms)) {
-            (TimerKind::Compacting, Some(elapsed)) => crate::i18n::t_fmt(cx, "Compacting for {duration}", &[("duration", elapsed.into())]),
+            (TimerKind::Compacting, Some(elapsed)) => format!("{}{elapsed}", crate::i18n::t(cx, "Compacting for ")),
             (TimerKind::Compacting, None) => crate::i18n::t(cx, "Compacting…").to_owned(),
-            (TimerKind::Working, Some(elapsed)) => crate::i18n::t_fmt(cx, "Working for {duration}", &[("duration", elapsed.into())]),
+            (TimerKind::Working, Some(elapsed)) => format!("{}{elapsed}", crate::i18n::t(cx, "Working for ")),
             (TimerKind::Working, None) => crate::i18n::t(cx, "Working...").to_owned(),
             (TimerKind::Elapsed, _) => elapsed_since(&self.started_at, now_ms).unwrap_or_default(),
             (TimerKind::SetupStage, _) => t3_core::worktree_setup::live_label(&self.started_at, now_ms).unwrap_or_default(),

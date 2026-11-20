@@ -1151,4 +1151,118 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn timer_settled_usage_saved_views_and_preview_keys_translate_in_every_locale() {
+        let plain_keys = [
+            "Working for ",
+            "Compacting for ",
+            "Could not load older threads. Retry",
+            "Hourly cost",
+            "Daily cost",
+            "Hourly processed tokens",
+            "Daily processed tokens",
+            "Reopen Closed Tab",
+            "Capture screenshot",
+            "This site can\u{2019}t be reached",
+            "Connection refused",
+            "DNS address could not be found",
+            "Checking your connection",
+            "Confirming the dev server is running",
+            "Checking the proxy and the firewall",
+            "Hide details",
+            "Rotate viewport",
+            "Loading earlier turns…",
+            "Load earlier turns",
+            "Add a reaction",
+            "Could not load issue trackers",
+            "Rewinding conversation",
+            "This saved view was removed",
+        ];
+
+        for &locale in SUPPORTED_LOCALES.iter().filter(|&&l| l != DEFAULT_LOCALE) {
+            for key in plain_keys {
+                assert!(
+                    lookup_web_first(locale, key).is_some(),
+                    "missing web translation in {locale} for {key:?}"
+                );
+                assert_ne!(
+                    translate(locale, key),
+                    key,
+                    "expected non-English translation in {locale} for {key:?}"
+                );
+            }
+
+            // Settled "Show N more" plural key and flattened rich key
+            let settled = translate_fmt(
+                locale,
+                "{count, plural, one {Show {count} more} other {Show {count} more}}",
+                &[("count", 5usize.into())],
+            );
+            assert_ne!(settled, "Show 5 more", "expected localized settled show-more in {locale}");
+            assert!(settled.contains('5'), "expected count in {locale}: {settled}");
+
+            let settled_rich = translate_fmt(
+                locale,
+                "Show {_gt_value_1} more",
+                &[("_gt_value_1", 5usize.into())],
+            );
+            assert_ne!(settled_rich, "Show 5 more", "expected localized rich show-more in {locale}");
+
+            // Usage provider & environment plural keys
+            let providers = translate_fmt(
+                locale,
+                "{count, plural, one {{count} providers} other {{count} providers}}",
+                &[("count", 3usize.into())],
+            );
+            assert_ne!(providers, "3 providers", "expected localized provider count in {locale}");
+            assert!(providers.contains('3'));
+
+            let envs = translate_fmt(
+                locale,
+                "{count, plural, one {{count} environments} other {{count} environments}}",
+                &[("count", 2usize.into())],
+            );
+            assert_ne!(envs, "2 environments", "expected localized environment count in {locale}");
+            assert!(envs.contains('2'));
+
+            // Saved views ICU select keys for both PR and issue lists
+            for (key, pr_en, issue_en) in [
+                (
+                    "{list, select, pullRequest {Saved pull request views} other {Saved issue views}}",
+                    "Saved pull request views",
+                    "Saved issue views",
+                ),
+                (
+                    "{list, select, pullRequest {Rename PR view} other {Rename issue view}}",
+                    "Rename PR view",
+                    "Rename issue view",
+                ),
+                (
+                    "{list, select, pullRequest {Save PR view} other {Save issue view}}",
+                    "Save PR view",
+                    "Save issue view",
+                ),
+            ] {
+                let pr = translate_fmt(locale, key, &[("list", "pullRequest".into())]);
+                let issue = translate_fmt(locale, key, &[("list", "issue".into())]);
+                assert_ne!(pr, pr_en, "expected localized PR saved-view string in {locale}");
+                assert_ne!(issue, issue_en, "expected localized issue saved-view string in {locale}");
+                assert_ne!(pr, issue, "expected distinct PR vs issue saved-view strings in {locale}");
+            }
+
+            // Partial issues banner & opened/closed rich keys
+            let partial = translate_fmt(
+                locale,
+                "{_gt_value_1} Showing the issues that loaded.",
+                &[("_gt_value_1", "Rate limited.".into())],
+            );
+            assert!(partial.starts_with("Rate limited."), "expected error prefix in {locale}: {partial}");
+            assert_ne!(partial, "Rate limited. Showing the issues that loaded.");
+
+            let opened = translate_fmt(locale, "opened {_gt_value_1}", &[("_gt_value_1", "2h".into())]);
+            assert!(opened.contains("2h"));
+            assert_ne!(opened, "opened 2h", "expected localized opened label in {locale}");
+        }
+    }
 }

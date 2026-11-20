@@ -378,7 +378,11 @@ fn filters_menu(
             } else if selected_labels.len() == 1 {
                 selected_labels[0].clone()
             } else {
-                format!("{} {}", selected_labels.len(), t(cx, "labels"))
+                crate::i18n::t_fmt(
+                    cx,
+                    "{count, plural, one {{count} label} other {{count} labels}}",
+                    &[("count", selected_labels.len().into())],
+                )
             };
             let label_entity = entity.clone();
             let labels_list = visible_labels.clone();
@@ -392,7 +396,12 @@ fn filters_menu(
                         let clear_entity = label_entity.clone();
                         menu = menu
                             .item(
-                                PopupMenuItem::new(t(cx, "Clear labels").to_owned()).on_click(
+                                PopupMenuItem::new(crate::i18n::t_fmt(
+                                    cx,
+                                    "Clear {field}",
+                                    &[("field", t(cx, "Labels").into())],
+                                ))
+                                .on_click(
                                     move |_, _, cx| {
                                         update(&clear_entity, cx, |prefs| prefs.label.clear());
                                     },
@@ -436,7 +445,7 @@ fn filters_menu(
                     if failed_candidates {
                         let retry_entity = label_entity.clone();
                         menu = menu.separator().item(
-                            PopupMenuItem::new(t(cx, "Retry failed repositories").to_owned())
+                            PopupMenuItem::new(t(cx, "Retry").to_owned())
                                 .on_click(move |_, _, cx| {
                                     if let Some(page) = retry_entity.upgrade() {
                                         page.update(cx, |page, cx| {
@@ -503,7 +512,7 @@ fn filters_menu(
                     if failed_candidates {
                         let retry_entity = assignee_entity.clone();
                         menu = menu.separator().item(
-                            PopupMenuItem::new(t(cx, "Retry failed repositories").to_owned())
+                            PopupMenuItem::new(t(cx, "Retry").to_owned())
                                 .on_click(move |_, _, cx| {
                                     if let Some(page) = retry_entity.upgrade() {
                                         page.update(cx, |page, cx| {
@@ -551,7 +560,13 @@ fn saved_views_menu(
     let tooltip_text = selected
         .as_ref()
         .map(|view| view.name.clone())
-        .unwrap_or_else(|| t(cx, "Saved issue views").to_owned());
+        .unwrap_or_else(|| {
+            crate::i18n::t_fmt(
+                cx,
+                "{list, select, pullRequest {Saved pull request views} other {Saved issue views}}",
+                &[("list", "issue".into())],
+            )
+        });
 
     Button::new("issues-saved-views", Variant::Outline, Size::Default)
         .icon(Icon::Bookmark)
@@ -719,9 +734,17 @@ pub fn render_saved_view_dialog(
     let name_error =
         saved_view_name_error(&typed_name, &page.saved_views, editor.editing_id.as_deref());
     let title = if editor.editing_id.is_some() {
-        t(cx, "Rename issue view")
+        crate::i18n::t_fmt(
+            cx,
+            "{list, select, pullRequest {Rename PR view} other {Rename issue view}}",
+            &[("list", "issue".into())],
+        )
     } else {
-        t(cx, "Save issue view")
+        crate::i18n::t_fmt(
+            cx,
+            "{list, select, pullRequest {Save PR view} other {Save issue view}}",
+            &[("list", "issue".into())],
+        )
     };
     let show_error = !typed_name.is_empty() && name_error.is_some();
 

@@ -214,10 +214,13 @@ impl UsageView {
     fn render_compact_menu(&mut self, kind: MenuKind, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let open = self.menu == Some(kind);
-        let label = match kind {
-            MenuKind::Period => self.data.preferences.period.label(),
-            _ => self.data.preferences.metric.label(),
-        };
+        let label = crate::i18n::t(
+            cx,
+            match kind {
+                MenuKind::Period => self.data.preferences.period.label(),
+                _ => self.data.preferences.metric.label(),
+            },
+        );
         let trigger = menu_trigger(if kind == MenuKind::Period { "usage-period-menu" } else { "usage-metric-menu" }, label, None, open, window, cx)
             .h(r(28.))
             .px(r(9.))
@@ -229,7 +232,7 @@ impl UsageView {
                 MenuKind::Period => UsagePeriod::ALL
                     .map(|period| {
                         let checked = period == self.data.preferences.period;
-                        check_item(("usage-period-item", period.days() as usize), checked, div().child(period.label()).into_any_element(), cx)
+                        check_item(("usage-period-item", period.days() as usize), checked, div().child(crate::i18n::t(cx, period.label())).into_any_element(), cx)
                             .on_click(cx.listener(move |this, _, _, cx| this.select_period(period, cx)))
                             .into_any_element()
                     })
@@ -240,7 +243,7 @@ impl UsageView {
                     .enumerate()
                     .map(|(index, metric)| {
                         let metric = *metric;
-                        check_item(("usage-metric-item", index), metric == self.data.preferences.metric, div().child(metric.label()).into_any_element(), cx)
+                        check_item(("usage-metric-item", index), metric == self.data.preferences.metric, div().child(crate::i18n::t(cx, metric.label())).into_any_element(), cx)
                             .on_click(cx.listener(move |this, _, _, cx| this.select_metric(metric, cx)))
                             .into_any_element()
                     })
@@ -256,7 +259,7 @@ impl UsageView {
         let open = self.menu == Some(MenuKind::Environment);
         let selected_usages = self.data.selected_environment_usages();
         let has_issue = selected_usages.iter().any(|env| env.error.is_some()) || !self.data.merged.contract_mismatches.is_empty();
-        let label = self.data.environment_filter_label();
+        let label = self.data.environment_filter_label(cx);
         let leading = (show_status && has_issue).then(|| icon(Icon::CircleAlert, 14., hsla(p.warning_foreground)).into_any_element());
         let trigger = menu_trigger("usage-environment-filter", label, leading, open, window, cx)
             .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(MenuKind::Environment, cx)));
@@ -361,7 +364,21 @@ impl UsageView {
         let p = palette(cx);
         let open = self.menu == Some(MenuKind::Provider);
         let hidden = self.data.hidden().clone();
-        let trigger = menu_trigger("usage-provider-filter", crate::i18n::t(cx, &usage::provider_filter_label(&hidden)).to_owned(), None, open, window, cx)
+        let visible: Vec<UsageProvider> = UsageProvider::ORDER.into_iter().filter(|provider| !hidden.contains(provider)).collect();
+        let filter_label = if visible.len() == UsageProvider::ORDER.len() {
+            crate::i18n::t(cx, "All providers").to_owned()
+        } else if visible.is_empty() {
+            crate::i18n::t(cx, "No providers").to_owned()
+        } else if visible.len() == 1 {
+            visible[0].label().to_owned()
+        } else {
+            crate::i18n::t_fmt(
+                cx,
+                "{count, plural, one {{count} providers} other {{count} providers}}",
+                &[("count", visible.len().into())],
+            )
+        };
+        let trigger = menu_trigger("usage-provider-filter", filter_label, None, open, window, cx)
             .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(MenuKind::Provider, cx)));
         let popup = open.then(|| {
             let all = hidden.is_empty();

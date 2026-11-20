@@ -216,13 +216,13 @@ impl DeviceToolbar {
         cx.notify();
     }
 
-    fn selected_label(&self) -> SharedString {
+    fn selected_label(&self, cx: &gpui::App) -> SharedString {
         if let Some(preset_id) = self.setting.preset_id()
             && let Some(preset) = find_viewport_preset(preset_id)
         {
             return SharedString::from(preset.label);
         }
-        SharedString::from("Responsive")
+        SharedString::from(crate::i18n::t(cx, "Responsive"))
     }
 
     fn render_preset_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -251,7 +251,7 @@ impl DeviceToolbar {
                         cx.notify();
                     }))
                     .child(
-                        MenuItem::new("preview-preset-responsive", "Responsive")
+                        MenuItem::new("preview-preset-responsive", crate::i18n::t(cx, "Responsive"))
                             .checked(is_responsive)
                             .on_click(cx.listener(|this, _, _, cx| this.select_responsive(cx))),
                     )
@@ -262,7 +262,7 @@ impl DeviceToolbar {
                             .pb(px(2.))
                             .text_xs()
                             .text_color(hsla(p.muted_foreground))
-                            .child("Standard"),
+                            .child(crate::i18n::t(cx, "Standard")),
                     )
                     .children(VIEWPORT_PRESETS.iter().enumerate().map(|(index, preset)| {
                         let id = preset.id;
@@ -319,7 +319,7 @@ impl Render for DeviceToolbar {
                     .gap(px(4.))
                     .px(px(6.))
                     .when(show_dimensions_label, |this| {
-                        this.child(div().mr(px(2.)).flex_none().text_xs().text_color(hsla(p.muted_foreground)).child("Dimensions"))
+                        this.child(div().mr(px(2.)).flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Dimensions")))
                     })
                     .child(
                         h_flex()
@@ -344,7 +344,7 @@ impl Render for DeviceToolbar {
                                     cx.notify();
                                 }
                             }))
-                            .child(div().truncate().text_xs().text_color(hsla(p.foreground)).child(self.selected_label()))
+                            .child(div().truncate().text_xs().text_color(hsla(p.foreground)).child(self.selected_label(cx)))
                             .child(Icon::ChevronDown.sized(px(12.)).text_color(hsla(p.muted_foreground))),
                     )
                     .child(
@@ -385,7 +385,7 @@ impl Render for DeviceToolbar {
                             .variant(if locked { Variant::Secondary } else { Variant::Ghost })
                             .size(Size::IconXs)
                             .icon(if locked { Icon::Link2 } else { Icon::Unlink2 })
-                            .tooltip(if locked { "Unlock aspect ratio" } else { "Lock aspect ratio" })
+                            .tooltip(crate::i18n::t(cx, if locked { "Unlock aspect ratio" } else { "Lock aspect ratio" }))
                             .disabled(!custom_valid)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_aspect_ratio(cx))),
                     )
@@ -394,7 +394,7 @@ impl Render for DeviceToolbar {
                             .variant(Variant::Ghost)
                             .size(Size::IconXs)
                             .icon(Icon::RotateCcw)
-                            .tooltip("Rotate viewport")
+                            .tooltip(crate::i18n::t(cx, "Rotate viewport"))
                             .on_click(cx.listener(|this, _, _, cx| this.rotate(cx))),
                     )
                     .child(div().flex_1())
@@ -403,7 +403,7 @@ impl Render for DeviceToolbar {
                             .variant(Variant::Ghost)
                             .size(Size::IconXs)
                             .icon(Icon::X)
-                            .tooltip("Close device toolbar")
+                            .tooltip(crate::i18n::t(cx, "Close device toolbar"))
                             .on_click(cx.listener(|this, _, _, cx| this.close_toolbar(cx))),
                     ),
             )

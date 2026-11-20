@@ -286,7 +286,7 @@ impl PullRequestsPage {
 }
 
 /// Saved named pull request views menu (`SavedViewsMenu.tsx`, `pingdotgg/t3code#29387`).
-fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, _cx: &App) -> impl IntoElement {
+fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage>, cx: &App) -> impl IntoElement {
     let views = page.saved_views.clone();
     let prefs = page.current_saved_preferences();
     let selected = resolve_selected_view(&views, page.selected_view_id.as_deref(), &prefs, pull_request_view_matches).cloned();
@@ -294,18 +294,24 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
     let trigger_label = match &selected {
         Some(view) if modified => format!("{}*", view.name),
         Some(view) => view.name.clone(),
-        None => "Views".to_owned(),
+        None => crate::i18n::t(cx, "Views").to_owned(),
     };
     let tooltip_text = selected
         .as_ref()
         .map(|view| view.name.clone())
-        .unwrap_or_else(|| "Saved pull request views".to_owned());
+        .unwrap_or_else(|| {
+            crate::i18n::t_fmt(
+                cx,
+                "{list, select, pullRequest {Saved pull request views} other {Saved issue views}}",
+                &[("list", "pullRequest".into())],
+            )
+        });
 
     Button::new("pr-saved-views", Variant::Outline, Size::Default)
         .icon(Icon::Bookmark)
         .label(trigger_label)
         .tooltip(tooltip_text)
-        .dropdown_menu(move |mut menu, _, _| {
+        .dropdown_menu(move |mut menu, _, cx| {
             for view in &views {
                 let is_active = selected.as_ref().is_some_and(|active| active.id == view.id && !modified);
                 let view_id = view.id.clone();
@@ -324,7 +330,7 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
             }
             let save_entity = entity.clone();
             let suggested = pull_request_view_suggested_name(&prefs);
-            menu = menu.item(PopupMenuItem::new("Save current view…").on_click(move |_, window, cx| {
+            menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Save current view…").to_owned()).on_click(move |_, window, cx| {
                 if let Some(page) = save_entity.upgrade() {
                     let initial = suggested.to_owned();
                     page.update(cx, |page, cx| page.open_saved_view_editor(None, initial, window, cx));
@@ -334,7 +340,7 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
                 if modified {
                     let update_entity = entity.clone();
                     let active_id = active.id.clone();
-                    menu = menu.item(PopupMenuItem::new("Update saved view").on_click(move |_, _, cx| {
+                    menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Update saved view").to_owned()).on_click(move |_, _, cx| {
                         if let Some(page) = update_entity.upgrade() {
                             let active_id = active_id.clone();
                             page.update(cx, |page, cx| page.update_active_saved_view(&active_id, cx));
@@ -344,7 +350,7 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
                 let rename_entity = entity.clone();
                 let active_id = active.id.clone();
                 let active_name = active.name.clone();
-                menu = menu.item(PopupMenuItem::new("Rename view…").on_click(move |_, window, cx| {
+                menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Rename view…").to_owned()).on_click(move |_, window, cx| {
                     if let Some(page) = rename_entity.upgrade() {
                         let active_id = active_id.clone();
                         let active_name = active_name.clone();
@@ -353,7 +359,7 @@ fn saved_views_menu(page: &PullRequestsPage, entity: WeakEntity<PullRequestsPage
                 }));
                 let delete_entity = entity.clone();
                 let active_id = active.id.clone();
-                menu = menu.item(PopupMenuItem::new("Delete view").on_click(move |_, _, cx| {
+                menu = menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Delete view").to_owned()).on_click(move |_, _, cx| {
                     if let Some(page) = delete_entity.upgrade() {
                         let active_id = active_id.clone();
                         page.update(cx, |page, cx| page.delete_active_saved_view(&active_id, cx));
@@ -375,9 +381,17 @@ pub(super) fn render_saved_view_dialog(
     let typed_name = editor.input.read(cx).value().to_string();
     let name_error = saved_view_name_error(&typed_name, &page.saved_views, editor.editing_id.as_deref());
     let title = if editor.editing_id.is_some() {
-        "Rename pull request view"
+        crate::i18n::t_fmt(
+            cx,
+            "{list, select, pullRequest {Rename PR view} other {Rename issue view}}",
+            &[("list", "pullRequest".into())],
+        )
     } else {
-        "Save pull request view"
+        crate::i18n::t_fmt(
+            cx,
+            "{list, select, pullRequest {Save PR view} other {Save issue view}}",
+            &[("list", "pullRequest".into())],
+        )
     };
     let show_error = !typed_name.is_empty() && name_error.is_some();
 
@@ -417,7 +431,7 @@ pub(super) fn render_saved_view_dialog(
                             div()
                                 .text_xs()
                                 .text_color(hsla(p.muted_foreground))
-                                .child("Save your search, filters, and sort order on this device."),
+                                .child(crate::i18n::t(cx, "Save your search, filters, and sort order on this device.")),
                         ),
                 )
                 .child(
@@ -428,7 +442,7 @@ pub(super) fn render_saved_view_dialog(
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(hsla(p.foreground))
-                                .child("View name"),
+                                .child(crate::i18n::t(cx, "View name")),
                         )
                         .child(
                             h_flex()
@@ -450,7 +464,7 @@ pub(super) fn render_saved_view_dialog(
                                 div()
                                     .text_xs()
                                     .text_color(hsla(p.destructive_foreground))
-                                    .child(error.message()),
+                                    .child(crate::i18n::t(cx, error.message())),
                             )
                         }),
                 )
@@ -460,12 +474,12 @@ pub(super) fn render_saved_view_dialog(
                         .gap(px(8.))
                         .child(
                             Button::new("pr-view-cancel", Variant::Outline, Size::Sm)
-                                .label("Cancel")
+                                .label(crate::i18n::t(cx, "Cancel"))
                                 .on_click(cx.listener(|this, _, _, cx| this.close_saved_view_editor(cx))),
                         )
                         .child(
                             Button::new("pr-view-save", Variant::Default, Size::Sm)
-                                .label("Save")
+                                .label(crate::i18n::t(cx, "Save"))
                                 .disabled(name_error.is_some())
                                 .on_click(cx.listener(|this, _, _, cx| this.submit_saved_view_editor(cx))),
                         ),

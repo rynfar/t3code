@@ -79,10 +79,10 @@ pub(crate) fn render_ghost(seed: Option<&IssueListEntry>, cx: &App) -> AnyElemen
                     .child(
                         Button::new("issue-ghost-open", Variant::GhostMuted, Size::IconSm)
                             .icon(Icon::ExternalLink)
-                            .tooltip(format!(
-                                "{} {}",
-                                t(cx, "Open on"),
-                                entry.tracker.display_name()
+                            .tooltip(crate::i18n::t_fmt(
+                                cx,
+                                "Open on {provider}",
+                                &[("provider", entry.tracker.display_name().into())],
                             ))
                             .on_click(move |_, _, cx| cx.open_url(&open_url)),
                     ),
@@ -104,8 +104,21 @@ pub(crate) fn render_ghost(seed: Option<&IssueListEntry>, cx: &App) -> AnyElemen
                     .text_color(hsla(p.muted_foreground))
                     .child(avatar(&author_login, 16., cx))
                     .child(author_login)
-                    .child(format!("{} {opened}", t(cx, "opened")))
-                    .children(closed.map(|when| format!("· {} {when}", t(cx, "closed")))),
+                    .child(crate::i18n::t_fmt(
+                        cx,
+                        "opened {_gt_value_1}",
+                        &[("_gt_value_1", opened.into())],
+                    ))
+                    .children(closed.map(|when| {
+                        format!(
+                            "· {}",
+                            crate::i18n::t_fmt(
+                                cx,
+                                "closed {_gt_value_1}",
+                                &[("_gt_value_1", when.into())],
+                            )
+                        )
+                    })),
             )
             .child(
                 h_flex()

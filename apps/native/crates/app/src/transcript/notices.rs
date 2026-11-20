@@ -175,7 +175,7 @@ pub fn history_control(has_more: bool, loading: bool, error: Option<&str>, cx: &
             .text_xs()
             .text_color(hsla(p.muted_foreground))
             .child(line())
-            .child(div().flex_none().child(if loading { "Loading earlier turns…" } else { "Load earlier turns" }))
+            .child(div().flex_none().child(crate::i18n::t(cx, if loading { "Loading earlier turns…" } else { "Load earlier turns" })))
             .child(line());
         if loading {
             button.into_any_element()

@@ -2495,7 +2495,7 @@ mod sb_sections_pane_tests {
         assert_eq!(method, GET_OLDER_SETTLED_THREADS);
         vcx.run_until_parked();
         assert!(notifications.get() > before_expand);
-        assert_eq!(state.read_with(vcx, |s, _| s.settled_show_more_label(15)), "Loading");
+        assert_eq!(state.read_with(vcx, |s, cx| s.settled_show_more_label(15, cx)), "Loading");
         vcx.update(|window, cx| { window.draw(cx).clear(); });
 
         let before_fail = notifications.get();
@@ -2520,7 +2520,7 @@ mod sb_sections_pane_tests {
         fail_rx.await.unwrap();
         vcx.run_until_parked();
         assert!(notifications.get() > before_fail);
-        assert_eq!(state.read_with(vcx, |s, _| s.settled_show_more_label(15)), "Could not load older threads. Retry");
+        assert_eq!(state.read_with(vcx, |s, cx| s.settled_show_more_label(15, cx)), "Could not load older threads. Retry");
 
         vcx.update(|window, cx| { window.draw(cx).clear(); });
         let show_more_center = pane.read_with(vcx, |pane, _| {
