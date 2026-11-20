@@ -26,8 +26,9 @@ use crate::i18n::t;
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{
-    ThemeSlot, ThemeSlotExt, ThemeSlotHoverExt, ThemeSlotInteractiveExt, apply_slot_override, hsla, palette, slot_style,
-    theme_slot_background_layer,
+    SlotState, ThemeSlot, ThemeSlotExt, ThemeSlotHoverExt, ThemeSlotInteractiveExt,
+    apply_slot_override, hsla, palette, slot_has_state_background, slot_style,
+    theme_slot_background_layer, theme_slot_pseudo_before, theme_slot_state_background_layer,
 };
 
 /// `DEFAULT_COMPOSER_PLACEHOLDER` (`web/src/composerPlaceholder.ts`).
@@ -599,21 +600,22 @@ impl Render for Composer {
         let can_drop_mention = self.can_drop_file_mention(cx);
         let gutter = if self.fixed.is_some() { 12. } else { 48. };
         let host_slot = slot_style(ThemeSlot::ComposerHost, cx);
-        let host_bg_layer = theme_slot_background_layer(ThemeSlot::ComposerHost, cx);
+        let host_focused = self.input.read(cx).focus_handle(cx).contains_focused(window, cx);
+        let host_state = if host_focused { SlotState::FocusWithin } else { SlotState::Base };
+        let host_bg_layer =
+            theme_slot_state_background_layer(ThemeSlot::ComposerHost, host_state, px(16.), cx);
+        let host_before_bar = theme_slot_pseudo_before(ThemeSlot::ComposerHost, host_state, cx);
         let host_overrides_bg = host_bg_layer.is_some()
-            || host_slot.as_ref().is_some_and(|s| {
-                matches!(
-                    s.base.background,
-                    Some(
-                        t3_core::themes::slots::SlotBackground::Solid(_)
-                            | t3_core::themes::slots::SlotBackground::Transparent
-                            | t3_core::themes::slots::SlotBackground::LinearGradient { .. }
-                    )
-                )
-            });
-        let host_overrides_border = host_slot
-            .as_ref()
-            .is_some_and(|s| s.base.border_color.is_some() || !s.base.border_widths.is_empty());
+            || slot_has_state_background(ThemeSlot::ComposerHost, host_state, cx);
+        let host_overrides_border = host_slot.as_ref().is_some_and(|s| {
+            s.base.border_color.is_some()
+                || !s.base.border_widths.is_empty()
+                || s.base.border_gradient.is_some()
+                || (host_focused
+                    && (s.focus_within.border_color.is_some()
+                        || !s.focus_within.border_widths.is_empty()
+                        || s.focus_within.border_gradient.is_some()))
+        });
         let tiptap_bg_layer = theme_slot_background_layer(ThemeSlot::ComposerTiptap, cx);
         let tiptap_hover = slot_style(ThemeSlot::ComposerTiptap, cx)
             .filter(|s| !s.hover.is_empty())
@@ -860,12 +862,16 @@ impl Render for Composer {
                             }])
                         })
                         .theme_slot_interactive(ThemeSlot::ComposerHost, cx)
+                        .when(host_focused, |this| {
+                            this.theme_slot_state(ThemeSlot::ComposerHost, SlotState::FocusWithin, cx)
+                        })
                         .when(!host_overrides_bg, |this| {
                             let border = if host_overrides_border { outline.opacity(0.) } else { outline };
                             let highlight = (!host_overrides_border && dark).then(|| hsla(p.composer_highlight));
                             this.child(crate::glass::backdrop_with_highlight(16., surface, border, highlight, cx))
                         })
                         .children(host_bg_layer)
+                        .children(host_before_bar)
                         // Files dragged in from Finder (`isDragOverComposer`) or file-tree mentions (`composerMentionDragHandlers`).
                         .when(!rewinding, |this| {
                             this.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_fill).border_color(drop_ring))

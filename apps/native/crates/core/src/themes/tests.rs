@@ -533,7 +533,8 @@ fn decode_uses_top_level_canvas_and_accent_seeds_when_present() {
 fn slot_engine_parses_all_29_theme_css_hooks_and_scrollbar_aliases() {
     use slots::{SlotBackground, SlotLength, ThemeSlot};
 
-    assert_eq!(ThemeSlot::ALL.len(), 29);
+    assert_eq!(ThemeSlot::CANONICAL_COUNT, 29);
+    assert_eq!(ThemeSlot::ALL.len(), 32);
 
     let mut css = String::new();
     for (idx, slot) in ThemeSlot::ALL.iter().enumerate() {
@@ -543,7 +544,7 @@ fn slot_engine_parses_all_29_theme_css_hooks_and_scrollbar_aliases() {
 
     let parsed = css::ParsedCss::parse(&css);
     let diag = parsed.diagnostics();
-    assert_eq!(diag.applied_slot_rules, 58);
+    assert_eq!(diag.applied_slot_rules, ThemeSlot::ALL.len() * 2);
     assert_eq!(diag.unmapped_dom_rules, 0);
 
     let roles = standard(true);
@@ -849,7 +850,7 @@ fn slot_engine_enforces_safety_clamps_blocks_remote_fetches_and_separates_diagno
         [data-slot="button"] svg {
             color: #ff0000;
         }
-        [data-slot="button"]::before {
+        [data-slot="button"]::after {
             background: #ff0000;
         }
         svg.lucide {
@@ -863,7 +864,7 @@ fn slot_engine_enforces_safety_clamps_blocks_remote_fetches_and_separates_diagno
     // Supported declarations on Button (border-width, box-shadow, font-size, opacity, color) + Input (font-size, opacity) = 7.
     // Remote `background: url(...)` & `background-image: image-set(...)` are dropped before counting.
     assert_eq!(diag.applied_slot_rules, 7);
-    // Unmapped: `backdrop-filter` on Button + `[data-slot="button"] svg` + `::before` + `svg.lucide` = 4.
+    // Unmapped: `backdrop-filter` on Button + `[data-slot="button"] svg` + `::after` + `svg.lucide` = 4.
     assert_eq!(diag.unmapped_dom_rules, 4);
 
     let roles = standard(true);
@@ -882,4 +883,345 @@ fn slot_engine_enforces_safety_clamps_blocks_remote_fetches_and_separates_diagno
     let input = &sheet.get(ThemeSlot::Input).unwrap().base;
     assert_eq!(input.font_size, Some(slots::MIN_FONT_SIZE_PX));
     assert_eq!(input.opacity, Some(0.0));
+}
+
+#[test]
+fn slot_engine_compiles_kraken_glass_rules_faithfully() {
+    use slots::{SlotBackground, SlotLength, ThemeSlot};
+
+    // Synthetic minimal WOFF2 payload (`wOF2` magic header) base64-encoded for `@font-face` extraction.
+    let kraken_glass_css = r#"
+        @font-face {
+          font-family: "Figtree";
+          src: url("data:font/woff2;base64,d09GMgABAAAAAA==") format("woff2");
+          font-weight: 300 900;
+        }
+        @font-face {
+          font-family: "RemoteBlocked";
+          src: url("https://evil.example/font.woff2") format("woff2");
+        }
+        :root {
+          --kraken-sans: "Figtree", -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+          --kraken-mono: "Geist Mono", "SF Mono", ui-monospace, Menlo, monospace;
+          --font-sans: var(--kraken-sans);
+          --font-mono: var(--kraken-mono);
+          --kraken-halo: linear-gradient(135deg, rgb(243 60 159 / 0.90) 0%, rgb(173 55 248 / 0.88) 24%, rgb(94 74 251 / 0.90) 46%, rgb(11 183 245 / 0.92) 72%, rgb(2 196 156 / 0.92) 88%, rgb(243 60 159 / 0.90) 100%);
+          --kraken-halo-soft: linear-gradient(135deg, rgb(243 60 159 / 0.30) 0%, rgb(173 55 248 / 0.26) 24%, rgb(94 74 251 / 0.26) 46%, rgb(11 183 245 / 0.28) 72%, rgb(2 196 156 / 0.28) 88%, rgb(243 60 159 / 0.28) 100%);
+          --kraken-switch-on: linear-gradient(135deg, #6C52F8 0%, #5235E8 100%);
+          --kraken-switch-off: rgb(10 12 16 / 0.16);
+          --kraken-card-surface: #FFFFFF;
+          --kraken-card-border: #E2E5EE;
+          --kraken-control-bg: #FFFFFF;
+          --kraken-control-border: #C9D0DE;
+          --kraken-control-border-hover: #A4AEC2;
+        }
+        .dark {
+          --kraken-switch-on: linear-gradient(135deg, #8B74FF 0%, #6A4FF5 100%);
+          --kraken-switch-off: rgb(255 255 255 / 0.16);
+          --kraken-card-surface: rgb(18 20 27 / 0.88);
+          --kraken-card-border: rgb(255 255 255 / 0.09);
+          --kraken-control-bg: rgb(21 23 31 / 0.88);
+          --kraken-control-border: rgb(255 255 255 / 0.14);
+          --kraken-control-border-hover: rgb(255 255 255 / 0.24);
+        }
+        html, body, [data-slot="sidebar-inner"] {
+          font-family: var(--kraken-sans) !important;
+        }
+        .dark [data-slot="sidebar"],
+        .dark [data-slot="sidebar"] > * {
+          background: #0A0B0E !important;
+          border-color: transparent !important;
+          border-right: 0 !important;
+          box-shadow: none !important;
+        }
+        [data-slot="sidebar-inner"] {
+          margin: 6px !important;
+          width: calc(100% - 12px) !important;
+          height: calc(100% - 12px) !important;
+          border-radius: 14px !important;
+          border: 1px solid transparent !important;
+          background-origin: border-box !important;
+          background-clip: padding-box, border-box !important;
+        }
+        .dark [data-slot="sidebar-inner"] {
+          background-image: linear-gradient(180deg, rgb(21 23 30 / 0.94) 0%, rgb(15 16 22 / 0.97) 100%), var(--kraken-halo-soft) !important;
+        }
+        .dark [data-thread-item]:is([data-active]:not([data-active="false"]), [data-selected]:not([data-selected="false"]), [aria-current]:not([aria-current="false"]), [aria-selected="true"], [data-state="active"], [data-state="selected"]),
+        .dark [data-thread-item]:has(:is([data-active]:not([data-active="false"]), [aria-selected="true"])),
+        .dark :is([data-active]:not([data-active="false"]), [aria-selected="true"]) > [data-thread-item] {
+          color: #F4F5F8 !important;
+          border: 1px solid transparent !important;
+          background-image: linear-gradient(#262934, #262934), var(--kraken-halo-soft) !important;
+          background-origin: border-box !important;
+          background-clip: padding-box, border-box !important;
+        }
+        .dark [data-thread-item]:has(:is([data-active]:not([data-active="false"]))) :is([data-active]:not([data-active="false"])) {
+          background: transparent !important;
+          box-shadow: none !important;
+        }
+        [data-slot="composer-host"] {
+          border-radius: 14px !important;
+        }
+        .dark [data-slot="composer-host"] {
+          background: #161820 !important;
+          border: 1px solid #282C36 !important;
+        }
+        [data-slot="composer-host"]:focus-within {
+          border-color: transparent !important;
+          background-image: linear-gradient(var(--composer-bg, #161820), var(--composer-bg, #161820)), var(--kraken-halo) !important;
+          background-origin: border-box !important;
+          background-clip: padding-box, border-box !important;
+        }
+        .dark [data-slot="composer-host"]:focus-within {
+          --composer-bg: #161820;
+          box-shadow: 0 0 0 3px rgb(139 116 255 / 0.16), 0 16px 34px -12px rgb(0 0 0 / 0.85) !important;
+        }
+        :root:not(.dark) [data-slot="composer-host"]:focus-within {
+          --composer-bg: #FFFFFF;
+          box-shadow: 0 0 0 3px rgb(91 61 245 / 0.12) !important;
+        }
+        [data-slot="switch"] {
+          background: var(--kraken-switch-off) !important;
+        }
+        [data-slot="switch"][data-checked] {
+          background: var(--kraken-switch-on) !important;
+        }
+        [data-slot="switch"]:focus-visible {
+          box-shadow: 0 0 0 2px var(--background), 0 0 0 4px rgb(139 116 255 / 0.65) !important;
+        }
+        [data-slot="switch-thumb"] {
+          background: #FFFFFF !important;
+        }
+        .dark [data-slot="switch"][data-unchecked] [data-slot="switch-thumb"],
+        .dark [data-slot="switch-thumb"][data-unchecked] {
+          background: #DCE0EC !important;
+        }
+        [data-slot="checkbox"] {
+          border-color: var(--kraken-control-border) !important;
+        }
+        [data-slot="checkbox"][data-checked] {
+          border-color: transparent !important;
+        }
+        [data-slot="checkbox-indicator"][data-checked] {
+          background: var(--kraken-switch-on) !important;
+          color: #FFFFFF !important;
+        }
+        [data-slot="input-control"][class*="border-input"],
+        [data-slot="select-trigger"][class*="border-input"] {
+          background: var(--kraken-control-bg) !important;
+          border-color: var(--kraken-control-border) !important;
+          border-radius: 10px !important;
+        }
+        [data-slot="input-control"][class*="border-input"]:hover,
+        [data-slot="select-trigger"][class*="border-input"]:hover {
+          border-color: var(--kraken-control-border-hover) !important;
+        }
+        [data-slot="input-control"][class*="border-input"]:focus-within,
+        [data-slot="select-trigger"][class*="border-input"]:focus-visible {
+          border-color: var(--focus, #8B74FF) !important;
+          box-shadow: 0 0 0 3px rgb(139 116 255 / 0.18) !important;
+        }
+        [data-slot="settings-group"] {
+          background: var(--kraken-card-surface) !important;
+          border-color: var(--kraken-card-border) !important;
+          border-radius: 14px !important;
+        }
+        .dark [data-slot="settings-group"] > *:not(:first-child) {
+          border-top-color: rgb(255 255 255 / 0.07) !important;
+        }
+        .dark [data-slot="select-popup"] > .dropdown-glass {
+          border: 1px solid transparent !important;
+          border-radius: 14px !important;
+          background-clip: padding-box, border-box !important;
+          background-image: linear-gradient(rgb(21 23 30 / 0.96), rgb(15 16 22 / 0.97)), var(--kraken-halo-soft) !important;
+        }
+    "#;
+
+    let (_, dark_sheet) =
+        palette_and_slots_for_with_css(None, None, Some(kraken_glass_css), true, 100, 80).unwrap();
+    let (_, light_sheet) =
+        palette_and_slots_for_with_css(None, None, Some(kraken_glass_css), false, 100, 80).unwrap();
+
+    // Embedded `@font-face`: local data: WOFF2 extracted, remote https: blocked.
+    assert_eq!(dark_sheet.font_faces().len(), 1);
+    assert_eq!(dark_sheet.font_faces()[0].family, "Figtree");
+    assert_eq!(dark_sheet.font_faces()[0].format, css::EmbeddedFontFormat::Woff2);
+    assert!(dark_sheet.font_faces()[0].bytes.starts_with(b"wOF2"));
+    assert!(dark_sheet.theme_fonts().sans.as_deref().unwrap().contains("Figtree"));
+    assert!(dark_sheet.theme_fonts().mono.as_deref().unwrap().contains("Geist Mono"));
+
+    // Sidebar frame: border-right zeroed, transparent border, #0A0B0E fill.
+    let sidebar = &dark_sheet.get(ThemeSlot::Sidebar).unwrap().base;
+    assert_eq!(sidebar.background, Some(SlotBackground::Solid(0x0a0b_0eff)));
+    assert_eq!(sidebar.border_widths.right, Some(0.0));
+    assert_eq!(sidebar.border_color, Some(0x0000_0000));
+
+    // Floating SidebarInner card: 6px margin, calc(100% - 12px), 14px radius, 6-stop prismatic border_gradient.
+    let sb_inner = &dark_sheet.get(ThemeSlot::SidebarInner).unwrap().base;
+    assert_eq!(sb_inner.margin.top, Some(SlotLength::Px(6.0)));
+    assert_eq!(sb_inner.width, Some(SlotLength::FullMinusPx(12.0)));
+    assert_eq!(sb_inner.height, Some(SlotLength::FullMinusPx(12.0)));
+    assert_eq!(sb_inner.border_radii.top_left, Some(SlotLength::Px(14.0)));
+    assert!(matches!(sb_inner.background, Some(SlotBackground::LinearGradient { .. })));
+    match &sb_inner.border_gradient {
+        Some(SlotBackground::LinearGradient { angle_deg, stops }) => {
+            assert_eq!(*angle_deg, 135.0);
+            assert_eq!(stops.len(), 6);
+        }
+        other => panic!("expected 6-stop border_gradient, got {other:?}"),
+    }
+
+    // Active/selected ThreadItem gets prismatic rim and is NOT clobbered by inner descendant reset rule.
+    let thread_sel = &dark_sheet.get(ThemeSlot::ThreadItem).unwrap().selected;
+    assert_eq!(thread_sel.color, Some(0xf4f5_f8ff));
+    assert!(matches!(thread_sel.border_gradient, Some(SlotBackground::LinearGradient { .. })));
+    assert!(matches!(thread_sel.background, Some(SlotBackground::LinearGradient { .. })));
+
+    // ComposerHost :focus-within resolves state-scoped `--composer-bg` accurately per appearance mode.
+    let dark_composer_focus = &dark_sheet.get(ThemeSlot::ComposerHost).unwrap().focus_within;
+    match &dark_composer_focus.background {
+        Some(SlotBackground::LinearGradient { stops, .. }) => {
+            assert_eq!(stops[0].color, 0x1618_20ff);
+        }
+        other => panic!("expected dark composer focus fill, got {other:?}"),
+    }
+    assert!(dark_composer_focus.border_gradient.is_some());
+    assert_eq!(dark_composer_focus.box_shadows.as_ref().map(Vec::len), Some(2));
+
+    let light_composer_focus = &light_sheet.get(ThemeSlot::ComposerHost).unwrap().focus_within;
+    match &light_composer_focus.background {
+        Some(SlotBackground::LinearGradient { stops, .. }) => {
+            assert_eq!(stops[0].color, 0xffff_ffff);
+        }
+        other => panic!("expected light composer focus fill, got {other:?}"),
+    }
+
+    // Switch & SwitchThumb states.
+    let sw = dark_sheet.get(ThemeSlot::Switch).unwrap();
+    assert!(matches!(sw.base.background, Some(SlotBackground::Solid(_))));
+    assert!(matches!(sw.selected.background, Some(SlotBackground::LinearGradient { .. })));
+    assert_eq!(sw.focus_within.box_shadows.as_ref().map(Vec::len), Some(2));
+
+    let thumb_dark = dark_sheet.get(ThemeSlot::SwitchThumb).unwrap();
+    assert_eq!(thumb_dark.base.background, Some(SlotBackground::Solid(0xffff_ffff)));
+    assert_eq!(thumb_dark.unchecked.background, Some(SlotBackground::Solid(0xdce0_ecff)));
+    let thumb_light = light_sheet.get(ThemeSlot::SwitchThumb).unwrap();
+    assert_eq!(thumb_light.base.background, Some(SlotBackground::Solid(0xffff_ffff)));
+    assert_eq!(thumb_light.unchecked.background, None);
+
+    // Checkbox & checkbox-indicator.
+    let cb = dark_sheet.get(ThemeSlot::Checkbox).unwrap();
+    assert!(cb.base.border_color.is_some());
+    assert_eq!(cb.selected.border_color, Some(0x0000_0000));
+    assert!(matches!(cb.selected.background, Some(SlotBackground::LinearGradient { .. })));
+    assert_eq!(cb.selected.color, Some(0xffff_ffff));
+
+    // `[data-slot="input-control"][class*="border-input"]` & `[data-slot="select-trigger"][class*="border-input"]`.
+    let input = dark_sheet.get(ThemeSlot::Input).unwrap();
+    assert_eq!(input.base.border_radii.top_left, Some(SlotLength::Px(10.0)));
+    assert!(input.hover.border_color.is_some());
+    assert!(input.focus_within.border_color.is_some());
+    assert!(input.focus_within.box_shadows.is_some());
+
+    let sel_trig = dark_sheet.get(ThemeSlot::SelectTrigger).unwrap();
+    assert_eq!(sel_trig.base.border_radii.top_left, Some(SlotLength::Px(10.0)));
+    assert!(sel_trig.hover.border_color.is_some());
+    assert!(sel_trig.focus_within.border_color.is_some());
+
+    // SettingsGroup keeps outer border color (not clobbered by `> *:not(:first-child)`).
+    let sg = &dark_sheet.get(ThemeSlot::SettingsGroup).unwrap().base;
+    assert_eq!(sg.border_radii.top_left, Some(SlotLength::Px(14.0)));
+    assert_eq!(sg.border_color, Some(0xffff_ff17));
+
+    // `[data-slot="select-popup"] > .dropdown-glass` maps to PopoverPopup with border_gradient.
+    let pop = &dark_sheet.get(ThemeSlot::PopoverPopup).unwrap().base;
+    assert_eq!(pop.border_radii.top_left, Some(SlotLength::Px(14.0)));
+    assert!(pop.border_gradient.is_some());
+}
+
+#[test]
+fn slot_engine_compiles_kraken_kinetic_radial_gradient_before_bar_and_color_mix() {
+    use slots::{SlotBackground, SlotLength, ThemeSlot};
+
+    let kraken_kinetic_css = r#"
+        :root {
+          --kraken-sans: "Source Sans 3", ui-sans-serif, system-ui, sans-serif;
+          --kraken-halo: linear-gradient(90deg, #f33c9f, #f73cdc, #ad37f8, #5e4afb, #3388fe, #0bb7f5, #00d4c9, #02c49c);
+        }
+        body {
+          font-family: var(--kraken-sans);
+        }
+        [data-slot="sidebar-inner"] {
+          background-color: #07080C !important;
+          background-image: radial-gradient(120% 55% at 50% 108%, rgb(91 61 245 / 0.22), transparent 72%) !important;
+        }
+        [data-thread-item][data-active="true"],
+        [data-thread-item][data-selected="true"],
+        [data-thread-item][aria-current="page"] {
+          background: rgb(255 255 255 / 0.12) !important;
+          box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.16);
+        }
+        [data-thread-item][data-active="true"]::before,
+        [data-thread-item][data-selected="true"]::before,
+        [data-thread-item][aria-current="page"]::before {
+          content: "";
+          position: absolute;
+          left: 0;
+          top: 22%;
+          bottom: 22%;
+          width: 3px;
+          border-radius: 3px;
+          background: #8B74FF;
+        }
+        .dark [data-chat-header] {
+          background: color-mix(in srgb, #101218 86%, transparent) !important;
+          border-bottom: 1px solid #282C36 !important;
+        }
+        :root.dark [data-slot="menu-popup"] {
+          border-radius: 14px !important;
+        }
+    "#;
+
+    let (_, sheet) =
+        palette_and_slots_for_with_css(None, None, Some(kraken_kinetic_css), true, 100, 80)
+            .unwrap();
+
+    assert!(sheet.theme_fonts().sans.as_deref().unwrap().contains("Source Sans 3"));
+
+    // SidebarInner radial-gradient preserves `#07080C` underlay color.
+    let sb = &sheet.get(ThemeSlot::SidebarInner).unwrap().base;
+    assert_eq!(sb.background_color, Some(0x0708_0cff));
+    match &sb.background {
+        Some(SlotBackground::RadialGradient { cx_frac, cy_frac, rx_frac, ry_frac, stops }) => {
+            assert!((*cx_frac - 0.5).abs() < 1e-4);
+            assert!((*cy_frac - 1.08).abs() < 1e-4);
+            assert!((*rx_frac - 1.2).abs() < 1e-4);
+            assert!((*ry_frac - 0.55).abs() < 1e-4);
+            assert_eq!(stops.len(), 2);
+            assert_eq!(stops[0].position, Some(0.0));
+            assert_eq!(stops[1].color, 0x0000_0000);
+            assert!((stops[1].position.unwrap() - 0.72).abs() < 1e-4);
+        }
+        other => panic!("expected radial gradient, got {other:?}"),
+    }
+
+    // Active thread row `::before` 3px `#8B74FF` left accent bar.
+    let sel = &sheet.get(ThemeSlot::ThreadItem).unwrap().selected;
+    assert!(matches!(sel.background, Some(SlotBackground::Solid(_))));
+    let bar = sel.before.as_ref().expect("compiled ::before accent bar");
+    assert_eq!(bar.left, Some(SlotLength::Px(0.0)));
+    assert_eq!(bar.top, Some(SlotLength::Fraction(0.22)));
+    assert_eq!(bar.bottom, Some(SlotLength::Fraction(0.22)));
+    assert_eq!(bar.width, Some(SlotLength::Px(3.0)));
+    assert_eq!(bar.border_radius, Some(SlotLength::Px(3.0)));
+    assert_eq!(bar.background, Some(SlotBackground::Solid(0x8b74_ffff)));
+
+    // `color-mix(in srgb, #101218 86%, transparent)` on chat header.
+    let header = &sheet.get(ThemeSlot::ChatHeader).unwrap().base;
+    assert_eq!(header.background, Some(SlotBackground::Solid(0x1012_18db)));
+    assert_eq!(header.border_widths.bottom, Some(1.0));
+
+    // `:root.dark [data-slot="menu-popup"]` matches dark appearance cleanly.
+    let menu = &sheet.get(ThemeSlot::MenuPopup).unwrap().base;
+    assert_eq!(menu.border_radii.top_left, Some(SlotLength::Px(14.0)));
 }

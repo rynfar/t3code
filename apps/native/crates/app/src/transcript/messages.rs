@@ -1009,6 +1009,11 @@ pub fn user_row(
     });
     let fade_surface = match slot_style(ThemeSlot::UserMessageBubble, cx).and_then(|s| s.base.background) {
         Some(t3_core::themes::slots::SlotBackground::Solid(c)) => hsla(c),
+        Some(t3_core::themes::slots::SlotBackground::LinearGradient { stops, .. })
+            if !stops.is_empty() && stops.iter().all(|s| s.color == stops[0].color) =>
+        {
+            hsla(stops[0].color)
+        }
         _ => surface,
     };
     let bubble = (!media_alone && !standalone_cards_mode).then(|| {
@@ -1027,7 +1032,12 @@ pub fn user_row(
             .line_height(px(22.75))
             .text_color(hsla(p.message_foreground))
             .theme_slot_hover(ThemeSlot::UserMessageBubble, cx)
-            .children(theme_slot_background_layer(ThemeSlot::UserMessageBubble, cx))
+            .children(crate::theme::theme_slot_state_background_layer(
+                ThemeSlot::UserMessageBubble,
+                crate::theme::SlotState::Base,
+                px(16.),
+                cx,
+            ))
             .children(bubble_chips)
             .children(media_in_bubble)
             .children(bubble_files)

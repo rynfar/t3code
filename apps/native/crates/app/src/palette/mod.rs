@@ -45,8 +45,8 @@ use crate::new_thread::{NewThread, NewThreadWithoutProject};
 use crate::sidebar::is_composing;
 use crate::sidebar::controller::{now_ms, uuid};
 use crate::theme::{
-    ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
-    slot_border_color, slot_has_active, slot_has_background, theme_slot_background_layer,
+    SlotState, ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover,
+    slot_border_color, slot_has_active, slot_has_background, theme_slot_state_background_layer,
 };
 use crate::thread_view::FindInThread;
 use crate::toast::{Toast, ToastKind};
@@ -1835,7 +1835,7 @@ impl Render for CommandPalette {
                         .when(has_custom_bg, |this| {
                             this.bg(hsla(p.dialog_surface)).border_1().border_color(backdrop_border)
                         })
-                        .children(theme_slot_background_layer(ThemeSlot::DialogPopup, cx))
+                        .children(theme_slot_state_background_layer(ThemeSlot::DialogPopup, SlotState::Base, px(16.), cx))
                         .shadow(vec![BoxShadow { color: gpui_hsla(0., 0., 0., 0.65), offset: point(px(0.), px(24.)), blur_radius: px(64.), spread_radius: px(-24.), inset: false }])
                         .theme_slot(ThemeSlot::DialogPopup, cx)
                         .child(

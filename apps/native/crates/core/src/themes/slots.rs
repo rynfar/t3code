@@ -17,7 +17,8 @@ pub const PILL_RADIUS_PX: f32 = 9999.0;
 
 const ROOT_REM_PX: f32 = 16.0;
 
-/// All 29 stable UI hooks from `packages/shared/src/themeCss.ts` (`THEME_CSS_HOOKS`).
+/// Stable UI hooks from `packages/shared/src/themeCss.ts` (`THEME_CSS_HOOKS`, indices `0..29`)
+/// plus extended native control hooks (`SettingsGroup`, `SwitchThumb`, `Checkbox`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum ThemeSlot {
@@ -50,10 +51,15 @@ pub enum ThemeSlot {
     TooltipPopup = 26,
     ScrollAreaScrollbar = 27,
     ScrollAreaThumb = 28,
+    SettingsGroup = 29,
+    SwitchThumb = 30,
+    Checkbox = 31,
 }
 
 impl ThemeSlot {
-    pub const COUNT: usize = 29;
+    /// Number of canonical `THEME_CSS_HOOKS` entries (indices `0..29` in exact order).
+    pub const CANONICAL_COUNT: usize = 29;
+    pub const COUNT: usize = 32;
 
     pub const ALL: [Self; Self::COUNT] = [
         Self::Sidebar,
@@ -85,13 +91,17 @@ impl ThemeSlot {
         Self::TooltipPopup,
         Self::ScrollAreaScrollbar,
         Self::ScrollAreaThumb,
+        Self::SettingsGroup,
+        Self::SwitchThumb,
+        Self::Checkbox,
     ];
 
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    /// Canonical selector string matching `THEME_CSS_HOOKS` in `packages/shared/src/themeCss.ts`.
+    /// Canonical selector string matching `THEME_CSS_HOOKS` in `packages/shared/src/themeCss.ts`
+    /// plus extended native control hooks.
     pub const fn selector(self) -> &'static str {
         match self {
             Self::Sidebar => r#"[data-slot="sidebar"]"#,
@@ -123,15 +133,21 @@ impl ThemeSlot {
             Self::TooltipPopup => r#"[data-slot="tooltip-popup"]"#,
             Self::ScrollAreaScrollbar => r#"[data-slot="scroll-area-scrollbar"]"#,
             Self::ScrollAreaThumb => r#"[data-slot="scroll-area-thumb"]"#,
+            Self::SettingsGroup => r#"[data-slot="settings-group"]"#,
+            Self::SwitchThumb => r#"[data-slot="switch-thumb"]"#,
+            Self::Checkbox => r#"[data-slot="checkbox"]"#,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SlotState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SlotState {
     Base,
     Hover,
     Active,
+    Selected,
+    Unchecked,
+    FocusWithin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +155,7 @@ pub(crate) struct SlotSelectorMatch {
     pub slot: ThemeSlot,
     pub row_kind: Option<String>,
     pub state: SlotState,
+    pub pseudo_before: bool,
     pub appearance: css::AppearanceScope,
     pub specificity: (u16, u16, u16),
 }
@@ -148,6 +165,7 @@ pub(crate) struct SlotDecl {
     pub slot: ThemeSlot,
     pub row_kind: Option<String>,
     pub state: SlotState,
+    pub pseudo_before: bool,
     pub appearance: css::AppearanceScope,
     pub specificity: (u16, u16, u16),
     pub property: String,
@@ -160,6 +178,7 @@ pub(crate) struct SlotDecl {
 pub(crate) struct SlotVarDecl {
     pub slot: ThemeSlot,
     pub row_kind: Option<String>,
+    pub state: SlotState,
     pub appearance: css::AppearanceScope,
     pub specificity: (u16, u16, u16),
     pub name: String,
@@ -173,6 +192,8 @@ pub enum SlotLength {
     Px(f32),
     Rem(f32),
     Fraction(f32),
+    /// `calc(100% - <px>)` (e.g. `width: calc(100% - 12px)` on a floating sidebar card).
+    FullMinusPx(f32),
     Auto,
 }
 
@@ -247,11 +268,31 @@ pub enum SlotBackground {
         angle_deg: f32,
         stops: Vec<GradientStop>,
     },
+    RadialGradient {
+        cx_frac: f32,
+        cy_frac: f32,
+        rx_frac: f32,
+        ry_frac: f32,
+        stops: Vec<GradientStop>,
+    },
     ThemeBackgroundImage {
         size: BackgroundImageSize,
         overlay_color: Option<u32>,
     },
     Transparent,
+}
+
+/// Compiled `::before` pseudo-element geometry & fill (for accent bars like active thread left indicators).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SlotPseudoBar {
+    pub left: Option<SlotLength>,
+    pub right: Option<SlotLength>,
+    pub top: Option<SlotLength>,
+    pub bottom: Option<SlotLength>,
+    pub width: Option<SlotLength>,
+    pub height: Option<SlotLength>,
+    pub background: Option<SlotBackground>,
+    pub border_radius: Option<SlotLength>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -307,6 +348,12 @@ pub enum SlotJustifyContent {
 pub struct SlotStyleOverride {
     pub display_none: Option<bool>,
     pub background: Option<SlotBackground>,
+    /// Solid `background-color` preserved underneath a gradient `background-image` (e.g. `radial-gradient(...)` over `#07080C`).
+    pub background_color: Option<u32>,
+    /// Second layer from `background-clip: padding-box, border-box` rendered as a prismatic border rim.
+    pub border_gradient: Option<SlotBackground>,
+    /// Optional `::before` pseudo-element bar (e.g. active thread row left accent indicator).
+    pub before: Option<SlotPseudoBar>,
     pub color: Option<u32>,
     pub border_color: Option<u32>,
     pub border_widths: SlotEdges<f32>,
@@ -337,6 +384,9 @@ impl SlotStyleOverride {
     pub fn is_empty(&self) -> bool {
         self.display_none.is_none()
             && self.background.is_none()
+            && self.background_color.is_none()
+            && self.border_gradient.is_none()
+            && self.before.is_none()
             && self.color.is_none()
             && self.border_color.is_none()
             && self.border_widths.is_empty()
@@ -373,25 +423,50 @@ pub struct SlotStyleSet {
     pub base: SlotStyleOverride,
     pub hover: SlotStyleOverride,
     pub active: SlotStyleOverride,
+    pub selected: SlotStyleOverride,
+    pub unchecked: SlotStyleOverride,
+    pub focus_within: SlotStyleOverride,
 }
 
 impl SlotStyleSet {
     pub fn is_empty(&self) -> bool {
-        self.base.is_empty() && self.hover.is_empty() && self.active.is_empty()
+        self.base.is_empty()
+            && self.hover.is_empty()
+            && self.active.is_empty()
+            && self.selected.is_empty()
+            && self.unchecked.is_empty()
+            && self.focus_within.is_empty()
+    }
+
+    pub fn state(&self, state: SlotState) -> &SlotStyleOverride {
+        match state {
+            SlotState::Base => &self.base,
+            SlotState::Hover => &self.hover,
+            SlotState::Active => &self.active,
+            SlotState::Selected => &self.selected,
+            SlotState::Unchecked => &self.unchecked,
+            SlotState::FocusWithin => &self.focus_within,
+        }
     }
 
     pub fn has_scoped_background_image(&self) -> bool {
         self.base.has_scoped_background_image()
             || self.hover.has_scoped_background_image()
             || self.active.has_scoped_background_image()
+            || self.selected.has_scoped_background_image()
+            || self.unchecked.has_scoped_background_image()
+            || self.focus_within.has_scoped_background_image()
     }
 }
 
-/// Pre-compiled, appearance-resolved slot styles indexed by [`ThemeSlot`].
+/// Pre-compiled, appearance-resolved slot styles indexed by [`ThemeSlot`], alongside theme CSS
+/// default typography stacks and embedded local `@font-face` payloads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlotStylesheet {
     slots: Box<[Option<SlotStyleSet>; ThemeSlot::COUNT]>,
     timeline_rows: BTreeMap<String, SlotStyleSet>,
+    theme_fonts: css::ThemeCssFonts,
+    font_faces: Vec<css::EmbeddedFontFace>,
     empty: bool,
     has_scoped_bg_image: bool,
 }
@@ -407,6 +482,8 @@ impl SlotStylesheet {
         Self {
             slots: Box::new(std::array::from_fn(|_| None)),
             timeline_rows: BTreeMap::new(),
+            theme_fonts: css::ThemeCssFonts::default(),
+            font_faces: Vec::new(),
             empty: true,
             has_scoped_bg_image: false,
         }
@@ -432,6 +509,16 @@ impl SlotStylesheet {
     pub fn has_scoped_background_image(&self) -> bool {
         self.has_scoped_bg_image
     }
+
+    /// Theme-supplied default interface/code font stacks extracted from CSS `:root` / `body` / `html`.
+    pub fn theme_fonts(&self) -> &css::ThemeCssFonts {
+        &self.theme_fonts
+    }
+
+    /// Embedded local `data:` `@font-face` payloads extracted from the theme CSS.
+    pub fn font_faces(&self) -> &[css::EmbeddedFontFace] {
+        &self.font_faces
+    }
 }
 
 /// Whether `prop` (case-insensitive CSS property name) is compiled into [`SlotStyleOverride`].
@@ -443,6 +530,8 @@ pub(crate) fn is_supported_slot_property(prop: &str) -> bool {
             | "background-color"
             | "background-image"
             | "background-size"
+            | "background-clip"
+            | "background-origin"
             | "color"
             | "border"
             | "border-top"
@@ -504,6 +593,25 @@ pub(crate) fn is_supported_slot_property(prop: &str) -> bool {
             | "flex-direction"
             | "align-items"
             | "justify-content"
+    )
+}
+
+/// Whether `prop` is compiled into a [`SlotPseudoBar`] on `::before`.
+pub(crate) fn is_supported_pseudo_before_property(prop: &str) -> bool {
+    matches!(
+        prop.to_ascii_lowercase().as_str(),
+        "content"
+            | "position"
+            | "left"
+            | "right"
+            | "top"
+            | "bottom"
+            | "width"
+            | "height"
+            | "background"
+            | "background-color"
+            | "background-image"
+            | "border-radius"
     )
 }
 
@@ -620,13 +728,24 @@ fn split_complex_selector(sel: &str) -> Vec<(Option<Combinator>, &str)> {
     parts
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttrOp {
+    Present,
+    Equals,
+    Contains,
+    Word,
+    Prefix,
+    Suffix,
+    Dash,
+}
+
 #[derive(Debug)]
 enum SimpleToken<'a> {
     Type(&'a str),
     Universal,
     Id,
     Class(&'a str),
-    Attr(&'a str, Option<&'a str>),
+    Attr(&'a str, AttrOp, Option<&'a str>),
     PseudoClass(&'a str, Option<&'a str>),
     PseudoElement(&'a str),
 }
@@ -683,21 +802,31 @@ fn tokenize_compound(compound: &str) -> Option<Vec<SimpleToken<'_>>> {
                     return None;
                 }
                 let inner = compound[start..j].trim();
-                let (name, val) = if let Some((k, v)) = inner.split_once('=') {
-                    let k = k.trim();
-                    if k.ends_with(['~', '|', '^', '$', '*']) {
-                        return None;
-                    }
+                let (name, op, val) = if let Some((k, v)) = inner.split_once('=') {
+                    let k_trim = k.trim();
+                    let (attr_name, op) = if let Some(stripped) = k_trim.strip_suffix('*') {
+                        (stripped.trim(), AttrOp::Contains)
+                    } else if let Some(stripped) = k_trim.strip_suffix('~') {
+                        (stripped.trim(), AttrOp::Word)
+                    } else if let Some(stripped) = k_trim.strip_suffix('^') {
+                        (stripped.trim(), AttrOp::Prefix)
+                    } else if let Some(stripped) = k_trim.strip_suffix('$') {
+                        (stripped.trim(), AttrOp::Suffix)
+                    } else if let Some(stripped) = k_trim.strip_suffix('|') {
+                        (stripped.trim(), AttrOp::Dash)
+                    } else {
+                        (k_trim, AttrOp::Equals)
+                    };
                     let v = v.trim();
                     let unquoted = strip_quotes(v);
-                    (k, Some(unquoted))
+                    (attr_name, op, Some(unquoted))
                 } else {
-                    (inner, None)
+                    (inner, AttrOp::Present, None)
                 };
                 if name.is_empty() {
                     return None;
                 }
-                tokens.push(SimpleToken::Attr(name, val));
+                tokens.push(SimpleToken::Attr(name, op, val));
                 i = j + 1;
             }
             b':' => {
@@ -769,7 +898,7 @@ fn add_spec(a: (u16, u16, u16), b: (u16, u16, u16)) -> (u16, u16, u16) {
 
 fn match_slot_token(token: &SimpleToken<'_>) -> Option<(ThemeSlot, Option<String>)> {
     match token {
-        SimpleToken::Attr(name, val) => {
+        SimpleToken::Attr(name, AttrOp::Present | AttrOp::Equals, val) => {
             let name_lower = name.to_ascii_lowercase();
             let val_lower = val.map(str::to_ascii_lowercase);
             match (name_lower.as_str(), val_lower.as_deref()) {
@@ -800,11 +929,20 @@ fn match_slot_token(token: &SimpleToken<'_>) -> Option<(ThemeSlot, Option<String
                 }
                 ("data-settings-page-scroll", None) => Some((ThemeSlot::SettingsPageScroll, None)),
                 ("data-slot", Some("button")) => Some((ThemeSlot::Button, None)),
-                ("data-slot", Some("input")) => Some((ThemeSlot::Input, None)),
+                ("data-slot", Some("input")) | ("data-slot", Some("input-control")) => {
+                    Some((ThemeSlot::Input, None))
+                }
                 ("data-slot", Some("switch")) => Some((ThemeSlot::Switch, None)),
+                ("data-slot", Some("switch-thumb")) => Some((ThemeSlot::SwitchThumb, None)),
+                ("data-slot", Some("checkbox")) | ("data-slot", Some("checkbox-indicator")) => {
+                    Some((ThemeSlot::Checkbox, None))
+                }
+                ("data-slot", Some("settings-group")) => Some((ThemeSlot::SettingsGroup, None)),
                 ("data-slot", Some("select-trigger")) => Some((ThemeSlot::SelectTrigger, None)),
                 ("data-slot", Some("dialog-popup")) => Some((ThemeSlot::DialogPopup, None)),
-                ("data-slot", Some("popover-popup")) => Some((ThemeSlot::PopoverPopup, None)),
+                ("data-slot", Some("popover-popup")) | ("data-slot", Some("select-popup")) => {
+                    Some((ThemeSlot::PopoverPopup, None))
+                }
                 ("data-slot", Some("menu-popup")) => Some((ThemeSlot::MenuPopup, None)),
                 ("data-slot", Some("tooltip-popup")) => Some((ThemeSlot::TooltipPopup, None)),
                 ("data-slot", Some("scroll-area-scrollbar")) => {
@@ -843,7 +981,7 @@ fn match_appearance_token(token: &SimpleToken<'_>) -> Option<(css::AppearanceSco
         SimpleToken::Class(cls) if cls.eq_ignore_ascii_case("light") => {
             Some((css::AppearanceScope::Light, (0, 1, 0)))
         }
-        SimpleToken::Attr(name, Some(val)) if name.eq_ignore_ascii_case("data-theme") => {
+        SimpleToken::Attr(name, AttrOp::Equals, Some(val)) if name.eq_ignore_ascii_case("data-theme") => {
             if val.eq_ignore_ascii_case("dark") {
                 Some((css::AppearanceScope::Dark, (0, 1, 0)))
             } else if val.eq_ignore_ascii_case("light") {
@@ -870,6 +1008,135 @@ fn match_appearance_token(token: &SimpleToken<'_>) -> Option<(css::AppearanceSco
     }
 }
 
+fn is_selected_attr_token(token: &SimpleToken<'_>) -> bool {
+    let SimpleToken::Attr(name, op, val) = token else {
+        return false;
+    };
+    if !matches!(op, AttrOp::Present | AttrOp::Equals) {
+        return false;
+    }
+    let name_lower = name.to_ascii_lowercase();
+    let val_lower = val.map(str::to_ascii_lowercase);
+    matches!(
+        (name_lower.as_str(), val_lower.as_deref()),
+        ("data-active", None | Some("true"))
+            | ("data-selected", None | Some("true"))
+            | ("data-current", None | Some("true"))
+            | ("data-highlighted", None | Some("true"))
+            | ("aria-current", None | Some("page") | Some("true"))
+            | ("aria-selected", Some("true"))
+            | ("data-state", Some("active") | Some("selected") | Some("checked"))
+            | ("data-checked", None | Some("true"))
+            | ("data-indeterminate", None | Some("true"))
+    )
+}
+
+fn is_selected_state_expr(inner: &str) -> bool {
+    let parts = css::split_selector_list(inner);
+    if parts.is_empty() {
+        return false;
+    }
+    let mut saw_any = false;
+    for part in parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(tokens) = tokenize_compound(trimmed) else {
+            return false;
+        };
+        let mut matched_part = false;
+        for token in &tokens {
+            if is_selected_attr_token(token) {
+                matched_part = true;
+            } else if let SimpleToken::PseudoClass(pc, Some(nested)) = token {
+                if pc.eq_ignore_ascii_case("is")
+                    || pc.eq_ignore_ascii_case("where")
+                    || pc.eq_ignore_ascii_case("has")
+                {
+                    if is_selected_state_expr(nested) {
+                        matched_part = true;
+                    } else {
+                        return false;
+                    }
+                } else if pc.eq_ignore_ascii_case("not") {
+                    // Allow `:not([data-active="false"])`, `:not([aria-current="false"])`, etc.
+                    let nested_lower = nested.trim().to_ascii_lowercase();
+                    if !(nested_lower.contains("=\"false\"") || nested_lower.contains("='false'")) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        if !matched_part {
+            return false;
+        }
+        saw_any = true;
+    }
+    saw_any
+}
+
+fn match_state_token(token: &SimpleToken<'_>) -> Option<(SlotState, (u16, u16, u16))> {
+    match token {
+        SimpleToken::PseudoClass(pc, None) if pc.eq_ignore_ascii_case("hover") => {
+            Some((SlotState::Hover, (0, 1, 0)))
+        }
+        SimpleToken::PseudoClass(pc, None) if pc.eq_ignore_ascii_case("active") => {
+            Some((SlotState::Active, (0, 1, 0)))
+        }
+        SimpleToken::PseudoClass(pc, None)
+            if pc.eq_ignore_ascii_case("focus-within")
+                || pc.eq_ignore_ascii_case("focus-visible")
+                || pc.eq_ignore_ascii_case("focus") =>
+        {
+            Some((SlotState::FocusWithin, (0, 1, 0)))
+        }
+        SimpleToken::Attr(name, AttrOp::Present | AttrOp::Equals, val)
+            if name.eq_ignore_ascii_case("data-unchecked")
+                && val.is_none_or(|v| v.eq_ignore_ascii_case("true")) =>
+        {
+            Some((SlotState::Unchecked, (0, 1, 0)))
+        }
+        token if is_selected_attr_token(token) => Some((SlotState::Selected, (0, 1, 0))),
+        SimpleToken::PseudoClass(pc, Some(inner))
+            if (pc.eq_ignore_ascii_case("is")
+                || pc.eq_ignore_ascii_case("where")
+                || pc.eq_ignore_ascii_case("has"))
+                && is_selected_state_expr(inner) =>
+        {
+            let spec = if pc.eq_ignore_ascii_case("where") {
+                (0, 0, 0)
+            } else {
+                (0, 2, 0)
+            };
+            Some((SlotState::Selected, spec))
+        }
+        _ => None,
+    }
+}
+
+fn merge_slot_state(current: SlotState, next: SlotState) -> SlotState {
+    match (current, next) {
+        (SlotState::Base, s) | (s, SlotState::Base) => s,
+        // Keep FocusWithin / Active / Selected over plain Hover.
+        (SlotState::Hover, s) => s,
+        (s, SlotState::Hover) => s,
+        (_, s) => s,
+    }
+}
+
+fn is_select_popup_token(token: &SimpleToken<'_>) -> bool {
+    matches!(
+        token,
+        SimpleToken::Attr(name, AttrOp::Equals, Some(val))
+            if name.eq_ignore_ascii_case("data-slot") && val.eq_ignore_ascii_case("select-popup")
+    )
+}
+
 fn match_single_slot_selector(selector: &str) -> Option<SlotSelectorMatch> {
     let compounds = split_complex_selector(selector.trim());
     if compounds.is_empty() {
@@ -878,6 +1145,10 @@ fn match_single_slot_selector(selector: &str) -> Option<SlotSelectorMatch> {
 
     let mut appearance = css::AppearanceScope::Any;
     let mut specificity: (u16, u16, u16) = (0, 0, 0);
+    let mut prev_slot: Option<ThemeSlot> = None;
+    let mut prev_is_select_popup = false;
+    let mut prev_is_selected_wrapper = false;
+    let mut ancestor_unchecked_switch = false;
 
     // Ancestor compounds (all except the rightmost subject compound).
     for &(comb, compound) in &compounds[..compounds.len() - 1] {
@@ -885,12 +1156,24 @@ fn match_single_slot_selector(selector: &str) -> Option<SlotSelectorMatch> {
             return None;
         }
         let tokens = tokenize_compound(compound)?;
+        prev_is_select_popup = false;
+        prev_is_selected_wrapper = false;
+        let mut compound_slot: Option<ThemeSlot> = None;
+        let mut compound_state = SlotState::Base;
+
         for token in &tokens {
             if let Some((app, spec)) = match_appearance_token(token) {
                 appearance = combine_appearance(appearance, app)?;
                 specificity = add_spec(specificity, spec);
-            } else if match_slot_token(token).is_some() {
+            } else if let Some((slot, _)) = match_slot_token(token) {
+                compound_slot = Some(slot);
+                if is_select_popup_token(token) {
+                    prev_is_select_popup = true;
+                }
                 specificity = add_spec(specificity, token_specificity(token));
+            } else if let Some((st, spec)) = match_state_token(token) {
+                compound_state = merge_slot_state(compound_state, st);
+                specificity = add_spec(specificity, spec);
             } else {
                 match token {
                     SimpleToken::Universal => {}
@@ -902,12 +1185,19 @@ fn match_single_slot_selector(selector: &str) -> Option<SlotSelectorMatch> {
                     SimpleToken::PseudoClass(pc, None) if pc.eq_ignore_ascii_case("root") => {
                         specificity = add_spec(specificity, (0, 1, 0));
                     }
-                    SimpleToken::Attr(name, _) if name.eq_ignore_ascii_case("data-theme-id") => {
+                    SimpleToken::Attr(name, _, _) if name.eq_ignore_ascii_case("data-theme-id") => {
                         specificity = add_spec(specificity, (0, 1, 0));
                     }
                     _ => return None,
                 }
             }
+        }
+        prev_slot = compound_slot;
+        if compound_slot.is_none() && compound_state == SlotState::Selected {
+            prev_is_selected_wrapper = true;
+        }
+        if compound_slot == Some(ThemeSlot::Switch) && compound_state == SlotState::Unchecked {
+            ancestor_unchecked_switch = true;
         }
     }
 
@@ -919,6 +1209,10 @@ fn match_single_slot_selector(selector: &str) -> Option<SlotSelectorMatch> {
     let tokens = tokenize_compound(subject)?;
     let mut matched_slot: Option<(ThemeSlot, Option<String>)> = None;
     let mut state = SlotState::Base;
+    let mut pseudo_before = false;
+    let mut saw_universal = false;
+    let mut saw_dropdown_glass = false;
+    let mut saw_extra_class_attr = false;
 
     for token in &tokens {
         if let Some(found) = match_slot_token(token) {
@@ -941,39 +1235,96 @@ fn match_single_slot_selector(selector: &str) -> Option<SlotSelectorMatch> {
             specificity = add_spec(specificity, spec);
             continue;
         }
+        if let Some((st, spec)) = match_state_token(token) {
+            state = merge_slot_state(state, st);
+            specificity = add_spec(specificity, spec);
+            continue;
+        }
         match token {
-            SimpleToken::Universal => {}
+            SimpleToken::Universal => {
+                saw_universal = true;
+            }
             SimpleToken::Type(_) => {
                 specificity = add_spec(specificity, (0, 0, 1));
             }
-            SimpleToken::PseudoClass(pc, None) if pc.eq_ignore_ascii_case("hover") => {
-                if state != SlotState::Active {
-                    state = SlotState::Hover;
-                }
+            SimpleToken::Class(cls)
+                if cls.eq_ignore_ascii_case("dropdown-glass")
+                    && last_comb == Some(Combinator::Child)
+                    && prev_is_select_popup =>
+            {
+                saw_dropdown_glass = true;
                 specificity = add_spec(specificity, (0, 1, 0));
             }
-            SimpleToken::PseudoClass(pc, None) if pc.eq_ignore_ascii_case("active") => {
-                state = SlotState::Active;
+            SimpleToken::Attr(name, op, Some(_))
+                if name.eq_ignore_ascii_case("class")
+                    && matches!(
+                        op,
+                        AttrOp::Contains | AttrOp::Prefix | AttrOp::Suffix | AttrOp::Word | AttrOp::Dash
+                    ) =>
+            {
+                saw_extra_class_attr = true;
                 specificity = add_spec(specificity, (0, 1, 0));
+            }
+            SimpleToken::PseudoElement(pe) if pe.eq_ignore_ascii_case("before") => {
+                pseudo_before = true;
+                specificity = add_spec(specificity, (0, 0, 1));
+            }
+            SimpleToken::PseudoClass(pc, None) if pc.eq_ignore_ascii_case("before") => {
+                pseudo_before = true;
+                specificity = add_spec(specificity, (0, 0, 1));
             }
             SimpleToken::PseudoClass(pc, None) if pc.eq_ignore_ascii_case("root") => {
                 specificity = add_spec(specificity, (0, 1, 0));
             }
-            SimpleToken::Attr(name, _) if name.eq_ignore_ascii_case("data-theme-id") => {
+            SimpleToken::Attr(name, _, _) if name.eq_ignore_ascii_case("data-theme-id") => {
                 specificity = add_spec(specificity, (0, 1, 0));
             }
             _ => return None,
         }
     }
 
+    // Special direct-child slot aliases:
+    // - `[data-slot="sidebar"] > *` -> `ThemeSlot::Sidebar`
+    // - `[data-slot="select-popup"] > .dropdown-glass` -> `ThemeSlot::PopoverPopup`
+    if matched_slot.is_none() {
+        if saw_dropdown_glass && last_comb == Some(Combinator::Child) && prev_is_select_popup {
+            matched_slot = Some((ThemeSlot::PopoverPopup, None));
+        } else if saw_universal
+            && !saw_extra_class_attr
+            && state == SlotState::Base
+            && !pseudo_before
+            && last_comb == Some(Combinator::Child)
+            && prev_slot == Some(ThemeSlot::Sidebar)
+        {
+            matched_slot = Some((ThemeSlot::Sidebar, None));
+        }
+    }
+
     let (slot, row_kind) = matched_slot?;
-    Some(SlotSelectorMatch { slot, row_kind, state, appearance, specificity })
+    // Propagate ancestor wrapper states where applicable:
+    // - `:is([data-active]...) > [data-thread-item]` -> `SlotState::Selected`
+    // - `[data-slot="switch"][data-unchecked] [data-slot="switch-thumb"]` -> `SlotState::Unchecked`
+    if prev_is_selected_wrapper && last_comb == Some(Combinator::Child) {
+        state = merge_slot_state(state, SlotState::Selected);
+    }
+    if ancestor_unchecked_switch && slot == ThemeSlot::SwitchThumb {
+        state = merge_slot_state(state, SlotState::Unchecked);
+    }
+
+    Some(SlotSelectorMatch {
+        slot,
+        row_kind,
+        state,
+        pseudo_before,
+        appearance,
+        specificity,
+    })
 }
 
 fn token_specificity(token: &SimpleToken<'_>) -> (u16, u16, u16) {
     match token {
         SimpleToken::Id => (1, 0, 0),
-        SimpleToken::Class(_) | SimpleToken::Attr(_, _) | SimpleToken::PseudoClass(_, _) => {
+        SimpleToken::Class(_) | SimpleToken::Attr(_, _, _) | SimpleToken::PseudoClass(_, _) => {
             (0, 1, 0)
         }
         SimpleToken::Type(_) | SimpleToken::PseudoElement(_) => (0, 0, 1),
@@ -995,11 +1346,122 @@ fn cascade_wins(existing: Option<CascadeKey>, candidate: CascadeKey) -> bool {
 }
 
 #[derive(Default)]
+struct PseudoBarBuilder {
+    left: Option<(CascadeKey, SlotLength)>,
+    right: Option<(CascadeKey, SlotLength)>,
+    top: Option<(CascadeKey, SlotLength)>,
+    bottom: Option<(CascadeKey, SlotLength)>,
+    width: Option<(CascadeKey, SlotLength)>,
+    height: Option<(CascadeKey, SlotLength)>,
+    bg_layers: Option<(CascadeKey, Option<Vec<SlotBackground>>)>,
+    bg_color: Option<(CascadeKey, Option<SlotBackground>)>,
+    border_radius: Option<(CascadeKey, SlotLength)>,
+}
+
+impl PseudoBarBuilder {
+    fn apply(&mut self, prop: &str, val: &str, key: CascadeKey, roles: &Colors, dark: bool) {
+        let prop_lower = prop.to_ascii_lowercase();
+        let val = val.trim();
+        if val.is_empty() {
+            return;
+        }
+        match prop_lower.as_str() {
+            "left" => {
+                if let Some(v) = parse_margin_length(val) {
+                    set_if_wins(&mut self.left, key, v);
+                }
+            }
+            "right" => {
+                if let Some(v) = parse_margin_length(val) {
+                    set_if_wins(&mut self.right, key, v);
+                }
+            }
+            "top" => {
+                if let Some(v) = parse_margin_length(val) {
+                    set_if_wins(&mut self.top, key, v);
+                }
+            }
+            "bottom" => {
+                if let Some(v) = parse_margin_length(val) {
+                    set_if_wins(&mut self.bottom, key, v);
+                }
+            }
+            "width" => {
+                if let Some(v) = parse_dimension_length(val) {
+                    set_if_wins(&mut self.width, key, v);
+                }
+            }
+            "height" => {
+                if let Some(v) = parse_dimension_length(val) {
+                    set_if_wins(&mut self.height, key, v);
+                }
+            }
+            "border-radius" => {
+                let horiz = val.split('/').next().unwrap_or(val).trim();
+                if let Some([tl, _, _, _]) = parse_corner_shorthand(horiz) {
+                    set_if_wins(&mut self.border_radius, key, tl);
+                }
+            }
+            "background" => {
+                if let Some((layers, col, _)) = parse_background_shorthand(val, roles, dark) {
+                    set_if_wins(&mut self.bg_layers, key, layers);
+                    set_if_wins(&mut self.bg_color, key, col);
+                }
+            }
+            "background-color" => {
+                if val.eq_ignore_ascii_case("transparent") || val.eq_ignore_ascii_case("none") {
+                    set_if_wins(&mut self.bg_color, key, Some(SlotBackground::Transparent));
+                } else if let Some(c) = eval_color(val, roles, dark) {
+                    set_if_wins(&mut self.bg_color, key, Some(SlotBackground::Solid(c)));
+                }
+            }
+            "background-image" => {
+                if val.eq_ignore_ascii_case("none") {
+                    set_if_wins(&mut self.bg_layers, key, None);
+                } else if let Some((layers, _)) = parse_background_image_layers(val, roles, dark) {
+                    set_if_wins(&mut self.bg_layers, key, Some(layers));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(self) -> Option<SlotPseudoBar> {
+        let background = match (self.bg_layers, self.bg_color) {
+            (Some((_, Some(layers))), _) if !layers.is_empty() => layers.into_iter().next(),
+            (_, Some((_, col))) => col,
+            _ => None,
+        };
+        let has_geom = self.left.is_some()
+            || self.right.is_some()
+            || self.top.is_some()
+            || self.bottom.is_some()
+            || self.width.is_some()
+            || self.height.is_some();
+        if background.is_none() && !has_geom {
+            return None;
+        }
+        Some(SlotPseudoBar {
+            left: self.left.map(|(_, v)| v),
+            right: self.right.map(|(_, v)| v),
+            top: self.top.map(|(_, v)| v),
+            bottom: self.bottom.map(|(_, v)| v),
+            width: self.width.map(|(_, v)| v),
+            height: self.height.map(|(_, v)| v),
+            background,
+            border_radius: self.border_radius.map(|(_, v)| v),
+        })
+    }
+}
+
+#[derive(Default)]
 struct OverrideBuilder {
     display_none: Option<(CascadeKey, bool)>,
-    bg_image: Option<(CascadeKey, Option<SlotBackground>)>,
+    bg_layers: Option<(CascadeKey, Option<Vec<SlotBackground>>)>,
     bg_color: Option<(CascadeKey, Option<SlotBackground>)>,
     bg_size: Option<(CascadeKey, BackgroundImageSize)>,
+    bg_clip_border_box: Option<(CascadeKey, bool)>,
+    before: PseudoBarBuilder,
     color: Option<(CascadeKey, u32)>,
     border_color: Option<(CascadeKey, u32)>,
     border_top: Option<(CascadeKey, f32)>,
@@ -1045,6 +1507,10 @@ fn set_if_wins<T>(slot: &mut Option<(CascadeKey, T)>, key: CascadeKey, val: T) {
 }
 
 impl OverrideBuilder {
+    fn apply_before(&mut self, prop: &str, val: &str, key: CascadeKey, roles: &Colors, dark: bool) {
+        self.before.apply(prop, val, key, roles, dark);
+    }
+
     fn apply(&mut self, prop: &str, val: &str, key: CascadeKey, roles: &Colors, dark: bool) {
         let prop_lower = prop.to_ascii_lowercase();
         let val = val.trim();
@@ -1064,9 +1530,10 @@ impl OverrideBuilder {
                 }
             }
             "background" => {
-                if let Some((img, col, sz)) = parse_background_shorthand(val, roles, dark) {
-                    set_if_wins(&mut self.bg_image, key, img);
+                if let Some((layers, col, sz)) = parse_background_shorthand(val, roles, dark) {
+                    set_if_wins(&mut self.bg_layers, key, layers);
                     set_if_wins(&mut self.bg_color, key, col);
+                    set_if_wins(&mut self.bg_clip_border_box, key, false);
                     if let Some(size) = sz {
                         set_if_wins(&mut self.bg_size, key, size);
                     }
@@ -1081,9 +1548,9 @@ impl OverrideBuilder {
             }
             "background-image" => {
                 if val.eq_ignore_ascii_case("none") {
-                    set_if_wins(&mut self.bg_image, key, None);
-                } else if let Some((bg, sz)) = parse_background_image(val, roles, dark) {
-                    set_if_wins(&mut self.bg_image, key, Some(bg));
+                    set_if_wins(&mut self.bg_layers, key, None);
+                } else if let Some((layers, sz)) = parse_background_image_layers(val, roles, dark) {
+                    set_if_wins(&mut self.bg_layers, key, Some(layers));
                     if let Some(size) = sz {
                         set_if_wins(&mut self.bg_size, key, size);
                     }
@@ -1094,6 +1561,12 @@ impl OverrideBuilder {
                     set_if_wins(&mut self.bg_size, key, sz);
                 }
             }
+            "background-clip" => {
+                if let Some(is_rim) = parse_background_clip_border_box(val) {
+                    set_if_wins(&mut self.bg_clip_border_box, key, is_rim);
+                }
+            }
+            "background-origin" => {}
             "color" => {
                 if let Some(c) = eval_color(val, roles, dark) {
                     set_if_wins(&mut self.color, key, c);
@@ -1428,24 +1901,38 @@ impl OverrideBuilder {
     }
 
     fn finish(self) -> SlotStyleOverride {
-        let background = match (self.bg_image, self.bg_color) {
-            (
-                Some((img_key, Some(SlotBackground::ThemeBackgroundImage { mut size, mut overlay_color }))),
-                col_entry,
-            ) => {
-                if let Some((sz_key, sz)) = self.bg_size
-                    && sz_key >= img_key
-                {
-                    size = sz;
+        let clip_border_box = self.bg_clip_border_box.is_some_and(|(_, v)| v);
+        let mut background_color: Option<u32> = None;
+        let mut border_gradient: Option<SlotBackground> = None;
+
+        let background = match (self.bg_layers, self.bg_color) {
+            (Some((img_key, Some(mut layers))), col_entry) if !layers.is_empty() => {
+                let first = layers.remove(0);
+                match first {
+                    SlotBackground::ThemeBackgroundImage { mut size, mut overlay_color } => {
+                        if let Some((sz_key, sz)) = self.bg_size
+                            && sz_key >= img_key
+                        {
+                            size = sz;
+                        }
+                        if overlay_color.is_none()
+                            && let Some((_, Some(SlotBackground::Solid(c)))) = col_entry
+                        {
+                            overlay_color = Some(c);
+                        }
+                        Some(SlotBackground::ThemeBackgroundImage { size, overlay_color })
+                    }
+                    other => {
+                        if clip_border_box && !layers.is_empty() {
+                            border_gradient = Some(layers.remove(0));
+                        }
+                        if let Some((_, Some(SlotBackground::Solid(c)))) = col_entry {
+                            background_color = Some(c);
+                        }
+                        Some(other)
+                    }
                 }
-                if overlay_color.is_none()
-                    && let Some((_, Some(SlotBackground::Solid(c)))) = col_entry
-                {
-                    overlay_color = Some(c);
-                }
-                Some(SlotBackground::ThemeBackgroundImage { size, overlay_color })
             }
-            (Some((_, Some(img))), _) => Some(img),
             (_, Some((_, col))) => col,
             _ => None,
         };
@@ -1453,6 +1940,9 @@ impl OverrideBuilder {
         SlotStyleOverride {
             display_none: self.display_none.map(|(_, v)| v),
             background,
+            background_color,
+            border_gradient,
+            before: self.before.finish(),
             color: self.color.map(|(_, v)| v),
             border_color: self.border_color.map(|(_, v)| v),
             border_widths: SlotEdges {
@@ -1501,6 +1991,7 @@ impl OverrideBuilder {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_slot_stylesheet(
     slot_decls: &[SlotDecl],
     slot_vars: &[SlotVarDecl],
@@ -1508,9 +1999,18 @@ pub(crate) fn compile_slot_stylesheet(
     dark: bool,
     roles: &Colors,
     palette: &BTreeMap<String, u32>,
+    theme_fonts: css::ThemeCssFonts,
+    font_faces: Vec<css::EmbeddedFontFace>,
 ) -> SlotStylesheet {
     if slot_decls.is_empty() {
-        return SlotStylesheet::empty();
+        return SlotStylesheet {
+            slots: Box::new(std::array::from_fn(|_| None)),
+            timeline_rows: BTreeMap::new(),
+            theme_fonts,
+            font_faces,
+            empty: true,
+            has_scoped_bg_image: false,
+        };
     }
 
     let base_vars = build_base_vars(root_vars, roles, palette);
@@ -1564,24 +2064,24 @@ pub(crate) fn compile_slot_stylesheet(
     SlotStylesheet {
         slots,
         timeline_rows,
+        theme_fonts,
+        font_faces,
         empty: !any_non_empty,
         has_scoped_bg_image,
     }
 }
 
-fn compile_slot_set(
+fn collect_slot_state_vars(
     slot: ThemeSlot,
     row_kind: Option<&str>,
-    slot_decls: &[SlotDecl],
+    state: SlotState,
     slot_vars: &[SlotVarDecl],
-    base_vars: &BTreeMap<String, String>,
+    seed: &BTreeMap<String, String>,
     dark: bool,
-    roles: &Colors,
-) -> SlotStyleSet {
-    let mut vars = base_vars.clone();
+) -> BTreeMap<String, String> {
     let mut local_best: BTreeMap<&str, (CascadeKey, &str)> = BTreeMap::new();
     for decl in slot_vars {
-        if decl.slot != slot || !decl.appearance.matches(dark) {
+        if decl.slot != slot || decl.state != state || !decl.appearance.matches(dark) {
             continue;
         }
         let kind_matches = match (row_kind, decl.row_kind.as_deref()) {
@@ -1598,15 +2098,37 @@ fn compile_slot_set(
             local_best.insert(decl.name.as_str(), (key, decl.value.as_str()));
         }
     }
+    let mut vars = seed.clone();
     for (name, (_, val)) in local_best {
         if !name.eq_ignore_ascii_case("--theme-background-image") {
             vars.insert(name.to_owned(), val.to_owned());
         }
     }
+    vars
+}
+
+fn compile_slot_set(
+    slot: ThemeSlot,
+    row_kind: Option<&str>,
+    slot_decls: &[SlotDecl],
+    slot_vars: &[SlotVarDecl],
+    base_vars: &BTreeMap<String, String>,
+    dark: bool,
+    roles: &Colors,
+) -> SlotStyleSet {
+    let base_slot_vars = collect_slot_state_vars(slot, row_kind, SlotState::Base, slot_vars, base_vars, dark);
+    let hover_vars = collect_slot_state_vars(slot, row_kind, SlotState::Hover, slot_vars, &base_slot_vars, dark);
+    let active_vars = collect_slot_state_vars(slot, row_kind, SlotState::Active, slot_vars, &base_slot_vars, dark);
+    let selected_vars = collect_slot_state_vars(slot, row_kind, SlotState::Selected, slot_vars, &base_slot_vars, dark);
+    let unchecked_vars = collect_slot_state_vars(slot, row_kind, SlotState::Unchecked, slot_vars, &base_slot_vars, dark);
+    let focus_within_vars = collect_slot_state_vars(slot, row_kind, SlotState::FocusWithin, slot_vars, &base_slot_vars, dark);
 
     let mut base = OverrideBuilder::default();
     let mut hover = OverrideBuilder::default();
     let mut active = OverrideBuilder::default();
+    let mut selected = OverrideBuilder::default();
+    let mut unchecked = OverrideBuilder::default();
+    let mut focus_within = OverrideBuilder::default();
 
     for decl in slot_decls {
         if decl.slot != slot || !decl.appearance.matches(dark) {
@@ -1621,7 +2143,15 @@ fn compile_slot_set(
         if !kind_matches {
             continue;
         }
-        let resolved = css::resolve_var_expr(&decl.value, &vars, &mut BTreeSet::new());
+        let vars = match decl.state {
+            SlotState::Base => &base_slot_vars,
+            SlotState::Hover => &hover_vars,
+            SlotState::Active => &active_vars,
+            SlotState::Selected => &selected_vars,
+            SlotState::Unchecked => &unchecked_vars,
+            SlotState::FocusWithin => &focus_within_vars,
+        };
+        let resolved = css::resolve_var_expr(&decl.value, vars, &mut BTreeSet::new());
         if css::value_fetches(&resolved) {
             continue;
         }
@@ -1630,14 +2160,24 @@ fn compile_slot_set(
             SlotState::Base => &mut base,
             SlotState::Hover => &mut hover,
             SlotState::Active => &mut active,
+            SlotState::Selected => &mut selected,
+            SlotState::Unchecked => &mut unchecked,
+            SlotState::FocusWithin => &mut focus_within,
         };
-        builder.apply(&decl.property, &resolved, key, roles, dark);
+        if decl.pseudo_before {
+            builder.apply_before(&decl.property, &resolved, key, roles, dark);
+        } else {
+            builder.apply(&decl.property, &resolved, key, roles, dark);
+        }
     }
 
     SlotStyleSet {
         base: base.finish(),
         hover: hover.finish(),
         active: active.finish(),
+        selected: selected.finish(),
+        unchecked: unchecked.finish(),
+        focus_within: focus_within.finish(),
     }
 }
 
@@ -1765,68 +2305,96 @@ fn parse_background_size(val: &str) -> Option<BackgroundImageSize> {
     }
 }
 
+fn parse_background_clip_border_box(val: &str) -> Option<bool> {
+    let parts: Vec<String> = color::split(val, ',')
+        .into_iter()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let valid_clip = |s: &str| matches!(s, "border-box" | "padding-box" | "content-box" | "text");
+    if !parts.iter().all(|p| valid_clip(p)) {
+        return None;
+    }
+    Some(parts.len() >= 2 && parts[0] == "padding-box" && parts[1] == "border-box")
+}
+
+fn parse_gradient(val: &str, roles: &Colors, dark: bool) -> Option<SlotBackground> {
+    parse_linear_gradient(val, roles, dark).or_else(|| parse_radial_gradient(val, roles, dark))
+}
+
+type ParsedBackgroundShorthand =
+    (Option<Vec<SlotBackground>>, Option<SlotBackground>, Option<BackgroundImageSize>);
+
 fn parse_background_shorthand(
     val: &str,
     roles: &Colors,
     dark: bool,
-) -> Option<(Option<SlotBackground>, Option<SlotBackground>, Option<BackgroundImageSize>)> {
+) -> Option<ParsedBackgroundShorthand> {
     if val.eq_ignore_ascii_case("transparent") || val.eq_ignore_ascii_case("none") {
         return Some((None, Some(SlotBackground::Transparent), None));
     }
     if contains_theme_bg_var(val) {
         let (bg, sz) = parse_theme_bg_layers(val, roles, dark);
-        return Some((Some(bg), None, sz));
+        return Some((Some(vec![bg]), None, sz));
     }
-    if let Some(grad) = parse_linear_gradient(val, roles, dark) {
-        return Some((Some(grad), None, None));
+    if let Some(grad) = parse_gradient(val, roles, dark) {
+        return Some((Some(vec![grad]), None, None));
     }
     if let Some(c) = eval_color(val, roles, dark) {
         return Some((None, Some(SlotBackground::Solid(c)), None));
     }
     // Check comma-separated layers and shorthand tokens (e.g. `linear-gradient(...) no-repeat`
-    // or `linear-gradient(...), #111111`).
-    let mut found_grad: Option<SlotBackground> = None;
+    // or `linear-gradient(...), linear-gradient(...)` or `linear-gradient(...), #111111`).
+    let mut found_layers: Vec<SlotBackground> = Vec::new();
     let mut found_color: Option<u32> = None;
     for layer in color::split(val, ',') {
         let layer = layer.trim();
-        if found_grad.is_none()
-            && let Some(grad) = parse_linear_gradient(layer, roles, dark)
-        {
-            found_grad = Some(grad);
+        if let Some(grad) = parse_gradient(layer, roles, dark) {
+            found_layers.push(grad);
             continue;
         }
+        let mut layer_grad: Option<SlotBackground> = None;
         for token in split_ws_tokens(layer) {
-            if found_grad.is_none()
-                && let Some(grad) = parse_linear_gradient(token, roles, dark)
+            if layer_grad.is_none()
+                && let Some(grad) = parse_gradient(token, roles, dark)
             {
-                found_grad = Some(grad);
+                layer_grad = Some(grad);
             } else if found_color.is_none()
                 && let Some(c) = eval_color(token, roles, dark)
             {
                 found_color = Some(c);
             }
         }
+        if let Some(grad) = layer_grad {
+            found_layers.push(grad);
+        }
     }
-    if found_grad.is_some() || found_color.is_some() {
-        return Some((found_grad, found_color.map(SlotBackground::Solid), None));
+    if !found_layers.is_empty() || found_color.is_some() {
+        let layers = (!found_layers.is_empty()).then_some(found_layers);
+        return Some((layers, found_color.map(SlotBackground::Solid), None));
     }
     None
 }
 
-fn parse_background_image(
+fn parse_background_image_layers(
     val: &str,
     roles: &Colors,
     dark: bool,
-) -> Option<(SlotBackground, Option<BackgroundImageSize>)> {
+) -> Option<(Vec<SlotBackground>, Option<BackgroundImageSize>)> {
     if contains_theme_bg_var(val) {
-        return Some(parse_theme_bg_layers(val, roles, dark));
+        let (bg, sz) = parse_theme_bg_layers(val, roles, dark);
+        return Some((vec![bg], sz));
     }
+    let mut layers = Vec::new();
     for layer in color::split(val, ',') {
-        if let Some(grad) = parse_linear_gradient(layer.trim(), roles, dark) {
-            return Some((grad, None));
+        if let Some(grad) = parse_gradient(layer.trim(), roles, dark) {
+            layers.push(grad);
         }
     }
-    None
+    if layers.is_empty() { None } else { Some((layers, None)) }
 }
 
 fn parse_theme_bg_layers(
@@ -1883,29 +2451,10 @@ fn parse_theme_bg_layers(
     (SlotBackground::ThemeBackgroundImage { size, overlay_color }, explicit_size)
 }
 
-fn parse_linear_gradient(val: &str, roles: &Colors, dark: bool) -> Option<SlotBackground> {
-    let trimmed = val.trim();
-    if trimmed.len() < 17
-        || !trimmed[..16].eq_ignore_ascii_case("linear-gradient(")
-        || !trimmed.ends_with(')')
-    {
-        return None;
-    }
-    let inner = &trimmed[16..trimmed.len() - 1];
-    let parts = color::split(inner, ',');
-    if parts.len() < 2 {
-        return None;
-    }
-
-    let (angle_deg, stop_slice) = if let Some(angle) = parse_gradient_direction(parts[0]) {
-        (angle, &parts[1..])
-    } else {
-        (180.0, &parts[..])
-    };
+fn parse_gradient_stops(stop_slice: &[&str], roles: &Colors, dark: bool) -> Option<Vec<GradientStop>> {
     if stop_slice.len() < 2 {
         return None;
     }
-
     let mut stops = Vec::with_capacity(stop_slice.len());
     for part in stop_slice {
         let tokens = split_ws_tokens(part);
@@ -1949,8 +2498,174 @@ fn parse_linear_gradient(val: &str, roles: &Colors, dark: bool) -> Option<SlotBa
             i += 1;
         }
     }
+    Some(stops)
+}
+
+fn parse_linear_gradient(val: &str, roles: &Colors, dark: bool) -> Option<SlotBackground> {
+    let trimmed = val.trim();
+    if trimmed.len() < 17
+        || !trimmed[..16].eq_ignore_ascii_case("linear-gradient(")
+        || !trimmed.ends_with(')')
+    {
+        return None;
+    }
+    let inner = &trimmed[16..trimmed.len() - 1];
+    let parts = color::split(inner, ',');
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let (angle_deg, stop_slice) = if let Some(angle) = parse_gradient_direction(parts[0]) {
+        (angle, &parts[1..])
+    } else {
+        (180.0, &parts[..])
+    };
+    let stops = parse_gradient_stops(stop_slice, roles, dark)?;
 
     Some(SlotBackground::LinearGradient { angle_deg, stops })
+}
+
+fn parse_radial_gradient(val: &str, roles: &Colors, dark: bool) -> Option<SlotBackground> {
+    let trimmed = val.trim();
+    if trimmed.len() < 17
+        || !trimmed[..16].eq_ignore_ascii_case("radial-gradient(")
+        || !trimmed.ends_with(')')
+    {
+        return None;
+    }
+    let inner = &trimmed[16..trimmed.len() - 1];
+    let parts = color::split(inner, ',');
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let (cx_frac, cy_frac, rx_frac, ry_frac, stop_slice) =
+        if let Some((cx, cy, rx, ry)) = parse_radial_prelude(parts[0]) {
+            (cx, cy, rx, ry, &parts[1..])
+        } else {
+            // No geometry prelude: default ellipse centered at (50%, 50%) covering corners.
+            (0.5, 0.5, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2, &parts[..])
+        };
+    let stops = parse_gradient_stops(stop_slice, roles, dark)?;
+    Some(SlotBackground::RadialGradient { cx_frac, cy_frac, rx_frac, ry_frac, stops })
+}
+
+fn parse_radial_prelude(raw: &str) -> Option<(f32, f32, f32, f32)> {
+    let tokens: Vec<String> = split_ws_tokens(raw)
+        .into_iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    // Find `at` separator if present.
+    let at_idx = tokens.iter().position(|t| t == "at");
+    let (shape_size_toks, pos_toks) = match at_idx {
+        Some(idx) => (&tokens[..idx], &tokens[idx + 1..]),
+        None => (&tokens[..], &[][..]),
+    };
+
+    let mut cx = 0.5f32;
+    let mut cy = 0.5f32;
+    let mut saw_prelude_token = at_idx.is_some();
+
+    if !pos_toks.is_empty() {
+        let mut horiz: Option<f32> = None;
+        let mut vert: Option<f32> = None;
+        let mut generic: Vec<f32> = Vec::new();
+        for tok in pos_toks {
+            match tok.as_str() {
+                "left" => horiz = Some(0.0),
+                "right" => horiz = Some(1.0),
+                "top" => vert = Some(0.0),
+                "bottom" => vert = Some(1.0),
+                "center" => generic.push(0.5),
+                other => {
+                    if let Some(p) = parse_percentage_unit(other) {
+                        generic.push(p.clamp(-5.0, 5.0));
+                    } else {
+                        let px_v = parse_px_or_rem(other)?;
+                        // Approximate pixel center offset relative to a 256px reference box.
+                        generic.push((px_v / 256.0).clamp(-5.0, 5.0));
+                    }
+                }
+            }
+        }
+        let mut g_iter = generic.into_iter();
+        cx = horiz.or_else(|| g_iter.next()).unwrap_or(0.5);
+        cy = vert.or_else(|| g_iter.next()).unwrap_or(0.5);
+    }
+
+    let mut explicit_radii: Vec<f32> = Vec::new();
+    let mut extent: Option<&str> = None;
+    let mut is_circle = false;
+    for tok in shape_size_toks {
+        match tok.as_str() {
+            "circle" => {
+                is_circle = true;
+                saw_prelude_token = true;
+            }
+            "ellipse" => {
+                saw_prelude_token = true;
+            }
+            "closest-side" | "farthest-side" | "closest-corner" | "farthest-corner" => {
+                extent = Some(tok.as_str());
+                saw_prelude_token = true;
+            }
+            other => {
+                if let Some(p) = parse_percentage_unit(other) {
+                    if p <= 0.0 {
+                        return None;
+                    }
+                    explicit_radii.push(p.clamp(0.01, 10.0));
+                    saw_prelude_token = true;
+                } else {
+                    let px_v = parse_px_or_rem(other)?;
+                    if px_v <= 0.0 {
+                        return None;
+                    }
+                    explicit_radii.push((px_v / 256.0).clamp(0.01, 10.0));
+                    saw_prelude_token = true;
+                }
+            }
+        }
+    }
+
+    if !saw_prelude_token {
+        return None;
+    }
+
+    let (rx, ry) = match explicit_radii.as_slice() {
+        [r] => (*r, *r),
+        [rx, ry] => (*rx, *ry),
+        [] => {
+            let dx_min = cx.abs().min((1.0 - cx).abs()).max(0.05);
+            let dy_min = cy.abs().min((1.0 - cy).abs()).max(0.05);
+            let dx_max = cx.abs().max((1.0 - cx).abs()).max(0.05);
+            let dy_max = cy.abs().max((1.0 - cy).abs()).max(0.05);
+            let (rx, ry) = match extent.unwrap_or("farthest-corner") {
+                "closest-side" => (dx_min, dy_min),
+                "farthest-side" => (dx_max, dy_max),
+                "closest-corner" => {
+                    let d = (dx_min * dx_min + dy_min * dy_min).sqrt();
+                    (d, d)
+                }
+                _ => {
+                    let d = (dx_max * dx_max + dy_max * dy_max).sqrt();
+                    (d, d)
+                }
+            };
+            if is_circle {
+                let r = rx.max(ry);
+                (r, r)
+            } else {
+                (rx, ry)
+            }
+        }
+        _ => return None,
+    };
+
+    Some((cx, cy, rx, ry))
 }
 
 fn parse_gradient_direction(raw: &str) -> Option<f32> {
@@ -2142,6 +2857,19 @@ fn parse_length(val: &str, allow_negative: bool, allow_auto: bool) -> Option<Slo
     if lower == "0" {
         return Some(SlotLength::Px(0.0));
     }
+    if let Some(inner) = lower.strip_prefix("calc(").and_then(|s| s.strip_suffix(')')) {
+        let inner = inner.trim();
+        if let Some(rest) = inner.strip_prefix("100%") {
+            let rest = rest.trim();
+            if let Some(sub) = rest.strip_prefix('-')
+                && let Some(px_val) = parse_px_or_rem(sub.trim())
+                && px_val >= 0.0
+            {
+                return Some(SlotLength::FullMinusPx(px_val.clamp(0.0, 10_000.0)));
+            }
+        }
+        return None;
+    }
     if let Some(n) = lower.strip_suffix("px") {
         let v = parse_finite_f32(n)?;
         if !allow_negative && v < 0.0 {
@@ -2174,7 +2902,7 @@ fn parse_size_constraint(val: &str) -> Option<SlotSizeConstraint> {
         SlotLength::Px(v) => Some(SlotSizeConstraint::Px(v)),
         SlotLength::Rem(v) => Some(SlotSizeConstraint::Rem(v)),
         SlotLength::Fraction(v) => Some(SlotSizeConstraint::Fraction(v)),
-        SlotLength::Auto => None,
+        SlotLength::FullMinusPx(_) | SlotLength::Auto => None,
     }
 }
 

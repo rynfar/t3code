@@ -9,10 +9,41 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
+use base64::Engine as _;
+
 use super::{Colors, color, slots};
 
 /// `THEME_CSS_MAX_LENGTH` from `packages/contracts/src/server.ts`.
 pub const MAX_CSS_LEN: usize = 100_000;
+
+/// Maximum decoded byte size for a single embedded `@font-face` `data:` payload (4 MiB).
+pub const MAX_EMBEDDED_FONT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Binary container format of an embedded `@font-face` `data:` URL payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedFontFormat {
+    Woff2,
+    Woff,
+    TrueType,
+    OpenType,
+    Unknown,
+}
+
+/// A local `data:` `@font-face` payload extracted from theme CSS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedFontFace {
+    pub family: String,
+    pub format: EmbeddedFontFormat,
+    pub bytes: Vec<u8>,
+}
+
+/// Theme-supplied default font stacks extracted from `:root` (`--font-sans`, `--font-mono`)
+/// and document-level `body` / `html` `font-family` rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThemeCssFonts {
+    pub sans: Option<String>,
+    pub mono: Option<String>,
+}
 
 /// Checks `css.length <= THEME_CSS_MAX_LENGTH` in UTF-16 code units, matching JavaScript.
 pub fn is_valid_length(css: &str) -> bool {
@@ -171,6 +202,14 @@ struct CustomDecl {
     order: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocFontDecl {
+    appearance: AppearanceScope,
+    value: String,
+    important: bool,
+    order: usize,
+}
+
 /// Summary of what a theme's CSS contains for editor feedback and diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CssDiagnostics {
@@ -186,6 +225,8 @@ pub struct ParsedCss {
     declarations: Vec<CustomDecl>,
     slot_declarations: Vec<slots::SlotDecl>,
     slot_vars: Vec<slots::SlotVarDecl>,
+    doc_fonts: Vec<DocFontDecl>,
+    font_faces: Vec<EmbeddedFontFace>,
     diagnostics: CssDiagnostics,
 }
 
@@ -202,6 +243,8 @@ impl ParsedCss {
             declarations: Vec::new(),
             slot_declarations: Vec::new(),
             slot_vars: Vec::new(),
+            doc_fonts: Vec::new(),
+            font_faces: Vec::new(),
             applied_slot_rules: 0,
             unmapped_dom_rules: 0,
             recognized_vars: BTreeSet::new(),
@@ -211,6 +254,8 @@ impl ParsedCss {
             declarations: parser.declarations,
             slot_declarations: parser.slot_declarations,
             slot_vars: parser.slot_vars,
+            doc_fonts: parser.doc_fonts,
+            font_faces: parser.font_faces,
             diagnostics: CssDiagnostics {
                 loads_remote_files: remote,
                 exceeds_max_length,
@@ -225,6 +270,51 @@ impl ParsedCss {
         self.diagnostics
     }
 
+    /// Embedded local `data:` `@font-face` payloads extracted from the theme CSS.
+    pub fn font_faces(&self) -> &[EmbeddedFontFace] {
+        &self.font_faces
+    }
+
+    /// Theme-supplied default interface (`sans`) and code (`mono`) font stacks for `dark`.
+    pub fn theme_fonts(&self, dark: bool) -> ThemeCssFonts {
+        let root_vars = self.collect_vars(dark, TargetScope::Root);
+        let resolve_stack = |raw: &str| -> Option<String> {
+            let resolved = resolve_var_expr(raw, &root_vars, &mut BTreeSet::new());
+            let trimmed = resolved.trim();
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("inherit")
+                || trimmed.eq_ignore_ascii_case("initial")
+                || trimmed.eq_ignore_ascii_case("unset")
+                || contains_ci_ascii(trimmed, "var(")
+                || value_fetches(trimmed)
+            {
+                return None;
+            }
+            Some(trimmed.to_owned())
+        };
+
+        let mut best_doc_sans: Option<(bool, usize, &str)> = None;
+        for decl in &self.doc_fonts {
+            if !decl.appearance.matches(dark) {
+                continue;
+            }
+            let replace = match best_doc_sans {
+                None => true,
+                Some((imp, ord, _)) => {
+                    (decl.important && !imp) || (decl.important == imp && decl.order >= ord)
+                }
+            };
+            if replace {
+                best_doc_sans = Some((decl.important, decl.order, decl.value.as_str()));
+            }
+        }
+        let sans = best_doc_sans
+            .and_then(|(_, _, v)| resolve_stack(v))
+            .or_else(|| root_vars.get("--font-sans").and_then(|v| resolve_stack(v)));
+        let mono = root_vars.get("--font-mono").and_then(|v| resolve_stack(v));
+        ThemeCssFonts { sans, mono }
+    }
+
     /// Compiles all matched `THEME_CSS_HOOKS` declarations for `dark` using the active roles and
     /// resolved palette tokens for `var(--...)` expansion.
     pub fn slot_stylesheet(
@@ -234,6 +324,7 @@ impl ParsedCss {
         palette: &BTreeMap<String, u32>,
     ) -> slots::SlotStylesheet {
         let root_vars = self.collect_vars(dark, TargetScope::Root);
+        let theme_fonts = self.theme_fonts(dark);
         slots::compile_slot_stylesheet(
             &self.slot_declarations,
             &self.slot_vars,
@@ -241,6 +332,8 @@ impl ParsedCss {
             dark,
             roles,
             palette,
+            theme_fonts,
+            self.font_faces.clone(),
         )
     }
 
@@ -348,6 +441,8 @@ struct Parser<'a> {
     declarations: Vec<CustomDecl>,
     slot_declarations: Vec<slots::SlotDecl>,
     slot_vars: Vec<slots::SlotVarDecl>,
+    doc_fonts: Vec<DocFontDecl>,
+    font_faces: Vec<EmbeddedFontFace>,
     applied_slot_rules: usize,
     unmapped_dom_rules: usize,
     recognized_vars: BTreeSet<String>,
@@ -418,12 +513,20 @@ impl<'a> Parser<'a> {
 
     fn handle_nested_block(&mut self, parent_selectors: &[String], prelude: &str) {
         let lower = prelude.to_ascii_lowercase();
+        if lower.starts_with("@font-face") {
+            let block = self.take_block();
+            if let Some(face) = parse_font_face_block(&block) {
+                self.font_faces.push(face);
+            } else {
+                self.unmapped_dom_rules += 1;
+            }
+            return;
+        }
         if lower.starts_with("@keyframes")
             || lower.starts_with("@-webkit-keyframes")
-            || lower.starts_with("@font-face")
             || lower.starts_with("@property")
         {
-            // Skip block content safely; @keyframes/@font-face/@property are DOM-only.
+            // Skip block content safely; @keyframes/@property are DOM-only.
             self.skip_block();
             self.unmapped_dom_rules += 1;
             return;
@@ -444,6 +547,32 @@ impl<'a> Parser<'a> {
         let mut next = parent_selectors.to_vec();
         next.push(prelude.to_owned());
         self.parse_block(&next);
+    }
+
+    fn take_block(&mut self) -> String {
+        let start = self.pos;
+        let mut depth: usize = 1;
+        let mut quote: Option<u8> = None;
+        while self.pos < self.bytes.len() && depth > 0 {
+            let b = self.bytes[self.pos];
+            self.pos += 1;
+            if let Some(q) = quote {
+                if b == b'\\' && self.pos < self.bytes.len() {
+                    self.pos += 1;
+                } else if b == q {
+                    quote = None;
+                }
+                continue;
+            }
+            match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        let end = if depth == 0 && self.pos > start { self.pos - 1 } else { self.pos };
+        self.source[start..end].to_owned()
     }
 
     fn skip_block(&mut self) {
@@ -486,18 +615,46 @@ impl<'a> Parser<'a> {
             return;
         }
         if !prop.starts_with("--") {
+            let doc_font_targets = if prop.eq_ignore_ascii_case("font-family") {
+                classify_doc_font_selectors(selectors)
+            } else {
+                Vec::new()
+            };
+            for appearance in &doc_font_targets {
+                self.order += 1;
+                self.doc_fonts.push(DocFontDecl {
+                    appearance: *appearance,
+                    value: val.to_owned(),
+                    important,
+                    order: self.order,
+                });
+            }
+
             let slot_targets = slots::classify_slot_selectors(selectors);
-            if slot_targets.is_empty() || !slots::is_supported_slot_property(prop) {
-                self.unmapped_dom_rules += 1;
+            let matching_targets: Vec<_> = slot_targets
+                .into_iter()
+                .filter(|target| {
+                    if target.pseudo_before {
+                        slots::is_supported_pseudo_before_property(prop)
+                    } else {
+                        slots::is_supported_slot_property(prop)
+                    }
+                })
+                .collect();
+            if matching_targets.is_empty() {
+                if doc_font_targets.is_empty() {
+                    self.unmapped_dom_rules += 1;
+                }
                 return;
             }
             self.applied_slot_rules += 1;
-            for target in slot_targets {
+            for target in matching_targets {
                 self.order += 1;
                 self.slot_declarations.push(slots::SlotDecl {
                     slot: target.slot,
                     row_kind: target.row_kind,
                     state: target.state,
+                    pseudo_before: target.pseudo_before,
                     appearance: target.appearance,
                     specificity: target.specificity,
                     property: prop.to_owned(),
@@ -516,7 +673,9 @@ impl<'a> Parser<'a> {
         }
         let recognized = custom_prop_to_role(prop).is_some()
             || !root_prop_to_tokens(prop).is_empty()
-            || !sidebar_prop_to_tokens(prop).is_empty();
+            || !sidebar_prop_to_tokens(prop).is_empty()
+            || prop.eq_ignore_ascii_case("--font-sans")
+            || prop.eq_ignore_ascii_case("--font-mono");
         if recognized && !targets.is_empty() {
             self.recognized_vars.insert(prop.to_owned());
         }
@@ -532,10 +691,14 @@ impl<'a> Parser<'a> {
             });
         }
         for target in slot_targets {
+            if target.pseudo_before {
+                continue;
+            }
             self.order += 1;
             self.slot_vars.push(slots::SlotVarDecl {
                 slot: target.slot,
                 row_kind: target.row_kind,
+                state: target.state,
                 appearance: target.appearance,
                 specificity: target.specificity,
                 name: prop.to_owned(),
@@ -544,6 +707,218 @@ impl<'a> Parser<'a> {
                 order: self.order,
             });
         }
+    }
+}
+
+fn classify_doc_font_selectors(selectors: &[String]) -> Vec<AppearanceScope> {
+    if selectors.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut outer_appearance = AppearanceScope::Any;
+    for sel in &selectors[..selectors.len() - 1] {
+        if let Some((_, app)) = classify_single_selector(sel)
+            && app != AppearanceScope::Any
+        {
+            outer_appearance = app;
+        }
+    }
+    let leaf = &selectors[selectors.len() - 1];
+    for part in split_selector_list(leaf) {
+        let lower = part.trim().to_ascii_lowercase();
+        let has_html_or_body = lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            .any(|tok| tok == "html" || tok == "body");
+        if !has_html_or_body {
+            continue;
+        }
+        if let Some((TargetScope::Root, app)) = classify_single_selector(part) {
+            let combined = match (outer_appearance, app) {
+                (AppearanceScope::Any, a) => a,
+                (a, AppearanceScope::Any) => a,
+                (a, b) if a == b => a,
+                _ => continue,
+            };
+            if !out.contains(&combined) {
+                out.push(combined);
+            }
+        }
+    }
+    out
+}
+
+fn parse_font_face_block(block: &str) -> Option<EmbeddedFontFace> {
+    let mut family: Option<String> = None;
+    let mut src_value: Option<String> = None;
+
+    for decl in split_top_level(block, b';') {
+        let decl = decl.trim();
+        if decl.is_empty() {
+            continue;
+        }
+        let Some((prop_raw, val_raw)) = decl.split_once(':') else {
+            continue;
+        };
+        let prop = prop_raw.trim();
+        let (val, _) = strip_important(val_raw.trim());
+        if prop.eq_ignore_ascii_case("font-family") {
+            let cleaned = val.trim().trim_matches(['"', '\'']).trim();
+            if !cleaned.is_empty() {
+                family = Some(cleaned.to_owned());
+            }
+        } else if prop.eq_ignore_ascii_case("src") {
+            src_value = Some(val.to_owned());
+        }
+    }
+
+    let family = family?;
+    let src = src_value?;
+    // Refuse any remote URL or escape tricks anywhere in the src declaration.
+    if value_fetches(&src) {
+        return None;
+    }
+
+    for candidate in split_top_level(&src, b',') {
+        if let Some((format, bytes)) = extract_data_font_url(candidate) {
+            return Some(EmbeddedFontFace { family, format, bytes });
+        }
+    }
+    None
+}
+
+fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+        } else {
+            match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                x if x == sep && depth == 0 => {
+                    out.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+fn extract_data_font_url(candidate: &str) -> Option<(EmbeddedFontFormat, Vec<u8>)> {
+    let bytes = candidate.as_bytes();
+    let mut url_inner: Option<&str> = None;
+    let mut format_hint: Option<&str> = None;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 4 <= bytes.len()
+            && bytes[i..i + 4].eq_ignore_ascii_case(b"url(")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && let Some((end, inner)) = take_balanced_parens(candidate, i + 4)
+        {
+            if url_inner.is_none() {
+                url_inner = Some(inner.trim());
+            }
+            i = end;
+            continue;
+        }
+        if i + 7 <= bytes.len()
+            && bytes[i..i + 7].eq_ignore_ascii_case(b"format(")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && let Some((end, inner)) = take_balanced_parens(candidate, i + 7)
+        {
+            format_hint = Some(inner.trim().trim_matches(['"', '\'']).trim());
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+
+    let raw_url = url_inner?.trim().trim_matches(['"', '\'']).trim();
+    if raw_url.len() < 5 || !raw_url[..5].eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let after_scheme = &raw_url[5..];
+    let (meta, payload) = after_scheme.split_once(',')?;
+    let meta_lower = meta.to_ascii_lowercase();
+    if !meta_lower.contains(";base64") {
+        return None;
+    }
+    let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+    // Reject absurdly large base64 payloads before decoding.
+    if compact.len() > (MAX_EMBEDDED_FONT_BYTES / 3 + 2) * 4 {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD.decode(&compact).ok()?;
+    if decoded.is_empty() || decoded.len() > MAX_EMBEDDED_FONT_BYTES {
+        return None;
+    }
+    let format = detect_embedded_font_format(format_hint, &meta_lower, &decoded);
+    Some((format, decoded))
+}
+
+fn detect_embedded_font_format(
+    format_hint: Option<&str>,
+    meta_lower: &str,
+    bytes: &[u8],
+) -> EmbeddedFontFormat {
+    if bytes.starts_with(b"wOF2") {
+        return EmbeddedFontFormat::Woff2;
+    }
+    if bytes.starts_with(b"wOFF") {
+        return EmbeddedFontFormat::Woff;
+    }
+    if bytes.starts_with(b"OTTO") {
+        return EmbeddedFontFormat::OpenType;
+    }
+    if bytes.starts_with(&[0x00, 0x01, 0x00, 0x00]) || bytes.starts_with(b"true") {
+        return EmbeddedFontFormat::TrueType;
+    }
+    if let Some(hint) = format_hint {
+        let lower = hint.to_ascii_lowercase();
+        if lower.contains("woff2") {
+            return EmbeddedFontFormat::Woff2;
+        }
+        if lower.contains("woff") {
+            return EmbeddedFontFormat::Woff;
+        }
+        if lower.contains("opentype") || lower.contains("otf") {
+            return EmbeddedFontFormat::OpenType;
+        }
+        if lower.contains("truetype") || lower.contains("ttf") {
+            return EmbeddedFontFormat::TrueType;
+        }
+    }
+    if meta_lower.contains("woff2") {
+        EmbeddedFontFormat::Woff2
+    } else if meta_lower.contains("woff") {
+        EmbeddedFontFormat::Woff
+    } else if meta_lower.contains("otf") || meta_lower.contains("opentype") {
+        EmbeddedFontFormat::OpenType
+    } else if meta_lower.contains("ttf") || meta_lower.contains("truetype") || meta_lower.contains("sfnt") {
+        EmbeddedFontFormat::TrueType
+    } else {
+        EmbeddedFontFormat::Unknown
     }
 }
 

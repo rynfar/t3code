@@ -19,8 +19,8 @@ use super::hover::{HoverTarget, pr_icon, pr_tone};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
 use crate::theme::{
-    Palette, ThemeSlot, ThemeSlotExt as _, hsla, palette, refine_slot_active, refine_slot_hover,
-    slot_style,
+    Palette, SlotState, ThemeSlot, ThemeSlotExt as _, hsla, palette, refine_slot_active,
+    refine_slot_hover, slot_style, theme_slot_pseudo_before, theme_slot_state_background_layer,
 };
 
 const CARD_CONTENT_HEIGHT: f32 = 78.;
@@ -338,8 +338,18 @@ impl SidebarPane {
         let preview = (thread.title.clone(), project, visual);
         let pane = cx.entity().downgrade();
         let thread_item_slot = slot_style(ThemeSlot::ThreadItem, cx);
-        let slot_has_hover = thread_item_slot.as_ref().is_some_and(|set| !set.hover.is_empty());
+        let is_selected = active || selected;
+        let row_slot_state = if is_selected { SlotState::Selected } else { SlotState::Base };
+        let selected_overrides_bg = is_selected
+            && thread_item_slot
+                .as_ref()
+                .is_some_and(|set| set.selected.background.is_some() || set.selected.border_gradient.is_some());
+        let slot_has_hover = !selected_overrides_bg
+            && thread_item_slot.as_ref().is_some_and(|set| !set.hover.is_empty());
         let slot_has_active = thread_item_slot.as_ref().is_some_and(|set| !set.active.is_empty());
+        let row_bg_layer =
+            theme_slot_state_background_layer(ThemeSlot::ThreadItem, row_slot_state, px(6.), cx);
+        let row_before_bar = theme_slot_pseudo_before(ThemeSlot::ThreadItem, row_slot_state, cx);
         div()
             .id(row_id)
             .debug_selector(move || debug_row_id.to_string())
@@ -355,19 +365,26 @@ impl SidebarPane {
             .when(draft_bg, |this| this.bg(hsla(p.warning).opacity(0.04)))
             .when(recede_working, |this| this.opacity(0.7))
             .theme_slot(ThemeSlot::ThreadItem, cx)
+            .when(is_selected, |this| this.theme_slot_state(ThemeSlot::ThreadItem, SlotState::Selected, cx))
             // GPUI allows one hover style per element: the background, the receding row's full
             // opacity, and `[data-thread-item]:hover` overrides share it.
             .when(hover_bg || recede_working || slot_has_hover, |this| {
                 this.hover(|style| {
                     let style = if draft_bg { style.bg(hsla(p.warning).opacity(0.08)) } else if hover_bg { style.bg(hsla(p.sidebar_row_hover)) } else { style };
                     let style = if recede_working { style.opacity(1.) } else { style };
-                    refine_slot_hover(style, ThemeSlot::ThreadItem, cx)
+                    if selected_overrides_bg {
+                        style
+                    } else {
+                        refine_slot_hover(style, ThemeSlot::ThreadItem, cx)
+                    }
                 })
             })
             .when(slot_has_active, |this| {
                 this.active(|style| refine_slot_active(style, ThemeSlot::ThreadItem, cx))
             })
             .when(dragging, |this| this.opacity(0.5))
+            .children(row_bg_layer)
+            .children(row_before_bar)
             .child(self.hover.record_row_bounds(hover_bounds_id, cx.entity_id()))
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.hover.on_hover(this.hover_suppressed(), hover_row_id.clone(), hover.clone(), *hovered, cx);

@@ -8,10 +8,12 @@ mod tokens;
 pub mod html_render;
 pub mod slots;
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use t3_core::themes::{self, ThemeDefinition};
+use t3_core::themes::css::{EmbeddedFontFace, EmbeddedFontFormat, ThemeCssFonts};
 
 use gpui::{App, Global, Hsla, Rems, Window, WindowAppearance, px, rems};
 use gpui_component::{Theme, ThemeConfig, ThemeMode};
@@ -19,13 +21,15 @@ use serde_json::json;
 use t3_core::client_settings::typography::{FontDefaults, FontRole, MONO_STACK, Typography, resolve_font_stack};
 use t3_core::client_settings::{AppearanceMode, ChatWidth, DiffColorScheme, ThemePreference};
 
-// Part 1 of #457 exports the slot engine API for Wave H4B's UI call-site wiring.
 #[allow(unused_imports)]
 pub use slots::{
-    SlotStyleOverride, SlotStyleSet, SlotStylesheet, ThemeSlot, ThemeSlotExt, ThemeSlotHoverExt,
-    ThemeSlotInteractiveExt, apply_slot_override, refine_slot_active, refine_slot_hover,
-    slot_border_color, slot_has_active, slot_has_background, slot_has_hover, slot_style,
-    slot_stylesheet, theme_slot_background_layer, theme_slot_clipped_background_layer,
+    SlotPseudoBar, SlotState, SlotStyleOverride, SlotStyleSet, SlotStylesheet, ThemeSlot,
+    ThemeSlotExt, ThemeSlotHoverExt, ThemeSlotInteractiveExt, apply_slot_override,
+    refine_slot_active, refine_slot_hover, slot_border_color, slot_has_active,
+    slot_has_background, slot_has_floating_inset, slot_has_hover, slot_has_state_background,
+    slot_style, slot_stylesheet, theme_slot_background_layer,
+    theme_slot_clipped_background_layer, theme_slot_pseudo_before,
+    theme_slot_state_background_layer,
 };
 pub use tokens::{BUILT_IN_THEMES, Palette, metrics};
 
@@ -79,6 +83,7 @@ struct ThemeState {
     saved: Option<Rc<SavedTheme>>,
     prepared_preview: Option<PreparedPreview>,
     background_image: Option<std::sync::Arc<gpui::RenderImage>>,
+    loaded_font_hashes: HashSet<(u64, u64, usize)>,
 }
 
 #[derive(Clone)]
@@ -87,7 +92,7 @@ struct SavedTheme {
     palettes: [Palette; 2],
     slot_stylesheets: [Arc<SlotStylesheet>; 2],
     configs: [Rc<ThemeConfig>; 2],
-    fonts: [gpui::SharedString; 4],
+    fonts: [[gpui::SharedString; 4]; 2],
 }
 #[derive(Clone)]
 struct PreparedPreview {
@@ -96,6 +101,7 @@ struct PreparedPreview {
     palette: Palette,
     slot_stylesheet: Arc<SlotStylesheet>,
     config: Rc<ThemeConfig>,
+    fonts: [gpui::SharedString; 4],
 }
 impl Global for ThemeState {}
 
@@ -116,6 +122,7 @@ pub fn init(cx: &mut App) {
         saved: None,
         prepared_preview: None,
         background_image: None,
+        loaded_font_hashes: HashSet::new(),
     });
     cache_font_inventory(cx);
     install(cx);
@@ -346,18 +353,88 @@ pub fn default_mono_family(cx: &App) -> &str {
     &cx.global::<FontInventory>().mono
 }
 
-fn resolve_family(role: FontRole, cx: &App) -> gpui::SharedString {
+fn embedded_font_fingerprint(bytes: &[u8]) -> (u64, u64, usize) {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut h2: u64 = 0x9e37_79b9_7f4a_7c15;
+    for &b in bytes {
+        h1 ^= u64::from(b);
+        h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+        h2 = h2.wrapping_mul(0xbf58_476d_1ce4_e5b9) ^ u64::from(b);
+    }
+    (h1, h2, bytes.len())
+}
+
+fn decode_embedded_font_sfnt(face: &EmbeddedFontFace) -> Option<Vec<u8>> {
+    match face.format {
+        EmbeddedFontFormat::Woff2 => wuff::decompress_woff2(&face.bytes).ok(),
+        EmbeddedFontFormat::Woff => wuff::decompress_woff1(&face.bytes).ok(),
+        EmbeddedFontFormat::TrueType | EmbeddedFontFormat::OpenType => Some(face.bytes.clone()),
+        EmbeddedFontFormat::Unknown => {
+            if face.bytes.starts_with(b"wOF2") {
+                wuff::decompress_woff2(&face.bytes).ok()
+            } else if face.bytes.starts_with(b"wOFF") {
+                wuff::decompress_woff1(&face.bytes).ok()
+            } else if face.bytes.starts_with(b"OTTO")
+                || face.bytes.starts_with(&[0x00, 0x01, 0x00, 0x00])
+                || face.bytes.starts_with(b"true")
+            {
+                Some(face.bytes.clone())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn register_embedded_fonts(faces: &[EmbeddedFontFace], cx: &mut App) {
+    if faces.is_empty() {
+        return;
+    }
+    let mut pending: Vec<Cow<'static, [u8]>> = Vec::new();
+    for face in faces {
+        let key = embedded_font_fingerprint(&face.bytes);
+        if !cx.global_mut::<ThemeState>().loaded_font_hashes.insert(key) {
+            continue;
+        }
+        match decode_embedded_font_sfnt(face) {
+            Some(sfnt) if !sfnt.is_empty() => pending.push(Cow::Owned(sfnt)),
+            _ => {
+                tracing::debug!(family = %face.family, format = ?face.format, "skipping undecodable embedded theme font");
+            }
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    match cx.text_system().add_fonts(pending) {
+        Ok(()) => cache_font_inventory(cx),
+        Err(error) => tracing::warn!(%error, "failed to register embedded theme fonts"),
+    }
+}
+
+fn resolve_family(role: FontRole, theme_fonts: &ThemeCssFonts, cx: &App) -> gpui::SharedString {
     let inventory = cx.global::<FontInventory>();
-    let family = preferences(cx).typography.family(role);
+    let user_family = preferences(cx).typography.family(role);
     let fallback = if role.monospace() {
         inventory.mono.clone().into()
     } else if role == FontRole::Prompt {
-        resolve_family(FontRole::Interface, cx)
+        resolve_family(FontRole::Interface, theme_fonts, cx)
     } else {
         gpui::SharedString::from(".SystemUIFont")
     };
+    let effective_stack = if !user_family.is_empty() {
+        user_family
+    } else if role == FontRole::Interface {
+        theme_fonts.sans.as_deref().unwrap_or("")
+    } else if role == FontRole::Code
+        || (role == FontRole::Terminal && !preferences(cx).typography.separate)
+    {
+        theme_fonts.mono.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
     resolve_font_stack(
-        family,
+        effective_stack,
         &inventory.names,
         FontDefaults {
             sans: ".SystemUIFont",
@@ -391,12 +468,17 @@ fn install(cx: &mut App) {
     let saved = cx.global::<ThemeState>().saved.clone();
     let saved = saved.unwrap_or_else(|| {
         let preferences = preferences(cx).clone();
-        let fonts = FontRole::ALL.map(|role| resolve_family(role, cx));
         let environment = cx.global::<ThemeState>().environment.clone();
         let [(light_palette, light_slots), (dark_palette, dark_slots)] =
             [false, true].map(|dark| derived(&preferences.theme, dark, &preferences, &environment));
+        register_embedded_fonts(light_slots.font_faces(), cx);
+        register_embedded_fonts(dark_slots.font_faces(), cx);
         let palettes = [light_palette, dark_palette];
         let slot_stylesheets = [light_slots, dark_slots];
+        let fonts = [
+            FontRole::ALL.map(|role| resolve_family(role, slot_stylesheets[0].theme_fonts(), cx)),
+            FontRole::ALL.map(|role| resolve_family(role, slot_stylesheets[1].theme_fonts(), cx)),
+        ];
         let configs = std::array::from_fn(|i| {
             Rc::new(config(
                 if i == 0 { "T3 Code Light" } else { "T3 Code Dark" },
@@ -404,8 +486,8 @@ fn install(cx: &mut App) {
                 &slot_stylesheets[i],
                 i == 1,
                 preferences.interface_font_size,
-                &fonts[FontRole::Code as usize],
-                &fonts[FontRole::Interface as usize],
+                &fonts[i][FontRole::Code as usize],
+                &fonts[i][FontRole::Interface as usize],
                 preferences.typography.size(FontRole::Code),
             ))
         });
@@ -420,10 +502,10 @@ fn install(cx: &mut App) {
         saved
     });
     let preferences = &saved.preferences;
-    cx.set_global(ActiveFonts(saved.fonts.clone()));
     let mut palettes = saved.palettes;
     let mut slot_stylesheets = saved.slot_stylesheets.clone();
     let mut configs = saved.configs.clone();
+    let mut fonts = saved.fonts.clone();
     if let Some(input) = cx.global::<ThemeState>().preview.clone() {
         let cached = cx
             .global::<ThemeState>()
@@ -441,6 +523,9 @@ fn install(cx: &mut App) {
                 preferences.glass,
             )
             .ok()?;
+            register_embedded_fonts(slot_sheet.font_faces(), cx);
+            let preview_fonts =
+                FontRole::ALL.map(|role| resolve_family(role, slot_sheet.theme_fonts(), cx));
             let base = if input.dark { tokens::DARK } else { tokens::LIGHT };
             let mut value = serde_json::to_value(base).ok()?;
             value.as_object_mut()?.extend(values.into_iter().map(|(k, v)| (k, v.into())));
@@ -457,8 +542,8 @@ fn install(cx: &mut App) {
                 &slot_stylesheet,
                 input.dark,
                 preferences.interface_font_size,
-                &saved.fonts[FontRole::Code as usize],
-                &saved.fonts[FontRole::Interface as usize],
+                &preview_fonts[FontRole::Code as usize],
+                &preview_fonts[FontRole::Interface as usize],
                 preferences.typography.size(FontRole::Code),
             ));
             let prepared = PreparedPreview {
@@ -467,6 +552,7 @@ fn install(cx: &mut App) {
                 palette,
                 slot_stylesheet,
                 config,
+                fonts: preview_fonts,
             };
             cx.global_mut::<ThemeState>().prepared_preview = Some(prepared.clone());
             Some(prepared)
@@ -476,16 +562,27 @@ fn install(cx: &mut App) {
             palettes[i] = prepared.palette;
             slot_stylesheets[i] = prepared.slot_stylesheet;
             configs[i] = prepared.config;
+            fonts[i] = prepared.fonts;
         }
     }
+    let active_idx = usize::from(dark);
+    let active_fonts = fonts[active_idx].clone();
+    cx.set_global(ActiveFonts(active_fonts.clone()));
     let revision = cx.try_global::<ActivePalette>().map_or(0, |p| p.1.wrapping_add(1));
-    cx.set_global(ActivePalette(palettes[usize::from(dark)], revision));
-    cx.set_global(slots::ActiveSlotStylesheet(Arc::clone(&slot_stylesheets[usize::from(dark)])));
+    cx.set_global(ActivePalette(palettes[active_idx], revision));
+    let next_slots = Arc::clone(&slot_stylesheets[active_idx]);
+    let slots_changed = cx
+        .try_global::<slots::ActiveSlotStylesheet>()
+        .is_none_or(|prev| !Arc::ptr_eq(&prev.0, &next_slots));
+    if slots_changed {
+        slots::clear_gradient_cache();
+    }
+    cx.set_global(slots::ActiveSlotStylesheet(next_slots));
     let theme = Theme::global_mut(cx);
     [theme.light_theme, theme.dark_theme] = configs;
     theme.font_size = px(preferences.interface_font_size);
-    theme.font_family = saved.fonts[FontRole::Interface as usize].clone();
-    theme.mono_font_family = saved.fonts[FontRole::Code as usize].clone();
+    theme.font_family = active_fonts[FontRole::Interface as usize].clone();
+    theme.mono_font_family = active_fonts[FontRole::Code as usize].clone();
     theme.mono_font_size = px(preferences.typography.size(FontRole::Code));
 }
 
@@ -549,7 +646,10 @@ fn slot_bg_rgba(ov: &SlotStyleOverride) -> Option<u32> {
     match ov.background.as_ref()? {
         t3_core::themes::slots::SlotBackground::Solid(c) => Some(*c),
         t3_core::themes::slots::SlotBackground::Transparent => Some(0x0000_0000),
-        t3_core::themes::slots::SlotBackground::LinearGradient { stops, .. } => stops.first().map(|s| s.color),
+        t3_core::themes::slots::SlotBackground::LinearGradient { stops, .. }
+        | t3_core::themes::slots::SlotBackground::RadialGradient { stops, .. } => {
+            stops.first().map(|s| s.color)
+        }
         t3_core::themes::slots::SlotBackground::ThemeBackgroundImage { overlay_color, .. } => *overlay_color,
     }
 }
@@ -925,6 +1025,45 @@ mod tests {
             assert_eq!(cx.theme().scrollbar_thumb, stock_thumb);
             assert_eq!(cx.theme().scrollbar_thumb_hover, stock_thumb_hover);
             assert_eq!(cx.theme().input, stock_input);
+            preview(None, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn theme_css_typography_defaults_apply_and_yield_to_user_preferences(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            init(cx);
+
+            let installed = installed_font_families(cx).to_vec();
+            let Some(picked) = installed
+                .iter()
+                .find(|name| !name.starts_with('.') && !name.eq_ignore_ascii_case("Menlo"))
+                .cloned()
+            else {
+                return;
+            };
+            let colors = themes::standard(true);
+            let css = format!(r#"body {{ font-family: "{picked}", sans-serif; }}"#);
+
+            // With no user font preference, theme CSS `body { font-family }` applies to Interface & Prompt.
+            preview_with_css(Some((&colors, Some(&css), true)), cx);
+            assert_eq!(font_family(FontRole::Interface, cx).as_ref(), picked.as_str());
+            assert_eq!(font_family(FontRole::Prompt, cx).as_ref(), picked.as_str());
+            assert_eq!(cx.theme().font_family.as_ref(), picked.as_str());
+
+            // Explicit user font preference takes precedence over theme CSS defaults.
+            if let Some(user_font) = installed
+                .iter()
+                .find(|name| !name.starts_with('.') && !name.eq_ignore_ascii_case(&picked))
+                .cloned()
+            {
+                let mut prefs = preferences(cx).clone();
+                prefs.typography.families[FontRole::Interface as usize] = user_font.clone();
+                set_preferences(prefs, cx);
+                assert_eq!(font_family(FontRole::Interface, cx).as_ref(), user_font.as_str());
+            }
+
             preview(None, cx);
         });
     }

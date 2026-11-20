@@ -13,8 +13,9 @@ use t3_core::thread_actions::{archive_confirmation, unpin_confirmation};
 
 use crate::app_state::AppState;
 use crate::theme::{
-    ThemeSlot, ThemeSlotExt, WHITE, hsla, palette, refine_slot_active, refine_slot_hover,
-    slot_border_color, slot_has_active, slot_has_background, theme_slot_background_layer,
+    SlotState, ThemeSlot, ThemeSlotExt, WHITE, hsla, palette, refine_slot_active,
+    refine_slot_hover, slot_border_color, slot_has_active, slot_has_background,
+    theme_slot_state_background_layer,
 };
 
 struct Host(WeakEntity<ConfirmDialog>);
@@ -428,7 +429,7 @@ impl Render for ConfirmDialog {
                         .when(has_custom_bg, |this| {
                             this.bg(hsla(p.dialog_surface)).border_1().border_color(backdrop_border)
                         })
-                        .children(theme_slot_background_layer(ThemeSlot::DialogPopup, cx))
+                        .children(theme_slot_state_background_layer(ThemeSlot::DialogPopup, SlotState::Base, px(16.), cx))
                         .shadow(vec![BoxShadow {
                             color: gpui_hsla(0., 0., 0., 0.65),
                             offset: point(px(0.), px(24.)),

@@ -38,8 +38,8 @@ use crate::dialog::ConfirmDialog;
 use crate::snooze_dialog::SnoozeDialog;
 use crate::icons::Icon;
 use crate::theme::{
-    ThemeSlot, ThemeSlotInteractiveExt as _, hsla, palette, slot_style,
-    theme_slot_background_layer,
+    SlotState, ThemeSlot, ThemeSlotInteractiveExt as _, hsla, palette, slot_has_floating_inset,
+    slot_style, theme_slot_state_background_layer,
 };
 use crate::workspace::TITLEBAR_HEIGHT;
 use controller::now_ms;
@@ -1808,12 +1808,16 @@ impl Render for SidebarPane {
         let hover_overlay = self.hover.overlay(suppressed, &active_list);
         let sidebar_overrides_bg =
             slot_style(ThemeSlot::Sidebar, cx).is_some_and(|set| set.base.background.is_some());
-        div()
+        let inner_floating = slot_has_floating_inset(ThemeSlot::SidebarInner, cx);
+        let inner_bg_layer =
+            theme_slot_state_background_layer(ThemeSlot::SidebarInner, SlotState::Base, px(0.), cx);
+        let inner = div()
             .id("sidebar-folder-drop")
             .debug_selector(|| "sidebar-folder-drop".into())
             .relative()
             .overflow_hidden()
-            .size_full()
+            .when(inner_floating, |this| this.flex_1().min_w_0().min_h_0())
+            .when(!inner_floating, |this| this.size_full())
             .flex()
             .flex_col()
             .when(!sidebar_overrides_bg, |this| this.bg(hsla(p.sidebar)))
@@ -1847,7 +1851,7 @@ impl Render for SidebarPane {
                 this.finish_sweep(false, cx);
                 this.finish_project_drag(false, cx);
             }))
-            .children(theme_slot_background_layer(ThemeSlot::SidebarInner, cx))
+            .children(inner_bg_layer)
             .child(self.hover.begin_frame_probe())
             .child(self.render_header(cx))
             .child(self.render_search(cx))
@@ -1879,7 +1883,12 @@ impl Render for SidebarPane {
                         .child(Icon::FolderPlus.sized(px(20.)).text_color(hsla(p.sidebar_muted_foreground)))
                         .child(crate::i18n::t(cx, "Drop folders to add projects")),
                 )
-            })
+            });
+        if inner_floating {
+            div().size_full().flex().flex_col().child(inner).into_any_element()
+        } else {
+            inner.into_any_element()
+        }
     }
 }
 
