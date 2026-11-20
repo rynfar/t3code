@@ -691,3 +691,88 @@ fn browser_default_viewport_zoom_appearance_and_profiles_round_trip_and_validate
     assert_eq!(invalid.browser_default_profile_id(), DEFAULT_BROWSER_PROFILE_ID);
     assert_eq!(invalid.entries()["futureSetting"], 7);
 }
+
+#[test]
+fn snapshot_settings_defaults_round_trip_and_invalid_fallbacks() {
+    use crate::keybindings::parse_keybinding_shortcut;
+    use crate::settings::snapshot::{
+        SnapShotModifier, SnapShotShortcut, SnapShotSound, SnapShotSoundSelection,
+    };
+
+    let mut doc = ClientSettingsDoc::from_json(r#"{"futureSetting": "keep"}"#);
+    assert!(!doc.snap_shot_enabled());
+    assert!(doc.snap_shot_include_accessibility());
+    assert_eq!(doc.snap_shot_shortcut(), SnapShotShortcut::BothShiftKeys);
+    assert!(doc.snap_shot_play_sound());
+    assert_eq!(doc.snap_shot_sound(), SnapShotSound::SoftPop);
+    assert_eq!(
+        doc.snap_shot_sound_selection(),
+        SnapShotSoundSelection::Sound(SnapShotSound::SoftPop)
+    );
+    assert!(doc.snap_shot_flash());
+    assert!(doc.snap_shot_animations());
+
+    assert!(!doc.apply_change(&ClientSettingChange::SnapShotEnabled(true)).is_empty());
+    assert!(doc.apply_change(&ClientSettingChange::SnapShotEnabled(true)).is_empty());
+    assert!(doc.snap_shot_enabled());
+
+    assert!(!doc.apply_change(&ClientSettingChange::SnapShotIncludeAccessibility(false)).is_empty());
+    assert!(!doc.snap_shot_include_accessibility());
+
+    let meta_pair = SnapShotShortcut::ModifierPair(SnapShotModifier::Meta);
+    assert!(!doc.apply_change(&ClientSettingChange::SnapShotShortcut(meta_pair.clone())).is_empty());
+    assert_eq!(doc.snap_shot_shortcut(), meta_pair);
+    assert_eq!(
+        doc.entries()["snapShotShortcut"],
+        serde_json::json!({"kind": "modifier-pair", "modifier": "meta"})
+    );
+
+    let chord = SnapShotShortcut::KeyChord(parse_keybinding_shortcut("mod+shift+2").unwrap());
+    assert!(!doc.apply_change(&ClientSettingChange::SnapShotShortcut(chord.clone())).is_empty());
+    assert_eq!(doc.snap_shot_shortcut(), chord);
+
+    let off_patch = doc.apply_change(&ClientSettingChange::SnapShotSoundSelection(
+        SnapShotSoundSelection::Off,
+    ));
+    assert_eq!(off_patch.get("snapShotPlaySound"), Some(&serde_json::json!(false)));
+    assert!(!off_patch.contains_key("snapShotSound"));
+    assert!(!doc.snap_shot_play_sound());
+    assert_eq!(doc.snap_shot_sound_selection(), SnapShotSoundSelection::Off);
+
+    let shutter_patch = doc.apply_change(&ClientSettingChange::SnapShotSoundSelection(
+        SnapShotSoundSelection::Sound(SnapShotSound::CameraShutter),
+    ));
+    assert_eq!(shutter_patch.get("snapShotPlaySound"), Some(&serde_json::json!(true)));
+    assert_eq!(shutter_patch.get("snapShotSound"), Some(&serde_json::json!("camera-shutter")));
+    assert!(doc.snap_shot_play_sound());
+    assert_eq!(doc.snap_shot_sound(), SnapShotSound::CameraShutter);
+    assert_eq!(
+        doc.snap_shot_sound_selection(),
+        SnapShotSoundSelection::Sound(SnapShotSound::CameraShutter)
+    );
+
+    assert!(!doc.apply_change(&ClientSettingChange::SnapShotFlash(false)).is_empty());
+    assert!(!doc.apply_change(&ClientSettingChange::SnapShotAnimations(false)).is_empty());
+
+    let reread = ClientSettingsDoc::from_json(&doc.to_json());
+    assert_eq!(reread, doc);
+    assert!(reread.snap_shot_enabled());
+    assert!(!reread.snap_shot_include_accessibility());
+    assert_eq!(reread.snap_shot_shortcut(), chord);
+    assert_eq!(reread.snap_shot_sound(), SnapShotSound::CameraShutter);
+    assert!(!reread.snap_shot_flash());
+    assert!(!reread.snap_shot_animations());
+    assert_eq!(reread.entries()["futureSetting"], "keep");
+
+    // Invalid values fall back per key to contract defaults.
+    let invalid = ClientSettingsDoc::from_json(
+        r#"{"snapShotEnabled":"yes","snapShotIncludeAccessibility":0,"snapShotShortcut":{"kind":"unknown"},"snapShotPlaySound":"nope","snapShotSound":"laser","snapShotFlash":1,"snapShotAnimations":"off"}"#,
+    );
+    assert!(!invalid.snap_shot_enabled());
+    assert!(invalid.snap_shot_include_accessibility());
+    assert_eq!(invalid.snap_shot_shortcut(), SnapShotShortcut::BothShiftKeys);
+    assert!(invalid.snap_shot_play_sound());
+    assert_eq!(invalid.snap_shot_sound(), SnapShotSound::SoftPop);
+    assert!(invalid.snap_shot_flash());
+    assert!(invalid.snap_shot_animations());
+}

@@ -43,6 +43,7 @@ mod settings;
 mod side_chat;
 #[cfg(feature = "snapshot")]
 mod snapshot;
+mod snapshot_capture;
 mod sidebar;
 mod lineage;
 mod snooze_dialog;
@@ -90,6 +91,7 @@ fn main() {
 
     #[cfg(feature = "snapshot")]
     if let Some(options) = snapshot::Options::from_args() {
+        snapshot_capture::set_snapshot_mode(true);
         snapshot::run(options, handle);
         return;
     }

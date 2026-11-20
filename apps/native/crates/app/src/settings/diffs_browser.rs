@@ -1,8 +1,8 @@
 //! `DiffsSettingsPanel` / `DiffColorsSettingsRow` (`SettingsPanels.tsx`), `BrowserSettingsPanel`
 //! (`IntegrationsSettings.tsx`, with `BrowserImportWizard.tsx`) and `SnapShotSettings.tsx`.
 //! Server-streamed preview defaults (profiles, viewport, zoom, appearance, link target, search
-//! engine, agent access) are live; Electron desktop cookie import, floating preview, WebView
-//! recordings, and SnapShots window capture remain Electron-only N/A.
+//! engine, agent access) and macOS native SnapShots capture are live; Electron desktop cookie
+//! import, floating preview, and WebView recordings remain Electron-only N/A.
 
 use std::collections::HashMap;
 
@@ -25,6 +25,12 @@ use t3_core::preview::viewport::{
 };
 use t3_core::preview::{DEFAULT_ZOOM, ZOOM_LEVELS, method as preview_method};
 use t3_core::settings::ServerSettingChange;
+use t3_core::settings::snapshot::{
+    SnapShotBackendState, SnapShotMode, SnapShotModifier, SnapShotShortcut, SnapShotSound,
+    SnapShotSoundSelection, same_snap_shot_shortcut, snap_shot_description,
+    snap_shot_setup_button_label, snap_shot_setup_complete, snap_shot_shortcut_status,
+    snap_shot_status,
+};
 
 use super::controls::{
     Button, ButtonSize, ButtonVariant, Row, Select, SelectOption, Switch, muted_text, r, section,
@@ -33,16 +39,25 @@ use super::controls::{
 use super::{Block, SettingsView, store};
 use crate::app_state::AppState;
 use crate::icons::Icon;
+use crate::snapshot_capture::setup_dialog::{
+    render_shortcut_keycaps, shortcut_conflict_message, shortcut_from_keystroke,
+};
 use crate::theme::{hsla, palette};
 use crate::toast::{Toast, ToastKind};
 
+const MAC: bool = cfg!(target_os = "macos");
 const BROWSER_ELECTRON_ONLY: &str = "Only available in the desktop app.";
-const SNAPSHOTS_UNAVAILABLE: &str = "SnapShots capture requires the Electron desktop app. The native client doesn't have window capture or global capture shortcuts yet.";
 const ADVANCED: &[&str] = &[
     "browser-default-viewport",
     "browser-default-zoom",
     "browser-default-appearance",
 ];
+
+#[derive(Default)]
+struct SnapShotPageState {
+    candidate: Option<SnapShotShortcut>,
+    recording: bool,
+}
 
 pub(super) struct BrowserState {
     pub(super) custom_url: Entity<InputState>,
@@ -50,6 +65,7 @@ pub(super) struct BrowserState {
     viewport_height: Entity<InputState>,
     profile_inputs: HashMap<String, (Entity<InputState>, Subscription)>,
     advanced: bool,
+    snapshot: SnapShotPageState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -82,13 +98,73 @@ impl BrowserState {
                     view.commit_browser_viewport_dimensions(window, cx);
                 }
             });
+        let view = cx.entity().downgrade();
+        let snap_key_sub = cx.intercept_keystrokes(move |event, _, cx| {
+            let _ = view.update(cx, |view, cx| {
+                if !view.browser.snapshot.recording {
+                    return;
+                }
+                let setup_open = crate::snapshot_capture::active_setup_dialog(cx)
+                    .is_some_and(|dialog| dialog.read(cx).is_open());
+                if view.section != t3_core::settings::search::Section::SnapShot || setup_open {
+                    view.stop_snapshot_recording(cx);
+                    return;
+                }
+                if event.keystroke.key == "tab" {
+                    return;
+                }
+                cx.stop_propagation();
+                if event.keystroke.key == "escape" {
+                    view.stop_snapshot_recording(cx);
+                    return;
+                }
+                if let Some(shortcut) = shortcut_from_keystroke(&event.keystroke, cx) {
+                    view.browser.snapshot.candidate = Some(shortcut);
+                    view.stop_snapshot_recording(cx);
+                }
+            });
+        });
+        let self_sub = cx.observe_self(|view, cx| {
+            if view.browser.snapshot.recording
+                && view.section != t3_core::settings::search::Section::SnapShot
+            {
+                view.stop_snapshot_recording(cx);
+            }
+        });
+        let release_sub = cx.on_release(|view: &mut SettingsView, cx| {
+            if view.browser.snapshot.recording {
+                view.browser.snapshot.recording = false;
+                if let Some(coordinator) = crate::snapshot_capture::active_coordinator(cx) {
+                    coordinator.update(cx, |c, cx| c.set_shortcut_suppressed(false, cx));
+                }
+            }
+        });
+        let mut subscriptions = vec![url_sub, width_sub, height_sub, snap_key_sub, self_sub, release_sub];
+        if let Some(coordinator) = crate::snapshot_capture::active_coordinator(cx) {
+            subscriptions.push(cx.observe(&coordinator, |view, _, cx| {
+                if view.section == t3_core::settings::search::Section::SnapShot {
+                    cx.notify();
+                }
+            }));
+        }
+        if let Some(dialog) = crate::snapshot_capture::active_setup_dialog(cx) {
+            subscriptions.push(cx.observe(&dialog, |view, dialog, cx| {
+                if dialog.read(cx).is_open() && view.browser.snapshot.recording {
+                    view.stop_snapshot_recording(cx);
+                }
+                if view.section == t3_core::settings::search::Section::SnapShot {
+                    cx.notify();
+                }
+            }));
+        }
         Self {
             custom_url,
             viewport_width,
             viewport_height,
             profile_inputs: HashMap::new(),
             advanced: false,
-            _subscriptions: vec![url_sub, width_sub, height_sub],
+            snapshot: SnapShotPageState::default(),
+            _subscriptions: subscriptions,
         }
     }
 }
@@ -1034,31 +1110,458 @@ impl SettingsView {
         ]
     }
 
+    fn start_snapshot_recording(&mut self, cx: &mut Context<Self>) {
+        self.browser.snapshot.recording = true;
+        if let Some(coordinator) = crate::snapshot_capture::active_coordinator(cx) {
+            coordinator.update(cx, |c, cx| c.set_shortcut_suppressed(true, cx));
+        }
+        cx.notify();
+    }
+
+    fn stop_snapshot_recording(&mut self, cx: &mut Context<Self>) {
+        if !self.browser.snapshot.recording {
+            return;
+        }
+        self.browser.snapshot.recording = false;
+        if let Some(coordinator) = crate::snapshot_capture::active_coordinator(cx) {
+            coordinator.update(cx, |c, cx| c.set_shortcut_suppressed(false, cx));
+        }
+        cx.notify();
+    }
+
+    fn snapshot_backend_state(&self, cx: &App) -> SnapShotBackendState {
+        if let Some(coordinator) = crate::snapshot_capture::active_coordinator(cx) {
+            return coordinator.read(cx).backend_state().clone();
+        }
+        let doc = store::client(cx);
+        let plat = crate::snapshot_capture::platform(cx);
+        if !plat.is_supported() {
+            return SnapShotBackendState::unsupported(doc.snap_shot_shortcut());
+        }
+        if let Some(perms) = plat.mac_permissions() {
+            SnapShotBackendState::macos(
+                doc.snap_shot_shortcut(),
+                perms,
+                doc.snap_shot_include_accessibility(),
+                doc.snap_shot_enabled() && perms.screen_recording,
+                false,
+            )
+        } else {
+            SnapShotBackendState::unsupported(doc.snap_shot_shortcut())
+        }
+    }
+
     pub(super) fn snapshots_page(&mut self, cx: &mut Context<Self>) -> Vec<Block> {
-        vec![Block::new(
-            &["snap-shot", "snap-shot-enabled"],
-            section(
-                "SnapShots",
-                vec![
-                    unavailable_group(
-                        SNAPSHOTS_UNAVAILABLE,
-                        vec![
-                            Row::new("snap-shot-enabled", "SnapShots")
-                                .description(
-                                    "Capture a window and attach it to your current draft.",
-                                )
-                                .highlighted(self.is_target("snap-shot-enabled"))
-                                .control(
-                                    Switch::new("snap-shot-enabled-switch", false).disabled(true),
-                                )
-                                .into_any_element(),
-                        ],
+        let doc = store::client(cx).clone();
+        let state = self.state.clone();
+        let backend = self.snapshot_backend_state(cx);
+        let capture_available = backend.mode != SnapShotMode::Unavailable;
+        let enabled = doc.snap_shot_enabled();
+
+        if !capture_available {
+            return vec![Block::new(
+                &[
+                    "snap-shot",
+                    "snap-shot-enabled",
+                    "snap-shot-accessibility",
+                    "snap-shot-shortcut",
+                    "snap-shot-sound",
+                    "snap-shot-flash",
+                    "snap-shot-animations",
+                ],
+                section(
+                    "SnapShots",
+                    vec![
+                        unavailable_group(
+                            "Not supported on this platform.",
+                            vec![
+                                Row::new("snap-shot-enabled", "SnapShots")
+                                    .description(snap_shot_description(Some(&backend)))
+                                    .highlighted(self.is_target("snap-shot-enabled"))
+                                    .control(
+                                        Switch::new("snap-shot-enabled-switch", false)
+                                            .disabled(true),
+                                    )
+                                    .into_any_element(),
+                            ],
+                            cx,
+                        )
+                        .into_any_element(),
+                    ],
+                    cx,
+                ),
+            )];
+        }
+
+        let include_ax = doc.snap_shot_include_accessibility();
+        let setup_complete = snap_shot_setup_complete(Some(&backend), include_ax);
+        let status_text = snap_shot_status(Some(&backend), enabled);
+        let switch_state = state.clone();
+        let setup_btn_label = snap_shot_setup_button_label(Some(&backend));
+
+        let mut enable_controls = h_flex().items_center().gap(r(8.));
+        let weak_setup_btn = cx.entity().downgrade();
+        let weak_switch_setup = cx.entity().downgrade();
+        if enabled {
+            enable_controls = enable_controls.child(
+                Button::new("snap-shot-setup-btn", ButtonVariant::Outline, ButtonSize::Xs)
+                    .label(setup_btn_label)
+                    .on_click(move |_, _, cx| {
+                        let _ = weak_setup_btn.update(cx, |view, cx| {
+                            view.stop_snapshot_recording(cx);
+                        });
+                        if let Some(dialog) = crate::snapshot_capture::active_setup_dialog(cx) {
+                            dialog.update(cx, |d, cx| d.open(None, cx));
+                        }
+                    }),
+            );
+        }
+        enable_controls = enable_controls.child(
+            Switch::new("snap-shot-enabled-switch", enabled).on_change(move |checked, _, cx| {
+                if !checked {
+                    let _ = weak_switch_setup.update(cx, |view, cx| {
+                        view.stop_snapshot_recording(cx);
+                    });
+                    store::update_client(
+                        &switch_state,
+                        ClientSettingChange::SnapShotEnabled(false),
                         cx,
+                    );
+                } else if !setup_complete
+                    && let Some(dialog) = crate::snapshot_capture::active_setup_dialog(cx)
+                {
+                    let _ = weak_switch_setup.update(cx, |view, cx| {
+                        view.stop_snapshot_recording(cx);
+                    });
+                    dialog.update(cx, |d, cx| d.open(None, cx));
+                } else {
+                    store::update_client(
+                        &switch_state,
+                        ClientSettingChange::SnapShotEnabled(true),
+                        cx,
+                    );
+                }
+            }),
+        );
+
+        let mut rows: Vec<gpui::AnyElement> = vec![
+            Row::new("snap-shot-enabled", "SnapShots")
+                .description(snap_shot_description(Some(&backend)))
+                .status(status_text)
+                .highlighted(self.is_target("snap-shot-enabled"))
+                .control(enable_controls)
+                .into_any_element(),
+        ];
+
+        if enabled {
+            let ax_state = state.clone();
+            rows.push(
+                Row::new("snap-shot-accessibility", "Include app text")
+                    .description("Include text and controls when the app makes them available.")
+                    .highlighted(self.is_target("snap-shot-accessibility"))
+                    .reset(
+                        !include_ax,
+                        reset(&state, ClientSettingChange::SnapShotIncludeAccessibility(true)),
+                    )
+                    .control(
+                        Switch::new("snap-shot-accessibility-switch", include_ax).on_change(
+                            move |on, _, cx| {
+                                store::update_client(
+                                    &ax_state,
+                                    ClientSettingChange::SnapShotIncludeAccessibility(on),
+                                    cx,
+                                );
+                                if let Some(coordinator) =
+                                    crate::snapshot_capture::active_coordinator(cx)
+                                {
+                                    coordinator.update(cx, |c, cx| {
+                                        c.refresh_state(cx);
+                                    });
+                                }
+                            },
+                        ),
                     )
                     .into_any_element(),
-                ],
-                cx,
-            ),
+            );
+
+            let saved_shortcut = doc.snap_shot_shortcut();
+            let candidate = self
+                .browser
+                .snapshot
+                .candidate
+                .clone()
+                .unwrap_or_else(|| saved_shortcut.clone());
+            let shortcut_changed = !same_snap_shot_shortcut(&candidate, &saved_shortcut, MAC);
+            let recording = self.browser.snapshot.recording;
+            let conflict = shortcut_changed
+                .then(|| shortcut_conflict_message(&candidate, &self.state, cx))
+                .flatten();
+            let can_save_shortcut = shortcut_changed && conflict.is_none();
+
+            let shortcut_status = if recording {
+                Some("Press your shortcut. Esc cancels.".to_owned())
+            } else if let Some(conflict_msg) = conflict {
+                Some(conflict_msg)
+            } else if shortcut_changed {
+                Some("Ready to save.".to_owned())
+            } else {
+                snap_shot_shortcut_status(Some(&backend))
+            };
+
+            let weak_record = cx.entity().downgrade();
+            let weak_save = cx.entity().downgrade();
+            let weak_cancel = cx.entity().downgrade();
+            let weak_reset = cx.entity().downgrade();
+            let reset_shortcut_state = state.clone();
+            let save_shortcut_state = state.clone();
+            let save_candidate = candidate.clone();
+            let p = palette(cx);
+
+            let recorder_trigger = div()
+                .id("snap-shot-shortcut-recorder")
+                .px(r(8.))
+                .py(r(4.))
+                .rounded(r(6.))
+                .border_1()
+                .border_color(if recording {
+                    hsla(p.ring)
+                } else {
+                    hsla(p.input)
+                })
+                .bg(if recording {
+                    hsla(p.secondary)
+                } else {
+                    hsla(p.card)
+                })
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    let _ = weak_record.update(cx, |view, cx| {
+                        if view.browser.snapshot.recording {
+                            view.stop_snapshot_recording(cx);
+                        } else {
+                            view.start_snapshot_recording(cx);
+                        }
+                    });
+                })
+                .child(if recording {
+                    div()
+                        .text_xs()
+                        .text_color(hsla(p.muted_foreground))
+                        .child(crate::i18n::t(cx, "Press shortcut\u{2026}").to_owned())
+                        .into_any_element()
+                } else {
+                    render_shortcut_keycaps(&candidate, cx)
+                });
+
+            let mut shortcut_controls = h_flex().items_center().gap(r(6.)).child(recorder_trigger);
+            if shortcut_changed {
+                shortcut_controls = shortcut_controls
+                    .child(
+                        Button::new("snap-shot-shortcut-save", ButtonVariant::Default, ButtonSize::Xs)
+                            .label("Save")
+                            .disabled(!can_save_shortcut)
+                            .on_click(move |_, _, cx| {
+                                store::update_client(
+                                    &save_shortcut_state,
+                                    ClientSettingChange::SnapShotShortcut(save_candidate.clone()),
+                                    cx,
+                                );
+                                let _ = weak_save.update(cx, |view, cx| {
+                                    view.browser.snapshot.candidate = None;
+                                    view.stop_snapshot_recording(cx);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("snap-shot-shortcut-cancel", ButtonVariant::Ghost, ButtonSize::Xs)
+                            .label("Cancel")
+                            .on_click(move |_, _, cx| {
+                                let _ = weak_cancel.update(cx, |view, cx| {
+                                    view.browser.snapshot.candidate = None;
+                                    view.stop_snapshot_recording(cx);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+            } else {
+                shortcut_controls = shortcut_controls.child(
+                    Button::new("snap-shot-test-capture", ButtonVariant::Outline, ButtonSize::Xs)
+                        .label("Test capture")
+                        .on_click(|_, _, cx| {
+                            if let Some(coordinator) =
+                                crate::snapshot_capture::active_coordinator(cx)
+                            {
+                                coordinator.update(cx, |c, cx| c.capture_now(false, cx));
+                            }
+                        }),
+                );
+            }
+
+            let mut shortcut_row = Row::new("snap-shot-shortcut", "Capture shortcut")
+                .description("Capture the window you're using without switching apps.")
+                .highlighted(self.is_target("snap-shot-shortcut"))
+                .reset(
+                    !same_snap_shot_shortcut(&saved_shortcut, &SnapShotShortcut::BothShiftKeys, MAC),
+                    move |_, _, cx| {
+                        store::update_client(
+                            &reset_shortcut_state,
+                            ClientSettingChange::SnapShotShortcut(SnapShotShortcut::BothShiftKeys),
+                            cx,
+                        );
+                        let _ = weak_reset.update(cx, |view, cx| {
+                            view.browser.snapshot.candidate = None;
+                            view.stop_snapshot_recording(cx);
+                            cx.notify();
+                        });
+                    },
+                )
+                .control(shortcut_controls);
+            if let Some(status) = shortcut_status {
+                shortcut_row = shortcut_row.status(status);
+            }
+            if recording {
+                let presets = h_flex().flex_wrap().gap(r(6.)).pt(r(6.)).children(
+                    SnapShotModifier::ALL.iter().copied().map(|modifier| {
+                        let preset = SnapShotShortcut::from_modifier_pair(modifier);
+                        let weak_preset = cx.entity().downgrade();
+                        Button::new(
+                            SharedString::from(format!("snap-shot-preset-{}", modifier.as_str())),
+                            ButtonVariant::Outline,
+                            ButtonSize::Xs,
+                        )
+                        .label(modifier.pair_label(MAC))
+                        .on_click(move |_, _, cx| {
+                            let _ = weak_preset.update(cx, |view, cx| {
+                                view.browser.snapshot.candidate = Some(preset.clone());
+                                view.stop_snapshot_recording(cx);
+                                cx.notify();
+                            });
+                        })
+                    }),
+                );
+                shortcut_row = shortcut_row.below(presets);
+            }
+            rows.push(shortcut_row.into_any_element());
+
+            let sound_selection = doc.snap_shot_sound_selection();
+            let sound_state = state.clone();
+            let sound_select = Select::new(
+                "snap-shot-sound-select",
+                SnapShotSoundSelection::ALL
+                    .iter()
+                    .map(|opt| SelectOption::new(opt.as_str(), opt.label()))
+                    .collect(),
+            )
+            .selected(sound_selection.as_str())
+            .width(176.)
+            .show_check()
+            .on_change(move |next, _, cx| {
+                if let Some(selection) = SnapShotSoundSelection::parse(next.as_ref()) {
+                    store::update_client(
+                        &sound_state,
+                        ClientSettingChange::SnapShotSoundSelection(selection),
+                        cx,
+                    );
+                }
+            });
+            let preview_sound = match sound_selection {
+                SnapShotSoundSelection::Off => None,
+                SnapShotSoundSelection::Sound(sound) => Some(sound),
+            };
+            let sound_controls = h_flex()
+                .items_center()
+                .gap(r(6.))
+                .child(sound_select)
+                .child(
+                    Button::new("snap-shot-sound-preview", ButtonVariant::Outline, ButtonSize::IconSm)
+                        .icon(Icon::Play)
+                        .tooltip(match preview_sound {
+                            Some(SnapShotSound::SoftPop) => "Play Whoosh",
+                            Some(SnapShotSound::CameraShutter) => "Play Click",
+                            None => "Sound is off",
+                        })
+                        .disabled(preview_sound.is_none())
+                        .on_click(move |_, _, cx| {
+                            if let Some(sound) = preview_sound {
+                                crate::snapshot_capture::platform(cx).play_sound(sound);
+                            }
+                        }),
+                );
+            rows.push(
+                Row::new("snap-shot-sound", "Capture sound")
+                    .description("Choose the sound played when capture starts.")
+                    .highlighted(self.is_target("snap-shot-sound"))
+                    .reset(
+                        sound_selection != SnapShotSoundSelection::Sound(SnapShotSound::SoftPop),
+                        reset(
+                            &state,
+                            ClientSettingChange::SnapShotSoundSelection(
+                                SnapShotSoundSelection::Sound(SnapShotSound::SoftPop),
+                            ),
+                        ),
+                    )
+                    .control(sound_controls)
+                    .into_any_element(),
+            );
+
+            let flash_state = state.clone();
+            rows.push(
+                Row::new("snap-shot-flash", "Capture flash")
+                    .description("Show a gentle cue on the captured window.")
+                    .highlighted(self.is_target("snap-shot-flash"))
+                    .reset(
+                        !doc.snap_shot_flash(),
+                        reset(&state, ClientSettingChange::SnapShotFlash(true)),
+                    )
+                    .control(
+                        Switch::new("snap-shot-flash-switch", doc.snap_shot_flash()).on_change(
+                            move |on, _, cx| {
+                                store::update_client(
+                                    &flash_state,
+                                    ClientSettingChange::SnapShotFlash(on),
+                                    cx,
+                                );
+                            },
+                        ),
+                    )
+                    .into_any_element(),
+            );
+
+            let anim_state = state.clone();
+            rows.push(
+                Row::new("snap-shot-animations", "Capture animations")
+                    .description("Animate captured windows into your draft.")
+                    .highlighted(self.is_target("snap-shot-animations"))
+                    .reset(
+                        !doc.snap_shot_animations(),
+                        reset(&state, ClientSettingChange::SnapShotAnimations(true)),
+                    )
+                    .control(
+                        Switch::new("snap-shot-animations-switch", doc.snap_shot_animations())
+                            .on_change(move |on, _, cx| {
+                                store::update_client(
+                                    &anim_state,
+                                    ClientSettingChange::SnapShotAnimations(on),
+                                    cx,
+                                );
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        vec![Block::new(
+            &[
+                "snap-shot",
+                "snap-shot-enabled",
+                "snap-shot-accessibility",
+                "snap-shot-shortcut",
+                "snap-shot-sound",
+                "snap-shot-flash",
+                "snap-shot-animations",
+            ],
+            section("SnapShots", rows, cx),
         )]
     }
 }
@@ -1115,7 +1618,7 @@ mod tests {
 
 #[cfg(all(test, feature = "snapshot"))]
 mod gpui_tests {
-    use gpui::{Context, IntoElement, ParentElement, Render, Window};
+    use gpui::{AppContext, Context, IntoElement, ParentElement, Render, Window};
     use serde_json::json;
     use t3_core::client_settings::ClientSettingChange;
     use t3_core::preview::viewport::{
@@ -1203,6 +1706,183 @@ mod gpui_tests {
             assert_eq!(defaults.appearance, AppearancePreference::Dark);
             assert_eq!(defaults.profile_id, "work");
         });
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn snapshots_settings_page_renders_live_controls_and_unsupported_fallback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::Arc;
+        use t3_core::settings::snapshot::{SnapShotSound, SnapShotSoundSelection};
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mock = Arc::new(crate::snapshot_capture::MockSnapShotPlatform::macos_ready());
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::snapshot_capture::install_platform(mock.clone(), cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            let mut scratch = t3_core::client_settings::ClientSettingsDoc::default();
+            let mut patch = serde_json::Map::new();
+            for change in [
+                ClientSettingChange::SnapShotEnabled(true),
+                ClientSettingChange::SnapShotSoundSelection(SnapShotSoundSelection::Sound(
+                    SnapShotSound::CameraShutter,
+                )),
+                ClientSettingChange::SnapShotFlash(false),
+                ClientSettingChange::SnapShotAnimations(false),
+                ClientSettingChange::SnapShotIncludeAccessibility(false),
+            ] {
+                patch.extend(scratch.apply_change(&change));
+            }
+            crate::settings::store::install_committed_client(&state, patch, cx);
+        });
+
+        let window = cx.add_window(|_, _| SettingsFrame);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| {
+            crate::settings::open_at(Section::SnapShot, Some("snap-shot-enabled".to_owned()), cx)
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        vcx.read(|cx| {
+            let doc = crate::settings::store::client(cx);
+            assert!(doc.snap_shot_enabled());
+            assert_eq!(
+                doc.snap_shot_sound_selection(),
+                SnapShotSoundSelection::Sound(SnapShotSound::CameraShutter)
+            );
+            assert!(!doc.snap_shot_flash());
+            assert!(!doc.snap_shot_animations());
+            assert!(!doc.snap_shot_include_accessibility());
+        });
+
+        // Verify unsupported fallback renders cleanly too.
+        mock.supported.store(false, std::sync::atomic::Ordering::SeqCst);
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        state.update(&mut vcx, |state, _| state.stop_pump());
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn snapshot_recorder_clears_suppression_on_section_switch_setup_open_and_settings_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mock = Arc::new(crate::snapshot_capture::MockSnapShotPlatform::macos_ready());
+        let (state, _fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::snapshot_capture::install_platform(mock.clone(), cx);
+            crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone())
+        });
+        cx.update(|cx| {
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            crate::settings::init(state.clone(), cx);
+            crate::updates::init(cx);
+            let mut scratch = t3_core::client_settings::ClientSettingsDoc::default();
+            let patch = scratch.apply_change(&ClientSettingChange::SnapShotEnabled(true));
+            crate::settings::store::install_committed_client(&state, patch, cx);
+        });
+
+        let state_for_win = state.clone();
+        let window = cx.add_window(|window, cx| {
+            let composer = cx.new(|cx| crate::composer::Composer::new(state_for_win.clone(), window, cx));
+            let coordinator = cx.new(|cx| {
+                crate::snapshot_capture::SnapShotCoordinator::new(
+                    state_for_win.clone(),
+                    composer,
+                    window,
+                    cx,
+                )
+            });
+            let setup_dialog = cx.new(|cx| {
+                crate::snapshot_capture::SnapShotSetupDialog::new(
+                    state_for_win.clone(),
+                    coordinator.clone(),
+                    window,
+                    cx,
+                )
+            });
+            crate::snapshot_capture::register_workspace_handles(coordinator, setup_dialog, cx);
+            SettingsFrame
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|_, cx| crate::settings::open_at(Section::SnapShot, None, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        assert!(!mock.active_listener_stopped.load(Ordering::SeqCst));
+
+        // 1. Start recording on SnapShot section -> global shortcut suppressed.
+        let settings_view = vcx.read(|cx| cx.global::<super::super::Host>().view.clone().expect("settings view"));
+        vcx.update(|_, cx| {
+            settings_view.update(cx, |view, cx| view.start_snapshot_recording(cx));
+        });
+        assert!(mock.active_listener_stopped.load(Ordering::SeqCst));
+
+        // 2. Switching to another section stops recording and restores the global shortcut.
+        vcx.update(|_, cx| {
+            settings_view.update(cx, |view, cx| view.navigate(Section::Diffs, None, cx));
+        });
+        vcx.run_until_parked();
+        assert!(!settings_view.read_with(&vcx, |view, _| view.browser.snapshot.recording));
+        assert!(!mock.active_listener_stopped.load(Ordering::SeqCst));
+
+        // 3. Opening SnapShotSetupDialog while recording stops Settings recording.
+        vcx.update(|_, cx| {
+            settings_view.update(cx, |view, cx| {
+                view.navigate(Section::SnapShot, None, cx);
+                view.start_snapshot_recording(cx);
+            });
+        });
+        assert!(mock.active_listener_stopped.load(Ordering::SeqCst));
+        vcx.update(|_, cx| {
+            let dialog = crate::snapshot_capture::active_setup_dialog(cx).expect("setup dialog");
+            dialog.update(cx, |d, cx| d.open(None, cx));
+        });
+        vcx.run_until_parked();
+        assert!(!settings_view.read_with(&vcx, |view, _| view.browser.snapshot.recording));
+        assert!(!mock.active_listener_stopped.load(Ordering::SeqCst));
+
+        // 4. Closing Settings while recording triggers `on_release` and restores the global shortcut.
+        vcx.update(|_, cx| {
+            let dialog = crate::snapshot_capture::active_setup_dialog(cx).expect("setup dialog");
+            dialog.update(cx, |d, cx| d.close(false, cx));
+            settings_view.update(cx, |view, cx| view.start_snapshot_recording(cx));
+        });
+        assert!(mock.active_listener_stopped.load(Ordering::SeqCst));
+        drop(settings_view);
+        vcx.update(|window, cx| {
+            super::super::finish_close(window, cx);
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+        assert!(!mock.active_listener_stopped.load(Ordering::SeqCst));
 
         state.update(&mut vcx, |state, _| state.stop_pump());
         vcx.run_until_parked();

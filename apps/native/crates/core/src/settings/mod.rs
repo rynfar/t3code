@@ -17,6 +17,7 @@ pub mod search;
 pub mod scheduled_tasks;
 pub mod secrets;
 pub mod shared;
+pub mod snapshot;
 pub mod snooze;
 pub mod source_control;
 pub mod voice;

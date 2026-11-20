@@ -457,6 +457,14 @@ pub enum ClientSettingChange {
     ProactivePanelsEnabled(bool),
     ScreenReaderAnnouncements(ScreenReaderAnnouncements),
     ScreenReaderWindowTitle(bool),
+    SnapShotEnabled(bool),
+    SnapShotIncludeAccessibility(bool),
+    SnapShotShortcut(crate::settings::snapshot::SnapShotShortcut),
+    SnapShotPlaySound(bool),
+    SnapShotSound(crate::settings::snapshot::SnapShotSound),
+    SnapShotSoundSelection(crate::settings::snapshot::SnapShotSoundSelection),
+    SnapShotFlash(bool),
+    SnapShotAnimations(bool),
 }
 
 impl ClientSettingChange {
@@ -602,6 +610,20 @@ impl ClientSettingChange {
                 text(screen_reader_announcements_value(*mode)),
             ),
             ClientSettingChange::ScreenReaderWindowTitle(on) => ("screenReaderWindowTitle", Value::Bool(*on)),
+            ClientSettingChange::SnapShotEnabled(on) => ("snapShotEnabled", Value::Bool(*on)),
+            ClientSettingChange::SnapShotIncludeAccessibility(on) => {
+                ("snapShotIncludeAccessibility", Value::Bool(*on))
+            }
+            ClientSettingChange::SnapShotShortcut(shortcut) => {
+                ("snapShotShortcut", shortcut.to_value())
+            }
+            ClientSettingChange::SnapShotPlaySound(on) => ("snapShotPlaySound", Value::Bool(*on)),
+            ClientSettingChange::SnapShotSound(sound) => ("snapShotSound", text(sound.as_str())),
+            ClientSettingChange::SnapShotSoundSelection(_) => {
+                unreachable!("snapshot sound selection applies atomically")
+            }
+            ClientSettingChange::SnapShotFlash(on) => ("snapShotFlash", Value::Bool(*on)),
+            ClientSettingChange::SnapShotAnimations(on) => ("snapShotAnimations", Value::Bool(*on)),
         }
     }
 }
@@ -685,6 +707,22 @@ impl ClientSettingsDoc {
         if let ClientSettingChange::ThemePatch(patch) = change {
             let patch: Map<String, Value> = patch.iter().filter(|(k,v)|self.entries.get(*k)!=Some(*v)).map(|(k,v)|(k.clone(),v.clone())).collect();
             self.entries.extend(patch.clone()); return patch;
+        }
+        if let ClientSettingChange::SnapShotSoundSelection(selection) = change {
+            let sound_patch = crate::settings::snapshot::snap_shot_sound_patch(*selection);
+            let mut patch = Map::new();
+            let play_val = Value::Bool(sound_patch.play_sound);
+            if self.entries.get("snapShotPlaySound") != Some(&play_val) {
+                patch.insert("snapShotPlaySound".to_owned(), play_val);
+            }
+            if let Some(sound) = sound_patch.sound {
+                let sound_val = Value::String(sound.as_str().to_owned());
+                if self.entries.get("snapShotSound") != Some(&sound_val) {
+                    patch.insert("snapShotSound".to_owned(), sound_val);
+                }
+            }
+            self.entries.extend(patch.clone());
+            return patch;
         }
         let mut patch = Map::new();
         let (key, value) = change.entry();
@@ -1107,6 +1145,52 @@ impl ClientSettingsDoc {
     /// Lead window title with thread status for screen readers (`screenReaderWindowTitle`, default `false`).
     pub fn screen_reader_window_title(&self) -> bool {
         crate::announcements::screen_reader_window_title_setting(&self.entries)
+    }
+
+    /// `snapShotEnabled` (`packages/contracts/src/settings.ts`, default `false`).
+    pub fn snap_shot_enabled(&self) -> bool {
+        self.flag("snapShotEnabled", false)
+    }
+
+    /// `snapShotIncludeAccessibility` (`packages/contracts/src/settings.ts`, default `true`).
+    pub fn snap_shot_include_accessibility(&self) -> bool {
+        self.flag("snapShotIncludeAccessibility", true)
+    }
+
+    /// `snapShotShortcut` (`packages/contracts/src/settings.ts`, default `{ kind: "both-shift-keys" }`).
+    pub fn snap_shot_shortcut(&self) -> crate::settings::snapshot::SnapShotShortcut {
+        self.entries
+            .get("snapShotShortcut")
+            .and_then(crate::settings::snapshot::SnapShotShortcut::from_value)
+            .unwrap_or_default()
+    }
+
+    /// `snapShotPlaySound` (`packages/contracts/src/settings.ts`, default `true`).
+    pub fn snap_shot_play_sound(&self) -> bool {
+        self.flag("snapShotPlaySound", true)
+    }
+
+    /// `snapShotSound` (`packages/contracts/src/settings.ts`, default `"soft-pop"`).
+    pub fn snap_shot_sound(&self) -> crate::settings::snapshot::SnapShotSound {
+        self.literal("snapShotSound", crate::settings::snapshot::SnapShotSound::parse)
+    }
+
+    /// Combined `SnapShotSoundSelection` (`"off"` | `"soft-pop"` | `"camera-shutter"`).
+    pub fn snap_shot_sound_selection(&self) -> crate::settings::snapshot::SnapShotSoundSelection {
+        crate::settings::snapshot::SnapShotSoundSelection::from_settings(
+            self.snap_shot_play_sound(),
+            self.snap_shot_sound(),
+        )
+    }
+
+    /// `snapShotFlash` (`packages/contracts/src/settings.ts`, default `true`).
+    pub fn snap_shot_flash(&self) -> bool {
+        self.flag("snapShotFlash", true)
+    }
+
+    /// `snapShotAnimations` (`packages/contracts/src/settings.ts`, default `true`).
+    pub fn snap_shot_animations(&self) -> bool {
+        self.flag("snapShotAnimations", true)
     }
 }
 
