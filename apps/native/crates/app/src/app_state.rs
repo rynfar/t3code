@@ -23,6 +23,8 @@ use t3_core::workflows::{self, StopTarget};
 use crate::environments::ConnectScreen;
 use crate::sidebar::controller::SidebarController;
 
+const LOCAL_SERVER_AUTO_START_KEY: &str = "local-server-auto-start";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     /// No environment connected: the connect screen.
@@ -183,6 +185,11 @@ pub struct AppState {
     runtime: tokio::runtime::Handle,
     /// SSH environments' tunnels, owned for the life of the app.
     pub(crate) ssh: SshEnvironments,
+    /// Embedded local `t3 serve` subprocess host owned for the life of the app (`CN-LOCAL`).
+    pub(crate) local_host: t3_client::local::LocalServerHost,
+    pub local_host_phase: t3_core::local_server::LocalServerPhase,
+    pub local_server_auto_start: bool,
+    _local_host_pump: Option<Task<()>>,
     /// SSH password prompts waiting for an answer, oldest first, each with its sequence number.
     pub ssh_prompts: VecDeque<(u64, PasswordRequest)>,
     pub(crate) ssh_prompt_sequence: u64,
@@ -251,6 +258,24 @@ impl AppState {
                 }
             }
         });
+        let local_host = t3_client::local::LocalServerHost::new();
+        let mut local_host_rx = local_host.subscribe();
+        let local_host_phase = local_host_rx.borrow_and_update().clone();
+        let local_host_pump = cx.spawn(async move |this, cx| {
+            while local_host_rx.changed().await.is_ok() {
+                let phase = local_host_rx.borrow_and_update().clone();
+                if this.update(cx, |state, cx| state.apply_local_host_phase(phase, cx)).is_err() {
+                    return;
+                }
+            }
+        });
+        let local_server_auto_start = if cfg!(test) {
+            false
+        } else {
+            store::load_ui_state(LOCAL_SERVER_AUTO_START_KEY)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        };
         let mut state = AppState {
             announcements: crate::announcements::Announcements::new(cx),
             github_star: crate::github_star_prompt::GitHubStarPrompt::new(cx),
@@ -310,6 +335,10 @@ impl AppState {
             connection: 0,
             runtime,
             ssh: SshEnvironments::new(Some(prompts)),
+            local_host,
+            local_host_phase,
+            local_server_auto_start,
+            _local_host_pump: Some(local_host_pump),
             ssh_prompts: VecDeque::new(),
             ssh_prompt_sequence: 0,
             connections,
@@ -320,10 +349,14 @@ impl AppState {
             dismissed_provider_banners: Default::default(),
             _ssh_quit: None,
         };
-        // Quitting stops the tunnels this app started, by the PIDs it spawned.
+        // Quitting stops the tunnels and embedded local server this app started, by the PIDs it spawned.
         state._ssh_quit = Some(cx.on_app_quit(|state, cx| {
             state.clear_pending_notifications(cx);
-            state.ssh.shutdown()
+            let ssh = state.ssh.shutdown();
+            let local = state.local_host.shutdown();
+            async move {
+                futures::future::join(ssh, local).await;
+            }
         }));
         // Setup fixtures render without a client: no discovery, subscriptions, or commands.
         if crate::chatgpt_setup::fixture_active(cx) {
@@ -334,7 +367,13 @@ impl AppState {
         }
         match state.environments.active().filter(|environment| !environment.disabled && environment.credentials().is_some()).map(|environment| environment.id.clone()) {
             Some(id) => { state.start_environment(&id, cx); state.connections.activate(Some(&id)); },
-            None => state.refresh_local_server(cx),
+            None => {
+                if state.local_server_auto_start {
+                    state.start_local_server(true, cx);
+                } else {
+                    state.refresh_local_server(cx);
+                }
+            }
         }
         let watched: Vec<_> = state.environments.environments.iter().filter(|e| !e.disabled && e.access_token.is_some()).map(|e| e.id.clone()).collect();
         for id in watched { state.start_environment(&id, cx); }
@@ -347,6 +386,7 @@ impl AppState {
     pub(crate) fn stop_pump(&mut self) {
         self._pump = None;
         self._fleet_pump = None;
+        self._local_host_pump = None;
     }
 
     /// Turn-item fixtures keep asset RPCs alive while holding their projected UI state.
@@ -1463,6 +1503,122 @@ impl AppState {
     /// The connected server's address, `None` while unpaired.
     pub fn environment(&self) -> Option<&str> {
         self.client.as_ref().map(ClientHandle::environment)
+    }
+
+    /// Whether this app is currently hosting the local `t3 serve` subprocess (`CN-LOCAL`).
+    pub fn is_hosting_local_server(&self) -> bool {
+        self.local_host_phase.is_running()
+    }
+
+    /// Persists whether the native app automatically starts a local server on launch when unpaired.
+    pub fn set_local_server_auto_start(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.local_server_auto_start == enabled {
+            return;
+        }
+        self.local_server_auto_start = enabled;
+        if !cfg!(test) {
+            store::save_ui_state(LOCAL_SERVER_AUTO_START_KEY, &Value::Bool(enabled));
+        }
+        cx.emit(AppEvent::Phase);
+    }
+
+    /// Starts the embedded local `t3 serve` subprocess under the configured `T3CODE_HOME`, waits
+    /// for readiness, and optionally pairs/connects once ready.
+    pub fn start_local_server(&mut self, auto_connect: bool, cx: &mut Context<Self>) {
+        if self.local_host_phase.is_starting() || self.local_host_phase.is_stopping() {
+            return;
+        }
+        if self
+            .connect
+            .error
+            .as_ref()
+            .is_some_and(|(source, _)| *source == crate::environments::PairingSource::Local)
+        {
+            self.connect.error = None;
+        }
+        let start_future = self.local_host.start_future();
+        let task = self.runtime.spawn(start_future);
+        cx.emit(AppEvent::Phase);
+        cx.spawn(async move |this, cx| {
+            let result = task.await.unwrap_or_else(|_| {
+                Err(t3_client::local::LocalServerHostError::ProcessFailed(
+                    "Local server task stopped unexpectedly.".to_owned(),
+                ))
+            });
+            let _ = this.update(cx, |state, cx| match result {
+                Ok(server) => {
+                    state.connect.local_server = Some(server);
+                    cx.emit(AppEvent::Phase);
+                    if auto_connect {
+                        state.connect_local(cx);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not start local server");
+                    if matches!(error, t3_client::local::LocalServerHostError::StateDirOwned) {
+                        state.refresh_local_server(cx);
+                    }
+                    state.fail_pairing(crate::environments::PairingSource::Local, error.to_string(), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Cleanly terminates the embedded local `t3 serve` subprocess this app started.
+    pub fn stop_local_server(&mut self, cx: &mut Context<Self>) {
+        if !self.local_host_phase.is_active() {
+            return;
+        }
+        let stop_future = self.local_host.shutdown();
+        let task = self.runtime.spawn(stop_future);
+        cx.emit(AppEvent::Phase);
+        cx.spawn(async move |this, cx| {
+            let _ = task.await;
+            let _ = this.update(cx, |state, cx| {
+                state.connect.local_server = None;
+                cx.emit(AppEvent::Phase);
+                state.refresh_local_server(cx);
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn apply_local_host_phase(
+        &mut self,
+        phase: t3_core::local_server::LocalServerPhase,
+        cx: &mut Context<Self>,
+    ) {
+        let was_running = self.local_host_phase.is_running();
+        self.local_host_phase = phase.clone();
+        if let t3_core::local_server::LocalServerPhase::Failed(failure) = &phase
+            && was_running
+        {
+            self.connect.local_server = None;
+            if failure.kind == t3_core::local_server::LocalServerFailureKind::StateDirOwned {
+                self.refresh_local_server(cx);
+            }
+            self.show_toast(
+                crate::toast::Toast::new(crate::toast::ToastKind::Error, "Local server stopped")
+                    .description(failure.message.clone()),
+                cx,
+            );
+        }
+        cx.emit(AppEvent::Phase);
+    }
+
+    /// Copyable diagnostics text for the last hosted local server failure, if any.
+    pub fn local_server_diagnostics(&self) -> Option<String> {
+        let failure = self.local_host_phase.failure()?;
+        let (home, cli) = match self.local_host.active_home_and_cli() {
+            Some((home, cli)) => (Some(home), Some(cli)),
+            None => (t3_client::local::home(), None),
+        };
+        Some(t3_core::local_server::format_local_server_diagnostics(
+            failure,
+            home.as_deref(),
+            cli.as_deref(),
+        ))
     }
 }
 
