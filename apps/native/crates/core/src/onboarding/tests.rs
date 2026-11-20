@@ -202,10 +202,59 @@ fn the_agents_step_lists_every_codex_instance_and_the_best_claude() {
 
 #[test]
 fn the_privacy_line_names_an_administrator_that_turned_usage_data_off() {
-    assert!(privacy_notice(None).starts_with("T3 Code collects anonymous usage data to help us improve it."));
-    assert!(privacy_notice(None).ends_with("and how to opt out, see our"));
+    assert_eq!(
+        privacy_notice(None),
+        "T3 Code collects anonymous usage data to improve the app. To opt out, see the"
+    );
     let off = json!({"organization": "Acme", "limits": {"telemetry": false}});
-    assert_eq!(privacy_notice(Some(&off)), "Acme turned off anonymous usage data. To read more about how your data is used, see our");
+    assert_eq!(
+        privacy_notice(Some(&off)),
+        "Acme turned off anonymous usage data. See the"
+    );
+    let unnamed = json!({"limits": {"telemetry": false}});
+    assert_eq!(
+        privacy_notice(Some(&unnamed)),
+        "Your organization turned off anonymous usage data. See the"
+    );
+}
+
+#[test]
+fn telemetry_notice_link_splitting_translates_across_locales_and_word_orders() {
+    // English preserves lowercase "privacy policy" inside the sentence.
+    assert_eq!(
+        split_telemetry_notice_link(TELEMETRY_NOTICE_DEFAULT, PRIVACY_POLICY_LINK_LABEL),
+        (
+            "T3 Code collects anonymous usage data to improve the app. To opt out, see the ".into(),
+            "privacy policy".into(),
+            ".".into(),
+        )
+    );
+
+    // German translates both sentence and link label via the real catalog keys.
+    let de_sentence = crate::i18n::translate("de", TELEMETRY_NOTICE_DEFAULT);
+    let de_link = crate::i18n::translate("de", PRIVACY_POLICY_LINK_LABEL);
+    assert_ne!(de_sentence, TELEMETRY_NOTICE_DEFAULT);
+    assert_eq!(de_link, "Datenschutzerklärung");
+    let (de_before, de_matched, de_after) = split_telemetry_notice_link(de_sentence, de_link);
+    assert!(!de_before.is_empty());
+    assert_eq!(de_matched, "Datenschutzerklärung");
+    assert_eq!(de_after, ".");
+
+    // Japanese places trailing text after the link.
+    let ja_sentence = crate::i18n::translate("ja", TELEMETRY_NOTICE_DEFAULT);
+    let ja_link = crate::i18n::translate("ja", PRIVACY_POLICY_LINK_LABEL);
+    let (ja_before, ja_matched, ja_after) = split_telemetry_notice_link(ja_sentence, ja_link);
+    assert!(!ja_before.is_empty());
+    assert_eq!(ja_matched, "プライバシーポリシー");
+    assert!(ja_after.contains("をご覧ください。"), "unexpected ja_after: {ja_after:?}");
+
+    // Inflected form fallback keeps the full translated sentence plus the translated link label.
+    let ru_sentence = crate::i18n::translate("ru", TELEMETRY_NOTICE_DEFAULT);
+    let ru_link = crate::i18n::translate("ru", PRIVACY_POLICY_LINK_LABEL);
+    let (ru_before, ru_matched, ru_after) = split_telemetry_notice_link(ru_sentence, ru_link);
+    assert_eq!(ru_before, ru_sentence);
+    assert_eq!(ru_matched, ru_link);
+    assert!(ru_after.is_empty());
 }
 
 fn settings_with_binary(instance_id: &str, driver: &str, binary_path: &str) -> ServerSettings {
@@ -327,4 +376,245 @@ fn welcome_page_groups_agents_by_readiness_and_detects_cli_path_status() {
     );
     assert_eq!(shadowed.shadowed_by.as_deref(), Some("/opt/homebrew/bin/t3"));
     assert!(shadowed.description().contains("runs first in a new terminal"));
+}
+
+#[test]
+fn welcome_offers_phone_requires_primary_cloud_share_scopes_and_policy() {
+    let base = WelcomePhoneOfferInput {
+        is_primary: true,
+        cloud_configured: true,
+        can_share: true,
+        managed_policy: None,
+    };
+    assert!(welcome_offers_phone(base));
+    assert!(!welcome_offers_phone(WelcomePhoneOfferInput { is_primary: false, ..base }));
+    assert!(!welcome_offers_phone(WelcomePhoneOfferInput { cloud_configured: false, ..base }));
+    assert!(!welcome_offers_phone(WelcomePhoneOfferInput { can_share: false, ..base }));
+
+    let no_remote = json!({"organization": "Acme", "limits": {"clients": ["local"]}});
+    assert!(!welcome_offers_phone(WelcomePhoneOfferInput { managed_policy: Some(&no_remote), ..base }));
+
+    let no_connect = json!({"organization": "Acme", "limits": {"connect": false}});
+    assert!(!welcome_offers_phone(WelcomePhoneOfferInput { managed_policy: Some(&no_connect), ..base }));
+
+    let allowed = json!({"organization": "Acme", "limits": {"clients": ["local", "remote"], "connect": true}});
+    assert!(welcome_offers_phone(WelcomePhoneOfferInput { managed_policy: Some(&allowed), ..base }));
+}
+
+#[test]
+fn phone_is_shared_enforces_linked_revoked_user_and_tunnel_rules() {
+    use crate::mcp::gate::CloudLinkState;
+
+    let mut link = CloudLinkState {
+        linked: true,
+        cloud_user_id: Some("user_alice".into()),
+        link_revoked: Some(false),
+        managed_tunnel_active: Some(true),
+        ..Default::default()
+    };
+
+    assert!(!phone_is_shared(None, PhoneCloudAccount::UserId("user_alice")));
+    assert!(!phone_is_shared(Some(&link), PhoneCloudAccount::SignedOut));
+    assert!(phone_is_shared(Some(&link), PhoneCloudAccount::UserId("user_alice")));
+    assert!(!phone_is_shared(Some(&link), PhoneCloudAccount::UserId("user_bob")));
+
+    // Older servers omit `managedTunnelActive` (`None`), which counts as shared.
+    link.managed_tunnel_active = None;
+    assert!(phone_is_shared(Some(&link), PhoneCloudAccount::UserId("user_alice")));
+
+    // Publish-only link (`managedTunnelActive: false`) is not shared for the phone app.
+    link.managed_tunnel_active = Some(false);
+    assert!(!phone_is_shared(Some(&link), PhoneCloudAccount::UserId("user_alice")));
+    link.managed_tunnel_active = Some(true);
+
+    // Revoked or unlinked computers are not shared.
+    link.link_revoked = Some(true);
+    assert!(!phone_is_shared(Some(&link), PhoneCloudAccount::UserId("user_alice")));
+    link.link_revoked = None;
+    link.linked = false;
+    assert!(!phone_is_shared(Some(&link), PhoneCloudAccount::UserId("user_alice")));
+    link.linked = true;
+
+    // Missing `cloudUserId` does not match a known user or an unlisted native identity.
+    link.cloud_user_id = None;
+    assert!(!phone_is_shared(Some(&link), PhoneCloudAccount::UserId("user_alice")));
+    assert!(!phone_is_shared(Some(&link), PhoneCloudAccount::NativeIdentity { in_account_relay_list: None }));
+
+    // Native email identity respects relay discovery membership once listed.
+    link.cloud_user_id = Some("user_alice".into());
+    assert!(phone_is_shared(Some(&link), PhoneCloudAccount::NativeIdentity { in_account_relay_list: None }));
+    assert!(phone_is_shared(Some(&link), PhoneCloudAccount::NativeIdentity { in_account_relay_list: Some(true) }));
+    assert!(!phone_is_shared(Some(&link), PhoneCloudAccount::NativeIdentity { in_account_relay_list: Some(false) }));
+}
+
+#[test]
+fn resolve_phone_connect_state_covers_all_six_states() {
+    use crate::mcp::gate::{CloudLinkState, ConnectReachability};
+
+    let account = PhoneCloudAccount::UserId("user_alice");
+    let shared_base = CloudLinkState {
+        linked: true,
+        cloud_user_id: Some("user_alice".into()),
+        link_revoked: Some(false),
+        managed_tunnel_active: Some(true),
+        ..Default::default()
+    };
+
+    // 1. Signed in & pending (`link == None`): Checking.
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account,
+            link: None,
+            is_pending: true,
+            has_error: false,
+        }),
+        PhoneConnectState::Checking
+    );
+    // Checking wins over stale error while retrying with no cached link.
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account,
+            link: None,
+            is_pending: true,
+            has_error: true,
+        }),
+        PhoneConnectState::Checking
+    );
+
+    // 2. Signed in & error: Error.
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account,
+            link: None,
+            is_pending: false,
+            has_error: true,
+        }),
+        PhoneConnectState::Error
+    );
+
+    // 3. Signed in & shared & reachability == "reachable": Reachable (stays stable during background refresh).
+    let reachable_link = CloudLinkState {
+        reachability: Some(ConnectReachability::Reachable {
+            checked_at: "2026-11-20T00:00:00Z".into(),
+            ready_connections: Some(1),
+            protocol: Some("quic".into()),
+        }),
+        ..shared_base.clone()
+    };
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account,
+            link: Some(&reachable_link),
+            is_pending: true,
+            has_error: false,
+        }),
+        PhoneConnectState::Reachable
+    );
+
+    // 4. Signed in & shared & reachability == None: SharedUnknownReachability.
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account,
+            link: Some(&shared_base),
+            is_pending: false,
+            has_error: false,
+        }),
+        PhoneConnectState::SharedUnknownReachability
+    );
+
+    // 5a. Signed in & shared & reachability == "unreachable": SharedUnreachable.
+    let unreachable_link = CloudLinkState {
+        reachability: Some(ConnectReachability::Unreachable {
+            checked_at: "2026-11-20T00:00:00Z".into(),
+            cause: "tunnel_down".into(),
+            reason: "Tunnel disconnected".into(),
+            hint: None,
+            fix: "Check T3 Connect".into(),
+        }),
+        ..shared_base.clone()
+    };
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account,
+            link: Some(&unreachable_link),
+            is_pending: false,
+            has_error: false,
+        }),
+        PhoneConnectState::SharedUnreachable
+    );
+
+    // 5b. Signed in & not shared (unlinked, wrong account, revoked, publish-only, or no link yet): NotShared.
+    let other_account_link = CloudLinkState {
+        cloud_user_id: Some("user_other".into()),
+        reachability: reachable_link.reachability.clone(),
+        ..shared_base.clone()
+    };
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account,
+            link: Some(&other_account_link),
+            is_pending: false,
+            has_error: false,
+        }),
+        PhoneConnectState::NotShared
+    );
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account,
+            link: None,
+            is_pending: false,
+            has_error: false,
+        }),
+        PhoneConnectState::NotShared
+    );
+
+    // 6. Signed out: SignedOut regardless of link/pending/error.
+    assert_eq!(
+        resolve_phone_connect_state(&PhoneConnectInput {
+            account: PhoneCloudAccount::SignedOut,
+            link: Some(&reachable_link),
+            is_pending: true,
+            has_error: true,
+        }),
+        PhoneConnectState::SignedOut
+    );
+}
+
+#[test]
+fn phone_account_for_identity_matches_user_ids_and_relay_discovery() {
+    use crate::relay::{Discovery, Endpoint, Environment};
+
+    let empty = Discovery::default();
+    assert_eq!(phone_account_for_identity(None, &empty, &["env-1"]), PhoneCloudAccount::SignedOut);
+    assert_eq!(phone_account_for_identity(Some("   "), &empty, &["env-1"]), PhoneCloudAccount::SignedOut);
+    assert_eq!(
+        phone_account_for_identity(Some("user_123"), &empty, &["env-1"]),
+        PhoneCloudAccount::UserId("user_123")
+    );
+    assert_eq!(
+        phone_account_for_identity(Some("dev@example.test"), &empty, &["env-1"]),
+        PhoneCloudAccount::NativeIdentity { in_account_relay_list: None }
+    );
+
+    let listed = Discovery {
+        listed: true,
+        refreshing: false,
+        environments: vec![Environment {
+            environment_id: "env-primary".into(),
+            label: "Mac".into(),
+            endpoint: Endpoint {
+                http_base_url: "https://mac.t3.codes".into(),
+                ws_base_url: "wss://mac.t3.codes".into(),
+                provider_kind: "cloudflare_tunnel".into(),
+            },
+        }],
+    };
+    assert_eq!(
+        phone_account_for_identity(Some("dev@example.test"), &listed, &["env-primary"]),
+        PhoneCloudAccount::NativeIdentity { in_account_relay_list: Some(true) }
+    );
+    assert_eq!(
+        phone_account_for_identity(Some("dev@example.test"), &listed, &["env-other"]),
+        PhoneCloudAccount::NativeIdentity { in_account_relay_list: Some(false) }
+    );
 }

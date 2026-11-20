@@ -11,8 +11,15 @@
 //! nothing saved the wizard opens at once, since there is no workspace to inspect
 //! (`resolve_unpaired`).
 
+pub mod phone;
 pub mod projects;
 pub mod terminal;
+
+pub use phone::{
+    MOBILE_APP_URL, PHONE_LINK_REFRESH_INTERVAL_SECS, PhoneCloudAccount, PhoneConnectInput,
+    PhoneConnectState, WelcomePhoneOfferInput, phone_account_for_identity, phone_is_shared,
+    resolve_phone_connect_state, welcome_offers_phone,
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -25,6 +32,51 @@ pub const SUBSCRIBE_SERVER_LIFECYCLE: &str = "subscribeServerLifecycle";
 
 /// `PRIVACY_POLICY_URL` (`web/src/legalLinks.ts`).
 pub const PRIVACY_POLICY_URL: &str = "https://t3.codes/privacy-policy";
+
+/// Catalog keys for `TelemetryNotice` (`apps/web/src/components/onboarding/WelcomePage.tsx`,
+/// matching flattened rich entries `71f3822326109c8e`, `b33f35083757b42c`, and `3188bc3b3c4508bc`).
+pub const TELEMETRY_NOTICE_DEFAULT: &str =
+    "T3 Code collects anonymous usage data to improve the app. To opt out, see the privacy policy.";
+pub const TELEMETRY_NOTICE_SEE_POLICY: &str = "See the privacy policy.";
+pub const PRIVACY_POLICY_LINK_LABEL: &str = "Privacy policy";
+
+/// Splits a localized telemetry notice sentence around the localized privacy-policy link phrase
+/// (`before`, `link`, `after`) using UTF-8-safe case-insensitive character matching so every
+/// locale (including languages like Japanese that place text after the link) preserves natural
+/// word order and exact sentence casing. Falls back to `(sentence, link_phrase, "")` when the
+/// sentence uses an inflected or alternate form of `link_phrase`.
+pub fn split_telemetry_notice_link(sentence: &str, link_phrase: &str) -> (String, String, String) {
+    let needle = link_phrase.trim();
+    if needle.is_empty() {
+        return (sentence.to_owned(), String::new(), String::new());
+    }
+    if let Some(start) = sentence.find(needle) {
+        let end = start + needle.len();
+        return (
+            sentence[..start].to_owned(),
+            sentence[start..end].to_owned(),
+            sentence[end..].to_owned(),
+        );
+    }
+    let needle_lower = needle.to_lowercase();
+    let needle_chars = needle.chars().count();
+    let starts: Vec<usize> = sentence.char_indices().map(|(idx, _)| idx).collect();
+    if needle_chars > 0 && starts.len() >= needle_chars {
+        for i in 0..=starts.len() - needle_chars {
+            let start = starts[i];
+            let end = starts.get(i + needle_chars).copied().unwrap_or(sentence.len());
+            let candidate = &sentence[start..end];
+            if candidate.to_lowercase() == needle_lower {
+                return (
+                    sentence[..start].to_owned(),
+                    candidate.to_owned(),
+                    sentence[end..].to_owned(),
+                );
+            }
+        }
+    }
+    (sentence.to_owned(), needle.to_owned(), String::new())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirstRunDecision {
@@ -219,15 +271,13 @@ pub fn managed_driver_allowed(policy: Option<&Value>, driver: &str) -> bool {
     }
 }
 
-/// The connection step's privacy line up to its link ("…see our"), with
-/// `managedTelemetryOffMessage` when an administrator turned usage data off.
+/// The footer's telemetry notice up to its link ("…see the" / "…See the"), matching
+/// `TelemetryNotice` (`WelcomePage.tsx`) and `managedTelemetryOffMessage`
+/// (`web/src/state/managedPolicy.ts`).
 pub fn privacy_notice(policy: Option<&Value>) -> String {
-    let telemetry_off = policy
-        .filter(|policy| policy.pointer("/limits/telemetry") == Some(&Value::Bool(false)))
-        .map(|policy| format!("{} turned off anonymous usage data.", policy.get("organization").and_then(Value::as_str).unwrap_or_default()));
-    match telemetry_off {
-        Some(message) => format!("{message} To read more about how your data is used, see our"),
-        None => "T3 Code collects anonymous usage data to help us improve it. To read more about how your data is used and how to opt out, see our".to_owned(),
+    match crate::managed_policy::managed_telemetry_off_message(policy) {
+        Some(message) => format!("{message} See the"),
+        None => "T3 Code collects anonymous usage data to improve the app. To opt out, see the".to_owned(),
     }
 }
 

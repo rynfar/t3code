@@ -3,8 +3,8 @@
 //! and the privacy line. Picking a computer attaches the setup view to its connection.
 
 use gpui::{
-    AnyElement, App, Context, ElementId, FontWeight, InteractiveText, IntoElement, ParentElement, SharedString, StyledText, Styled, TextRun,
-    UnderlineStyle, Window, div, prelude::*, px,
+    AnyElement, App, Context, ElementId, FontWeight, IntoElement, ParentElement, SharedString,
+    Styled, StyledText, TextRun, Window, div, prelude::*, px,
 };
 use gpui_component::input::Input;
 use gpui_component::{ActiveTheme, Sizable, h_flex, v_flex};
@@ -13,10 +13,11 @@ use t3_client::status::ConnectionPhase;
 use t3_client::store::SavedEnvironment;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::onboarding::{
-    INSTALL_T3_COMMAND_NPX, INSTALL_T3_COMMAND_UNIX, PRIVACY_POLICY_URL, privacy_notice,
+    INSTALL_T3_COMMAND_NPX, INSTALL_T3_COMMAND_UNIX, PRIVACY_POLICY_LINK_LABEL,
+    TELEMETRY_NOTICE_DEFAULT, TELEMETRY_NOTICE_SEE_POLICY, split_telemetry_notice_link,
 };
 
-use super::{WelcomeWizard, key_stop, row_card, section_heading};
+use super::{WelcomeWizard, key_stop, key_stop_with_focus, row_card, section_heading};
 use crate::app_state::{AppState, Phase};
 use crate::composer::controls::radio;
 use crate::connect::{discovery_message, local_details, pairing_error};
@@ -424,27 +425,62 @@ impl WelcomeWizard {
         Some(body.into_any_element())
     }
 
-    /// Footer with the privacy policy link and the primary "Start coding" CTA (`WelcomePage.tsx`).
-    pub(super) fn render_welcome_footer(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Footer with the keyboard-accessible `TelemetryNotice` (`WelcomePage.tsx:338-380`) and
+    /// primary "Start coding" CTA.
+    pub(super) fn render_welcome_footer(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let app = self.state.read(cx);
         let connected = app.phase == Phase::Online(ConnectionStatus::Connected) && app.connect.pairing.is_none();
         let policy = app.server_config.config.as_ref().and_then(|config| config.managed_policy.clone());
-        let notice = privacy_notice(policy.as_ref());
-        let link = "privacy policy";
-        let text = format!("{notice} {link}.");
-        let link_range = notice.len() + 1..notice.len() + 1 + link.len();
-        let privacy = InteractiveText::new(
-            "welcome-privacy",
-            StyledText::new(text).with_highlights([(
-                link_range.clone(),
-                gpui::HighlightStyle {
-                    underline: Some(UnderlineStyle { thickness: px(1.), ..Default::default() }),
-                    ..Default::default()
-                },
-            )]),
-        )
-        .on_click(vec![link_range], |_, _, cx| cx.open_url(PRIVACY_POLICY_URL));
+        let sentence = match policy.as_ref().filter(|policy| policy["limits"]["telemetry"] == false) {
+            Some(policy) => {
+                let org = t3_core::managed_policy::organization(policy);
+                let off = crate::i18n::t_fmt(
+                    cx,
+                    "{organization} turned off anonymous usage data.",
+                    &[("organization", org.into())],
+                );
+                let see = crate::i18n::t(cx, TELEMETRY_NOTICE_SEE_POLICY);
+                format!("{off} {see}")
+            }
+            None => crate::i18n::t(cx, TELEMETRY_NOTICE_DEFAULT).to_owned(),
+        };
+        let link_phrase = crate::i18n::t(cx, PRIVACY_POLICY_LINK_LABEL);
+        let (before, link_label, after) = split_telemetry_notice_link(&sentence, link_phrase);
+        let open_policy = cx.listener(|this, _: &(), _, cx| this.open_privacy_policy(cx));
+        let privacy_link = key_stop_with_focus(
+            div()
+                .id("welcome-privacy-policy")
+                .debug_selector(|| "welcome-privacy-policy".to_owned())
+                .role(gpui::Role::Link)
+                .aria_label(link_label.clone())
+                .rounded(r(3.))
+                .underline()
+                .text_color(hsla(p.muted_foreground))
+                .hover(move |style| style.text_color(hsla(p.foreground)))
+                .child(link_label),
+            &self.privacy_focus,
+            open_policy,
+            window,
+            cx,
+        );
+        let before_trimmed = before.trim_end();
+        let link_group = h_flex()
+            .items_baseline()
+            .child(privacy_link)
+            .when(!after.is_empty(), |row| row.child(after));
+        let telemetry_notice = h_flex()
+            .debug_selector(|| "welcome-telemetry-notice".to_owned())
+            .flex_1()
+            .min_w_0()
+            .flex_wrap()
+            .items_baseline()
+            .gap_x(r(4.))
+            .text_xs()
+            .line_height(r(19.5))
+            .text_color(hsla(p.muted_foreground))
+            .when(!before_trimmed.is_empty(), |row| row.child(before_trimmed.to_owned()))
+            .child(link_group);
         h_flex()
             .pt(r(12.))
             .border_t_1()
@@ -452,7 +488,7 @@ impl WelcomeWizard {
             .items_end()
             .justify_between()
             .gap(r(24.))
-            .child(div().flex_1().min_w_0().text_xs().line_height(r(19.5)).text_color(hsla(p.muted_foreground)).child(privacy))
+            .child(telemetry_notice)
             .child(
                 Button::new("welcome-continue", ButtonVariant::Default, ButtonSize::Default)
                     .label("Start coding")
