@@ -16,7 +16,7 @@ use t3_core::pull_requests::{PrRef, method};
 use t3_core::sidebar::time::{compact_relative_label, parse_iso};
 
 use super::controls::{avatar, outcome_glyph, state_glyph};
-use super::{read, settle};
+use super::{owner_for_pr, read_for_owner, settle};
 use crate::app_state::AppState;
 use crate::sidebar::controller::now_ms;
 use crate::theme::{hsla, palette};
@@ -26,14 +26,21 @@ pub const PREVIEW_CLOSE_DELAY: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone)]
 pub struct PreviewTarget {
+    pub environment_id: Option<String>,
     pub reference: PrRef,
     pub url: String,
     pub fallback: Option<Preview>,
 }
 
 impl PreviewTarget {
+    #[cfg(test)]
     pub fn from_entry(entry: &ListEntry) -> Self {
+        Self::from_entry_in_env(entry, None)
+    }
+
+    pub fn from_entry_in_env(entry: &ListEntry, environment_id: Option<String>) -> Self {
         PreviewTarget {
+            environment_id,
             reference: PrRef::of(entry),
             url: entry.url.clone(),
             fallback: Some(Preview {
@@ -129,9 +136,11 @@ impl LinkPreviewController {
         cx: &mut Context<V>,
     ) {
         let names_subject = matches!(parse_anchor(&target.url), Some(Anchor::Timeline(_))) || link_commit(&target.url).is_some();
-        let preview_task = read(state.read(cx), method::PREVIEW, target.reference.payload(), decode::<Preview>);
+        let app = state.read(cx);
+        let owner = owner_for_pr(app, target.environment_id.as_deref(), &target.reference.project_id);
+        let preview_task = read_for_owner(app, owner.as_ref(), method::PREVIEW, target.reference.payload(), decode::<Preview>);
         let activity_task = if names_subject {
-            read(state.read(cx), method::ACTIVITY, target.reference.payload(), decode::<Activity>)
+            read_for_owner(app, owner.as_ref(), method::ACTIVITY, target.reference.payload(), decode::<Activity>)
         } else {
             None
         };

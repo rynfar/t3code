@@ -18,6 +18,8 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{h_flex, v_flex};
+use t3_client::supervisor::ConnectionStatus;
+use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::commands::method::DISPATCH_COMMAND;
 use t3_core::pull_requests::detail::{MergeGate, PrimaryControl, StateKind, change_request_term, host_label, merge_gate, merge_method_label, primary_control, resolve_merge_method};
 use t3_core::pull_requests::anchor::{Anchor, LinkedTab, anchor_matches_url, link_commit, parse_anchor, resolve_review_anchor};
@@ -42,7 +44,8 @@ use t3_core::pull_requests::wire::{
     Action, Activity, CommentKind, Detail, DiffResult, LabelCandidate, LabelCandidates, ListEntry, MergeMethod, PrState, ReactionContent, ReviewVerdict, ReviewerCandidate, ReviewerCandidates, Stack, Summary,
     ThreadCommentsPage, decode,
 };
-use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, failure_message, invalidate_input, method, stack_merge};
+use t3_core::pull_requests::{PrRef, action_failed_label, action_input, action_needs_host_refresh, invalidate_input, method, stack_merge};
+use t3_core::sidebar::grouping::EnvironmentOwner;
 
 use super::code::CodeTab;
 use super::controls::{BadgeKind, Button, Size, Variant, badge, diff_stat, state_glyph};
@@ -50,7 +53,7 @@ use super::guide::GuideTab;
 use super::interactions;
 use super::mutations::{self, MergePicks, Mutations};
 use super::page::{PullRequestsPage, Refreshes};
-use super::{read, settle};
+use super::{diff_for_owner, owner_for_pr, read_for_owner, settle};
 use crate::app_state::{AppEvent, AppState, uuid_v4};
 use crate::icons::Icon;
 use crate::right_panel::{segment, segmented};
@@ -80,8 +83,16 @@ fn held_environment(state: &AppState) -> Option<&str> {
 }
 
 impl HeldKey {
+    #[cfg(test)]
     fn of(state: &AppState, reference: &PrRef) -> Option<Self> {
-        let environment = held_environment(state)?.to_owned();
+        Self::of_in_env(state, None, reference)
+    }
+
+    fn of_in_env(state: &AppState, env_id: Option<&str>, reference: &PrRef) -> Option<Self> {
+        let environment = env_id
+            .map(str::to_owned)
+            .or_else(|| owner_for_pr(state, None, &reference.project_id).map(|o| o.saved_id))
+            .or_else(|| held_environment(state).map(str::to_owned))?;
         Some(HeldKey { environment, project_id: reference.project_id.clone(), pr: reference.key() })
     }
 }
@@ -107,16 +118,31 @@ fn hold(key: HeldKey, detail: Option<&Detail>, activity: Option<&Activity>, cx: 
 }
 
 /// Seeds `Held` from a hover-intent prefetch (`usePullRequestIntentPrefetch`), scoped to the
-/// active environment so clicking the row paints immediately.
-pub(super) fn prefetch_into_held(state: &Entity<AppState>, reference: &PrRef, detail: Option<&Detail>, activity: Option<&Activity>, cx: &mut App) {
-    let key = HeldKey::of(state.read(cx), reference);
+/// owning environment so clicking the row paints immediately.
+pub(super) fn prefetch_into_held_in_env(
+    state: &Entity<AppState>,
+    env_id: Option<&str>,
+    reference: &PrRef,
+    detail: Option<&Detail>,
+    activity: Option<&Activity>,
+    cx: &mut App,
+) {
+    let key = HeldKey::of_in_env(state.read(cx), env_id, reference);
     if let Some(key) = key {
         hold(key, detail, activity, cx);
     }
 }
 
+pub(super) fn prefetch_into_held(state: &Entity<AppState>, reference: &PrRef, detail: Option<&Detail>, activity: Option<&Activity>, cx: &mut App) {
+    prefetch_into_held_in_env(state, None, reference, detail, activity, cx);
+}
+
+pub(super) fn has_held_detail_in_env(state: &AppState, env_id: Option<&str>, reference: &PrRef, cx: &App) -> bool {
+    HeldKey::of_in_env(state, env_id, reference).is_some_and(|key| held(&key, cx).0.is_some())
+}
+
 pub(super) fn has_held_detail(state: &AppState, reference: &PrRef, cx: &App) -> bool {
-    HeldKey::of(state, reference).is_some_and(|key| held(&key, cx).0.is_some())
+    has_held_detail_in_env(state, None, reference, cx)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,8 +293,20 @@ pub struct DetailView {
 }
 
 impl DetailView {
+    #[cfg(test)]
     pub fn new(state: Entity<AppState>, page: WeakEntity<PullRequestsPage>, reference: PrRef, entry: Option<ListEntry>, cx: &mut Context<Self>) -> Self {
-        Self::new_with_hooks(state, page, None, None, reference, entry, cx)
+        Self::new_in_environment(state, page, None, reference, entry, cx)
+    }
+
+    pub fn new_in_environment(
+        state: Entity<AppState>,
+        page: WeakEntity<PullRequestsPage>,
+        environment_id: Option<String>,
+        reference: PrRef,
+        entry: Option<ListEntry>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_hooks(state, page, None, None, environment_id, reference, entry, cx)
     }
 
     /// Creates a `DetailView` embedded inside another surface (such as `ThreadPullRequestsPanel`
@@ -281,14 +319,16 @@ impl DetailView {
         on_select_pr: SelectPrHandler,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_hooks(state, WeakEntity::new_invalid(), Some(on_close), Some(on_select_pr), reference, entry, cx)
+        Self::new_with_hooks(state, WeakEntity::new_invalid(), Some(on_close), Some(on_select_pr), None, reference, entry, cx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_hooks(
         state: Entity<AppState>,
         page: WeakEntity<PullRequestsPage>,
         on_close: Option<CloseHandler>,
         on_select_pr: Option<SelectPrHandler>,
+        environment_id: Option<String>,
         reference: PrRef,
         entry: Option<ListEntry>,
         cx: &mut Context<Self>,
@@ -304,8 +344,12 @@ impl DetailView {
             }),
             cx.observe_global::<Mutations>(|_, cx| cx.notify()),
         ];
-        let environment = held_environment(state.read(cx)).map(str::to_owned);
-        let (detail, activity) = HeldKey::of(state.read(cx), &reference).map(|key| held(&key, cx)).unwrap_or_default();
+        let environment = environment_id
+            .or_else(|| owner_for_pr(state.read(cx), None, &reference.project_id).map(|o| o.saved_id))
+            .or_else(|| held_environment(state.read(cx)).map(str::to_owned));
+        let (detail, activity) = HeldKey::of_in_env(state.read(cx), environment.as_deref(), &reference)
+            .map(|key| held(&key, cx))
+            .unwrap_or_default();
         crate::media::cache(&state, cx);
         let viewer = cx.new(crate::media::MediaViewer::new);
         let mut view = DetailView {
@@ -403,12 +447,53 @@ impl DetailView {
         view
     }
 
-    /// Keeps the linked-threads subscription bound to the active connection: tears it down on
-    /// disconnect or connection swap, and starts it again on reconnect.
+    fn owner(&self, cx: &App) -> Option<EnvironmentOwner> {
+        owner_for_pr(self.state.read(cx), self.environment.as_deref(), &self.reference.project_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_environment(&self) -> Option<&str> {
+        self.environment.as_deref()
+    }
+
+    fn read_pr<T: Send + 'static>(
+        &self,
+        method: &'static str,
+        payload: serde_json::Value,
+        decode_fn: fn(serde_json::Value) -> Result<T, String>,
+        cx: &App,
+    ) -> super::Read<T> {
+        let state = self.state.read(cx);
+        let owner = owner_for_pr(state, self.environment.as_deref(), &self.reference.project_id);
+        read_for_owner(state, owner.as_ref(), method, payload, decode_fn)
+    }
+
+    fn write_pr(&self, method: &'static str, input: serde_json::Value, cx: &App) -> super::Read<()> {
+        let state = self.state.read(cx);
+        let owner = owner_for_pr(state, self.environment.as_deref(), &self.reference.project_id);
+        mutations::write(state, owner.as_ref(), method, input, cx)
+    }
+
+    fn run_action_pr(&self, input: serde_json::Value, cx: &App) -> super::Read<Option<Summary>> {
+        let state = self.state.read(cx);
+        let owner = owner_for_pr(state, self.environment.as_deref(), &self.reference.project_id);
+        mutations::run_action(state, owner.as_ref(), input, cx)
+    }
+
+    /// Keeps the linked-threads subscription bound to the owning environment's connection: tears it
+    /// down on disconnect or connection swap, and starts it again on reconnect.
     fn sync_linked_threads(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let connected = state.client_handle().is_some() && matches!(state.phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected));
-        let connection = state.connection_id();
+        let owner = owner_for_pr(state, self.environment.as_deref(), &self.reference.project_id);
+        let (connected, connection) = if let Some(owner) = &owner {
+            let env = state.fleet.environment(&owner.saved_id);
+            let is_connected = env.is_some_and(|env| env.status == ConnectionStatus::Connected);
+            (is_connected, Some(owner.connection_generation))
+        } else {
+            let is_connected = state.client_handle().is_some()
+                && matches!(state.phase, crate::app_state::Phase::Online(ConnectionStatus::Connected));
+            (is_connected, state.connection_id())
+        };
         if !connected || connection != self.linked_connection {
             self._linked_signal = None;
             self._linked_read = None;
@@ -425,9 +510,24 @@ impl DetailView {
     /// predates the signal. Dropping the view or disconnecting unsubscribes.
     fn follow_linked_threads(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let Some(client) = state.client_handle() else { return };
+        let owner = owner_for_pr(state, self.environment.as_deref(), &self.reference.project_id);
+        let dest_fut = owner.as_ref().map(|owner| state.connections.destination(owner, ORCHESTRATION_READ_SCOPE));
+        let fallback_client = if dest_fut.is_none() { state.client_handle() } else { None };
+        if dest_fut.is_none() && fallback_client.is_none() {
+            return;
+        }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let net = state.runtime().spawn(async move {
+            let client = match dest_fut {
+                Some(fut) => match fut.await {
+                    Ok(dest) => dest.client,
+                    Err(_) => return,
+                },
+                None => match fallback_client {
+                    Some(client) => client,
+                    None => return,
+                },
+            };
             if tx.send(()).is_err() {
                 return;
             }
@@ -478,7 +578,7 @@ impl DetailView {
 
     fn read_linked_threads(&mut self, cx: &mut Context<Self>) {
         let url = self.detail.as_ref().map(|detail| detail.url.clone()).or(self.entry.as_ref().map(|entry| entry.url.clone())).unwrap_or_default();
-        let task = read(self.state.read(cx), LINKED_THREADS, linked_threads_input(&self.reference, &url), decode::<LinkedThreads>);
+        let task = self.read_pr(LINKED_THREADS, linked_threads_input(&self.reference, &url), decode::<LinkedThreads>, cx);
         self._linked_read = Some(cx.spawn(async move |this, cx| {
             let Ok(linked) = settle(task).await else { return };
             let _ = this.update(cx, |this, cx| {
@@ -553,7 +653,7 @@ impl DetailView {
     }
 
     fn hold(&self, cx: &mut App) {
-        let Some(key) = HeldKey::of(self.state.read(cx), &self.reference) else { return };
+        let Some(key) = HeldKey::of_in_env(self.state.read(cx), self.environment.as_deref(), &self.reference) else { return };
         if self.environment.as_deref() != Some(key.environment.as_str()) {
             return;
         }
@@ -562,9 +662,8 @@ impl DetailView {
 
     /// Re-reads the detail, its activity and stack membership, and the patch if it was read.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let state = self.state.read(cx);
-        let detail = read(state, method::DETAIL, self.reference.payload(), decode::<Detail>);
-        let activity = read(state, method::ACTIVITY, self.reference.payload(), decode::<Activity>);
+        let detail = self.read_pr(method::DETAIL, self.reference.payload(), decode::<Detail>, cx);
+        let activity = self.read_pr(method::ACTIVITY, self.reference.payload(), decode::<Activity>, cx);
         self._detail = Some(cx.spawn(async move |this, cx| {
             let result = settle(detail).await;
             let _ = this.update(cx, |this, cx| {
@@ -625,7 +724,7 @@ impl DetailView {
     /// "Refresh from host": this pull request's host reads are dropped
     /// (`pullRequests.invalidate({ reference })`), then everything re-read.
     pub(super) fn refresh_from_host(&mut self, cx: &mut Context<Self>) {
-        let task = read(self.state.read(cx), method::INVALIDATE, invalidate_input(Some(&self.reference)), |_| Ok(()));
+        let task = self.read_pr(method::INVALIDATE, invalidate_input(Some(&self.reference)), |_| Ok(()), cx);
         self.refreshing = true;
         self._labels = None;
         self.label_candidates = None;
@@ -648,7 +747,7 @@ impl DetailView {
             self._stack = None;
             return;
         }
-        let task = read(self.state.read(cx), method::STACK, self.reference.payload(), decode::<Option<Stack>>);
+        let task = self.read_pr(method::STACK, self.reference.payload(), decode::<Option<Stack>>, cx);
         self._stack = Some(cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |this, cx| {
@@ -666,7 +765,7 @@ impl DetailView {
 
     /// `pullRequests.checks` for the Checks section, when the detail's are out of date.
     pub(super) fn refresh_checks(&mut self, cx: &mut Context<Self>) {
-        let task = read(self.state.read(cx), method::CHECKS, self.reference.payload(), t3_core::pull_requests::wire::decode_checks);
+        let task = self.read_pr(method::CHECKS, self.reference.payload(), t3_core::pull_requests::wire::decode_checks, cx);
         cx.spawn(async move |this, cx| {
             let Ok(Some(checks)) = settle(task).await else { return };
             let _ = this.update(cx, |this, cx| {
@@ -753,10 +852,11 @@ impl DetailView {
         }
         let task = if action == Action::Merge {
             let picks = self.picks(cx);
-            mutations::merge(self.state.read(cx), self.reference.clone(), picks, cx)
+            let owner = self.owner(cx);
+            mutations::merge(self.state.read(cx), owner.as_ref(), self.reference.clone(), picks, cx)
         } else {
             let method = self.selected_merge_method(cx);
-            mutations::run_action(self.state.read(cx), action_input(&self.reference, action, method), cx)
+            self.run_action_pr(action_input(&self.reference, action, method), cx)
         };
         let term = self.term();
         cx.spawn(async move |this, cx| {
@@ -794,7 +894,7 @@ impl DetailView {
             return;
         }
         self.stack_pending = true;
-        let task = mutations::run_action(self.state.read(cx), merge.input, cx);
+        let task = self.run_action_pr(merge.input, cx);
         let host = host_label(self.provider());
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -831,7 +931,15 @@ impl DetailView {
     /// Whether this connection holds `source-control:write` (`usePullRequestDetail`'s
     /// `canWriteSourceControl`); unknown grants leave the server to decide.
     pub(super) fn can_write_source_control(&self, cx: &App) -> bool {
-        self.state.read(cx).client_handle().and_then(|handle| handle.session_state().borrow().clone()).is_none_or(|session| session.grants(SOURCE_CONTROL_WRITE_SCOPE))
+        let state = self.state.read(cx);
+        if let Some(env_id) = self.environment.as_deref()
+            && let Some(env) = state.fleet.environments.iter().find(|env| {
+                env.summary.owner.saved_id == env_id || env.summary.owner.canonical_id.as_deref() == Some(env_id)
+            })
+        {
+            return env.grants.as_ref().is_none_or(|session| session.grants(SOURCE_CONTROL_WRITE_SCOPE));
+        }
+        state.client_handle().and_then(|handle| handle.session_state().borrow().clone()).is_none_or(|session| session.grants(SOURCE_CONTROL_WRITE_SCOPE))
     }
 
     /// The description shown: this client's draft while it is in force, else the host's.
@@ -911,7 +1019,7 @@ impl DetailView {
         let key = detail.url.clone();
         self.description_draft = Some(start_description_save(self.description_draft.take(), &key, detail.observed_at_ms(), body.clone()));
         self.description_saves += 1;
-        let task = mutations::write(self.state.read(cx), editing::method::UPDATE, update_body_input(&self.reference, &body), cx);
+        let task = self.write_pr(editing::method::UPDATE, update_body_input(&self.reference, &body), cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let saved = settle(task).await.is_ok();
@@ -935,7 +1043,7 @@ impl DetailView {
         if !self.resolving.insert(thread_id.clone()) {
             return;
         }
-        let task = mutations::write(self.state.read(cx), editing::method::SET_THREAD_RESOLUTION, thread_resolution_input(&self.reference, &thread_id, resolved), cx);
+        let task = self.write_pr(editing::method::SET_THREAD_RESOLUTION, thread_resolution_input(&self.reference, &thread_id, resolved), cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = settle(task).await;
@@ -957,7 +1065,7 @@ impl DetailView {
         if self._labels.is_some() {
             return;
         }
-        let task = read(self.state.read(cx), editing::method::LABEL_CANDIDATES, self.reference.payload(), decode::<LabelCandidates>);
+        let task = self.read_pr(editing::method::LABEL_CANDIDATES, self.reference.payload(), decode::<LabelCandidates>, cx);
         self._labels = Some(cx.spawn(async move |this, cx| {
             let result = settle(task).await;
             let _ = this.update(cx, |this, cx| {
@@ -1047,10 +1155,10 @@ impl DetailView {
         cx.notify();
         let mut tasks = Vec::new();
         for chunk in change_batches(&add_names) {
-            tasks.push(mutations::write(self.state.read(cx), editing::method::SET_LABELS, labels_change_input(&reference, chunk, true), cx));
+            tasks.push(self.write_pr(editing::method::SET_LABELS, labels_change_input(&reference, chunk, true), cx));
         }
         for chunk in change_batches(&remove_names) {
-            tasks.push(mutations::write(self.state.read(cx), editing::method::SET_LABELS, labels_change_input(&reference, chunk, false), cx));
+            tasks.push(self.write_pr(editing::method::SET_LABELS, labels_change_input(&reference, chunk, false), cx));
         }
         cx.spawn(async move |this, cx| {
             let mut failed: Option<String> = None;
@@ -1172,12 +1280,13 @@ impl DetailView {
             let activity = self.activity.clone();
             let can_write = self.can_write_source_control(cx);
             let prefetched = self.prefetched_diff.take();
+            let environment_id = self.environment.clone();
             self.code = Some(cx.new(|cx| {
                 CodeTab::new(
                     state,
                     detail_view,
                     reference,
-                    super::code::CodeTabInit { detail: detail.as_ref(), activity: activity.as_ref(), can_write, prefetched },
+                    super::code::CodeTabInit { environment_id, detail: detail.as_ref(), activity: activity.as_ref(), can_write, prefetched },
                     cx,
                 )
             }));
@@ -1188,8 +1297,9 @@ impl DetailView {
             } else {
                 let state = self.state.clone();
                 let detail_view = cx.entity().downgrade();
+                let environment_id = self.environment.clone();
                 let reference = self.reference.clone();
-                self.guide = Some(cx.new(|cx| GuideTab::new(state, detail_view, reference, cx)));
+                self.guide = Some(cx.new(|cx| GuideTab::new(state, detail_view, environment_id, reference, cx)));
             }
         }
         cx.notify();
@@ -1201,14 +1311,12 @@ impl DetailView {
         if self.code.is_some() || self.prefetched_diff.is_some() || self.diff_prefetching {
             return;
         }
-        let Some(client) = self.state.read(cx).client_handle() else { return };
-        let payload = self.reference.payload();
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, self.environment.as_deref(), &self.reference.project_id);
+        let Some(diff_task) = diff_for_owner(app, owner.as_ref(), self.reference.payload()) else { return };
         self.diff_prefetching = true;
         let task = self.state.read(cx).runtime().spawn(async move {
-            let value = client
-                .pull_request_diff(payload)
-                .await
-                .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
+            let value = settle(Some(diff_task)).await?;
             decode::<DiffResult>(value)
         });
         self._diff_prefetch = Some(cx.spawn(async move |this, cx| {
@@ -1287,7 +1395,7 @@ impl DetailView {
         self.title_editing = false;
         self.title_saving = true;
         self.hold(cx);
-        let task = mutations::write(self.state.read(cx), editing::method::UPDATE, update_title_input(&self.reference, &next), cx);
+        let task = self.write_pr(editing::method::UPDATE, update_title_input(&self.reference, &next), cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = settle(task).await;
@@ -1345,7 +1453,7 @@ impl DetailView {
             return;
         }
         self.maintainer_edits_saving = true;
-        let task = mutations::write(self.state.read(cx), editing::method::UPDATE, update_maintainer_edits_input(&self.reference, allow), cx);
+        let task = self.write_pr(editing::method::UPDATE, update_maintainer_edits_input(&self.reference, allow), cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = settle(task).await;
@@ -1422,7 +1530,7 @@ impl DetailView {
         if self._reviewers.is_some() {
             return;
         }
-        let task = read(self.state.read(cx), method::REVIEWER_CANDIDATES, reviewer_candidates_input(&self.reference, None), decode::<ReviewerCandidates>);
+        let task = self.read_pr(method::REVIEWER_CANDIDATES, reviewer_candidates_input(&self.reference, None), decode::<ReviewerCandidates>, cx);
         self._reviewers = Some(cx.spawn(async move |this, cx| {
             let res = settle(task).await;
             let _ = this.update(cx, |this, cx| {
@@ -1451,7 +1559,7 @@ impl DetailView {
             return;
         };
         self.reviewer_search_pending = true;
-        let task = read(self.state.read(cx), method::REVIEWER_CANDIDATES, reviewer_candidates_input(&self.reference, Some(&host_q)), decode::<ReviewerCandidates>);
+        let task = self.read_pr(method::REVIEWER_CANDIDATES, reviewer_candidates_input(&self.reference, Some(&host_q)), decode::<ReviewerCandidates>, cx);
         self._reviewer_search = Some(cx.spawn(async move |this, cx| {
             let res = settle(task).await;
             let _ = this.update(cx, |this, cx| {
@@ -1545,12 +1653,12 @@ impl DetailView {
         for chunk in change_batches(&changes.add) {
             let refs: Vec<(String, _)> = chunk.iter().map(|c| (c.id.clone(), c.kind)).collect();
             let payload = request_reviewers_batch_input(&reference, &refs, true);
-            tasks.push(mutations::write(self.state.read(cx), method::REQUEST_REVIEWERS, payload, cx));
+            tasks.push(self.write_pr(method::REQUEST_REVIEWERS, payload, cx));
         }
         for chunk in change_batches(&changes.remove) {
             let refs: Vec<(String, _)> = chunk.iter().map(|c| (c.id.clone(), c.kind)).collect();
             let payload = request_reviewers_batch_input(&reference, &refs, false);
-            tasks.push(mutations::write(self.state.read(cx), method::REQUEST_REVIEWERS, payload, cx));
+            tasks.push(self.write_pr(method::REQUEST_REVIEWERS, payload, cx));
         }
         cx.spawn(async move |this, cx| {
             let mut failed: Option<String> = None;
@@ -1636,7 +1744,7 @@ impl DetailView {
         let submitted_comments = self.review_draft.comments.clone();
         let submitted_ids: Vec<String> = submitted_comments.iter().map(|c| c.id.clone()).collect();
         let payload = submit_review_input(&self.reference, verdict, &body, &submitted_comments);
-        let task = mutations::write(self.state.read(cx), method::SUBMIT_REVIEW, payload, cx);
+        let task = self.write_pr(method::SUBMIT_REVIEW, payload, cx);
         let term = self.term();
         self.review_submitting = true;
         let window_handle = window.window_handle();
@@ -1697,7 +1805,7 @@ impl DetailView {
             return;
         }
         self.comment_submitting = true;
-        let task = mutations::write(self.state.read(cx), method::COMMENT, post_comment_input(&self.reference, &trimmed), cx);
+        let task = self.write_pr(method::COMMENT, post_comment_input(&self.reference, &trimmed), cx);
         let window_handle = window.window_handle();
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -1745,8 +1853,8 @@ impl DetailView {
             return;
         }
         self.comment_submitting = true;
-        let comment_task = mutations::write(self.state.read(cx), method::COMMENT, post_comment_input(&self.reference, &trimmed), cx);
-        let action_task = mutations::run_action(self.state.read(cx), action_input(&self.reference, action, None), cx);
+        let comment_task = self.write_pr(method::COMMENT, post_comment_input(&self.reference, &trimmed), cx);
+        let action_task = self.run_action_pr(action_input(&self.reference, action, None), cx);
         let term = self.term();
         let window_handle = window.window_handle();
         cx.notify();
@@ -1808,7 +1916,7 @@ impl DetailView {
         }
         edit.saving = true;
         let (comment_id, kind) = (edit.comment_id.clone(), edit.kind);
-        let task = mutations::write(self.state.read(cx), method::UPDATE_COMMENT, update_comment_input(&self.reference, &comment_id, kind, &body), cx);
+        let task = self.write_pr(method::UPDATE_COMMENT, update_comment_input(&self.reference, &comment_id, kind, &body), cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = settle(task).await;
@@ -1863,7 +1971,7 @@ impl DetailView {
             return;
         }
         self.reply_submitting = true;
-        let task = mutations::write(self.state.read(cx), method::REPLY_TO_THREAD, reply_to_thread_input(&self.reference, &thread_id, &body), cx);
+        let task = self.write_pr(method::REPLY_TO_THREAD, reply_to_thread_input(&self.reference, &thread_id, &body), cx);
         let window_handle = window.window_handle();
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -1892,7 +2000,7 @@ impl DetailView {
         if !self.loading_more_replies.insert(thread_id.clone()) {
             return;
         }
-        let task = read(self.state.read(cx), method::THREAD_COMMENTS, thread_comments_input(&self.reference, &thread_id, &cursor), decode::<ThreadCommentsPage>);
+        let task = self.read_pr(method::THREAD_COMMENTS, thread_comments_input(&self.reference, &thread_id, &cursor), decode::<ThreadCommentsPage>, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = settle(task).await;
@@ -1946,7 +2054,7 @@ impl DetailView {
         }
         entry.values.insert(content, (reacted, seq));
         let payload = set_reaction_input(&self.reference, subject_id.as_deref(), content, reacted);
-        let task = mutations::write(self.state.read(cx), method::SET_REACTION, payload, cx);
+        let task = self.write_pr(method::SET_REACTION, payload, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let res = settle(task).await;

@@ -13,6 +13,7 @@ use gpui::{
 };
 use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::composer::review::{Selection, Side as DiffSide, build_diff_comment};
 use t3_core::diff::{FileDiff, LineKind};
 use t3_core::pull_requests::editing::allowed_review_verdicts;
@@ -23,7 +24,7 @@ use t3_core::pull_requests::{PrRef, failure_message, method};
 
 use super::controls::{BadgeKind, Button, Size, Variant, badge};
 use super::detail::DetailView;
-use super::{read, settle};
+use super::{destination_error_message, owner_for_pr, read_for_owner, settle};
 use crate::app_state::{AppState, uuid_v4};
 use crate::icons::Icon;
 use crate::theme::{hsla, palette};
@@ -42,6 +43,7 @@ struct GuideCommentTarget {
 pub struct GuideTab {
     state: Entity<AppState>,
     detail_view: WeakEntity<DetailView>,
+    environment_id: Option<String>,
     reference: PrRef,
     result: Option<ReviewGuideResult>,
     loading: bool,
@@ -117,10 +119,17 @@ where
 }
 
 impl GuideTab {
-    pub fn new(state: Entity<AppState>, detail_view: WeakEntity<DetailView>, reference: PrRef, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        detail_view: WeakEntity<DetailView>,
+        environment_id: Option<String>,
+        reference: PrRef,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut tab = GuideTab {
             state,
             detail_view,
+            environment_id,
             reference,
             result: None,
             loading: false,
@@ -175,7 +184,9 @@ impl GuideTab {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let task = read(self.state.read(cx), method::REVIEW_GUIDE, self.reference.payload(), decode::<ReviewGuideResult>);
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, self.environment_id.as_deref(), &self.reference.project_id);
+        let task = read_for_owner(app, owner.as_ref(), method::REVIEW_GUIDE, self.reference.payload(), decode::<ReviewGuideResult>);
         self.loading = true;
         self.error = None;
         cx.notify();
@@ -193,25 +204,49 @@ impl GuideTab {
     }
 
     fn load_diff(&mut self, head_sha: String, wanted: HashSet<String>, cx: &mut Context<Self>) {
-        let Some(client) = self.state.read(cx).client_handle() else { return };
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, self.environment_id.as_deref(), &self.reference.project_id);
         let base_payload = self.reference.payload();
-        let task = self.state.read(cx).runtime().spawn(async move {
-            fetch_guide_diff_slices(&wanted, move |cursor| {
-                let client = client.clone();
-                let mut payload = base_payload.clone();
-                if let Some(cursor) = cursor {
-                    payload["cursor"] = serde_json::json!(cursor);
-                }
-                async move {
-                    let value = client
-                        .pull_request_diff(payload)
-                        .await
-                        .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
-                    decode::<DiffResult>(value)
-                }
+        let task = if let Some(owner) = owner {
+            let dest_fut = app.connections.destination(&owner, ORCHESTRATION_READ_SCOPE);
+            app.runtime().spawn(async move {
+                let client = dest_fut.await.map_err(destination_error_message)?.client;
+                fetch_guide_diff_slices(&wanted, move |cursor| {
+                    let client = client.clone();
+                    let mut payload = base_payload.clone();
+                    if let Some(cursor) = cursor {
+                        payload["cursor"] = serde_json::json!(cursor);
+                    }
+                    async move {
+                        let value = client
+                            .pull_request_diff(payload)
+                            .await
+                            .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
+                        decode::<DiffResult>(value)
+                    }
+                })
+                .await
             })
-            .await
-        });
+        } else {
+            let Some(client) = app.client_handle() else { return };
+            app.runtime().spawn(async move {
+                fetch_guide_diff_slices(&wanted, move |cursor| {
+                    let client = client.clone();
+                    let mut payload = base_payload.clone();
+                    if let Some(cursor) = cursor {
+                        payload["cursor"] = serde_json::json!(cursor);
+                    }
+                    async move {
+                        let value = client
+                            .pull_request_diff(payload)
+                            .await
+                            .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
+                        decode::<DiffResult>(value)
+                    }
+                })
+                .await
+            })
+        };
         self._diff = Some(cx.spawn(async move |this, cx| {
             let res = task.await.unwrap_or_else(|e| Err(e.to_string()));
             let _ = this.update(cx, |tab, cx| {
@@ -232,7 +267,9 @@ impl GuideTab {
         if self.generating {
             return;
         }
-        let task = read(self.state.read(cx), method::GENERATE_REVIEW_GUIDE, self.reference.payload(), decode::<ReviewGuideResult>);
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, self.environment_id.as_deref(), &self.reference.project_id);
+        let task = read_for_owner(app, owner.as_ref(), method::GENERATE_REVIEW_GUIDE, self.reference.payload(), decode::<ReviewGuideResult>);
         self.generating = true;
         cx.notify();
         self._fetch = Some(cx.spawn(async move |this, cx| {
@@ -1118,7 +1155,7 @@ mod tests {
             detail_view.update(cx, |v, _| v.detail = Some(readonly_detail));
             (state, detail_view)
         });
-        let (guide, cx) = cx.add_window_view(|_window, cx| GuideTab::new(state.clone(), detail_view.downgrade(), reference.clone(), cx));
+        let (guide, cx) = cx.add_window_view(|_window, cx| GuideTab::new(state.clone(), detail_view.downgrade(), None, reference.clone(), cx));
         guide.update(cx, |guide, cx| {
             guide.set_result_for_test(sample_guide_result(), Vec::new(), cx);
             // Viewer with no allowed review verdicts cannot finish review.
@@ -1202,7 +1239,7 @@ mod tests {
             detail_view.update(cx, |v, _| v.detail = Some(writable_detail));
             (state, detail_view)
         });
-        let (guide, vcx) = cx.add_window_view(|_window, cx| GuideTab::new(state.clone(), detail_view.downgrade(), reference.clone(), cx));
+        let (guide, vcx) = cx.add_window_view(|_window, cx| GuideTab::new(state.clone(), detail_view.downgrade(), None, reference.clone(), cx));
         let t3_core::diff::ParsedPatch::Files(files) = t3_core::diff::parse_patch(
             "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
         ) else {

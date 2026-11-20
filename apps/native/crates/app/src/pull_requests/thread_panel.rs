@@ -29,7 +29,7 @@ use super::controls::{Button, Size, Variant, checks_glyph, glyph, state_glyph};
 use super::detail::{DetailView, has_held_detail, prefetch_into_held};
 use super::page::INTENT_PREFETCH_DELAY;
 use super::preview::{LinkPreviewController, PreviewTarget};
-use super::{LinkPullRequest, OpenPullRequests, read, settle};
+use super::{LinkPullRequest, OpenPullRequests, owner_for_pr, read_for_owner, settle};
 use crate::app_state::{AppEvent, AppState, uuid_v4};
 use crate::icons::Icon;
 use crate::right_panel::tooltip_view;
@@ -133,8 +133,10 @@ impl ThreadPullRequestsPanel {
                 }
                 let mut detail_input = reference.payload();
                 detail_input["allowStale"] = json!(false);
-                let detail_task = read(this.state.read(cx), method::DETAIL, detail_input, decode::<Detail>);
-                let activity_task = read(this.state.read(cx), method::ACTIVITY, reference.payload(), decode::<Activity>);
+                let app = this.state.read(cx);
+                let owner = owner_for_pr(app, None, &reference.project_id);
+                let detail_task = read_for_owner(app, owner.as_ref(), method::DETAIL, detail_input, decode::<Detail>);
+                let activity_task = read_for_owner(app, owner.as_ref(), method::ACTIVITY, reference.payload(), decode::<Activity>);
                 let reference_done = reference.clone();
                 this._intent_fetch = Some(cx.spawn(async move |this, cx| {
                     let (detail_res, activity_res) = futures::future::join(settle(detail_task), settle(activity_task)).await;
@@ -510,7 +512,7 @@ impl ThreadPullRequestsPanel {
             updated_at: snapshot.updated_at.clone(),
             observed_at: None,
         });
-        PreviewTarget { reference: reference.clone(), url: link.url.clone(), fallback }
+        PreviewTarget { environment_id: None, reference: reference.clone(), url: link.url.clone(), fallback }
     }
 
     fn row(&self, item: &FlattenedLink, project_id: Option<&str>, index: usize, cx: &mut Context<Self>) -> impl IntoElement {

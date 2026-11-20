@@ -22,11 +22,11 @@ use t3_core::diff::{
 use t3_core::pull_requests::anchor::{Range, Side, diff_path_matches, resolve_anchor_range};
 use t3_core::pull_requests::review::{files_viewed_map, pending_comment_from_diff, to_inline_review_threads};
 use t3_core::pull_requests::wire::{Activity, Detail, DiffResult, FilesViewedResult, OmittedFileStat, decode};
-use t3_core::pull_requests::{PrRef, failure_message, method};
+use t3_core::pull_requests::{PrRef, method};
 
 use super::controls::{Button, Size, Variant};
 use super::detail::DetailView;
-use super::{read, settle};
+use super::{diff_for_owner, owner_for_pr, read_for_owner, settle};
 use crate::app_state::AppState;
 use crate::diff::{DiffPanel, External, Parsed, ViewedTarget, WithheldFileStatus};
 use crate::icons::Icon;
@@ -38,6 +38,7 @@ const NEAR_END: f32 = 240.;
 pub struct CodeTab {
     state: Entity<AppState>,
     detail_view: WeakEntity<DetailView>,
+    environment_id: Option<String>,
     reference: PrRef,
     panel: Entity<DiffPanel>,
     /// Each slice's own parse, in order.
@@ -79,6 +80,7 @@ pub struct CodeTab {
 }
 
 pub struct CodeTabInit<'a> {
+    pub environment_id: Option<String>,
     pub detail: Option<&'a Detail>,
     pub activity: Option<&'a Activity>,
     pub can_write: bool,
@@ -93,7 +95,7 @@ impl CodeTab {
         init: CodeTabInit<'_>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let CodeTabInit { detail, activity, can_write, prefetched } = init;
+        let CodeTabInit { environment_id, detail, activity, can_write, prefetched } = init;
         let panel = cx.new(|cx| DiffPanel::detached(state.clone(), cx));
         let this = cx.entity().downgrade();
         let rows = panel.downgrade();
@@ -118,6 +120,7 @@ impl CodeTab {
         let mut tab = CodeTab {
             state,
             detail_view,
+            environment_id,
             reference,
             panel,
             slices: Vec::new(),
@@ -259,7 +262,9 @@ impl CodeTab {
             return;
         }
         let target = self.viewed_target(can_write);
-        let task = read(self.state.read(cx), method::FILES_VIEWED, self.reference.payload(), decode::<FilesViewedResult>);
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, self.environment_id.as_deref(), &self.reference.project_id);
+        let task = read_for_owner(app, owner.as_ref(), method::FILES_VIEWED, self.reference.payload(), decode::<FilesViewedResult>);
         self._viewed = Some(cx.spawn(async move |this, cx| {
             let Ok(result) = settle(task).await else { return };
             let states = files_viewed_map(&result);
@@ -363,7 +368,14 @@ impl CodeTab {
     /// `pingdotgg/t3code#37007`). Unfolds the file when `unfold_on_success` is true (first click),
     /// while preserving reader fold state when re-fetching after a refresh.
     pub fn load_withheld_file(&mut self, path: String, unfold_on_success: bool, cx: &mut Context<Self>) {
-        let Some(client) = self.state.read(cx).client_handle() else {
+        let mut payload = self.reference.payload();
+        payload["path"] = json!(path);
+        if let Some(commit) = &self.commit {
+            payload["commit"] = json!(commit);
+        }
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, self.environment_id.as_deref(), &self.reference.project_id);
+        let Some(diff_task) = diff_for_owner(app, owner.as_ref(), payload) else {
             self.withheld_status.insert(path, WithheldFileStatus::Error(super::NOT_CONNECTED.to_owned()));
             self.sync_withheld_panel(cx);
             return;
@@ -372,18 +384,10 @@ impl CodeTab {
         self.withheld_status.insert(path.clone(), WithheldFileStatus::Loading);
         self.sync_withheld_panel(cx);
 
-        let mut payload = self.reference.payload();
-        payload["path"] = json!(path);
-        if let Some(commit) = &self.commit {
-            payload["commit"] = json!(commit);
-        }
         let generation = self.generation;
         let path_for_fetch = path.clone();
         let task = self.state.read(cx).runtime().spawn(async move {
-            let value = client
-                .pull_request_diff(payload)
-                .await
-                .map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
+            let value = settle(Some(diff_task)).await?;
             let diff: DiffResult = decode(value)?;
             let cut = has_cut_lines(&diff.patch);
             let parsed = Parsed::new(&diff.patch, diff.truncated, None, None, None);
@@ -448,10 +452,6 @@ impl CodeTab {
         {
             self.last_requested_cursor = cursor.clone();
         }
-        let Some(client) = self.state.read(cx).client_handle() else {
-            self.error = Some(super::NOT_CONNECTED.to_owned());
-            return self.show(cx);
-        };
         let mut payload = self.reference.payload();
         if let Some(cursor) = &cursor {
             payload["cursor"] = json!(cursor);
@@ -459,8 +459,14 @@ impl CodeTab {
         if let Some(commit) = &self.commit {
             payload["commit"] = json!(commit);
         }
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, self.environment_id.as_deref(), &self.reference.project_id);
+        let Some(diff_task) = diff_for_owner(app, owner.as_ref(), payload) else {
+            self.error = Some(super::NOT_CONNECTED.to_owned());
+            return self.show(cx);
+        };
         let task = self.state.read(cx).runtime().spawn(async move {
-            let value = client.pull_request_diff(payload).await.map_err(|failure| failure_message(failure.tag.as_deref(), &failure.error, &failure.message))?;
+            let value = settle(Some(diff_task)).await?;
             decode::<DiffResult>(value)
         });
         let generation = self.generation;
@@ -806,7 +812,7 @@ mod tests {
                     state,
                     WeakEntity::new_invalid(),
                     reference,
-                    CodeTabInit { detail: Some(&detail), activity: Some(&activity), can_write: true, prefetched: None },
+                    CodeTabInit { environment_id: None, detail: Some(&detail), activity: Some(&activity), can_write: true, prefetched: None },
                     cx,
                 )
             });
@@ -872,7 +878,7 @@ mod tests {
                     state,
                     WeakEntity::new_invalid(),
                     reference,
-                    CodeTabInit { detail: None, activity: None, can_write: true, prefetched: Some(prefetched) },
+                    CodeTabInit { environment_id: None, detail: None, activity: None, can_write: true, prefetched: Some(prefetched) },
                     cx,
                 )
             });

@@ -18,6 +18,7 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{h_flex, v_flex};
 use t3_client::store;
 use t3_client::supervisor::ConnectionStatus;
+use t3_core::auth::ORCHESTRATION_READ_SCOPE;
 use t3_core::issues::saved_views::{
     create_saved_view, decode_saved_views, delete_saved_view, rename_saved_view,
     update_saved_view_preferences,
@@ -42,11 +43,11 @@ use t3_core::pull_requests::{
 use t3_core::sidebar::grouping::EnvironmentOwner;
 
 use super::controls::{Button, Size, Variant};
-use super::detail::{DetailView, has_held_detail, prefetch_into_held};
+use super::detail::{DetailView, has_held_detail_in_env, prefetch_into_held_in_env};
 use super::mutations::{self, MergePicks, Mutations};
 use super::preview::{LinkPreviewController, PreviewTarget};
 use super::thread_panel::PendingSelection;
-use super::{read, read_for_owner, settle};
+use super::{owner_for_pr, read, read_for_owner, settle};
 use crate::app_state::{AppEvent, AppState};
 use crate::icons::Icon;
 use crate::sidebar::controller::now_ms;
@@ -100,6 +101,10 @@ impl Drop for Refreshes {
 
 const REFRESH_RETRY_MIN: Duration = Duration::from_secs(1);
 const REFRESH_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Cooldown after a transient RPC failure on a connected fleet environment before retrying its
+/// shared repositories (`pingdotgg/t3code#34088`). Disconnected environments remain excluded via
+/// live `ConnectionStatus` until reconnect.
+const UNREACHABLE_TTL_MS: i64 = 30_000;
 
 struct PrFleetTarget {
     owner: Option<EnvironmentOwner>,
@@ -114,20 +119,43 @@ struct FleetInventory {
     unreachable: HashSet<String>,
 }
 
+enum FetchCursors {
+    Single(HashMap<String, String>),
+    PerEnv {
+        cursors: HashMap<String, HashMap<String, String>>,
+        regrown: HashSet<String>,
+    },
+}
+
+struct MergedFleetList {
+    result: ListResult,
+    entry_environments: HashMap<String, String>,
+    next_cursors_by_env: HashMap<String, HashMap<String, String>>,
+    truncated_envs: HashSet<String>,
+}
+
 /// Merges multi-environment `pullRequests.list` results using `merge_pull_request_lists` so
-/// cross-server duplicates are collapsed by `entry.url` (`pingdotgg/t3code#37704`).
-fn merge_fleet_list_results(answers: &[(String, ListResult)]) -> ListResult {
+/// cross-server duplicates are collapsed by `entry.url` (`pingdotgg/t3code#37704`), while
+/// retaining each entry's owning `environment_id` and per-environment pagination cursors.
+fn merge_fleet_list_results(answers: &[(String, ListResult)]) -> MergedFleetList {
     let slices: Vec<(&str, &[t3_core::pull_requests::wire::ListEntry])> = answers
         .iter()
         .map(|(env_id, result)| (env_id.as_str(), result.entries.as_slice()))
         .collect();
-    let entries = merge_pull_request_lists(&slices).into_iter().map(|item| item.entry).collect();
+    let merged_entries = merge_pull_request_lists(&slices);
+    let mut entry_environments = HashMap::with_capacity(merged_entries.len());
+    let mut entries = Vec::with_capacity(merged_entries.len());
+    for item in merged_entries {
+        entry_environments.insert(PrRef::of(&item.entry).key(), item.environment_id);
+        entries.push(item.entry);
+    }
     let mut viewers: HashMap<String, String> = HashMap::new();
     let mut providers: HashMap<String, ProviderSummary> = HashMap::new();
     let mut errors = Vec::new();
     let mut truncated = false;
-    let mut next_cursors: HashMap<String, String> = HashMap::new();
-    for (_, answer) in answers {
+    let mut next_cursors_by_env: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut truncated_envs: HashSet<String> = HashSet::new();
+    for (env_id, answer) in answers {
         for (host, login) in &answer.viewers {
             viewers.entry(host.clone()).or_insert_with(|| login.clone());
         }
@@ -142,18 +170,26 @@ fn merge_fleet_list_results(answers: &[(String, ListResult)]) -> ListResult {
                 .or_insert_with(|| provider.clone());
         }
         errors.extend(answer.errors.iter().cloned());
-        truncated |= answer.truncated;
-        for (k, v) in &answer.next_cursors {
-            next_cursors.entry(k.clone()).or_insert_with(|| v.clone());
+        if answer.truncated {
+            truncated = true;
+            truncated_envs.insert(env_id.clone());
+        }
+        if !answer.next_cursors.is_empty() {
+            next_cursors_by_env.insert(env_id.clone(), answer.next_cursors.clone());
         }
     }
-    ListResult {
-        entries,
-        viewers,
-        providers: providers.into_values().collect(),
-        errors,
-        truncated,
-        next_cursors,
+    MergedFleetList {
+        result: ListResult {
+            entries,
+            viewers,
+            providers: providers.into_values().collect(),
+            errors,
+            truncated,
+            next_cursors: HashMap::new(),
+        },
+        entry_environments,
+        next_cursors_by_env,
+        truncated_envs,
     }
 }
 
@@ -191,8 +227,16 @@ pub struct PullRequestsPage {
     restat: bool,
     /// Host availability and stacked project-assignment column state (`pullRequestProjectAssignment.logic.ts`).
     host_availability: HostAvailability,
-    /// Environments whose latest fleet PR list read failed or are disconnected (`pingdotgg/t3code#34088`).
-    unreachable_environments: HashSet<String>,
+    /// Connected fleet environments whose latest PR list read failed, mapped to retry deadline ms (`pingdotgg/t3code#34088`).
+    unreachable_environments: HashMap<String, i64>,
+    /// Owning fleet environment id for each merged list entry, keyed by `PrRef::key()`.
+    entry_environments: HashMap<String, String>,
+    /// Per-environment pagination cursors from the latest fleet list read (`PullRequestsPage.tsx:342`).
+    next_cursors_by_env: HashMap<String, HashMap<String, String>>,
+    /// Fleet environments whose latest page reported `truncated == true`.
+    truncated_envs: HashSet<String>,
+    /// Currently connected enabled fleet environment ids (for reconnect detection in `sync`).
+    connected_fleet_envs: HashSet<String>,
     projects_column_open: bool,
     /// Per-project counts preserved across project-scoped reads, keyed by `(env, unfiltered_scope_key)`.
     project_counts_scope: Option<(String, String)>,
@@ -211,9 +255,9 @@ pub struct PullRequestsPage {
     focus: FocusHandle,
     connected: bool,
     open: bool,
-    refreshes: Option<Refreshes>,
-    /// The refresh epoch the held reads answer to.
-    epoch: Option<u64>,
+    refreshes: Vec<Refreshes>,
+    /// The refresh epoch each environment's held reads answer to.
+    epochs: HashMap<String, u64>,
     _debounce: Option<Task<()>>,
     _list: Option<Task<()>>,
     _options: Option<Task<()>>,
@@ -271,7 +315,11 @@ impl PullRequestsPage {
             requested: HashSet::new(),
             restat: false,
             host_availability: HashMap::new(),
-            unreachable_environments: HashSet::new(),
+            unreachable_environments: HashMap::new(),
+            entry_environments: HashMap::new(),
+            next_cursors_by_env: HashMap::new(),
+            truncated_envs: HashSet::new(),
+            connected_fleet_envs: HashSet::new(),
             projects_column_open: true,
             project_counts_scope: None,
             project_counts: HashMap::new(),
@@ -286,8 +334,8 @@ impl PullRequestsPage {
             focus: cx.focus_handle(),
             connected: false,
             open: false,
-            refreshes: None,
-            epoch: None,
+            refreshes: Vec::new(),
+            epochs: HashMap::new(),
             _debounce: None,
             _list: None,
             _options: None,
@@ -372,12 +420,45 @@ impl PullRequestsPage {
         }
     }
 
-    /// Reads when the page is shown and connected, again on reopening and on reconnecting, and
-    /// follows the refresh signal only while both hold.
+    /// Owning fleet environment id for a listed pull request, if tracked.
+    pub(super) fn entry_environment(&self, reference: &PrRef) -> Option<&str> {
+        self.entry_environments.get(&reference.key()).map(String::as_str)
+    }
+
+    /// Reads when the page is shown and at least one environment is connected (active or fleet),
+    /// again on reopening and on reconnecting, and follows refresh signals while open.
     fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let connected = state.client_handle().is_some() && matches!(state.phase, crate::app_state::Phase::Online(t3_client::supervisor::ConnectionStatus::Connected));
+        let active_connected = state.client_handle().is_some()
+            && matches!(state.phase, crate::app_state::Phase::Online(ConnectionStatus::Connected));
+        let live_fleet_envs: HashSet<String> = state
+            .fleet
+            .environments
+            .iter()
+            .filter(|env| {
+                env.status == ConnectionStatus::Connected
+                    && !state
+                        .environments
+                        .environments
+                        .iter()
+                        .any(|saved| saved.id == env.summary.owner.saved_id && saved.disabled)
+            })
+            .map(|env| env.summary.owner.saved_id.clone())
+            .collect();
+        let connected = if !state.fleet.environments.is_empty() {
+            !live_fleet_envs.is_empty()
+        } else {
+            active_connected
+        };
         let open = state.pull_requests_open;
+        let fleet_changed = live_fleet_envs != self.connected_fleet_envs;
+        // Any environment that just transitioned to Connected clears any prior transient failure mark.
+        for env_id in &live_fleet_envs {
+            if !self.connected_fleet_envs.contains(env_id) {
+                self.unreachable_environments.remove(env_id);
+            }
+        }
+        self.connected_fleet_envs = live_fleet_envs;
         let returned = connected && open && (!self.connected || !self.open);
         if open && let Some((reference, url)) = cx.try_global::<PendingSelection>().and_then(|pending| pending.0.clone()) {
             cx.set_global(PendingSelection(None));
@@ -389,17 +470,17 @@ impl PullRequestsPage {
         self.connected = connected;
         self.open = open;
         if !(open && connected) {
-            self.refreshes = None;
-            self.epoch = None;
+            self.refreshes.clear();
+            self.epochs.clear();
             self.cancel_intent();
             self.preview.clear();
-        } else if self.refreshes.is_none() {
+        } else if self.refreshes.is_empty() || fleet_changed {
             self.follow_refreshes(cx);
         }
         if open && self.data.result.is_none() {
             self.hydrate_from_cache(cx);
         }
-        if open && connected && (returned || self.data.key.is_none()) {
+        if open && connected && (returned || fleet_changed || self.data.key.is_none()) {
             self.refetch(cx);
             self.fetch_options(cx);
             if returned && let Some(detail) = &self.detail {
@@ -420,7 +501,8 @@ impl PullRequestsPage {
         };
         let state_entity = self.state.clone();
         self.preview.hover(&state_entity, Some(preview_target), |page: &mut Self| &mut page.preview, cx);
-        if self.selected.as_ref() == Some(&reference) || has_held_detail(self.state.read(cx), &reference, cx) {
+        let env_id = self.entry_environment(&reference);
+        if self.selected.as_ref() == Some(&reference) || has_held_detail_in_env(self.state.read(cx), env_id, &reference, cx) {
             self.cancel_intent();
             return;
         }
@@ -451,14 +533,17 @@ impl PullRequestsPage {
         }
         let mut payload = reference.payload();
         payload["allowStale"] = serde_json::json!(false);
-        let detail_task = read(self.state.read(cx), method::DETAIL, payload, decode::<Detail>);
-        let activity_task = read(self.state.read(cx), method::ACTIVITY, reference.payload(), decode::<Activity>);
+        let env_id = self.entry_environment(&reference).map(str::to_owned);
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, env_id.as_deref(), &reference.project_id);
+        let detail_task = read_for_owner(app, owner.as_ref(), method::DETAIL, payload, decode::<Detail>);
+        let activity_task = read_for_owner(app, owner.as_ref(), method::ACTIVITY, reference.payload(), decode::<Activity>);
         self._intent_fetch = Some(cx.spawn(async move |this, cx| {
             let (detail, activity) = (settle(detail_task).await.ok(), settle(activity_task).await.ok());
             let _ = this.update(cx, |page, cx| {
                 if page.is_listed(&reference) {
                     let state = page.state.clone();
-                    prefetch_into_held(&state, &reference, detail.as_ref(), activity.as_ref(), cx);
+                    prefetch_into_held_in_env(&state, env_id.as_deref(), &reference, detail.as_ref(), activity.as_ref(), cx);
                 }
             });
         }));
@@ -471,7 +556,10 @@ impl PullRequestsPage {
             return;
         }
         self.row_stack_loading.insert(key.clone());
-        let task = read(self.state.read(cx), method::STACK, reference.payload(), decode::<Option<Stack>>);
+        let env_id = self.entry_environment(&reference);
+        let app = self.state.read(cx);
+        let owner = owner_for_pr(app, env_id, &reference.project_id);
+        let task = read_for_owner(app, owner.as_ref(), method::STACK, reference.payload(), decode::<Option<Stack>>);
         cx.spawn(async move |this, cx| {
             let res = settle(task).await;
             let _ = this.update(cx, |page, cx| {
@@ -484,8 +572,71 @@ impl PullRequestsPage {
     }
 
     fn follow_refreshes(&mut self, cx: &mut Context<Self>) {
+        self.refreshes.clear();
         let state = self.state.read(cx);
+        if !state.fleet.environments.is_empty() {
+            let owners: Vec<(String, EnvironmentOwner)> = state
+                .fleet
+                .environments
+                .iter()
+                .filter(|env| {
+                    env.status == ConnectionStatus::Connected
+                        && !state
+                            .environments
+                            .environments
+                            .iter()
+                            .any(|saved| saved.id == env.summary.owner.saved_id && saved.disabled)
+                })
+                .map(|env| (env.summary.owner.saved_id.clone(), env.summary.owner.clone()))
+                .collect();
+            for (env_id, owner) in owners {
+                let dest_fut = state.connections.destination(&owner, ORCHESTRATION_READ_SCOPE);
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                let net = state.runtime().spawn(async move {
+                    let Ok(dest) = dest_fut.await else { return };
+                    let client = dest.client;
+                    let mut delay = REFRESH_RETRY_MIN;
+                    loop {
+                        match client.stream(method::SUBSCRIBE_REFRESHES, serde_json::json!({})).await {
+                            Ok(mut stream) => {
+                                while let Some(item) = stream.receiver.recv().await {
+                                    match item {
+                                        Ok(value) => {
+                                            delay = REFRESH_RETRY_MIN;
+                                            if let Some(epoch) = value.as_u64()
+                                                && tx.send(epoch).is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        Err(t3_client::session::RpcError::Failure(failure)) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") => return,
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            Err(t3_client::session::RpcError::Failure(failure)) if failure.tag.as_deref() == Some("EnvironmentAuthorizationError") => return,
+                            Err(_) => {}
+                        }
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(REFRESH_RETRY_MAX);
+                    }
+                });
+                let ui = cx.spawn(async move |this, cx| {
+                    while let Some(mut epoch) = rx.recv().await {
+                        while let Ok(later) = rx.try_recv() {
+                            epoch = later;
+                        }
+                        if this.update(cx, |this, cx| this.refreshed(&env_id, epoch, cx)).is_err() {
+                            return;
+                        }
+                    }
+                });
+                self.refreshes.push(Refreshes { net, _ui: ui });
+            }
+            return;
+        }
         let Some(client) = state.client_handle() else { return };
+        let env_id = self.environment_key(cx).unwrap_or_else(|| "local".into());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
         let net = state.runtime().spawn(async move {
             let mut delay = REFRESH_RETRY_MIN;
@@ -519,19 +670,18 @@ impl PullRequestsPage {
                 while let Ok(later) = rx.try_recv() {
                     epoch = later;
                 }
-                if this.update(cx, |this, cx| this.refreshed(epoch, cx)).is_err() {
+                if this.update(cx, |this, cx| this.refreshed(&env_id, epoch, cx)).is_err() {
                     return;
                 }
             }
         });
-        self.refreshes = Some(Refreshes { net, _ui: ui });
+        self.refreshes.push(Refreshes { net, _ui: ui });
     }
 
     /// A new epoch means the host's reads moved on (a turn ended, or any client wrote). The first
-    /// one heard only marks where the reads made on opening stand.
-    fn refreshed(&mut self, epoch: u64, cx: &mut Context<Self>) {
-        let moved = self.epoch.is_some_and(|held| held != epoch);
-        self.epoch = Some(epoch);
+    /// one heard for an environment only marks where the reads made on opening stand.
+    fn refreshed(&mut self, env_id: &str, epoch: u64, cx: &mut Context<Self>) {
+        let moved = self.epochs.insert(env_id.to_owned(), epoch).is_some_and(|held| held != epoch);
         if !moved {
             return;
         }
@@ -616,64 +766,143 @@ impl PullRequestsPage {
         self.fetch(None, false, cx);
     }
 
+    pub(super) fn retry_fetch(&mut self, cx: &mut Context<Self>) {
+        self.unreachable_environments.clear();
+        self.refetch(cx);
+    }
+
+    /// Computes the per-environment `pullRequests.list` requests for fleet mode: scopes each
+    /// environment to its assigned `projectIds`, passes only that environment's own pagination
+    /// cursors (`PullRequestsPage.tsx:366-388`), and skips environments with no cursor/regrowth
+    /// during cursor continuation.
+    fn plan_fleet_requests(
+        &self,
+        inventory: &FleetInventory,
+        cursors: Option<&FetchCursors>,
+    ) -> Vec<(String, Option<EnvironmentOwner>, serde_json::Value)> {
+        let slices = pull_request_project_queries_with_unreachable(
+            &inventory.projects,
+            &inventory.env_ids,
+            Some(&self.host_availability),
+            Some(&inventory.unreachable),
+        );
+        let mut planned = Vec::new();
+        for slice in slices {
+            let Some(target) = inventory.targets.get(&slice.environment_id).filter(|t| t.connected) else {
+                continue;
+            };
+            if let Some(scoped) = self.prefs.project_id.as_deref() {
+                let owns_scoped = match &slice.project_ids {
+                    Some(ids) => ids.iter().any(|id| id == scoped),
+                    None => inventory
+                        .projects
+                        .iter()
+                        .any(|p| p.environment_id == slice.environment_id && p.id == scoped),
+                };
+                if !owns_scoped {
+                    continue;
+                }
+            }
+            let env_cursors = match cursors {
+                None => None,
+                Some(FetchCursors::Single(map)) => Some(map),
+                Some(FetchCursors::PerEnv { cursors, regrown }) => {
+                    let next = cursors.get(&slice.environment_id).filter(|map| !map.is_empty());
+                    if next.is_none() && !regrown.contains(&slice.environment_id) {
+                        continue;
+                    }
+                    next
+                }
+            };
+            let mut input = list_input(&self.prefs, &self.sent, self.data.page_size, env_cursors);
+            if self.prefs.project_id.is_none()
+                && let Some(project_ids) = &slice.project_ids
+                && let Some(obj) = input.as_object_mut()
+            {
+                obj.insert("projectIds".into(), serde_json::json!(project_ids));
+            }
+            planned.push((slice.environment_id, target.owner.clone(), input));
+        }
+        planned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn planned_fleet_requests(
+        &self,
+        per_env_cursors: Option<HashMap<String, HashMap<String, String>>>,
+        cx: &App,
+    ) -> Vec<(String, serde_json::Value)> {
+        let inventory = self.fleet_inventory(cx);
+        let fetch_cursors = per_env_cursors.map(|cursors| FetchCursors::PerEnv {
+            regrown: self
+                .truncated_envs
+                .iter()
+                .filter(|env_id| !cursors.contains_key(*env_id))
+                .cloned()
+                .collect(),
+            cursors,
+        });
+        self.plan_fleet_requests(&inventory, fetch_cursors.as_ref())
+            .into_iter()
+            .map(|(env_id, _, input)| (env_id, input))
+            .collect()
+    }
+
     /// `refreshing` re-reads the first page under rows that later cursors added. Queries across
     /// all reachable fleet environments using `pull_request_project_queries_with_unreachable`
     /// (`pingdotgg/t3code#34088`) and deduplicates cross-server results by URL (`pingdotgg/t3code#37704`).
-    fn fetch(&mut self, cursors: Option<HashMap<String, String>>, refreshing: bool, cx: &mut Context<Self>) {
+    fn fetch(&mut self, cursors: Option<FetchCursors>, refreshing: bool, cx: &mut Context<Self>) {
         let appending = cursors.is_some();
         let key = self.scope_key();
-        let state = self.state.read(cx);
-        let FleetInventory { projects, env_ids, targets, unreachable, .. } = self.fleet_inventory(cx);
-        if targets.len() > 1 {
-            let slices = pull_request_project_queries_with_unreachable(
-                &projects,
-                &env_ids,
-                Some(&self.host_availability),
-                Some(&unreachable),
-            );
-            let mut dispatched = Vec::new();
-            for slice in slices {
-                let Some(target) = targets.get(&slice.environment_id).filter(|t| t.connected) else {
-                    continue;
-                };
-                if let Some(scoped) = self.prefs.project_id.as_deref() {
-                    let owns_scoped = match &slice.project_ids {
-                        Some(ids) => ids.iter().any(|id| id == scoped),
-                        None => projects
-                            .iter()
-                            .any(|p| p.environment_id == slice.environment_id && p.id == scoped),
+        let fleet_mode = !self.state.read(cx).fleet.environments.is_empty();
+        if fleet_mode {
+            let inventory = self.fleet_inventory(cx);
+            let planned = self.plan_fleet_requests(&inventory, cursors.as_ref());
+            if planned.is_empty() {
+                if inventory.projects.is_empty() {
+                    self.apply_list(key, appending, refreshing, Ok(ListResult::default()), cx);
+                } else if appending {
+                    self.data.pending = false;
+                    self.data.loading_more = false;
+                    cx.notify();
+                } else {
+                    let message = if self.prefs.project_id.is_some() {
+                        "The environment for this project is currently offline.".to_owned()
+                    } else {
+                        super::NOT_CONNECTED.to_owned()
                     };
-                    if !owns_scoped {
-                        continue;
-                    }
+                    self.apply_list(key, appending, refreshing, Err(message), cx);
                 }
-                let mut input = list_input(&self.prefs, &self.sent, self.data.page_size, cursors.as_ref());
-                if self.prefs.project_id.is_none()
-                    && let Some(project_ids) = &slice.project_ids
-                    && let Some(obj) = input.as_object_mut()
-                {
-                    obj.insert("projectIds".into(), serde_json::json!(project_ids));
-                }
-                let task = read_for_owner(state, target.owner.as_ref(), method::LIST, input, decode::<ListResult>);
-                dispatched.push((slice.environment_id, task));
-            }
-            if !dispatched.is_empty() {
-                self.data.pending = true;
-                self.data.loading_more = appending;
-                self._list = Some(cx.spawn(async move |this, cx| {
-                    let mut settled = Vec::with_capacity(dispatched.len());
-                    for (env_id, task) in dispatched {
-                        settled.push((env_id, settle(task).await));
-                    }
-                    let _ = this.update(cx, |this, cx| {
-                        this.apply_fleet_lists(key, appending, refreshing, settled, cx);
-                    });
-                }));
-                cx.notify();
                 return;
             }
+            let state = self.state.read(cx);
+            let dispatched: Vec<_> = planned
+                .into_iter()
+                .map(|(env_id, owner, input)| {
+                    let task = read_for_owner(state, owner.as_ref(), method::LIST, input, decode::<ListResult>);
+                    (env_id, task)
+                })
+                .collect();
+            self.data.pending = true;
+            self.data.loading_more = appending;
+            self._list = Some(cx.spawn(async move |this, cx| {
+                let mut settled = Vec::with_capacity(dispatched.len());
+                for (env_id, task) in dispatched {
+                    settled.push((env_id, settle(task).await));
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.apply_fleet_lists(key, appending, refreshing, settled, cx);
+                });
+            }));
+            cx.notify();
+            return;
         }
-        let input = list_input(&self.prefs, &self.sent, self.data.page_size, cursors.as_ref());
+        let single_cursors = match &cursors {
+            Some(FetchCursors::Single(map)) => Some(map),
+            _ => None,
+        };
+        let state = self.state.read(cx);
+        let input = list_input(&self.prefs, &self.sent, self.data.page_size, single_cursors);
         let task = read(state, method::LIST, input, decode::<ListResult>);
         self.data.pending = true;
         self.data.loading_more = appending;
@@ -685,7 +914,8 @@ impl PullRequestsPage {
     }
 
     /// Merges multi-environment `pullRequests.list` responses, deduplicating PRs across servers
-    /// by URL (`pingdotgg/t3code#37704`) and tracking unreachable environments (`pingdotgg/t3code#34088`).
+    /// by URL (`pingdotgg/t3code#37704`), preserving owning `environment_id` + per-environment
+    /// cursors, and tracking unreachable environments (`pingdotgg/t3code#34088`).
     pub(crate) fn apply_fleet_lists(
         &mut self,
         key: String,
@@ -697,17 +927,18 @@ impl PullRequestsPage {
         if key != self.scope_key() {
             return;
         }
+        let now = now_ms();
         let mut ok_answers: Vec<(String, ListResult)> = Vec::new();
         let mut first_error: Option<String> = None;
         for (env_id, outcome) in answers {
             match outcome {
                 Ok(result) => {
                     self.unreachable_environments.remove(&env_id);
-                    self.host_availability = remember_hosts(&self.host_availability, &[(env_id.as_str(), &result.providers, now_ms())]);
+                    self.host_availability = remember_hosts(&self.host_availability, &[(env_id.as_str(), &result.providers, now)]);
                     ok_answers.push((env_id, result));
                 }
                 Err(error) => {
-                    self.unreachable_environments.insert(env_id);
+                    self.unreachable_environments.insert(env_id, now + UNREACHABLE_TTL_MS);
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -718,8 +949,40 @@ impl PullRequestsPage {
             self.apply_list(key, appending, refreshing, Err(first_error.unwrap_or_else(|| super::NOT_CONNECTED.to_owned())), cx);
             return;
         }
-        let merged = merge_fleet_list_results(&ok_answers);
-        self.apply_list(key, appending, refreshing, Ok(merged), cx);
+        let mut merged = merge_fleet_list_results(&ok_answers);
+        let keeping_later_pages = refreshing
+            && self
+                .data
+                .result
+                .as_ref()
+                .is_some_and(|previous| previous.entries.len() > self.data.first_page && self.data.key.as_deref() == Some(key.as_str()));
+        if !appending && !keeping_later_pages {
+            self.entry_environments = merged.entry_environments;
+            self.next_cursors_by_env = merged.next_cursors_by_env;
+            self.truncated_envs = merged.truncated_envs;
+        } else if appending {
+            for (pr_key, env_id) in merged.entry_environments {
+                self.entry_environments.entry(pr_key).or_insert(env_id);
+            }
+            for (env_id, _) in &ok_answers {
+                if let Some(next) = merged.next_cursors_by_env.remove(env_id) {
+                    self.next_cursors_by_env.insert(env_id.clone(), next);
+                } else {
+                    self.next_cursors_by_env.remove(env_id);
+                }
+                if merged.truncated_envs.contains(env_id) {
+                    self.truncated_envs.insert(env_id.clone());
+                } else {
+                    self.truncated_envs.remove(env_id);
+                }
+            }
+            merged.result.truncated = !self.next_cursors_by_env.is_empty() || !self.truncated_envs.is_empty();
+        } else {
+            for (pr_key, env_id) in merged.entry_environments {
+                self.entry_environments.insert(pr_key, env_id);
+            }
+        }
+        self.apply_list(key, appending, refreshing, Ok(merged.result), cx);
     }
 
     fn apply_list(&mut self, key: String, appending: bool, refreshing: bool, result: Result<ListResult, String>, cx: &mut Context<Self>) {
@@ -781,39 +1044,58 @@ impl PullRequestsPage {
         cx.notify();
     }
 
-    /// `pullRequests.listStats` for rows the listing left unmeasured, once per row per epoch, in
-    /// batches the contract takes.
+    /// `pullRequests.listStats` for rows the listing left unmeasured, grouped by each row's owning
+    /// fleet environment so secondary-server PR stats are read from their owning host.
     fn fetch_stats(&mut self, cx: &mut Context<Self>) {
         let Some(result) = &self.data.result else { return };
         let restat = std::mem::take(&mut self.restat);
-        let wanted: Vec<_> = result
-            .entries
-            .iter()
-            .filter(|entry| {
-                let key = stat_key(&entry.project_id, entry.number);
-                (needs_stats(entry) || (restat && self.stats.contains_key(&key))) && !self.requested.contains(&key)
-            })
-            .collect();
-        let batches = stats_inputs(wanted.iter().copied());
-        if batches.is_empty() {
+        let mut by_env: HashMap<Option<String>, Vec<&t3_core::pull_requests::wire::ListEntry>> = HashMap::new();
+        let mut total_wanted = 0usize;
+        for entry in &result.entries {
+            let key = stat_key(&entry.project_id, entry.number);
+            if (needs_stats(entry) || (restat && self.stats.contains_key(&key))) && !self.requested.contains(&key) {
+                let env_id = self.entry_environments.get(&PrRef::of(entry).key()).cloned();
+                by_env.entry(env_id).or_default().push(entry);
+                total_wanted += 1;
+            }
+        }
+        if total_wanted == 0 {
             return;
         }
         if self.stats.len() > MAX_HELD_STATS {
             self.stats.clear();
             self.requested.clear();
         }
-        self.requested.extend(wanted.iter().map(|entry| stat_key(&entry.project_id, entry.number)));
-        for input in batches {
-            self.fetch_stats_batch(input, cx);
+        let mut dispatches: Vec<(Option<String>, Option<EnvironmentOwner>, serde_json::Value)> = Vec::new();
+        let state = self.state.read(cx);
+        for (env_id, entries) in by_env {
+            let Some(first) = entries.first() else { continue };
+            let owner = owner_for_pr(state, env_id.as_deref(), &first.project_id);
+            let batches = stats_inputs(entries.iter().copied());
+            for entry in &entries {
+                self.requested.insert(stat_key(&entry.project_id, entry.number));
+            }
+            for input in batches {
+                dispatches.push((env_id.clone(), owner.clone(), input));
+            }
+        }
+        for (env_id, owner, input) in dispatches {
+            self.fetch_stats_batch(env_id, owner, input, cx);
         }
     }
 
-    fn fetch_stats_batch(&mut self, input: serde_json::Value, cx: &mut Context<Self>) {
-        let task = read(self.state.read(cx), method::LIST_STATS, input, decode::<ListStats>);
+    fn fetch_stats_batch(
+        &mut self,
+        env_id: Option<String>,
+        owner: Option<EnvironmentOwner>,
+        input: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let task = read_for_owner(self.state.read(cx), owner.as_ref(), method::LIST_STATS, input, decode::<ListStats>);
         cx.spawn(async move |this, cx| {
             let Ok(stats) = settle(task).await else { return };
             let _ = this.update(cx, |this, cx| {
-                if let Some(env) = this.environment_key(cx) {
+                if let Some(env) = env_id.or_else(|| this.environment_key(cx)) {
                     this.stats_cache.record(&env, &stats, now_ms());
                     store::save_ui_state(STATS_CACHE_KEY, &this.stats_cache);
                 }
@@ -837,18 +1119,56 @@ impl PullRequestsPage {
         .detach();
     }
 
-    /// The host's labels and authors for the Filters menu, beside those the loaded rows carry.
+    /// The host's labels and authors for the Filters menu, fanned out across connected fleet
+    /// environments (or the single environment owning `prefs.project_id`).
     fn fetch_options(&mut self, cx: &mut Context<Self>) {
         let mut scope = serde_json::Map::new();
         if let Some(project) = &self.prefs.project_id {
             scope.insert("projectId".into(), project.clone().into());
         }
-        let state = self.state.read(cx);
         let input = |kind: &str| {
             let mut input = scope.clone();
             input.insert("kind".into(), kind.into());
             serde_json::Value::Object(input)
         };
+        let fleet_mode = !self.state.read(cx).fleet.environments.is_empty();
+        if fleet_mode {
+            let inventory = self.fleet_inventory(cx);
+            let state = self.state.read(cx);
+            let mut tasks = Vec::new();
+            for env_id in &inventory.env_ids {
+                let Some(target) = inventory.targets.get(env_id).filter(|t| t.connected) else {
+                    continue;
+                };
+                if let Some(scoped) = self.prefs.project_id.as_deref()
+                    && !inventory.projects.iter().any(|p| p.environment_id == *env_id && p.id == scoped)
+                {
+                    continue;
+                }
+                let labels = read_for_owner(state, target.owner.as_ref(), method::FILTER_OPTIONS, input("labels"), decode::<FilterOptions>);
+                let authors = read_for_owner(state, target.owner.as_ref(), method::FILTER_OPTIONS, input("authors"), decode::<FilterOptions>);
+                tasks.push((labels, authors));
+            }
+            self._options = Some(cx.spawn(async move |this, cx| {
+                let mut labels = Vec::new();
+                let mut authors = Vec::new();
+                for (l_task, a_task) in tasks {
+                    for label in settle(l_task).await.unwrap_or_default().labels {
+                        if !labels.iter().any(|known: &t3_core::pull_requests::wire::Label| known.name.eq_ignore_ascii_case(&label.name)) {
+                            labels.push(label);
+                        }
+                    }
+                    for actor in settle(a_task).await.unwrap_or_default().authors {
+                        if !authors.iter().any(|known: &t3_core::pull_requests::wire::Actor| known.login.eq_ignore_ascii_case(&actor.login)) {
+                            authors.push(actor);
+                        }
+                    }
+                }
+                let _ = this.update(cx, |this, _| this.options = FilterOptions { labels, authors, truncated: false });
+            }));
+            return;
+        }
+        let state = self.state.read(cx);
         let labels = read(state, method::FILTER_OPTIONS, input("labels"), decode::<FilterOptions>);
         let authors = read(state, method::FILTER_OPTIONS, input("authors"), decode::<FilterOptions>);
         self._options = Some(cx.spawn(async move |this, cx| {
@@ -859,9 +1179,21 @@ impl PullRequestsPage {
 
     pub(super) fn load_more(&mut self, cx: &mut Context<Self>) {
         let Some(result) = &self.data.result else { return };
-        if !result.next_cursors.is_empty() {
+        if !self.next_cursors_by_env.is_empty() {
+            let cursors = self.next_cursors_by_env.clone();
+            let regrown: HashSet<String> = self
+                .truncated_envs
+                .iter()
+                .filter(|env_id| !cursors.contains_key(*env_id))
+                .cloned()
+                .collect();
+            if !regrown.is_empty() && self.data.page_size < MAX_PAGE_SIZE {
+                self.data.page_size = (self.data.page_size + PAGE_SIZE).min(MAX_PAGE_SIZE);
+            }
+            self.fetch(Some(FetchCursors::PerEnv { cursors, regrown }), false, cx);
+        } else if !result.next_cursors.is_empty() {
             let cursors = result.next_cursors.clone();
-            self.fetch(Some(cursors), false, cx);
+            self.fetch(Some(FetchCursors::Single(cursors)), false, cx);
         } else if self.data.page_size < MAX_PAGE_SIZE {
             self.data.page_size = (self.data.page_size + PAGE_SIZE).min(MAX_PAGE_SIZE);
             self.data.loading_more = true;
@@ -870,18 +1202,50 @@ impl PullRequestsPage {
     }
 
     pub(super) fn can_load_more(&self) -> bool {
-        self.data.result.as_ref().is_some_and(|result| result.truncated && (!result.next_cursors.is_empty() || self.data.page_size < MAX_PAGE_SIZE))
+        self.data.result.as_ref().is_some_and(|result| {
+            result.truncated
+                && (!self.next_cursors_by_env.is_empty()
+                    || !result.next_cursors.is_empty()
+                    || self.data.page_size < MAX_PAGE_SIZE)
+        })
     }
 
-    /// "Check again": the host is asked afresh (`pullRequests.invalidate`), caches and host
-    /// availability reset, then the list re-read.
+    /// "Check again": every connected host is asked afresh (`pullRequests.invalidate`), caches and
+    /// host availability reset, then the list re-read.
     pub(super) fn refresh_from_host(&mut self, cx: &mut Context<Self>) {
-        let task = read(self.state.read(cx), method::INVALIDATE, t3_core::pull_requests::invalidate_input(None), |_| Ok(()));
+        let fleet_mode = !self.state.read(cx).fleet.environments.is_empty();
+        let invalidate_tasks: Vec<_> = if fleet_mode {
+            let inventory = self.fleet_inventory(cx);
+            let state = self.state.read(cx);
+            inventory
+                .targets
+                .values()
+                .filter(|target| target.connected)
+                .map(|target| {
+                    read_for_owner(
+                        state,
+                        target.owner.as_ref(),
+                        method::INVALIDATE,
+                        t3_core::pull_requests::invalidate_input(None),
+                        |_| Ok(()),
+                    )
+                })
+                .collect()
+        } else {
+            vec![read(
+                self.state.read(cx),
+                method::INVALIDATE,
+                t3_core::pull_requests::invalidate_input(None),
+                |_| Ok(()),
+            )]
+        };
         self.data.pending = true;
         self.stats.clear();
         self.requested.clear();
         self.row_stacks.clear();
         self.unreachable_environments.clear();
+        self.next_cursors_by_env.clear();
+        self.truncated_envs.clear();
         self.host_availability = reset_hosts(&self.host_availability);
         if let Some(env) = self.environment_key(cx) {
             self.list_cache.clear_environment(&env);
@@ -891,7 +1255,9 @@ impl PullRequestsPage {
         }
         cx.notify();
         self._list = Some(cx.spawn(async move |this, cx| {
-            let _ = settle(task).await;
+            for task in invalidate_tasks {
+                let _ = settle(task).await;
+            }
             let _ = this.update(cx, |this, cx| {
                 this.refetch(cx);
                 if let Some(detail) = &this.detail {
@@ -952,9 +1318,10 @@ impl PullRequestsPage {
         self.cancel_intent();
         self.preview.clear();
         let entry = self.data.result.as_ref().and_then(|result| result.entries.iter().find(|entry| PrRef::of(entry) == reference)).cloned();
+        let env_id = self.entry_environment(&reference).map(str::to_owned);
         let state = self.state.clone();
         let page = cx.entity().downgrade();
-        self.detail = Some(cx.new(|cx| DetailView::new(state, page, reference.clone(), entry, cx)));
+        self.detail = Some(cx.new(|cx| DetailView::new_in_environment(state, page, env_id, reference.clone(), entry, cx)));
         self.selected = Some(reference);
         cx.notify();
     }
@@ -1130,7 +1497,21 @@ impl PullRequestsPage {
 
     /// The project's and the last-picked merge methods, read when a merge is asked for.
     pub(super) fn merge_picks(&self, project_id: &str, current: Option<MergeMethod>, cx: &App) -> MergePicks {
-        let project_default = self.state.read(cx).server_config.config.as_ref().and_then(|config| project_default_merge_method(&config.settings, project_id));
+        let state = self.state.read(cx);
+        let fleet_default = state
+            .fleet
+            .environments
+            .iter()
+            .find(|env| env.summary.projects.iter().any(|scoped| scoped.project.id == project_id))
+            .and_then(|env| env.config.config.as_ref())
+            .and_then(|config| project_default_merge_method(&config.settings, project_id));
+        let project_default = fleet_default.or_else(|| {
+            state
+                .server_config
+                .config
+                .as_ref()
+                .and_then(|config| project_default_merge_method(&config.settings, project_id))
+        });
         MergePicks { current, project_default, last: self.prefs.merge_method }
     }
 
@@ -1142,11 +1523,16 @@ impl PullRequestsPage {
             return;
         }
         let term = t3_core::pull_requests::detail::change_request_term(&entry.provider);
+        let env_id = self.entry_environment(&reference).map(str::to_owned);
         let task = if action == Action::Merge {
             let picks = self.merge_picks(&entry.project_id, None, cx);
-            mutations::merge(self.state.read(cx), reference.clone(), picks, cx)
+            let app = self.state.read(cx);
+            let owner = owner_for_pr(app, env_id.as_deref(), &entry.project_id);
+            mutations::merge(app, owner.as_ref(), reference.clone(), picks, cx)
         } else {
-            mutations::run_action(self.state.read(cx), action_input(&reference, action, None), cx)
+            let app = self.state.read(cx);
+            let owner = owner_for_pr(app, env_id.as_deref(), &entry.project_id);
+            mutations::run_action(app, owner.as_ref(), action_input(&reference, action, None), cx)
         };
         cx.spawn(async move |this, cx| {
             let result = settle(task).await;
@@ -1210,7 +1596,13 @@ impl PullRequestsPage {
     fn fleet_inventory(&self, cx: &App) -> FleetInventory {
         let state = self.state.read(cx);
         let active_id = self.environment_key(cx);
-        let mut unreachable = self.unreachable_environments.clone();
+        let now = now_ms();
+        let mut unreachable: HashSet<String> = self
+            .unreachable_environments
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(env_id, _)| env_id.clone())
+            .collect();
         if !state.fleet.environments.is_empty() {
             let mut env_ids: Vec<String> = Vec::new();
             let mut envs: Vec<EnvironmentInfo> = Vec::new();
@@ -1449,7 +1841,7 @@ impl PullRequestsPage {
             return super::row::ghost("Loading pull requests…", cx).into_any_element();
         }
         if let Some(error) = self.data.error.clone().filter(|_| shown == 0) {
-            let retry = cx.listener(|this, _, _, cx| this.refetch(cx));
+            let retry = cx.listener(|this, _, _, cx| this.retry_fetch(cx));
             return super::row::unavailable(error, self.data.pending, retry, cx).into_any_element();
         }
         if shown == 0 {
@@ -1500,7 +1892,7 @@ impl Render for PullRequestsPage {
                                     .min_h_0()
                                     .child(super::toolbar::render(self, window, cx))
                                     .children(error_with_rows.map(|error| {
-                                        let retry = cx.listener(|this, _, _, cx| this.refetch(cx));
+                                        let retry = cx.listener(|this, _, _, cx| this.retry_fetch(cx));
                                         h_flex()
                                             .flex_none()
                                             .mx(px(20.))
@@ -1574,9 +1966,9 @@ mod tests {
             state.update(cx, |state, _| state.environments.active = Some("env-a".into()));
 
             let reference = PrRef::of(&entry);
-            assert!(!has_held_detail(state.read(cx), &reference, cx));
-            prefetch_into_held(&state, &reference, Some(&detail), None, cx);
-            assert!(has_held_detail(state.read(cx), &reference, cx));
+            assert!(!has_held_detail_in_env(state.read(cx), None, &reference, cx));
+            prefetch_into_held_in_env(&state, None, &reference, Some(&detail), None, cx);
+            assert!(has_held_detail_in_env(state.read(cx), None, &reference, cx));
 
             // LinkPreviewController renders immediately from fallback summary and clears cleanly.
             struct Host {
@@ -1841,6 +2233,10 @@ mod tests {
         };
 
         page.update(cx, |page, cx| {
+            // 0. Fleet-aware `sync`: even though active `saved-local` is offline (`Reconnecting`),
+            // `saved-remote` is `Connected`, so the page treats the fleet as connected.
+            assert!(page.connected, "fleet page must stay connected while a secondary fleet env is Connected");
+
             // 1. Disconnected active env yields shared repo to connected remote env (`#34088`),
             // while keeping its exclusive repository assigned to itself.
             let (rows, _) = page.assignment_rows(cx);
@@ -1851,11 +2247,13 @@ mod tests {
             assert_eq!(local_only.environment_id, "saved-local");
 
             // 2. Cross-server URL deduplication (`#37704`): identical PR URL from two servers
-            // collapses to a single row while preserving the preferred server's copy.
+            // collapses to a single row while preserving the preferred server's copy AND tracking
+            // each entry's owning `environment_id` and per-environment `next_cursors`.
             let key = page.scope_key();
             let local_list: ListResult = decode(json!({
                 "entries": [make_pr("p-shared-local", 42, "From MacBook", "https://github.com/acme/shared/pull/42")],
-                "providers": [], "errors": [], "hasMore": false
+                "providers": [], "errors": [], "truncated": true,
+                "nextCursors": { "github": "cursor-local-1" }
             }))
             .unwrap();
             let remote_list: ListResult = decode(json!({
@@ -1863,7 +2261,8 @@ mod tests {
                     make_pr("p-shared-remote", 42, "From Linux", "https://github.com/acme/shared/pull/42"),
                     make_pr("p-shared-remote", 43, "Remote Only", "https://github.com/acme/shared/pull/43")
                 ],
-                "providers": [], "errors": [], "hasMore": false
+                "providers": [], "errors": [], "truncated": true,
+                "nextCursors": { "github": "cursor-remote-9" }
             }))
             .unwrap();
             page.apply_fleet_lists(
@@ -1876,10 +2275,37 @@ mod tests {
             let entries = &page.data.result.as_ref().unwrap().entries;
             assert_eq!(entries.len(), 2);
             let pr42 = entries.iter().find(|e| e.number == 42).unwrap();
+            let pr43 = entries.iter().find(|e| e.number == 43).unwrap();
             assert_eq!(pr42.title, "From MacBook");
+            assert_eq!(page.entry_environment(&PrRef::of(pr42)), Some("saved-local"));
+            assert_eq!(page.entry_environment(&PrRef::of(pr43)), Some("saved-remote"));
+
+            // Selecting a PR owned by secondary env `saved-remote` binds `DetailView` to `saved-remote`
+            // and `owner_for_pr` resolves `saved-remote`'s `EnvironmentOwner`.
+            let pr43_ref = PrRef::of(pr43);
+            page.select(pr43_ref.clone(), cx);
+            let detail_env = page.detail.as_ref().unwrap().read(cx).target_environment().map(str::to_owned);
+            assert_eq!(detail_env.as_deref(), Some("saved-remote"));
+            let resolved_owner = owner_for_pr(page.state.read(cx), detail_env.as_deref(), &pr43_ref.project_id).unwrap();
+            assert_eq!(resolved_owner.saved_id, "saved-remote");
+
+            // Per-environment cursors stay isolated (neither overwrites the other's `"github"` cursor)
+            // and `planned_fleet_requests` sends ONLY `saved-remote`'s own cursor to `saved-remote`.
+            assert_eq!(
+                page.next_cursors_by_env.get("saved-local").and_then(|c| c.get("github")).map(String::as_str),
+                Some("cursor-local-1")
+            );
+            assert_eq!(
+                page.next_cursors_by_env.get("saved-remote").and_then(|c| c.get("github")).map(String::as_str),
+                Some("cursor-remote-9")
+            );
+            let planned_next = page.planned_fleet_requests(Some(page.next_cursors_by_env.clone()), cx);
+            assert_eq!(planned_next.len(), 1);
+            assert_eq!(planned_next[0].0, "saved-remote");
+            assert_eq!(planned_next[0].1["cursors"]["github"], json!("cursor-remote-9"));
 
             // 3. Partial fleet failure marks the failing env unreachable while still painting the
-            // healthy env's rows (`#34088`), and clears when it recovers.
+            // healthy env's rows (`#34088`), and `retry_fetch` clears transient unreachable marks.
             page.apply_fleet_lists(
                 key,
                 false,
@@ -1890,10 +2316,21 @@ mod tests {
                 ],
                 cx,
             );
-            assert!(page.unreachable_environments.contains("saved-local"));
-            assert!(!page.unreachable_environments.contains("saved-remote"));
+            assert!(page.unreachable_environments.contains_key("saved-local"));
+            assert!(!page.unreachable_environments.contains_key("saved-remote"));
             assert_eq!(page.data.result.as_ref().unwrap().entries.len(), 2);
             assert!(page.data.error.is_none());
+
+            // 4. Zero-slice fallback: scoping to `p-only-local` (owned only by disconnected `saved-local`)
+            // dispatches zero fleet slices and surfaces an offline error instead of querying another server.
+            page.prefs.project_id = Some("p-only-local".into());
+            assert!(page.planned_fleet_requests(None, cx).is_empty());
+            page.retry_fetch(cx);
+            assert!(!page.unreachable_environments.contains_key("saved-local"), "retry_fetch clears transient failure marks");
+            assert_eq!(
+                page.data.error.as_deref(),
+                Some("The environment for this project is currently offline.")
+            );
         });
     }
 }
