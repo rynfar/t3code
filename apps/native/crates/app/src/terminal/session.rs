@@ -251,10 +251,12 @@ async fn run_writer(target: Arc<Target>, client: ClientHandle, shared: Shared, m
         }
         if pending_close_paste {
             let payload = terminal::write_input(&target.thread_id, &target.terminal_id, terminal::BRACKETED_PASTE_END);
-            if client.request(method::WRITE, payload).await.is_ok() {
-                pending_close_paste = false;
-            } else {
-                continue;
+            match client.request(method::WRITE, payload).await {
+                Ok(_) => pending_close_paste = false,
+                Err(err) => {
+                    let _ = job.on_error.send(err);
+                    continue;
+                }
             }
         }
         let chunks = terminal::paste_chunks(&job.data);

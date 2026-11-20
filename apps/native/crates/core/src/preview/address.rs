@@ -341,10 +341,53 @@ impl BrowserHistory {
     }
 }
 
+/// Matches `isPrivateNetworkHost` in `packages/shared/src/hostClassification.ts:95-118`:
+/// private IPv4/IPv6 ranges (including IPv4-mapped IPv6), `.ts.net`, `.local`, `.home.arpa`,
+/// and single-label hosts; public and T3 Connect relay domains return `false`.
+fn is_private_network_host(host: &str) -> bool {
+    let bare = normalize_hostname(host);
+    let trimmed = bare.strip_suffix('.').unwrap_or(&bare);
+    if trimmed.is_empty() {
+        return false;
+    }
+    if is_loopback_host(trimmed)
+        || trimmed.ends_with(".local")
+        || trimmed == "home.arpa"
+        || trimmed.ends_with(".home.arpa")
+        || trimmed.ends_with(".ts.net")
+        || (!trimmed.contains('.') && !trimmed.contains(':'))
+    {
+        return true;
+    }
+    let is_private_v4 = |ip: std::net::Ipv4Addr| {
+        let [a, b, ..] = ip.octets();
+        a == 0
+            || a == 10
+            || a == 127
+            || (a == 100 && (64..=127).contains(&b))
+            || (a == 169 && b == 254)
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 168)
+    };
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => is_private_v4(ip),
+        Ok(std::net::IpAddr::V6(ip)) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_private_v4(mapped);
+            }
+            let seg = ip.segments()[0];
+            (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
 /// `resolveExternalServerUrl` (`browserTargetResolver.ts`, `pingdotgg/t3code#37948`):
 /// resolves a preview URL for the system browser, which has no loopback tunnel and needs an
 /// address it can reach itself. Rewrites loopback (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`,
-/// `[::]`) hosts to the remote environment's host when `environment_http_base` is non-loopback.
+/// `[::]`) hosts to the remote environment's private-network host when `environment_http_base`
+/// is a non-loopback private/tailnet host; public/relay hosts (e.g. T3 Connect Managed Relay)
+/// keep the original URL untouched.
 pub fn resolve_external_server_url(raw_url: &str, environment_http_base: Option<&str>) -> String {
     let Ok(normalized) = normalize_preview_url(raw_url) else {
         return raw_url.to_owned();
@@ -365,7 +408,7 @@ pub fn resolve_external_server_url(raw_url: &str, environment_http_base: Option<
         return normalized;
     };
     let env_norm = normalize_hostname(env_host);
-    if is_loopback_host(&env_norm) {
+    if is_loopback_host(&env_norm) || !is_private_network_host(&env_norm) {
         return normalized;
     }
     let _ = parsed.set_host(Some(env_host));
@@ -464,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_external_server_url_rewrites_loopback_for_remote_environments() {
+    fn resolve_external_server_url_rewrites_loopback_only_for_private_network_environments() {
         assert_eq!(
             resolve_external_server_url("http://localhost:5173/app?a=1", Some("https://devbox.ts.net:3773")),
             "http://devbox.ts.net:5173/app?a=1"
@@ -472,6 +515,31 @@ mod tests {
         assert_eq!(
             resolve_external_server_url("http://127.0.0.1:3000/", Some("http://10.0.0.9:3773")),
             "http://10.0.0.9:3000/"
+        );
+        assert_eq!(
+            resolve_external_server_url("http://localhost:3000/", Some("http://mac-studio.local:3773")),
+            "http://mac-studio.local:3000/"
+        );
+        assert_eq!(
+            resolve_external_server_url("http://localhost:3000/", Some("http://nas.home.arpa:3773")),
+            "http://nas.home.arpa:3000/"
+        );
+        assert_eq!(
+            resolve_external_server_url("http://localhost:3000/", Some("http://buildbox:3773")),
+            "http://buildbox:3000/"
+        );
+        assert_eq!(
+            resolve_external_server_url("http://localhost:3000/", Some("http://[fd7a:115c:a1e0::1]:3773")),
+            "http://[fd7a:115c:a1e0::1]:3000/"
+        );
+        // Public and T3 Connect Managed Relay origins must NEVER rewrite loopback URLs.
+        assert_eq!(
+            resolve_external_server_url("http://localhost:5173/app", Some("https://relay.example.com")),
+            "http://localhost:5173/app"
+        );
+        assert_eq!(
+            resolve_external_server_url("http://127.0.0.1:5173/", Some("https://connect.t3.codes/env-1")),
+            "http://127.0.0.1:5173/"
         );
         // Local environment keeps loopback intact.
         assert_eq!(
