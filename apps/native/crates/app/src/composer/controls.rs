@@ -600,6 +600,9 @@ pub fn popup_surface(cx: &App) -> gpui::Div {
                 cx,
             ))
         })
+        .when(has_custom_bg, |this| {
+            this.bg(hsla(p.dropdown_surface)).border_1().border_color(backdrop_border)
+        })
         .children(theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, crate::theme::rem(8.), cx))
         .theme_slot(ThemeSlot::PopoverPopup, cx)
 }

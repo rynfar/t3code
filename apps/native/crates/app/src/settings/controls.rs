@@ -685,11 +685,12 @@ impl RenderOnce for Select {
                         div()
                             .id((self.id.clone(), "popup"))
                             .relative()
+                            .flex()
+                            .flex_col()
                             .occlude()
                             .mt(r(4.))
                             .min_w(r(self.popup_width))
                             .max_h(r(320.))
-                            .overflow_y_scroll()
                             .p(r(4.))
                             .rounded(r(8.))
                             .border_1()
@@ -715,7 +716,14 @@ impl RenderOnce for Select {
                                 theme_slot_clipped_background_layer(ThemeSlot::PopoverPopup, r(8.), cx)
                                     .or_else(|| theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, r(8.), cx)),
                             )
-                            .child(list),
+                            .child(
+                                div()
+                                    .id((self.id.clone(), "popup-scroll"))
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .child(list),
+                            ),
                     ),
                 )
                 .with_priority(2),
@@ -1146,6 +1154,9 @@ impl DialogFrame {
             .rounded(r(16.))
             .when(!has_custom_bg, |this| {
                 this.child(crate::glass::backdrop(16., hsla(p.dialog_surface), backdrop_border, cx))
+            })
+            .when(has_custom_bg, |this| {
+                this.bg(hsla(p.dialog_surface)).border_1().border_color(backdrop_border)
             })
             .children(theme_slot_background_layer(ThemeSlot::DialogPopup, cx))
             .shadow(vec![BoxShadow {

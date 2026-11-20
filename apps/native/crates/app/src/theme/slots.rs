@@ -57,11 +57,29 @@ pub fn slot_has_active(slot: ThemeSlot, cx: &App) -> bool {
         .is_some_and(|g| !g.0.is_empty() && g.0.get(slot).is_some_and(|set| !set.active.is_empty()))
 }
 
-/// Zero-allocation check for whether the active stylesheet defines a base `background` override for
-/// `slot` (used by glass overlays to suppress `glass::backdrop` so custom backgrounds show cleanly).
+/// Zero-allocation check for whether the active stylesheet defines a live base `background`
+/// override for `slot` (used by glass overlays to suppress `glass::backdrop` only when a visible
+/// custom background will actually paint). Returns `false` for `ThemeBackgroundImage` when no
+/// background image is currently loaded so overlays fall back to stock glass rather than turning
+/// transparent.
 pub fn slot_has_background(slot: ThemeSlot, cx: &App) -> bool {
-    cx.try_global::<ActiveSlotStylesheet>()
-        .is_some_and(|g| !g.0.is_empty() && g.0.get(slot).is_some_and(|set| set.base.background.is_some()))
+    let Some(g) = cx.try_global::<ActiveSlotStylesheet>() else {
+        return false;
+    };
+    if g.0.is_empty() {
+        return false;
+    }
+    let Some(bg) = g.0.get(slot).and_then(|set| set.base.background.as_ref()) else {
+        return false;
+    };
+    match bg {
+        SlotBackground::ThemeBackgroundImage { .. } => {
+            g.0.has_scoped_background_image() && background_image(cx).is_some()
+        }
+        SlotBackground::Solid(_)
+        | SlotBackground::LinearGradient { .. }
+        | SlotBackground::Transparent => true,
+    }
 }
 
 /// Zero-allocation lookup for a slot's compiled base `border-color` override, if any.
@@ -864,6 +882,120 @@ mod tests {
         let (_view, visual_cx) = cx.add_window_view(|window, cx| {
             let input = cx.new(|cx| InputState::new(window, cx));
             Harness { input, dialog_focus: cx.focus_handle() }
+        });
+        visual_cx.refresh().unwrap();
+
+        cx.update(|cx| {
+            theme::preview(None, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn glass_overlay_fallbacks_preserve_backdrop_without_wallpaper_and_border_without_border_decl(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Context, Render, Window};
+
+        struct OverlayHarness {
+            dialog_focus: gpui::FocusHandle,
+        }
+
+        impl Render for OverlayHarness {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let dialog = crate::settings::controls::DialogFrame {
+                    id: "fallback-dialog",
+                    title: "Fallback".into(),
+                    description: "Checks glass fallback".into(),
+                    max_width: 400.,
+                    body: div().child("Body").into_any_element(),
+                    footer: crate::settings::controls::dialog_footer(false, vec![], cx).into_any_element(),
+                    focus: self.dialog_focus.clone(),
+                }
+                .render(window, |_, _| {}, cx);
+                div()
+                    .size_full()
+                    .child(crate::composer::controls::popup_surface(cx).child("Popover"))
+                    .child(dialog)
+            }
+        }
+
+        let colors = themes::standard(true);
+
+        // 1. Scoped `var(--theme-background-image)` with `background_image == None`:
+        // `slot_has_background` MUST return `false` so overlays keep `glass::backdrop`.
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::init(cx);
+            theme::set_background_image(None, cx);
+            theme::preview_with_css(
+                Some((
+                    &colors,
+                    Some(
+                        r#"
+                        [data-slot="dialog-popup"] { background: var(--theme-background-image) center / cover no-repeat; }
+                        [data-slot="popover-popup"] { background: var(--theme-background-image) center / contain no-repeat; }
+                        [data-slot="menu-popup"] { background: var(--theme-background-image) center / cover no-repeat; }
+                        "#,
+                    ),
+                    true,
+                )),
+                cx,
+            );
+            assert!(slot_stylesheet(cx).has_scoped_background_image());
+            assert!(!slot_has_background(ThemeSlot::DialogPopup, cx));
+            assert!(!slot_has_background(ThemeSlot::PopoverPopup, cx));
+            assert!(!slot_has_background(ThemeSlot::MenuPopup, cx));
+            assert!(theme_slot_background_layer(ThemeSlot::DialogPopup, cx).is_none());
+            assert!(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, px(8.), cx).is_none());
+        });
+
+        let (_view, visual_cx) = cx.add_window_view(|_, cx| OverlayHarness {
+            dialog_focus: cx.focus_handle(),
+        });
+        visual_cx.refresh().unwrap();
+
+        // 2. Solid `background` without `border` keeps the 1px fallback border and default border color.
+        visual_cx.update(|_, cx| {
+            let expected_border = hsla(theme::palette(cx).dropdown_border);
+            theme::preview_with_css(
+                Some((
+                    &colors,
+                    Some(
+                        r#"
+                        [data-slot="dialog-popup"] { background: #141622; }
+                        [data-slot="popover-popup"] { background: #181a28; }
+                        "#,
+                    ),
+                    true,
+                )),
+                cx,
+            );
+            assert!(slot_has_background(ThemeSlot::DialogPopup, cx));
+            assert!(slot_has_background(ThemeSlot::PopoverPopup, cx));
+            let mut popover = crate::composer::controls::popup_surface(cx);
+            assert_eq!(
+                popover.style().background,
+                Some(Fill::Color(solid_background(hsla(0x181a_28ff))))
+            );
+            assert_eq!(popover.style().border_widths.top, Some(px(1.).into()));
+            assert_eq!(popover.style().border_color, Some(expected_border));
+
+            // Explicit `background: transparent; border: none;` overrides the fallback cleanly.
+            theme::preview_with_css(
+                Some((
+                    &colors,
+                    Some(r#"[data-slot="popover-popup"] { background: transparent; border: none; }"#),
+                    true,
+                )),
+                cx,
+            );
+            assert!(slot_has_background(ThemeSlot::PopoverPopup, cx));
+            let mut clear_popover = crate::composer::controls::popup_surface(cx);
+            assert_eq!(
+                clear_popover.style().background,
+                Some(Fill::Color(solid_background(transparent_black())))
+            );
+            assert_eq!(clear_popover.style().border_widths.top, Some(px(0.).into()));
         });
         visual_cx.refresh().unwrap();
 

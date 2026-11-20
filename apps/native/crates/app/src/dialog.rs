@@ -425,6 +425,9 @@ impl Render for ConfirmDialog {
                         .when(!has_custom_bg, |this| {
                             this.child(crate::glass::backdrop(16., hsla(p.dialog_surface), backdrop_border, cx))
                         })
+                        .when(has_custom_bg, |this| {
+                            this.bg(hsla(p.dialog_surface)).border_1().border_color(backdrop_border)
+                        })
                         .children(theme_slot_background_layer(ThemeSlot::DialogPopup, cx))
                         .shadow(vec![BoxShadow {
                             color: gpui_hsla(0., 0., 0., 0.65),

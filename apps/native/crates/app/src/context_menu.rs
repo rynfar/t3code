@@ -800,6 +800,9 @@ impl ContextMenu {
             .when(!has_custom_bg, |this| {
                 this.child(crate::glass::backdrop(8., hsla(p.dropdown_surface), backdrop_border, cx))
             })
+            .when(has_custom_bg, |this| {
+                this.bg(hsla(p.dropdown_surface)).border_1().border_color(backdrop_border)
+            })
             .children(theme_slot_clipped_background_layer(ThemeSlot::MenuPopup, px(8.), cx))
             .shadow(vec![BoxShadow {
                 color: gpui_hsla(0., 0., 0., 0.55),
