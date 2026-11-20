@@ -35,6 +35,7 @@ impl Global for ActiveSlotStylesheet {}
 const GRADIENT_TEX_SIZE: u32 = 128;
 const GRADIENT_MAX_DIM: u32 = 128;
 const GRADIENT_MIN_DIM: u32 = 16;
+const GRADIENT_GUTTER: u32 = 2;
 const MAX_CACHED_GRADIENTS: usize = 96;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -54,13 +55,37 @@ enum GradientCacheKey {
     },
 }
 
-static GRADIENT_CACHE: LazyLock<Mutex<HashMap<GradientCacheKey, Arc<RenderImage>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Clone)]
+struct RasterizedGradient {
+    image: Arc<RenderImage>,
+    inner_w: u32,
+    inner_h: u32,
+}
+
+#[derive(Default)]
+struct GradientCache {
+    entries: HashMap<GradientCacheKey, RasterizedGradient>,
+    pending_drop: Vec<Arc<RenderImage>>,
+}
+
+static GRADIENT_CACHE: LazyLock<Mutex<GradientCache>> =
+    LazyLock::new(|| Mutex::new(GradientCache::default()));
 
 /// Clears cached rasterized gradient textures whenever the active theme slot stylesheet changes.
 pub(super) fn clear_gradient_cache() {
     if let Ok(mut cache) = GRADIENT_CACHE.lock() {
-        cache.clear();
+        let evicted: Vec<_> = cache.entries.drain().map(|(_, v)| v.image).collect();
+        cache.pending_drop.extend(evicted);
+    }
+}
+
+fn drain_dropped_gradients(window: &mut Window) {
+    let pending = match GRADIENT_CACHE.lock() {
+        Ok(mut cache) if !cache.pending_drop.is_empty() => std::mem::take(&mut cache.pending_drop),
+        _ => return,
+    };
+    for image in pending {
+        let _ = window.drop_image(image);
     }
 }
 
@@ -120,11 +145,11 @@ fn sample_gradient_stops(stops: &[GradientStop], t: f32) -> [u8; 4] {
 
 fn aspect_bucket_and_dims(width_px: f32, height_px: f32) -> (i16, f32, u32, u32) {
     let ratio = (width_px.max(1.0) / height_px.max(1.0)).clamp(0.05, 20.0);
-    let bucket = (ratio.ln() * 12.0).round() as i16;
+    let bucket = (ratio.ln() * 16.0).round() as i16;
     if bucket == 0 {
         return (0, 1.0, GRADIENT_TEX_SIZE, GRADIENT_TEX_SIZE);
     }
-    let q_ratio = (bucket as f32 / 12.0).exp();
+    let q_ratio = (bucket as f32 / 16.0).exp();
     let (tex_w, tex_h) = if q_ratio >= 1.0 {
         let h = (GRADIENT_MAX_DIM as f32 / q_ratio)
             .round()
@@ -174,17 +199,29 @@ fn rasterize_gradient_for_size(
     bg: &SlotBackground,
     width_px: f32,
     height_px: f32,
-) -> Option<Arc<RenderImage>> {
-    let (bucket, q_ratio, tex_w, tex_h) = aspect_bucket_and_dims(width_px, height_px);
+) -> Option<RasterizedGradient> {
+    let (bucket, q_ratio, inner_w, inner_h) = aspect_bucket_and_dims(width_px, height_px);
     let key = gradient_cache_key(bg, bucket)?;
     if let Ok(cache) = GRADIENT_CACHE.lock()
-        && let Some(hit) = cache.get(&key)
+        && let Some(hit) = cache.entries.get(&key)
     {
-        return Some(Arc::clone(hit));
+        return Some(hit.clone());
     }
 
-    let inv_w = 1.0 / tex_w as f32;
-    let inv_h = 1.0 / tex_h as f32;
+    // GPUI packs sprite tiles with 0 atlas padding and linear sampling across [0, 1], so surround
+    // the gradient with a clamped 2-texel gutter and crop it cleanly via `paint_image_fitted`.
+    let tex_w = inner_w + GRADIENT_GUTTER * 2;
+    let tex_h = inner_h + GRADIENT_GUTTER * 2;
+    let inv_w = 1.0 / inner_w as f32;
+    let inv_h = 1.0 / inner_h as f32;
+    let clamp_u = |x: u32| -> f32 {
+        let ix = x.clamp(GRADIENT_GUTTER, inner_w + GRADIENT_GUTTER - 1) - GRADIENT_GUTTER;
+        (ix as f32 + 0.5) * inv_w
+    };
+    let clamp_v = |y: u32| -> f32 {
+        let iy = y.clamp(GRADIENT_GUTTER, inner_h + GRADIENT_GUTTER - 1) - GRADIENT_GUTTER;
+        (iy as f32 + 0.5) * inv_h
+    };
     let mut pixels = image::RgbaImage::new(tex_w, tex_h);
 
     match bg {
@@ -196,9 +233,9 @@ fn rasterize_gradient_for_size(
             let h = 1.0f32;
             let line_len = (w * dx.abs() + h * dy.abs()).max(1e-6);
             for y in 0..tex_h {
-                let py = ((y as f32 + 0.5) * inv_h - 0.5) * h;
+                let py = (clamp_v(y) - 0.5) * h;
                 for x in 0..tex_w {
-                    let px_x = ((x as f32 + 0.5) * inv_w - 0.5) * w;
+                    let px_x = (clamp_u(x) - 0.5) * w;
                     let t = ((px_x * dx + py * dy) / line_len + 0.5).clamp(0.0, 1.0);
                     pixels.put_pixel(x, y, image::Rgba(sample_gradient_stops(stops, t)));
                 }
@@ -208,9 +245,9 @@ fn rasterize_gradient_for_size(
             let rx = rx_frac.max(1e-4);
             let ry = ry_frac.max(1e-4);
             for y in 0..tex_h {
-                let ny = ((y as f32 + 0.5) * inv_h - *cy_frac) / ry;
+                let ny = (clamp_v(y) - *cy_frac) / ry;
                 for x in 0..tex_w {
-                    let nx = ((x as f32 + 0.5) * inv_w - *cx_frac) / rx;
+                    let nx = (clamp_u(x) - *cx_frac) / rx;
                     let t = (nx * nx + ny * ny).sqrt();
                     pixels.put_pixel(x, y, image::Rgba(sample_gradient_stops(stops, t)));
                 }
@@ -219,18 +256,39 @@ fn rasterize_gradient_for_size(
         _ => return None,
     }
 
-    let rendered = Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]));
+    let rendered = RasterizedGradient {
+        image: Arc::new(RenderImage::new(vec![image::Frame::new(pixels)])),
+        inner_w,
+        inner_h,
+    };
     if let Ok(mut cache) = GRADIENT_CACHE.lock() {
-        if cache.len() >= MAX_CACHED_GRADIENTS {
-            cache.clear();
+        if cache.entries.len() >= MAX_CACHED_GRADIENTS {
+            let evicted: Vec<_> = cache.entries.drain().map(|(_, v)| v.image).collect();
+            cache.pending_drop.extend(evicted);
         }
-        cache.insert(key, Arc::clone(&rendered));
+        cache.entries.insert(key, rendered.clone());
     }
     Some(rendered)
 }
 
-fn rasterize_gradient(bg: &SlotBackground) -> Option<Arc<RenderImage>> {
+fn rasterize_gradient(bg: &SlotBackground) -> Option<RasterizedGradient> {
     rasterize_gradient_for_size(bg, GRADIENT_TEX_SIZE as f32, GRADIENT_TEX_SIZE as f32)
+}
+
+fn fitted_bounds_for_gutter(
+    visible: Bounds<Pixels>,
+    inner_w: u32,
+    inner_h: u32,
+) -> Bounds<Pixels> {
+    let pad_x = f32::from(visible.size.width) * (GRADIENT_GUTTER as f32 / inner_w.max(1) as f32);
+    let pad_y = f32::from(visible.size.height) * (GRADIENT_GUTTER as f32 / inner_h.max(1) as f32);
+    Bounds::new(
+        point(visible.origin.x - px(pad_x), visible.origin.y - px(pad_y)),
+        size(
+            visible.size.width + px(2.0 * pad_x),
+            visible.size.height + px(2.0 * pad_y),
+        ),
+    )
 }
 
 fn override_uses_background_layer(ov: &SlotStyleOverride, base: Option<&SlotStyleOverride>) -> bool {
@@ -884,21 +942,25 @@ fn paint_slot_fill(
                     transparent_black(),
                     BorderStyle::Solid,
                 ));
-            } else if let Some(tex) = rasterize_gradient_for_size(
+            } else if let Some(grad) = rasterize_gradient_for_size(
                 bg,
                 f32::from(bounds.size.width),
                 f32::from(bounds.size.height),
             ) {
-                let _ = window.paint_image(bounds, corner_radii, tex, 0, false);
+                drain_dropped_gradients(window);
+                let fitted = fitted_bounds_for_gutter(bounds, grad.inner_w, grad.inner_h);
+                let _ = window.paint_image_fitted(bounds, fitted, corner_radii, grad.image, 0, false);
             }
         }
         SlotBackground::RadialGradient { .. } => {
-            if let Some(tex) = rasterize_gradient_for_size(
+            if let Some(grad) = rasterize_gradient_for_size(
                 bg,
                 f32::from(bounds.size.width),
                 f32::from(bounds.size.height),
             ) {
-                let _ = window.paint_image(bounds, corner_radii, tex, 0, false);
+                drain_dropped_gradients(window);
+                let fitted = fitted_bounds_for_gutter(bounds, grad.inner_w, grad.inner_h);
+                let _ = window.paint_image_fitted(bounds, fitted, corner_radii, grad.image, 0, false);
             }
         }
     }
@@ -1077,12 +1139,21 @@ fn render_override_background_layer(
                 let inner_radii = to_corners_px(radii, radius_inset, inner_bounds.size);
 
                 if let Some(blur) = backdrop_blur {
-                    let (blur_bounds, blur_radii) = if rim.is_some() {
-                        (outer_bounds, outer_radii)
+                    // `backdrop_blur_fragment` uses a binary `discard` instead of AA coverage, so
+                    // inset it safely inside `inner_bounds` when a translucent rim surrounds it.
+                    if rim.is_some() {
+                        let blur_bounds = inset_bounds(inner_bounds, [0.5; 4]);
+                        if blur_bounds.size.width > px(0.0) && blur_bounds.size.height > px(0.0) {
+                            let blur_radii = to_corners_px(
+                                radii,
+                                radius_inset.map(|r| r + 0.5),
+                                blur_bounds.size,
+                            );
+                            window.paint_backdrop_blur(blur_bounds, blur_radii, px(blur));
+                        }
                     } else {
-                        (inner_bounds, inner_radii)
-                    };
-                    window.paint_backdrop_blur(blur_bounds, blur_radii, px(blur));
+                        window.paint_backdrop_blur(inner_bounds, inner_radii, px(blur));
+                    }
                 }
 
                 if let Some(rim_bg) = &rim {
@@ -2123,7 +2194,8 @@ mod tests {
             assert!(slot_has_background(ThemeSlot::PopoverPopup, cx));
             assert!(slot_has_background(ThemeSlot::MenuPopup, cx));
 
-            // Multi-stop linear gradient rasterization populates cache and reuses Arc.
+            // Multi-stop linear gradient rasterization populates cache, surrounds it with a clamped
+            // 2-texel gutter, and reuses the cached RenderImage Arc across hits.
             let rim = slot_style(ThemeSlot::SidebarInner, cx)
                 .unwrap()
                 .base
@@ -2131,9 +2203,17 @@ mod tests {
                 .unwrap();
             let img1 = rasterize_gradient(&rim).expect("rasterized 6-stop halo");
             let img2 = rasterize_gradient(&rim).expect("cached 6-stop halo");
-            assert!(Arc::ptr_eq(&img1, &img2));
-            assert_eq!(img1.size(0).width.0, GRADIENT_TEX_SIZE as i32);
-            assert_eq!(img1.size(0).height.0, GRADIENT_TEX_SIZE as i32);
+            assert!(Arc::ptr_eq(&img1.image, &img2.image));
+            assert_eq!(img1.inner_w, GRADIENT_TEX_SIZE);
+            assert_eq!(img1.inner_h, GRADIENT_TEX_SIZE);
+            assert_eq!(
+                img1.image.size(0).width.0,
+                (GRADIENT_TEX_SIZE + 2 * GRADIENT_GUTTER) as i32
+            );
+            assert_eq!(
+                img1.image.size(0).height.0,
+                (GRADIENT_TEX_SIZE + 2 * GRADIENT_GUTTER) as i32
+            );
 
             // Aspect-aware gradient rasterization on a wide 600x92 composer sweeps pink -> emerald across top edge.
             let composer_halo = slot_style(ThemeSlot::ComposerHost, cx)
@@ -2145,28 +2225,61 @@ mod tests {
                 .expect("wide composer gradient");
             let wide2 = rasterize_gradient_for_size(&composer_halo, 604.0, 92.0)
                 .expect("same bucket cache hit");
-            assert!(Arc::ptr_eq(&wide1, &wide2));
+            assert!(Arc::ptr_eq(&wide1.image, &wide2.image));
             let tall = rasterize_gradient_for_size(&composer_halo, 260.0, 900.0)
                 .expect("tall sidebar gradient");
-            assert!(wide1.size(0).width > wide1.size(0).height);
-            assert!(tall.size(0).height > tall.size(0).width);
+            assert!(wide1.inner_w > wide1.inner_h);
+            assert!(tall.inner_h > tall.inner_w);
 
-            let w_px = wide1.size(0).width.0 as usize;
-            let h_px = wide1.size(0).height.0 as usize;
-            let bytes = wide1.as_bytes(0).unwrap();
+            let tw = wide1.image.size(0).width.0 as usize;
+            let th = wide1.image.size(0).height.0 as usize;
+            let g = GRADIENT_GUTTER as usize;
+            let bytes = wide1.image.as_bytes(0).unwrap();
             let pixel_rgba = |x: usize, y: usize| -> [u8; 4] {
-                let off = (y * w_px + x) * 4;
+                let off = (y * tw + x) * 4;
                 // Stored in straight-alpha BGRA8 byte order.
                 [bytes[off + 2], bytes[off + 1], bytes[off], bytes[off + 3]]
             };
-            let tl = pixel_rgba(0, 0);
-            let tr = pixel_rgba(w_px - 1, 0);
-            let bl = pixel_rgba(0, h_px - 1);
-            let br = pixel_rgba(w_px - 1, h_px - 1);
+            let tl = pixel_rgba(g, g);
+            let tr = pixel_rgba(tw - g - 1, g);
+            let bl = pixel_rgba(g, th - g - 1);
+            let br = pixel_rgba(tw - g - 1, th - g - 1);
             assert!(tl[0] > 200 && tl[2] > 120, "top-left should be pink: {tl:?}");
             assert!(tr[1] > 170 && tr[0] < 40, "top-right should be emerald/cyan: {tr:?}");
             assert!(bl[0] > 180 && bl[2] > 160, "bottom-left should be pink/violet: {bl:?}");
             assert!(br[0] > 200 && br[2] > 120, "bottom-right should be pink: {br:?}");
+
+            // Outer 2-texel gutter clamps the adjacent interior edge color (never transparent black).
+            let mid_x = tw / 2;
+            let mid_y = th / 2;
+            assert_eq!(pixel_rgba(0, g), tl);
+            assert_eq!(pixel_rgba(0, mid_y), pixel_rgba(g, mid_y));
+            assert_eq!(pixel_rgba(tw - 1, mid_y), pixel_rgba(tw - g - 1, mid_y));
+            assert_eq!(pixel_rgba(mid_x, 0), pixel_rgba(mid_x, g));
+            assert_eq!(pixel_rgba(mid_x, th - 1), pixel_rgba(mid_x, th - g - 1));
+            assert!(pixel_rgba(0, mid_y)[3] > 0 && pixel_rgba(mid_x, th - 1)[3] > 0);
+
+            // `fitted_bounds_for_gutter` reproduces GPUI's exact interior crop rectangle `(g, g, inner_w, inner_h)`.
+            for (w_f, h_f, grad_ref) in [
+                (600.0f32, 92.0f32, &wide1),
+                (240.0f32, 900.0f32, &tall),
+                (253.5f32, 877.25f32, &tall),
+            ] {
+                let visible = Bounds::new(point(px(6.0), px(6.0)), size(px(w_f), px(h_f)));
+                let fitted = fitted_bounds_for_gutter(visible, grad_ref.inner_w, grad_ref.inner_h);
+                let total_w = (grad_ref.inner_w + 2 * GRADIENT_GUTTER) as f32;
+                let total_h = (grad_ref.inner_h + 2 * GRADIENT_GUTTER) as f32;
+                let fx = (f32::from(visible.origin.x) - f32::from(fitted.origin.x))
+                    / f32::from(fitted.size.width);
+                let fy = (f32::from(visible.origin.y) - f32::from(fitted.origin.y))
+                    / f32::from(fitted.size.height);
+                let fsw = f32::from(visible.size.width) / f32::from(fitted.size.width);
+                let fsh = f32::from(visible.size.height) / f32::from(fitted.size.height);
+                assert_eq!((fx * total_w).round() as u32, GRADIENT_GUTTER);
+                assert_eq!((fy * total_h).round() as u32, GRADIENT_GUTTER);
+                assert_eq!((fsw * total_w).round() as u32, grad_ref.inner_w);
+                assert_eq!((fsh * total_h).round() as u32, grad_ref.inner_h);
+            }
 
             // ChatHeader with `backdrop-filter: blur(24px)` + translucent solid bg clears host bg for canvas blur.
             let mut ch = div().theme_slot(ThemeSlot::ChatHeader, cx);
@@ -2222,14 +2335,21 @@ mod tests {
         // Switch live to Kraken Kinetic and verify radial gradient + `::before` bar + cache invalidation.
         visual_cx.update(|_, cx| {
             theme::preview_with_css(Some((&colors, Some(kraken_kinetic_css), true)), cx);
+            assert!(
+                !GRADIENT_CACHE.lock().unwrap().pending_drop.is_empty(),
+                "cache invalidation queues old textures for window.drop_image cleanup"
+            );
             assert!(!slot_has_floating_inset(ThemeSlot::SidebarInner, cx));
             assert!(slot_has_background(ThemeSlot::SidebarInner, cx));
             let sb_bg = slot_style(ThemeSlot::SidebarInner, cx).unwrap().base.background.unwrap();
             let rad_img = rasterize_gradient(&sb_bg).expect("rasterized radial gradient");
-            // Bottom-center pixel (near 50% 108%) should have non-zero violet alpha; top-left should be transparent.
-            let bytes = rad_img.as_bytes(0).unwrap();
-            let top_left_alpha = bytes[3];
-            let bottom_center_offset = ((GRADIENT_TEX_SIZE - 1) * GRADIENT_TEX_SIZE + GRADIENT_TEX_SIZE / 2) as usize * 4;
+            // Interior bottom-center pixel (near 50% 108%) should have non-zero violet alpha; top-left should be transparent.
+            let tw = rad_img.image.size(0).width.0 as usize;
+            let th = rad_img.image.size(0).height.0 as usize;
+            let g = GRADIENT_GUTTER as usize;
+            let bytes = rad_img.image.as_bytes(0).unwrap();
+            let top_left_alpha = bytes[(g * tw + g) * 4 + 3];
+            let bottom_center_offset = ((th - g - 1) * tw + tw / 2) * 4;
             let bottom_center_alpha = bytes[bottom_center_offset + 3];
             assert_eq!(top_left_alpha, 0);
             assert!(bottom_center_alpha > 0);
@@ -2238,6 +2358,10 @@ mod tests {
             );
         });
         visual_cx.refresh().unwrap();
+        assert!(
+            GRADIENT_CACHE.lock().unwrap().pending_drop.is_empty(),
+            "paint pass drains queued gradient textures via window.drop_image"
+        );
 
         cx.update(|cx| {
             theme::preview(None, cx);
