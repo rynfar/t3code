@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     Animation, AnimationExt as _, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, EmptyView, Entity, FocusHandle, Focusable,
     FontWeight, IntoElement, MouseButton, ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window,
-    WindowControlArea, div, ease_out_quint, prelude::*, px,
+    div, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::status::{HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
@@ -40,7 +40,10 @@ use crate::pull_requests::{CopyPullRequestNumber, LinkPullRequest, LinkPullReque
 use crate::snooze_dialog::SnoozeDialog;
 use crate::sidebar::SidebarPane;
 use crate::terminal::{self, TerminalDrawer, ToggleTerminal};
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt as _, ThemeSlotHoverExt as _, hsla, palette,
+    theme_slot_background_layer,
+};
 use crate::thread_details::{self, DetailsEvent, DetailsView};
 use crate::thread_view::ThreadView;
 use t3_core::sidebar::layout;
@@ -610,17 +613,8 @@ impl Workspace {
         let status = self.render_connection_status(cx);
         let state = self.state.read(cx);
         let terminal_toggle = (state.selected_thread.is_some() || state.draft_project.is_some()).then(|| terminal::header_toggle(&self.terminal, cx).into_any_element());
-        let theme = cx.theme();
         let collapsed = sidebar_inline_width(state, f32::from(window.viewport_size().width)) == 0.;
-        h_flex()
-            .window_control_area(WindowControlArea::Drag)
-            .h(px(TITLEBAR_HEIGHT))
-            .flex_none()
-            .pl(px(if collapsed { 130. } else { 20. }))
-            .pr(px(12.))
-            .gap_3()
-            .border_b_1()
-            .border_color(theme.border)
+        chat_header::container(collapsed, cx)
             .child(self.header.clone())
             .children(status)
             .child(new_thread::new_thread_button(cx))
@@ -696,16 +690,19 @@ impl Render for Workspace {
         let sidebar_el: Option<gpui::AnyElement> = if sidebar_open {
             let base = div()
                 .track_focus(&self.area_focus.sidebar)
+                .relative()
+                .overflow_hidden()
                 .w(px(sidebar_width))
                 .h_full()
                 .flex_none()
                 .bg(theme.sidebar)
                 .border_r_1()
                 .border_color(hsla(palette(cx).sidebar_edge))
+                .theme_slot_hover(ThemeSlot::Sidebar, cx)
+                .children(theme_slot_background_layer(ThemeSlot::Sidebar, cx))
                 .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full()));
             Some(match sidebar_anim {
                 Some(anim) if anim.opening => base
-                    .overflow_hidden()
                     .with_animation(
                         ElementId::Name(format!("left-sidebar-open-{}", anim.seq).into()),
                         Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
@@ -718,12 +715,15 @@ impl Render for Workspace {
             sidebar_anim.filter(|a| !a.opening).map(|anim| {
                 div()
                     .id("left-sidebar-closing")
+                    .relative()
                     .h_full()
                     .flex_none()
                     .overflow_hidden()
                     .bg(theme.sidebar)
                     .border_r_1()
                     .border_color(hsla(palette(cx).sidebar_edge))
+                    .theme_slot(ThemeSlot::Sidebar, cx)
+                    .children(theme_slot_background_layer(ThemeSlot::Sidebar, cx))
                     .with_animation(
                         ElementId::Name(format!("left-sidebar-close-{}", anim.seq).into()),
                         Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
@@ -950,9 +950,12 @@ impl Render for Workspace {
                         this.child(
                             v_flex()
                                 .relative()
+                                .overflow_hidden()
                                 .flex_1()
                                 .min_h_0()
                                 .pr(px(details_layout.lane_inset))
+                                .theme_slot_hover(ThemeSlot::ConversationArea, cx)
+                                .children(theme_slot_background_layer(ThemeSlot::ConversationArea, cx))
                                 // An uncached shell lets minimap frames reuse the transcript's row cache.
                                 .child(
                                     div()
@@ -985,9 +988,12 @@ impl Render for Workspace {
                         this.child(
                             v_flex()
                                 .relative()
+                                .overflow_hidden()
                                 .flex_1()
                                 .min_h_0()
                                 .pr(px(details_layout.lane_inset))
+                                .theme_slot_hover(ThemeSlot::ConversationArea, cx)
+                                .children(theme_slot_background_layer(ThemeSlot::ConversationArea, cx))
                                 .child(div().track_focus(&self.area_focus.composer).flex_1().min_h_0().child(self.draft.clone()))
                                 .child(self.details.clone()),
                         )
@@ -1172,10 +1178,13 @@ impl Workspace {
                     .top_0()
                     .bottom_0()
                     .left_0()
+                    .overflow_hidden()
                     .w(px(width))
                     .bg(hsla(p.sidebar))
                     .border_r_1()
                     .border_color(hsla(p.sidebar_edge))
+                    .theme_slot_hover(ThemeSlot::Sidebar, cx)
+                    .children(theme_slot_background_layer(ThemeSlot::Sidebar, cx))
                     .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full())),
             )
     }
@@ -2522,5 +2531,276 @@ mod tests {
         drop(fixture);
         drop(runtime);
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn theme_css_hooks_chrome_panels_render_cleanly_with_preview_and_scoped_background_image(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (state, fixture) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::composer::init(cx);
+            crate::keymap::init(cx);
+            let installed =
+                crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone());
+            crate::settings::init(installed.0.clone(), cx);
+            crate::theme_editor::init(installed.0.clone(), cx);
+            crate::usage::init(installed.0.clone(), cx);
+            crate::updates::init(cx);
+            installed
+        });
+        fixture
+            .grants
+            .send(Some(
+                serde_json::from_value(json!({
+                    "authenticated": true,
+                    "permissions": ["orchestration:read", "orchestration:operate", "terminal:operate"]
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        state.update(cx, |state, cx| {
+            state.phase = Phase::Online(ConnectionStatus::Connected);
+            let snapshot = state.shell.snapshot.as_mut().expect("fixture snapshot");
+            let project_id = snapshot.projects[0].id.clone();
+            snapshot.projects[0].project_icon =
+                Some(json!({ "kind": "monogram", "text": "T3", "color": "blue" }));
+            // Add a running/working thread and a settled thread alongside `menu-thread` so
+            // active, inactive, and receding-working `row_surface` branches all render.
+            snapshot.threads.push(
+                serde_json::from_value(json!({
+                    "id": "working-thread",
+                    "projectId": project_id,
+                    "title": "Working row",
+                    "createdAt": "2026-06-01T00:00:00Z",
+                    "updatedAt": "2026-06-01T00:00:00Z",
+                    "providerInstanceId": "replay",
+                    "modelSelection": { "instanceId": "replay", "model": "replay" },
+                    "runtimeMode": "auto",
+                    "interactionMode": "default",
+                    "lineage": { "rootThreadId": "working-thread" },
+                    "status": "running",
+                    "latestRunId": "run-1",
+                    "activeRunId": "run-1",
+                    "activityRunStartedAt": "2026-06-01T00:00:00Z",
+                    "latestUserAuthoredMessageAt": "2026-06-01T00:00:00Z",
+                    "hasActionableProposedPlan": false,
+                    "itemCount": 0,
+                    "visibleItemCount": 0
+                }))
+                .unwrap(),
+            );
+            snapshot.threads.push(
+                serde_json::from_value(json!({
+                    "id": "inactive-thread",
+                    "projectId": project_id,
+                    "title": "Inactive row",
+                    "createdAt": "2026-06-01T00:00:00Z",
+                    "updatedAt": "2026-06-01T00:00:00Z",
+                    "providerInstanceId": "replay",
+                    "modelSelection": { "instanceId": "replay", "model": "replay" },
+                    "runtimeMode": "auto",
+                    "interactionMode": "default",
+                    "lineage": { "rootThreadId": "inactive-thread" },
+                    "status": "idle",
+                    "hasActionableProposedPlan": false,
+                    "itemCount": 0,
+                    "visibleItemCount": 0
+                }))
+                .unwrap(),
+            );
+            state.rebuild_sidebar(cx);
+            state.select_thread("menu-thread", cx);
+            state.sidebar.collapsed = false;
+        });
+
+        let (workspace, vcx) = cx.add_window_view(|window, cx| {
+            let mut ws = Workspace::new(state.clone(), window, cx);
+            // Suppress Composer's native macOS `Input` during `TestWindow::draw` (`gpui-component`
+            // calls unimplemented `TestWindow::window_handle` in `set_text_content_type`).
+            ws.composer_replaced = true;
+            ws
+        });
+        vcx.run_until_parked();
+
+        // Install a synthetic 2x2 RenderImage so `theme_slot_background_layer` produces live elements.
+        let synthetic_bg = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([0x22, 0x44, 0x88, 0xff])),
+        )]));
+
+        let all_nine_css = r#"
+            [data-slot="sidebar"] {
+                background: var(--theme-background-image) center / cover no-repeat;
+                border-right: 2px solid #445566;
+            }
+            [data-slot="sidebar"]:hover {
+                border-color: #778899;
+            }
+            [data-slot="sidebar-inner"] {
+                padding: 2px;
+                border-color: #334455;
+            }
+            [data-slot="sidebar-inner"]:hover {
+                opacity: 0.98;
+            }
+            [data-slot="sidebar-inner"]:active {
+                opacity: 0.96;
+            }
+            [data-thread-item] {
+                border-radius: 10px;
+                border: 1px solid #223344;
+            }
+            [data-thread-item]:hover {
+                background: #223344;
+                opacity: 1;
+            }
+            [data-thread-item]:active {
+                background: #112233;
+            }
+            [data-slot="project-monogram"] {
+                background: #102030;
+                color: #ffaa00;
+                border: 1px solid #ffaa00;
+                border-radius: 999px;
+            }
+            [data-slot="project-monogram"]:hover {
+                opacity: 0.9;
+            }
+            [data-chat-header] {
+                background: #121826;
+                border-bottom: 2px solid #335577;
+            }
+            [data-chat-header]:hover {
+                opacity: 0.99;
+            }
+            [data-workspace-area="conversation"] {
+                background: var(--theme-background-image) center / cover no-repeat;
+            }
+            [data-thread-details-card] {
+                background: #161b26;
+                border: 2px solid #446688;
+                border-radius: 12px;
+            }
+            [data-thread-details-card]:hover {
+                border-color: #6688aa;
+            }
+            [data-thread-details-card]:active {
+                opacity: 0.98;
+            }
+            [data-thread-terminal-drawer] {
+                background: #0b0e14;
+                border-top: 2px solid #336699;
+            }
+            [data-thread-terminal-drawer]:hover {
+                border-color: #4477aa;
+            }
+            [data-thread-terminal-drawer]:active {
+                opacity: 0.99;
+            }
+            [data-settings-page-scroll] {
+                background: #111520;
+                padding: 20px;
+            }
+            [data-settings-page-scroll]:hover {
+                opacity: 0.99;
+            }
+            [data-settings-page-scroll]:active {
+                opacity: 0.98;
+            }
+        "#;
+
+        vcx.update(|window, cx| {
+            crate::theme::set_background_image(Some(synthetic_bg.clone()), cx);
+            let colors = t3_core::themes::standard(true);
+            crate::theme::preview_with_css(Some((&colors, Some(all_nine_css), true)), cx);
+
+            assert!(crate::theme::slot_stylesheet(cx).has_scoped_background_image());
+            assert!(theme_slot_background_layer(ThemeSlot::Sidebar, cx).is_some());
+            assert!(theme_slot_background_layer(ThemeSlot::ConversationArea, cx).is_some());
+            assert!(theme_slot_background_layer(ThemeSlot::ChatHeader, cx).is_none());
+
+            // Open terminal drawer and suppress Composer's native macOS `Input` during `TestWindow::draw`
+            // (`gpui-component` calls unimplemented `TestWindow::window_handle` in `set_text_content_type`).
+            workspace.update(cx, |ws, cx| {
+                ws.composer_replaced = true;
+                ws.terminal.update(cx, |drawer, cx| drawer.toggle(window, cx));
+            });
+
+            // 1. Active thread + inline sidebar + chat header + conversation area + inline details card + terminal drawer.
+            window.blur();
+            window.refresh();
+            window.draw(cx).clear();
+
+            // 2. Narrow sheet sidebar (`render_sidebar_sheet`) + popover details card.
+            state.update(cx, |state, cx| {
+                state.set_sidebar_viewport(500., cx);
+                state.toggle_sidebar_or_sheet(cx);
+            });
+            if let Some(details) = crate::thread_details::details(cx) {
+                details.update(cx, |details, cx| {
+                    details.set_presentation(crate::thread_details::Presentation::Popover);
+                    details.toggle("menu-thread", cx);
+                });
+            }
+            window.blur();
+            window.refresh();
+            window.draw(cx).clear();
+
+            // 3. Settings modal (scrollable section + list-backed section) + scoped wallpaper on remaining slots.
+            let scoped_layers_css = r#"
+                [data-slot="sidebar-inner"] { background: var(--theme-background-image) center / cover no-repeat; }
+                [data-chat-header] { background: var(--theme-background-image) center / cover no-repeat; }
+                [data-thread-details-card] { background: var(--theme-background-image) center / cover no-repeat; }
+                [data-thread-terminal-drawer] { background: var(--theme-background-image) center / cover no-repeat; }
+                [data-settings-page-scroll] { background: var(--theme-background-image) center / cover no-repeat; }
+                [data-thread-item]:hover { background: #334455; }
+            "#;
+            crate::theme::preview_with_css(Some((&colors, Some(scoped_layers_css), true)), cx);
+            for slot in [
+                ThemeSlot::SidebarInner,
+                ThemeSlot::ChatHeader,
+                ThemeSlot::ThreadDetailsCard,
+                ThemeSlot::ThreadTerminalDrawer,
+                ThemeSlot::SettingsPageScroll,
+            ] {
+                assert!(
+                    theme_slot_background_layer(slot, cx).is_some(),
+                    "expected scoped background image layer for {slot:?}"
+                );
+            }
+            state.update(cx, |state, cx| {
+                state.set_sidebar_viewport(1200., cx);
+                state.select_thread("menu-thread", cx);
+            });
+            crate::settings::open(t3_core::settings::search::Section::Appearance, cx);
+            window.blur();
+            window.refresh();
+            window.draw(cx).clear();
+
+            crate::settings::open(t3_core::settings::search::Section::Projects, cx);
+            window.blur();
+            window.refresh();
+            window.draw(cx).clear();
+
+            // Clear live preview and background image; stock theme restores cleanly with zero overrides.
+            crate::theme::preview(None, cx);
+            crate::theme::set_background_image(None, cx);
+            assert!(crate::theme::slot_stylesheet(cx).is_empty());
+            assert!(theme_slot_background_layer(ThemeSlot::ConversationArea, cx).is_none());
+            window.blur();
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        state.update(vcx, |state, _| state.stop_pump());
+        vcx.cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        drop(fixture);
+        drop(runtime);
+        vcx.run_until_parked();
     }
 }

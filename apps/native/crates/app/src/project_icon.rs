@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, FontWeight, Hsla, Image, ImageFormat, IntoElement, ObjectFit, ParentElement, Pixels, SharedString, Styled, StyledImage, div, img, prelude::*};
+use gpui::{AnyElement, App, FontWeight, Hsla, Image, ImageFormat, IntoElement, ObjectFit, ParentElement, Pixels, SharedString, StyleRefinement, Styled, StyledImage, div, img, prelude::*};
 use t3_core::client_settings::typography::FontRole;
 use t3_core::settings::projects::{
     ProjectIcon,
@@ -15,8 +15,29 @@ use t3_core::settings::projects::{
 use crate::{
     app_state::AppState,
     icons::Icon,
-    theme::{Palette, hsla, palette},
+    theme::{Palette, ThemeSlot, apply_slot_override, hsla, palette, slot_style},
 };
+
+#[derive(Clone, Default)]
+struct MonogramSlotOverride {
+    base: Option<StyleRefinement>,
+    hover: Option<StyleRefinement>,
+}
+
+fn monogram_slot_override(cx: &App) -> Option<MonogramSlotOverride> {
+    let set = slot_style(ThemeSlot::ProjectMonogram, cx)?;
+    let base = (!set.base.is_empty()).then(|| {
+        let mut style = StyleRefinement::default();
+        apply_slot_override(&mut style, &set.base, cx);
+        style
+    });
+    let hover = (!set.hover.is_empty()).then(|| {
+        let mut style = StyleRefinement::default();
+        apply_slot_override(&mut style, &set.hover, cx);
+        style
+    });
+    (base.is_some() || hover.is_some()).then_some(MonogramSlotOverride { base, hover })
+}
 
 #[derive(Clone, Default)]
 pub struct ProjectVisual {
@@ -53,27 +74,57 @@ impl ProjectVisual {
     fn render_with_grayscale(&self, size: Pixels, muted: Hsla, grayscale: bool, cx: &App) -> AnyElement {
         let p = palette(cx);
         let font = crate::theme::font_family(FontRole::Code, cx);
+        let monogram_slot = monogram_slot_override(cx);
         match self.presentation.as_ref().map(|presentation| presentation.source(self.image.is_some())) {
             Some(Source::Image) => {
                 let fallback = self.presentation.clone();
                 let loading = fallback.clone();
                 let loading_font = font.clone();
+                let loading_slot = monogram_slot.clone();
                 img(self.image.clone().expect("image source"))
                     .flex_none()
                     .size(size)
                     .rounded(size * 0.25)
                     .object_fit(ObjectFit::Contain)
                     .grayscale(grayscale)
-                    .with_fallback(move || render_source(fallback.as_ref().map(|p| p.source(false)), size, muted, p, grayscale, font.clone()))
-                    .with_loading(move || render_source(loading.as_ref().map(|p| p.source(false)), size, muted, p, grayscale, loading_font.clone()))
+                    .with_fallback(move || {
+                        render_source(
+                            fallback.as_ref().map(|p| p.source(false)),
+                            size,
+                            muted,
+                            p,
+                            grayscale,
+                            font.clone(),
+                            monogram_slot.as_ref(),
+                        )
+                    })
+                    .with_loading(move || {
+                        render_source(
+                            loading.as_ref().map(|p| p.source(false)),
+                            size,
+                            muted,
+                            p,
+                            grayscale,
+                            loading_font.clone(),
+                            loading_slot.as_ref(),
+                        )
+                    })
                     .into_any_element()
             }
-            source => render_source(source, size, muted, p, grayscale, font),
+            source => render_source(source, size, muted, p, grayscale, font, monogram_slot.as_ref()),
         }
     }
 }
 
-fn render_source(source: Option<Source<'_>>, size: Pixels, muted: Hsla, p: Palette, grayscale: bool, font: SharedString) -> AnyElement {
+fn render_source(
+    source: Option<Source<'_>>,
+    size: Pixels,
+    muted: Hsla,
+    p: Palette,
+    grayscale: bool,
+    font: SharedString,
+    monogram_slot: Option<&MonogramSlotOverride>,
+) -> AnyElement {
     let ink = |color: &str| {
         let mut ink = color_token(color, p);
         if grayscale {
@@ -99,7 +150,7 @@ fn render_source(source: Option<Source<'_>>, size: Pixels, muted: Hsla, p: Palet
         Some(Source::Icon(ProjectIcon::Monogram { text, color })) => {
             let ink = ink(color);
             // GPUI lacks SVG textLength: keep the 8.25/16 type and 6/12-unit target, without stretching glyphs.
-            div()
+            let mut tile = div()
                 .flex_none()
                 .size(size)
                 .rounded(size * 0.25)
@@ -107,18 +158,39 @@ fn render_source(source: Option<Source<'_>>, size: Pixels, muted: Hsla, p: Palet
                 .bg(ink.opacity(0.14))
                 .flex()
                 .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .max_w(size * (monogram_width(text) / 16.))
-                        .text_size(size * (8.25 / 16.))
-                        .line_height(size)
-                        .font_family(font)
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(ink)
-                        .child(SharedString::from(text.clone())),
-                )
-                .into_any_element()
+                .justify_center();
+            let mut label = div()
+                .max_w(size * (monogram_width(text) / 16.))
+                .text_size(size * (8.25 / 16.))
+                .line_height(size)
+                .font_family(font)
+                .font_weight(FontWeight::BOLD)
+                .text_color(ink)
+                .child(SharedString::from(text.clone()));
+            if let Some(slot) = monogram_slot {
+                if let Some(base) = &slot.base {
+                    if let Some(color) = base.text.color {
+                        label = label.text_color(color);
+                    }
+                    if let Some(family) = base.text.font_family.clone() {
+                        label = label.font_family(family);
+                    }
+                    if let Some(weight) = base.text.font_weight {
+                        label = label.font_weight(weight);
+                    }
+                    if let Some(font_size) = base.text.font_size {
+                        label.style().text.font_size = Some(font_size);
+                    }
+                    tile.style().refine(base);
+                }
+                if let Some(hover) = slot.hover.clone() {
+                    tile = tile.hover(move |mut style| {
+                        style.refine(&hover);
+                        style
+                    });
+                }
+            }
+            tile.child(label).into_any_element()
         }
         Some(Source::Icon(ProjectIcon::Lucide { name, color })) => {
             let color = ink(color);
@@ -202,6 +274,7 @@ pub fn size(web_px: f32, cx: &App) -> Pixels {
 }
 
 pub(crate) fn preview(icon: &ProjectIcon, size: Pixels, cx: &App) -> AnyElement {
+    let monogram_slot = monogram_slot_override(cx);
     render_source(
         Some(Source::Icon(icon)),
         size,
@@ -209,6 +282,7 @@ pub(crate) fn preview(icon: &ProjectIcon, size: Pixels, cx: &App) -> AnyElement 
         palette(cx),
         false,
         crate::theme::font_family(FontRole::Code, cx),
+        monogram_slot.as_ref(),
     )
 }
 
@@ -251,5 +325,50 @@ mod tests {
 
         // Unknown future icon name returns None so render_source falls back to FolderCode.
         assert!(dynamic_lucide_image("nonexistent-icon-xyz", color).is_none());
+    }
+
+    #[gpui::test]
+    fn project_monogram_slot_refines_tile_and_clears_on_stock_theme(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+
+            assert!(monogram_slot_override(cx).is_none());
+
+            let colors = t3_core::themes::standard(true);
+            crate::theme::preview_with_css(
+                Some((
+                    &colors,
+                    Some(
+                        r#"
+                        [data-slot="project-monogram"] {
+                            background: #102030;
+                            color: #ffaa00;
+                            border: 1px solid #ffaa00;
+                            border-radius: 999px;
+                        }
+                        [data-slot="project-monogram"]:hover {
+                            opacity: 0.85;
+                        }
+                    "#,
+                    ),
+                    true,
+                )),
+                cx,
+            );
+
+            let ov = monogram_slot_override(cx).expect("project-monogram slot compiled");
+            let base = ov.base.as_ref().expect("base override present");
+            assert_eq!(base.text.color, Some(hsla(0xffaa_00ff)));
+            assert_eq!(base.border_color, Some(hsla(0xffaa_00ff)));
+            assert_eq!(base.corner_radii.top_left, Some(gpui::px(999.0).into()));
+            assert_eq!(ov.hover.as_ref().and_then(|h| h.opacity), Some(0.85));
+
+            let icon = ProjectIcon::Monogram { text: "T3".into(), color: "blue".into() };
+            let _ = preview(&icon, gpui::px(16.), cx);
+
+            crate::theme::preview(None, cx);
+            assert!(monogram_slot_override(cx).is_none());
+        });
     }
 }

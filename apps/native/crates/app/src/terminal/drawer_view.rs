@@ -18,7 +18,10 @@ use super::drawer::{DrawerAnimation, TerminalDrawer};
 use super::with_shortcut;
 use crate::icons::Icon;
 use super::{CloseTerminal, NewTerminal, SplitTerminal, SplitTerminalVertical};
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt as _, ThemeSlotInteractiveExt as _, hsla, palette,
+    theme_slot_background_layer,
+};
 
 const RESIZE_STRIP: f32 = 6.;
 const SIDEBAR_WIDTH: f32 = 144.;
@@ -339,12 +342,15 @@ impl Render for TerminalDrawer {
             if let Some(anim) = self.drawer_animation.filter(|a| !a.opening) {
                 return div()
                     .id("terminal-drawer-closing")
+                    .relative()
                     .w_full()
                     .flex_none()
                     .overflow_hidden()
                     .bg(hsla(p.background))
                     .border_t_1()
                     .border_color(hsla(p.border).opacity(0.8))
+                    .theme_slot(ThemeSlot::ThreadTerminalDrawer, cx)
+                    .children(theme_slot_background_layer(ThemeSlot::ThreadTerminalDrawer, cx))
                     .with_animation(
                         ElementId::Name(format!("terminal-drawer-close-{}", anim.seq).into()),
                         Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
@@ -430,6 +436,7 @@ impl Render for TerminalDrawer {
             .bg(hsla(p.background))
             .border_t_1()
             .border_color(hsla(p.border).opacity(0.8))
+            .theme_slot_interactive(ThemeSlot::ThreadTerminalDrawer, cx)
             .on_action(cx.listener(|drawer, _: &NewTerminal, window, cx| drawer.new_terminal(window, cx)))
             .on_action(cx.listener(|drawer, _: &SplitTerminal, window, cx| drawer.split(SplitDirection::Horizontal, window, cx)))
             .on_action(cx.listener(|drawer, _: &SplitTerminalVertical, window, cx| drawer.split(SplitDirection::Vertical, window, cx)))
@@ -437,6 +444,7 @@ impl Render for TerminalDrawer {
             .on_drag_move(cx.listener(move |drawer, event: &DragMoveEvent<ResizeDrawer>, _, cx| {
                 drawer.resize_to(f32::from(event.event.position.y), viewport, cx)
             }))
+            .children(theme_slot_background_layer(ThemeSlot::ThreadTerminalDrawer, cx))
             .child(body)
             .children(floating)
             .child(strip);

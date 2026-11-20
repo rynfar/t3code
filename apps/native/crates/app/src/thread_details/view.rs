@@ -26,7 +26,10 @@ use crate::composer::Composer;
 use crate::git::{BranchPicker, GitDialogs, GitEvent, GitStore};
 use crate::icons::Icon;
 use crate::terminal::TerminalDrawer;
-use crate::theme::{hsla, metrics, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotInteractiveExt as _, hsla, metrics, palette, slot_style,
+    theme_slot_background_layer,
+};
 use crate::thread_view::ThreadView;
 
 /// What the card shows from the shell; a shell update that leaves it alone skips the render.
@@ -418,15 +421,32 @@ impl Render for DetailsView {
             });
         let details = self.details.clone();
         let claim = self.row_menu_claim.clone();
+        let card_slot = slot_style(ThemeSlot::ThreadDetailsCard, cx);
+        let custom_surface = card_slot.as_ref().is_some_and(|set| {
+            set.base.background.is_some()
+                || set.base.border_color.is_some()
+                || !set.base.border_widths.is_empty()
+                || !set.base.border_radii.is_empty()
+        });
         let card = div()
             .id("thread-details-card")
             .relative()
+            .overflow_hidden()
             .w(px(metrics::THREAD_DETAILS_PANEL_WIDTH))
             .max_h_full()
             .flex()
             .flex_col()
             .rounded(px(16.))
-            .child(crate::glass::backdrop(16., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+            .when(custom_surface, |this| {
+                this.bg(hsla(p.dropdown_surface))
+                    .border_1()
+                    .border_color(hsla(p.dropdown_border))
+            })
+            .theme_slot_interactive(ThemeSlot::ThreadDetailsCard, cx)
+            .when(!custom_surface, |this| {
+                this.child(crate::glass::backdrop(16., hsla(p.dropdown_surface), hsla(p.dropdown_border), cx))
+            })
+            .children(theme_slot_background_layer(ThemeSlot::ThreadDetailsCard, cx))
             .child(crate::webview::occluder("thread-details-cover", crate::webview::Layer::TranscriptChrome))
             .when(popover, |this| {
                 this.occlude()

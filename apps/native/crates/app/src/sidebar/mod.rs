@@ -37,7 +37,10 @@ use crate::context_menu::{ContextMenu, ContextMenuEvent};
 use crate::dialog::ConfirmDialog;
 use crate::snooze_dialog::SnoozeDialog;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotInteractiveExt as _, hsla, palette, slot_style,
+    theme_slot_background_layer,
+};
 use crate::workspace::TITLEBAR_HEIGHT;
 use controller::now_ms;
 use search::SearchState;
@@ -1803,14 +1806,18 @@ impl Render for SidebarPane {
         let suppressed = self.hover_suppressed();
         let active_list = if self.search.is_active() { self.search.list().clone() } else { self.list.clone() };
         let hover_overlay = self.hover.overlay(suppressed, &active_list);
+        let sidebar_overrides_bg =
+            slot_style(ThemeSlot::Sidebar, cx).is_some_and(|set| set.base.background.is_some());
         div()
             .id("sidebar-folder-drop")
             .debug_selector(|| "sidebar-folder-drop".into())
             .relative()
+            .overflow_hidden()
             .size_full()
             .flex()
             .flex_col()
-            .bg(hsla(p.sidebar))
+            .when(!sidebar_overrides_bg, |this| this.bg(hsla(p.sidebar)))
+            .theme_slot_interactive(ThemeSlot::SidebarInner, cx)
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 if this.hover.is_active() {
                     cx.notify();
@@ -1840,6 +1847,7 @@ impl Render for SidebarPane {
                 this.finish_sweep(false, cx);
                 this.finish_project_drag(false, cx);
             }))
+            .children(theme_slot_background_layer(ThemeSlot::SidebarInner, cx))
             .child(self.hover.begin_frame_probe())
             .child(self.render_header(cx))
             .child(self.render_search(cx))

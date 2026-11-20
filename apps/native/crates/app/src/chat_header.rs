@@ -22,7 +22,9 @@ use crate::context_menu::ContextMenu;
 use crate::icons::Icon;
 use crate::keymap;
 use crate::right_panel::{self, Button, Variant};
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotHoverExt as _, hsla, palette, theme_slot_background_layer,
+};
 use crate::thread_details::{self, ToggleThreadPanel, canvas_width};
 use crate::toast::{Toast, ToastKind};
 use crate::workspace::sidebar_inline_width;
@@ -369,6 +371,25 @@ impl Render for ChatHeader {
     }
 }
 
+/// Outer chat header bar (`[data-chat-header]`): full-width titlebar strip carrying compiled
+/// `ThemeSlot::ChatHeader` overrides and any scoped `var(--theme-background-image)` layer painted
+/// behind the breadcrumb and panel controls.
+pub fn container(collapsed: bool, cx: &App) -> gpui::Div {
+    h_flex()
+        .relative()
+        .overflow_hidden()
+        .window_control_area(gpui::WindowControlArea::Drag)
+        .h(px(crate::workspace::TITLEBAR_HEIGHT))
+        .flex_none()
+        .pl(px(if collapsed { 130. } else { 20. }))
+        .pr(px(12.))
+        .gap_3()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .theme_slot_hover(ThemeSlot::ChatHeader, cx)
+        .children(theme_slot_background_layer(ThemeSlot::ChatHeader, cx))
+}
+
 /// `PanelLayoutControls`: Thread details, Terminal (the drawer's toggle) and Right panel toggles
 /// (ghost `sm` toggles, 16px icons). While the right panel is open its tab bar holds the panel
 /// toggles, so the header keeps Thread details (`ThreadPanelHeaderControl`).
@@ -393,4 +414,57 @@ pub fn controls(state: &Entity<AppState>, terminal_toggle: Option<AnyElement>, w
         })
         .children(terminal_toggle)
         .when(!panel_open, |this| this.child(right_panel::header_controls(state, cx)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn chat_header_container_applies_theme_slot_and_restores_on_clear(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+
+            let colors = t3_core::themes::standard(true);
+            crate::theme::preview_with_css(
+                Some((
+                    &colors,
+                    Some(
+                        r#"
+                        [data-chat-header] {
+                            background: #121826;
+                            border-bottom: 2px solid #ff44aa;
+                            padding: 4px 16px;
+                        }
+                        [data-chat-header]:hover {
+                            opacity: 0.95;
+                        }
+                    "#,
+                    ),
+                    true,
+                )),
+                cx,
+            );
+
+            let mut styled = container(false, cx);
+            let style = styled.style();
+            assert_eq!(
+                style.background,
+                Some(gpui::Fill::Color(gpui::solid_background(hsla(0x1218_26ff))))
+            );
+            assert_eq!(style.border_color, Some(hsla(0xff44_aaff)));
+            assert_eq!(style.border_widths.bottom, Some(px(2.0).into()));
+            assert_eq!(style.padding.top, Some(px(4.0).into()));
+            assert_eq!(style.padding.right, Some(px(16.0).into()));
+
+            crate::theme::preview(None, cx);
+            let mut restored = container(false, cx);
+            let restored_style = restored.style();
+            assert_eq!(restored_style.border_color, Some(cx.theme().border));
+            assert_eq!(restored_style.background, None);
+            assert_eq!(restored_style.padding.top, None);
+            assert_ne!(restored_style.border_color, Some(hsla(0xff44_aaff)));
+        });
+    }
 }

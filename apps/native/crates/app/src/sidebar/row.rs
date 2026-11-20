@@ -18,7 +18,10 @@ use super::drag::{DraggedSweep, DraggedThread, ThreadDragPreview, drop_verb_badg
 use super::hover::{HoverTarget, pr_icon, pr_tone};
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon, ProviderMark};
-use crate::theme::{Palette, hsla, palette};
+use crate::theme::{
+    Palette, ThemeSlot, ThemeSlotExt as _, hsla, palette, refine_slot_active, refine_slot_hover,
+    slot_style,
+};
 
 const CARD_CONTENT_HEIGHT: f32 = 78.;
 const SLIM_HEIGHT: f32 = 36.;
@@ -334,6 +337,9 @@ impl SidebarPane {
         let hover = HoverTarget { state: self.state.clone(), key: key.cloned(), thread_id: thread.id.clone(), project: project.clone(), favicon: visual.clone(), is_repo };
         let preview = (thread.title.clone(), project, visual);
         let pane = cx.entity().downgrade();
+        let thread_item_slot = slot_style(ThemeSlot::ThreadItem, cx);
+        let slot_has_hover = thread_item_slot.as_ref().is_some_and(|set| !set.hover.is_empty());
+        let slot_has_active = thread_item_slot.as_ref().is_some_and(|set| !set.active.is_empty());
         div()
             .id(row_id)
             .debug_selector(move || debug_row_id.to_string())
@@ -348,12 +354,18 @@ impl SidebarPane {
             .when(selected, |this| this.bg(hsla(p.sidebar_row_selected)).when(light, |this| this.shadow(vec![ring.clone()])))
             .when(draft_bg, |this| this.bg(hsla(p.warning).opacity(0.04)))
             .when(recede_working, |this| this.opacity(0.7))
-            // GPUI allows one hover style per element: the background and the receding row's full opacity share it.
-            .when(hover_bg || recede_working, |this| {
+            .theme_slot(ThemeSlot::ThreadItem, cx)
+            // GPUI allows one hover style per element: the background, the receding row's full
+            // opacity, and `[data-thread-item]:hover` overrides share it.
+            .when(hover_bg || recede_working || slot_has_hover, |this| {
                 this.hover(|style| {
                     let style = if draft_bg { style.bg(hsla(p.warning).opacity(0.08)) } else if hover_bg { style.bg(hsla(p.sidebar_row_hover)) } else { style };
-                    if recede_working { style.opacity(1.) } else { style }
+                    let style = if recede_working { style.opacity(1.) } else { style };
+                    refine_slot_hover(style, ThemeSlot::ThreadItem, cx)
                 })
+            })
+            .when(slot_has_active, |this| {
+                this.active(|style| refine_slot_active(style, ThemeSlot::ThreadItem, cx))
             })
             .when(dragging, |this| this.opacity(0.5))
             .child(self.hover.record_row_bounds(hover_bounds_id, cx.entity_id()))

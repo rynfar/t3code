@@ -53,7 +53,9 @@ use t3_core::sidebar::grouping::{EnvironmentOwner, ScopedProject};
 use crate::app_state::{AppEvent, AppState};
 use crate::i18n::{active_locale, t};
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotInteractiveExt as _, hsla, palette, theme_slot_background_layer,
+};
 use controls::{
     Button, ButtonSize, ButtonVariant, ModalLayout, Select, SelectOption, focus_ring, group, icon,
     r,
@@ -2398,9 +2400,11 @@ impl Render for SettingsView {
         });
         let content = match archive_list {
             Some(list) => v_flex()
+                .id("settings-page-scroll-list")
                 .flex_1()
                 .min_h_0()
                 .items_center()
+                .theme_slot_interactive(ThemeSlot::SettingsPageScroll, cx)
                 .when_some(error, |this, error| this.child(div().w_full().flex().justify_center().pt(r(24.)).child(error)))
                 .when_some(scope_banner, |this, banner| this.child(div().w_full().flex().justify_center().pt(r(16.)).child(banner)))
                 .child(list)
@@ -2415,12 +2419,20 @@ impl Render for SettingsView {
                 .pt(r(24.))
                 .pb(r(48.))
                 .gap(r(24.))
+                .theme_slot_interactive(ThemeSlot::SettingsPageScroll, cx)
                 .children(error)
                 .children(scope_banner)
                 .children(scope_notice)
                 .children(blocks.into_iter().map(|block| div().w_full().max_w(r(page_width)).px(r(24.)).child(block.element)))
                 .into_any_element(),
         };
+        let content_pane = v_flex()
+            .relative()
+            .overflow_hidden()
+            .flex_1()
+            .min_h_0()
+            .children(theme_slot_background_layer(ThemeSlot::SettingsPageScroll, cx))
+            .child(content);
         let icon_picker = self.project_icon_picker_overlay(window, cx);
         let action_editor = self.action_editor_overlay(window, cx);
         let secret_dialog = self.secret_dialog_overlay(window, cx);
@@ -2442,7 +2454,7 @@ impl Render for SettingsView {
             .on_action(cx.listener(|this, _: &FocusPreviousInSettings, window, cx| this.cycle_focus(false, window, cx)))
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_nav(layout, window, cx))
-            .child(v_flex().flex_1().min_w_0().h_full().child(self.render_header(cx)).child(content))
+            .child(v_flex().flex_1().min_w_0().h_full().child(self.render_header(cx)).child(content_pane))
             .children(icon_picker)
             .children(action_editor)
             .children(secret_dialog)
