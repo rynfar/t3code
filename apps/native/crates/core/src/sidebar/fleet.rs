@@ -153,13 +153,74 @@ pub struct ScopedSidebarModel {
 }
 
 fn folder_dot(threads: &[&SidebarThread]) -> Option<FolderDot> {
-    use super::status::{ThreadStatus, resolve_status, has_unseen_completion};
-    let statuses = threads.iter().map(|thread| resolve_status(thread)).collect::<Vec<_>>();
+    use super::status::{ThreadStatus, resolve_row_status, has_unseen_completion};
+    let statuses = threads.iter().map(|thread| resolve_row_status(thread)).collect::<Vec<_>>();
     if statuses.iter().any(|status| matches!(status, ThreadStatus::Input | ThreadStatus::Approval | ThreadStatus::Request | ThreadStatus::Limited)) { Some(FolderDot::Attention) }
     else if statuses.contains(&ThreadStatus::Failed) { Some(FolderDot::Failed) }
-    else if threads.iter().any(|thread| resolve_status(thread) == ThreadStatus::Ready && has_unseen_completion(thread)) { Some(FolderDot::Unread) }
+    else if threads.iter().any(|thread| resolve_row_status(thread) == ThreadStatus::Ready && has_unseen_completion(thread)) { Some(FolderDot::Unread) }
     else if statuses.iter().any(|status| matches!(status, ThreadStatus::Working | ThreadStatus::Preparing)) { Some(FolderDot::Working) }
     else { None }
+}
+
+/// `resolveListedAncestorThreadRef` (`packages/client-runtime/src/state/threadShell.ts`):
+/// Subagents, side chats, and tasks delegated from a listed parent have no list row, so an open
+/// one is represented by its nearest listed ancestor. A broken chain (missing or archived parent,
+/// cycle) resolves to `selected` itself, which then matches no row.
+pub fn resolve_listed_ancestor_thread_key(
+    selected: &ThreadKey,
+    environments: &[&EnvironmentSummary],
+    extra_threads: &[ScopedExtraThreads<'_>],
+) -> ThreadKey {
+    let all_threads = || {
+        environments
+            .iter()
+            .flat_map(|env| env.threads.iter())
+            .chain(extra_threads.iter().flat_map(|extra| extra.threads.iter()))
+    };
+    let find_by_key = |target: &ThreadKey| -> Option<&ScopedThread> {
+        all_threads().find(|row| row.thread.id == target.thread_id && row.owner.saved_id == target.environment_id)
+    };
+    let find_delegated_parent = |env_id: &str, thread_id: &str| -> Option<&ScopedThread> {
+        all_threads().find(|row| {
+            row.thread.id == thread_id
+                && (row.owner.canonical_id.as_deref() == Some(env_id) || row.owner.saved_id == env_id)
+        })
+    };
+    let mut visited = HashSet::<ThreadKey>::new();
+    let mut current = selected.clone();
+    let mut thread = find_by_key(&current);
+    while let Some(entry) = thread {
+        let next = if !entry.lineage.is_listed() {
+            let Some(parent_id) = entry.lineage.parent_thread_id.as_deref() else {
+                return selected.clone();
+            };
+            let parent_key = ThreadKey::new(&entry.owner.saved_id, parent_id);
+            (parent_key.clone(), find_by_key(&parent_key))
+        } else if let Some(from) = entry.delegated_from.as_ref() {
+            let (Some(env_id), Some(parent_id)) = (
+                from.get("environmentId").and_then(|v| v.as_str()),
+                from.get("threadId").and_then(|v| v.as_str()),
+            ) else {
+                return current;
+            };
+            // Mirrors delegatedUnderParent: a task whose parent is missing or archived keeps its own row.
+            let Some(parent_row) = find_delegated_parent(env_id, parent_id) else {
+                return current;
+            };
+            if parent_row.thread.archived {
+                return current;
+            }
+            (parent_row.key(), Some(parent_row))
+        } else {
+            return current;
+        };
+        if !visited.insert(current) {
+            return selected.clone();
+        }
+        current = next.0;
+        thread = next.1;
+    }
+    selected.clone()
 }
 
 impl ScopedSidebarModel {

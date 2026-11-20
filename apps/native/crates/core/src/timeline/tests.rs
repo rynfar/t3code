@@ -2694,3 +2694,55 @@ fn reasoning_preview_cap_info_notice_linked_sender_and_context_stripping() {
     ));
     assert_eq!(ans, "[File: main.rs]\nYes please");
 }
+
+#[test]
+fn command_display_text_unwraps_windows_pwsh_and_cmd_launchers() {
+    // Windows pwsh/powershell -Command and cmd /c launchers unwrap cleanly (`pingdotgg/t3code#38946`).
+    assert_eq!(command_display_text("pwsh -NoProfile -Command 'git status'"), "git status");
+    assert_eq!(
+        command_display_text(r#""C:\Program Files\PowerShell\7\pwsh.exe" -ExecutionPolicy Bypass -c "npm test""#),
+        "npm test"
+    );
+    assert_eq!(
+        command_display_text(r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -Command 'rg -n -F "new Date()" .'"#),
+        r#"rg -n -F "new Date()" ."#
+    );
+    assert_eq!(command_display_text(r#"cmd /d /s /c "dir /b""#), "dir /b");
+    assert_eq!(command_display_text(r#"C:\Windows\System32\cmd.exe /c "echo hi""#), "echo hi");
+    // Extra positional args or chained segments keep the invocation intact.
+    assert_eq!(command_display_text("pwsh -Command 'echo hi' extra"), "pwsh -Command 'echo hi' extra");
+    assert_eq!(command_display_text("cmd /c 'echo a' && echo b"), "cmd /c 'echo a' && echo b");
+}
+
+#[test]
+fn home_paths_do_not_prefix_with_workspace_folder() {
+    // Home paths like `~/.claude/CLAUDE.md` stay as written instead of prefixing workspace folder (`pingdotgg/t3code#39146`).
+    assert_eq!(
+        format_workspace_relative_path("~/.claude/CLAUDE.md", Some("/Users/me/repo")),
+        "~/.claude/CLAUDE.md"
+    );
+    assert_eq!(
+        format_workspace_relative_path(r"~\.claude\CLAUDE.md", Some(r"C:\Users\me\repo")),
+        "~/.claude/CLAUDE.md"
+    );
+    assert_eq!(
+        format_workspace_relative_path(r"C:\other\file.rs", Some("/Users/me/repo")),
+        "C:/other/file.rs"
+    );
+    assert_eq!(
+        format_workspace_relative_path("src/main.rs", Some("/Users/me/repo")),
+        "repo/src/main.rs"
+    );
+    let entry = WorkLogEntry {
+        id: "r1".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        label: "Read".into(),
+        changed_files: vec!["~/.claude/CLAUDE.md".into(), "src/lib.rs".into()],
+        tone: Tone::Tool,
+        ..WorkLogEntry::default()
+    };
+    assert_eq!(
+        presentation::work_entry_read_output(&entry, Some("/Users/me/repo")).as_deref(),
+        Some("~/.claude/CLAUDE.md\n/Users/me/repo/src/lib.rs")
+    );
+}

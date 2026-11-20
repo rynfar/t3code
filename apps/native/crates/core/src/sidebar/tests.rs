@@ -52,6 +52,7 @@ fn base(id: &str) -> SidebarThread {
         settled_override: None,
         settled_at: None,
         unsettled_at: None,
+        unsettled_at_iso: None,
         snoozed_until: None,
         snoozed_at: None,
         pinned: false,
@@ -1966,4 +1967,160 @@ fn updated_at_sort_prefers_latest_user_authored_message_at() {
     // Older servers omitting `latestUserAuthoredMessageAt` still fall back to `latestUserMessageAt`.
     thread.latest_user_authored_message_at = None;
     assert_eq!(thread_sort_timestamp(&thread, ThreadSortOrder::UpdatedAt), Some(99));
+}
+
+#[test]
+fn snooze_wake_label_counts_clock_minutes_for_one_hour_rounding() {
+    // 1h snooze taken mid-minute when caller passes minute-floored `now` still reads "1h", not "2h" (`pingdotgg/t3code#36785`).
+    let now_floored = iso("2026-04-10T10:00:00.000Z");
+    let wake_one_hour_mid_minute = iso("2026-04-10T11:00:30.000Z");
+    assert_eq!(snooze_wake_label(wake_one_hour_mid_minute, now_floored), "1h");
+    assert_eq!(snooze_wake_label(iso("2026-04-10T11:01:00.000Z"), now_floored), "2h");
+    assert_eq!(snooze_wake_label(iso("2026-04-10T10:00:30.000Z"), now_floored), "1m");
+    assert_eq!(snooze_wake_label(now_floored, now_floored), "now");
+}
+
+#[test]
+fn stopped_runs_do_not_show_unseen_completion_and_opened_failures_clear_row_badge() {
+    // Stopped runs (interrupted/cancelled) never count as unseen completions (`pingdotgg/t3code#37475`).
+    for status in ["interrupted", "cancelled"] {
+        let stopped = SidebarThread {
+            latest_run: Some(run(status, None, Some("2026-04-10T10:00:00.000Z"))),
+            last_visited_at: Some(iso("2026-04-10T09:00:00.000Z")),
+            ..base(status)
+        };
+        assert!(!has_unseen_completion(&stopped), "{status} must not show Done");
+    }
+
+    // Opened failure clears the sidebar row badge to Ready (`pingdotgg/t3code#28616`).
+    let failed_unseen = SidebarThread {
+        runtime: Some(runtime("failed")),
+        latest_run: Some(run("failed", Some("2026-04-10T09:50:00.000Z"), Some("2026-04-10T10:00:00.000Z"))),
+        last_visited_at: Some(iso("2026-04-10T09:00:00.000Z")),
+        ..base("failed-unseen")
+    };
+    assert_eq!(resolve_row_status(&failed_unseen), ThreadStatus::Failed);
+    let failed_seen = SidebarThread { last_visited_at: Some(iso("2026-04-10T10:05:00.000Z")), ..failed_unseen.clone() };
+    assert_eq!(resolve_status(&failed_seen), ThreadStatus::Failed);
+    assert_eq!(resolve_row_status(&failed_seen), ThreadStatus::Ready);
+
+    // Failed run without completedAt falls back to startedAt (`hasUnseenRunFailure`).
+    let failed_no_completed = SidebarThread {
+        runtime: Some(runtime("failed")),
+        latest_run: Some(run("failed", Some("2026-04-10T09:50:00.000Z"), None)),
+        last_visited_at: Some(iso("2026-04-10T10:00:00.000Z")),
+        ..base("failed-legacy")
+    };
+    assert!(!has_unseen_failure(&failed_no_completed));
+    assert_eq!(resolve_row_status(&failed_no_completed), ThreadStatus::Ready);
+
+    // Runtime failure without a failed run stays Failed.
+    let runtime_only = SidebarThread { runtime: Some(runtime("failed")), last_visited_at: Some(iso("2026-04-10T10:00:00.000Z")), ..base("rt-only") };
+    assert_eq!(resolve_row_status(&runtime_only), ThreadStatus::Failed);
+}
+
+#[test]
+fn command_palette_status_pill_reports_failed_before_background_waiting() {
+    // A failed run with background work still reports Failed in the command palette (`pingdotgg/t3code#38968`).
+    let failed_with_bg = SidebarThread {
+        latest_run: Some(run("failed", None, Some("2026-04-10T10:00:00.000Z"))),
+        background_holds_completion: true,
+        last_visited_at: Some(iso("2026-04-10T09:00:00.000Z")),
+        ..base("failed-bg")
+    };
+    assert_eq!(status_pill(&failed_with_bg).map(|p| p.label), Some("Failed"));
+
+    // A running thread blocked on thread wait still reports Waiting.
+    let blocked_wait = SidebarThread {
+        runtime: Some(runtime("running")),
+        blocked_on_thread_wait: true,
+        latest_run: Some(run("failed", None, Some("2026-04-10T10:00:00.000Z"))),
+        ..base("blocked-wait")
+    };
+    assert_eq!(status_pill(&blocked_wait).map(|p| p.label), Some("Waiting"));
+}
+
+#[test]
+fn resolve_listed_ancestor_follows_subagents_side_chats_and_delegated_tasks() {
+    use super::fleet::{EnvironmentSummary, ScopedThread, ThreadKey, resolve_listed_ancestor_thread_key};
+    use super::grouping::EnvironmentOwner;
+
+    let owner_a = EnvironmentOwner {
+        saved_id: "saved-a".into(),
+        canonical_id: Some("canon-a".into()),
+        generation: 1,
+        connection_generation: 1,
+        shell_generation: 1,
+    };
+    let owner_b = EnvironmentOwner {
+        saved_id: "saved-b".into(),
+        canonical_id: Some("canon-b".into()),
+        generation: 1,
+        connection_generation: 1,
+        shell_generation: 1,
+    };
+    let make_row = |owner: &EnvironmentOwner, id: &str, parent: Option<&str>, side_chat: bool, delegated: Option<(&str, &str)>, archived: bool| ScopedThread {
+        owner: owner.clone(),
+        thread: SidebarThread { archived, listed: parent.is_none(), ..base(id) },
+        created_at: "2026-06-01T00:00:00.000Z".into(),
+        lineage: crate::shell::Lineage {
+            parent_thread_id: parent.map(str::to_owned),
+            relationship_to_parent: parent.map(|_| if side_chat { "fork".into() } else { "subagent".into() }),
+            root_thread_id: parent.unwrap_or(id).to_owned(),
+            side_chat: side_chat.then_some(true),
+        },
+        delegated_from: delegated.map(|(env, tid)| serde_json::json!({ "environmentId": env, "threadId": tid })),
+        tags: Vec::new(),
+    };
+    let env_a = EnvironmentSummary {
+        owner: owner_a.clone(),
+        projects: vec![],
+        threads: vec![
+            make_row(&owner_a, "parent", None, false, None, false),
+            make_row(&owner_a, "archived-parent", None, false, None, true),
+        ],
+        running_thread_count: 0,
+        synchronized: true,
+        config_loaded: true,
+        snapshot_sequence: Some(1),
+        older_settled: None,
+        removed_at: HashMap::new(),
+        older_count_key: None,
+        request_contributions: vec![],
+        request_ancestry_len: 1,
+    };
+    let env_b = EnvironmentSummary {
+        owner: owner_b.clone(),
+        projects: vec![],
+        threads: vec![
+            make_row(&owner_b, "delegated", None, false, Some(("canon-a", "parent")), false),
+            make_row(&owner_b, "delegated-subagent", Some("delegated"), false, None, false),
+            make_row(&owner_b, "delegated-archived", None, false, Some(("canon-a", "archived-parent")), false),
+        ],
+        running_thread_count: 0,
+        synchronized: true,
+        config_loaded: true,
+        snapshot_sequence: Some(1),
+        older_settled: None,
+        removed_at: HashMap::new(),
+        older_count_key: None,
+        request_contributions: vec![],
+        request_ancestry_len: 3,
+    };
+    let envs = [&env_a, &env_b];
+    // Open delegated task selects its parent's sidebar row across environments (`pingdotgg/t3code#37500`).
+    assert_eq!(
+        resolve_listed_ancestor_thread_key(&ThreadKey::new("saved-b", "delegated"), &envs, &[]),
+        ThreadKey::new("saved-a", "parent")
+    );
+    // A subagent of a delegated task walks all the way to the listed parent.
+    assert_eq!(
+        resolve_listed_ancestor_thread_key(&ThreadKey::new("saved-b", "delegated-subagent"), &envs, &[]),
+        ThreadKey::new("saved-a", "parent")
+    );
+    // A delegated task whose parent is archived keeps its own row.
+    assert_eq!(
+        resolve_listed_ancestor_thread_key(&ThreadKey::new("saved-b", "delegated-archived"), &envs, &[]),
+        ThreadKey::new("saved-b", "delegated-archived")
+    );
 }

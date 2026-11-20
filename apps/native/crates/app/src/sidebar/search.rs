@@ -67,6 +67,7 @@ struct OwnerFlight {
     spec: OwnerSpec,
     query: String,
     loading: bool,
+    failed: bool,
     matches: Vec<ServerThreadSearchMatch>,
     rows: Option<FamilyRead>,
 }
@@ -85,6 +86,7 @@ pub struct SearchState {
     settled_query: String,
     debouncing: bool,
     pending: bool,
+    failed: bool,
     next_flight_id: u64,
     flights: Vec<OwnerFlight>,
     previous: Option<SettledSnapshot>,
@@ -106,6 +108,7 @@ impl Default for SearchState {
             settled_query: String::new(),
             debouncing: false,
             pending: false,
+            failed: false,
             next_flight_id: 0,
             flights: Vec::new(),
             previous: None,
@@ -127,6 +130,10 @@ impl SearchState {
 
     pub fn is_pending(&self) -> bool {
         self.pending
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.failed
     }
 
     pub(super) fn query(&self) -> &str {
@@ -172,6 +179,7 @@ impl SearchState {
                 self.settled_query.clear();
                 self.debouncing = false;
                 self.pending = false;
+                self.failed = false;
                 self.previous = None;
                 self.shown_order = None;
             } else {
@@ -210,6 +218,7 @@ impl SearchState {
             self.shown_order = None;
             self.settled_query.clear();
             self.pending = false;
+            self.failed = false;
             self.results.clear();
             self.list.reset(0);
             self.content_matches.clear();
@@ -273,6 +282,7 @@ impl SearchState {
                 spec: spec.clone(),
                 query: active_query.clone(),
                 loading: true,
+                failed: false,
                 matches: Vec::new(),
                 rows: None,
             });
@@ -334,11 +344,13 @@ impl SearchState {
         };
         flight.loading = false;
         if let Some(value) = value {
+            flight.failed = false;
             flight.matches = decode_search_matches(&value, flight.spec.owner.environment_id());
             flight.rows = serde_json::from_value::<FamilyRead>(value)
                 .ok()
                 .filter(|read| !read.threads.is_empty());
         } else {
+            flight.failed = true;
             flight.matches.clear();
             flight.rows = None;
         }
@@ -449,7 +461,17 @@ impl SearchState {
         }
         self.shown_order = Some(order);
         self.settled_query = visible.query;
-        self.pending = can_search && (self.debouncing || self.flights.iter().any(|flight| flight.loading));
+        let any_loading = self.flights.iter().any(|flight| flight.loading);
+        let asked = self.flights.len();
+        let failures = self.flights.iter().filter(|flight| flight.failed).count();
+        self.pending = can_search && (self.debouncing || any_loading);
+        // Every environment asked failed to answer, so an empty result is not "No threads found" (`pingdotgg/t3code#38155`).
+        self.failed = can_search
+            && !self.debouncing
+            && self.debounced_query == self.normalized_query
+            && !any_loading
+            && asked > 0
+            && failures == asked;
         self.content_matches = content_matches;
         self.highlighted = previous_highlight
             .and_then(|key| results.iter().position(|candidate| *candidate == key))
@@ -660,7 +682,13 @@ impl SidebarPane {
     pub(super) fn render_search_results(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         if self.search.results.is_empty() {
-            let label = if self.search.is_pending() { "Searching thread messages…" } else { "No threads found" };
+            let label = if self.search.is_pending() {
+                "Searching thread messages…"
+            } else if self.search.is_failed() {
+                "Couldn't search thread messages"
+            } else {
+                "No threads found"
+            };
             return div()
                 .flex()
                 .justify_center()
@@ -702,10 +730,9 @@ impl SidebarPane {
         let scoped = state.sidebar.fleet.thread(&id);
         let thread = scoped.map(|row| &row.thread).unwrap_or(&raw_thread);
         let active = if scoped.is_some() {
-            state.active_thread_key(&id.thread_id).as_ref() == Some(&id)
-                && state.selected_thread.as_deref() == Some(id.thread_id.as_str())
+            state.active_sidebar_row_key().as_ref() == Some(&id)
         } else {
-            state.selected_thread.as_deref() == Some(id.thread_id.as_str())
+            state.active_sidebar_row_id().as_deref() == Some(id.thread_id.as_str())
         };
         let highlighted = index == self.search.highlighted;
         let settled = is_search_thread_settled(state, &id, thread, scoped.is_some());
@@ -881,7 +908,14 @@ impl SidebarPane {
                                     .items_center()
                                     .gap(px(6.))
                                     .min_w_0()
-                                    .child(
+                                    .child(if thread.regenerating_title {
+                                        super::row::render_glimmering_title(
+                                            SharedString::from(format!("search-title-glimmer:{}:{}", id.environment_id, id.thread_id)),
+                                            title,
+                                            if settled { FontWeight::NORMAL } else { FontWeight::MEDIUM },
+                                            p,
+                                        )
+                                    } else {
                                         div()
                                             .flex_1()
                                             .min_w_0()
@@ -892,9 +926,9 @@ impl SidebarPane {
                                             .when(settled && !active && !highlighted, |this| {
                                                 this.group_hover("sidebar-row", move |style| style.text_color(hsla(p.foreground)))
                                             })
-                                            .when(thread.regenerating_title, |this| this.opacity(0.55))
-                                            .child(title),
-                                    )
+                                            .child(title)
+                                            .into_any_element()
+                                    })
                                     .children(pr_badge.map(|(icon, base_color, hover_color, has_snapshot, text)| {
                                         div()
                                             .flex_none()

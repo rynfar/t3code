@@ -90,7 +90,14 @@ pub fn download_name(uri: Option<&str>, name: Option<&str>) -> String {
     let raw = match name.filter(|s| !s.trim().is_empty()) {
         Some(name) => name,
         None => match uri {
-            Some(uri) => uri.split(['/', '?', '#']).rfind(|part| !part.is_empty()).unwrap_or("download"),
+            // Strip query/fragment before taking the last path segment (`pingdotgg/t3code#30712`).
+            Some(uri) => uri
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .split('/')
+                .rfind(|part| !part.is_empty())
+                .unwrap_or("download"),
             None => "download",
         },
     };

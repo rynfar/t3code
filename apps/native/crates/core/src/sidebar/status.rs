@@ -40,20 +40,36 @@ pub fn resolve_status(thread: &SidebarThread) -> ThreadStatus {
     }
 }
 
+/// Sidebar row status (`resolveSidebarRowStatus`): a failure the user has already opened settles
+/// to ready, like Done.
+pub fn resolve_row_status(thread: &SidebarThread) -> ThreadStatus {
+    let status = resolve_status(thread);
+    // A runtime failure without a failed run has nothing to date it, so it stays.
+    if status != ThreadStatus::Failed || thread.latest_run.as_ref().is_none_or(|run| run.status != "failed") {
+        return status;
+    }
+    if has_unseen_failure(thread) { status } else { ThreadStatus::Ready }
+}
+
 pub fn has_unseen_completion(thread: &SidebarThread) -> bool {
-    match (thread.latest_run.as_ref().and_then(|run| run.completed_at), thread.last_visited_at) {
+    let Some(run) = thread.latest_run.as_ref() else { return false };
+    if matches!(run.status.as_str(), "interrupted" | "cancelled") {
+        return false;
+    }
+    match (run.completed_at, thread.last_visited_at) {
         (Some(completed_at), Some(visited_at)) => completed_at > visited_at,
         _ => false,
     }
 }
 
-/// Unopened threads' failures still count as unseen, unlike completions.
+/// Whether the latest run failed after the user last saw the thread (`hasUnseenRunFailure`).
+/// Only the run dates the failure, since the shell's `updatedAt` also moves on renames. A failed
+/// run without a completion time, from older data, is dated by its start or request time.
 pub fn has_unseen_failure(thread: &SidebarThread) -> bool {
     let Some(run) = thread.latest_run.as_ref().filter(|run| run.status == "failed") else { return false };
-    match (run.completed_at, thread.last_visited_at) {
-        (Some(completed_at), Some(visited_at)) => completed_at > visited_at,
-        _ => true,
-    }
+    let Some(visited_at) = thread.last_visited_at else { return true };
+    let Some(failed_at) = run.completed_at.or(run.started_at).or(run.requested_at) else { return true };
+    failed_at > visited_at
 }
 
 pub fn should_recede(status: ThreadStatus, is_unread: bool, is_woke: bool, is_active: bool, is_selected: bool) -> bool {
@@ -175,11 +191,15 @@ pub fn status_pill(thread: &SidebarThread) -> Option<StatusPill> {
     if matches!(runtime, Some("preparing" | "starting" | "queued")) {
         return pill("Connecting", PillTone::Working, true);
     }
-    if (runtime == Some("running") && thread.blocked_on_thread_wait) || thread.background_holds_completion {
+    if runtime == Some("running") && thread.blocked_on_thread_wait {
         return pill("Waiting", PillTone::Waiting, false);
     }
+    // A failed run goes to the inbox even while background work holds the thread.
     if has_unseen_failure(thread) {
         return pill("Failed", PillTone::Failed, false);
+    }
+    if thread.background_holds_completion {
+        return pill("Waiting", PillTone::Waiting, false);
     }
     if !thread.has_pending_user_input && thread.interaction_mode == "plan" && latest_run_settled(thread) && thread.has_actionable_proposed_plan {
         return pill("Plan Ready", PillTone::Plan, false);

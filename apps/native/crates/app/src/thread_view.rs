@@ -522,6 +522,8 @@ impl ThreadView {
                 let disclosure_follow = !paused && changed && follow.is_some_and(|(distance, viewport)| self.disclosure.follow_change(distance, viewport));
                 let keep_end = (self.follow.is_following() && !paused && self.follow.anchored_user_message_id().is_none()) || disclosure_follow;
                 if keep_end {
+                    // Snap directly to the end when following or catching up from a stale cached state (`pingdotgg/t3code#38963`).
+                    self.smooth_scroll = None;
                     self.pending_scroll_source = None;
                     self.list.scroll_to_end();
                 } else {

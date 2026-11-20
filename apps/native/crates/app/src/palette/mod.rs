@@ -121,6 +121,8 @@ pub struct CommandPalette {
     message_finds: HashMap<String, t3_core::timeline::PendingThreadFind>,
     message_order: Option<ShownOrder<String>>,
     message_request: Option<Task<()>>,
+    message_search_pending: bool,
+    message_search_failed: bool,
     linked_thread_search: Option<LinkedThreadSearch>,
     groups: Vec<CommandPaletteGroup>,
     highlighted: Option<String>,
@@ -516,6 +518,8 @@ impl CommandPalette {
             message_finds: HashMap::new(),
             message_order: None,
             message_request: None,
+            message_search_pending: false,
+            message_search_failed: false,
             linked_thread_search: None,
             groups: Vec::new(),
             highlighted: None,
@@ -593,6 +597,8 @@ impl CommandPalette {
         self.message_items.clear();
         self.message_finds.clear();
         self.message_order = None;
+        self.message_search_pending = false;
+        self.message_search_failed = false;
     }
 
     fn enter_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
@@ -868,6 +874,8 @@ impl CommandPalette {
         };
         let conn_id = self.state.read(cx).connection_id();
         let state = self.state.clone();
+        self.message_search_pending = true;
+        self.message_search_failed = false;
         self.message_request = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(SEARCH_DEBOUNCE_MS)).await;
             let current = this.read_with(cx, |palette, _| {
@@ -894,12 +902,16 @@ impl CommandPalette {
                 {
                     return;
                 }
+                palette.message_search_pending = false;
                 let Ok(value) = result else {
+                    palette.message_search_failed = true;
                     palette.message_items.clear();
                     palette.message_finds.clear();
                     palette.refilter(cx);
+                    cx.notify();
                     return;
                 };
+                palette.message_search_failed = false;
                 let matches = decode_search_matches(&value, ENVIRONMENT);
                 let now = now_ms();
                 let item_by_value: HashMap<&str, &CommandPaletteItem> =
@@ -1848,6 +1860,10 @@ impl Render for CommandPalette {
                             Mode::Command => {
                                 let empty_text = if self.search.query.trim_start().starts_with('>') {
                                     "No matching actions."
+                                } else if self.message_search_pending {
+                                    "Searching thread messages…"
+                                } else if self.message_search_failed {
+                                    "Couldn't search thread messages."
                                 } else {
                                     "No matching commands, projects, or threads."
                                 };

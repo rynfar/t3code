@@ -693,6 +693,7 @@ fn render_details_block(
         cx,
     );
 
+    let rtl = data.details.rtl;
     let toggle_state = state.clone();
     v_flex()
         .w_full()
@@ -706,6 +707,7 @@ fn render_details_block(
             h_flex()
                 .id(SharedString::from(format!("details-toggle:{}", data.key)))
                 .w_full()
+                .when(rtl, |this| this.flex_row_reverse())
                 .gap(px(8.))
                 .items_center()
                 .px(px(12.))
@@ -719,13 +721,20 @@ fn render_details_block(
                     });
                 })
                 .child(
-                    if open { Icon::ChevronDown } else { Icon::ChevronRight }
-                        .render(px(14.), hsla(p.muted_foreground)),
+                    if open {
+                        Icon::ChevronDown
+                    } else if rtl {
+                        Icon::ChevronLeft
+                    } else {
+                        Icon::ChevronRight
+                    }
+                    .render(px(14.), hsla(p.muted_foreground)),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
+                        .when(rtl, |this| this.text_right())
                         .text_size(px(13.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(hsla(p.foreground))
@@ -736,6 +745,7 @@ fn render_details_block(
             this.child(
                 div()
                     .w_full()
+                    .when(rtl, |this| this.text_right())
                     .border_t_1()
                     .border_color(hsla(p.border).opacity(0.7))
                     .px(px(12.))
@@ -898,7 +908,7 @@ fn render_mermaid_block(
 
     let show_diagram = !show_code && error.is_none() && image.is_some();
     let toggle_state = state.clone();
-    let copy_code = data.code.clone();
+    let copy_code = t3_core::markdown::strip_code_fence_trailing_newline(&data.code);
     let expand_ctx = action_ctx.lock().unwrap().clone();
     let expand_svg = svg_text.clone();
 

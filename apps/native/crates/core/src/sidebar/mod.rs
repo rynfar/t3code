@@ -509,3 +509,47 @@ pub fn search_titles(model: &SidebarModel, query: &str, now: Ms) -> Vec<String> 
         .map(|ranked| model.threads[ranked.item.0].id.clone())
         .collect()
 }
+
+/// Single-environment `resolveListedAncestorThreadRef` (`packages/client-runtime/src/state/threadShell.ts`).
+/// Subagents, side chats, and tasks delegated from a listed parent on the same environment resolve
+/// to their nearest listed ancestor. A broken chain resolves to `thread_id`.
+pub fn resolve_listed_ancestor_thread_id(
+    thread_id: &str,
+    canonical_environment_id: Option<&str>,
+    threads: &[&ThreadShell],
+) -> String {
+    let find_thread = |id: &str| threads.iter().copied().find(|thread| thread.id == id);
+    let mut visited = HashSet::<String>::new();
+    let mut current = thread_id.to_owned();
+    let mut thread = find_thread(&current);
+    while let Some(entry) = thread {
+        let parent_id = if !entry.lineage.is_listed() {
+            let Some(parent_id) = entry.lineage.parent_thread_id.as_deref() else {
+                return thread_id.to_owned();
+            };
+            parent_id.to_owned()
+        } else if let Some(from) = entry.delegated_from.as_ref() {
+            let (Some(env_id), Some(parent_id)) = (
+                from.get("environmentId").and_then(|v| v.as_str()),
+                from.get("threadId").and_then(|v| v.as_str()),
+            ) else {
+                return current;
+            };
+            if canonical_environment_id != Some(env_id) {
+                return current;
+            }
+            if find_thread(parent_id).is_none_or(|parent| parent.archived_at.is_some()) {
+                return current;
+            }
+            parent_id.to_owned()
+        } else {
+            return current;
+        };
+        if !visited.insert(current) {
+            return thread_id.to_owned();
+        }
+        current = parent_id;
+        thread = find_thread(&current);
+    }
+    thread_id.to_owned()
+}

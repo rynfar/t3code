@@ -92,7 +92,73 @@ pub fn normalize_plan_markdown_for_export(plan_markdown: &str) -> String {
     format!("{}\n", plan_markdown.trim_end())
 }
 
-/// The latest interrupted or usage-limited run that a manual resume continues (`deriveResumableRunId`).
+/// `unsentManualContinuationSource` (`packages/shared/src/orchestrationV2ManualContinuation.ts`):
+/// returns whether continuing `run_id` has an unsent message that the provider never received.
+fn has_unsent_manual_continuation_source(run_id: &str, projection: &ThreadProjection) -> bool {
+    let runs: std::collections::HashMap<&str, &crate::thread::Run> =
+        projection.runs.iter().map(|run| (run.id.as_str(), run)).collect();
+    let accepted_attempts: std::collections::HashSet<&str> = projection
+        .provider_turns
+        .iter()
+        .filter_map(|turn| turn.value.get("runAttemptId").and_then(serde_json::Value::as_str))
+        .collect();
+    let latest_attempt = |id: &str, matches: &dyn Fn(&crate::thread::RunAttempt) -> bool| -> u64 {
+        projection
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.run_id == id && matches(attempt))
+            .map(|attempt| attempt.attempt_ordinal)
+            .max()
+            .unwrap_or(0)
+    };
+    let mut visited = std::collections::HashSet::<&str>::new();
+    let mut source_id = Some(run_id);
+    while let Some(id) = source_id {
+        if !visited.insert(id) {
+            break;
+        }
+        let Some(source) = runs.get(id).copied() else {
+            return false;
+        };
+        let accepted = latest_attempt(id, &|attempt| accepted_attempts.contains(attempt.id.as_str()));
+        // An accepted attempt delivered everything before it; only a later steering restart's message is unsent.
+        let restarted = latest_attempt(id, &|attempt| attempt.reason.as_deref() == Some("steering_restart"));
+        if restarted > accepted {
+            return true;
+        }
+        if accepted > 0 {
+            return false;
+        }
+        if source.manual_continuation_of_run_id.is_none() {
+            return true;
+        }
+        source_id = source.manual_continuation_of_run_id.as_deref();
+    }
+    false
+}
+
+fn run_provider_session<'a>(
+    projection: &'a ThreadProjection,
+    run: &crate::thread::Run,
+) -> Option<&'a crate::thread::Entity> {
+    let session_id = run.provider_thread_id.as_deref().and_then(|pt_id| {
+        projection
+            .provider_threads
+            .iter()
+            .find(|thread| thread.id == pt_id)
+            .and_then(|thread| thread.value.get("providerSessionId").and_then(serde_json::Value::as_str))
+    });
+    match session_id {
+        Some(sid) => projection.provider_sessions.iter().find(|session| session.id == sid),
+        None => projection.provider_sessions.iter().rfind(|session| {
+            session.value.get("providerInstanceId").and_then(serde_json::Value::as_str)
+                == Some(run.provider_instance_id.as_str())
+        }),
+    }
+}
+
+/// The latest interrupted or usage-limited run that a manual resume continues (`deriveResumableRunId`,
+/// `pingdotgg/t3code#39229`).
 pub fn resumable_run_id(projection: &ThreadProjection) -> Option<String> {
     let latest_executed = projection
         .runs
@@ -107,7 +173,19 @@ pub fn resumable_run_id(projection: &ThreadProjection) -> Option<String> {
         || (latest_executed.status == "failed"
             && super::status::thread_error(projection)
                 .is_some_and(|err| err.class.as_deref() == Some("usage_limit")));
-    resumable.then(|| latest_executed.id.clone())
+    if !resumable {
+        return None;
+    }
+    // Without native resume the server can only resend a message the provider never received.
+    let supports_native_resume = run_provider_session(projection, latest_executed)
+        .and_then(|session| session.value.pointer("/capabilities/turns/supportsNativeResume"))
+        .and_then(serde_json::Value::as_bool);
+    if supports_native_resume == Some(false)
+        && !has_unsent_manual_continuation_source(&latest_executed.id, projection)
+    {
+        return None;
+    }
+    Some(latest_executed.id.clone())
 }
 
 /// Whether the thread currently has a resumable interrupted/usage-limited run (without a
@@ -227,5 +305,65 @@ mod tests {
         assert!(!can_resume_thread(&projection));
         projection.runtime_requests[0].value["status"] = serde_json::json!("resolved");
         assert!(can_resume_thread(&projection));
+    }
+
+    #[test]
+    fn resumable_run_id_hides_resume_when_provider_cannot_continue_accepted_run() {
+        // Provider with supportsNativeResume=false cannot continue an already-accepted interrupted run (`pingdotgg/t3code#39229`).
+        let mut projection: ThreadProjection = serde_json::from_value(serde_json::json!({
+            "thread": {
+                "id": "t-1", "projectId": "p-1", "title": "T", "providerInstanceId": "claude-1",
+                "modelSelection": { "instanceId": "claude-1", "model": "claude-sonnet-4-6" },
+                "runtimeMode": "full-access", "interactionMode": "default", "branch": null,
+                "worktreePath": null, "activeProviderThreadId": null, "historyOrigin": "native",
+                "lineage": { "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "t-1", "sideChat": false },
+                "forkedFrom": null, "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z",
+                "archivedAt": null, "settledOverride": null, "settledAt": null, "lastVisitedAt": null, "deletedAt": null
+            },
+            "runs": [{
+                "id": "run-1", "ordinal": 1, "providerInstanceId": "claude-1",
+                "modelSelection": { "instanceId": "claude-1", "model": "claude-sonnet-4-6" },
+                "providerThreadId": "pt-1", "userMessageId": "msg-1", "rootNodeId": null,
+                "status": "interrupted", "requestedAt": "2026-01-01T00:00:00Z",
+                "startedAt": "2026-01-01T00:00:01Z", "completedAt": "2026-01-01T00:01:00Z"
+            }],
+            "attempts": [{
+                "id": "att-1", "runId": "run-1", "rootNodeId": "node-1",
+                "attemptOrdinal": 1, "reason": "initial", "status": "interrupted", "completedAt": "2026-01-01T00:01:00Z"
+            }],
+            "nodes": [], "subagents": [],
+            "providerSessions": [{
+                "id": "ps-1", "providerInstanceId": "claude-1",
+                "capabilities": { "turns": { "supportsNativeResume": false } }
+            }],
+            "providerThreads": [{ "id": "pt-1", "providerSessionId": "ps-1" }],
+            "providerTurns": [{ "id": "turn-1", "runAttemptId": "att-1" }],
+            "runtimeRequests": [], "messages": [], "plans": [], "turnItems": [],
+            "checkpointScopes": [], "checkpoints": [], "contextHandoffs": [], "contextTransfers": [],
+            "visibleTurnItems": [], "updatedAt": "2026-01-01T00:01:00Z"
+        }))
+        .expect("valid projection");
+
+        assert_eq!(resumable_run_id(&projection), None);
+
+        // If the provider never received the attempt (no providerTurn for att-1), manual continuation can still resend it.
+        projection.provider_turns.clear();
+        assert_eq!(resumable_run_id(&projection).as_deref(), Some("run-1"));
+
+        // If a later steering_restart attempt wasn't accepted after an accepted attempt, it is resumable again.
+        projection.provider_turns.push(crate::thread::Entity {
+            id: "turn-1".into(),
+            value: serde_json::json!({ "id": "turn-1", "runAttemptId": "att-1" }),
+        });
+        projection.attempts.push(crate::thread::RunAttempt {
+            id: "att-2".into(),
+            run_id: "run-1".into(),
+            root_node_id: "node-2".into(),
+            attempt_ordinal: 2,
+            reason: Some("steering_restart".into()),
+            status: "interrupted".into(),
+            completed_at: Some("2026-01-01T00:01:30Z".into()),
+        });
+        assert_eq!(resumable_run_id(&projection).as_deref(), Some("run-1"));
     }
 }

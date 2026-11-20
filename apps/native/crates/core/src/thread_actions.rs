@@ -32,7 +32,26 @@ pub fn settle(command_id: &str, thread_id: &str) -> Value {
 
 /// `reason: "user"` keeps the thread active until real activity, suppressing auto-settle.
 pub fn unsettle(command_id: &str, thread_id: &str) -> Value {
-    json!({ "type": "thread.unsettle", "commandId": command_id, "threadId": thread_id, "reason": "user" })
+    unsettle_with_restore(command_id, thread_id, None)
+}
+
+/// `unsettleThread` with optional `restoreUnsettledAt` (`pingdotgg/t3code#33248`).
+/// `None` omits the field; `Some(None)` sends `"restoreUnsettledAt": null`; `Some(Some(iso))`
+/// restores that Active anchor timestamp instead of moving the thread to the top.
+pub fn unsettle_with_restore(command_id: &str, thread_id: &str, restore_unsettled_at: Option<Option<&str>>) -> Value {
+    let mut command = json!({
+        "type": "thread.unsettle",
+        "commandId": command_id,
+        "threadId": thread_id,
+        "reason": "user",
+    });
+    if let Some(restore) = restore_unsettled_at {
+        command["restoreUnsettledAt"] = match restore {
+            Some(iso) => json!(iso),
+            None => Value::Null,
+        };
+    }
+    command
 }
 
 pub fn pin(command_id: &str, thread_id: &str, order_key: Option<&str>) -> Value {
@@ -517,8 +536,12 @@ pub use thread_reference::thread_reference;
 pub enum UndoStep {
     RestoreDraft,
     Unsettle,
+    /// `unsettle` carrying `restoreUnsettledAt` (`Some(iso)` or `None` -> JSON `null`) so undo
+    /// restores the thread's prior Active anchor instead of moving it to the top (`pingdotgg/t3code#33248`).
+    UnsettleRestore { restore_unsettled_at: Option<String> },
     Unsnooze,
     Pin { order_key: Option<String> },
+    ReorderActive { order_key: String },
     Snooze { snoozed_until: Ms },
     Unarchive,
 }
@@ -539,6 +562,16 @@ pub enum PlanFor {
     Unpin,
 }
 
+/// Snapshot of placement fields captured before settling/unpinning (`planThreadUndo`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SettleUndoSnapshot<'a> {
+    pub pinned: bool,
+    pub pin_order_key: Option<&'a str>,
+    pub active_order_key: Option<&'a str>,
+    pub unsettled_at: Option<&'a str>,
+    pub snoozed_until: Option<Ms>,
+}
+
 /// `planThreadUndo`. Pinning clears snooze on the server, so a snooze is restored after the pin.
 pub fn plan_undo(action: PlanFor, pinned: bool, pin_order_key: Option<&str>, snoozed_until: Option<Ms>) -> Vec<UndoStep> {
     if action == PlanFor::Snooze {
@@ -553,6 +586,35 @@ pub fn plan_undo(action: PlanFor, pinned: bool, pin_order_key: Option<&str>, sno
         plan.push(UndoStep::Unsettle);
         if pinned {
             plan.push(pin);
+        }
+    }
+    plan.extend(snooze);
+    plan
+}
+
+/// Full `planThreadUndo` (`pingdotgg/t3code#33248`): settling clears manual Active placement and
+/// `unsettledAt`, so undoing a settle restores `restoreUnsettledAt` and (when unpinned)
+/// `activeOrderKey`.
+pub fn plan_undo_for_thread(action: PlanFor, thread: Option<&SettleUndoSnapshot<'_>>) -> Vec<UndoStep> {
+    if action == PlanFor::Snooze {
+        return vec![UndoStep::Unsnooze];
+    }
+    let pin = UndoStep::Pin { order_key: thread.and_then(|t| t.pin_order_key).map(str::to_owned) };
+    let snooze = thread.and_then(|t| t.snoozed_until).map(|snoozed_until| UndoStep::Snooze { snoozed_until });
+    let mut plan = Vec::new();
+    if action == PlanFor::Unpin {
+        plan.push(pin);
+    } else {
+        match thread {
+            Some(snapshot) => {
+                plan.push(UndoStep::UnsettleRestore { restore_unsettled_at: snapshot.unsettled_at.map(str::to_owned) });
+                if snapshot.pinned {
+                    plan.push(pin);
+                } else if let Some(order_key) = snapshot.active_order_key {
+                    plan.push(UndoStep::ReorderActive { order_key: order_key.to_owned() });
+                }
+            }
+            None => plan.push(UndoStep::Unsettle),
         }
     }
     plan.extend(snooze);
@@ -858,6 +920,45 @@ mod tests {
         );
         assert_eq!(plan_undo(PlanFor::Unpin, true, None, None), [UndoStep::Pin { order_key: None }]);
         assert!(!runnable_step(&UndoStep::Snooze { snoozed_until: 5 }, 5));
+
+        // Settle undo restores unsettledAt + manual Active placement (`pingdotgg/t3code#33248`).
+        let placed = SettleUndoSnapshot {
+            pinned: false,
+            pin_order_key: None,
+            active_order_key: Some("m"),
+            unsettled_at: Some("2026-06-01T12:00:00.000Z"),
+            snoozed_until: None,
+        };
+        assert_eq!(
+            plan_undo_for_thread(PlanFor::Settle, Some(&placed)),
+            [
+                UndoStep::UnsettleRestore { restore_unsettled_at: Some("2026-06-01T12:00:00.000Z".into()) },
+                UndoStep::ReorderActive { order_key: "m".into() },
+            ]
+        );
+        // Pinned thread restores pin, not activeOrderKey, and preserves null unsettledAt.
+        let pinned = SettleUndoSnapshot {
+            pinned: true,
+            pin_order_key: Some("p1"),
+            active_order_key: Some("m"),
+            unsettled_at: None,
+            snoozed_until: Some(42),
+        };
+        assert_eq!(
+            plan_undo_for_thread(PlanFor::Settle, Some(&pinned)),
+            [
+                UndoStep::UnsettleRestore { restore_unsettled_at: None },
+                UndoStep::Pin { order_key: Some("p1".into()) },
+                UndoStep::Snooze { snoozed_until: 42 },
+            ]
+        );
+        // Command wire shape for restoreUnsettledAt.
+        assert!(unsettle("c1", "t1").get("restoreUnsettledAt").is_none());
+        assert_eq!(unsettle_with_restore("c2", "t1", Some(None))["restoreUnsettledAt"], Value::Null);
+        assert_eq!(
+            unsettle_with_restore("c3", "t1", Some(Some("2026-06-01T12:00:00.000Z")))["restoreUnsettledAt"],
+            "2026-06-01T12:00:00.000Z"
+        );
     }
 
     #[test]

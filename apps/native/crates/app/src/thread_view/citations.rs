@@ -74,8 +74,15 @@ impl ThreadView {
                 if thread != this.thread_id || connection.is_none() || connection != this.state.read(cx).connection_id() {
                     return;
                 }
-                let current = this.entries_cache.entries().iter().any(|entry| matches!(&entry.kind,
-                    t3_core::timeline::EntryKind::Message(current) if current.id == message && (*current.text == *source || current.text.contains(&*source))));
+                let current = this.entries_cache.entries().iter().any(|entry| match &entry.kind {
+                    t3_core::timeline::EntryKind::Message(current) => {
+                        current.id == message && (*current.text == *source || current.text.contains(&*source))
+                    }
+                    t3_core::timeline::EntryKind::SentMessage(sent) => {
+                        entry.id == message && (*sent.text == *source || sent.text.contains(&*source))
+                    }
+                    _ => false,
+                });
                 if !current { return; }
                 let quote = current_selection_quote(window, cx);
                 let (vertical_fraction, horizontal_fraction) = match hint_bounds {
@@ -336,6 +343,7 @@ impl ThreadView {
         }
         let message = self.entries_cache.entries().iter().find_map(|entry| match &entry.kind {
             t3_core::timeline::EntryKind::Message(message) if message.id == citation.message_id => Some(message.role),
+            t3_core::timeline::EntryKind::SentMessage(_) if entry.id == citation.message_id => Some(Role::Assistant),
             _ => None,
         });
         let message = match message {
@@ -355,6 +363,10 @@ impl ThreadView {
                 let matched_excerpt = self.entries_cache.entries().iter().find_map(|entry| match &entry.kind {
                     t3_core::timeline::EntryKind::Message(msg) if msg.id == citation.message_id => {
                         let rendered = rules::markdown_text(&msg.text);
+                        Some(rules::find_citation_range(&rendered, &citation).is_some())
+                    }
+                    t3_core::timeline::EntryKind::SentMessage(sent) if entry.id == citation.message_id => {
+                        let rendered = rules::markdown_text(&sent.text);
                         Some(rules::find_citation_range(&rendered, &citation).is_some())
                     }
                     _ => None,

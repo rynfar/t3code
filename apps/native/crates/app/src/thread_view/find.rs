@@ -52,7 +52,7 @@ pub fn row_holds(row: &TimelineRow, entry_id: &str) -> bool {
             entries.iter().any(|entry| entry.id == entry_id)
         }
         RowKind::Event { item, subagents, .. } => item.id == entry_id || subagents.iter().any(|member| member.id == entry_id),
-        RowKind::ProposedPlan(_) => row.id == entry_id,
+        RowKind::ProposedPlan(_) | RowKind::SentMessage(_) => row.id == entry_id,
         _ => false,
     }
 }
@@ -64,7 +64,7 @@ fn row_entry(row: &TimelineRow) -> Option<&str> {
             entries.first().map(|entry| entry.id.as_str())
         }
         RowKind::Event { item, .. } => Some(&item.id),
-        RowKind::ProposedPlan(_) => Some(&row.id),
+        RowKind::ProposedPlan(_) | RowKind::SentMessage(_) => Some(&row.id),
         _ => None,
     }
 }

@@ -2,7 +2,9 @@
 //! `sidebar/SidebarListMarkers.tsx`): 78px cards for pinned, active and working threads, 36px slim
 //! rows for snoozed and settled ones, shelf headers, and the Settled "Show more" button.
 
-use gpui::{AnyElement, App, BoxShadow, Context, DragMoveEvent, ElementId, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString, Styled, Window, div, point, prelude::*, px};
+use std::time::Duration;
+
+use gpui::{Animation, AnimationExt as _, AnyElement, App, BoxShadow, Context, DragMoveEvent, ElementId, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString, Styled, Window, div, point, prelude::*, px};
 use gpui_component::Sizable as _;
 use t3_core::sidebar::drag::SweepAction;
 use t3_core::sidebar::settled::{self, snooze_wake_label};
@@ -112,7 +114,7 @@ struct RowState {
 }
 
 fn row_state(thread: &SidebarThread, active: bool, selected: bool, swept: Option<SweepAction>, draft: bool, now: i64) -> RowState {
-    let status = status::resolve_status(thread);
+    let status = status::resolve_row_status(thread);
     let unread = status::has_unseen_completion(thread);
     let woke_at = settled::woke_at(thread, now);
     let is_woke = woke_at.is_some_and(|woke| thread.last_visited_at.is_none_or(|visited| visited < woke)) && !thread.is_settled();
@@ -128,6 +130,45 @@ fn row_state(thread: &SidebarThread, active: bool, selected: bool, swept: Option
         woke_at,
         is_woke,
     }
+}
+
+/// Regenerating title glimmer (`SidebarThreadRow.tsx` `ActivityShimmerOverlay`, `pingdotgg/t3code#29383`):
+/// base title in `muted_foreground` overlaid by a foreground highlight cycling on a 2.2s loop
+/// while `regenerating_title` is active.
+pub(super) fn render_glimmering_title(
+    id: SharedString,
+    title: SharedString,
+    weight: FontWeight,
+    p: Palette,
+) -> AnyElement {
+    let base = title.clone();
+    let overlay = title;
+    div()
+        .relative()
+        .flex_1()
+        .min_w_0()
+        .truncate()
+        .text_sm()
+        .font_weight(weight)
+        .text_color(hsla(p.muted_foreground))
+        .child(base)
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .truncate()
+                .text_color(hsla(p.foreground))
+                .child(overlay)
+                .with_animation(
+                    id,
+                    Animation::new(Duration::from_millis(2200)).repeat(),
+                    |el, delta| {
+                        let wave = 0.5 - 0.5 * (delta * std::f32::consts::TAU).cos();
+                        el.opacity(0.15 + 0.85 * wave)
+                    },
+                ),
+        )
+        .into_any_element()
 }
 
 /// A 12px text action revealed on hover (design-system §7.2 hover actions).
@@ -200,11 +241,12 @@ impl SidebarPane {
             let model = app.sidebar.fleet.clone();
             let Some(row) = model.rows.get(index) else { return div().into_any_element() };
             let multiline = self.folder_multiline;
+            let active_row_key = app.active_sidebar_row_key();
             let element = match row {
                 t3_core::sidebar::fleet::ScopedSidebarRow::Thread { index, section, in_folder } => {
                     let row = &model.threads[*index];
                     let project = model.project_names.get(&row.project).cloned();
-                    let active = app.active_thread_key(&row.key.thread_id).as_ref() == Some(&row.key) && app.selected_thread.as_deref() == Some(row.key.thread_id.as_str());
+                    let active = active_row_key.as_ref() == Some(&row.key);
                     if section.is_card() && !*in_folder {
                         self.render_card(RowTarget { key: Some(&row.key), thread: &row.thread, project: project.as_deref(), section: *section }, active, window, cx)
                     } else {
@@ -228,11 +270,12 @@ impl SidebarPane {
         }
         let model = app.sidebar.model.clone();
         let Some(row) = model.rows.get(index) else { return div().into_any_element() };
+        let active_row_id = app.active_sidebar_row_id();
         let element = match row {
             SidebarRow::Thread { index: thread_index, section } => {
                 let thread = &model.threads[*thread_index];
                 let project = model.project_names.get(&thread.project_id).cloned();
-                let active = self.state.read(cx).selected_thread.as_deref() == Some(thread.id.as_str());
+                let active = active_row_id.as_deref() == Some(thread.id.as_str());
                 if section.is_card() {
                     self.render_card(RowTarget { key: None, thread, project: project.as_deref(), section: *section }, active, window, cx)
                 } else {
@@ -453,14 +496,22 @@ impl SidebarPane {
                 .into_any_element();
         }
         let title: SharedString = thread.title.clone().into();
+        let weight = if recede { FontWeight::NORMAL } else { FontWeight::MEDIUM };
+        if thread.regenerating_title {
+            return render_glimmering_title(
+                SharedString::from(scoped_id("title-glimmer-", key, &thread.id)),
+                title,
+                weight,
+                palette(cx),
+            );
+        }
         div()
             .flex_1()
             .min_w_0()
             .truncate()
             .text_sm()
-            .font_weight(if recede { FontWeight::NORMAL } else { FontWeight::MEDIUM })
+            .font_weight(weight)
             .text_color(color)
-            .when(thread.regenerating_title, |this| this.opacity(0.55))
             .child(title)
             .into_any_element()
     }

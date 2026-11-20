@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::thread::{ApplyOptions, ItemVisibilityFilter, ProjectedTurnItem, ThreadProjection, ThreadState, Visibility};
+use crate::thread::{ApplyOptions, Entity, ItemVisibilityFilter, ProjectedTurnItem, ThreadProjection, ThreadState, Visibility};
 use crate::turn_item::{TurnItem, TurnItemKind};
 use crate::wire;
 
@@ -86,6 +86,8 @@ pub struct HistoryPage {
     pub items: Vec<ProjectedTurnItem>,
     pub next_cursor: Option<String>,
     pub has_more_history: bool,
+    /// Records of the page's subagent items, which a bounded snapshot can omit (`pingdotgg/t3code#38724`).
+    pub subagents: Vec<Entity>,
     /// The page holds a user-authored `user_message`; the loader pages on until one arrives.
     pub has_user_turn: bool,
 }
@@ -97,6 +99,8 @@ struct RawPage {
     items: Vec<ProjectedTurnItem>,
     next_cursor: Option<String>,
     has_more_history: bool,
+    #[serde(default)]
+    subagents: Vec<Entity>,
 }
 
 /// Steers join a running turn; every other user message opens one, and every notification acts
@@ -128,6 +132,7 @@ pub fn decode_history_page(mut value: Value) -> Result<HistoryPage, serde_json::
         items: raw.items.into_iter().filter(|row| row.item.is_known()).collect(),
         next_cursor: raw.next_cursor,
         has_more_history: raw.has_more_history,
+        subagents: raw.subagents,
         has_user_turn,
     })
 }
@@ -292,6 +297,21 @@ pub fn merge_older_history_with_work(
     true
 }
 
+/// `mergeOlderSubagentsIntoProjection` (`pingdotgg/t3code#38724`): adds the records of older
+/// subagents; a record already held is newer and stays.
+pub fn merge_older_subagents(projection: &mut ThreadProjection, older: Vec<Entity>) -> bool {
+    if older.is_empty() {
+        return false;
+    }
+    let held: HashSet<&str> = projection.subagents.iter().map(|agent| agent.id.as_str()).collect();
+    let added: Vec<Entity> = older.into_iter().filter(|agent| !held.contains(agent.id.as_str())).collect();
+    if added.is_empty() {
+        return false;
+    }
+    projection.subagents.splice(0..0, added);
+    true
+}
+
 /// What the page loader does next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryStep {
@@ -309,14 +329,16 @@ pub enum HistoryStep {
 pub struct HistoryMerge {
     projection: ThreadProjection,
     items: Vec<ProjectedTurnItem>,
+    subagents: Vec<Entity>,
     generation: u64,
     next: HistoryStep,
 }
 
 impl HistoryMerge {
     pub fn run(self) -> MergedHistory {
-        let HistoryMerge { mut projection, items, generation, next } = self;
+        let HistoryMerge { mut projection, items, subagents, generation, next } = self;
         merge_older_history(&mut projection, items);
+        merge_older_subagents(&mut projection, subagents);
         MergedHistory { projection, generation, next }
     }
 }
@@ -425,7 +447,13 @@ impl ThreadState {
             }
         };
         self.merging = Some(Vec::new());
-        PageOutcome::Merge(Box::new(HistoryMerge { projection, items: page.items, generation: self.generation, next }))
+        PageOutcome::Merge(Box::new(HistoryMerge {
+            projection,
+            items: page.items,
+            subagents: page.subagents,
+            generation: self.generation,
+            next,
+        }))
     }
 
     /// Swaps a merged projection back in and applies the events that arrived meanwhile.
@@ -506,6 +534,7 @@ impl ThreadState {
             next_cursor: page.next_cursor,
             projection,
             items: page.items,
+            subagents: page.subagents,
             generation: self.generation,
             next,
         }))
@@ -564,14 +593,16 @@ pub struct WorkMerge {
     next_cursor: Option<String>,
     projection: ThreadProjection,
     items: Vec<ProjectedTurnItem>,
+    subagents: Vec<Entity>,
     generation: u64,
     next: HistoryStep,
 }
 
 impl WorkMerge {
     pub fn run(self) -> MergedWork {
-        let WorkMerge { anchor_id, next_cursor, mut projection, items, generation, next } = self;
+        let WorkMerge { anchor_id, next_cursor, mut projection, items, subagents, generation, next } = self;
         merge_older_history_with_work(&mut projection, items, Some((&anchor_id, next_cursor.as_deref())));
+        merge_older_subagents(&mut projection, subagents);
         MergedWork { anchor_id, projection, generation, next }
     }
 }

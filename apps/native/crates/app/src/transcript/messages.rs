@@ -25,7 +25,7 @@ use t3_core::timeline::{
     split_codex_assistant_segments, strip_displayed_plan_markdown, user_message_file_label,
 };
 
-use super::markdown::{MarkdownStore, markdown_view, prose};
+use super::markdown::{MarkdownStore, prose, user_markdown_view};
 use super::notices::{SubagentLiveElapsed, plain_detail, provider_marks, subagent_avatar};
 use super::parts::{CopyButton, DividerTone, ROW_GROUP, Clock, focusable, ghost_button, ghost_icon_button, ghost_text_button, mono_frame, system_divider, tooltip_icon_button};
 use super::RowEnv;
@@ -948,7 +948,7 @@ pub fn user_row(
     } else {
         let source: Arc<str> = Arc::from(with_line_breaks(display_text));
         let state = markdown.state_in_context(&format!("user:{id}"), &source, Some(action_ctx), cx);
-        Some(markdown_view(&state, cx))
+        Some(user_markdown_view(&state, &source, cx))
     };
     let images = t3_core::media::image_attachments(attachments);
     let videos = t3_core::media::video_attachments(&partitioned.videos);
@@ -1400,8 +1400,10 @@ fn render_artifact_template_card(
     let p = palette(cx);
     let subtitle = codex_artifact_template_presentation_label(&template.artifact_kind).unwrap_or("Artifact template");
     let display_name = template.display_name.clone();
+    let rtl = t3_core::markdown::is_rtl_text(&display_name);
     h_flex()
         .w_full()
+        .when(rtl, |this| this.flex_row_reverse())
         .gap(px(10.))
         .px(px(12.))
         .py(px(10.))
@@ -1421,9 +1423,10 @@ fn render_artifact_template_card(
             v_flex()
                 .min_w_0()
                 .flex_1()
+                .when(rtl, |this| this.items_end())
                 .gap(px(1.))
-                .child(div().truncate().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(display_name))
-                .child(div().text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(subtitle)),
+                .child(div().truncate().when(rtl, |this| this.text_right()).text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(display_name))
+                .child(div().when(rtl, |this| this.text_right()).text_size(px(11.)).text_color(hsla(p.muted_foreground)).child(subtitle)),
         )
         .child(
             Button::new(id, ButtonVariant::Outline, ButtonSize::Xs)
@@ -1524,6 +1527,7 @@ pub fn assistant_meta_row(message: &Arc<ChatMessage>, show_copy: bool, copy_stre
 }
 
 /// `SentMessageTimelineRow`: text an agent sent with `send_to_user`, shown under `T3 Code`.
+/// Citations name its turn item id (`pingdotgg/t3code#36858`).
 pub fn sent_message_row(
     id: &str,
     entry: &SentMessageEntry,
@@ -1534,6 +1538,26 @@ pub fn sent_message_row(
     let p = palette(cx);
     let action_ctx = action_context(env, cx);
     let state = markdown.state_in_context(&format!("sent-message:{id}"), &entry.text, Some(action_ctx), cx);
+    let selection_state = state.clone();
+    let message_id = id.to_owned();
+    let full_text = entry.text.clone();
+    let bounds_cell = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<gpui::Pixels>>));
+    let bounds_paint = bounds_cell.clone();
+    let body = div()
+        .id(SharedString::from(format!("sent-message-select:{id}")))
+        .relative()
+        .on_mouse_up(gpui::MouseButton::Left, cx.listener(move |view, event: &gpui::MouseUpEvent, window, cx| {
+            view.capture_citation_selection(
+                selection_state.clone(),
+                message_id.clone(),
+                full_text.clone(),
+                (event.position, bounds_cell.get()),
+                window,
+                cx,
+            );
+        }))
+        .child(gpui::canvas(move |bounds, _, _| bounds_paint.set(Some(bounds)), |_, _, _, _| {}).absolute().inset_0())
+        .child(prose(&state, cx));
     v_flex()
         .w_full()
         .min_w_0()
@@ -1547,7 +1571,7 @@ pub fn sent_message_row(
                 .text_color(hsla(p.muted_foreground))
                 .child("T3 Code"),
         )
-        .child(prose(&state, cx))
+        .child(body)
         .into_any_element()
 }
 

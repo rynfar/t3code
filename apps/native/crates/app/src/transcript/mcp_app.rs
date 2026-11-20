@@ -1909,4 +1909,35 @@ mod tests {
             assert_eq!(side_frame.read(cx).display_mode, DisplayMode::Inline);
         });
     }
+
+    #[gpui::test]
+    async fn late_teardown_does_not_close_replacement_host(cx: &mut gpui::TestAppContext) {
+        // A replacement document mounted while the prior host wound down stays open (`pingdotgg/t3code#30387`).
+        let (_runtime, state, client, env, _fixture) = setup_test_state(cx);
+        let frame = cx.update(|cx| {
+            cx.new(|cx| McpFrame::new(env, "thread-1".into(), None, state.clone(), &client, test_entry("item-race"), cx))
+        });
+
+        cx.update(|cx| {
+            frame.update(cx, |f, cx| {
+                f.install_host(cx);
+                let old_gen = f.generation;
+                f.receive_message(old_gen, r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#, cx);
+                // Old host begins winding down.
+                f.receive_message(old_gen, r#"{"jsonrpc":"2.0","method":"ui/notifications/request-teardown"}"#, cx);
+                assert!(!f.closed && f.teardown_timer.is_some());
+
+                // Replacement host installs while old teardown is in flight.
+                f.install_host(cx);
+                let new_gen = f.generation;
+                assert!(new_gen > old_gen);
+                assert!(f.teardown_timer.is_none());
+
+                // Late teardown ack or timeout from old_gen must not close the replacement host.
+                f.receive_message(old_gen, r#"{"jsonrpc":"2.0","id":"t3-host-0","result":{}}"#, cx);
+                f.teardown_timeout(old_gen, cx);
+                assert!(!f.closed && f.host.is_some());
+            });
+        });
+    }
 }
