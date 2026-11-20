@@ -1,7 +1,7 @@
 //! Multi-language UI localization: ports `packages/client-runtime/src/locales.ts`,
 //! `apps/web/src/i18n/locales.ts`, `apps/web/src/i18n/runtime.ts`, and embeds the 10
-//! translation catalogs directly from `apps/web/src/i18n/translations/*.json` and
-//! `apps/desktop/src/i18n/translations/*.json`.
+//! vendored web and desktop translation catalogs from `translations/web/*.json` and
+//! `translations/desktop/*.json` (synced via `apps/native/scripts/sync-i18n.sh`).
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -186,32 +186,32 @@ fn flatten_rich_ast(node: &serde_json::Value, out: &mut String) {
     }
 }
 
-const RAW_EN_BUNDLE: &str = include_str!("../../../../../web/src/i18n/translations/en.json");
+const RAW_EN_BUNDLE: &str = include_str!("translations/web/en.json");
 
 const NON_DEFAULT_BUNDLES: [(&str, &str); 9] = [
-    ("de", include_str!("../../../../../web/src/i18n/translations/de.json")),
-    ("es", include_str!("../../../../../web/src/i18n/translations/es.json")),
-    ("fr", include_str!("../../../../../web/src/i18n/translations/fr.json")),
-    ("ja", include_str!("../../../../../web/src/i18n/translations/ja.json")),
-    ("ko", include_str!("../../../../../web/src/i18n/translations/ko.json")),
-    ("pt-BR", include_str!("../../../../../web/src/i18n/translations/pt-BR.json")),
-    ("ru", include_str!("../../../../../web/src/i18n/translations/ru.json")),
-    ("sv", include_str!("../../../../../web/src/i18n/translations/sv.json")),
-    ("zh", include_str!("../../../../../web/src/i18n/translations/zh.json")),
+    ("de", include_str!("translations/web/de.json")),
+    ("es", include_str!("translations/web/es.json")),
+    ("fr", include_str!("translations/web/fr.json")),
+    ("ja", include_str!("translations/web/ja.json")),
+    ("ko", include_str!("translations/web/ko.json")),
+    ("pt-BR", include_str!("translations/web/pt-BR.json")),
+    ("ru", include_str!("translations/web/ru.json")),
+    ("sv", include_str!("translations/web/sv.json")),
+    ("zh", include_str!("translations/web/zh.json")),
 ];
 
-const RAW_DESKTOP_EN_BUNDLE: &str = include_str!("../../../../../desktop/src/i18n/translations/en.json");
+const RAW_DESKTOP_EN_BUNDLE: &str = include_str!("translations/desktop/en.json");
 
 const NON_DEFAULT_DESKTOP_BUNDLES: [(&str, &str); 9] = [
-    ("de", include_str!("../../../../../desktop/src/i18n/translations/de.json")),
-    ("es", include_str!("../../../../../desktop/src/i18n/translations/es.json")),
-    ("fr", include_str!("../../../../../desktop/src/i18n/translations/fr.json")),
-    ("ja", include_str!("../../../../../desktop/src/i18n/translations/ja.json")),
-    ("ko", include_str!("../../../../../desktop/src/i18n/translations/ko.json")),
-    ("pt-BR", include_str!("../../../../../desktop/src/i18n/translations/pt-BR.json")),
-    ("ru", include_str!("../../../../../desktop/src/i18n/translations/ru.json")),
-    ("sv", include_str!("../../../../../desktop/src/i18n/translations/sv.json")),
-    ("zh", include_str!("../../../../../desktop/src/i18n/translations/zh.json")),
+    ("de", include_str!("translations/desktop/de.json")),
+    ("es", include_str!("translations/desktop/es.json")),
+    ("fr", include_str!("translations/desktop/fr.json")),
+    ("ja", include_str!("translations/desktop/ja.json")),
+    ("ko", include_str!("translations/desktop/ko.json")),
+    ("pt-BR", include_str!("translations/desktop/pt-BR.json")),
+    ("ru", include_str!("translations/desktop/ru.json")),
+    ("sv", include_str!("translations/desktop/sv.json")),
+    ("zh", include_str!("translations/desktop/zh.json")),
 ];
 
 struct ParsedEnglishCatalog {
@@ -771,35 +771,57 @@ mod tests {
 
     #[test]
     fn embedded_translation_catalogs_match_web_json_exactly() {
-        let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../web/src/i18n/translations");
-        assert!(web_dir.is_dir(), "expected web translations dir at {}", web_dir.display());
-        let en_web_raw = std::fs::read_to_string(web_dir.join("en.json")).expect("read web en.json");
-        assert_eq!(RAW_EN_BUNDLE, en_web_raw);
+        let vendored_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/i18n/translations/web");
+        assert!(vendored_dir.is_dir(), "expected vendored web translations dir at {}", vendored_dir.display());
+        let vendored_en_raw =
+            std::fs::read_to_string(vendored_dir.join("en.json")).expect("read vendored web en.json");
+        assert_eq!(RAW_EN_BUNDLE, vendored_en_raw);
+
         let en_web: BTreeMap<String, CatalogEntry> =
-            serde_json::from_str(&en_web_raw).expect("parse web en.json");
-        assert!(!en_web.is_empty(), "expected non-empty web en.json");
+            serde_json::from_str(RAW_EN_BUNDLE).expect("parse vendored web en.json");
+        assert!(!en_web.is_empty(), "expected non-empty vendored web en.json");
 
         // All 10 supported locales exist on disk and are covered by embedded bundles.
         assert_eq!(SUPPORTED_LOCALES.len(), 1 + NON_DEFAULT_BUNDLES.len());
         assert_eq!(NATIVE_LANGUAGE_NAMES.len(), SUPPORTED_LOCALES.len());
 
-        for &(locale, embedded_raw) in &NON_DEFAULT_BUNDLES {
-            let web_path = web_dir.join(format!("{locale}.json"));
-            let web_raw = std::fs::read_to_string(&web_path)
-                .unwrap_or_else(|e| panic!("failed to read {}: {e}", web_path.display()));
+        // When running inside the monorepo, also enforce exact byte-for-byte parity against
+        // `apps/web/src/i18n/translations/*.json`. Standalone `apps/native` checkouts omit that
+        // parent directory and validate the vendored catalogs directly.
+        let web_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../web/src/i18n/translations");
+        if web_dir.is_dir() {
+            let en_web_raw = std::fs::read_to_string(web_dir.join("en.json")).expect("read web en.json");
             assert_eq!(
-                embedded_raw, web_raw,
-                "embedded {locale}.json drifted from apps/web/src/i18n/translations/{locale}.json"
+                RAW_EN_BUNDLE, en_web_raw,
+                "vendored web en.json drifted from apps/web/src/i18n/translations/en.json; run `sh apps/native/scripts/sync-i18n.sh`"
             );
-            let web_map: BTreeMap<String, CatalogEntry> =
-                serde_json::from_str(&web_raw).unwrap_or_else(|e| panic!("parse web {locale}: {e}"));
+        }
+
+        for &(locale, embedded_raw) in &NON_DEFAULT_BUNDLES {
+            let vendored_path = vendored_dir.join(format!("{locale}.json"));
+            let vendored_raw = std::fs::read_to_string(&vendored_path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", vendored_path.display()));
+            assert_eq!(embedded_raw, vendored_raw, "embedded web {locale}.json drifted from vendored file");
+
+            if web_dir.is_dir() {
+                let web_path = web_dir.join(format!("{locale}.json"));
+                let web_raw = std::fs::read_to_string(&web_path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", web_path.display()));
+                assert_eq!(
+                    embedded_raw, web_raw,
+                    "vendored web {locale}.json drifted from apps/web/src/i18n/translations/{locale}.json; run `sh apps/native/scripts/sync-i18n.sh`"
+                );
+            }
+
+            let locale_map: BTreeMap<String, CatalogEntry> =
+                serde_json::from_str(embedded_raw).unwrap_or_else(|e| panic!("parse web {locale}: {e}"));
 
             // Build the expected set of valid string translations per English source (multiple
             // GT hashes can share one English string under distinct `$context` values).
             let mut valid_by_english: HashMap<&str, HashSet<&str>> = HashMap::new();
             for (hash, en_entry) in &en_web {
                 if let CatalogEntry::Text(english) = en_entry
-                    && let Some(CatalogEntry::Text(translated)) = web_map.get(hash)
+                    && let Some(CatalogEntry::Text(translated)) = locale_map.get(hash)
                 {
                     valid_by_english.entry(english.as_str()).or_default().insert(translated.as_str());
                 }
@@ -913,29 +935,63 @@ mod tests {
 
     #[test]
     fn embedded_desktop_catalogs_match_desktop_json_exactly() {
-        let desktop_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../desktop/src/i18n/translations");
-        assert!(desktop_dir.is_dir(), "expected desktop translations dir at {}", desktop_dir.display());
-        let en_raw = std::fs::read_to_string(desktop_dir.join("en.json")).expect("read desktop en.json");
-        assert_eq!(RAW_DESKTOP_EN_BUNDLE, en_raw);
+        let vendored_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/i18n/translations/desktop");
+        assert!(
+            vendored_dir.is_dir(),
+            "expected vendored desktop translations dir at {}",
+            vendored_dir.display()
+        );
+        let vendored_en_raw =
+            std::fs::read_to_string(vendored_dir.join("en.json")).expect("read vendored desktop en.json");
+        assert_eq!(RAW_DESKTOP_EN_BUNDLE, vendored_en_raw);
+
         let en_desktop: BTreeMap<String, CatalogEntry> =
-            serde_json::from_str(&en_raw).expect("parse desktop en.json");
+            serde_json::from_str(RAW_DESKTOP_EN_BUNDLE).expect("parse vendored desktop en.json");
+        assert!(!en_desktop.is_empty(), "expected non-empty vendored desktop en.json");
+        assert_eq!(SUPPORTED_LOCALES.len(), 1 + NON_DEFAULT_DESKTOP_BUNDLES.len());
+
+        // When running inside the monorepo, also enforce exact byte-for-byte parity against
+        // `apps/desktop/src/i18n/translations/*.json`. Standalone `apps/native` checkouts omit
+        // that parent directory and validate the vendored catalogs directly.
+        let desktop_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../desktop/src/i18n/translations");
+        if desktop_dir.is_dir() {
+            let en_raw = std::fs::read_to_string(desktop_dir.join("en.json")).expect("read desktop en.json");
+            assert_eq!(
+                RAW_DESKTOP_EN_BUNDLE, en_raw,
+                "vendored desktop en.json drifted from apps/desktop/src/i18n/translations/en.json; run `sh apps/native/scripts/sync-i18n.sh`"
+            );
+        }
 
         for &(locale, embedded_raw) in &NON_DEFAULT_DESKTOP_BUNDLES {
-            let desktop_path = desktop_dir.join(format!("{locale}.json"));
-            let disk_raw = std::fs::read_to_string(&desktop_path)
-                .unwrap_or_else(|e| panic!("failed to read {}: {e}", desktop_path.display()));
-            assert_eq!(embedded_raw, disk_raw, "embedded desktop {locale}.json drifted");
+            let vendored_path = vendored_dir.join(format!("{locale}.json"));
+            let vendored_raw = std::fs::read_to_string(&vendored_path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", vendored_path.display()));
+            assert_eq!(
+                embedded_raw, vendored_raw,
+                "embedded desktop {locale}.json drifted from vendored file"
+            );
 
-            let disk_map: BTreeMap<String, CatalogEntry> =
-                serde_json::from_str(&disk_raw).unwrap_or_else(|e| panic!("parse desktop {locale}: {e}"));
+            if desktop_dir.is_dir() {
+                let desktop_path = desktop_dir.join(format!("{locale}.json"));
+                let disk_raw = std::fs::read_to_string(&desktop_path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", desktop_path.display()));
+                assert_eq!(
+                    embedded_raw, disk_raw,
+                    "vendored desktop {locale}.json drifted from apps/desktop/src/i18n/translations/{locale}.json; run `sh apps/native/scripts/sync-i18n.sh`"
+                );
+            }
+
+            let locale_map: BTreeMap<String, CatalogEntry> =
+                serde_json::from_str(embedded_raw).unwrap_or_else(|e| panic!("parse desktop {locale}: {e}"));
             let mut valid_by_english: HashMap<&str, HashSet<&str>> = HashMap::new();
             for (hash, en_entry) in &en_desktop {
                 if let CatalogEntry::Text(english) = en_entry
-                    && let Some(CatalogEntry::Text(translated)) = disk_map.get(hash)
+                    && let Some(CatalogEntry::Text(translated)) = locale_map.get(hash)
                 {
                     valid_by_english.entry(english.as_str()).or_default().insert(translated.as_str());
                 }
             }
+            assert!(!valid_by_english.is_empty(), "desktop {locale}.json has no plain string entries");
             for (english, valid) in &valid_by_english {
                 let actual = translate_menu(locale, english);
                 assert!(
