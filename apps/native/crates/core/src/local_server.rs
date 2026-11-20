@@ -21,6 +21,23 @@ pub const SERVER_EXIT_CODE_MANAGED_POLICY: i32 = 77;
 /// state-directory owner.
 pub const SERVER_EXIT_CODE_STATE_DIR_OWNED: i32 = 78;
 
+/// Default loopback interface bound when hosting a local server (`DesktopBackendConfiguration.ts`).
+pub const DEFAULT_LOCAL_SERVER_HOST: &str = "127.0.0.1";
+/// Default HTTP/WebSocket port (`ServerConfig.DEFAULT_PORT`).
+pub const DEFAULT_LOCAL_SERVER_PORT: u16 = 3773;
+/// Unauthenticated readiness & descriptor probe path (`BACKEND_READINESS_PATH`).
+pub const LOCAL_SERVER_READINESS_PATH: &str = "/.well-known/t3/environment";
+/// Initial exponential restart backoff (`INITIAL_RESTART_DELAY` in `DesktopBackendManager.ts`).
+pub const INITIAL_RESTART_DELAY_MS: u64 = 500;
+/// Cap on exponential restart backoff (`MAX_RESTART_DELAY` in `DesktopBackendManager.ts`).
+pub const MAX_RESTART_DELAY_MS: u64 = 10_000;
+/// Startup crash restart limit (`STARTUP_FAILURE_RESTART_ATTEMPTS` in `DesktopBackendManager.ts`).
+pub const MAX_STARTUP_RESTART_ATTEMPTS: u32 = 3;
+/// Grace period between SIGTERM and SIGKILL (`DEFAULT_BACKEND_TERMINATE_GRACE`).
+pub const TERMINATE_GRACE_MS: u64 = 5_000;
+/// Bounded diagnostic tail retained from subprocess stdout/stderr (`STARTUP_FAILURE_OUTPUT_CHARS`).
+pub const OUTPUT_TAIL_MAX_CHARS: usize = 4_000;
+
 /// Copy shown when exit 77 stops local startup (`DesktopStartupRecovery.ts`, `pingdotgg/t3code#30319`).
 pub const MANAGED_POLICY_STARTUP_MESSAGE: &str =
     "Your organization's managed policy stopped T3 Code from starting. Send the details below to your IT administrator.";
@@ -249,6 +266,399 @@ pub fn cli_failure_summary(stderr: &str, stdout: &str) -> String {
         .unwrap_or_else(|| "it exited without a message.".to_owned())
 }
 
+/// Parameters for launching an embedded local `t3 serve` subprocess (`apps/server/src/cli/server.ts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalServerLaunchSpec {
+    pub home: PathBuf,
+    pub default_home: PathBuf,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+/// Builds `t3 serve` CLI arguments for hosting the local server without opening a browser or
+/// auto-bootstrapping the current working directory as a project.
+pub fn serve_args(spec: &LocalServerLaunchSpec) -> Vec<String> {
+    let mut args = vec!["serve".to_owned(), "--no-browser".to_owned()];
+    if spec.home != spec.default_home {
+        args.extend(["--base-dir".to_owned(), spec.home.to_string_lossy().into_owned()]);
+    }
+    if let Some(host) = spec.host.as_deref().map(str::trim).filter(|host| !host.is_empty()) {
+        args.extend(["--host".to_owned(), host.to_owned()]);
+    }
+    if let Some(port) = spec.port.filter(|port| *port > 0) {
+        args.extend(["--port".to_owned(), port.to_string()]);
+    }
+    args
+}
+
+/// Loopback-reachable HTTP origin for a configured bind host and port (`runtimeOriginForConfig`
+/// in `apps/server/src/serverRuntimeState.ts`).
+pub fn server_origin(host: Option<&str>, port: u16) -> String {
+    let trimmed = host.map(str::trim).unwrap_or("");
+    let wildcard = trimmed.is_empty() || matches!(trimmed, "0.0.0.0" | "::" | "[::]");
+    if wildcard {
+        return format!("http://{DEFAULT_LOCAL_SERVER_HOST}:{port}");
+    }
+    if trimmed.contains(':') && !(trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        format!("http://[{trimmed}]:{port}")
+    } else {
+        format!("http://{trimmed}:{port}")
+    }
+}
+
+/// Unauthenticated readiness URL for `origin` (`BACKEND_READINESS_PATH`).
+pub fn readiness_url(origin: &str) -> String {
+    format!("{}{LOCAL_SERVER_READINESS_PATH}", origin.trim_end_matches('/'))
+}
+
+/// Appends `chunk` to `existing`, retaining at most `max_chars` Unicode scalar values from the end.
+pub fn append_output_tail(existing: &str, chunk: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let combined_chars = existing.chars().count() + chunk.chars().count();
+    if combined_chars <= max_chars {
+        let mut out = String::with_capacity(existing.len() + chunk.len());
+        out.push_str(existing);
+        out.push_str(chunk);
+        return out;
+    }
+    let skip = combined_chars - max_chars;
+    existing.chars().chain(chunk.chars()).skip(skip).collect()
+}
+
+/// Exponential backoff for restarting an unexpectedly exited local server (`calculateRestartDelay`).
+pub fn restart_delay_ms(attempt: u32) -> u64 {
+    let shift = attempt.min(16);
+    let factor = 1u64 << shift;
+    INITIAL_RESTART_DELAY_MS.saturating_mul(factor).min(MAX_RESTART_DELAY_MS)
+}
+
+/// Whether a discovered `ServerRuntimeState` matches the port requested for a hosted local server.
+pub fn matches_hosted_runtime(state: &ServerRuntimeState, expected_port: Option<u16>) -> bool {
+    expected_port.is_none_or(|port| state.port == port)
+}
+
+/// Structured reason why the hosted local server stopped or refused to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalServerFailureKind {
+    CliMissing,
+    SpawnFailed,
+    ManagedPolicy,
+    StateDirOwned,
+    IncompatibleProtocol,
+    ReadinessTimeout,
+    Crashed { exit_code: Option<i32> },
+}
+
+/// Diagnostic payload stored when the hosted local server enters `LocalServerPhase::Failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalServerFailure {
+    pub kind: LocalServerFailureKind,
+    pub message: String,
+    pub recovery: StartupRecoveryOffer,
+    pub output_tail: String,
+    pub restart_suppressed: bool,
+}
+
+/// Observable lifecycle state of the embedded local server host.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LocalServerPhase {
+    #[default]
+    Stopped,
+    Starting { pid: Option<u32>, attempt: u32 },
+    Running { pid: u32, origin: String, server_version: Option<String> },
+    Stopping { pid: Option<u32> },
+    Failed(LocalServerFailure),
+}
+
+impl LocalServerPhase {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Starting { .. } | Self::Running { .. })
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    pub fn is_starting(&self) -> bool {
+        matches!(self, Self::Starting { .. })
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        matches!(self, Self::Stopping { .. })
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Starting { pid, .. } | Self::Stopping { pid } => *pid,
+            Self::Running { pid, .. } => Some(*pid),
+            Self::Stopped | Self::Failed(_) => None,
+        }
+    }
+
+    pub fn failure(&self) -> Option<&LocalServerFailure> {
+        match self {
+            Self::Failed(failure) => Some(failure),
+            _ => None,
+        }
+    }
+}
+
+/// Inputs driving the pure `LocalServerLifecycle` state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalServerEvent {
+    StartRequested,
+    StopRequested,
+    CliMissing,
+    Spawned { pid: u32 },
+    SpawnFailed { reason: String },
+    OutputChunk(String),
+    Ready { pid: u32, origin: String, server_version: Option<String> },
+    IncompatibleProtocol { message: String },
+    ReadinessTimedOut { origin: Option<String> },
+    ProcessExited { exit_code: Option<i32>, stderr: String, stdout: String },
+}
+
+/// Side effect the host runtime should perform after applying a `LocalServerEvent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalServerAction {
+    None,
+    Spawn,
+    Terminate { pid: Option<u32> },
+    ScheduleRestart { delay_ms: u64, attempt: u32 },
+}
+
+/// Pure lifecycle state machine mirroring `DesktopBackendManager.ts` (startup, readiness,
+/// managed-policy exit 77 and state-dir-owned exit 78 restart suppression, bounded crash backoff,
+/// and clean shutdown).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalServerLifecycle {
+    phase: LocalServerPhase,
+    desired_running: bool,
+    restart_attempt: u32,
+    max_restarts: u32,
+    last_started_version: Option<String>,
+    output_tail: String,
+}
+
+impl Default for LocalServerLifecycle {
+    fn default() -> Self {
+        Self::with_max_restarts(MAX_STARTUP_RESTART_ATTEMPTS)
+    }
+}
+
+impl LocalServerLifecycle {
+    pub fn with_max_restarts(max_restarts: u32) -> Self {
+        Self {
+            phase: LocalServerPhase::Stopped,
+            desired_running: false,
+            restart_attempt: 0,
+            max_restarts,
+            last_started_version: None,
+            output_tail: String::new(),
+        }
+    }
+
+    pub fn phase(&self) -> &LocalServerPhase {
+        &self.phase
+    }
+
+    pub fn desired_running(&self) -> bool {
+        self.desired_running
+    }
+
+    pub fn restart_attempt(&self) -> u32 {
+        self.restart_attempt
+    }
+
+    pub fn output_tail(&self) -> &str {
+        &self.output_tail
+    }
+
+    pub fn apply(&mut self, event: LocalServerEvent) -> LocalServerAction {
+        match event {
+            LocalServerEvent::StartRequested => {
+                if matches!(self.phase, LocalServerPhase::Starting { .. } | LocalServerPhase::Running { .. }) {
+                    self.desired_running = true;
+                    return LocalServerAction::None;
+                }
+                self.desired_running = true;
+                self.restart_attempt = 0;
+                self.output_tail.clear();
+                self.phase = LocalServerPhase::Starting { pid: None, attempt: 1 };
+                LocalServerAction::Spawn
+            }
+            LocalServerEvent::StopRequested => {
+                self.desired_running = false;
+                match self.phase.pid() {
+                    pid if self.phase.is_active() => {
+                        self.phase = LocalServerPhase::Stopping { pid };
+                        LocalServerAction::Terminate { pid }
+                    }
+                    _ => {
+                        self.phase = LocalServerPhase::Stopped;
+                        LocalServerAction::None
+                    }
+                }
+            }
+            LocalServerEvent::CliMissing => {
+                self.desired_running = false;
+                let recovery = resolve_startup_recovery_offer(None, self.last_started_version.as_deref(), false);
+                self.phase = LocalServerPhase::Failed(LocalServerFailure {
+                    kind: LocalServerFailureKind::CliMissing,
+                    message: "Could not find the t3 command. Install the t3 CLI or open T3 Code Desktop once to install it.".to_owned(),
+                    recovery,
+                    output_tail: self.output_tail.clone(),
+                    restart_suppressed: true,
+                });
+                LocalServerAction::None
+            }
+            LocalServerEvent::Spawned { pid } => {
+                let attempt = match self.phase {
+                    LocalServerPhase::Starting { attempt, .. } => attempt,
+                    _ => self.restart_attempt.saturating_add(1),
+                };
+                self.phase = LocalServerPhase::Starting { pid: Some(pid), attempt };
+                LocalServerAction::None
+            }
+            LocalServerEvent::SpawnFailed { reason } => {
+                self.desired_running = false;
+                let recovery = resolve_startup_recovery_offer(None, self.last_started_version.as_deref(), false);
+                self.phase = LocalServerPhase::Failed(LocalServerFailure {
+                    kind: LocalServerFailureKind::SpawnFailed,
+                    message: format!("Could not start the local T3 Code server: {reason}"),
+                    recovery,
+                    output_tail: self.output_tail.clone(),
+                    restart_suppressed: true,
+                });
+                LocalServerAction::None
+            }
+            LocalServerEvent::OutputChunk(chunk) => {
+                self.output_tail = append_output_tail(&self.output_tail, &chunk, OUTPUT_TAIL_MAX_CHARS);
+                LocalServerAction::None
+            }
+            LocalServerEvent::Ready { pid, origin, server_version } => {
+                self.restart_attempt = 0;
+                if let Some(version) = server_version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                    self.last_started_version = Some(version.to_owned());
+                }
+                self.phase = LocalServerPhase::Running { pid, origin, server_version };
+                LocalServerAction::None
+            }
+            LocalServerEvent::IncompatibleProtocol { message } => {
+                let pid = self.phase.pid();
+                self.desired_running = false;
+                let recovery = resolve_startup_recovery_offer(None, self.last_started_version.as_deref(), false);
+                self.phase = LocalServerPhase::Failed(LocalServerFailure {
+                    kind: LocalServerFailureKind::IncompatibleProtocol,
+                    message,
+                    recovery,
+                    output_tail: self.output_tail.clone(),
+                    restart_suppressed: true,
+                });
+                if pid.is_some() {
+                    LocalServerAction::Terminate { pid }
+                } else {
+                    LocalServerAction::None
+                }
+            }
+            LocalServerEvent::ReadinessTimedOut { origin } => {
+                let pid = self.phase.pid();
+                self.desired_running = false;
+                let recovery = resolve_startup_recovery_offer(None, self.last_started_version.as_deref(), false);
+                let message = match origin {
+                    Some(origin) => format!("The local T3 Code server started but did not become ready in time at {origin}."),
+                    None => "The local T3 Code server started but did not become ready in time.".to_owned(),
+                };
+                self.phase = LocalServerPhase::Failed(LocalServerFailure {
+                    kind: LocalServerFailureKind::ReadinessTimeout,
+                    message,
+                    recovery,
+                    output_tail: self.output_tail.clone(),
+                    restart_suppressed: true,
+                });
+                LocalServerAction::Terminate { pid }
+            }
+            LocalServerEvent::ProcessExited { exit_code, stderr, stdout } => {
+                if !self.desired_running || matches!(self.phase, LocalServerPhase::Stopping { .. }) {
+                    self.phase = LocalServerPhase::Stopped;
+                    return LocalServerAction::None;
+                }
+                match classify_server_exit(exit_code, &stderr, &stdout) {
+                    StartupExitKind::ManagedPolicy { detail } => {
+                        self.desired_running = false;
+                        let recovery = resolve_startup_recovery_offer(None, self.last_started_version.as_deref(), true);
+                        self.phase = LocalServerPhase::Failed(LocalServerFailure {
+                            kind: LocalServerFailureKind::ManagedPolicy,
+                            message: detail,
+                            recovery,
+                            output_tail: self.output_tail.clone(),
+                            restart_suppressed: true,
+                        });
+                        LocalServerAction::None
+                    }
+                    StartupExitKind::StateDirOwned => {
+                        self.desired_running = false;
+                        let recovery = resolve_startup_recovery_offer(None, self.last_started_version.as_deref(), false);
+                        self.phase = LocalServerPhase::Failed(LocalServerFailure {
+                            kind: LocalServerFailureKind::StateDirOwned,
+                            message: "Another T3 Code process already owns this state directory.".to_owned(),
+                            recovery,
+                            output_tail: self.output_tail.clone(),
+                            restart_suppressed: true,
+                        });
+                        LocalServerAction::None
+                    }
+                    StartupExitKind::Other { exit_code, detail } => {
+                        if !should_suppress_restart(exit_code) && self.restart_attempt < self.max_restarts {
+                            let delay_ms = restart_delay_ms(self.restart_attempt);
+                            self.restart_attempt += 1;
+                            self.phase = LocalServerPhase::Starting { pid: None, attempt: self.restart_attempt + 1 };
+                            return LocalServerAction::ScheduleRestart { delay_ms, attempt: self.restart_attempt };
+                        }
+                        self.desired_running = false;
+                        let recovery = resolve_startup_recovery_offer(None, self.last_started_version.as_deref(), false);
+                        let code_suffix = exit_code.map_or_else(String::new, |code| format!(" (exit {code})"));
+                        self.phase = LocalServerPhase::Failed(LocalServerFailure {
+                            kind: LocalServerFailureKind::Crashed { exit_code },
+                            message: format!("The local T3 Code server stopped unexpectedly{code_suffix}: {detail}"),
+                            recovery,
+                            output_tail: self.output_tail.clone(),
+                            restart_suppressed: should_suppress_restart(exit_code),
+                        });
+                        LocalServerAction::None
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Formats a copyable diagnostics bundle for a local server startup/runtime failure.
+pub fn format_local_server_diagnostics(failure: &LocalServerFailure, home: Option<&Path>, cli: Option<&Path>) -> String {
+    let mut lines = vec![
+        format!("Error: {}", failure.message),
+        format!("Recovery: {}", describe_startup_recovery_offer(&failure.recovery)),
+    ];
+    if failure.restart_suppressed {
+        lines.push("Automatic restart: suppressed".to_owned());
+    }
+    if let Some(home) = home {
+        lines.push(format!("T3 home: {}", home.display()));
+    }
+    if let Some(cli) = cli {
+        lines.push(format!("t3 CLI: {}", cli.display()));
+    }
+    let tail = failure.output_tail.trim();
+    if !tail.is_empty() {
+        lines.push(String::new());
+        lines.push("Server output:".to_owned());
+        lines.push(tail.to_owned());
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +791,129 @@ mod tests {
             describe_startup_recovery_offer(&StartupRecoveryOffer::ManagedPolicy),
             MANAGED_POLICY_STARTUP_MESSAGE
         );
+    }
+
+    #[test]
+    fn serve_args_and_origin_match_server_cli_conventions() {
+        let default = PathBuf::from("/Users/me/.t3");
+        let args = serve_args(&LocalServerLaunchSpec {
+            home: default.clone(),
+            default_home: default.clone(),
+            host: Some("127.0.0.1".into()),
+            port: None,
+        });
+        assert_eq!(args, ["serve", "--no-browser", "--host", "127.0.0.1"]);
+
+        let custom = serve_args(&LocalServerLaunchSpec {
+            home: PathBuf::from("/tmp/t3-custom"),
+            default_home: default,
+            host: Some("  ".into()),
+            port: Some(4123),
+        });
+        assert_eq!(custom, ["serve", "--no-browser", "--base-dir", "/tmp/t3-custom", "--port", "4123"]);
+
+        assert_eq!(server_origin(None, 3773), "http://127.0.0.1:3773");
+        assert_eq!(server_origin(Some("0.0.0.0"), 3773), "http://127.0.0.1:3773");
+        assert_eq!(server_origin(Some("::"), 3773), "http://127.0.0.1:3773");
+        assert_eq!(server_origin(Some("::1"), 3773), "http://[::1]:3773");
+        assert_eq!(server_origin(Some("[::1]"), 3773), "http://[::1]:3773");
+        assert_eq!(readiness_url("http://127.0.0.1:3773/"), "http://127.0.0.1:3773/.well-known/t3/environment");
+    }
+
+    #[test]
+    fn output_tail_truncates_on_unicode_boundaries_and_backoff_caps() {
+        assert_eq!(append_output_tail("abc", "def", 4), "cdef");
+        assert_eq!(append_output_tail("héllo", "🚀world", 6), "🚀world");
+        assert_eq!(append_output_tail("abc", "def", 0), "");
+
+        assert_eq!(restart_delay_ms(0), 500);
+        assert_eq!(restart_delay_ms(1), 1_000);
+        assert_eq!(restart_delay_ms(2), 2_000);
+        assert_eq!(restart_delay_ms(3), 4_000);
+        assert_eq!(restart_delay_ms(4), 8_000);
+        assert_eq!(restart_delay_ms(5), 10_000);
+        assert_eq!(restart_delay_ms(30), 10_000);
+    }
+
+    #[test]
+    fn lifecycle_transitions_start_ready_stop_and_suppresses_policy_restarts() {
+        let mut lc = LocalServerLifecycle::default();
+        assert_eq!(lc.phase(), &LocalServerPhase::Stopped);
+        assert_eq!(lc.apply(LocalServerEvent::StartRequested), LocalServerAction::Spawn);
+        assert_eq!(lc.phase(), &LocalServerPhase::Starting { pid: None, attempt: 1 });
+        // Idempotent while starting.
+        assert_eq!(lc.apply(LocalServerEvent::StartRequested), LocalServerAction::None);
+
+        assert_eq!(lc.apply(LocalServerEvent::Spawned { pid: 4242 }), LocalServerAction::None);
+        assert_eq!(lc.phase().pid(), Some(4242));
+
+        assert_eq!(
+            lc.apply(LocalServerEvent::Ready {
+                pid: 4242,
+                origin: "http://127.0.0.1:3773".into(),
+                server_version: Some("0.1.9".into()),
+            }),
+            LocalServerAction::None
+        );
+        assert!(lc.phase().is_running());
+
+        assert_eq!(lc.apply(LocalServerEvent::StopRequested), LocalServerAction::Terminate { pid: Some(4242) });
+        assert!(lc.phase().is_stopping());
+        // Exiting during intentional stop transitions to Stopped even with a signal/non-zero code.
+        assert_eq!(
+            lc.apply(LocalServerEvent::ProcessExited { exit_code: None, stderr: String::new(), stdout: String::new() }),
+            LocalServerAction::None
+        );
+        assert_eq!(lc.phase(), &LocalServerPhase::Stopped);
+
+        // Managed-policy exit 77 suppresses restart and never offers reinstall/releases.
+        assert_eq!(lc.apply(LocalServerEvent::StartRequested), LocalServerAction::Spawn);
+        lc.apply(LocalServerEvent::OutputChunk("ManagedPolicyFileError: invalid policy\n".into()));
+        let action = lc.apply(LocalServerEvent::ProcessExited {
+            exit_code: Some(SERVER_EXIT_CODE_MANAGED_POLICY),
+            stderr: "ManagedPolicyFileError: invalid policy".into(),
+            stdout: String::new(),
+        });
+        assert_eq!(action, LocalServerAction::None);
+        assert!(!lc.desired_running());
+        let failure = lc.phase().failure().expect("failed state");
+        assert_eq!(failure.kind, LocalServerFailureKind::ManagedPolicy);
+        assert!(failure.restart_suppressed);
+        assert_eq!(failure.recovery, StartupRecoveryOffer::ManagedPolicy);
+        assert!(failure.message.contains(MANAGED_POLICY_STARTUP_MESSAGE));
+        let diag = format_local_server_diagnostics(failure, Some(Path::new("/tmp/h")), Some(Path::new("/tmp/t3")));
+        assert!(diag.contains("Automatic restart: suppressed"));
+        assert!(diag.contains("Server output:"));
+
+        // State-dir-owned exit 78 also suppresses restart.
+        assert_eq!(lc.apply(LocalServerEvent::StartRequested), LocalServerAction::Spawn);
+        let owned_action = lc.apply(LocalServerEvent::ProcessExited {
+            exit_code: Some(SERVER_EXIT_CODE_STATE_DIR_OWNED),
+            stderr: String::new(),
+            stdout: String::new(),
+        });
+        assert_eq!(owned_action, LocalServerAction::None);
+        assert_eq!(lc.phase().failure().map(|f| &f.kind), Some(&LocalServerFailureKind::StateDirOwned));
+    }
+
+    #[test]
+    fn lifecycle_exhausts_bounded_crash_restarts_then_fails() {
+        let mut lc = LocalServerLifecycle::with_max_restarts(2);
+        assert_eq!(lc.apply(LocalServerEvent::StartRequested), LocalServerAction::Spawn);
+        assert_eq!(
+            lc.apply(LocalServerEvent::ProcessExited { exit_code: Some(1), stderr: "boom 1".into(), stdout: String::new() }),
+            LocalServerAction::ScheduleRestart { delay_ms: 500, attempt: 1 }
+        );
+        assert_eq!(
+            lc.apply(LocalServerEvent::ProcessExited { exit_code: Some(1), stderr: "boom 2".into(), stdout: String::new() }),
+            LocalServerAction::ScheduleRestart { delay_ms: 1_000, attempt: 2 }
+        );
+        assert_eq!(
+            lc.apply(LocalServerEvent::ProcessExited { exit_code: Some(1), stderr: "boom 3".into(), stdout: String::new() }),
+            LocalServerAction::None
+        );
+        let failure = lc.phase().failure().expect("exhausted restarts");
+        assert_eq!(failure.kind, LocalServerFailureKind::Crashed { exit_code: Some(1) });
+        assert!(failure.message.contains("boom 3"));
     }
 }

@@ -6,17 +6,22 @@
 //! `T3CODE_HOME` moves the T3 home, as it does for the CLI. `T3_NATIVE_T3_BIN` replaces the CLI
 //! (tests point it at a wrapper around a dev server's `bin.ts`).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use t3_core::compatibility::{ProtocolMismatch, protocol_mismatch};
 use t3_core::local_server::{
-    CliVersionRefusal, SERVER_EXIT_CODE_MANAGED_POLICY, ServerRuntimeState, StartupExitKind, check_cli_version, classify_server_exit, cli_candidates,
-    cli_failure_summary, managed_policy_diagnostic, pair_args, parse_pair_output, parse_runtime_state, runtime_state_paths, t3_home,
+    CliVersionRefusal, DEFAULT_LOCAL_SERVER_HOST, LocalServerEvent, LocalServerFailure, LocalServerFailureKind, LocalServerLaunchSpec,
+    LocalServerLifecycle, LocalServerPhase, SERVER_EXIT_CODE_MANAGED_POLICY, ServerRuntimeState, StartupExitKind, TERMINATE_GRACE_MS,
+    check_cli_version, classify_server_exit, cli_candidates, cli_failure_summary, managed_policy_diagnostic, matches_hosted_runtime, pair_args,
+    parse_pair_output, parse_runtime_state, runtime_state_paths, serve_args, server_origin, t3_home,
 };
 use t3_core::pairing::PairingLink;
 use t3_core::server_config::EnvironmentDescriptor;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{Notify, oneshot, watch};
 
 use crate::auth::{self, AuthError, Paired};
 
@@ -24,6 +29,8 @@ use crate::auth::{self, AuthError, Paired};
 const PAIR_TIMEOUT: Duration = Duration::from_secs(45);
 /// `t3 --version` answers before loading the server.
 pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default budget for a hosted local server to bind and answer its descriptor endpoint.
+const DEFAULT_HOST_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalServer {
@@ -152,11 +159,20 @@ fn is_executable(path: &Path) -> bool {
 /// CLI of another version, runs `t3 pair`, and redeems the token at the server's origin, which
 /// is always reachable from here. Dropping the future stops the CLI.
 pub async fn pair(server: &LocalServer) -> Result<Paired, LocalPairError> {
+    pair_with_cli(server, None).await
+}
+
+/// Like `pair`, optionally pinning the `t3` CLI binary instead of discovering it from `PATH`.
+pub async fn pair_with_cli(server: &LocalServer, cli_override: Option<&Path>) -> Result<Paired, LocalPairError> {
     let current = discover_in(&server.home).await.ok_or(LocalPairError::NotRunning)?;
     if let Some(mismatch) = current.mismatch() {
         return Err(LocalPairError::Incompatible(mismatch.message(&current.descriptor.label)));
     }
-    let cli = find_cli(&current.home).ok_or(LocalPairError::CliMissing)?;
+    let cli = match cli_override {
+        Some(path) if is_executable(path) => path.to_path_buf(),
+        Some(_) => return Err(LocalPairError::CliMissing),
+        None => find_cli(&current.home).ok_or(LocalPairError::CliMissing)?,
+    };
     check_version(&cli, &current).await?;
     let token = run_pair(&cli, &current.home).await?;
     let credentials = auth::redeem_pairing(&PairingLink { http_base: current.state.origin.clone(), token }).await?;
@@ -271,6 +287,533 @@ impl Drop for ProcessGroup {
             unsafe { libc::killpg(pid, libc::SIGKILL) };
         }
     }
+}
+
+/// Configuration for hosting a local `t3 serve` subprocess (`LocalServerHost`).
+#[derive(Debug, Clone)]
+pub struct LocalServerHostConfig {
+    pub home: PathBuf,
+    pub cli_override: Option<PathBuf>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub readiness_timeout: Duration,
+    pub terminate_grace: Duration,
+}
+
+impl LocalServerHostConfig {
+    pub fn for_home(home: PathBuf) -> Self {
+        Self {
+            home,
+            cli_override: None,
+            host: Some(DEFAULT_LOCAL_SERVER_HOST.to_owned()),
+            port: None,
+            readiness_timeout: DEFAULT_HOST_READINESS_TIMEOUT,
+            terminate_grace: Duration::from_millis(TERMINATE_GRACE_MS),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LocalServerHostError {
+    #[error("Could not determine the T3 home directory.")]
+    HomeUnavailable,
+    #[error("Could not find the t3 command. Open the T3 Code desktop app once to install it, or paste a pairing link below.")]
+    CliMissing,
+    #[error("{0}")]
+    ManagedPolicy(String),
+    #[error("Another T3 Code process already owns this state directory.")]
+    StateDirOwned,
+    #[error("{0}")]
+    Incompatible(String),
+    #[error("{0}")]
+    ReadinessTimeout(String),
+    #[error("{0}")]
+    ProcessFailed(String),
+    #[error("The local server was stopped before it became ready.")]
+    Stopped,
+    #[error(transparent)]
+    Pair(#[from] LocalPairError),
+}
+
+fn failure_to_error(failure: &LocalServerFailure) -> LocalServerHostError {
+    match failure.kind {
+        LocalServerFailureKind::CliMissing => LocalServerHostError::CliMissing,
+        LocalServerFailureKind::ManagedPolicy => LocalServerHostError::ManagedPolicy(failure.message.clone()),
+        LocalServerFailureKind::StateDirOwned => LocalServerHostError::StateDirOwned,
+        LocalServerFailureKind::IncompatibleProtocol => LocalServerHostError::Incompatible(failure.message.clone()),
+        LocalServerFailureKind::ReadinessTimeout => LocalServerHostError::ReadinessTimeout(failure.message.clone()),
+        LocalServerFailureKind::SpawnFailed | LocalServerFailureKind::Crashed { .. } => {
+            LocalServerHostError::ProcessFailed(failure.message.clone())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_managed_child(pid: u32, signal: libc::c_int) {
+    if let Ok(pgid) = libc::pid_t::try_from(pid) {
+        // SAFETY: the child was spawned with `process_group(0)`, so `pgid` contains only the
+        // exact child process we spawned and its own descendants.
+        unsafe {
+            libc::killpg(pgid, signal);
+            libc::kill(pgid, signal);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_managed_child(_pid: u32, _signal: i32) {}
+
+async fn discover_matching(home: &Path, expected_port: Option<u16>) -> Option<LocalServer> {
+    for state in live_states(home) {
+        if !matches_hosted_runtime(&state, expected_port) {
+            continue;
+        }
+        match auth::fetch_descriptor(&state.origin).await {
+            Ok(descriptor) => return Some(LocalServer { home: home.to_path_buf(), state, descriptor }),
+            Err(error) => tracing::info!(origin = %state.origin, %error, "skipping a recorded T3 Code that does not answer"),
+        }
+    }
+    None
+}
+
+struct ManagedRun {
+    stop_tx: Option<oneshot::Sender<()>>,
+    stopped_rx: watch::Receiver<bool>,
+    home: PathBuf,
+    cli: PathBuf,
+}
+
+struct LocalServerHostInner {
+    phase_tx: watch::Sender<LocalServerPhase>,
+    lifecycle: Mutex<LocalServerLifecycle>,
+    /// Exact PID of our currently unreaped child process (leader of its own process group).
+    /// Cleared immediately once `child.wait()` reaps it so a reused PID can never be signaled.
+    active_pid: Mutex<Option<u32>>,
+    run: Mutex<Option<ManagedRun>>,
+    start_gate: tokio::sync::Mutex<()>,
+}
+
+/// Owns a managed local `t3 serve` subprocess for this app session: spawns the discovered CLI,
+/// monitors stdout/stderr and exit status (suppressing restart loops on exit 77 managed policy and
+/// exit 78 state-dir-owned), waits for readiness without sleep-polling loops, pairs via `t3 pair`,
+/// and cleanly terminates ONLY the exact child PID it spawned on `stop()` and `Drop`.
+pub struct LocalServerHost {
+    inner: Arc<LocalServerHostInner>,
+}
+
+impl Default for LocalServerHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalServerHost {
+    pub fn new() -> Self {
+        let (phase_tx, _) = watch::channel(LocalServerPhase::Stopped);
+        Self {
+            inner: Arc::new(LocalServerHostInner {
+                phase_tx,
+                lifecycle: Mutex::new(LocalServerLifecycle::with_max_restarts(0)),
+                active_pid: Mutex::new(None),
+                run: Mutex::new(None),
+                start_gate: tokio::sync::Mutex::new(()),
+            }),
+        }
+    }
+
+    pub fn phase(&self) -> LocalServerPhase {
+        self.inner.phase_tx.borrow().clone()
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<LocalServerPhase> {
+        self.inner.phase_tx.subscribe()
+    }
+
+    pub fn child_pid(&self) -> Option<u32> {
+        *self.inner.active_pid.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn active_home_and_cli(&self) -> Option<(PathBuf, PathBuf)> {
+        self.inner
+            .run
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|run| (run.home.clone(), run.cli.clone()))
+    }
+
+    /// Starts the local server using the default `T3CODE_HOME` (`home()`).
+    pub async fn start(&self) -> Result<LocalServer, LocalServerHostError> {
+        let home = home().ok_or(LocalServerHostError::HomeUnavailable)?;
+        start_inner(self.inner.clone(), LocalServerHostConfig::for_home(home)).await
+    }
+
+    /// Starts the local server under `config.home` and waits until its runtime state and HTTP
+    /// descriptor endpoint answer, or until the child process exits / times out.
+    pub async fn start_with_config(&self, config: LocalServerHostConfig) -> Result<LocalServer, LocalServerHostError> {
+        start_inner(self.inner.clone(), config).await
+    }
+
+    /// Returns a `'static` future that starts the local server using the default `T3CODE_HOME`,
+    /// allowing callers (e.g. `AppState`) to keep unique ownership of `LocalServerHost` for `Drop`.
+    pub fn start_future(&self) -> impl Future<Output = Result<LocalServer, LocalServerHostError>> + Send + 'static {
+        let inner = self.inner.clone();
+        async move {
+            let home = home().ok_or(LocalServerHostError::HomeUnavailable)?;
+            start_inner(inner, LocalServerHostConfig::for_home(home)).await
+        }
+    }
+
+    /// Returns a `'static` future that starts the local server with `config`.
+    pub fn start_with_config_future(
+        &self,
+        config: LocalServerHostConfig,
+    ) -> impl Future<Output = Result<LocalServer, LocalServerHostError>> + Send + 'static {
+        let inner = self.inner.clone();
+        async move { start_inner(inner, config).await }
+    }
+
+    /// Starts the local server and immediately pairs with it via `t3 pair`.
+    pub async fn start_and_pair(&self, config: LocalServerHostConfig) -> Result<(LocalServer, Paired), LocalServerHostError> {
+        let cli_override = config.cli_override.clone();
+        let server = self.start_with_config(config).await?;
+        let paired = pair_with_cli(&server, cli_override.as_deref()).await?;
+        Ok((server, paired))
+    }
+
+    /// Cleanly terminates ONLY the exact child process spawned by this host (`SIGTERM` -> grace ->
+    /// `SIGKILL`) and waits until it has been reaped.
+    pub async fn stop(&self) {
+        stop_inner(&self.inner).await;
+    }
+
+    /// Quit hook future compatible with GPUI `cx.on_app_quit`.
+    pub fn shutdown(&self) -> impl Future<Output = ()> + Send + use<> {
+        let inner = self.inner.clone();
+        async move {
+            stop_inner(&inner).await;
+        }
+    }
+
+    fn terminate_immediately(&self) {
+        if let Some(run) = self.inner.run.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+            && let Some(stop_tx) = run.stop_tx.take()
+        {
+            let _ = stop_tx.send(());
+        }
+        if let Some(pid) = self.inner.active_pid.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            #[cfg(unix)]
+            signal_managed_child(pid, libc::SIGKILL);
+            #[cfg(not(unix))]
+            let _ = pid;
+        }
+        let mut lc = self.inner.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if lc.phase().is_active() || lc.phase().is_stopping() {
+            lc.apply(LocalServerEvent::StopRequested);
+            lc.apply(LocalServerEvent::ProcessExited {
+                exit_code: None,
+                stderr: String::new(),
+                stdout: String::new(),
+            });
+            self.inner.phase_tx.send_replace(lc.phase().clone());
+        }
+    }
+}
+
+impl Drop for LocalServerHost {
+    fn drop(&mut self) {
+        self.terminate_immediately();
+    }
+}
+
+async fn start_inner(
+    inner: Arc<LocalServerHostInner>,
+    config: LocalServerHostConfig,
+) -> Result<LocalServer, LocalServerHostError> {
+    let _gate = inner.start_gate.lock().await;
+
+    // If our managed server is already running and responsive, return it directly.
+    if inner.phase_tx.borrow().is_running()
+        && let Some(server) = discover_matching(&config.home, config.port).await
+    {
+        return Ok(server);
+    }
+
+    // If an external server already owns this home, adopt it without claiming its PID.
+    let has_managed_run = inner.run.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    if !has_managed_run
+        && let Some(existing) = discover_matching(&config.home, config.port).await
+    {
+        if let Some(mismatch) = existing.mismatch() {
+            return Err(LocalServerHostError::Incompatible(mismatch.message(&existing.descriptor.label)));
+        }
+        return Ok(existing);
+    }
+
+    // Stop any stale run before launching a fresh process.
+    if has_managed_run {
+        stop_inner(&inner).await;
+    }
+
+    let cli = match config.cli_override.clone() {
+        Some(path) if is_executable(&path) => path,
+        Some(_) => {
+            apply_event(&inner, LocalServerEvent::CliMissing);
+            return Err(LocalServerHostError::CliMissing);
+        }
+        None => match find_cli(&config.home) {
+            Some(path) => path,
+            None => {
+                apply_event(&inner, LocalServerEvent::CliMissing);
+                return Err(LocalServerHostError::CliMissing);
+            }
+        },
+    };
+
+    apply_event(&inner, LocalServerEvent::StartRequested);
+
+    let default_home = user_home().map(|user| user.join(".t3")).unwrap_or_default();
+    let launch_args = serve_args(&LocalServerLaunchSpec {
+        home: config.home.clone(),
+        default_home,
+        host: config.host.clone(),
+        port: config.port,
+    });
+
+    let mut command = tokio::process::Command::new(&cli);
+    command
+        .args(&launch_args)
+        .env("T3CODE_HOME", &config.home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    if let Some(user) = user_home() {
+        command.current_dir(user);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let reason = error.to_string();
+            apply_event(&inner, LocalServerEvent::SpawnFailed { reason: reason.clone() });
+            return Err(LocalServerHostError::ProcessFailed(format!(
+                "Could not start the local T3 Code server: {reason}"
+            )));
+        }
+    };
+
+    let Some(pid) = child.id() else {
+        apply_event(&inner, LocalServerEvent::SpawnFailed { reason: "process exited immediately".to_owned() });
+        return Err(LocalServerHostError::ProcessFailed(
+            "Could not start the local T3 Code server: process exited immediately".to_owned(),
+        ));
+    };
+
+    *inner.active_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(pid);
+    apply_event(&inner, LocalServerEvent::Spawned { pid });
+
+    let readiness_notify = Arc::new(Notify::new());
+    let stdout_task = spawn_pipe_reader(child.stdout.take(), inner.clone(), readiness_notify.clone());
+    let stderr_task = spawn_pipe_reader(child.stderr.take(), inner.clone(), readiness_notify.clone());
+
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let (stopped_tx, stopped_rx) = watch::channel(false);
+    *inner.run.lock().unwrap_or_else(|e| e.into_inner()) = Some(ManagedRun {
+        stop_tx: Some(stop_tx),
+        stopped_rx,
+        home: config.home.clone(),
+        cli: cli.clone(),
+    });
+
+    // Subscribe before spawning the monitor task so an immediate exit cannot be missed.
+    let mut phase_rx = inner.phase_tx.subscribe();
+    let monitor_inner = inner.clone();
+    let terminate_grace = config.terminate_grace;
+    tokio::spawn(async move {
+        let mut stop_requested = false;
+        let exit_status = tokio::select! {
+            biased;
+            _ = &mut stop_rx => {
+                stop_requested = true;
+                #[cfg(unix)]
+                signal_managed_child(pid, libc::SIGTERM);
+                #[cfg(not(unix))]
+                let _ = child.start_kill();
+                match tokio::time::timeout(terminate_grace, child.wait()).await {
+                    Ok(status) => status.ok(),
+                    Err(_) => {
+                        #[cfg(unix)]
+                        signal_managed_child(pid, libc::SIGKILL);
+                        let _ = child.start_kill();
+                        child.wait().await.ok()
+                    }
+                }
+            }
+            status = child.wait() => status.ok(),
+        };
+
+        // Reaped: clear `active_pid` immediately so a reused OS PID can never be signaled.
+        {
+            let mut active = monitor_inner.active_pid.lock().unwrap_or_else(|e| e.into_inner());
+            if *active == Some(pid) {
+                *active = None;
+            }
+        }
+
+        let stdout_text = tokio::time::timeout(Duration::from_secs(2), stdout_task)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let stderr_text = tokio::time::timeout(Duration::from_secs(2), stderr_task)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+
+        {
+            let mut lc = monitor_inner.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            // Preserve an already-recorded ReadinessTimeout / IncompatibleProtocol failure
+            // when stopping the child as cleanup for that failure.
+            if !matches!(lc.phase(), LocalServerPhase::Failed(_)) {
+                if stop_requested {
+                    lc.apply(LocalServerEvent::StopRequested);
+                }
+                lc.apply(LocalServerEvent::ProcessExited {
+                    exit_code: exit_status.and_then(|status| status.code()),
+                    stderr: stderr_text,
+                    stdout: stdout_text,
+                });
+                monitor_inner.phase_tx.send_replace(lc.phase().clone());
+            }
+        }
+        *monitor_inner.run.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let _ = stopped_tx.send(true);
+    });
+
+    let deadline = tokio::time::Instant::now() + config.readiness_timeout;
+    let mut retry_delay_ms = 50u64;
+    loop {
+        match phase_rx.borrow_and_update().clone() {
+            LocalServerPhase::Failed(failure) => return Err(failure_to_error(&failure)),
+            LocalServerPhase::Stopped | LocalServerPhase::Stopping { .. } => {
+                return Err(LocalServerHostError::Stopped);
+            }
+            _ => {}
+        }
+
+        if let Some(server) = discover_matching(&config.home, config.port).await {
+            if let Some(mismatch) = server.mismatch() {
+                let message = mismatch.message(&server.descriptor.label);
+                apply_event(&inner, LocalServerEvent::IncompatibleProtocol { message: message.clone() });
+                stop_inner(&inner).await;
+                return Err(LocalServerHostError::Incompatible(message));
+            }
+            apply_event(
+                &inner,
+                LocalServerEvent::Ready {
+                    pid,
+                    origin: server.state.origin.clone(),
+                    server_version: server.server_version().map(str::to_owned),
+                },
+            );
+            return Ok(server);
+        }
+
+        let next_probe = (tokio::time::Instant::now() + Duration::from_millis(retry_delay_ms)).min(deadline);
+        retry_delay_ms = retry_delay_ms.saturating_mul(2).min(250);
+        tokio::select! {
+            biased;
+            changed = phase_rx.changed() => {
+                if changed.is_err() {
+                    return Err(LocalServerHostError::Stopped);
+                }
+            }
+            _ = readiness_notify.notified() => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                let expected_origin = config.port.map(|port| server_origin(config.host.as_deref(), port));
+                apply_event(&inner, LocalServerEvent::ReadinessTimedOut { origin: expected_origin });
+                let message = inner
+                    .phase_tx
+                    .borrow()
+                    .failure()
+                    .map(|failure| failure.message.clone())
+                    .unwrap_or_else(|| "The local T3 Code server started but did not become ready in time.".to_owned());
+                stop_inner(&inner).await;
+                return Err(LocalServerHostError::ReadinessTimeout(message));
+            }
+            _ = tokio::time::sleep_until(next_probe) => {}
+        }
+    }
+}
+
+fn apply_event(inner: &LocalServerHostInner, event: LocalServerEvent) {
+    let mut lc = inner.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+    lc.apply(event);
+    inner.phase_tx.send_replace(lc.phase().clone());
+}
+
+fn spawn_pipe_reader<R>(
+    pipe: Option<R>,
+    inner: Arc<LocalServerHostInner>,
+    readiness_notify: Arc<Notify>,
+) -> tokio::task::JoinHandle<String>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let Some(pipe) = pipe else {
+            return String::new();
+        };
+        let mut reader = BufReader::new(pipe);
+        let mut collected = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    collected.push_str(&line);
+                    {
+                        let mut lc = inner.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                        lc.apply(LocalServerEvent::OutputChunk(line.clone()));
+                    }
+                    readiness_notify.notify_one();
+                }
+            }
+        }
+        collected
+    })
+}
+
+async fn stop_inner(inner: &Arc<LocalServerHostInner>) {
+    let stopped_rx = {
+        let mut guard = inner.run.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(run) = guard.as_mut() else {
+            let mut lc = inner.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(lc.phase(), LocalServerPhase::Failed(_)) && lc.phase() != &LocalServerPhase::Stopped {
+                lc.apply(LocalServerEvent::StopRequested);
+                inner.phase_tx.send_replace(lc.phase().clone());
+            }
+            return;
+        };
+        {
+            let mut lc = inner.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(lc.phase(), LocalServerPhase::Failed(_)) {
+                lc.apply(LocalServerEvent::StopRequested);
+                inner.phase_tx.send_replace(lc.phase().clone());
+            }
+        }
+        if let Some(stop_tx) = run.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        run.stopped_rx.clone()
+    };
+    let mut stopped_rx = stopped_rx;
+    let _ = stopped_rx.wait_for(|done| *done).await;
 }
 
 #[cfg(test)]
@@ -498,6 +1041,209 @@ wait
             matches!(pair_err, LocalPairError::ManagedPolicy(ref msg) if msg.contains("managed policy")),
             "expected ManagedPolicy from run_pair, got {pair_err:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn write_mock_host_cli(
+        dir: &Path,
+        origin: &str,
+        port: u16,
+        version: &str,
+    ) -> (PathBuf, tokio::net::TcpListener, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        SpawningCli::require_bash_tcp().await;
+        let status = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds status listener");
+        let status_port = status.local_addr().expect("status address").port();
+        let nonce = dir.file_name().expect("scratch name").to_str().expect("UTF-8 scratch name").to_owned();
+        let script = dir.join("fake-t3-host");
+        let script_text = format!(
+            r#"#!/bin/sh
+case "$1" in
+  --version)
+    printf "t3 v{version}\n"
+    exit 0
+    ;;
+  pair)
+    printf "Token: HOSTEDPAIR123\n"
+    exit 0
+    ;;
+  serve)
+    mkdir -p "$T3CODE_HOME/userdata"
+    printf '{{"version":1,"pid":%s,"port":{port},"origin":"{origin}","startedAt":"2026-11-20T00:00:00Z","serverVersion":"{version}"}}\n' "$$" > "$T3CODE_HOME/userdata/server-runtime.json"
+    printf "ready {origin}\n"
+    /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{status_port}
+printf "%s %s\n" "{nonce}" "$$" >&3
+read -r release <&3
+printf "survived\n" >&3' &
+    wait
+    exit 0
+    ;;
+  *)
+    echo "unexpected args: $*" >&2
+    exit 2
+    ;;
+esac
+"#
+        );
+        std::fs::write(&script, script_text).expect("writes host script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (script, status, nonce)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn accept_child_socket(
+        status: &tokio::net::TcpListener,
+        nonce: &str,
+    ) -> (u32, tokio::io::BufReader<tokio::net::TcpStream>) {
+        use tokio::io::AsyncBufReadExt;
+        let prefix = format!("{nonce} ");
+        loop {
+            let (stream, _) = status.accept().await.expect("accepts hosted child");
+            let mut events = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            if events.read_line(&mut line).await.expect("reads child pid") == 0 {
+                continue;
+            }
+            let Some(pid) = line.strip_prefix(&prefix).and_then(|rest| rest.strip_suffix('\n')).and_then(|pid| pid.parse::<u32>().ok()) else {
+                continue;
+            };
+            assert!(process_alive(pid), "hosted child must be alive before stop/drop");
+            return (pid, events);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn local_server_host_starts_becomes_ready_pairs_and_stops_cleanly() {
+        let dir = scratch("host-lifecycle");
+        let fake = FakeServer::start().await;
+        let origin = fake.credentials().http_base;
+        let port = fake.port();
+        fake.set_descriptor(Some(serde_json::json!({
+            "environmentId": "env-hosted-mac",
+            "label": "Hosted Mac",
+            "serverVersion": "0.1.9",
+            "orchestrationProtocolVersion": 2
+        })));
+
+        let (script, status, nonce) = write_mock_host_cli(&dir, &origin, port, "0.1.9").await;
+        let host = LocalServerHost::new();
+        let mut config = LocalServerHostConfig::for_home(dir.clone());
+        config.cli_override = Some(script);
+        config.port = Some(port);
+        config.readiness_timeout = Duration::from_secs(10);
+        config.terminate_grace = Duration::from_millis(200);
+
+        let (server, paired) = host.start_and_pair(config).await.expect("starts and pairs");
+        assert_eq!(server.state.origin, origin);
+        assert_eq!(server.environment_id(), Some("env-hosted-mac"));
+        assert_eq!(paired.credentials.access_token, "ssh-access");
+        assert!(host.phase().is_running());
+        assert!(host.child_pid().is_some());
+
+        let (_grandchild_pid, events) = accept_child_socket(&status, &nonce).await;
+
+        host.stop().await;
+        assert_eq!(host.phase(), LocalServerPhase::Stopped);
+        assert_eq!(host.child_pid(), None);
+        SpawningCli::exits(events).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn local_server_host_exit_77_managed_policy_refuses_without_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("host-exit77");
+        let log_file = dir.join("invocations.log");
+        let script = dir.join("fake-t3-policy-host");
+        let script_text = format!(
+            "#!/bin/sh\necho invoked >> \"{}\"\necho 'ManagedPolicyFileError: organization policy blocked startup.' >&2\nexit 77\n",
+            log_file.display()
+        );
+        std::fs::write(&script, script_text).expect("writes script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let host = LocalServerHost::new();
+        let mut config = LocalServerHostConfig::for_home(dir.clone());
+        config.cli_override = Some(script);
+        config.readiness_timeout = Duration::from_secs(5);
+
+        let err = host.start_with_config(config).await.unwrap_err();
+        assert!(
+            matches!(err, LocalServerHostError::ManagedPolicy(ref msg) if msg.contains("managed policy") && msg.contains("IT administrator")),
+            "expected ManagedPolicy, got {err:?}"
+        );
+        let phase = host.phase();
+        let failure = phase.failure().expect("host must enter Failed state");
+        assert_eq!(failure.kind, LocalServerFailureKind::ManagedPolicy);
+        assert!(failure.restart_suppressed);
+        assert_eq!(failure.recovery, t3_core::local_server::StartupRecoveryOffer::ManagedPolicy);
+        assert!(failure.output_tail.contains("ManagedPolicyFileError"));
+        assert_eq!(host.child_pid(), None);
+
+        let invocations = std::fs::read_to_string(&log_file).expect("reads invocation log");
+        assert_eq!(invocations.lines().count(), 1, "exit 77 must never trigger a restart loop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn local_server_host_drop_cleanly_terminates_spawned_child() {
+        let dir = scratch("host-drop");
+        let fake = FakeServer::start().await;
+        let origin = fake.credentials().http_base;
+        let port = fake.port();
+        fake.set_descriptor(Some(serde_json::json!({
+            "environmentId": "env-drop-mac",
+            "label": "Drop Mac",
+            "serverVersion": "0.1.9",
+            "orchestrationProtocolVersion": 2
+        })));
+
+        let (script, status, nonce) = write_mock_host_cli(&dir, &origin, port, "0.1.9").await;
+        let host = LocalServerHost::new();
+        let mut config = LocalServerHostConfig::for_home(dir.clone());
+        config.cli_override = Some(script);
+        config.port = Some(port);
+        config.readiness_timeout = Duration::from_secs(10);
+
+        host.start_with_config(config).await.expect("starts hosted server");
+        let (_grandchild_pid, events) = accept_child_socket(&status, &nonce).await;
+
+        drop(host);
+        SpawningCli::exits(events).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn local_server_host_reports_startup_crash_with_stderr_diagnostics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("host-crash");
+        let script = dir.join("fake-t3-crash");
+        std::fs::write(&script, "#!/bin/sh\necho 'PortBindError: address already in use' >&2\nexit 1\n").expect("writes script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let host = LocalServerHost::new();
+        let mut config = LocalServerHostConfig::for_home(dir.clone());
+        config.cli_override = Some(script);
+        config.readiness_timeout = Duration::from_secs(5);
+
+        let err = host.start_with_config(config).await.unwrap_err();
+        assert!(
+            matches!(err, LocalServerHostError::ProcessFailed(ref msg) if msg.contains("address already in use")),
+            "expected ProcessFailed with stderr detail, got {err:?}"
+        );
+        let phase = host.phase();
+        let failure = phase.failure().expect("failed phase");
+        assert_eq!(failure.kind, LocalServerFailureKind::Crashed { exit_code: Some(1) });
+        assert!(failure.output_tail.contains("address already in use"));
+        assert_eq!(host.child_pid(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

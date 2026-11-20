@@ -18,6 +18,7 @@ use t3_client::ssh::{DiscoveredSshHost, SshTarget};
 use t3_client::status::{DotTone, HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
 use t3_client::store::SavedEnvironment;
 use t3_core::compatibility::resolve_version_mismatch;
+use t3_core::local_server::{LocalServerFailure, LocalServerFailureKind, LocalServerPhase, describe_startup_recovery_offer};
 use t3_core::pairing::{
     ANOTHER_ADDRESS, LinkMachineBadge, LinkableMachine, link_destination, link_machine_badge as resolve_link_machine_badge,
     link_machine_select_label, session_has_legacy_permissions,
@@ -55,6 +56,8 @@ pub struct ConnectView {
     confirm_remove: Option<String>,
     /// Saved environment IDs whose connection diagnosis panel is expanded (`CN-STATUS`).
     expanded_diagnosis: HashSet<String>,
+    /// Whether the hosted local server failure output tail is expanded (`CN-LOCAL`).
+    local_diagnostics_expanded: bool,
     /// Cached dismissal state per environment ID for the legacy-permission update notice (`CN-REPAIR`).
     /// Loaded from UI state at most once per key so `render()` never hits disk every frame.
     dismissed_permission_notice: HashMap<String, bool>,
@@ -461,6 +464,7 @@ impl ConnectView {
             ssh_matches: Vec::new(),
             confirm_remove: None,
             expanded_diagnosis: HashSet::new(),
+            local_diagnostics_expanded: false,
             dismissed_permission_notice: HashMap::new(),
             submitted: false,
             ssh_submitted: false,
@@ -584,35 +588,201 @@ impl ConnectView {
         )
     }
 
-    /// "Connect to T3 Code on this Mac", or why it isn't offered.
+    /// Structured diagnostic panel when hosting the local server fails (`CN-LOCAL`).
+    fn render_local_failure(&self, failure: &LocalServerFailure, cx: &mut Context<Self>) -> Div {
+        let p = palette(cx);
+        let recovery = (failure.kind != LocalServerFailureKind::ManagedPolicy)
+            .then(|| describe_startup_recovery_offer(&failure.recovery));
+        let has_output = !failure.output_tail.trim().is_empty();
+        let expanded = self.local_diagnostics_expanded;
+        let copy_text = self
+            .state
+            .read(cx)
+            .local_server_diagnostics()
+            .unwrap_or_else(|| failure.message.clone());
+        let details_label = crate::i18n::t(cx, if expanded { "Hide details" } else { "Details" });
+        let copy_label = crate::i18n::t(cx, "Copy diagnostics");
+
+        v_flex()
+            .px(px(12.))
+            .py(px(10.))
+            .gap(px(6.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(hsla(p.error).opacity(0.32))
+            .bg(hsla(p.error_surface))
+            .text_xs()
+            .child(div().line_height(px(18.)).text_color(hsla(p.error_foreground)).child(failure.message.clone()))
+            .children(recovery.map(|text| div().line_height(px(18.)).text_color(hsla(p.muted_foreground)).child(text)))
+            .when(failure.restart_suppressed, |this| {
+                this.child(
+                    div()
+                        .line_height(px(18.))
+                        .text_color(hsla(p.muted_foreground))
+                        .child("Automatic restart is disabled for this error."),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .pt(px(2.))
+                    .when(has_output, |this| {
+                        this.child(
+                            Button::new("connect-local-diag-toggle", ButtonVariant::GhostMuted, ButtonSize::Compact)
+                                .label(details_label)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.local_diagnostics_expanded = !this.local_diagnostics_expanded;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("connect-local-diag-copy", ButtonVariant::Outline, ButtonSize::Compact)
+                            .icon(Icon::Copy)
+                            .label(copy_label)
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                            }),
+                    ),
+            )
+            .when(has_output && expanded, |this| {
+                this.child(
+                    div()
+                        .mt(px(4.))
+                        .p(px(8.))
+                        .rounded(px(6.))
+                        .bg(hsla(p.background).opacity(0.7))
+                        .border_1()
+                        .border_color(hsla(p.border).opacity(0.5))
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_xs()
+                        .line_height(px(16.))
+                        .text_color(hsla(p.muted_foreground))
+                        .child(failure.output_tail.trim().to_owned()),
+                )
+            })
+    }
+
+    /// "Connect to T3 Code on this Mac", embedded local server hosting controls, or diagnostics.
     fn render_local(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let connect = &state.connect;
         let error = pairing_error(connect, PairingSource::Local);
+        let local_phase = state.local_host_phase.clone();
+        let auto_start = state.local_server_auto_start;
+        let hosted = state.is_hosting_local_server();
+        let starting = local_phase.is_starting();
+        let stopping = local_phase.is_stopping();
+        let failure = local_phase.failure().cloned();
+        let p = palette(cx);
+
+        let status_badge = match &local_phase {
+            LocalServerPhase::Running { .. } => Some((DotTone::Success, crate::i18n::t(cx, "Running"))),
+            LocalServerPhase::Starting { .. } => Some((DotTone::Warning, crate::i18n::t(cx, "Starting…"))),
+            LocalServerPhase::Stopping { .. } => Some((DotTone::Warning, crate::i18n::t(cx, "Stopping…"))),
+            LocalServerPhase::Failed(_) => Some((DotTone::Destructive, crate::i18n::t(cx, "Stopped"))),
+            LocalServerPhase::Stopped => None,
+        };
+        let auto_start_toggle = {
+            let button = Button::new(
+                "connect-local-autostart",
+                if auto_start { ButtonVariant::Outline } else { ButtonVariant::GhostMuted },
+                ButtonSize::Compact,
+            )
+            .label("Auto-start")
+            .tooltip("Start the local T3 Code server automatically when opening this app.")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.state.update(cx, |state, cx| state.set_local_server_auto_start(!auto_start, cx));
+            }));
+            if auto_start { button.icon(Icon::Check) } else { button }
+        };
+
         let Some(server) = connect.local_server.clone() else {
-            let message = discovery_message(connect.discovering);
+            let message = if starting {
+                "Starting T3 Code on this Mac…"
+            } else if stopping {
+                "Stopping T3 Code on this Mac…"
+            } else {
+                discovery_message(connect.discovering)
+            };
+            let primary_start = state.environments.environments.is_empty();
+            let start_label = if starting { crate::i18n::t(cx, "Starting…") } else { "Start local server" };
+            let check_label = crate::i18n::t(cx, "Check again");
             return card(cx)
                 .px(px(16.))
-                .py(px(12.))
-                .gap(px(6.))
+                .py(px(14.))
+                .gap(px(10.))
                 .child(
                     h_flex()
-                        .gap_2()
-                        .child(div().flex_1().min_w_0().child(muted(message, cx)))
+                        .gap(px(10.))
+                        .items_center()
+                        .child(Icon::Server.render(px(16.), hsla(p.muted_foreground)))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    h_flex()
+                                        .gap(px(6.))
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(hsla(p.foreground))
+                                                .child("T3 Code on this Mac"),
+                                        )
+                                        .when_some(status_badge, |this, (tone, text)| {
+                                            this.child(
+                                                h_flex()
+                                                    .gap(px(4.))
+                                                    .items_center()
+                                                    .child(status_dot(Some(tone), cx))
+                                                    .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(text)),
+                                            )
+                                        }),
+                                )
+                                .child(muted(message, cx)),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .items_center()
+                        .flex_wrap()
+                        .child(
+                            Button::new(
+                                "connect-local-start",
+                                if primary_start { ButtonVariant::Default } else { ButtonVariant::Outline },
+                                ButtonSize::Sm,
+                            )
+                            .icon(Icon::Play)
+                            .label(start_label)
+                            .disabled(starting || stopping || connect.pairing.is_some())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.update(cx, |state, cx| state.start_local_server(true, cx));
+                            })),
+                        )
                         .child(
                             Button::new("connect-local-refresh", ButtonVariant::GhostMuted, ButtonSize::Compact)
                                 .icon(Icon::RefreshCw)
-                                .label("Check again")
-                                .disabled(connect.discovering)
-                                .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.refresh_local_server(cx)))),
-                        ),
+                                .label(check_label)
+                                .disabled(connect.discovering || starting || stopping)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.update(cx, |state, cx| state.refresh_local_server(cx));
+                                })),
+                        )
+                        .child(auto_start_toggle),
                 )
-                .children(error.map(|error| error_text(error, cx)))
+                .children(failure.as_ref().map(|failure| self.render_local_failure(failure, cx)))
+                .when(failure.is_none(), |this| this.children(error.map(|error| error_text(error, cx))))
                 .into_any_element();
         };
+
         let busy = connect.pairing == Some(PairingSource::Local);
         let (details, blocked) = local_details(&server);
-        let p = palette(cx);
+        let connect_label = if busy { crate::i18n::t(cx, "Connecting…") } else { "Connect to T3 Code on this Mac" };
+        let stop_label = if stopping { crate::i18n::t(cx, "Stopping…") } else { crate::i18n::t(cx, "Stop server") };
         card(cx)
             .px(px(16.))
             .py(px(14.))
@@ -625,17 +795,53 @@ impl ConnectView {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("T3 Code on this Mac"))
+                            .child(
+                                h_flex()
+                                    .gap(px(6.))
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(hsla(p.foreground))
+                                            .child("T3 Code on this Mac"),
+                                    )
+                                    .when_some(status_badge, |this, (tone, text)| {
+                                        this.child(
+                                            h_flex()
+                                                .gap(px(4.))
+                                                .items_center()
+                                                .child(status_dot(Some(tone), cx))
+                                                .child(div().text_xs().text_color(hsla(p.muted_foreground)).child(text)),
+                                        )
+                                    }),
+                            )
                             .child(div().truncate().child(muted(details, cx))),
                     ),
             )
             .child(
-                h_flex().child(
-                    Button::new("connect-local", ButtonVariant::Default, ButtonSize::Default)
-                        .label(if busy { "Connecting…" } else { "Connect to T3 Code on this Mac" })
-                        .disabled(busy || blocked.is_some() || connect.pairing.is_some())
-                        .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.connect_local(cx)))),
-                ),
+                h_flex()
+                    .gap(px(8.))
+                    .items_center()
+                    .flex_wrap()
+                    .child(
+                        Button::new("connect-local", ButtonVariant::Default, ButtonSize::Default)
+                            .label(connect_label)
+                            .disabled(busy || blocked.is_some() || connect.pairing.is_some() || stopping)
+                            .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.connect_local(cx)))),
+                    )
+                    .when(hosted || stopping, |this| {
+                        this.child(
+                            Button::new("connect-local-stop", ButtonVariant::Outline, ButtonSize::Sm)
+                                .icon(Icon::Square)
+                                .label(stop_label)
+                                .disabled(stopping)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.update(cx, |state, cx| state.stop_local_server(cx));
+                                })),
+                        )
+                    })
+                    .child(auto_start_toggle),
             )
             .children(blocked.or(error).map(|message| error_text(message, cx)))
             .into_any_element()
@@ -1413,5 +1619,100 @@ mod tests {
             cx.shutdown();
             cx.clear_globals();
         });
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn connect_view_renders_local_server_host_controls_and_policy_diagnostics(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            crate::settings::init(state.clone(), cx);
+            state
+        });
+        let window = cx.open_window(gpui::size(px(640.), px(780.)), |window, cx| {
+            ConnectView::new(state.clone(), window, cx)
+        });
+
+        // 1. Stopped + auto-start toggled on.
+        state.update(cx, |state, cx| {
+            state.connect.local_server = None;
+            state.set_local_server_auto_start(true, cx);
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        // 2. Managed policy exit-77 failure with diagnostics output tail.
+        state.update(cx, |state, cx| {
+            state.apply_local_host_phase(
+                LocalServerPhase::Failed(LocalServerFailure {
+                    kind: LocalServerFailureKind::ManagedPolicy,
+                    message: t3_core::local_server::MANAGED_POLICY_STARTUP_MESSAGE.to_owned(),
+                    recovery: t3_core::local_server::StartupRecoveryOffer::ManagedPolicy,
+                    output_tail: "ManagedPolicyFileError: invalid policy JSON".to_owned(),
+                    restart_suppressed: true,
+                }),
+                cx,
+            );
+        });
+        state.read_with(cx, |state, _| {
+            let diag = state.local_server_diagnostics().expect("diagnostics text");
+            assert!(diag.contains("Automatic restart: suppressed"));
+            assert!(diag.contains("ManagedPolicyFileError"));
+        });
+        cx.update_window(window.into(), |view, window, cx| {
+            let view = view.downcast::<ConnectView>().expect("ConnectView");
+            view.update(cx, |this, _| this.local_diagnostics_expanded = true);
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        // 3. Hosted local server running with Stop server control.
+        state.update(cx, |state, cx| {
+            state.connect.local_server = Some(LocalServer {
+                home: std::path::PathBuf::from("/tmp/t3-connect-test"),
+                state: serde_json::from_value(serde_json::json!({
+                    "version": 1,
+                    "pid": std::process::id(),
+                    "port": 3773,
+                    "origin": "http://127.0.0.1:3773",
+                    "serverVersion": "0.1.9"
+                }))
+                .unwrap(),
+                descriptor: t3_core::server_config::EnvironmentDescriptor {
+                    environment_id: "env-local-hosted".into(),
+                    label: "Hosted Mac".into(),
+                    server_version: "0.1.9".into(),
+                    orchestration_protocol_version: Some(2),
+                    ..Default::default()
+                },
+            });
+            state.apply_local_host_phase(
+                LocalServerPhase::Running {
+                    pid: std::process::id(),
+                    origin: "http://127.0.0.1:3773".into(),
+                    server_version: Some("0.1.9".into()),
+                },
+                cx,
+            );
+            assert!(state.is_hosting_local_server());
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
+        cx.run_until_parked();
     }
 }
