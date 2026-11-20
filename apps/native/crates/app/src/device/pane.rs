@@ -204,7 +204,7 @@ impl DevicePane {
         };
         let devices = self.devices.clone();
         let refresh = (!service.hub_readiness().busy).then(|| {
-            ActionButton::new("device-refresh", ButtonVariant::Outline, ButtonSize::Sm).label("Refresh devices").on_click(move |_, _, cx| {
+            ActionButton::new("device-refresh", ButtonVariant::Outline, ButtonSize::Sm).label(crate::i18n::t(cx, "Refresh devices")).on_click(move |_, _, cx| {
                 devices.update(cx, |devices, cx| devices.list(json!({}), cx)).detach();
             })
         });

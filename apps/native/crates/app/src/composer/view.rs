@@ -21,6 +21,7 @@ use super::controls::{
 };
 use super::model_picker::permissions_section;
 use super::{Composer, MenuKey, OpenPermissions, OutdentList, PasteAsText, Resolved, StashPrompt, StopPhase, Target, ToggleModelPicker, runtime_mode_icon};
+use crate::i18n::t;
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
 use crate::theme::{hsla, palette};
@@ -36,22 +37,22 @@ impl Composer {
     fn placeholder(&self, cx: &App) -> String {
         if let Some(approval) = self.snapshot.pending.approvals.first() {
             return if approval.supports_feedback {
-                "Send feedback to decline this request".to_owned()
+                t(cx, "Send feedback to decline this request").to_owned()
             } else {
-                "Send a message to decline and redirect the agent".to_owned()
+                t(cx, "Send a message to decline and redirect the agent").to_owned()
             };
         }
         if let Some((_, question)) = self.active_question() {
             return if question.allows_custom_answer() {
-                "Type your own answer, or leave this blank to use the selected option".to_owned()
+                t(cx, "Type your own answer, or leave this blank to use the selected option").to_owned()
             } else {
-                "Choose an option above".to_owned()
+                t(cx, "Choose an option above").to_owned()
             };
         }
         if let Some(suggestion) = self.offered_prompt_suggestion(cx) {
             return format!("{suggestion}  (Tab)");
         }
-        DEFAULT_PLACEHOLDER.to_owned()
+        t(cx, DEFAULT_PLACEHOLDER).to_owned()
     }
 
     fn input_disabled(&self, cx: &App) -> bool {
@@ -91,7 +92,7 @@ impl Composer {
         let label = if let Some(multi_label) = &resolved.multi_model_label {
             multi_label.clone()
         } else if resolved.model_label.is_empty() {
-            "Choose model".to_owned()
+            t(cx, "Choose model").to_owned()
         } else {
             resolved.model_label.clone()
         };
@@ -177,11 +178,11 @@ impl Composer {
             .child(
                 ComposerControl::new("permissions")
                     .icon(runtime_mode_icon(mode))
-                    .label(runtime_mode_label(mode))
+                    .label(t(cx, runtime_mode_label(mode)))
                     .emphasized(true)
                     .pressed(self.permissions_open)
                     .disabled(rewinding)
-                    .tooltip(format!("Permissions: {}. {}", runtime_mode_label(mode), runtime_mode_description(mode)))
+                    .tooltip(format!("{}: {}. {}", t(cx, "Permissions"), t(cx, runtime_mode_label(mode)), t(cx, runtime_mode_description(mode))))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this.is_rewinding(cx) || Self::guard_reopen(&mut this.menu_dismissed) {
                             return;
@@ -325,7 +326,7 @@ impl Composer {
                 .flex_none()
                 .debug_selector(|| "stop".to_owned())
                 .child(
-                    RoundButton::new("stop", RoundKind::Stop, if stop_pending { "Stopping…" } else { "Interrupt" })
+                    RoundButton::new("stop", RoundKind::Stop, t(cx, if stop_pending { "Stopping…" } else { "Interrupt" }))
                         .disabled(rewinding || !can_operate || stop_pending)
                         .on_click(cx.listener(|this, _, _, cx| this.request_stop(cx))),
                 )
@@ -365,13 +366,13 @@ impl Composer {
                     .when(progress.question_index > 0, |this| {
                         this.child(
                             Button::new("question-previous", ButtonVariant::Outline, ButtonSize::Sm)
-                                .label("Previous")
+                                .label(t(cx, "Previous"))
                                 .disabled(responding)
                                 .on_click(cx.listener(|this, _, window, cx| this.previous(window, cx))),
                         )
                     })
                     .child(
-                        Pill::new("question-submit", requests::primary_action_label(&progress, responding))
+                        Pill::new("question-submit", t(cx, requests::primary_action_label(&progress, responding)))
                             .disabled(!can_operate || responding || voice_preparing || (!voice_blocks && !enabled))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.stop_phase != StopPhase::Landed {
@@ -412,7 +413,7 @@ impl Composer {
             let resume_tooltip: SharedString = runtime_mode_denial
                 .clone()
                 .map(Into::into)
-                .unwrap_or_else(|| "Resume thread".into());
+                .unwrap_or_else(|| t(cx, "Resume thread").into());
             let resume_btn = RoundButton::new("send", RoundKind::Resume, resume_tooltip)
                 .disabled(self.sending || !can_operate || rewinding || runtime_mode_denial.is_some())
                 .stage_backdrop(stage_backdrop)
@@ -461,17 +462,17 @@ impl Composer {
             || runtime_mode_denial.is_some()
             || blocked;
         let tooltip: SharedString = if resolved.model.is_none() && resolved.multi_models.is_empty() {
-            "No provider available".into()
+            t(cx, "No provider available").into()
         } else if rewinding {
-            "Reverting checkpoint...".into()
+            t(cx, "Reverting checkpoint...").into()
         } else if self.snapshot.setup_blocks_send {
-            t3_core::worktree_setup::SEND_BLOCKED.into()
+            t(cx, t3_core::worktree_setup::SEND_BLOCKED).into()
         } else if let Some(reason) = attachment_block {
-            reason.into()
+            t(cx, &reason).to_owned().into()
         } else if let Some(reason) = runtime_mode_denial {
             reason.into()
         } else if self.sending {
-            if editing_queued { "Updating queued message".into() } else { "Submitting message".into() }
+            t(cx, if editing_queued { "Updating queued message" } else { "Submitting message" }).into()
         } else if let Some(tokens) = compact_tokens.as_deref().filter(|_| compacts_before_send) {
             format!("Summarize {tokens} tokens of history, then send").into()
         } else if running && can_steer && !editing_queued {
@@ -484,7 +485,7 @@ impl Composer {
             let via = alt_key.map_or_else(|| "⌘-click".to_owned(), |shortcut| format!("{shortcut} or ⌘-click"));
             format!("Click to {}, {via} to {}", action(dispatch), action(alternate)).into()
         } else {
-            label.into()
+            t(cx, label).into()
         };
         let submit_btn = div().flex_none().debug_selector(|| "send".to_owned()).child(
             RoundButton::new("send", kind, tooltip)
@@ -521,7 +522,7 @@ impl Composer {
             div().flex_none().debug_selector(|| "compact-before-send".to_owned()).child(
                 ComposerControl::new("compact-before-send")
                     .icon(Icon::Minimize2)
-                    .label(if keep_full_history { "Keep" } else { "Compact" })
+                    .label(t(cx, if keep_full_history { "Keep" } else { "Compact" }))
                     .suffix(div().text_color(hsla(p.muted_foreground)).child(SharedString::from(tokens)))
                     .active(!keep_full_history)
                     .disabled(!can_operate)
@@ -819,7 +820,7 @@ impl Render for Composer {
                                             Button::new("attach-files", ButtonVariant::Ghost, ButtonSize::IconSm)
                                                 .icon(Icon::Paperclip)
                                                 .disabled(rewinding)
-                                                .tooltip("Attach files")
+                                                .tooltip(t(cx, "Attach files"))
                                                 .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx))),
                                         ),
                                     )

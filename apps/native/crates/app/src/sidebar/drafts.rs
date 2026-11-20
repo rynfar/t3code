@@ -64,7 +64,7 @@ impl SidebarPane {
                     .cursor_pointer()
                     .bg(if active { hsla(p.sidebar_row_active) } else { hsla(p.warning).opacity(0.04) })
                     .when(!active, |this| this.hover(|this| this.bg(hsla(p.warning).opacity(0.08))))
-                    .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Unsent draft").build(window, cx))
+                    .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new(crate::i18n::t(cx, "Unsent draft")).build(window, cx))
                     .child(
                         div()
                             .h(px(20.))
@@ -96,7 +96,7 @@ impl SidebarPane {
                                     .text_color(hsla(p.muted_foreground))
                                     .hover(|this| this.text_color(hsla(p.foreground)))
                                     .child(Icon::X.sized(px(12.)))
-                                    .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Discard draft").build(window, cx))
+                                    .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new(crate::i18n::t(cx, "Discard draft")).build(window, cx))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
                                         this.discard_draft(&discard, window, cx);

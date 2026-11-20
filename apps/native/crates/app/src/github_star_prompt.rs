@@ -407,12 +407,12 @@ pub(crate) fn actions(
         InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, div, px,
     };
     let stage = state.read(cx).star_prompt_stage();
-    let label = match stage {
+    let label = crate::i18n::t(cx, match stage {
         Stage::Prompt => "Star on GitHub",
         Stage::Pending => "Starring…",
         Stage::Fallback => "Open GitHub",
         _ => return None,
-    };
+    });
     let pending = stage == Stage::Pending;
     let p = palette(cx);
     let dismiss = state.clone();
@@ -430,7 +430,7 @@ pub(crate) fn actions(
                     .id(("star-dismiss", id))
                     .tab_index(0)
                     .role(gpui::Role::Button)
-                    .aria_label("Dismiss")
+                    .aria_label(crate::i18n::t(cx, "Dismiss"))
                     .map(|element| action_focus(element, "star-dismiss", id, true, window, cx))
                     .cursor_pointer()
                     .text_xs()
@@ -441,7 +441,7 @@ pub(crate) fn actions(
                     .items_center()
                     .text_color(hsla(p.foreground))
                     .hover(|d| d.bg(hsla(p.accent)))
-                    .child("Dismiss")
+                    .child(crate::i18n::t(cx, "Dismiss"))
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         dismiss.update(cx, |s, cx| s.dismiss_toast(id, cx));

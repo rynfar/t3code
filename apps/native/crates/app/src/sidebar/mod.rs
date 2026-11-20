@@ -372,8 +372,8 @@ impl SidebarPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
-        let project_filter_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects..."));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search")));
+        let project_filter_search = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search projects...")));
         let project_filter_focus = cx.focus_handle();
         state.update(cx, |state, _| state.sidebar.search_input = Some(search_input.downgrade()));
         let subscriptions = vec![
@@ -1321,7 +1321,7 @@ impl SidebarPane {
         let p = palette(cx);
         let enabled = self.state.read(cx).can_navigate(back);
         let command = if back { "navigation.back" } else { "navigation.forward" };
-        let label = format!("{}{}", if back { "Go back" } else { "Go forward" }, crate::keymap::label(command, cx).map_or_else(String::new, |key| format!(" ({key})")));
+        let label = format!("{}{}", crate::i18n::t(cx, if back { "Go back" } else { "Go forward" }), crate::keymap::label(command, cx).map_or_else(String::new, |key| format!(" ({key})")));
         div()
             .id(if back { "history-back" } else { "history-forward" })
             .size(px(28.))
@@ -1414,7 +1414,7 @@ impl SidebarPane {
                 .items_center()
                 .when(has_filterable_projects, |this| {
                     this.child(self.render_project_filter_button(cx)).child(
-                        Self::header_button("add-project", Self::button_icon(Icon::FolderPlus, "add-project", cx), |_| "Add project".to_owned(), true, cx)
+                        Self::header_button("add-project", Self::button_icon(Icon::FolderPlus, "add-project", cx), |cx| crate::i18n::t(cx, "Add project").to_owned(), true, cx)
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx)),
                     )
                 })
@@ -1430,17 +1430,17 @@ impl SidebarPane {
     fn empty_state_copy(&self, synchronized: bool, settled_count: usize, cx: &Context<Self>) -> (String, bool) {
         let state = self.state.read(cx);
         if !synchronized {
-            return ("Loading…".to_owned(), false);
+            return (crate::i18n::t(cx, "Loading…").to_owned(), false);
         }
         let format_scoped = |label: Option<&str>| match label {
-            Some(name) if settled_count > 0 => format!("No active threads in {name}"),
-            Some(name) => format!("No threads in {name} yet"),
-            None if settled_count > 0 => "No active threads in these projects".to_owned(),
-            None => "No threads in these projects yet".to_owned(),
+            Some(name) if settled_count > 0 => crate::i18n::t_fmt(cx, "No active threads in {project}", &[("project", name.into())]),
+            Some(name) => crate::i18n::t_fmt(cx, "No threads in {project} yet", &[("project", name.into())]),
+            None if settled_count > 0 => crate::i18n::t(cx, "No active threads in these projects").to_owned(),
+            None => crate::i18n::t(cx, "No threads in these projects yet").to_owned(),
         };
         if !state.fleet.environments.is_empty() {
             if state.sidebar.grouping_projects.is_empty() {
-                return ("No projects yet".to_owned(), false);
+                return (crate::i18n::t(cx, "No projects yet").to_owned(), false);
             }
             let groups = t3_core::sidebar::grouping::pickable_scoped_project_groups(
                 &state.project_groups_for(t3_core::sidebar::grouping::GroupConsumer::Sidebar, cx),
@@ -1448,16 +1448,19 @@ impl SidebarPane {
             let keys = state.scoped_project_scope(&groups);
             let scoped: Vec<_> = groups.iter().filter(|group| keys.contains(&group.key)).collect();
             return match scoped.as_slice() {
-                [] => ("No threads yet".to_owned(), false),
-                [group] => (format_scoped(Some(&group.label)), true),
+                [] => (crate::i18n::t(cx, "No threads yet").to_owned(), false),
+                [group] => {
+                    let name = if group.is_scratch { crate::i18n::t(cx, "No project") } else { group.label.as_str() };
+                    (format_scoped(Some(name)), true)
+                }
                 _ => (format_scoped(None), true),
             };
         }
         if state.shell.snapshot.as_ref().is_some_and(|snapshot| snapshot.projects.is_empty()) {
-            return ("No projects yet".to_owned(), false);
+            return (crate::i18n::t(cx, "No projects yet").to_owned(), false);
         }
         if state.sidebar.project_scope.is_none() {
-            return ("No threads yet".to_owned(), false);
+            return (crate::i18n::t(cx, "No threads yet").to_owned(), false);
         }
         let scoped: Vec<_> = self
             .project_groups(cx)
@@ -1465,8 +1468,11 @@ impl SidebarPane {
             .filter(|group| state.sidebar.project_filter_scope.is_selected(group))
             .collect();
         match scoped.as_slice() {
-            [] => ("No threads yet".to_owned(), false),
-            [group] => (format_scoped(Some(&group.label)), true),
+            [] => (crate::i18n::t(cx, "No threads yet").to_owned(), false),
+            [group] => {
+                let name = if state.is_scratch_project(&group.representative_id) { crate::i18n::t(cx, "No project") } else { group.label.as_str() };
+                (format_scoped(Some(name)), true)
+            }
             _ => (format_scoped(None), true),
         }
     }
@@ -1499,7 +1505,7 @@ impl SidebarPane {
                 .cursor_pointer()
                 .hover(|this| this.bg(hsla(p.sidebar_row_hover)))
                 .child(Self::button_icon(glyph, id, cx))
-                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label).build(window, cx))
+                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(crate::i18n::t(cx, label)).build(window, cx))
         };
         let state = self.state.clone();
         let mut row = div().w_full().flex().items_center().gap(px(4.));
@@ -1521,7 +1527,7 @@ impl SidebarPane {
                     .text_color(hsla(p.sidebar_muted_foreground).opacity(0.8))
                     .hover(|this| this.bg(hsla(p.sidebar_row_hover)).text_color(hsla(p.sidebar_foreground)))
                     .child(Icon::ArrowLeft.sized(px(16.)).text_color(hsla(p.sidebar_icon)))
-                    .child("Back")
+                    .child(crate::i18n::t(cx, "Back"))
                     .on_click(move |_, _, cx| {
                         state.update(cx, |state, cx| {
                             state.set_pull_requests_open(false, cx);
@@ -1573,7 +1579,10 @@ impl SidebarPane {
         let state = self.state.read(cx);
         let notice = state.sidebar.undo.notice()?;
         let p = palette(cx);
-        let label = crate::keymap::label("thread.undo", cx).map_or_else(|| "Undo".to_owned(), |shortcut| format!("{shortcut} to undo"));
+        let label = crate::keymap::label("thread.undo", cx).map_or_else(
+            || crate::i18n::t(cx, "Undo").to_owned(),
+            |shortcut| crate::i18n::t_fmt(cx, "{shortcut} to undo", &[("shortcut", shortcut.into())]),
+        );
         Some(
             div()
                 .flex_1()
@@ -1643,7 +1652,10 @@ fn pull_requests_supported(state: &AppState) -> bool {
 }
 
 fn new_thread_label(cx: &App) -> String {
-    crate::keymap::label("chat.new", cx).map_or_else(|| "New thread".to_owned(), |key| format!("New thread ({key})"))
+    crate::keymap::label("chat.new", cx).map_or_else(
+        || crate::i18n::t(cx, "New thread").to_owned(),
+        |key| crate::i18n::t_fmt(cx, "New thread ({shortcut})", &[("shortcut", key.into())]),
+    )
 }
 
 impl Render for SidebarPane {
@@ -1716,7 +1728,7 @@ impl Render for SidebarPane {
                             .cursor_pointer()
                             .hover(|s| s.bg(hsla(p.accent)))
                             .child(Icon::Plus.sized(px(12.)).text_color(hsla(p.foreground)))
-                            .child("Add project")
+                            .child(crate::i18n::t(cx, "Add project"))
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::palette::OpenAddProject), cx)),
                     )
                 })
@@ -1737,7 +1749,7 @@ impl Render for SidebarPane {
                             .text_color(hsla(p.sidebar_muted_foreground))
                             .cursor_pointer()
                             .hover(|s| s.bg(hsla(p.sidebar_row_hover)).text_color(hsla(p.sidebar_foreground)))
-                            .child("Show all projects")
+                            .child(crate::i18n::t(cx, "Show all projects"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.state.update(cx, |state, cx| {
                                     if state.fleet.environments.is_empty() {
@@ -1857,7 +1869,7 @@ impl Render for SidebarPane {
                         .text_sm()
                         .text_color(hsla(p.sidebar_foreground))
                         .child(Icon::FolderPlus.sized(px(20.)).text_color(hsla(p.sidebar_muted_foreground)))
-                        .child("Drop folders to add projects"),
+                        .child(crate::i18n::t(cx, "Drop folders to add projects")),
                 )
             })
     }

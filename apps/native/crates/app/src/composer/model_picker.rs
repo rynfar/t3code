@@ -714,7 +714,7 @@ impl ModelPicker {
                             .border_color(hsla(p.border))
                             .text_size(px(10.))
                             .text_color(hsla(p.muted_foreground))
-                            .child("Unavailable"),
+                            .child(crate::i18n::t(cx, "Unavailable")),
                     )
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(reason.clone()).build(window, cx)
@@ -735,7 +735,7 @@ impl ModelPicker {
                 .cursor_pointer()
                 .text_sm()
                 .text_color(hsla(p.muted_foreground))
-                .child(div().flex_1().child(if *expanded { "Show less" } else { "Show more" }))
+                .child(div().flex_1().child(crate::i18n::t(cx, if *expanded { "Show less" } else { "Show more" })))
                 .child(if *expanded { Icon::ChevronUp } else { Icon::ChevronDown }.render(px(14.), hsla(p.muted_foreground)))
                 .on_click(cx.listener(move |this, _, _, cx| this.activate(index, false, cx)))
                 .into_any_element(),
@@ -769,7 +769,7 @@ impl ModelPicker {
                                         .border_color(hsla(p.border))
                                         .text_size(px(10.))
                                         .text_color(hsla(p.muted_foreground))
-                                        .child("Unavailable"),
+                                        .child(crate::i18n::t(cx, "Unavailable")),
                                 )
                             })
                             .when(*badge_new, |this| {
@@ -806,7 +806,7 @@ impl ModelPicker {
                                 })
                             })
                             .tooltip(move |window, cx| {
-                                let label = if star_id.2 { "Remove from favorites" } else { "Add to favorites" };
+                                let label = crate::i18n::t(cx, if star_id.2 { "Remove from favorites" } else { "Add to favorites" });
                                 gpui_component::tooltip::Tooltip::new(label).build(window, cx)
                             })
                             .on_click({
@@ -830,7 +830,7 @@ impl ModelPicker {
     fn render_effort(&self, model_label: SharedString, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let layout = traits::layout(&self.input.driver, &self.input.descriptors);
-        let header = layout.effort.map(|d| d.label().to_owned()).unwrap_or_else(|| if layout.others.is_empty() { "Effort".into() } else { "Options".into() });
+        let header = layout.effort.map(|d| crate::i18n::t(cx, d.label()).to_owned()).unwrap_or_else(|| crate::i18n::t(cx, if layout.others.is_empty() { "Effort" } else { "Options" }).to_owned());
         let mut column = v_flex().flex_1().min_h_0().gap(px(2.)).px(px(8.)).pt(px(10.)).pb(px(6.));
         match layout.effort {
             Some(OptionDescriptor::Select(select)) => {
@@ -841,17 +841,17 @@ impl ModelPicker {
                 let current = boolean.current_value == Some(true);
                 column = column.children([false, true].map(|value| {
                     let id = id.clone();
-                    self.level_row(format!("effort-{value}"), if value { "On" } else { "Off" }.into(), current == value, cx)
+                    self.level_row(format!("effort-{value}"), crate::i18n::t(cx, if value { "On" } else { "Off" }).into(), current == value, cx)
                         .on_click(cx.listener(move |this, _, _, cx| this.change_option(&id, OptionValue::Bool(value), cx)))
                 }));
             }
             None if layout.others.is_empty() => {
-                column = column.child(div().px(px(8.)).py(px(6.)).text_sm().text_color(hsla(p.muted_foreground)).child("No effort levels"));
+                column = column.child(div().px(px(8.)).py(px(6.)).text_sm().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "No effort levels")));
             }
             None => {}
         }
         for descriptor in layout.others {
-            column = column.child(div().px(px(8.)).pt(px(6.)).pb(px(4.)).text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child(descriptor.label().to_owned()));
+            column = column.child(div().px(px(8.)).pt(px(6.)).pb(px(4.)).text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, descriptor.label()).to_owned()));
             match descriptor {
                 OptionDescriptor::Select(select) => column = column.children(self.level_rows(select, cx)),
                 OptionDescriptor::Boolean(boolean) => {
@@ -859,7 +859,7 @@ impl ModelPicker {
                     let current = boolean.current_value == Some(true);
                     column = column.children([false, true].map(|value| {
                         let id = id.clone();
-                        self.level_row(format!("{}-{value}", boolean.id), if value { "On" } else { "Off" }.into(), current == value, cx)
+                        self.level_row(format!("{}-{value}", boolean.id), crate::i18n::t(cx, if value { "On" } else { "Off" }).into(), current == value, cx)
                             .on_click(cx.listener(move |this, _, _, cx| this.change_option(&id, OptionValue::Bool(value), cx)))
                     }));
                 }

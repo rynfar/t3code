@@ -405,7 +405,7 @@ impl Composer {
                     ))
                     .child(
                         Textarea::new(&editor.input)
-                            .aria_label("Comment on selected text")
+                            .aria_label(crate::i18n::t(cx, "Comment on selected text"))
                             .appearance(false)
                             .bordered(false)
                             .readonly(voice_frozen),
@@ -425,13 +425,13 @@ impl Composer {
                             .child(
                                 h_flex()
                                     .gap(px(8.))
-                                    .child(Button::new("cancel-citation-comment", ButtonVariant::Outline, ButtonSize::Xs).label("Cancel").on_click(cx.listener(|this, _, window, cx| {
+                                    .child(Button::new("cancel-citation-comment", ButtonVariant::Outline, ButtonSize::Xs).label(crate::i18n::t(cx, "Cancel")).on_click(cx.listener(|this, _, window, cx| {
                                         this.close_citation_comment("escape-key", window, cx);
                                     })))
                                     .child(
                                         Button::new("save-citation-comment", ButtonVariant::Default, ButtonSize::Xs)
                                             .disabled(voice_preparing || (too_long && !voice_blocks))
-                                            .label(if too_long { "Shorten comment" } else { "Save" })
+                                            .label(crate::i18n::t(cx, if too_long { "Shorten comment" } else { "Save" }))
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 if let Some(editor) = this.citation_editor.as_mut()
                                                     && editor.voice.read(cx).blocks_submission()

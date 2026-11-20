@@ -702,14 +702,14 @@ impl Render for ThreadPullRequestsPanel {
                         .child(
                             Button::new("thread-pr-detail-back", Variant::Ghost, Size::Xs)
                                 .icon(Icon::ArrowLeft)
-                                .label("Linked pull requests")
+                                .label(crate::i18n::t(cx, "Linked pull requests"))
                                 .on_click(cx.listener(|this, _, _, cx| this.close_detail(cx))),
                         )
                         .child(
                             Button::new("thread-pr-detail-popout", Variant::GhostMuted, Size::Xs)
                                 .icon(Icon::ExternalLink)
-                                .label("Pull Requests")
-                                .tooltip("Open in Pull Requests page")
+                                .label(crate::i18n::t(cx, "Pull requests"))
+                                .tooltip(crate::i18n::t(cx, "Open in Pull Requests page"))
                                 .on_click(move |_, window, cx| {
                                     cx.set_global(PendingSelection(Some((pop_out_ref.clone(), None))));
                                     window.dispatch_action(Box::new(OpenPullRequests), cx);
@@ -738,18 +738,18 @@ impl Render for ThreadPullRequestsPanel {
                         .p(px(24.))
                         .text_center()
                         .child(Icon::Link2.sized(px(24.)).text_color(hsla(p.muted_foreground).opacity(0.6)))
-                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("No linked pull requests"))
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "No linked pull requests")))
                         .child(
                             div()
                                 .max_w(px(240.))
                                 .text_xs()
                                 .text_color(hsla(p.muted_foreground))
-                                .child("Pull requests the agent opens from this thread land here. Link one yourself from a URL or a number."),
+                                .child(crate::i18n::t(cx, "Pull requests the agent opens from this thread land here. Link one yourself from a URL or a number.")),
                         )
                         .child(
                             Button::new("thread-pr-link-empty", Variant::Outline, Size::Sm)
                                 .icon(Icon::Plus)
-                                .label("Link pull request")
+                                .label(crate::i18n::t(cx, "Link pull request"))
                                 .on_click(cx.listener(|this, _, window, cx| this.toggle_inline_picker(window, cx))),
                         ),
                 )
@@ -790,7 +790,7 @@ impl Render for ThreadPullRequestsPanel {
                     .child(
                         Button::new("thread-pr-link", Variant::Ghost, Size::Xs)
                             .icon(Icon::Plus)
-                            .label(if self.picker_open { "Cancel" } else { "Link" })
+                            .label(crate::i18n::t(cx, if self.picker_open { "Cancel" } else { "Link" }))
                             .on_click(cx.listener(|this, _, window, cx| this.toggle_inline_picker(window, cx))),
                     ),
             )

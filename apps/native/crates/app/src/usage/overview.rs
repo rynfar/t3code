@@ -231,15 +231,15 @@ impl UsageView {
         let shares: Vec<AnyElement> = if merged.total_tokens == 0 {
             Vec::new()
         } else if metric == ChartMetric::Tokens {
-            share_bar("usage-token-types", "Tokens by type", &merge::token_type_segments(&merged.token_totals()), format_tokens, None, cx)
+            share_bar("usage-token-types", crate::i18n::t(cx, "Tokens by type"), &merge::token_type_segments(&merged.token_totals()), format_tokens, None, cx)
                 .into_iter()
                 .collect()
         } else {
-            let mut bars: Vec<AnyElement> = share_bar("usage-cost-types", "Cost by type", &merge::cost_type_segments(&merged.category_cost), format_usd, None, cx).into_iter().collect();
+            let mut bars: Vec<AnyElement> = share_bar("usage-cost-types", crate::i18n::t(cx, "Cost by type"), &merge::cost_type_segments(&merged.category_cost), format_usd, None, cx).into_iter().collect();
             if merged.speed_cost.fast + merged.speed_cost.ultrafast > 0. {
                 bars.extend(share_bar(
                     "usage-cost-speed",
-                    "Cost by speed",
+                    crate::i18n::t(cx, "Cost by speed"),
                     &merge::speed_cost_segments(&merged.speed_cost),
                     format_usd,
                     Some(speed_premium(merged.speed_cost.premium, cx)),
@@ -255,10 +255,10 @@ impl UsageView {
             .child(
                 v_flex()
                     .gap(r(8.))
-                    .child(heading("Totals", cx))
+                    .child(heading(crate::i18n::t(cx, "Totals"), cx))
                     .child(
                         div().grid().grid_cols(columns).gap_x(r(24.)).gap_y(r(16.)).py(r(4.)).children(
-                            TOTAL_LABELS.iter().zip(totals).map(|(label, value)| metric_cell(label, value, loading.partial, cx)),
+                            TOTAL_LABELS.iter().zip(totals).map(|(label, value)| metric_cell(crate::i18n::t(cx, label), value, loading.partial, cx)),
                         ),
                     ),
             )

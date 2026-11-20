@@ -88,8 +88,8 @@ impl ChildWorkDialog {
 
     fn render_child(child: &NativeChildWork, cx: &App) -> AnyElement {
         let p = palette(cx);
-        let role = if child.role.is_empty() { "Subagent".to_owned() } else { child.role.clone() };
-        let note = |text: &'static str| div().text_xs().text_color(hsla(p.muted_foreground)).child(text);
+        let role = if child.role.is_empty() { crate::i18n::t(cx, "Subagent").to_owned() } else { child.role.clone() };
+        let note = |text: &'static str| div().text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, text));
         v_flex()
             .min_w_0()
             .gap(px(8.))
@@ -116,10 +116,10 @@ impl Render for ChildWorkDialog {
         let p = palette(cx);
         let muted = hsla(p.muted_foreground);
         let body: Vec<AnyElement> = match &self.load {
-            Load::Loading => vec![div().text_sm().text_color(muted).child("Loading…").into_any_element()],
+            Load::Loading => vec![div().text_sm().text_color(muted).child(crate::i18n::t(cx, "Loading…")).into_any_element()],
             Load::Failed(error) => vec![div().text_sm().text_color(hsla(p.destructive_foreground)).child(error.clone()).into_any_element()],
             Load::Loaded(children) if children.is_empty() => {
-                vec![div().text_sm().text_color(muted).child("The provider has no record of which subagents this call started.").into_any_element()]
+                vec![div().text_sm().text_color(muted).child(crate::i18n::t(cx, "The provider has no record of which subagents this call started.")).into_any_element()]
             }
             Load::Loaded(children) => children.iter().map(|child| Self::render_child(child, cx)).collect(),
         };
@@ -166,14 +166,14 @@ impl Render for ChildWorkDialog {
                                 v_flex()
                                     .p(px(24.))
                                     .gap(px(8.))
-                                    .child(div().text_xl().line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child("Subagent work"))
-                                    .child(div().text_sm().text_color(muted).child("Read only. These subagents cannot take messages.")),
+                                    .child(div().text_xl().line_height(px(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(crate::i18n::t(cx, "Subagent work")))
+                                    .child(div().text_sm().text_color(muted).child(crate::i18n::t(cx, "Read only. These subagents cannot take messages."))),
                             )
                             .child(v_flex().id("native-child-work-panel").flex_1().min_h_0().overflow_y_scroll().px(px(24.)).pt(px(4.)).pb(px(24.)).gap(px(16.)).children(body))
                             .child(
                                 h_flex().justify_end().px(px(24.)).pb(px(16.)).child(
                                     Button::new("native-child-work-refresh", ButtonVariant::Outline, ButtonSize::Sm)
-                                        .label("Refresh")
+                                        .label(crate::i18n::t(cx, "Refresh"))
                                         .disabled(self.pending)
                                         .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                                 ),

@@ -304,7 +304,7 @@ impl ThreadView {
                                     }))
                                 })
                                 .child(Icon::Quote.render(px(14.), hsla(p.foreground)))
-                                .child(if too_long { "Shorten selection" } else { "Cite" }),
+                                .child(crate::i18n::t(cx, if too_long { "Shorten selection" } else { "Cite" })),
                         ),
                 ),
             )
@@ -374,8 +374,8 @@ impl ThreadView {
                 if matched_excerpt == Some(false) {
                     self.state.update(cx, |state, cx| {
                         state.show_toast(
-                            Toast::new(ToastKind::Info, "The quoted text has changed")
-                                .description("Showing the source response. The saved quote is unchanged."),
+                            Toast::new(ToastKind::Info, crate::i18n::t(cx, "The quoted text has changed"))
+                                .description(crate::i18n::t(cx, "Showing the source response. The saved quote is unchanged.")),
                             cx,
                         );
                     });
@@ -385,7 +385,13 @@ impl ThreadView {
             HistoryAction::Failed(failure) => {
                 self.citation_ui.pending = None;
                 let (title, description) = failure.copy();
-                self.state.update(cx, |state, cx| state.show_toast(Toast::new(ToastKind::Warning, title).description(description), cx));
+                self.state.update(cx, |state, cx| {
+                    state.show_toast(
+                        Toast::new(ToastKind::Warning, crate::i18n::t(cx, title))
+                            .description(crate::i18n::t(cx, description)),
+                        cx,
+                    );
+                });
             }
             HistoryAction::Aborted => self.citation_ui.pending = None,
         }

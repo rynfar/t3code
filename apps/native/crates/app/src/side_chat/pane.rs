@@ -181,8 +181,8 @@ impl SideChatPane {
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Delete side chat \"{title}\"?"),
-            Some("This permanently clears its conversation history."),
-            &["Delete", "Cancel"],
+            Some(crate::i18n::t(cx, "This permanently clears its conversation history.")),
+            &[crate::i18n::t(cx, "Delete"), crate::i18n::t(cx, "Cancel")],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -197,7 +197,7 @@ impl SideChatPane {
         let p = palette(cx);
         let state = self.state.read(cx);
         let shell = state.thread_shell(&self.thread_id);
-        let title = shell.map_or_else(|| "Side chat".to_owned(), |thread| thread.title.clone());
+        let title = shell.map_or_else(|| crate::i18n::t(cx, "Side chat").to_owned(), |thread| thread.title.clone());
         let busy = state.side_threads.busy.contains(&self.thread_id);
         let can_operate = state.can_operate_threads();
         let parent_active = state.selected_thread.as_deref().is_some_and(|parent| state.is_thread_running(parent));
@@ -217,9 +217,9 @@ impl SideChatPane {
             .child(
                 Button::new("side-chat-bring-back")
                     .size(Size::Xs)
-                    .label("Bring back")
+                    .label(crate::i18n::t(cx, "Bring back"))
                     .disabled(blocked.is_some() || busy || missing)
-                    .tooltip(blocked.unwrap_or(BRING_BACK_HINT))
+                    .tooltip(crate::i18n::t(cx, blocked.unwrap_or(BRING_BACK_HINT)))
                     .on_click(cx.listener(|this, _, _, cx| {
                         let id = this.thread_id.clone();
                         this.state.update(cx, |state, cx| state.bring_back_side_chat(&id, cx));
@@ -230,7 +230,7 @@ impl SideChatPane {
                     .size(Size::IconXs)
                     .icon(Icon::Trash2)
                     .disabled(!can_operate || missing || busy)
-                    .tooltip("Delete side chat")
+                    .tooltip(crate::i18n::t(cx, "Delete side chat"))
                     .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx))),
             )
             .child(
@@ -238,7 +238,7 @@ impl SideChatPane {
                     .variant(Variant::Ghost)
                     .size(Size::IconXs)
                     .icon(Icon::X)
-                    .tooltip("Close side chat")
+                    .tooltip(crate::i18n::t(cx, "Close side chat"))
                     .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
             )
             .into_any_element()
@@ -252,7 +252,7 @@ impl Render for SideChatPane {
         let state = self.state.read(cx);
         let missing = state.thread_shell(&self.thread_id).is_none();
         let body = if missing {
-            let deleted = state.shell.synchronized.then(|| div().p(px(12.)).text_xs().text_color(muted).child("This side chat was deleted."));
+            let deleted = state.shell.synchronized.then(|| div().p(px(12.)).text_xs().text_color(muted).child(crate::i18n::t(cx, "This side chat was deleted.")));
             div().flex_1().children(deleted).into_any_element()
         } else {
             div()

@@ -174,11 +174,15 @@ impl Render for ChatHeader {
             let project_id = app.draft_project.clone();
             let project = project_id.as_deref().and_then(|id| app.shell.project(id)).map(|project| {
                 let scratch = app.is_scratch_project(&project.id);
-                let title = header_project_title(&project.title, scratch).to_owned();
+                let title = if scratch {
+                    crate::i18n::t(cx, "No project").to_owned()
+                } else {
+                    header_project_title(&project.title, scratch).to_owned()
+                };
                 let favicon = crate::project_icon::render(app, &project.id, crate::project_icon::size(14., cx), hsla(p.icon_muted), cx);
                 (project.id.clone(), title, scratch, favicon)
             });
-            let draft_label = app.draft_project.is_some().then_some("New thread");
+            let draft_label = app.draft_project.is_some().then(|| crate::i18n::t(cx, "New thread"));
             let state = self.state.clone();
             let settings_project = project.as_ref().filter(|(_, _, scratch, _)| !*scratch).map(|(id, _, _, _)| id.clone());
             return h_flex()
@@ -189,7 +193,7 @@ impl Render for ChatHeader {
                 .text_sm()
                 .children(project.map(|(project_id, name, _, favicon)| {
                     let state = state.clone();
-                    let tooltip: SharedString = format!("New thread in {name}").into();
+                    let tooltip: SharedString = crate::i18n::t_fmt(cx, "New thread in {project}", &[("project", name.as_str().into())]).into();
                     h_flex()
                         .id("chat-header-project")
                         .flex_shrink(1.)
@@ -207,9 +211,9 @@ impl Render for ChatHeader {
                 .children(draft_label.map(|label| div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(label)))
                 .map(|this| match settings_project {
                     Some(project_id) => this
-                        .context_menu(move |menu, _, _| {
+                        .context_menu(move |menu, _, cx| {
                             let project_id = project_id.clone();
-                            menu.item(PopupMenuItem::new("Project settings").on_click(move |_, _, cx| crate::settings::open_project(&project_id, cx)))
+                            menu.item(PopupMenuItem::new(crate::i18n::t(cx, "Project settings")).on_click(move |_, _, cx| crate::settings::open_project(&project_id, cx)))
                         })
                         .into_any_element(),
                     None => this.into_any_element(),
@@ -219,14 +223,19 @@ impl Render for ChatHeader {
         let title = thread.title.clone();
         let project = app.shell.project(&thread.project_id).map(|project| {
             let scratch = app.is_scratch_project(&project.id);
-            (project.id.clone(), header_project_title(&project.title, scratch).to_owned())
+            let name = if scratch {
+                crate::i18n::t(cx, "No project").to_owned()
+            } else {
+                header_project_title(&project.title, scratch).to_owned()
+            };
+            (project.id.clone(), name)
         });
         let favicon = crate::project_icon::render(app, &thread.project_id, crate::project_icon::size(14., cx), hsla(p.icon_muted), cx);
         let parent = (thread.lineage.relationship_to_parent.as_deref() == Some("subagent"))
             .then(|| thread.lineage.parent_thread_id.clone())
             .flatten()
             .map(|id| {
-                let title = app.thread_shell(&id).map_or_else(|| "Parent thread".to_owned(), |parent| parent.title.clone());
+                let title = app.thread_shell(&id).map_or_else(|| crate::i18n::t(cx, "Parent thread").to_owned(), |parent| parent.title.clone());
                 (id, title)
             });
         let link_badge = thread.link_origin.as_ref().and_then(link_origin_badge);

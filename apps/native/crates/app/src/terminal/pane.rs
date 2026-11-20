@@ -1149,17 +1149,17 @@ impl Render for TerminalPane {
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .child(element)
             .children(self.selection_menu.as_ref().map(|menu| self.render_selection_menu(menu, cx)))
-            .context_menu(move |menu, _, _| {
+            .context_menu(move |menu, _, cx| {
                 let core = shared.lock();
                 let selected = core.emulator.selection_text().is_some_and(|text| !normalize_text(&text).is_empty());
                 let read_only = core.read_only;
                 drop(core);
                 menu.action_context(menu_focus.clone())
-                    .menu_with_disabled("Add to chat", Box::new(AddToChat), !selected)
-                    .menu_with_disabled("Copy", Box::new(Copy), !selected)
-                    .menu_with_disabled("Paste", Box::new(Paste), read_only)
-                    .menu("Select all", Box::new(SelectAll))
-                    .menu("Jump to latest", Box::new(JumpToLatest))
+                    .menu_with_disabled(crate::i18n::t(cx, "Add to chat"), Box::new(AddToChat), !selected)
+                    .menu_with_disabled(crate::i18n::t(cx, "Copy"), Box::new(Copy), !selected)
+                    .menu_with_disabled(crate::i18n::t(cx, "Paste"), Box::new(Paste), read_only)
+                    .menu(crate::i18n::t(cx, "Select all"), Box::new(SelectAll))
+                    .menu(crate::i18n::t(cx, "Jump to latest"), Box::new(JumpToLatest))
             })
     }
 }

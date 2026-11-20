@@ -45,10 +45,10 @@ impl UsageView {
         let unknown = model.is_cost_unknown();
         let metric = if unknown || self.data.preferences.metric == UsageMetric::Tokens { ChartMetric::Tokens } else { ChartMetric::Cost };
         let stats: Vec<(&str, String)> = [
-            Some(("Cost", if unknown { "Unpriced".to_owned() } else { format_usd(model.cost_usd) })),
-            Some(("Tokens", format_tokens(model.total_tokens as f64))),
-            model.cost_per_million_tokens().map(|value| ("Per 1M tokens", format_usd(value))),
-            model.cache_hit_rate().map(|rate| ("Cache hit", format_percent(rate))),
+            Some((crate::i18n::t(cx, "Cost"), if unknown { crate::i18n::t(cx, "Unpriced").to_owned() } else { format_usd(model.cost_usd) })),
+            Some((crate::i18n::t(cx, "Tokens"), format_tokens(model.total_tokens as f64))),
+            model.cost_per_million_tokens().map(|value| (crate::i18n::t(cx, "Per 1M tokens"), format_usd(value))),
+            model.cache_hit_rate().map(|rate| (crate::i18n::t(cx, "Cache hit"), format_percent(rate))),
         ]
         .into_iter()
         .flatten()
@@ -70,13 +70,13 @@ impl UsageView {
         );
         let mut shares: Vec<AnyElement> = Vec::new();
         if !unknown {
-            shares.extend(share_bar("usage-model-cost-types", "Cost by type", &merge::cost_type_segments(&usage.category_cost), format_usd, None, cx));
+            shares.extend(share_bar("usage-model-cost-types", crate::i18n::t(cx, "Cost by type"), &merge::cost_type_segments(&usage.category_cost), format_usd, None, cx));
         }
-        shares.extend(share_bar("usage-model-token-types", "Tokens by type", &merge::token_type_segments(&model.tokens), format_tokens, None, cx));
+        shares.extend(share_bar("usage-model-token-types", crate::i18n::t(cx, "Tokens by type"), &merge::token_type_segments(&model.tokens), format_tokens, None, cx));
         if usage.speed_cost.fast + usage.speed_cost.ultrafast > 0. {
             shares.extend(share_bar(
                 "usage-model-speed",
-                "Cost by speed",
+                crate::i18n::t(cx, "Cost by speed"),
                 &merge::speed_cost_segments(&usage.speed_cost),
                 format_usd,
                 Some(speed_premium(usage.speed_cost.premium, cx)),

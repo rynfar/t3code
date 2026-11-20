@@ -235,9 +235,9 @@ impl RenderOnce for Button {
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
             .when(!self.disabled, |this| this.cursor_pointer().hover(move |this| this.bg(hover_fill).text_color(hover_text)))
             .children(self.icon.map(|glyph| icon(glyph, icon_size, self.icon_color.unwrap_or(icon_color))))
-            .children(self.label.map(|label| div().truncate().child(label)))
+            .children(self.label.map(|label| div().truncate().child(crate::i18n::t(cx, label.as_ref()).to_owned())))
             .children(self.trailing.map(|glyph| icon(glyph, icon_size, icon_color)))
-            .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))
+            .when_some(self.tooltip, |this, text| this.tooltip(tooltip(crate::i18n::t(cx, text.as_ref()).to_owned().into())))
             .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
                 this.on_click(move |event, window, cx| {
                     cx.stop_propagation();
@@ -575,7 +575,9 @@ impl RenderOnce for Select {
             .on_key_down(on_key)
             .children(trigger_content)
             .children(trigger_icon.map(|glyph| icon(glyph, 14., hsla(p.icon_muted).opacity(0.8))))
-            .when(!trigger_label.is_empty(), |this| this.child(div().flex_1().min_w_0().truncate().child(trigger_label)))
+            .when(!trigger_label.is_empty(), |this| {
+                this.child(div().flex_1().min_w_0().truncate().child(crate::i18n::t(cx, trigger_label.as_ref()).to_owned()))
+            })
             .child(icon(Icon::ChevronDown, 14., hsla(p.foreground).opacity(0.7)));
 
         let popup = open.then(|| {
@@ -593,7 +595,7 @@ impl RenderOnce for Select {
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(hsla(p.muted_foreground))
-                            .children(option.group.clone()),
+                            .children(option.group.as_ref().map(|group| crate::i18n::t(cx, group.as_ref()).to_owned())),
                     );
                 }
                 let is_selected = selected_index == Some(index);
@@ -616,7 +618,7 @@ impl RenderOnce for Select {
                         .text_color(hsla(p.foreground))
                         .when(is_selected, |this| this.bg(hsla(p.foreground).opacity(0.08)))
                         .when(is_highlighted, |this| this.bg(hsla(p.accent)).text_color(hsla(p.accent_foreground)))
-                        .when_some(disabled_tip, |this, tip| this.tooltip(tooltip(tip)))
+                        .when_some(disabled_tip, |this, tip| this.tooltip(tooltip(crate::i18n::t(cx, tip.as_ref()).to_owned().into())))
                         .when(!option_disabled, |this| {
                             this.on_mouse_move(move |_, _, cx| {
                                 hover_state.update(cx, |state, cx| {
@@ -639,10 +641,10 @@ impl RenderOnce for Select {
                                         .when(option.description.is_some(), |this| this.font_weight(FontWeight::MEDIUM))
                                         .children(self.render_icon.as_ref().and_then(|render| render(&option.value, cx)))
                                         .children(option.icon.map(|glyph| icon(glyph, 14., hsla(p.muted_foreground))))
-                                        .child(div().truncate().child(option.label.clone())),
+                                        .child(div().truncate().child(crate::i18n::t(cx, option.label.as_ref()).to_owned())),
                                 )
-                                .children(option.description.clone().map(|description| {
-                                    div().text_xs().line_height(r(16.)).text_color(hsla(p.muted_foreground)).child(description)
+                                .children(option.description.as_ref().map(|description| {
+                                    div().text_xs().line_height(r(16.)).text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, description.as_ref()).to_owned())
                                 })),
                         )
                         .when(self.show_check, |this| {
@@ -692,7 +694,9 @@ impl RenderOnce for Select {
 
 /// `SettingsSection` (grouped): a 16px semibold title above a bordered group whose rows divide.
 pub fn section(title: impl Into<SharedString>, rows: Vec<AnyElement>, cx: &App) -> gpui::Div {
-    v_flex().gap(r(10.)).child(section_title(title)).child(group(rows, cx))
+    let title: SharedString = title.into();
+    let translated = crate::i18n::t(cx, title.as_ref()).to_owned();
+    v_flex().gap(r(10.)).child(section_title(translated)).child(group(rows, cx))
 }
 
 pub fn section_title(title: impl Into<SharedString>) -> gpui::Div {
@@ -721,7 +725,7 @@ pub fn unavailable_group(message: &'static str, rows: Vec<AnyElement>, cx: &App)
                         .text_xs()
                         .line_height(r(18.))
                         .text_color(hsla(p.muted_foreground))
-                        .child(message),
+                        .child(crate::i18n::t(cx, message)),
                 ),
         )
         .child(v_flex().opacity(0.64).children(rows))
@@ -853,8 +857,8 @@ impl RenderOnce for Row {
         let p = palette(cx);
         let stacked = ModalLayout::of(window).rows_stacked;
         let has_below = self.below.is_some();
-        let reset_tooltip = self.reset_tooltip.unwrap_or_else(|| "Reset to default".into());
-        let unavailable = self.unavailable;
+        let reset_tooltip = self.reset_tooltip.unwrap_or_else(|| crate::i18n::t(cx, "Reset to default").into());
+        let unavailable = self.unavailable.map(|msg| SharedString::from(crate::i18n::t(cx, msg.as_ref()).to_owned()));
         let reset = self.reset.filter(|_| unavailable.is_none()).map(|handler| {
             Button::new(ElementId::Name(format!("{}-reset", self.id).into()), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
                 .icon(Icon::Undo2)
@@ -883,7 +887,7 @@ impl RenderOnce for Row {
                                     .min_h(r(20.))
                                     .gap(r(6.))
                                     .children(self.title_icon.map(|glyph| icon(glyph, 18., hsla(p.foreground).opacity(0.8))))
-                                    .child(div().min_w_0().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(self.title))
+                                    .child(div().min_w_0().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, self.title.as_ref()).to_owned()))
                                     .children(self.title_tooltip.map(|text| {
                                         Button::new(ElementId::Name(format!("{}-details", self.id).into()), ButtonVariant::GhostMuted, ButtonSize::IconMicro)
                                             .icon(Icon::Info)
@@ -891,10 +895,10 @@ impl RenderOnce for Row {
                                     }))
                                     .child(div().size(r(20.)).flex().items_center().justify_center().children(reset)),
                             )
-                            .children(self.description.map(|description| description.into_any_element()).or(self.description_content).map(|description| {
+                            .children(self.description.map(|description| crate::i18n::t(cx, description.as_ref()).to_owned().into_any_element()).or(self.description_content).map(|description| {
                                 div().max_w(r(672.)).text_xs().line_height(r(18.)).text_color(hsla(p.muted_foreground)).child(description)
                             }))
-                            .children(self.status.map(|status| div().pt(r(2.)).text_xs().text_color(hsla(p.muted_foreground)).child(status))),
+                            .children(self.status.map(|status| div().pt(r(2.)).text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, status.as_ref()).to_owned()))),
                     )
                     .children(self.control.map(|control| {
                         let id = self.id.clone();
@@ -1055,8 +1059,8 @@ impl RenderOnce for InlineButton {
             .text_color(text)
             .when(self.disabled, |this| this.opacity(DISABLED_OPACITY))
             .when(!self.disabled, |this| this.cursor_pointer().hover(move |this| this.text_color(hover).underline()))
-            .child(self.label)
-            .when_some(self.tooltip, |this, text| this.tooltip(tooltip(text)))
+            .child(crate::i18n::t(cx, self.label.as_ref()).to_owned())
+            .when_some(self.tooltip, |this, text| this.tooltip(tooltip(crate::i18n::t(cx, text.as_ref()).to_owned().into())))
             .when_some(self.on_click.filter(|_| !self.disabled), |this, handler| {
                 this.on_click(move |event, window, cx| {
                     cx.stop_propagation();
@@ -1116,8 +1120,8 @@ impl DialogFrame {
                 v_flex()
                     .p(r(24.))
                     .gap(r(8.))
-                    .child(div().text_xl().line_height(r(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(self.title))
-                    .when(!self.description.is_empty(), |this| this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(self.description))),
+                    .child(div().text_xl().line_height(r(20.)).font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.popover_foreground)).child(crate::i18n::t(cx, self.title.as_ref()).to_owned()))
+                    .when(!self.description.is_empty(), |this| this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, self.description.as_ref()).to_owned()))),
             )
             .child(div().id(ElementId::Name(format!("{}-panel", self.id).into())).flex_1().min_h_0().overflow_y_scroll().px(r(24.)).pt(r(4.)).pb(r(24.)).child(self.body))
             .child(self.footer)

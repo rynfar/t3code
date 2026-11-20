@@ -4,6 +4,7 @@ use std::{cell::Cell, rc::Rc};
 use gpui::{AnyElement, Bounds, Context, ElementId, FontWeight, IntoElement, MouseButton, ParentElement, Pixels, SharedString, Styled, Window, canvas, div, prelude::*};
 use t3_core::sidebar::fleet::FolderDot;
 use super::SidebarPane;
+use crate::i18n::{t, t_fmt};
 use crate::icons::Icon;
 use crate::theme::{hsla, metrics, palette, rem};
 
@@ -22,7 +23,7 @@ impl SidebarPane {
         let is_scratch = group.is_scratch;
         let drag_key = group.key.clone();
         let move_key = group.key.clone();
-        let label = group.label.clone();
+        let label = if is_scratch { t(cx, "No project").to_owned() } else { group.label.clone() };
         let id = ElementId::Name(SharedString::from(format!("project-folder-{key}")));
         let new_id = ElementId::Name(SharedString::from(format!("folder-new-{key}")));
         let focus = crate::settings::controls::focus_handle(&id, window, cx);
@@ -31,7 +32,7 @@ impl SidebarPane {
         let bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
         let measured = bounds.clone();
         let folder_group = SharedString::from(format!("project-folder-group-{key}"));
-        let new_thread_aria = format!("New thread in {label}");
+        let new_thread_aria = t_fmt(cx, "New thread in {project}", &[("project", label.as_str().into())]);
         let new_thread_tooltip = new_thread_aria.clone();
         let color = dot.map(|dot| match dot { FolderDot::Attention => p.warning, FolderDot::Failed => p.error, FolderDot::Unread => p.success, FolderDot::Working => p.info });
         let manual_sort = crate::settings::store::client(cx).project_sort_order() == t3_core::client_settings::ProjectSortOrder::Manual;

@@ -144,10 +144,10 @@ pub(super) fn usage_limits_section(app: &AppState, draft_provider: Option<&str>,
         vec![usage_row(
             UsageRowSpec {
                 id: "details-usage-unavailable".into(),
-                label: "Limits".to_owned(),
+                label: crate::i18n::t(cx, "Limits").to_owned(),
                 bar: None,
                 tone: None,
-                value: "Unavailable".to_owned(),
+                value: crate::i18n::t(cx, "Unavailable").to_owned(),
                 tooltip: notice,
                 opens_usage: true,
             },
@@ -246,7 +246,7 @@ pub(super) fn context_window_section(app: &AppState, separated: bool, essential:
     let row = usage_row(
         UsageRowSpec {
             id: "details-context-window".into(),
-            label: "Context".to_owned(),
+            label: crate::i18n::t(cx, "Context").to_owned(),
             bar,
             tone,
             value,

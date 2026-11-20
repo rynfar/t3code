@@ -885,17 +885,17 @@ pub fn user_row(
             tooltip_icon_button(
                 SharedString::from(format!("rewind:{id}")),
                 Icon::Pencil,
-                EDIT_FROM_HERE,
+                crate::i18n::t(cx, EDIT_FROM_HERE),
                 env.rewind_disabled,
                 cx.listener(move |view, _, window, cx| view.request_rewind(&message_id, turn_count, &text, window, cx)),
                 cx,
             )
         }))
         .children(prompt_link.map(|link| tooltip_icon_button(
-            SharedString::from(format!("copy-prompt-link:{id}")), Icon::Link, "Copy prompt link", false,
+            SharedString::from(format!("copy-prompt-link:{id}")), Icon::Link, crate::i18n::t(cx, "Copy prompt link"), false,
             cx.listener(move |view, _, _, cx| crate::composer::prompt_links::copy(&view.state, link.clone(), cx)), cx,
         )))
-        .child(CopyButton::new(SharedString::from(format!("copy-user:{id}")), "Copy message", move |_, cx| {
+        .child(CopyButton::new(SharedString::from(format!("copy-user:{id}")), crate::i18n::t(cx, "Copy message"), move |_, cx| {
             let environment = copy_state.read(cx).server_config.config.as_ref().map(|c| c.environment.environment_id.clone()).unwrap_or_default();
             let records = match copy_item.as_ref().map(|item| &item.kind) {
                 Some(t3_core::turn_item::TurnItemKind::UserMessage { context: Some(context), .. }) => context["records"].as_array().map(Vec::as_slice).unwrap_or_default(),
@@ -1324,7 +1324,7 @@ fn reply_button(message: &ChatMessage, env: &RowEnv, cx: &mut Context<ThreadView
     Some(tooltip_icon_button(
         id,
         Icon::Reply,
-        "Reply to this response",
+        crate::i18n::t(cx, "Reply to this response"),
         false,
         move |_, _, cx| {
             let app_read = state.read(cx);
@@ -1375,7 +1375,7 @@ fn assistant_meta(
     let status = message.item.as_ref().map(|item| item.status.clone()).filter(|status| status != "completed");
     let copy = (show_copy && !message.text.trim().is_empty()).then(|| {
         let text = render_codex_directives_for_copy(&message.text);
-        CopyButton::new(SharedString::from(format!("copy-assistant:{}", message.id)), "Copy message", move |_, cx| {
+        CopyButton::new(SharedString::from(format!("copy-assistant:{}", message.id)), crate::i18n::t(cx, "Copy message"), move |_, cx| {
             crate::composer::clipboard::write(text.clone(), String::new(), cx);
         })
     });
@@ -1607,7 +1607,7 @@ impl RenderOnce for PlanCard {
             let u = ui.read(cx);
             (u.menu_open, u.save_open, u.saving, u.saved_path.clone(), u.save_error.clone(), u.path_input.clone())
         };
-        let title = proposed_plan_title(&self.plan.markdown).unwrap_or_else(|| "Proposed plan".into());
+        let title = proposed_plan_title(&self.plan.markdown).unwrap_or_else(|| crate::i18n::t(cx, "Proposed plan").to_owned());
         let export_markdown = normalize_plan_markdown_for_export(&self.plan.markdown);
         let default_filename = build_proposed_plan_markdown_filename(&self.plan.markdown);
         let card = hsla(p.card).opacity(0.7);
@@ -1694,7 +1694,7 @@ impl RenderOnce for PlanCard {
                                     .relative()
                                     .flex_none()
                                     .gap(px(4.))
-                                    .child(CopyButton::new(SharedString::from(format!("copy-plan:{id}")), "Copy plan", move |_, cx| {
+                                    .child(CopyButton::new(SharedString::from(format!("copy-plan:{id}")), crate::i18n::t(cx, "Copy plan"), move |_, cx| {
                                         crate::composer::clipboard::write(copy_for_btn.clone(), String::new(), cx);
                                     }))
                                     .child(ghost_icon_button(
@@ -1719,7 +1719,7 @@ impl RenderOnce for PlanCard {
                                                 });
                                             })
                                             .child(
-                                                MenuItem::new(SharedString::from(format!("plan-menu-copy:{id_str}")), "Copy to clipboard")
+                                                MenuItem::new(SharedString::from(format!("plan-menu-copy:{id_str}")), crate::i18n::t(cx, "Copy to clipboard"))
                                                     .icon(Icon::Copy, hsla(p.muted_foreground))
                                                     .on_click(move |_, _, cx| {
                                                         crate::composer::clipboard::write(copy_for_menu.clone(), String::new(), cx);
@@ -1730,7 +1730,7 @@ impl RenderOnce for PlanCard {
                                                     }),
                                             )
                                             .child(
-                                                MenuItem::new(SharedString::from(format!("plan-menu-download:{id_str}")), "Download as markdown")
+                                                MenuItem::new(SharedString::from(format!("plan-menu-download:{id_str}")), crate::i18n::t(cx, "Download as markdown"))
                                                     .icon(Icon::Download, hsla(p.muted_foreground))
                                                     .on_click(move |_, _, cx| {
                                                         ui_download.update(cx, |u, cx| {
@@ -1757,7 +1757,7 @@ impl RenderOnce for PlanCard {
                                             )
                                             .when(self.workspace_root.is_some(), |menu| {
                                                 menu.child(
-                                                    MenuItem::new(SharedString::from(format!("plan-menu-save:{id_str}")), "Save to workspace")
+                                                    MenuItem::new(SharedString::from(format!("plan-menu-save:{id_str}")), crate::i18n::t(cx, "Save to workspace"))
                                                         .icon(Icon::FolderPlus, hsla(p.muted_foreground))
                                                         .disabled(!can_write_workspace || saving)
                                                         .on_click(move |_, window, cx| {
@@ -1791,7 +1791,7 @@ impl RenderOnce for PlanCard {
                                 .border_1()
                                 .border_color(hsla(p.border).opacity(0.7))
                                 .bg(hsla(p.secondary).opacity(0.35))
-                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Save plan to workspace"))
+                                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Save plan to workspace")))
                                 .children(input.map(|input| {
                                     let save_input = input.clone();
                                     h_flex()
@@ -1799,7 +1799,7 @@ impl RenderOnce for PlanCard {
                                         .child(div().flex_1().min_w_0().child(Input::new(&input).disabled(saving)))
                                         .child(
                                             Button::new(SharedString::from(format!("plan-save-confirm:{id}")), ButtonVariant::Outline, ButtonSize::Xs)
-                                                .label(if saving { "Saving..." } else { "Save" })
+                                                .label(crate::i18n::t(cx, if saving { "Saving..." } else { "Save" }))
                                                 .disabled(saving || !can_write_workspace)
                                                 .on_click(move |_, _, cx| {
                                                     if saving || !can_write_workspace {

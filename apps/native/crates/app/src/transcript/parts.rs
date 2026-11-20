@@ -218,7 +218,7 @@ impl RenderOnce for CopyButton {
         let copied = state.read(cx).seq > 0;
         let icon = if copied { Icon::Check } else { Icon::Copy };
         let color = if copied { hsla(p.primary) } else { hsla(p.muted_foreground) };
-        let tip = if copied { "Copied" } else { self.tooltip };
+        let tip = if copied { crate::i18n::t(cx, "Copied") } else { crate::i18n::t(cx, self.tooltip) };
         let on_copy = self.on_copy;
         let button = div()
             .id(self.id)

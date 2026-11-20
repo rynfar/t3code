@@ -553,7 +553,7 @@ impl PreviewPane {
                                     .variant(Variant::Ghost)
                                     .size(Size::IconXs)
                                     .icon(Icon::ArrowLeft)
-                                    .tooltip("Back")
+                                    .tooltip(crate::i18n::t(cx, "Back"))
                                     .disabled(!can_back)
                                     .on_click(cx.listener(|this, _, _, cx| this.send(StreamInput::History { delta: -1 }, cx))),
                             )
@@ -562,7 +562,7 @@ impl PreviewPane {
                                     .variant(Variant::Ghost)
                                     .size(Size::IconXs)
                                     .icon(Icon::ArrowRight)
-                                    .tooltip("Forward")
+                                    .tooltip(crate::i18n::t(cx, "Forward"))
                                     .disabled(!can_forward)
                                     .on_click(cx.listener(|this, _, _, cx| this.send(StreamInput::History { delta: 1 }, cx))),
                             )
@@ -571,7 +571,7 @@ impl PreviewPane {
                                     .variant(Variant::Ghost)
                                     .size(Size::IconXs)
                                     .icon(if loading { Icon::LoaderCircle } else { Icon::RefreshCw })
-                                    .tooltip(if loading { "Stop" } else { "Refresh" })
+                                    .tooltip(crate::i18n::t(cx, if loading { "Stop" } else { "Refresh" }))
                                     .disabled(refresh_disabled)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.send(if loading { StreamInput::StopLoading } else { StreamInput::Reload { ignore_cache: None } }, cx);
@@ -627,7 +627,7 @@ impl PreviewPane {
                                         .variant(Variant::Ghost)
                                         .size(Size::IconXs)
                                         .icon(Icon::ExternalLink)
-                                        .tooltip("Open in system browser")
+                                        .tooltip(crate::i18n::t(cx, "Open in system browser"))
                                         .on_click(move |_, _, cx| cx.open_url(&external_url)),
                                 )
                             }),
@@ -637,7 +637,7 @@ impl PreviewPane {
                             .variant(Variant::Ghost)
                             .size(Size::IconXs)
                             .icon(Icon::Image)
-                            .tooltip("Attach screenshot to chat")
+                            .tooltip(crate::i18n::t(cx, "Attach screenshot to chat"))
                             .disabled(annotate_disabled)
                             .on_click(cx.listener(|this, _, _, cx| this.capture_screenshot(cx))),
                     )
@@ -646,13 +646,13 @@ impl PreviewPane {
                             .variant(if annotate_active { Variant::Secondary } else { Variant::Ghost })
                             .size(Size::IconXs)
                             .icon(Icon::MousePointerClick)
-                            .tooltip(if annotate_disabled && is_unreachable {
+                            .tooltip(crate::i18n::t(cx, if annotate_disabled && is_unreachable {
                                 "Page didn't load. Pick is unavailable until the page renders"
                             } else if annotate_active {
                                 "Cancel annotation (Esc)"
                             } else {
                                 "Annotate elements, regions, and drawings"
-                            })
+                            }))
                             .disabled(annotate_disabled && !annotate_active)
                             .on_click(cx.listener(|this, _, window, cx| this.toggle_annotate(window, cx))),
                     )
@@ -661,7 +661,7 @@ impl PreviewPane {
                             .variant(if self.more_menu_open { Variant::Secondary } else { Variant::Ghost })
                             .size(Size::IconXs)
                             .icon(Icon::Ellipsis)
-                            .tooltip("More")
+                            .tooltip(crate::i18n::t(cx, "More"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.more_menu_open = !this.more_menu_open;
                                 cx.notify();
@@ -708,7 +708,7 @@ impl PreviewPane {
                         .p(px(4.))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
-                            MenuItem::new("preview-menu-hard-reload", "Hard reload")
+                            MenuItem::new("preview-menu-hard-reload", crate::i18n::t(cx, "Hard reload"))
                                 .disabled(!enabled)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.more_menu_open = false;
@@ -719,7 +719,7 @@ impl PreviewPane {
                         .child(
                             MenuItem::new(
                                 "preview-menu-device-toolbar",
-                                if device_toolbar_visible { "Hide device toolbar" } else { "Show device toolbar" },
+                                crate::i18n::t(cx, if device_toolbar_visible { "Hide device toolbar" } else { "Show device toolbar" }),
                             )
                             .disabled(!enabled)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -729,16 +729,16 @@ impl PreviewPane {
                             })),
                         )
                         .when(has_closed, |this| {
-                            this.child(MenuItem::new("preview-menu-reopen-closed", "Reopen closed tab").on_click(cx.listener(|this, _, _, cx| {
+                            this.child(MenuItem::new("preview-menu-reopen-closed", crate::i18n::t(cx, "Reopen closed tab")).on_click(cx.listener(|this, _, _, cx| {
                                 this.more_menu_open = false;
                                 this.state.update(cx, |state, cx| state.reopen_closed_view(cx));
                                 cx.notify();
                             })))
                         })
                         .child(div().my(px(4.)).h(px(1.)).bg(hsla(p.border)))
-                        .child(div().px(px(8.)).py(px(2.)).text_xs().text_color(hsla(p.muted_foreground)).child("Appearance"))
+                        .child(div().px(px(8.)).py(px(2.)).text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, "Appearance")))
                         .children(AppearancePreference::ALL.into_iter().map(|pref| {
-                            MenuItem::new(SharedString::from(format!("preview-menu-scheme-{}", pref.as_str())), pref.label())
+                            MenuItem::new(SharedString::from(format!("preview-menu-scheme-{}", pref.as_str())), crate::i18n::t(cx, pref.label()))
                                 .checked(color_scheme == pref)
                                 .disabled(!enabled)
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -755,7 +755,7 @@ impl PreviewPane {
                                 .py(px(4.))
                                 .justify_between()
                                 .items_center()
-                                .child(div().text_sm().text_color(hsla(p.foreground)).child("Zoom"))
+                                .child(div().text_sm().text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Zoom")))
                                 .child(
                                     h_flex()
                                         .items_center()
@@ -763,7 +763,7 @@ impl PreviewPane {
                                         .child(
                                             ActionButton::new("preview-menu-zoom-out", ButtonVariant::Outline, ButtonSize::IconXs)
                                                 .icon(Icon::Minus)
-                                                .tooltip("Zoom out")
+                                                .tooltip(crate::i18n::t(cx, "Zoom out"))
                                                 .disabled(!enabled)
                                                 .on_click(cx.listener(|this, _, _, cx| this.zoom(-1, cx))),
                                         )
@@ -771,7 +771,7 @@ impl PreviewPane {
                                         .child(
                                             ActionButton::new("preview-menu-zoom-in", ButtonVariant::Outline, ButtonSize::IconXs)
                                                 .icon(Icon::Plus)
-                                                .tooltip("Zoom in")
+                                                .tooltip(crate::i18n::t(cx, "Zoom in"))
                                                 .disabled(!enabled)
                                                 .on_click(cx.listener(|this, _, _, cx| this.zoom(1, cx))),
                                         )
@@ -780,7 +780,7 @@ impl PreviewPane {
                                                 .variant(Variant::Ghost)
                                                 .size(Size::IconXs)
                                                 .icon(Icon::RotateCcw)
-                                                .tooltip("Reset zoom")
+                                                .tooltip(crate::i18n::t(cx, "Reset zoom"))
                                                 .disabled(!enabled)
                                                 .on_click(cx.listener(|this, _, _, cx| this.zoom(0, cx))),
                                         ),

@@ -412,7 +412,7 @@ fn entry_row(
     let question = entry.question_answer.as_ref().map(question_text_preview).filter(|q| !q.is_empty());
     let answer = entry.question_answer.as_ref().filter(|a| has_question_answer(a)).map(question_answer_preview);
     let preview = if reasoning && expanded {
-        if entry.status == Some(ToolStatus::InProgress) { "Thinking".to_owned() } else { "Thought".to_owned() }
+        crate::i18n::t(cx, if entry.status == Some(ToolStatus::InProgress) { "Thinking" } else { "Thought" }).to_owned()
     } else {
         question.or_else(|| display_label.map(str::to_owned)).unwrap_or_else(|| work_entry_display_label(entry, env.workspace_root))
     };
@@ -433,7 +433,7 @@ fn entry_row(
         let target_thread_id = target_thread_id.clone();
         trailing.push(inline_button(
             SharedString::from(format!("thread-created-open:{}", entry.id)),
-            "Open chat",
+            crate::i18n::t(cx, "Open chat"),
             InlineTone::Default,
             false,
             cx.listener(move |view, _, _, cx| {
@@ -448,7 +448,7 @@ fn entry_row(
     {
         trailing.push(inline_button(
             SharedString::from(format!("notif-open:{}", entry.id)),
-            "Open subagent",
+            crate::i18n::t(cx, "Open subagent"),
             InlineTone::Default,
             false,
             cx.listener(move |view, _, _, cx| {

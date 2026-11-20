@@ -401,11 +401,11 @@ impl Render for Editor {
             pos.x.max(px(8.)).min((viewport.width - width - px(8.)).max(px(8.))),
             pos.y.max(px(8.)).min((viewport.height - px(48.)).max(px(8.))),
         );
-        let title = if self.session.is_editing() { "Edit theme" } else { "Create theme" };
+        let title = crate::i18n::t(cx, if self.session.is_editing() { "Edit theme" } else { "Create theme" });
         let mut body = v_flex().gap(r(12.)).px(r(12.)).py(r(12.)).child(
             h_flex()
                 .gap(r(12.))
-                .child(div().w(r(116.)).text_sm().font_weight(FontWeight::MEDIUM).child("Theme name"))
+                .child(div().w(r(116.)).text_sm().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, "Theme name")))
                 .child(div().flex_1().child(Input::new(&self.name).small())),
         );
         if let Some(e) = &self.session.error {
@@ -415,7 +415,7 @@ impl Render for Editor {
             .child(
                 h_flex()
                     .gap(r(12.))
-                    .child(div().w(r(116.)).text_sm().font_weight(FontWeight::MEDIUM).child("Appearance"))
+                    .child(div().w(r(116.)).text_sm().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, "Appearance")))
                     .child(h_flex().gap(r(2.)).children([false, true].into_iter().map(|dark| {
                         let reason = self.session.lock_reason(dark, store::client(cx));
                         Button::new(
@@ -443,18 +443,18 @@ impl Render for Editor {
                     .justify_between()
                     .child(
                         v_flex()
-                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child("Colors"))
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(crate::i18n::t(cx, "Colors")))
                             .when(!self.session.advanced, |d| {
                                 d.child(
                                     div()
                                         .text_xs()
                                         .text_color(hsla(p.muted_foreground))
-                                        .child("Two colors, rest derived"),
+                                        .child(crate::i18n::t(cx, "Two colors, rest derived")),
                                 )
                             }),
                     )
                     .child(
-                        h_flex().gap(r(8.)).child("Advanced").child(
+                        h_flex().gap(r(8.)).child(crate::i18n::t(cx, "Advanced")).child(
                             Switch::new("editor-advanced", self.session.advanced)
                                 .disabled(self.saving)
                                 .on_change(move |on, window, cx| {
@@ -486,7 +486,7 @@ impl Render for Editor {
             body = body.child(self.field(family.role, family.label, window, cx));
         }
         if !found {
-            body = body.child(div().text_xs().child("No matches."));
+            body = body.child(div().text_xs().child(crate::i18n::t(cx, "No matches.")));
         }
         let css_toggle = Button::new("toggle-theme-css", ButtonVariant::Ghost, ButtonSize::Xs)
             .icon(if self.session.css_open { Icon::ChevronDown } else { Icon::ChevronRight })

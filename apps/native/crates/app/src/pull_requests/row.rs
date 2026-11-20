@@ -289,15 +289,20 @@ fn empty(icon: Icon, title: impl Into<SharedString>, description: impl Into<Shar
 }
 
 pub fn unavailable(error: String, refreshing: bool, retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static, cx: &App) -> impl IntoElement {
-    empty(Icon::GitPullRequestArrow, "Could not load pull requests", error, cx)
-        .child(Button::new("pr-retry", Variant::Outline, Size::Sm).icon(Icon::RefreshCw).label("Retry").disabled(refreshing).on_click(retry))
+    empty(Icon::GitPullRequestArrow, crate::i18n::t(cx, "Could not load pull requests"), error, cx)
+        .child(Button::new("pr-retry", Variant::Outline, Size::Sm).icon(Icon::RefreshCw).label(crate::i18n::t(cx, "Retry")).disabled(refreshing).on_click(retry))
 }
 
 /// `PullRequestListEmptyState`.
 pub fn empty_state(page: &PullRequestsPage, _window: &mut Window, cx: &mut Context<PullRequestsPage>) -> impl IntoElement {
     let has_projects = page.state.read(cx).shell.snapshot.as_ref().is_none_or(|snapshot| !snapshot.projects.is_empty());
     if !has_projects {
-        return empty(Icon::GitBranch, "No projects in this workspace", "Add a project, and the pull requests from its repository appear here.", cx);
+        return empty(
+            Icon::GitBranch,
+            crate::i18n::t(cx, "No projects in this workspace"),
+            crate::i18n::t(cx, "Add a project, and the pull requests from its repository appear here."),
+            cx,
+        );
     }
     let query = page.typed.trim().to_owned();
     let searching = !query.is_empty() && (query != page.sent || page.data.pending);
@@ -308,27 +313,32 @@ pub fn empty_state(page: &PullRequestsPage, _window: &mut Window, cx: &mut Conte
     let refreshing = page.data.pending;
     let refresh = Button::new("pr-check-again", Variant::Outline, Size::Sm)
         .icon(Icon::RefreshCw)
-        .label(if refreshing { "Checking..." } else { "Check again" })
+        .label(crate::i18n::t(cx, if refreshing { "Checking..." } else { "Check again" }))
         .disabled(refreshing)
         .on_click(cx.listener(|this, _, _, cx| this.refresh_from_host(cx)));
     if !query.is_empty() {
         let shown: String = if query.chars().count() > 48 { format!("{}…", query.chars().take(48).collect::<String>()) } else { query };
-        return empty(Icon::GitBranch, format!("Nothing matches “{shown}”"), "The hosts were searched for it. Try fewer words, or search by number, author or branch.", cx).child(
+        return empty(
+            Icon::GitBranch,
+            format!("Nothing matches “{shown}”"),
+            crate::i18n::t(cx, "The hosts were searched for it. Try fewer words, or search by number, author or branch."),
+            cx,
+        ).child(
             h_flex()
                 .gap(px(8.))
-                .child(Button::new("pr-clear-search", Variant::Outline, Size::Sm).icon(Icon::Search).label("Clear search").on_click(cx.listener(|this, _, window, cx| this.clear_query(window, cx))))
+                .child(Button::new("pr-clear-search", Variant::Outline, Size::Sm).icon(Icon::Search).label(crate::i18n::t(cx, "Clear search")).on_click(cx.listener(|this, _, window, cx| this.clear_query(window, cx))))
                 .child(refresh),
         );
     }
     let filtered = page.prefs.filtered();
     let (title, description) = if filtered {
-        ("Nothing under these filters", "Widen the state, involvement or project filter to see more.")
+        (crate::i18n::t(cx, "Nothing under these filters"), crate::i18n::t(cx, "Widen the state, involvement or project filter to see more."))
     } else {
-        ("No pull requests", "Pull requests from every project in this workspace appear here.")
+        (crate::i18n::t(cx, "No pull requests"), crate::i18n::t(cx, "Pull requests from every project in this workspace appear here."))
     };
     let load_more = page.can_load_more().then(|| {
         Button::new("pr-empty-load-more", Variant::Outline, Size::Sm)
-            .label(if page.data.loading_more { "Loading..." } else { "Load more pull requests" })
+            .label(crate::i18n::t(cx, if page.data.loading_more { "Loading..." } else { "Load more pull requests" }))
             .disabled(page.data.loading_more)
             .on_click(cx.listener(|this, _, _, cx| this.load_more(cx)))
     });

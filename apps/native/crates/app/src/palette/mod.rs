@@ -86,14 +86,14 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn placeholder(self, project: Option<&str>) -> String {
+    fn placeholder(self, project: Option<&str>, cx: &App) -> String {
         match (self, project) {
-            (Mode::Command, _) => "Search commands, projects, and threads...".to_owned(),
-            (Mode::Files, _) => "Search files…".to_owned(),
-            (Mode::Content, Some(project)) => format!("Search in {project}"),
-            (Mode::Content, None) => "Search project contents…".to_owned(),
-            (Mode::Browse, _) => "Enter project path (e.g. ~/projects/my-app)".to_owned(),
-            (Mode::NewProject, _) => "Project name".to_owned(),
+            (Mode::Command, _) => crate::i18n::t(cx, "Search commands, projects, and threads...").to_owned(),
+            (Mode::Files, _) => crate::i18n::t(cx, "Search files…").to_owned(),
+            (Mode::Content, Some(project)) => crate::i18n::t_fmt(cx, "Search in {project}", &[("project", project.into())]),
+            (Mode::Content, None) => crate::i18n::t(cx, "Search project contents…").to_owned(),
+            (Mode::Browse, _) => crate::i18n::t(cx, "Enter project path (e.g. ~/projects/my-app)").to_owned(),
+            (Mode::NewProject, _) => crate::i18n::t(cx, "Project name").to_owned(),
         }
     }
 }
@@ -466,7 +466,7 @@ impl CommandPalette {
     }
 
     pub fn new(state: Entity<AppState>, composer: Entity<crate::composer::Composer>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search commands, projects, and threads..."));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search commands, projects, and threads...")));
         let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
             InputEvent::Change => {
                 let query = input.read(cx).value().to_string();
@@ -548,7 +548,7 @@ impl CommandPalette {
         self.clear_message_search();
         self.rebuild(cx);
         self.search = create_command_palette_search_state(&search.query);
-        let placeholder = Mode::Command.placeholder(None);
+        let placeholder = Mode::Command.placeholder(None, cx);
         self.input.update(cx, |input, cx| {
             input.set_value(search.query.clone(), window, cx);
             input.set_placeholder(placeholder, window, cx);
@@ -605,7 +605,7 @@ impl CommandPalette {
         self.mode = mode;
         self.clear_message_search();
         let target = self.state.read(cx).active_project_target();
-        let placeholder = mode.placeholder(target.as_ref().map(|target| target.project_name.as_str()));
+        let placeholder = mode.placeholder(target.as_ref().map(|target| target.project_name.as_str()), cx);
         self.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.set_placeholder(placeholder, window, cx);
@@ -1582,7 +1582,7 @@ impl CommandPalette {
                 .text_xs()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(hsla(p.muted_foreground))
-                .child(label.to_string())
+                .child(crate::i18n::t(cx, label).to_owned())
                 .into_any_element(),
             CommandPaletteRow::Item { item, .. } => {
                 let highlighted = !item.disabled && self.highlighted.as_deref() == Some(item.value.as_str());
@@ -1613,8 +1613,8 @@ impl CommandPalette {
                     .when(disabled, |this| this.opacity(0.4))
                     .when(!disabled, |this| this.cursor_pointer())
                     .when(highlighted, |this| this.bg(hsla(p.foreground).opacity(0.09)))
-                    .child(div().flex_none().max_w(px(320.)).truncate().text_color(hsla(p.foreground)).child(item.title.clone()))
-                    .children(description.map(|text| div().flex_1().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(text)))
+                    .child(div().flex_none().max_w(px(320.)).truncate().text_color(hsla(p.foreground)).child(crate::i18n::t(cx, &item.title).to_owned()))
+                    .children(description.map(|text| div().flex_1().min_w_0().truncate().text_xs().text_color(hsla(p.muted_foreground)).child(crate::i18n::t(cx, &text).to_owned())))
                     .child(div().flex_1())
                     .children(trailing.map(|text| div().flex_none().text_xs().text_color(hsla(p.muted_foreground)).child(text)))
                     .when(is_submenu, |this| this.child(Icon::ChevronRight.render(px(14.), hsla(p.muted_foreground))))

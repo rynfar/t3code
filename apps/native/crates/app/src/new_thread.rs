@@ -1242,7 +1242,7 @@ impl Render for DraftHero {
         let below = if !scratch_available {
             None
         } else if scratch_draft {
-            Some(self.picker_trigger("No project".into(), None, can_choose, None, cx))
+            Some(self.picker_trigger(crate::i18n::t(cx, "No project").into(), None, can_choose, None, cx))
         } else {
             Some(
                 div()

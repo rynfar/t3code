@@ -198,9 +198,9 @@ impl SidebarPane {
     pub(super) fn render_marker(&self, marker: Marker, cx: &mut Context<Self>) -> AnyElement {
         let p = palette(cx);
         let (label, section) = match marker {
-            Marker::PinnedHeader => ("Pinned", Section::Pinned),
-            Marker::PinnedDivider | Marker::ActivePlaceholder => ("Active", Section::Active),
-            _ => ("Settled", Section::Settled),
+            Marker::PinnedHeader => (crate::i18n::t(cx, "Pinned"), Section::Pinned),
+            Marker::PinnedDivider | Marker::ActivePlaceholder => (crate::i18n::t(cx, "Active"), Section::Active),
+            _ => (crate::i18n::t(cx, "Settled"), Section::Settled),
         };
         let is_target = self.drop_target() == Some(section);
         match marker {

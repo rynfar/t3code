@@ -479,8 +479,8 @@ impl UsageView {
                     .pt(r(10.))
                     .border_t_1()
                     .border_color(hsla(p.border).opacity(0.6))
-                    .children(account.plan.clone().map(|plan| row("Plan", plan)))
-                    .children(account.location().map(|location| row(if account.environments.is_empty() { "Via" } else { "Signed in" }, location))),
+                    .children(account.plan.clone().map(|plan| row(crate::i18n::t(cx, "Plan"), plan)))
+                    .children(account.location().map(|location| row(crate::i18n::t(cx, if account.environments.is_empty() { "Via" } else { "Signed in" }), location))),
             )
             .child(
                 v_flex()
@@ -488,10 +488,10 @@ impl UsageView {
                     .pt(r(10.))
                     .border_t_1()
                     .border_color(hsla(p.border).opacity(0.6))
-                    .child(row("Left", format!("{remaining}%")))
-                    .children(resets_at.map(|at| row("Resets", format!("{at}{}", resets.map(|resets| format!(" · {}", resets.replace("resets in ", "in "))).unwrap_or_default()))))
-                    .children(time_left.map(|left| row("Even pace", format!("{left}% left by now"))))
-                    .children(restore.map(|reset| row("Restores", format!("+{}% of pool", reset.restores_percent)))),
+                    .child(row(crate::i18n::t(cx, "Left"), format!("{remaining}%")))
+                    .children(resets_at.map(|at| row(crate::i18n::t(cx, "Resets"), format!("{at}{}", resets.map(|resets| format!(" · {}", resets.replace("resets in ", "in "))).unwrap_or_default()))))
+                    .children(time_left.map(|left| row(crate::i18n::t(cx, "Even pace"), format!("{left}% left by now"))))
+                    .children(restore.map(|reset| row(crate::i18n::t(cx, "Restores"), format!("+{}% of pool", reset.restores_percent)))),
             )
             .when_some(credits.zip(redeem), |this, (credits, redeem)| {
                 let summary = reset_credits_summary(credits.available_count, credits.next_expires_at.as_deref(), now, true);

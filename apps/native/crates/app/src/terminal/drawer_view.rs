@@ -58,12 +58,12 @@ impl Action {
     }
 
     fn label(self, at_limit: bool, cx: &App) -> String {
-        let name = match self {
+        let name = crate::i18n::t(cx, match self {
             Action::SplitHorizontal => "Split Terminal Horizontally",
             Action::SplitVertical => "Split Terminal Vertically",
             Action::New => "New Terminal",
             Action::Close => "Close Terminal",
-        };
+        });
         if self.at_limit(at_limit) {
             return format!("{name} (max {MAX_TERMINALS_PER_GROUP} per group)");
         }
