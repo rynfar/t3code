@@ -151,6 +151,17 @@ impl SavedEnvironments {
 
     /// Saves or refreshes a T3 Connect relay-managed environment and makes it active.
     pub fn upsert_relay(&mut self, environment_id: &str, label: &str, http_base: &str, access_token: &str) -> String {
+        self.upsert_relay_in(base(), environment_id, label, http_base, access_token)
+    }
+
+    fn upsert_relay_in(
+        &mut self,
+        dir: Option<PathBuf>,
+        environment_id: &str,
+        label: &str,
+        http_base: &str,
+        access_token: &str,
+    ) -> String {
         let env_id = (!environment_id.trim().is_empty()).then(|| environment_id.trim().to_owned());
         let existing = self.find(env_id.as_deref(), http_base).map(|environment| environment.id.clone());
         let id = existing.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -180,7 +191,7 @@ impl SavedEnvironments {
             Some(entry) => *entry = environment,
             None => self.environments.push(environment),
         }
-        set_relay_managed_environment(&id, true);
+        set_relay_managed_environment_in(dir, &id, true);
         self.active = Some(id.clone());
         id
     }
@@ -316,12 +327,16 @@ impl SavedEnvironments {
 
     /// Forgets an environment and its credential. Returns whether it was saved.
     pub fn remove(&mut self, id: &str) -> bool {
+        self.remove_in(base(), id)
+    }
+
+    fn remove_in(&mut self, dir: Option<PathBuf>, id: &str) -> bool {
         let before = self.environments.len();
         if let Some(removed) = self.environments.iter().find(|environment| environment.id == id) {
             crate::dpop::remove_direct_credential_matching(&removed.http_base, removed.access_token.as_deref());
         }
         self.environments.retain(|environment| environment.id != id);
-        set_relay_managed_environment(id, false);
+        set_relay_managed_environment_in(dir, id, false);
         if self.active.as_deref() == Some(id) {
             self.active = None;
         }
@@ -903,7 +918,10 @@ fn load_relay_managed_file(base: &Path) -> std::collections::HashSet<String> {
 
 /// Returns whether `id` is a T3 Connect relay-managed saved environment.
 pub fn is_relay_managed_environment(id: &str) -> bool {
-    let base = base();
+    is_relay_managed_environment_in(base(), id)
+}
+
+fn is_relay_managed_environment_in(base: Option<PathBuf>, id: &str) -> bool {
     let mut guard = relay_managed_store().lock().unwrap_or_else(|p| p.into_inner());
     let set = guard
         .entry(base.clone())
@@ -913,7 +931,10 @@ pub fn is_relay_managed_environment(id: &str) -> bool {
 
 /// Persists whether saved environment `id` is managed via T3 Connect relay.
 pub fn set_relay_managed_environment(id: &str, relay_managed: bool) {
-    let base = base();
+    set_relay_managed_environment_in(base(), id, relay_managed);
+}
+
+fn set_relay_managed_environment_in(base: Option<PathBuf>, id: &str, relay_managed: bool) {
     let mut guard = relay_managed_store().lock().unwrap_or_else(|p| p.into_inner());
     let set = guard
         .entry(base.clone())
@@ -1336,13 +1357,20 @@ mod tests {
         }
         clear_clerk_session(&dir).unwrap();
         assert_eq!(load_clerk_session(&dir).unwrap(), None);
-        let _ = std::fs::remove_dir_all(&dir);
 
         let mut saved = SavedEnvironments::default();
-        let id = saved.upsert_relay("env-relay-1", "Studio", "https://studio.t3.codes", "relay-tok");
-        assert!(saved.get(&id).unwrap().is_relay_managed());
+        let id = saved.upsert_relay_in(
+            Some(dir.clone()),
+            "env-relay-1",
+            "Studio",
+            "https://studio.t3.codes",
+            "relay-tok",
+        );
+        assert!(is_relay_managed_environment_in(Some(dir.clone()), &id));
+        assert!(dir.join(RELAY_MANAGED_FILE).exists());
         assert_eq!(saved.get(&id).unwrap().environment_id.as_deref(), Some("env-relay-1"));
-        assert!(saved.remove(&id));
-        assert!(!is_relay_managed_environment(&id));
+        assert!(saved.remove_in(Some(dir.clone()), &id));
+        assert!(!is_relay_managed_environment_in(Some(dir.clone()), &id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

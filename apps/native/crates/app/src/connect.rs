@@ -449,7 +449,7 @@ impl ConnectView {
             }),
             cx.subscribe_in(&cloud_second_factor, window, |this, _, event: &InputEvent, _, cx| {
                 if let InputEvent::PressEnter { .. } = event {
-                    let kind = this.cloud_second_factor_kind;
+                    let kind = this.effective_second_factor_kind(cx);
                     this.submit_cloud_second_factor(kind, cx);
                 }
             }),
@@ -538,6 +538,23 @@ impl ConnectView {
             .update(cx, |state, cx| state.submit_email_cloud_first_factor(kind, secret, cx));
     }
 
+    fn effective_second_factor_kind(&self, cx: &App) -> SecondFactorKind {
+        if let CloudAuthFlow::SecondFactor(pending) = &self.state.read(cx).cloud.auth_flow {
+            let supports_totp = pending.challenge.supports_totp;
+            let supports_backup = pending.challenge.supports_backup_code;
+            if self.cloud_second_factor_kind == SecondFactorKind::BackupCode && supports_backup {
+                return SecondFactorKind::BackupCode;
+            }
+            if supports_totp {
+                return SecondFactorKind::Totp;
+            }
+            if supports_backup {
+                return SecondFactorKind::BackupCode;
+            }
+        }
+        self.cloud_second_factor_kind
+    }
+
     fn submit_cloud_second_factor(&mut self, kind: SecondFactorKind, cx: &mut Context<Self>) {
         let code = self.cloud_second_factor.read(cx).value().to_string();
         self.state
@@ -617,8 +634,15 @@ impl ConnectView {
     fn render_rejected(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let state = self.state.read(cx);
         let rejected = state.connect.rejected.clone()?;
-        let can_pair_again = rejected.ssh || (rejected.local && state.local_saved_environment().is_some_and(|local| local.id == rejected.id));
-        let busy = state.connect.pairing.is_some();
+        let can_reconnect_relay = state.cloud.has_clerk_session
+            && state
+                .environments
+                .get(&rejected.id)
+                .is_some_and(SavedEnvironment::is_relay_managed);
+        let can_pair_again = can_reconnect_relay
+            || rejected.ssh
+            || (rejected.local && state.local_saved_environment().is_some_and(|local| local.id == rejected.id));
+        let busy = state.connect.pairing.is_some() || state.cloud.connecting_env_id.is_some();
         let p = palette(cx);
         let trace_id = rejected
             .trace_id
@@ -629,7 +653,13 @@ impl ConnectView {
             "T3 Code on {host} did not accept this device",
             &[("host", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&rejected.label)))],
         );
-        let body = if can_pair_again {
+        let body = if can_reconnect_relay {
+            crate::i18n::t_fmt(
+                cx,
+                "This device's sign-in to {host} expired or was revoked. Reconnect through T3 Connect.",
+                &[("host", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&rejected.label)))],
+            )
+        } else if can_pair_again {
             crate::i18n::t_fmt(
                 cx,
                 "This device's sign-in to {host} expired or was revoked. Pair again to reconnect.",
@@ -643,7 +673,16 @@ impl ConnectView {
             )
         };
         let trace_prefix = crate::i18n::t(cx, "Trace ID");
-        let repair_label = crate::i18n::t(cx, if busy { "Pairing…" } else { "Pair again" });
+        let repair_label = crate::i18n::t(
+            cx,
+            if can_reconnect_relay {
+                if busy { "Connecting…" } else { "Reconnect" }
+            } else if busy {
+                "Pairing…"
+            } else {
+                "Pair again"
+            },
+        );
         Some(
             v_flex()
                 .px(px(14.))
@@ -673,7 +712,15 @@ impl ConnectView {
                             .label(repair_label)
                             .disabled(busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.update(cx, |state, cx| if ssh { state.pair_ssh_again(&id, cx) } else { state.pair_local(cx) })
+                                this.state.update(cx, |state, cx| {
+                                    if can_reconnect_relay {
+                                        state.connect_environment(&id, cx);
+                                    } else if ssh {
+                                        state.pair_ssh_again(&id, cx);
+                                    } else {
+                                        state.pair_local(cx);
+                                    }
+                                })
                             })),
                     ))
                 }),
@@ -1105,13 +1152,7 @@ impl ConnectView {
             CloudAuthFlow::SecondFactor(pending) => {
                 let supports_totp = pending.challenge.supports_totp;
                 let supports_backup = pending.challenge.supports_backup_code;
-                let active_kind = if self.cloud_second_factor_kind == SecondFactorKind::BackupCode && supports_backup {
-                    SecondFactorKind::BackupCode
-                } else if supports_totp {
-                    SecondFactorKind::Totp
-                } else {
-                    SecondFactorKind::BackupCode
-                };
+                let active_kind = self.effective_second_factor_kind(cx);
                 let mut panel = v_flex()
                     .gap(px(8.))
                     .child(muted(crate::i18n::t(cx, "Two-factor verification"), cx));
@@ -2279,8 +2320,29 @@ mod tests {
         })
         .unwrap();
 
-        // 3. Legacy OAuth session without Clerk session.
+        // 3. Backup-code-only 2FA resolves effective factor to BackupCode for both Enter & Verify.
         state.update(cx, |state, _| {
+            state.cloud.has_clerk_session = false;
+            state.cloud.auth_flow = CloudAuthFlow::SecondFactor(t3_client::connect::PendingSecondFactor::for_test(
+                t3_core::connect::SecondFactorChallenge {
+                    sign_in_id: "sia-backup".into(),
+                    supports_totp: false,
+                    supports_backup_code: true,
+                },
+            ));
+        });
+        cx.update_window(window.into(), |view, window, cx| {
+            let view = view.downcast::<ConnectView>().expect("ConnectView");
+            view.read_with(cx, |this, cx| {
+                assert_eq!(this.effective_second_factor_kind(cx), SecondFactorKind::BackupCode);
+            });
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        // 4. Legacy OAuth session without Clerk session.
+        state.update(cx, |state, _| {
+            state.cloud.auth_flow = CloudAuthFlow::Idle;
             state.cloud.has_clerk_session = false;
         });
         cx.update_window(window.into(), |_, window, cx| {

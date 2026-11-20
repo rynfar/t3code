@@ -141,6 +141,16 @@ pub struct PendingSecondFactor {
     client_token: String,
 }
 
+#[cfg(feature = "test-support")]
+impl PendingSecondFactor {
+    pub fn for_test(challenge: SecondFactorChallenge) -> Self {
+        Self {
+            challenge,
+            client_token: "test-token".into(),
+        }
+    }
+}
+
 /// Result of completing a Clerk Native first factor or OAuth callback.
 #[derive(Debug, Clone)]
 pub enum ClerkAuthOutcome {

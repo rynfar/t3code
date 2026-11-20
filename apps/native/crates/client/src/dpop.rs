@@ -560,17 +560,37 @@ pub fn update_direct_credential(store_key: &str, mut credential: DpopConnectionC
 
 /// Migrates a stored DPoP credential when a saved environment moves to a new address (e.g., an SSH
 /// tunnel reserving a new ephemeral port or a local server restarting on a different port).
+/// If a fresh credential is already registered under `new_http_base` (such as a relay tunnel move
+/// where `Prepare` registered the new endpoint's credential before returning `Moved`), preserves
+/// that credential and only cleans up the stale `old_http_base` entry.
 pub fn relocate_direct_credential(old_http_base: &str, new_http_base: &str, access_token: Option<&str>) {
+    relocate_direct_credential_in(crate::store::base(), old_http_base, new_http_base, access_token);
+}
+
+/// Explicit-home variant of [`relocate_direct_credential`].
+pub fn relocate_direct_credential_in(
+    base: Option<PathBuf>,
+    old_http_base: &str,
+    new_http_base: &str,
+    access_token: Option<&str>,
+) {
     let old_key = normalize_host_key(old_http_base);
     let new_key = normalize_host_key(new_http_base);
     if old_key == new_key {
         return;
     }
-    let base = crate::store::base();
     let mut guard = credential_store_lock().lock().unwrap_or_else(|p| p.into_inner());
     let map = guard
         .entry(base.clone())
         .or_insert_with(|| base.as_deref().map(load_credentials_file).unwrap_or_default());
+    if map.contains_key(&new_key) {
+        if map.remove(&old_key).is_some()
+            && let Some(dir) = base.as_deref()
+        {
+            save_credentials_file(dir, map);
+        }
+        return;
+    }
     let existing = map.remove(&old_key).or_else(|| {
         let token = access_token.filter(|t| !t.is_empty())?;
         let found_key = map
@@ -901,6 +921,30 @@ mod tests {
         assert_eq!(refreshed.access_token, "relay-cred-2");
         assert!(refreshed.matches_token("relay-cred-1"));
         assert!(refreshed.matches_token("relay-cred-2"));
+
+        // Relay tunnel move (`PrepareError::Moved`): `Prepare` registers the fresh credential at the
+        // new tunnel URL before `SavedEnvironments::relocate` runs. Relocation must preserve the
+        // fresh credential at `moved_http_base` and remove the stale old-tunnel entry.
+        let moved_http_base = "https://env-1-reallocated.t3.codes";
+        register_relay_credential_in(
+            Some(dir.clone()),
+            moved_http_base,
+            Some("wss://env-1-reallocated.t3.codes/ws"),
+            "relay-cred-moved-3".into(),
+            2_000_000_000_000,
+            Some("env-1".into()),
+            Some("relay-cred-1"),
+        );
+        relocate_direct_credential_in(Some(dir.clone()), http_base, moved_http_base, Some("relay-cred-1"));
+        assert!(
+            get_direct_credential_in(Some(dir.clone()), http_base).is_none(),
+            "old tunnel origin entry should be removed on move"
+        );
+        let moved = get_direct_credential_in(Some(dir.clone()), moved_http_base)
+            .expect("fresh credential at moved tunnel origin must be preserved");
+        assert_eq!(moved.access_token, "relay-cred-moved-3");
+        assert!(moved.matches_token("relay-cred-1"));
+        assert_eq!(moved.expires_at_epoch_ms, 2_000_000_000_000);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
