@@ -17,6 +17,7 @@ use gpui_component::tooltip::Tooltip;
 use crate::icons::Icon;
 use crate::theme::{
     ThemeSlot, ThemeSlotExt, hsla, palette, refine_slot_active, refine_slot_hover, slot_has_active,
+    theme_slot_clipped_background_layer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +272,27 @@ pub fn focusable(element: Stateful<Div>, key: ElementId, enabled: bool, window: 
 }
 
 pub fn tooltip_view(text: SharedString, window: &mut Window, cx: &mut App) -> AnyView {
+    if theme_slot_clipped_background_layer(ThemeSlot::TooltipPopup, px(9.), cx).is_some() {
+        let label = text.clone();
+        return Tooltip::element(move |_, cx| {
+            let p = palette(cx);
+            div()
+                .relative()
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(9.))
+                .text_xs()
+                .text_color(hsla(p.popover_foreground))
+                .theme_slot(ThemeSlot::TooltipPopup, cx)
+                .children(theme_slot_clipped_background_layer(ThemeSlot::TooltipPopup, px(9.), cx))
+                .child(div().relative().child(label.clone()))
+        })
+        .p_0()
+        .border_0()
+        .bg(gpui::transparent_black())
+        .shadow_none()
+        .build(window, cx);
+    }
     Tooltip::new(text).theme_slot(ThemeSlot::TooltipPopup, cx).build(window, cx)
 }
 
