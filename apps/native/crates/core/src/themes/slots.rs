@@ -1777,25 +1777,38 @@ fn parse_background_shorthand(
         let (bg, sz) = parse_theme_bg_layers(val, roles, dark);
         return Some((Some(bg), None, sz));
     }
-    if val.to_ascii_lowercase().starts_with("linear-gradient(") {
-        let grad = parse_linear_gradient(val, roles, dark)?;
+    if let Some(grad) = parse_linear_gradient(val, roles, dark) {
         return Some((Some(grad), None, None));
     }
     if let Some(c) = eval_color(val, roles, dark) {
         return Some((None, Some(SlotBackground::Solid(c)), None));
     }
-    // Check shorthand with gradient + fallback color or keywords.
-    for token in split_ws_tokens(val) {
-        if token.to_ascii_lowercase().starts_with("linear-gradient(")
-            && let Some(grad) = parse_linear_gradient(token, roles, dark)
+    // Check comma-separated layers and shorthand tokens (e.g. `linear-gradient(...) no-repeat`
+    // or `linear-gradient(...), #111111`).
+    let mut found_grad: Option<SlotBackground> = None;
+    let mut found_color: Option<u32> = None;
+    for layer in color::split(val, ',') {
+        let layer = layer.trim();
+        if found_grad.is_none()
+            && let Some(grad) = parse_linear_gradient(layer, roles, dark)
         {
-            return Some((Some(grad), None, None));
+            found_grad = Some(grad);
+            continue;
+        }
+        for token in split_ws_tokens(layer) {
+            if found_grad.is_none()
+                && let Some(grad) = parse_linear_gradient(token, roles, dark)
+            {
+                found_grad = Some(grad);
+            } else if found_color.is_none()
+                && let Some(c) = eval_color(token, roles, dark)
+            {
+                found_color = Some(c);
+            }
         }
     }
-    for token in split_ws_tokens(val) {
-        if let Some(c) = eval_color(token, roles, dark) {
-            return Some((None, Some(SlotBackground::Solid(c)), None));
-        }
+    if found_grad.is_some() || found_color.is_some() {
+        return Some((found_grad, found_color.map(SlotBackground::Solid), None));
     }
     None
 }
@@ -1808,8 +1821,10 @@ fn parse_background_image(
     if contains_theme_bg_var(val) {
         return Some(parse_theme_bg_layers(val, roles, dark));
     }
-    if val.to_ascii_lowercase().starts_with("linear-gradient(") {
-        return Some((parse_linear_gradient(val, roles, dark)?, None));
+    for layer in color::split(val, ',') {
+        if let Some(grad) = parse_linear_gradient(layer.trim(), roles, dark) {
+            return Some((grad, None));
+        }
     }
     None
 }

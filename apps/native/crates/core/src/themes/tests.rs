@@ -714,6 +714,15 @@ fn slot_engine_parses_vars_gradients_shadows_layout_typography_and_wallpaper_sco
             box-shadow: none;
             background: transparent;
         }
+        [data-slot="popover-popup"] {
+            background: linear-gradient(90deg, #ff0066, #6600ff) no-repeat;
+        }
+        [data-slot="menu-popup"] {
+            background: linear-gradient(180deg, #112233, #445566), #111111;
+        }
+        [data-slot="tooltip-popup"] {
+            background: linear-gradient(not-a-valid-gradient), #223344;
+        }
         [data-workspace-area="conversation"] {
             background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)), var(--theme-background-image) center / contain no-repeat;
         }
@@ -780,6 +789,29 @@ fn slot_engine_parses_vars_gradients_shadows_layout_typography_and_wallpaper_sco
     let dialog = &sheet.get(ThemeSlot::DialogPopup).unwrap().base;
     assert_eq!(dialog.box_shadows, Some(Vec::new()));
     assert_eq!(dialog.background, Some(SlotBackground::Transparent));
+
+    // Gradient shorthand with trailing keywords and comma-separated layers/fallback colors.
+    match &sheet.get(ThemeSlot::PopoverPopup).unwrap().base.background {
+        Some(SlotBackground::LinearGradient { angle_deg, stops }) => {
+            assert_eq!(*angle_deg, 90.0);
+            assert_eq!(stops.len(), 2);
+            assert_eq!(stops[0].color, 0xff00_66ff);
+            assert_eq!(stops[1].color, 0x6600_ffff);
+        }
+        other => panic!("expected gradient with trailing no-repeat, got {other:?}"),
+    }
+    match &sheet.get(ThemeSlot::MenuPopup).unwrap().base.background {
+        Some(SlotBackground::LinearGradient { angle_deg, stops }) => {
+            assert_eq!(*angle_deg, 180.0);
+            assert_eq!(stops[0].color, 0x1122_33ff);
+            assert_eq!(stops[1].color, 0x4455_66ff);
+        }
+        other => panic!("expected gradient from comma-separated layer, got {other:?}"),
+    }
+    assert_eq!(
+        sheet.get(ThemeSlot::TooltipPopup).unwrap().base.background,
+        Some(SlotBackground::Solid(0x2233_44ff))
+    );
 
     let conv = &sheet.get(ThemeSlot::ConversationArea).unwrap().base;
     assert_eq!(
