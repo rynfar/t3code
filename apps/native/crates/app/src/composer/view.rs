@@ -12,6 +12,7 @@ use gpui_component::input::{Copy, Editor, Enter, Escape, IndentInline, MoveDown,
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_core::commands::ComposerDispatch;
 use t3_core::composer::{self as rules, runtime_mode_description, runtime_mode_label};
+use t3_core::files::media_preview::DraggedFileMention;
 use t3_core::requests;
 use t3_core::traits;
 
@@ -61,6 +62,38 @@ impl Composer {
                 !self.can_answer(cx) || !input.can_respond() || self.question_responding(&input.request_id, cx)
             })
             || self.active_question().is_some_and(|(_, question)| !question.allows_custom_answer())
+    }
+
+    fn can_drop_file_mention(&self, cx: &App) -> bool {
+        !self.is_rewinding(cx)
+            && !self.input_disabled(cx)
+            && !self.voice.read(cx).freezes_editor()
+            && self.snapshot.target.is_some()
+            && self.answering.is_none()
+    }
+
+    /// Drop target for one or more files dragged from the Files explorer (`composerMentionDragHandlers`).
+    pub(super) fn on_drop_file_mention(
+        &mut self,
+        dragged: &DraggedFileMention,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_drop_file_mention(cx) {
+            return;
+        }
+        let mut inserted = false;
+        for path in &dragged.paths {
+            let trimmed = path.trim().trim_end_matches('/');
+            if trimmed.is_empty() {
+                continue;
+            }
+            self.insert_mention(trimmed, window, cx);
+            inserted = true;
+        }
+        if inserted {
+            cx.notify();
+        }
     }
 
     /// Placeholder and disabled/readonly state follow what the agent waits on; written only on change.
@@ -560,6 +593,7 @@ impl Render for Composer {
         let (drop_fill, drop_ring) = (hsla(p.accent).opacity(0.45), hsla(p.primary).opacity(0.7));
         let input_disabled = self.input_disabled(cx);
         let voice_frozen = self.voice.read(cx).freezes_editor();
+        let can_drop_mention = self.can_drop_file_mention(cx);
         let gutter = if self.fixed.is_some() { 12. } else { 48. };
         div().w_full().flex().justify_center().px(px(gutter)).pb(px(if self.fixed.is_some() { 12. } else { 16. })).pt(px(8.)).child(
             v_flex()
@@ -774,10 +808,18 @@ impl Render for Composer {
                                 inset: false,
                             }])
                         })
-                        // Files dragged in from Finder (`isDragOverComposer`).
+                        // Files dragged in from Finder (`isDragOverComposer`) or file-tree mentions (`composerMentionDragHandlers`).
                         .when(!rewinding, |this| {
                             this.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_fill).border_color(drop_ring))
                                 .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| this.on_drop_paths(paths, window, cx)))
+                                .when(can_drop_mention, |this| {
+                                    this.drag_over::<DraggedFileMention>(move |style, _, _, _| {
+                                        style.bg(drop_fill).border_color(drop_ring)
+                                    })
+                                    .on_drop(cx.listener(|this, dragged: &DraggedFileMention, window, cx| {
+                                        this.on_drop_file_mention(dragged, window, cx);
+                                    }))
+                                })
                         })
                         .child(
                             div()
@@ -870,4 +912,86 @@ pub(super) fn render_draft_usage_limits_overlay(banner: AnyElement) -> AnyElemen
         .pt(px(16.))
         .child(banner)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::AppState;
+
+    #[gpui::test]
+    fn composer_drop_file_mention_inserts_single_and_multi_preserving_draft_and_cursor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        let (composer, vcx) = cx.add_window_view(|window, cx| Composer::new(state.clone(), window, cx));
+
+        // 1. Without a target, drop is ignored and draft stays empty.
+        vcx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                assert!(!c.can_drop_file_mention(cx));
+                let payload = DraggedFileMention::from_drag("src/main.rs", &[]).expect("payload");
+                c.on_drop_file_mention(&payload, window, cx);
+                assert_eq!(c.prompt(cx), "");
+            });
+        });
+
+        // 2. With an active thread target, dropping onto empty composer inserts `[main.rs](src/main.rs) `.
+        vcx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.snapshot.target = Some(Target::Thread("t-drop".into()));
+                assert!(c.can_drop_file_mention(cx));
+                let payload = DraggedFileMention::from_drag("src/main.rs", &[]).expect("payload");
+                c.on_drop_file_mention(&payload, window, cx);
+                assert_eq!(c.prompt(cx), "[main.rs](src/main.rs) ");
+                assert_eq!(c.input.read(cx).cursor(), c.prompt(cx).len());
+            });
+            window.blur();
+            window.draw(cx).clear();
+        });
+
+        // 3. Dropping multiple files onto existing draft text preserves text with single space boundary.
+        vcx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.input.update(cx, |input, cx| input.set_value("Check these", window, cx));
+                let selection = vec!["src/a.rs".to_owned(), "src/dir with space/b.rs".to_owned()];
+                let payload = DraggedFileMention::from_drag("src/a.rs", &selection).expect("multi payload");
+                c.on_drop_file_mention(&payload, window, cx);
+                let expected = "Check these [a.rs](src/a.rs) [b.rs](src/dir%20with%20space/b.rs) ";
+                assert_eq!(c.prompt(cx), expected);
+                assert_eq!(c.input.read(cx).cursor(), expected.len());
+            });
+            window.blur();
+            window.draw(cx).clear();
+        });
+
+        // 4. Dropping a payload with trailing slash trims cleanly and avoids double spaces after trailing whitespace.
+        vcx.update(|window, cx| {
+            composer.update(cx, |c, cx| {
+                c.input.update(cx, |input, cx| input.set_value("Inspect ", window, cx));
+                let payload = DraggedFileMention {
+                    paths: vec!["crates/core/".into(), "   ".into()],
+                    mention: "[core](crates/core)".into(),
+                    label: "core".into(),
+                };
+                c.on_drop_file_mention(&payload, window, cx);
+                assert_eq!(c.prompt(cx), "Inspect [core](crates/core) ");
+            });
+            window.blur();
+            window.draw(cx).clear();
+        });
+
+        #[cfg(feature = "snapshot")]
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
 }

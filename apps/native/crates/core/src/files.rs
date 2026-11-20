@@ -18,6 +18,7 @@ pub mod office;
 pub mod pdf;
 pub mod position;
 pub mod save;
+pub mod sqlite;
 mod text;
 mod tree;
 
