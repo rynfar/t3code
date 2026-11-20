@@ -25,7 +25,10 @@ use super::{Composer, MenuKey, OpenPermissions, OutdentList, PasteAsText, Resolv
 use crate::i18n::t;
 use crate::icons::Icon;
 use crate::provider_icon::{BadgeSize, ProviderIcon};
-use crate::theme::{hsla, palette};
+use crate::theme::{
+    ThemeSlot, ThemeSlotExt, ThemeSlotHoverExt, ThemeSlotInteractiveExt, apply_slot_override, hsla, palette, slot_style,
+    theme_slot_background_layer,
+};
 
 /// `DEFAULT_COMPOSER_PLACEHOLDER` (`web/src/composerPlaceholder.ts`).
 pub const DEFAULT_PLACEHOLDER: &str = "Ask anything. @ files, $ skills, / commands";
@@ -595,6 +598,50 @@ impl Render for Composer {
         let voice_frozen = self.voice.read(cx).freezes_editor();
         let can_drop_mention = self.can_drop_file_mention(cx);
         let gutter = if self.fixed.is_some() { 12. } else { 48. };
+        let host_slot = slot_style(ThemeSlot::ComposerHost, cx);
+        let host_bg_layer = theme_slot_background_layer(ThemeSlot::ComposerHost, cx);
+        let host_overrides_bg = host_bg_layer.is_some()
+            || host_slot.as_ref().is_some_and(|s| {
+                matches!(
+                    s.base.background,
+                    Some(
+                        t3_core::themes::slots::SlotBackground::Solid(_)
+                            | t3_core::themes::slots::SlotBackground::Transparent
+                            | t3_core::themes::slots::SlotBackground::LinearGradient { .. }
+                    )
+                )
+            });
+        let host_overrides_border = host_slot
+            .as_ref()
+            .is_some_and(|s| s.base.border_color.is_some() || !s.base.border_widths.is_empty());
+        let tiptap_bg_layer = theme_slot_background_layer(ThemeSlot::ComposerTiptap, cx);
+        let tiptap_hover = slot_style(ThemeSlot::ComposerTiptap, cx)
+            .filter(|s| !s.hover.is_empty())
+            .map(|s| s.hover);
+        let prompt_editor = Editor::new(&self.input)
+            .appearance(false)
+            .disabled(input_disabled)
+            .readonly(voice_frozen)
+            .h(px(self.composer_editor_height(cx)))
+            .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Prompt, cx))
+            .text_size(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx)))
+            .line_height(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx) * 1.625))
+            .theme_slot(ThemeSlot::ComposerTiptap, cx);
+        let prompt_editor_el: AnyElement = if tiptap_bg_layer.is_some() || tiptap_hover.is_some() {
+            let mut wrap = div().relative().w_full().min_w_0();
+            if let Some(bg_layer) = tiptap_bg_layer {
+                wrap = wrap.overflow_hidden().child(bg_layer);
+            }
+            if let Some(hover) = tiptap_hover {
+                wrap = wrap.hover(|mut style| {
+                    apply_slot_override(&mut style, &hover, cx);
+                    style
+                });
+            }
+            wrap.child(prompt_editor).into_any_element()
+        } else {
+            prompt_editor.into_any_element()
+        };
         div().w_full().flex().justify_center().px(px(gutter)).pb(px(if self.fixed.is_some() { 12. } else { 16. })).pt(px(8.)).child(
             v_flex()
                 .key_context("Composer")
@@ -755,6 +802,7 @@ impl Render for Composer {
                 .relative()
                 .w_full()
                 .when_some(crate::theme::chat_max_width(cx), |this, width| this.max_w(width))
+                .theme_slot_hover(ThemeSlot::ChatComposerForm, cx)
                 .child(crate::webview::occluder("composer-overlay-cover", crate::webview::Layer::TranscriptChrome))
                 .children(self.render_queue(cx))
                 .children(error.map(|error| {
@@ -799,9 +847,9 @@ impl Render for Composer {
                         .when(rewinding, |this| this.opacity(0.65))
                         .rounded(px(16.))
                         .border_1()
-                        .border_color(outline.opacity(0.))
+                        .border_color(if host_overrides_bg { outline } else { outline.opacity(0.) })
                         .relative()
-                        .child(crate::glass::backdrop_with_highlight(16., surface, outline, dark.then(||hsla(p.composer_highlight)), cx))
+                        .overflow_hidden()
                         .when(!dark, |this| {
                             this.shadow(vec![gpui::BoxShadow {
                                 color: gpui::black().opacity(0.05),
@@ -811,6 +859,13 @@ impl Render for Composer {
                                 inset: false,
                             }])
                         })
+                        .theme_slot_interactive(ThemeSlot::ComposerHost, cx)
+                        .when(!host_overrides_bg, |this| {
+                            let border = if host_overrides_border { outline.opacity(0.) } else { outline };
+                            let highlight = (!host_overrides_border && dark).then(|| hsla(p.composer_highlight));
+                            this.child(crate::glass::backdrop_with_highlight(16., surface, border, highlight, cx))
+                        })
+                        .children(host_bg_layer)
                         // Files dragged in from Finder (`isDragOverComposer`) or file-tree mentions (`composerMentionDragHandlers`).
                         .when(!rewinding, |this| {
                             this.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_fill).border_color(drop_ring))
@@ -832,13 +887,7 @@ impl Render for Composer {
                                 .children(self.render_attachments(cx))
                                 .children(self.render_context_chips(cx))
                                 .children(self.render_citation_chips(cx))
-                                .child(Editor::new(&self.input).appearance(false)
-                                    .disabled(input_disabled)
-                                    .readonly(voice_frozen)
-                                    .h(px(self.composer_editor_height(cx)))
-                                    .font_family(crate::theme::font_family(t3_core::client_settings::typography::FontRole::Prompt, cx))
-                                    .text_size(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx)))
-                                    .line_height(px(crate::theme::font_size(t3_core::client_settings::typography::FontRole::Prompt, cx) * 1.625))),
+                                .child(prompt_editor_el),
                         )
                         .when(self.answering.is_none(), |this| {
                             this.when_some(self.prompt_length_error.clone(), |this, message| {
@@ -986,6 +1035,67 @@ mod tests {
                 c.on_drop_file_mention(&payload, window, cx);
                 assert_eq!(c.prompt(cx), "Inspect [core](crates/core) ");
             });
+            window.blur();
+            window.draw(cx).clear();
+        });
+
+        #[cfg(feature = "snapshot")]
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
+
+    #[gpui::test]
+    fn composer_renders_theme_css_slots_and_background_image_cleanly(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        let (_composer, vcx) = cx.add_window_view(|window, cx| Composer::new(state.clone(), window, cx));
+
+        let colors = t3_core::themes::standard(true);
+        let slot_css = r#"
+            [data-chat-composer-form] { padding: 4px; }
+            [data-chat-composer-form]:hover { opacity: 0.99; }
+            [data-slot="composer-host"] { background: #141926; border: 2px solid #ff44aa; border-radius: 20px; }
+            [data-slot="composer-host"]:hover { border-color: #66ccff; }
+            [data-slot="composer-host"]:active { opacity: 0.96; }
+            .composer-tiptap { font-size: 16px; line-height: 1.5; color: #f8fafc; padding: 2px; }
+            .composer-tiptap:hover { opacity: 1; }
+        "#;
+        vcx.update(|window, cx| {
+            crate::theme::preview_with_css(Some((&colors, Some(slot_css), true)), cx);
+            assert!(slot_style(ThemeSlot::ChatComposerForm, cx).is_some());
+            assert!(slot_style(ThemeSlot::ComposerHost, cx).is_some());
+            assert!(slot_style(ThemeSlot::ComposerTiptap, cx).is_some());
+            window.blur();
+            window.draw(cx).clear();
+            window.draw(cx).clear();
+        });
+
+        let bg_image = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([0x44, 0x22, 0x88, 0xff])),
+        )]));
+        let bg_css = r#"
+            [data-slot="composer-host"] { background: var(--theme-background-image) center / cover no-repeat; border-radius: 18px; }
+        "#;
+        vcx.update(|window, cx| {
+            crate::theme::set_background_image(Some(bg_image), cx);
+            crate::theme::preview_with_css(Some((&colors, Some(bg_css), true)), cx);
+            assert!(theme_slot_background_layer(ThemeSlot::ComposerHost, cx).is_some());
+            window.blur();
+            window.draw(cx).clear();
+            window.draw(cx).clear();
+        });
+
+        vcx.update(|window, cx| {
+            crate::theme::preview(None, cx);
+            crate::theme::set_background_image(None, cx);
             window.blur();
             window.draw(cx).clear();
         });

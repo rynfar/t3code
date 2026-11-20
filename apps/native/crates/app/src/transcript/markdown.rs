@@ -28,7 +28,7 @@ use self::blocks::{
 };
 use self::links::MarkdownActionContext;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotHoverExt, apply_slot_override, hsla, palette, slot_style, theme_slot_background_layer};
 
 /// States kept regardless of when they were drawn; beyond this, states not drawn in the last
 /// few frames (rows the list no longer renders) are dropped and rebuilt if scrolled back to.
@@ -675,6 +675,18 @@ fn style(cx: &App) -> TextViewStyle {
         .line_height(theme.mono_font_size * 1.375);
     let mut code_block = if crate::theme::preferences(cx).typography.word_wrap { code_block.whitespace_normal() } else { code_block.whitespace_nowrap() };
     code_block.overflow.x = Some(gpui::Overflow::Scroll);
+    if let Some(set) = slot_style(ThemeSlot::ChatMarkdownCodeblock, cx) {
+        if !set.base.is_empty() {
+            apply_slot_override(&mut code_block, &set.base, cx);
+        }
+        if matches!(
+            set.base.background,
+            Some(t3_core::themes::slots::SlotBackground::ThemeBackgroundImage { .. })
+        ) && crate::theme::background_image(cx).is_some()
+        {
+            code_block.background = Some(gpui::Fill::Color(gpui::solid_background(gpui::transparent_black())));
+        }
+    }
     let mut table = StyleRefinement::default();
     table.overflow.x = Some(gpui::Overflow::Scroll);
     TextViewStyle {
@@ -832,6 +844,10 @@ pub fn prose(state: &MarkdownState, cx: &App) -> impl IntoElement {
         .line_height(px(22.75))
         .font_weight(FontWeight::NORMAL)
         .text_color(hsla(palette(cx).foreground).opacity(0.9))
+        .theme_slot_hover(ThemeSlot::ChatMarkdown, cx)
+        .when_some(theme_slot_background_layer(ThemeSlot::ChatMarkdown, cx), |this, layer| {
+            this.relative().overflow_hidden().child(layer)
+        })
         .child(markdown_view(state, cx))
 }
 
@@ -1438,5 +1454,76 @@ mod context_tests {
             .update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
             .expect("Copy on user_markdown_view must populate clipboard");
         assert_eq!(copied, "  indented line\n\tsecond line\n\u{00A0}\u{00A0}literal nbsp");
+    }
+
+    #[gpui::test]
+    fn markdown_prose_and_codeblock_apply_theme_css_slot_overrides_cleanly(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+        });
+        struct ProseHost {
+            state: MarkdownState,
+        }
+        impl gpui::Render for ProseHost {
+            fn render(&mut self, _window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+                div().size_full().child(prose(&self.state, cx))
+            }
+        }
+        let source: Arc<str> = Arc::from("Hello markdown\n\n```rust\nlet x = 42;\n```\n");
+        let (_view, vcx) = cx.add_window_view(|_, cx| {
+            let mut store = MarkdownStore::new(cx.entity_id());
+            let state = store.state("assistant:css-slot-test", &source, cx);
+            ProseHost { state }
+        });
+        vcx.run_until_parked();
+
+        let colors = t3_core::themes::standard(true);
+        let css = r#"
+            .chat-markdown { font-size: 16px; color: #f0f4ff; }
+            .chat-markdown:hover { opacity: 0.98; }
+            .chat-markdown-codeblock { background: #141824; border: 2px solid #ff55aa; border-radius: 14px; }
+            .chat-markdown-codeblock:hover { border-color: #55ccff; }
+            .chat-markdown-codeblock:active { opacity: 0.92; }
+        "#;
+        vcx.update(|window, cx| {
+            crate::theme::preview_with_css(Some((&colors, Some(css), true)), cx);
+            let tv_style = style(cx);
+            assert_eq!(
+                tv_style.code_block.background,
+                Some(gpui::Fill::Color(gpui::solid_background(hsla(0x1418_24ff))))
+            );
+            assert_eq!(tv_style.code_block.border_color, Some(hsla(0xff55_aaff)));
+            assert_eq!(tv_style.code_block.corner_radii.top_left, Some(px(14.).into()));
+            window.resize(gpui::size(px(480.), px(320.)));
+            window.draw(cx).clear();
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        // Scoped background image makes inner TextView code_block transparent so the outer card layer shows through.
+        let bg_image = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([0x33, 0x66, 0x99, 0xff]),
+        ))]));
+        let bg_css = r#"
+            .chat-markdown-codeblock { background: var(--theme-background-image) center / cover no-repeat; border-radius: 12px; }
+        "#;
+        vcx.update(|window, cx| {
+            crate::theme::set_background_image(Some(bg_image), cx);
+            crate::theme::preview_with_css(Some((&colors, Some(bg_css), true)), cx);
+            let tv_style = style(cx);
+            assert_eq!(
+                tv_style.code_block.background,
+                Some(gpui::Fill::Color(gpui::solid_background(gpui::transparent_black())))
+            );
+            assert!(theme_slot_background_layer(ThemeSlot::ChatMarkdownCodeblock, cx).is_some());
+            window.draw(cx).clear();
+            crate::theme::preview(None, cx);
+            crate::theme::set_background_image(None, cx);
+            window.draw(cx).clear();
+        });
     }
 }

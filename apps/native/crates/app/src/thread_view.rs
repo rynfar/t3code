@@ -34,9 +34,9 @@ use t3_core::diff::TurnDiffSummary;
 use crate::app_state::{AppEvent, AppState};
 use crate::glass;
 use crate::icons::Icon;
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotExt, ThemeSlotHoverExt, hsla, palette, theme_slot_background_layer};
 use crate::transcript::markdown::MarkdownStore;
-use crate::transcript::{Clock, CommandOutputSlot, Detail, FoldWorkState, RowEnv, SetupEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member, render_row};
+use crate::transcript::{Clock, CommandOutputSlot, Detail, FoldWorkState, RowEnv, SetupEnv, TimerKind, TranscriptUi, WorkingTimer, history_control, render_group_member};
 use crate::worktree_setup::{SetupEvent, WorktreeSetupStore};
 
 actions!(thread_view, [FindInThread]);
@@ -1750,6 +1750,52 @@ fn toggle(set: &mut std::collections::HashSet<String>, key: &str) -> bool {
     true
 }
 
+/// Maps a native `RowKind` to the exact `data-timeline-row-kind` string emitted by web's `MessagesTimeline.tsx`.
+fn timeline_row_kind(kind: &RowKind) -> &'static str {
+    match kind {
+        RowKind::Work { .. } => "work",
+        RowKind::WorkLive { .. } => "work-live",
+        RowKind::Working { .. } => "working",
+        RowKind::Thinking { .. } => "thinking",
+        RowKind::ViewedImages { .. } => "viewed-images",
+        RowKind::WorkToggle { .. } => "work-toggle",
+        RowKind::TurnFold { .. } => "turn-fold",
+        RowKind::AttemptFold { .. } => "attempt-fold",
+        RowKind::ContextCompaction { .. } => "context-compaction",
+        RowKind::Message { .. } => "message",
+        RowKind::AssistantMeta { .. } => "assistant-meta",
+        RowKind::Event { .. } => "event",
+        RowKind::ProposedPlan(_) => "proposed-plan",
+        RowKind::WorktreeSetup { .. } => "worktree-setup",
+        RowKind::HtmlRender(_) => "html-render",
+        RowKind::SentMessage(_) => "sent-message",
+        RowKind::McpApp(_) => "mcp-app",
+    }
+}
+
+fn render_row(
+    row: &Arc<TimelineRow>,
+    env: &RowEnv,
+    markdown: &mut MarkdownStore,
+    window: &mut Window,
+    cx: &mut Context<ThreadView>,
+) -> gpui::AnyElement {
+    let el = crate::transcript::render_row(row, env, markdown, window, cx);
+    let kind = timeline_row_kind(&row.kind);
+    let sheet = crate::theme::slot_stylesheet(cx);
+    let Some(set) = sheet.timeline_row(kind) else {
+        return el;
+    };
+    let mut wrapped = div().w_full().min_w_0().theme_slot_timeline_row(kind, cx);
+    if !set.hover.is_empty() {
+        wrapped = wrapped.hover(|mut style| {
+            crate::theme::apply_slot_override(&mut style, &set.hover, cx);
+            style
+        });
+    }
+    wrapped.child(el).into_any_element()
+}
+
 fn lane(content: gpui::AnyElement, first: bool, max_width: Option<gpui::Rems>, gutter: f32) -> gpui::AnyElement {
     div()
         .w_full()
@@ -2256,15 +2302,31 @@ impl Render for ThreadView {
         let loading = thread.projection.is_none() && !thread.is_merging_history();
         let muted = hsla(palette(cx).muted_foreground);
         if loading {
-            return div().size_full().flex().items_center().justify_center().text_sm().text_color(muted).child("Loading thread…").into_any_element();
+            return div()
+                .relative()
+                .size_full()
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(muted)
+                .theme_slot_hover(ThemeSlot::MessagesTimelineScroll, cx)
+                .children(theme_slot_background_layer(ThemeSlot::MessagesTimelineScroll, cx))
+                .child(div().relative().child("Loading thread…"))
+                .into_any_element();
         }
         if self.rows.is_empty() && self.history.is_none() && !self.footer_shown() {
             let banners = self.render_banners(cx);
             return div()
                 .relative()
                 .size_full()
+                .overflow_hidden()
+                .theme_slot_hover(ThemeSlot::MessagesTimelineScroll, cx)
+                .children(theme_slot_background_layer(ThemeSlot::MessagesTimelineScroll, cx))
                 .child(
                     div()
+                        .relative()
                         .size_full()
                         .pb(px(self.bottom_inset))
                         .flex()
@@ -2355,6 +2417,9 @@ impl Render for ThreadView {
                 div()
                     .relative()
                     .size_full()
+                    .overflow_hidden()
+                    .theme_slot_hover(ThemeSlot::MessagesTimelineScroll, cx)
+                    .children(theme_slot_background_layer(ThemeSlot::MessagesTimelineScroll, cx))
                     .child(transcript)
                     .child(
                         div()
@@ -2406,6 +2471,7 @@ struct TranscriptTypography {
     code_family: gpui::SharedString,
     code_size: gpui::Pixels,
     word_wrap: bool,
+    theme_revision: usize,
 }
 
 impl TranscriptTypography {
@@ -2417,6 +2483,7 @@ impl TranscriptTypography {
             code_family: crate::theme::font_family(FontRole::Code, cx),
             code_size: px(crate::theme::font_size(FontRole::Code, cx)),
             word_wrap: crate::theme::preferences(cx).typography.word_wrap,
+            theme_revision: crate::theme::revision(cx),
         }
     }
 }
@@ -2653,7 +2720,7 @@ mod tests {
         };
         draw(2400., cx);
         draw(100., cx);
-        let baseline = TranscriptTypography { rem_size: px(16.), interface_family: "System".into(), code_family: "Menlo".into(), code_size: px(13.), word_wrap: true };
+        let baseline = TranscriptTypography { rem_size: px(16.), interface_family: "System".into(), code_family: "Menlo".into(), code_size: px(13.), word_wrap: true, theme_revision: 0 };
         let mut previous = baseline.clone();
         remeasure_for_typography(baseline.clone(), &mut previous, &main_list, &groups);
         assert_eq!(main_list.bounds_for_item(99).unwrap().size.height, px(24.));
@@ -2674,6 +2741,7 @@ mod tests {
             TranscriptTypography { code_family: "Courier New".into(), ..baseline.clone() },
             TranscriptTypography { interface_family: "Arial".into(), ..baseline.clone() },
             TranscriptTypography { word_wrap: false, ..baseline.clone() },
+            TranscriptTypography { theme_revision: 1, ..baseline.clone() },
         ] {
             remeasure_for_typography(baseline.clone(), &mut previous, &main_list, &groups);
             draw(4000., cx);
@@ -4716,6 +4784,180 @@ mod tests {
         vcx.run_until_parked();
         view.read_with(vcx, |view, _| {
             assert!(!view.tail_in_list, "tail spacer item must be spliced out once bottom_inset returns to 0");
+        });
+    }
+
+    #[test]
+    fn timeline_row_kind_matches_web_data_attributes() {
+        assert_eq!(timeline_row_kind(&RowKind::Working { compacting: false }), "working");
+        assert_eq!(
+            timeline_row_kind(&RowKind::Thinking { group_id: None, expanded: false, label: None, live_answer_preview: None }),
+            "thinking"
+        );
+        assert_eq!(timeline_row_kind(&RowKind::ViewedImages { paths: Vec::new() }), "viewed-images");
+        assert_eq!(
+            timeline_row_kind(&RowKind::TurnFold { run_id: "r1".into(), label: "1 step".into(), expanded: false }),
+            "turn-fold"
+        );
+        assert_eq!(
+            timeline_row_kind(&RowKind::AttemptFold { attempt_id: "a1".into(), label: "1 step".into(), expanded: false }),
+            "attempt-fold"
+        );
+        assert_eq!(
+            timeline_row_kind(&RowKind::ContextCompaction {
+                label: "Compacted".into(),
+                tokens: None,
+                active: false,
+                title: None,
+                failed: false,
+                failure: None,
+            }),
+            "context-compaction"
+        );
+        assert_eq!(
+            timeline_row_kind(&RowKind::Work { entries: Vec::new(), expanded_group: false, display_label: None }),
+            "work"
+        );
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    fn thread_view_renders_all_timeline_and_transcript_theme_css_slots_cleanly(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
+        let (state, _old_fixture) = cx.update(|cx| crate::context_menu::project_filter_tests::install_state(cx, runtime.handle().clone()));
+        let (read_client, _read_fixture) = t3_client::supervisor::ClientFixture::handle_with_http_base(
+            serde_json::from_value(serde_json::json!({
+                "authenticated": true,
+                "permissions": ["orchestration:read"]
+            }))
+            .unwrap(),
+            "http://127.0.0.1:1".into(),
+        );
+        let shell = state.read_with(cx, |state, _| state.shell.clone());
+        let items = vec![
+            test_user_item("t1", 0, "m-user-1", "Please show an example rust function."),
+            serde_json::json!({
+                "position": 1,
+                "visibility": "local",
+                "sourceThreadId": "t1",
+                "sourceItemId": "w-1",
+                "item": {
+                    "id": "w-1",
+                    "threadId": "t1",
+                    "runId": "r0",
+                    "nodeId": null,
+                    "parentItemId": null,
+                    "ordinal": 2,
+                    "type": "command_execution",
+                    "status": "completed",
+                    "title": null,
+                    "startedAt": "2026-04-01T00:00:01.000Z",
+                    "completedAt": "2026-04-01T00:00:01.500Z",
+                    "updatedAt": "2026-04-01T00:00:01.500Z",
+                    "input": "cargo check"
+                }
+            }),
+            test_assistant_item(
+                "t1",
+                2,
+                "m-asst-1",
+                "r0",
+                "Here is an example:\n\n```rust\nfn greet() -> &'static str {\n    \"hello\"\n}\n```\n",
+            ),
+        ];
+        let snap = test_snapshot_json("t1", serde_json::json!([]), items);
+        state.update(cx, |state, cx| {
+            let mut shell = shell.clone();
+            shell.snapshot.as_mut().unwrap().threads = vec![serde_json::from_value(serde_json::json!({
+                "id": "t1", "projectId": "checkout-a", "title": "Theme CSS Slots",
+                "createdAt": "2026-04-01T00:00:00.000Z", "updatedAt": "2026-04-01T00:00:05.000Z",
+                "lastVisitedAt": null, "providerInstanceId": "replay",
+                "modelSelection": {"instanceId":"replay","model":"replay"},
+                "runtimeMode": "auto", "interactionMode": "default", "lineage": {"rootThreadId":"t1"},
+                "status": "idle", "hasActionableProposedPlan": false, "itemCount": 3, "visibleItemCount": 3
+            }))
+            .unwrap()];
+            state.install_active_environment(read_client.clone(), shell, state.server_config.clone(), t3_client::supervisor::ConnectionStatus::Connected, cx);
+            state.select_thread("t1", cx);
+            let parsed: t3_core::thread::ThreadStreamItem = serde_json::from_str(&snap).unwrap();
+            state.thread.apply(parsed);
+            cx.emit(AppEvent::Thread);
+        });
+
+        let (_view, vcx) = cx.add_window_view(|window, cx| {
+            let mut view = ThreadView::new(state.clone(), window, cx);
+            view.sync(cx);
+            view
+        });
+        vcx.run_until_parked();
+
+        // 1. Apply live CSS targeting all timeline + transcript hooks (base, :hover, :active, row-kind display:none).
+        let colors = t3_core::themes::standard(true);
+        let slot_css = r#"
+            .messages-timeline-scroll { background: #10141c; padding: 6px; }
+            .messages-timeline-scroll:hover { opacity: 0.98; }
+            [data-timeline-row-kind="message"] { padding: 4px; border-radius: 10px; }
+            [data-timeline-row-kind="message"]:hover { background: rgba(255, 255, 255, 0.03); }
+            [data-timeline-row-kind="work"] { display: none; }
+            [data-message-role="user"] { padding: 2px 4px; }
+            [data-message-role="user"]:hover { opacity: 0.99; }
+            [data-user-message-bubble] { background: linear-gradient(135deg, #223355, #332255); border: 1px solid #ff44aa; border-radius: 18px; }
+            [data-user-message-bubble]:hover { border-color: #66ccff; }
+            [data-message-role="assistant"] { padding: 4px 6px; }
+            [data-message-role="assistant"]:hover { opacity: 0.99; }
+            .chat-markdown { font-size: 15px; line-height: 1.6; color: #eef2ff; }
+            .chat-markdown:hover { opacity: 1; }
+            .chat-markdown-codeblock { background: #0c0f16; border: 2px solid #445577; border-radius: 12px; }
+            .chat-markdown-codeblock:hover { border-color: #ff44aa; }
+            .chat-markdown-codeblock:active { opacity: 0.95; }
+        "#;
+        vcx.update(|window, cx| {
+            crate::theme::preview_with_css(Some((&colors, Some(slot_css), true)), cx);
+            assert!(crate::theme::slot_style(ThemeSlot::MessagesTimelineScroll, cx).is_some());
+            assert!(crate::theme::slot_stylesheet(cx).timeline_row("message").is_some());
+            assert!(crate::theme::slot_style(ThemeSlot::UserMessageRow, cx).is_some());
+            assert!(crate::theme::slot_style(ThemeSlot::UserMessageBubble, cx).is_some());
+            assert!(crate::theme::slot_style(ThemeSlot::AssistantMessageRow, cx).is_some());
+            assert!(crate::theme::slot_style(ThemeSlot::ChatMarkdown, cx).is_some());
+            assert!(crate::theme::slot_style(ThemeSlot::ChatMarkdownCodeblock, cx).is_some());
+            window.draw(cx).clear();
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        // 2. Scope `var(--theme-background-image)` onto timeline scroll, user bubble, and code block cards.
+        let bg_image = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([0x22, 0x44, 0x88, 0xff]),
+        ))]));
+        let bg_css = r#"
+            .messages-timeline-scroll { background: var(--theme-background-image) center / cover no-repeat; }
+            [data-user-message-bubble] { background: var(--theme-background-image) center / cover no-repeat; }
+            .chat-markdown-codeblock { background: var(--theme-background-image) center / cover no-repeat; border-radius: 14px; }
+        "#;
+        vcx.update(|window, cx| {
+            crate::theme::set_background_image(Some(bg_image), cx);
+            crate::theme::preview_with_css(Some((&colors, Some(bg_css), true)), cx);
+            assert!(theme_slot_background_layer(ThemeSlot::MessagesTimelineScroll, cx).is_some());
+            assert!(theme_slot_background_layer(ThemeSlot::UserMessageBubble, cx).is_some());
+            assert!(theme_slot_background_layer(ThemeSlot::ChatMarkdownCodeblock, cx).is_some());
+            window.draw(cx).clear();
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        // 3. Clear preview and background image cleanly.
+        vcx.update(|window, cx| {
+            crate::theme::preview(None, cx);
+            crate::theme::set_background_image(None, cx);
+            window.draw(cx).clear();
+        });
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
         });
     }
 }

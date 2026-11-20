@@ -33,7 +33,7 @@ use crate::app_state::AppState;
 use crate::composer::controls::{Button, ButtonSize, ButtonVariant, Float, MenuItem, floating, menu_surface};
 use crate::icons::Icon;
 use crate::provider_icon::ProviderMark;
-use crate::theme::{hsla, palette};
+use crate::theme::{ThemeSlot, ThemeSlotHoverExt, hsla, palette, slot_style, theme_slot_background_layer};
 use crate::thread_view::ThreadView;
 use crate::toast::{Toast, ToastKind};
 
@@ -538,6 +538,8 @@ impl RenderOnce for CollapsibleAttributionCard {
             .gap(px(4.))
             .child(
                 h_flex()
+                    .relative()
+                    .overflow_hidden()
                     .max_w(relative(0.8))
                     .justify_between()
                     .gap(px(8.))
@@ -547,6 +549,8 @@ impl RenderOnce for CollapsibleAttributionCard {
                     .border_1()
                     .border_color(hsla(p.border).opacity(0.6))
                     .bg(self.surface)
+                    .theme_slot_hover(ThemeSlot::UserMessageBubble, cx)
+                    .children(theme_slot_background_layer(ThemeSlot::UserMessageBubble, cx))
                     .child(
                         focusable(
                             h_flex()
@@ -929,6 +933,10 @@ pub fn user_row(
         let _ = app_read;
         return v_flex()
             .w_full()
+            .theme_slot_hover(ThemeSlot::UserMessageRow, cx)
+            .when_some(theme_slot_background_layer(ThemeSlot::UserMessageRow, cx), |this, layer| {
+                this.relative().overflow_hidden().child(layer)
+            })
             .children(fresh_divider)
             .children(model_switch)
             .child(WorkflowOpeningCard {
@@ -999,9 +1007,14 @@ pub fn user_row(
             .children(standalone_audios)
             .into_any_element()
     });
+    let fade_surface = match slot_style(ThemeSlot::UserMessageBubble, cx).and_then(|s| s.base.background) {
+        Some(t3_core::themes::slots::SlotBackground::Solid(c)) => hsla(c),
+        _ => surface,
+    };
     let bubble = (!media_alone && !standalone_cards_mode).then(|| {
         v_flex()
             .relative()
+            .overflow_hidden()
             .min_w_0()
             .max_w(relative(0.8))
             .p(px(12.))
@@ -1013,6 +1026,8 @@ pub fn user_row(
             .text_size(px(14.))
             .line_height(px(22.75))
             .text_color(hsla(p.message_foreground))
+            .theme_slot_hover(ThemeSlot::UserMessageBubble, cx)
+            .children(theme_slot_background_layer(ThemeSlot::UserMessageBubble, cx))
             .children(bubble_chips)
             .children(media_in_bubble)
             .children(bubble_files)
@@ -1063,7 +1078,7 @@ pub fn user_row(
                                 .left_0()
                                 .right_0()
                                 .h(px(28.))
-                                .bg(linear_gradient(180., linear_color_stop(surface.opacity(0.), 0.), linear_color_stop(surface, 1.))),
+                                .bg(linear_gradient(180., linear_color_stop(fade_surface.opacity(0.), 0.), linear_color_stop(fade_surface, 1.))),
                         )
                     })
             }))
@@ -1119,6 +1134,10 @@ pub fn user_row(
         let preview = first_line_preview(display_text);
         return v_flex()
             .w_full()
+            .theme_slot_hover(ThemeSlot::UserMessageRow, cx)
+            .when_some(theme_slot_background_layer(ThemeSlot::UserMessageRow, cx), |this, layer| {
+                this.relative().overflow_hidden().child(layer)
+            })
             .children(fresh_divider)
             .children(model_switch)
             .child(CollapsibleAttributionCard {
@@ -1141,6 +1160,10 @@ pub fn user_row(
 
     v_flex()
         .w_full()
+        .theme_slot_hover(ThemeSlot::UserMessageRow, cx)
+        .when_some(theme_slot_background_layer(ThemeSlot::UserMessageRow, cx), |this, layer| {
+            this.relative().overflow_hidden().child(layer)
+        })
         .children(fresh_divider)
         .children(model_switch)
         .child(
@@ -1507,6 +1530,10 @@ pub fn assistant_row(row: &TimelineRow, env: &RowEnv, markdown: &mut MarkdownSto
         .min_w_0()
         .px(px(4.))
         .py(px(2.))
+        .theme_slot_hover(ThemeSlot::AssistantMessageRow, cx)
+        .when_some(theme_slot_background_layer(ThemeSlot::AssistantMessageRow, cx), |this, layer| {
+            this.relative().overflow_hidden().child(layer)
+        })
         .child(body)
         .children(env.turn_diffs.get(&message.id).and_then(|summary| super::changed_files::changed_files_card(&message.id, summary, env, cx)))
         .when(!show_meta && message.item.as_ref().is_some_and(|i| i.status == "interrupted"), |this| {
