@@ -18,6 +18,7 @@ mod notebook;
 mod office;
 mod pdf;
 mod preview;
+mod sqlite;
 mod table;
 #[cfg(feature = "snapshot")]
 pub(crate) use preview::MarkdownFixture;

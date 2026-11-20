@@ -752,11 +752,95 @@ impl Preview {
         }
     }
 
+    pub(super) fn binary_state_mut(&mut self) -> Option<&mut BinaryState> {
+        match &mut self.content {
+            Content::Binary(state) => Some(state),
+            _ => None,
+        }
+    }
+
     pub(super) fn set_binary_mode(&mut self, mode: BinaryViewMode, cx: &mut Context<Self>) {
         if let Content::Binary(state) = &mut self.content {
             state.set_mode(mode);
             cx.notify();
         }
+    }
+
+    pub(super) fn sqlite_select_table(&mut self, table_name: String, cx: &mut Context<Self>) {
+        let already_selected = matches!(
+            &self.content,
+            Content::Binary(BinaryState::Ready(ready))
+                if matches!(
+                    ready.sqlite.as_ref(),
+                    Some(binary::SqliteData::Ready(viewer))
+                        if viewer.selected_table.as_deref() == Some(table_name.as_str())
+                            && viewer.page == 0
+                            && matches!(viewer.page_state, binary::SqlitePageState::Ready(_))
+                )
+        );
+        if already_selected {
+            return;
+        }
+        self.sqlite_query_page(table_name, 0, cx);
+    }
+
+    pub(super) fn sqlite_select_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let table_name = match &self.content {
+            Content::Binary(BinaryState::Ready(ready)) => match ready.sqlite.as_ref() {
+                Some(binary::SqliteData::Ready(viewer)) => viewer.selected_table.clone(),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(table_name) = table_name {
+            self.sqlite_query_page(table_name, page, cx);
+        }
+    }
+
+    fn sqlite_query_page(&mut self, table_name: String, page: usize, cx: &mut Context<Self>) {
+        let preview_gen = self.generation;
+        let Some(Content::Binary(BinaryState::Ready(ready))) = Some(&mut self.content) else {
+            return;
+        };
+        let Some(binary::SqliteData::Ready(viewer)) = ready.sqlite.as_mut() else {
+            return;
+        };
+        let Some(table_info) = viewer.db.table(&table_name).cloned() else {
+            viewer.page_state = binary::SqlitePageState::Failed("This table is unavailable.".to_owned());
+            cx.notify();
+            return;
+        };
+        let range = t3_core::files::sqlite::sqlite_page_range(
+            table_info.row_count,
+            page,
+            t3_core::files::sqlite::SQLITE_PAGE_SIZE,
+        );
+        viewer.query_generation += 1;
+        let query_gen = viewer.query_generation;
+        viewer.selected_table = Some(table_name.clone());
+        viewer.page = range.page;
+        viewer.page_state = binary::SqlitePageState::Loading;
+        viewer.h_offset = px(0.);
+        let db = viewer.db.clone();
+        let target_page = range.page;
+        viewer.query_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { db.query_page(&table_name, target_page) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != preview_gen {
+                    return;
+                }
+                if let Content::Binary(BinaryState::Ready(ready)) = &mut this.content
+                    && let Some(binary::SqliteData::Ready(viewer)) = ready.sqlite.as_mut()
+                {
+                    viewer.apply_page_result(query_gen, result);
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
     }
 
     pub(super) fn archive_open_folder(&mut self, folder: String, cx: &mut Context<Self>) {
@@ -1346,6 +1430,173 @@ mod tests {
                 p.discard_unsaved_and_exit(cx);
                 assert!(!p.is_editing());
                 assert!(!p.is_dirty());
+            });
+            window.draw(cx).clear();
+        });
+
+        #[cfg(feature = "snapshot")]
+        state.update(vcx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+    }
+
+    #[gpui::test]
+    fn sqlite_preview_renders_tables_pages_generated_columns_hex_toggle_and_errors(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            cx.new(|cx| AppState::new(runtime.handle().clone(), cx))
+        });
+        let (preview, vcx) = cx.add_window_view(|_, cx| Preview::new(state.clone(), cx));
+
+        // 1. Multi-table DB with >50 rows, GENERATED ALWAYS AS columns, WITHOUT ROWID, BLOB & NULL.
+        let mut sql = String::from(
+            "CREATE TABLE a_items (id INTEGER PRIMARY KEY, label TEXT, raw BLOB);
+             CREATE TABLE z_orders (
+                 price INTEGER,
+                 qty INTEGER,
+                 total INTEGER GENERATED ALWAYS AS (price * qty) STORED,
+                 doubled INTEGER GENERATED ALWAYS AS (price * 2) VIRTUAL
+             );
+             INSERT INTO z_orders(price, qty) VALUES (7, 3);
+             CREATE TABLE z_empty (k TEXT PRIMARY KEY) WITHOUT ROWID;",
+        );
+        for idx in 1..=62 {
+            if idx == 1 {
+                sql.push_str("INSERT INTO a_items VALUES (1, NULL, X'CAFEBABE');");
+            } else {
+                sql.push_str(&format!("INSERT INTO a_items VALUES ({idx}, 'item-{idx}', NULL);"));
+            }
+        }
+        let db_bytes = super::super::sqlite::build_test_sqlite_bytes(&sql);
+
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_binary_for_test("data/app.sqlite", db_bytes, cx);
+                let Some(BinaryState::Ready(ready)) = p.binary_state() else {
+                    panic!("expected ready binary state");
+                };
+                assert_eq!(ready.mode, BinaryViewMode::Sqlite);
+                let Some(binary::SqliteData::Ready(viewer)) = ready.sqlite.as_ref() else {
+                    panic!("expected ready sqlite viewer");
+                };
+                assert_eq!(viewer.selected_table.as_deref(), Some("a_items"));
+                assert_eq!(viewer.page, 0);
+                let binary::SqlitePageState::Ready(page0) = &viewer.page_state else {
+                    panic!("expected initial page 0 ready");
+                };
+                assert_eq!(page0.rows.len(), 50);
+                assert_eq!(page0.rows[0][1].display, "NULL");
+                assert_eq!(page0.rows[0][2].display, "[blob: 4 bytes · ca fe ba be]");
+            });
+            window.draw(cx).clear();
+        });
+
+        // 2. Navigate to page 1 on `a_items` (rows 51..=62).
+        vcx.update(|_, cx| {
+            preview.update(cx, |p, cx| p.sqlite_select_page(1, cx));
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, _| {
+                let Some(BinaryState::Ready(ready)) = p.binary_state() else {
+                    panic!("expected ready binary state");
+                };
+                let Some(binary::SqliteData::Ready(viewer)) = ready.sqlite.as_ref() else {
+                    panic!("expected ready sqlite viewer");
+                };
+                assert_eq!(viewer.page, 1);
+                let binary::SqlitePageState::Ready(page1) = &viewer.page_state else {
+                    panic!("expected page 1 ready");
+                };
+                assert_eq!(page1.rows.len(), 12);
+                assert_eq!(page1.rows[0][0].display, "51");
+                assert_eq!(page1.rows[11][0].display, "62");
+            });
+            window.draw(cx).clear();
+        });
+
+        // 3. Switch to `z_orders` and verify STORED & VIRTUAL generated columns.
+        vcx.update(|_, cx| {
+            preview.update(cx, |p, cx| p.sqlite_select_table("z_orders".into(), cx));
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, _| {
+                let Some(BinaryState::Ready(ready)) = p.binary_state() else {
+                    panic!("expected ready binary state");
+                };
+                let Some(binary::SqliteData::Ready(viewer)) = ready.sqlite.as_ref() else {
+                    panic!("expected ready sqlite viewer");
+                };
+                assert_eq!(viewer.selected_table.as_deref(), Some("z_orders"));
+                let binary::SqlitePageState::Ready(page) = &viewer.page_state else {
+                    panic!("expected z_orders page ready");
+                };
+                let cols: Vec<&str> = page.columns.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(cols, vec!["price", "qty", "total", "doubled"]);
+                assert_eq!(page.rows[0][2].display, "21");
+                assert_eq!(page.rows[0][3].display, "14");
+            });
+            window.draw(cx).clear();
+        });
+
+        // 4. Switch to empty WITHOUT ROWID table and toggle Hex <-> Database cleanly.
+        vcx.update(|_, cx| {
+            preview.update(cx, |p, cx| p.sqlite_select_table("z_empty".into(), cx));
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+            preview.update(cx, |p, cx| {
+                p.set_binary_mode(BinaryViewMode::Hex, cx);
+                let Some(BinaryState::Ready(ready)) = p.binary_state() else {
+                    panic!("expected ready binary state");
+                };
+                assert_eq!(ready.mode, BinaryViewMode::Hex);
+            });
+            window.draw(cx).clear();
+            preview.update(cx, |p, cx| {
+                p.set_binary_mode(BinaryViewMode::Sqlite, cx);
+                let Some(BinaryState::Ready(ready)) = p.binary_state() else {
+                    panic!("expected ready binary state");
+                };
+                assert_eq!(ready.mode, BinaryViewMode::Sqlite);
+            });
+            window.draw(cx).clear();
+        });
+
+        // 5. Corrupt / encrypted `.sqlite` shows error in Database mode and still allows Hex inspection.
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_binary_for_test("broken.sqlite", b"encrypted-or-corrupt-payload".to_vec(), cx);
+                let Some(BinaryState::Ready(ready)) = p.binary_state() else {
+                    panic!("expected ready binary state for corrupt sqlite");
+                };
+                assert_eq!(ready.mode, BinaryViewMode::Sqlite);
+                assert!(matches!(ready.sqlite, Some(binary::SqliteData::Failed(_))));
+            });
+            window.draw(cx).clear();
+            preview.update(cx, |p, cx| p.set_binary_mode(BinaryViewMode::Hex, cx));
+            window.draw(cx).clear();
+        });
+
+        // 6. Empty database (0 tables) renders cleanly.
+        let empty_db = super::super::sqlite::build_test_sqlite_bytes("CREATE TABLE tmp (x INT); DROP TABLE tmp;");
+        vcx.update(|window, cx| {
+            preview.update(cx, |p, cx| {
+                p.load_binary_for_test("empty.db", empty_db, cx);
+                let Some(BinaryState::Ready(ready)) = p.binary_state() else {
+                    panic!("expected ready binary state");
+                };
+                let Some(binary::SqliteData::Ready(viewer)) = ready.sqlite.as_ref() else {
+                    panic!("expected ready sqlite viewer");
+                };
+                assert!(viewer.db.tables().is_empty());
             });
             window.draw(cx).clear();
         });
