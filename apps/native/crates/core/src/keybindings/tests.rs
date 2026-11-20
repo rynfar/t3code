@@ -535,11 +535,15 @@ fn formats_labels_on_mac_and_elsewhere() {
         ("arrowdown", "Down"),
         ("arrowleft", "Left"),
         ("arrowright", "Right"),
+        ("pageup", "PageUp"),
+        ("pagedown", "PageDown"),
         ("enter", "Enter"),
         ("в", "В"),
     ] {
         assert_eq!(format_shortcut_key_label(key), label);
     }
+    assert_eq!(format_shortcut_label(&sc("ctrl+pageup"), WIN), "Ctrl+PageUp");
+    assert_eq!(format_shortcut_label(&sc("shift+pagedown"), MAC), "⇧PageDown");
 }
 
 #[test]

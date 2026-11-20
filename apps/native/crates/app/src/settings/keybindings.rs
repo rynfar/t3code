@@ -259,7 +259,15 @@ impl SettingsView {
         cx.stop_propagation();
         if keystroke.key == "escape" {
             let saved = self.keybindings.saved_key(&target);
-            self.keybindings.draft_mut(&target).key = saved;
+            let unassigned = self.keybindings.rows().iter().find(|row| row.id == target && row.is_unassigned).cloned();
+            let draft = self.keybindings.draft_mut(&target);
+            draft.key = saved;
+            if let Some(row) = unassigned
+                && draft.when_expression() == row.default_when
+            {
+                draft.when = t3_core::keybindings::parse_keybinding_when_expression(&row.when);
+                draft.when_valid = true;
+            }
             self.stop_recording(&target, window, cx);
             return;
         }
@@ -271,7 +279,21 @@ impl SettingsView {
         else {
             return;
         };
-        self.keybindings.draft_mut(&target).key = next;
+        let unassigned_default_when = self
+            .keybindings
+            .rows()
+            .iter()
+            .find(|row| row.id == target && row.is_unassigned)
+            .map(|row| row.default_when.clone());
+        let draft = self.keybindings.draft_mut(&target);
+        draft.key = next;
+        // Giving an unassigned row a shortcut brings back its default condition (`pingdotgg/t3code#28687`).
+        if let Some(default_when) = unassigned_default_when
+            && draft.when_expression() == "false"
+        {
+            draft.when = t3_core::keybindings::parse_keybinding_when_expression(&default_when);
+            draft.when_valid = true;
+        }
         self.keybindings.armed = false;
         // An unchanged row swaps its field back for the pill, which takes focus.
         if !self.keybindings.is_dirty(&target) {
@@ -385,6 +407,16 @@ impl SettingsView {
             return;
         }
         if let Some(payload) = model::reset_payload(row) {
+            self.send_keybinding(SERVER_UPSERT_KEYBINDING, payload, row.command.clone(), Some(row.id.clone()), "Unable to save keybinding", cx);
+        }
+    }
+
+    fn unassign_binding(&mut self, row: &BindingRow, cx: &mut Context<Self>) {
+        self.keybindings.menu = None;
+        if !self.can_write_keybindings(cx) {
+            return;
+        }
+        if let Some(payload) = model::unassign_payload(row) {
             self.send_keybinding(SERVER_UPSERT_KEYBINDING, payload, row.command.clone(), Some(row.id.clone()), "Unable to save keybinding", cx);
         }
     }
@@ -661,12 +693,21 @@ impl SettingsView {
             .child(div().text_sm().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(row.label()))
             .when(row.source != model::BindingSource::Default, |this| this.child(source_badge(row.source.label(), cx)))
             .tooltip(text_tooltip(row.command.clone().into()));
-        let description = h_flex()
-            .h(r(24.))
-            .min_w_0()
-            .gap(r(6.))
-            .child(div().text_xs().text_color(hsla(p.muted_foreground).opacity(0.7)).child("When"))
-            .child(self.when_control(&row.id, &when, &draft, window, cx));
+        let description: AnyElement = if row.is_unassigned && !dirty {
+            div()
+                .text_xs()
+                .text_color(hsla(p.muted_foreground))
+                .child("No keyboard shortcut assigned. Click Unassigned to set one.")
+                .into_any_element()
+        } else {
+            h_flex()
+                .h(r(24.))
+                .min_w_0()
+                .gap(r(6.))
+                .child(div().text_xs().text_color(hsla(p.muted_foreground).opacity(0.7)).child("When"))
+                .child(self.when_control(&row.id, &when, &draft, window, cx))
+                .into_any_element()
+        };
 
         let save_id = row.id.clone();
         let save_view = view.clone();
@@ -783,7 +824,12 @@ impl SettingsView {
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.start_recording(&id, window, cx)))
             })
             .when(!can_write, |this| this.opacity(0.6))
-            .children(model::key_pill_parts(&row.key, MAC).into_iter().map(|part| kbd(part, cx)))
+            .when(row.is_unassigned, |this| {
+                this.child(div().text_sm().text_color(hsla(p.muted_foreground)).child("Unassigned"))
+            })
+            .when(!row.is_unassigned, |this| {
+                this.children(model::key_pill_parts(&row.key, MAC).into_iter().map(|part| kbd(part, cx)))
+            })
             .into_any_element()
     }
 
@@ -830,9 +876,9 @@ impl SettingsView {
             .into_any_element()
     }
 
-    /// `KeybindingHoverRowMenu`: Reset to default and Remove, shown on row hover.
+    /// `KeybindingHoverRowMenu`: Reset to default, Unassign, and Remove, shown on row hover.
     fn row_menu(&self, row: &BindingRow, disabled: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !row.can_reset() && !row.can_remove() {
+        if !row.can_reset() && !row.can_unassign() && !row.can_remove() {
             return None;
         }
         let p = palette(cx);
@@ -863,7 +909,7 @@ impl SettingsView {
                     .hover(|this| this.bg(hsla(p.accent)))
                     .child(label)
             };
-            let (reset_row, remove_row) = (row.clone(), row.clone());
+            let (reset_row, unassign_row, remove_row) = (row.clone(), row.clone(), row.clone());
             div().absolute().bottom_0().right_0().child(
                 gpui::deferred(
                     gpui::anchored().anchor(gpui::Anchor::TopRight).snap_to_window_with_margin(px(8.)).child(
@@ -883,6 +929,9 @@ impl SettingsView {
                             }))
                             .when(row.can_reset(), |this| {
                                 this.child(item("Reset to default", false).on_click(cx.listener(move |this, _, _, cx| this.reset_binding(&reset_row, cx))))
+                            })
+                            .when(row.can_unassign(), |this| {
+                                this.child(item("Unassign", true).on_click(cx.listener(move |this, _, _, cx| this.unassign_binding(&unassign_row, cx))))
                             })
                             .when(row.can_remove(), |this| {
                                 this.child(item("Remove", true).on_click(cx.listener(move |this, _, _, cx| this.remove_binding(&remove_row, cx))))

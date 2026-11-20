@@ -305,6 +305,8 @@ pub fn format_shortcut_key_label(key: &str) -> String {
         "arrowdown" => "Down".to_owned(),
         "arrowleft" => "Left".to_owned(),
         "arrowright" => "Right".to_owned(),
+        "pageup" => "PageUp".to_owned(),
+        "pagedown" => "PageDown".to_owned(),
         _ => {
             let mut chars = key.chars();
             chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())

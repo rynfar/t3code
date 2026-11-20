@@ -345,6 +345,31 @@ impl ThreadTerminalLayout {
         .normalized()
     }
 
+    /// `reconcileThreadTerminalSessionIds` (`pingdotgg/t3code#38998`): adds any newly visible
+    /// server terminals and closes any terminal that was previously observed on this same manager
+    /// snapshot and has since disappeared (closed by another client), closing non-active terminals
+    /// before the active one so surviving panes stay selected.
+    pub fn with_reconciled_observed(&self, server_ids: &[String], previous_server_ids: &[String]) -> Self {
+        let normalized = self.normalized();
+        let added: Vec<String> = server_ids.iter().filter(|id| !normalized.terminal_ids.contains(id)).cloned().collect();
+        let mut next = if added.is_empty() {
+            normalized.clone()
+        } else {
+            let mut ids = normalized.terminal_ids.clone();
+            ids.extend(added);
+            ThreadTerminalLayout { terminal_ids: ids, ..normalized.clone() }.normalized()
+        };
+        for id in previous_server_ids {
+            if id != &normalized.active_terminal_id && !server_ids.contains(id) {
+                next = next.with_closed(id);
+            }
+        }
+        if !server_ids.contains(&normalized.active_terminal_id) && previous_server_ids.contains(&normalized.active_terminal_id) {
+            next = next.with_closed(&normalized.active_terminal_id);
+        }
+        next
+    }
+
     /// `reconcileThreadTerminalSessionIds`: adopt the server's list, keeping groups that survive.
     pub fn with_reconciled(&self, next_ids: &[String]) -> Self {
         let normalized = self.normalized();
@@ -404,12 +429,27 @@ impl ThreadTerminalLayout {
     }
 }
 
+/// Identifies which server terminal manager produced a metadata snapshot (`pingdotgg/t3code#38998`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotId {
+    Manager(String),
+    Ephemeral(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerObservation {
+    ids: Vec<String>,
+    snapshot_id: SnapshotId,
+}
+
 /// Every thread's layout plus the terminals a close is still removing, so a server list that
-/// lags the close does not bring them back. Only the layouts are persisted.
+/// lags the close does not bring them back, and the server ids last observed per thread so a
+/// terminal closed by another client is dropped (`pingdotgg/t3code#38998`, `pingdotgg/t3code#39260`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TerminalLayouts {
     by_thread: HashMap<String, ThreadTerminalLayout>,
     suppressed: HashMap<String, Vec<String>>,
+    observations: HashMap<String, ServerObservation>,
 }
 
 impl TerminalLayouts {
@@ -421,7 +461,7 @@ impl TerminalLayouts {
             .map(|(thread_id, layout)| (thread_id, layout.normalized()))
             .filter(|(_, layout)| !layout.is_default())
             .collect();
-        TerminalLayouts { by_thread, suppressed: HashMap::new() }
+        TerminalLayouts { by_thread, suppressed: HashMap::new(), observations: HashMap::new() }
     }
 
     /// What is persisted: the layouts, without the in-flight close suppressions.
@@ -457,6 +497,22 @@ impl TerminalLayouts {
         }
         if let Some((terminal_id, suppress)) = suppression {
             let terminal_id = terminal_id.trim();
+            // A listing from before this client placed the id is about an earlier terminal, so it
+            // must not make reconcile close the new one (`pingdotgg/t3code#39260`).
+            if !suppress
+                && !terminal_id.is_empty()
+                && !current.terminal_ids.iter().any(|id| id == terminal_id)
+                && let Some(obs) = self.observations.get_mut(thread_id)
+            {
+                let before = obs.ids.len();
+                obs.ids.retain(|id| id != terminal_id);
+                if obs.ids.len() != before {
+                    changed = true;
+                }
+                if obs.ids.is_empty() {
+                    self.observations.remove(thread_id);
+                }
+            }
             let ids = self.suppressed.entry(thread_id.to_owned()).or_default();
             let present = ids.iter().any(|id| id == terminal_id);
             if !terminal_id.is_empty() && present != suppress {
@@ -512,6 +568,39 @@ impl TerminalLayouts {
             },
             None,
         )
+    }
+
+    /// Reconciles against a server metadata snapshot (`pingdotgg/t3code#38998`, `pingdotgg/t3code#39260`).
+    /// Drops terminals previously observed on the same manager snapshot that have since disappeared,
+    /// while preserving newly created local terminals not yet seen by the server.
+    pub fn reconcile_with_snapshot(&mut self, thread_id: &str, server_ids: &[String], snapshot_id: &SnapshotId) -> bool {
+        if thread_id.is_empty() {
+            return false;
+        }
+        let previous = self.observations.get(thread_id).cloned();
+        let previous_ids: Vec<String> = match &previous {
+            Some(obs) if obs.snapshot_id == *snapshot_id => obs.ids.clone(),
+            _ => Vec::new(),
+        };
+        let layout_changed = self.update(
+            thread_id,
+            |layout, suppressed| {
+                let visible: Vec<String> = server_ids.iter().filter(|id| !suppressed.contains(id)).cloned().collect();
+                layout.with_reconciled_observed(&visible, &previous_ids)
+            },
+            None,
+        );
+        let mut observed_ids = server_ids.to_vec();
+        observed_ids.sort();
+        if observed_ids.is_empty() {
+            self.observations.remove(thread_id);
+        } else {
+            let next = ServerObservation { ids: observed_ids, snapshot_id: snapshot_id.clone() };
+            if previous.as_ref() != Some(&next) {
+                self.observations.insert(thread_id.to_owned(), next);
+            }
+        }
+        layout_changed
     }
 }
 

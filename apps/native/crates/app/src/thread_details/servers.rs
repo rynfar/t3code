@@ -12,9 +12,10 @@ use serde_json::json;
 use t3_client::session::RpcError;
 use t3_client::supervisor::ConnectionStatus;
 use t3_core::auth::TERMINAL_OPERATE_SCOPE;
+use t3_core::preview::address::resolve_external_server_url;
 use t3_core::preview::{DiscoveredServer, PREVIEW_OPERATE_SCOPE, decode_discovered_servers, method};
 use t3_core::thread_details::{
-    SERVER_PAGE_COUNT, can_stop_server, filter_thread_servers, resolve_discovered_server_url, server_subtitle, stop_server_error_message,
+    SERVER_PAGE_COUNT, can_stop_server, filter_thread_servers, server_subtitle, stop_server_error_message,
     stop_server_payload, visible_server_page,
 };
 
@@ -186,7 +187,7 @@ impl ServersFeed {
             .map(|server| {
                 let port = server.port;
                 let preview_url = server.url.clone();
-                let external_url = resolve_discovered_server_url(&server.url, env_http_base.as_deref());
+                let external_url = resolve_external_server_url(&server.url, env_http_base.as_deref());
                 let middle_url = external_url.clone();
                 let target_thread = thread_id.to_owned();
                 let subtitle = server_subtitle(server);

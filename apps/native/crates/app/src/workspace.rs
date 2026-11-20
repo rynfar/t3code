@@ -6,9 +6,9 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    ClickEvent, ClipboardItem, Context, DragMoveEvent, EmptyView, Entity, FocusHandle, Focusable, FontWeight, IntoElement, MouseButton,
-    ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window, WindowControlArea, div,
-    prelude::*, px,
+    Animation, AnimationExt as _, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, EmptyView, Entity, FocusHandle, Focusable,
+    FontWeight, IntoElement, MouseButton, ParentElement, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window,
+    WindowControlArea, div, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::status::{HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
@@ -55,6 +55,14 @@ pub fn sidebar_inline_width(state: &AppState, viewport_width: f32) -> f32 {
 }
 
 struct SidebarResize;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SidebarAnimation {
+    seq: u64,
+    duration_ms: u32,
+    opening: bool,
+    from_width: f32,
+}
 
 struct WorkspaceAreaFocus {
     sidebar: FocusHandle,
@@ -111,6 +119,12 @@ pub struct Workspace {
     ssh_prompt: Entity<crate::ssh_prompt::SshPromptDialog>,
     /// A rail drag is live; `has_active_drag` alone also matches row and tab drags.
     rail_dragging: bool,
+    /// Tracks inline sidebar visibility across frames for `panelAnimationDurationMs` (`ST-APPEARANCE`).
+    last_sidebar_open: Option<bool>,
+    last_sidebar_width: f32,
+    sidebar_animation: Option<SidebarAnimation>,
+    sidebar_animation_seq: u64,
+    _sidebar_close_animation_task: Option<Task<()>>,
     theme_background: t3_core::themes::background::ThemeBackgroundTracker,
     theme_background_task: Option<Task<()>>,
     _save_sidebar_width: Option<Task<()>>,
@@ -321,6 +335,11 @@ impl Workspace {
             device_setup,
             ssh_prompt,
             rail_dragging: false,
+            last_sidebar_open: None,
+            last_sidebar_width: layout::DEFAULT_WIDTH,
+            sidebar_animation: None,
+            sidebar_animation_seq: 0,
+            _sidebar_close_animation_task: None,
             theme_background: t3_core::themes::background::ThemeBackgroundTracker::new(),
             theme_background_task: None,
             _save_sidebar_width: None,
@@ -615,12 +634,14 @@ impl Render for Workspace {
         let pane_height = f32::from(window.viewport_size().height);
         self.sync_theme_background(cx);
         self.sync_window_title(window, cx);
-        let theme = cx.theme();
         let state = self.state.read(cx);
         let has_thread = state.selected_thread.is_some();
         let has_draft = !has_thread && state.draft_project.is_some();
         let viewport = f32::from(window.viewport_size().width);
         let sidebar_width = sidebar_inline_width(state, viewport);
+        let sidebar_open = sidebar_width > 0.;
+        let sidebar_animation_ms = crate::settings::store::try_client(cx)
+            .map_or(t3_core::client_settings::DEFAULT_PANEL_ANIMATION_DURATION_MS, |doc| doc.panel_animation_duration_ms());
         let sheet = state.sidebar_sheet.is_open().then(|| layout::sheet_width(viewport));
         let running = state.is_selected_thread_running();
         let panel = state.panel_thread().as_deref().map(|thread| state.panels.panels.panel(thread));
@@ -639,6 +660,48 @@ impl Render for Workspace {
         let on_issues = state.issues_open && !on_pull_requests;
         let on_utility_page = on_pull_requests || on_issues;
         let composer_replaced = self.composer_replaced;
+        self.update_sidebar_animation(sidebar_open, sidebar_width, sidebar_animation_ms, sheet.is_some(), cx);
+        let sidebar_anim = self.sidebar_animation;
+        let theme = cx.theme();
+        let sidebar_el: Option<gpui::AnyElement> = if sidebar_open {
+            let base = div()
+                .track_focus(&self.area_focus.sidebar)
+                .w(px(sidebar_width))
+                .h_full()
+                .flex_none()
+                .bg(theme.sidebar)
+                .border_r_1()
+                .border_color(hsla(palette(cx).sidebar_edge))
+                .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full()));
+            Some(match sidebar_anim {
+                Some(anim) if anim.opening => base
+                    .overflow_hidden()
+                    .with_animation(
+                        ElementId::Name(format!("left-sidebar-open-{}", anim.seq).into()),
+                        Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
+                        move |el, delta| el.w(px(sidebar_width * delta)),
+                    )
+                    .into_any_element(),
+                _ => base.into_any_element(),
+            })
+        } else {
+            sidebar_anim.filter(|a| !a.opening).map(|anim| {
+                div()
+                    .id("left-sidebar-closing")
+                    .h_full()
+                    .flex_none()
+                    .overflow_hidden()
+                    .bg(theme.sidebar)
+                    .border_r_1()
+                    .border_color(hsla(palette(cx).sidebar_edge))
+                    .with_animation(
+                        ElementId::Name(format!("left-sidebar-close-{}", anim.seq).into()),
+                        Animation::new(Duration::from_millis(u64::from(anim.duration_ms))).with_easing(ease_out_quint()),
+                        move |el, delta| el.w(px(anim.from_width * (1. - delta))),
+                    )
+                    .into_any_element()
+            })
+        };
         h_flex()
             .track_focus(&focus)
             .relative()
@@ -823,19 +886,7 @@ impl Render for Workspace {
             .on_action(move |action: &crate::worktree_setup::OpenSetupTerminal, window, cx| {
                 drawer.update(cx, |drawer, cx| drawer.open_terminal(&action.terminal_id, window, cx))
             })
-            .when(sidebar_width > 0., |this| {
-                this.child(
-                    div()
-                        .track_focus(&self.area_focus.sidebar)
-                        .w(px(sidebar_width))
-                        .h_full()
-                        .flex_none()
-                        .bg(theme.sidebar)
-                        .border_r_1()
-                        .border_color(hsla(palette(cx).sidebar_edge))
-                        .child(self.sidebar.clone().cached(gpui::StyleRefinement::default().size_full())),
-                )
-            })
+            .children(sidebar_el)
             .when(on_pull_requests, |this| this.child(div().flex_1().h_full().min_w_0().child(self.pull_requests.clone())))
             .when(on_issues, |this| this.child(div().flex_1().h_full().min_w_0().child(self.issues.clone())))
             .when(!maximized && !on_utility_page, |this| {
@@ -952,6 +1003,59 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    fn update_sidebar_animation(
+        &mut self,
+        sidebar_open: bool,
+        sidebar_width: f32,
+        sidebar_animation_ms: u32,
+        is_sheet: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let sidebar_opened = self.last_sidebar_open == Some(false) && sidebar_open;
+        let sidebar_closed = self.last_sidebar_open == Some(true) && !sidebar_open;
+        self.last_sidebar_open = Some(sidebar_open);
+        if sidebar_open {
+            self.last_sidebar_width = sidebar_width;
+        }
+        if sidebar_animation_ms == 0 || is_sheet {
+            self.sidebar_animation = None;
+            self._sidebar_close_animation_task = None;
+        } else if sidebar_opened {
+            self._sidebar_close_animation_task = None;
+            self.sidebar_animation_seq = self.sidebar_animation_seq.wrapping_add(1);
+            self.sidebar_animation = Some(SidebarAnimation {
+                seq: self.sidebar_animation_seq,
+                duration_ms: sidebar_animation_ms,
+                opening: true,
+                from_width: 0.,
+            });
+        } else if sidebar_closed {
+            let from_width = self.last_sidebar_width.max(1.);
+            self.sidebar_animation_seq = self.sidebar_animation_seq.wrapping_add(1);
+            let seq = self.sidebar_animation_seq;
+            self.sidebar_animation = Some(SidebarAnimation {
+                seq,
+                duration_ms: sidebar_animation_ms,
+                opening: false,
+                from_width,
+            });
+            let wait = Duration::from_millis(u64::from(sidebar_animation_ms) + 16);
+            self._sidebar_close_animation_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |ws, cx| {
+                    if ws.sidebar_animation.is_some_and(|a| !a.opening && a.seq == seq) {
+                        ws.sidebar_animation = None;
+                        ws._sidebar_close_animation_task = None;
+                        cx.notify();
+                    }
+                });
+            }));
+        } else if sidebar_open && self.sidebar_animation.is_some_and(|a| !a.opening) {
+            self.sidebar_animation = None;
+            self._sidebar_close_animation_task = None;
+        }
+    }
+
     fn resize_sidebar(&mut self, event: &DragMoveEvent<SidebarResize>, window: &mut Window, cx: &mut Context<Self>) {
         let viewport = f32::from(window.viewport_size().width);
         let current = sidebar_inline_width(self.state.read(cx), viewport);
@@ -2325,6 +2429,50 @@ mod tests {
                 "slow rpc toast must close once pending slow requests clear"
             );
         });
+
+        // 9. `panelAnimationDurationMs` (`#1`) drives left sidebar open/close transitions, `Shift+F6`
+        // moves focus from right-panel/side-chat back to main chat (`pingdotgg/t3code#31931`), and
+        // right-panel shortcuts work on unsent draft threads (`pingdotgg/t3code#35189`).
+        cx.update(|cx| {
+            crate::settings::store::install_committed_client(
+                &state,
+                serde_json::from_value(json!({ "panelAnimationDurationMs": 180 })).unwrap(),
+                cx,
+            );
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |ws, cx| {
+                let anim_ms = crate::settings::store::try_client(cx)
+                    .map_or(0, |doc| doc.panel_animation_duration_ms());
+                assert_eq!(anim_ms, 180);
+                // Establish initial sidebar open state, then close -> closing animation, reopen -> opening animation.
+                ws.update_sidebar_animation(true, 280., anim_ms, false, cx);
+                assert_eq!(ws.last_sidebar_open, Some(true));
+                assert!(ws.sidebar_animation.is_none());
+
+                ws.update_sidebar_animation(false, 0., anim_ms, false, cx);
+                assert!(ws.sidebar_animation.is_some_and(|a| !a.opening && a.duration_ms == 180 && a.from_width == 280.));
+
+                ws.update_sidebar_animation(true, 280., anim_ms, false, cx);
+                assert!(ws.sidebar_animation.is_some_and(|a| a.opening && a.duration_ms == 180));
+
+                // `Shift+F6` from inside right-panel (including side chat) moves focus to main chat.
+                ws.area_focus.right_panel.focus(window, cx);
+                assert!(ws.area_focus.right_panel.contains_focused(window, cx));
+                ws.move_workspace_focus(false, window, cx);
+                assert!(!ws.area_focus.right_panel.contains_focused(window, cx));
+
+                // Unsent draft thread still has a `panel_thread()` and opens the right panel cleanly.
+                ws.state.update(cx, |state, cx| {
+                    state.start_draft(&expected_project, cx);
+                    assert_eq!(state.panel_thread().as_deref(), Some(format!("draft:{expected_project}").as_str()));
+                    state.toggle_right_panel(cx);
+                    let panel_key = state.panel_thread().expect("draft panel thread");
+                    assert!(state.panels.panels.panel(&panel_key).is_open);
+                });
+            });
+        })
+        .unwrap();
 
         state.update(cx, |state, _| state.stop_pump());
         cx.update(|cx| {

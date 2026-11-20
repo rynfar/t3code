@@ -20,9 +20,9 @@ use gpui_component::{ActiveTheme, h_flex, v_flex};
 use t3_client::preview_stream::{Frame, PreviewStream, StreamEvent, StreamSender, StreamTarget, download_file, upload_file_chooser};
 use t3_core::preview::annotation::{AnnotationRegion, AnnotationTarget};
 use t3_core::preview::stream::{
-    AGENT_CURSOR_ACTIVE_MS, Control, Controller, FileChooserOffer, HostSetup, KeyAction, MouseAction, MouseButton as PageButton, Pointer,
-    RESIZE_THROTTLE_MS, StreamInput, StreamMessage, UploadFile, Viewport, WHEEL_LINE_PX, control_label, cursor_position, dom_key, fit, grow_cap,
-    may_send, modifiers, page_point,
+    AGENT_CURSOR_ACTIVE_MS, Control, Controller, FileChooserOffer, HostSetup, KeyAction, MouseAction, MouseButton as PageButton,
+    NO_FRAME_STALLED_MESSAGE, NO_FRAME_TIMEOUT_MS, Pointer, RESIZE_THROTTLE_MS, StreamInput, StreamMessage, UploadFile, Viewport, WHEEL_LINE_PX,
+    control_label, cursor_position, dom_key, fit, grow_cap, may_send, modifiers, page_point,
 };
 
 use super::annotation::crop_frame_to_png;
@@ -98,6 +98,10 @@ pub struct FrameView {
     host_setup: Option<HostSetup>,
     refused: bool,
     gone: bool,
+    /// `framesStalled` (`ServerBrowserSurface.tsx`, `pingdotgg/t3code#38865`): connected without
+    /// receiving any frame for `NO_FRAME_TIMEOUT_MS`.
+    frames_stalled: bool,
+    no_frame_task: Option<Task<()>>,
     /// The page area in window coordinates, from the last layout.
     bounds: Option<Bounds<Pixels>>,
     /// The page area size last sent as `resize`, in logical px.
@@ -180,6 +184,8 @@ impl FrameView {
             host_setup: None,
             refused: false,
             gone: false,
+            frames_stalled: false,
+            no_frame_task: None,
             bounds: None,
             sent_size: None,
             cap: None,
@@ -204,6 +210,10 @@ impl FrameView {
 
     pub fn has_frame(&self) -> bool {
         self.image.is_some()
+    }
+
+    pub fn frames_stalled(&self) -> bool {
+        self.frames_stalled
     }
 
     pub fn panel_size(&self) -> Option<(f64, f64)> {
@@ -325,8 +335,10 @@ impl FrameView {
     fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.live = None;
         self.file_chooser = None;
+        self.no_frame_task = None;
+        let cleared_stall = std::mem::take(&mut self.frames_stalled);
         self.clear_input();
-        if self.control.take().is_some() {
+        if self.control.take().is_some() || cleared_stall {
             cx.emit(FrameEvent::Changed);
         }
         cx.notify();
@@ -335,18 +347,22 @@ impl FrameView {
     fn reconnect(&mut self, cx: &mut Context<Self>) {
         self.live = None;
         self.file_chooser = None;
+        self.no_frame_task = None;
+        self.frames_stalled = false;
         self.connect(cx);
     }
 
     fn show_frame(&mut self, frame: &Decoded, cx: &mut Context<Self>) {
         let first = self.image.is_none();
+        self.no_frame_task = None;
+        let cleared_stall = std::mem::take(&mut self.frames_stalled);
         if let Some(stale) = self.retired.take() {
             cx.drop_image(stale, None);
         }
         self.retired = self.image.replace(frame.image.clone());
         self.latest_jpeg = Some(frame.jpeg.clone());
         self.frame_size = frame.size;
-        if first {
+        if first || cleared_stall {
             cx.emit(FrameEvent::Changed);
         }
         cx.notify();
@@ -355,13 +371,29 @@ impl FrameView {
     fn on_event(&mut self, event: StreamEvent, cx: &mut Context<Self>) {
         match event {
             StreamEvent::Connected(connected) => {
-                if !connected {
-                    self.file_chooser = None;
-                    self.control = None;
-                    self.clear_input();
-                    cx.emit(FrameEvent::Changed);
-                    cx.notify();
+                self.no_frame_task = None;
+                if connected {
+                    if self.image.is_none() {
+                        self.no_frame_task = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(Duration::from_millis(NO_FRAME_TIMEOUT_MS)).await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.no_frame_task = None;
+                                if this.image.is_none() {
+                                    this.frames_stalled = true;
+                                    cx.emit(FrameEvent::Changed);
+                                    cx.notify();
+                                }
+                            });
+                        }));
+                    }
+                    return;
                 }
+                self.frames_stalled = false;
+                self.file_chooser = None;
+                self.control = None;
+                self.clear_input();
+                cx.emit(FrameEvent::Changed);
+                cx.notify();
             }
             StreamEvent::FileChooser(offer) => {
                 if self.file_chooser != offer {
@@ -372,12 +404,16 @@ impl FrameView {
             StreamEvent::Message(message) => self.on_message(message, cx),
             StreamEvent::Gone => {
                 self.gone = true;
+                self.no_frame_task = None;
+                self.frames_stalled = false;
                 self.file_chooser = None;
                 self.live = None;
                 cx.notify();
             }
             StreamEvent::HostSetup(setup) => {
                 self.host_setup = Some(setup);
+                self.no_frame_task = None;
+                self.frames_stalled = false;
                 self.file_chooser = None;
                 self.live = None;
                 cx.emit(FrameEvent::Changed);
@@ -385,6 +421,8 @@ impl FrameView {
             }
             StreamEvent::Refused => {
                 self.refused = true;
+                self.no_frame_task = None;
+                self.frames_stalled = false;
                 self.file_chooser = None;
                 self.live = None;
                 cx.emit(FrameEvent::Changed);
@@ -1005,6 +1043,25 @@ impl FrameView {
         })
     }
 
+    fn render_stalled_frames(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        if !self.visible || !self.frames_stalled || self.blocks() {
+            return None;
+        }
+        let p = palette(cx);
+        Some(
+            v_flex()
+                .id("preview-no-frames")
+                .absolute()
+                .inset_0()
+                .items_center()
+                .justify_center()
+                .p(px(16.))
+                .bg(hsla(p.background))
+                .text_center()
+                .child(div().max_w(px(384.)).text_sm().text_color(hsla(p.muted_foreground)).child(NO_FRAME_STALLED_MESSAGE)),
+        )
+    }
+
     fn render_blocker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let p = palette(cx);
         let base = || {
@@ -1139,6 +1196,7 @@ impl Render for FrameView {
                     .child(page)
                     .children(self.render_cursor(cx))
                     .children(self.render_pick_overlay(cx))
+                    .children(self.render_stalled_frames(cx))
                     .children(self.render_file_chooser(cx))
                     .children(self.render_dialog(cx))
                     .children(self.render_blocker(cx)),

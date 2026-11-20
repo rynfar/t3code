@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use serde_json::Value;
 use t3_client::session::RpcError;
 use t3_client::supervisor::ClientHandle;
 use t3_core::terminal::emulator::{Emulator, FairMutex, Snapshot, ThemeColors};
@@ -18,7 +17,7 @@ use t3_core::terminal::{
     self, AttachEvent, BufferState, BufferStatus, Grid, GridReplay, LaunchLocation, LifecycleCommand, OutputOp, SessionFollow, SessionMode,
     TerminalAccess, method,
 };
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 const AUTHORIZATION_ERROR: &str = "EnvironmentAuthorizationError";
 /// Output parsed per hold of the emulator lock, as alacritty bounds its reader.
@@ -114,6 +113,12 @@ impl Drop for AbortOnDrop {
     }
 }
 
+struct WriteJob {
+    data: String,
+    binary: Option<bool>,
+    on_error: oneshot::Sender<RpcError>,
+}
+
 pub struct Session {
     pub target: Arc<Target>,
     pub shared: Shared,
@@ -121,6 +126,8 @@ pub struct Session {
     scratch: RefCell<Frame>,
     client: ClientHandle,
     runtime: tokio::runtime::Handle,
+    write_tx: mpsc::UnboundedSender<WriteJob>,
+    _writer: AbortOnDrop,
     _driver: AbortOnDrop,
     _publisher: AbortOnDrop,
 }
@@ -172,6 +179,8 @@ impl Session {
         let target = Arc::new(target);
         let notifier = Notifier { signals, pending: pending.clone() };
         let dirty = Arc::new(Notify::new());
+        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let writer = runtime.spawn(run_writer(target.clone(), client.clone(), shared.clone(), write_rx));
         let publisher = runtime.spawn(publish_frames(shared.clone(), front.clone(), dirty.clone(), notifier.clone()));
         let driver = Driver { target: target.clone(), client: client.clone(), shared: shared.clone(), notifier, dirty };
         let handle = runtime.spawn(driver.run());
@@ -182,6 +191,8 @@ impl Session {
             scratch: RefCell::default(),
             client,
             runtime,
+            write_tx,
+            _writer: AbortOnDrop(writer),
             _driver: AbortOnDrop(handle),
             _publisher: AbortOnDrop(publisher),
         };
@@ -196,16 +207,24 @@ impl Session {
         result
     }
 
-    /// Sends input in order. Resolves with the server's error, if any.
-    pub fn write(&self, data: &str) -> Vec<tokio::task::JoinHandle<Result<Value, RpcError>>> {
+    /// Sends UTF-8 input in strict FIFO order, chunking pastes >64KB one round trip at a time
+    /// (`pingdotgg/t3code#37103`). Resolves with the first server error, if any.
+    pub fn write(&self, data: &str) -> Option<oneshot::Receiver<RpcError>> {
+        self.enqueue_write(data, None)
+    }
+
+    /// Sends raw Latin-1 bytes (`binary: true`) for legacy binary mouse reports (`pingdotgg/t3code#37223`).
+    pub fn write_binary(&self, data: &str) -> Option<oneshot::Receiver<RpcError>> {
+        self.enqueue_write(data, Some(true))
+    }
+
+    fn enqueue_write(&self, data: &str, binary: Option<bool>) -> Option<oneshot::Receiver<RpcError>> {
         if data.is_empty() || self.shared.lock().read_only {
-            return Vec::new();
+            return None;
         }
-        let Target { thread_id, terminal_id, .. } = &*self.target;
-        terminal::paste_chunks(data)
-            .into_iter()
-            .map(|chunk| self.runtime.spawn(self.client.request(method::WRITE, terminal::write_input(thread_id, terminal_id, chunk))))
-            .collect()
+        let (tx, rx) = oneshot::channel();
+        let _ = self.write_tx.send(WriteJob { data: data.to_owned(), binary, on_error: tx });
+        Some(rx)
     }
 
     /// Tells the PTY the settled grid, if this device operates a live shell.
@@ -217,6 +236,56 @@ impl Session {
         if let (Some(grid), true) = (grid, live) {
             let Target { thread_id, terminal_id, .. } = &*self.target;
             self.runtime.spawn(self.client.request(method::RESIZE, terminal::resize_input(thread_id, terminal_id, grid)));
+        }
+    }
+}
+
+/// Serialized per-session writer (`terminalInputWriter.ts`, `pingdotgg/t3code#37103`):
+/// sends multi-chunk pastes one chunk per round trip in FIFO order and closes an interrupted
+/// bracketed paste with `BRACKETED_PASTE_END` before subsequent input proceeds.
+async fn run_writer(target: Arc<Target>, client: ClientHandle, shared: Shared, mut rx: mpsc::UnboundedReceiver<WriteJob>) {
+    let mut pending_close_paste = false;
+    while let Some(job) = rx.recv().await {
+        if shared.lock().read_only {
+            continue;
+        }
+        if pending_close_paste {
+            let payload = terminal::write_input(&target.thread_id, &target.terminal_id, terminal::BRACKETED_PASTE_END);
+            match client.request(method::WRITE, payload).await {
+                Ok(_) => pending_close_paste = false,
+                Err(err) => {
+                    let _ = job.on_error.send(err);
+                    continue;
+                }
+            }
+        }
+        let chunks = terminal::paste_chunks(&job.data);
+        let bracketed = terminal::is_chunked_bracketed_paste(&job.data, chunks.len());
+        let mut opened = false;
+        let mut failed: Option<RpcError> = None;
+        for chunk in chunks {
+            if shared.lock().read_only {
+                failed = Some(RpcError::Closed);
+                break;
+            }
+            let payload = terminal::write_input_with_options(&target.thread_id, &target.terminal_id, chunk, job.binary, None);
+            match client.request(method::WRITE, payload).await {
+                Ok(_) => {
+                    opened = bracketed;
+                }
+                Err(err) => {
+                    opened = bracketed;
+                    failed = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(err) = failed {
+            if opened {
+                let close = terminal::write_input(&target.thread_id, &target.terminal_id, terminal::BRACKETED_PASTE_END);
+                pending_close_paste = client.request(method::WRITE, close).await.is_err();
+            }
+            let _ = job.on_error.send(err);
         }
     }
 }
@@ -436,7 +505,10 @@ impl Driver {
             return;
         }
         let Target { thread_id, terminal_id, .. } = &*self.target;
-        tokio::spawn(self.client.request(method::WRITE, terminal::write_input(thread_id, terminal_id, replies)));
+        // Mark PTY query answers (`DA`, `DSR`, `OSC 10/11`, `DECRQM`) with `reply: true` so the
+        // server forwards only one attached viewer's reply (`pingdotgg/t3code#37233`).
+        let payload = terminal::write_input_with_options(thread_id, terminal_id, replies, None, Some(true));
+        tokio::spawn(self.client.request(method::WRITE, payload));
     }
 
     fn show_error(&self, message: String) {

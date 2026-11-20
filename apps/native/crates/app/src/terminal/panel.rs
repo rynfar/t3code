@@ -278,6 +278,10 @@ impl PanelTerminalView {
         if !can_operate_terminals(cx) {
             return;
         }
+        if !crate::settings::store::try_client(cx).is_none_or(|doc| doc.confirm_terminal_close()) {
+            self.close_terminal_confirmed(terminal_id, window, cx);
+            return;
+        }
         let label = terminal_label(&self.thread_id, terminal_id, cx);
         let (message, detail) = terminal::close_confirmation(&[label]);
         let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &["Close", "Cancel"], cx);

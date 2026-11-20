@@ -521,11 +521,13 @@ impl PreviewPane {
         let is_unreachable = matches!(snapshot.map(|s| &s.nav_status), Some(NavStatus::LoadFailed { .. }));
         let empty = shows_empty_state(snapshot);
         let loading = snapshot.is_some_and(|snapshot| matches!(snapshot.nav_status, NavStatus::Loading { .. }))
-            || (frame.is_some_and(|frame| !frame.has_frame()) && !empty && !is_unreachable);
+            || (frame.is_some_and(|frame| !frame.has_frame() && !frame.frames_stalled()) && !empty && !is_unreachable);
         let can_back = snapshot.is_some_and(|snapshot| snapshot.can_go_back) && !input_disabled;
         let can_forward = snapshot.is_some_and(|snapshot| snapshot.can_go_forward) && !input_disabled;
         let refresh_disabled = empty || input_disabled;
         let url = self.page_url(cx);
+        let env_http_base = self.state.read(cx).active_environment().map(|env| env.http_base.clone());
+        let external_url = t3_core::preview::address::resolve_external_server_url(&url, env_http_base.as_deref());
         let defaults = self.previews.read(cx).browser_defaults(cx);
         let active_profile_id = snapshot.map_or(defaults.profile_id.as_str(), SessionSnapshot::profile_id_or_default);
         let show_profile_badge = active_profile_id != defaults.profile_id;
@@ -626,7 +628,7 @@ impl PreviewPane {
                                         .size(Size::IconXs)
                                         .icon(Icon::ExternalLink)
                                         .tooltip("Open in system browser")
-                                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                                        .on_click(move |_, _, cx| cx.open_url(&external_url)),
                                 )
                             }),
                     )
@@ -999,7 +1001,8 @@ impl PreviewPane {
         let host = host_label(url).unwrap_or_else(|| url.to_owned());
         let file_name = download.file_name.clone();
         let download_id = download.id.clone();
-        let open_url = url.to_owned();
+        let env_http_base = self.state.read(cx).active_environment().map(|env| env.http_base.clone());
+        let open_url = t3_core::preview::address::resolve_external_server_url(url, env_http_base.as_deref());
         let has_frame = self.frame.is_some();
         div()
             .id("preview-file-not-shown")

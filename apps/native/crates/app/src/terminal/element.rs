@@ -207,13 +207,17 @@ impl<T: TerminalSurface> Element for TerminalElement<T> {
         };
 
         let paint = colors::paint(cx);
+        let pane_bg = if frame.cols > 0 { to_hsla(frame.background) } else { paint.background };
+        let cursor_color = if frame.cols > 0 { to_hsla(frame.cursor_color) } else { paint.cursor };
         let cell = |row: usize, col: usize, cols: usize| {
             Bounds::new(
                 point(origin.x + cell_width * col as f32, origin.y + line_height * row as f32),
                 size(cell_width * cols as f32, line_height),
             )
         };
-        let mut quads = Vec::new();
+        // Paint the full pane background (including padding) in the emulator's active default
+        // background so OSC 11 changes repaint the whole surface (`pingdotgg/t3code#37193`).
+        let mut quads = vec![fill(bounds, pane_bg)];
         let mut selections = Vec::new();
         for row in 0..frame.rows {
             let cells = frame.row(row);
@@ -227,16 +231,16 @@ impl<T: TerminalSurface> Element for TerminalElement<T> {
         let cursor = frame.cursor;
         let block = cursor.filter(|c| self.focused && c.style == CursorStyle::Block);
         let mut overlays = Vec::new();
-        let cursor_block = block.map(|c| fill(cell(c.row, c.col, if c.wide { 2 } else { 1 }), paint.cursor));
+        let cursor_block = block.map(|c| fill(cell(c.row, c.col, if c.wide { 2 } else { 1 }), cursor_color));
         if let Some(c) = cursor.filter(|_| block.is_none()) {
             let bounds = cell(c.row, c.col, if c.wide { 2 } else { 1 });
             overlays.push(match c.style {
-                CursorStyle::Beam => fill(Bounds::new(bounds.origin, size(px(2.), line_height)), paint.cursor),
+                CursorStyle::Beam => fill(Bounds::new(bounds.origin, size(px(2.), line_height)), cursor_color),
                 CursorStyle::Underline => fill(
                     Bounds::new(point(bounds.left(), bounds.bottom() - px(2.)), size(bounds.size.width, px(2.))),
-                    paint.cursor,
+                    cursor_color,
                 ),
-                CursorStyle::Block | CursorStyle::Hollow => outline(bounds, paint.cursor, gpui::BorderStyle::Solid),
+                CursorStyle::Block | CursorStyle::Hollow => outline(bounds, cursor_color, gpui::BorderStyle::Solid),
             });
         }
         let cursor_glyph = block.map(|c| (c.row, c.col));
@@ -246,7 +250,7 @@ impl<T: TerminalSurface> Element for TerminalElement<T> {
             font.family.hash(&mut hasher);
             size_px.to_bits().hash(&mut hasher);
             f32::from(cell_width).to_bits().hash(&mut hasher);
-            hash_color(paint.background, &mut hasher);
+            hash_color(pane_bg, &mut hasher);
             hasher.finish()
         };
         let mut rows = self.rows.borrow_mut();
@@ -258,7 +262,7 @@ impl<T: TerminalSurface> Element for TerminalElement<T> {
             let key = row_key(frame, row, glyph_col, hovered_cols, style_key);
             let shaped = rows.row(key, || {
                 let mut shaped = Vec::new();
-                shape_row(frame, row, &font, font_size, cell_width, glyph_col, hovered_cols, paint.background, window, |col, line| {
+                shape_row(frame, row, &font, font_size, cell_width, glyph_col, hovered_cols, pane_bg, window, |col, line| {
                     shaped.push((col, line))
                 });
                 shaped
@@ -359,7 +363,7 @@ fn row_key(frame: &Snapshot, row: usize, cursor_col: Option<usize>, hovered_cols
     hovered_cols.hash(&mut hasher);
     let start = row * frame.cols;
     for (offset, cell) in frame.row(row).iter().enumerate() {
-        let flags = [cell.bold, cell.italic, cell.dim, cell.underline, cell.strikeout, cell.wide, cell.spacer];
+        let flags = [cell.bold, cell.italic, cell.dim, cell.hidden, cell.underline, cell.strikeout, cell.wide, cell.spacer];
         (cell.c, cell.fg.r, cell.fg.g, cell.fg.b, flags).hash(&mut hasher);
         if cell.combining {
             frame.combining(start + offset).for_each(|c| c.hash(&mut hasher));
@@ -439,9 +443,11 @@ fn shape_row(
             style: if cell.italic { FontStyle::Italic } else { FontStyle::Normal },
             ..font.clone()
         };
-        let underline = (cell.underline || hovered_cols.is_some_and(|(start, end)| col >= start && col <= end))
+        // Concealed cells keep text and decorations hidden even under the block cursor (`#37141`);
+        // visible decorations stay drawn in `cursor_text` above the block cursor (`#37206`).
+        let underline = (!cell.hidden && (cell.underline || hovered_cols.is_some_and(|(start, end)| col >= start && col <= end)))
             .then_some(UnderlineStyle { thickness: px(1.), color: Some(color), wavy: false });
-        let strikethrough = cell.strikeout.then_some(StrikethroughStyle { thickness: px(1.), color: Some(color) });
+        let strikethrough = (!cell.hidden && cell.strikeout).then_some(StrikethroughStyle { thickness: px(1.), color: Some(color) });
         let before = text.len();
         text.push(if cell.c == '\0' { ' ' } else { cell.c });
         if cell.combining {

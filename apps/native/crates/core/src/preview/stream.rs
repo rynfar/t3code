@@ -14,6 +14,10 @@ pub const STREAM_BASE_PATH: &str = "/api/preview-stream";
 pub const STREAM_PATH: &str = "/api/preview-stream/ws";
 pub const STREAM_UPLOAD_PATH: &str = "/api/preview-stream/upload";
 pub const STREAM_DOWNLOAD_PATH: &str = "/api/preview-stream/download";
+/// Timeout after WebSocket connect before reporting Chromium draws no frames (`pingdotgg/t3code#38865`).
+pub const NO_FRAME_TIMEOUT_MS: u64 = 10_000;
+pub const NO_FRAME_STALLED_MESSAGE: &str =
+    "The server's browser loaded this page but is not drawing it. Try reloading, or open the page in a browser on this computer.";
 pub const ACK_MESSAGE: &str = r#"{"type":"ack"}"#;
 /// `TAB_GONE_CODE`: the tab closed; stop.
 pub const GONE_CLOSE_CODE: u16 = 4404;

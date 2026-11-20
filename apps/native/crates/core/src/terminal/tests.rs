@@ -783,3 +783,121 @@ fn wire_codecs_handle_write_options_snapshot_error_and_metadata_manager_id() {
     .unwrap();
     assert_eq!(meta_legacy, MetadataEvent::Snapshot { terminals: vec![], manager_id: None });
 }
+
+#[test]
+fn bare_compiler_filenames_and_hostname_file_uris_resolve_with_exact_positions() {
+    use links::{extract_links, metadata_query_path, open_in_editor_payload, resolve_link_target_details};
+
+    // Bare filenames with compiler line/column positions (`pingdotgg/t3code#37071`).
+    for (line, expected) in [
+        ("main.c:1:25: error: expected ';'", "main.c:1:25"),
+        ("error in page.test.tsx:5:3", "page.test.tsx:5:3"),
+        ("see foo$bar.ts:12:3 here", "foo$bar.ts:12:3"),
+        ("in +page.svelte:12:4 failed", "+page.svelte:12:4"),
+        ("at contact@support.ts:12:3", "contact@support.ts:12:3"),
+    ] {
+        assert_eq!(extract_links(line), vec![path_at(expected, line.find(expected).unwrap())], "{line}");
+    }
+    assert_eq!(
+        extract_links("index.ts(12,3): error TS2322: Type mismatch"),
+        vec![found(links::LinkKind::Path, "index.ts:12:3", 0, "index.ts(12,3)".len())]
+    );
+    for line in [
+        "see README.md for details",
+        "listening on 127.0.0.1:3000",
+        "connect api.example.com:443",
+        "main.cs(42,7): error CS1002: ; expected",
+        "redis.local:6379> PING",
+    ] {
+        assert_eq!(extract_links(line), vec![], "{line}");
+    }
+
+    // Server hostname `file://` URIs & numeric filename suffixes (`pingdotgg/t3code#37133`, `pingdotgg/t3code#37201`).
+    let local_file = resolve_link_target_details("file://buildbox/tmp/report:2026:11", "/workspace", Some("buildbox"));
+    assert_eq!(local_file.path, "/tmp/report:2026:11");
+    assert!(local_file.exact_uri);
+    assert_eq!((local_file.line, local_file.column), (None, None));
+    assert_eq!(
+        metadata_query_path("file://buildbox/tmp/report:2026:11", "/workspace", Some("buildbox")).as_deref(),
+        Some("/tmp/report:2026:11")
+    );
+    assert_eq!(
+        open_in_editor_payload(&local_file, "vscode", Some("/workspace")),
+        json!({ "cwd": "/tmp/report:2026:11", "editor": "vscode", "projectRoot": "/workspace", "position": {} })
+    );
+
+    let anchored = resolve_link_target_details("file://BUILDBOX/tmp/report:2026:11#L12C3", "/workspace", Some("buildbox"));
+    assert_eq!(anchored.path, "/tmp/report:2026:11");
+    assert_eq!((anchored.line, anchored.column), (Some(12), Some(3)));
+    assert_eq!(
+        open_in_editor_payload(&anchored, "vscode", None),
+        json!({ "cwd": "/tmp/report:2026:11", "editor": "vscode", "position": { "line": 12, "column": 3 } })
+    );
+
+    let unc = resolve_link_target_details("file://otherhost/share/a.txt", "/workspace", Some("buildbox"));
+    assert_eq!(unc.path, r"\\otherhost\share\a.txt");
+    assert!(unc.exact_uri);
+}
+
+#[test]
+fn keypad_navigation_modified_f3_and_chunked_bracketed_paste() {
+    // Keypad NumLock navigation & NumpadEnter (`pingdotgg/t3code#37175`) and modified F3 (`pingdotgg/t3code#37211`).
+    assert_eq!(encode_key(&key("clear"), false), Some(b"\x1b[E".to_vec()));
+    assert_eq!(encode_key(&key("clear"), true), Some(b"\x1bOE".to_vec()));
+    assert_eq!(encode_key(&key("numpadenter"), false), Some(b"\r".to_vec()));
+    assert_eq!(encode_key(&KeyInput { alt: true, ..key("numpadenter") }, false), Some(b"\x1b\r".to_vec()));
+    assert_eq!(encode_key(&KeyInput { shift: true, ..key("f3") }, false), Some(b"\x1b[1;2R".to_vec()));
+    assert_eq!(encode_key(&KeyInput { alt: true, ..key("f3") }, false), Some(b"\x1b[1;3R".to_vec()));
+    assert_eq!(encode_key(&KeyInput { control: true, ..key("f3") }, false), Some(b"\x1b[1;5R".to_vec()));
+
+    // Chunked >64KB bracketed paste detection (`pingdotgg/t3code#37103`).
+    let large = encode_paste(&"x".repeat(70_000), true);
+    let chunks = paste_chunks(&large);
+    assert!(chunks.len() > 1);
+    assert!(is_chunked_bracketed_paste(&large, chunks.len()));
+    let small = encode_paste("small", true);
+    assert!(!is_chunked_bracketed_paste(&small, paste_chunks(&small).len()));
+    let plain = "x".repeat(70_000);
+    assert!(!is_chunked_bracketed_paste(&plain, paste_chunks(&plain).len()));
+}
+
+#[test]
+fn remote_close_drops_observed_terminals_while_preserving_reopened_and_new_ones() {
+    let mut layouts = TerminalLayouts::default();
+    let mgr_a = SnapshotId::Manager("mgr-a".into());
+    let mgr_b = SnapshotId::Manager("mgr-b".into());
+
+    // Open two split terminals and observe both in mgr-a.
+    layouts.new_terminal("t1", "term-1");
+    layouts.split("t1", "term-2", SplitDirection::Horizontal);
+    layouts.reconcile_with_snapshot("t1", &["term-1".into(), "term-2".into()], &mgr_a);
+    assert_eq!(ids(&layouts.get("t1")), ["term-1", "term-2"]);
+
+    // Another client closes term-1 (`pingdotgg/t3code#38998`): snapshot from same mgr-a drops term-1 and activates term-2.
+    assert!(layouts.reconcile_with_snapshot("t1", &["term-2".into()], &mgr_a));
+    assert_eq!(ids(&layouts.get("t1")), ["term-2"]);
+    assert_eq!(layouts.get("t1").active_terminal_id, "term-2");
+
+    // Newly placed term-3 has not been observed yet, so a lagging snapshot without it must NOT drop term-3.
+    layouts.split("t1", "term-3", SplitDirection::Horizontal);
+    assert!(!layouts.reconcile_with_snapshot("t1", &["term-2".into()], &mgr_a));
+    assert_eq!(ids(&layouts.get("t1")), ["term-2", "term-3"]);
+
+    // After server restart (new manager id), previously observed terminals are not falsely dropped from an empty snapshot.
+    layouts.reconcile_with_snapshot("t1", &["term-2".into(), "term-3".into()], &mgr_a);
+    assert!(!layouts.reconcile_with_snapshot("t1", &[], &mgr_b));
+    assert_eq!(ids(&layouts.get("t1")), ["term-2", "term-3"]);
+
+    // Closing the last terminal then reopening with the same id (`pingdotgg/t3code#39260`):
+    // a stale empty snapshot from the same manager must NOT immediately close the reopened drawer!
+    let mut reopen = TerminalLayouts::default();
+    reopen.ensure("t1", "term-1", true, Some(true));
+    reopen.reconcile_with_snapshot("t1", &["term-1".into()], &mgr_a);
+    reopen.close("t1", "term-1");
+    assert!(!reopen.get("t1").terminal_open);
+    reopen.ensure("t1", "term-1", true, Some(true));
+    assert!(reopen.get("t1").terminal_open);
+    assert!(!reopen.reconcile_with_snapshot("t1", &[], &mgr_a));
+    assert!(reopen.get("t1").terminal_open);
+    assert_eq!(ids(&reopen.get("t1")), ["term-1"]);
+}

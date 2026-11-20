@@ -396,7 +396,9 @@ impl AppState {
                 }
             }
         }
-        if terminal_labels.is_empty() {
+        if terminal_labels.is_empty()
+            || !crate::settings::store::try_client(cx).is_none_or(|doc| doc.confirm_terminal_close())
+        {
             finish(self, cx);
             return;
         }
@@ -479,6 +481,7 @@ impl AppState {
         let Some(active) = self.panels.panels.active_surface(&thread_id).cloned() else { return };
         if matches!(active.kind, SurfaceKind::Terminal { .. })
             && crate::terminal::can_operate_terminals(cx)
+            && crate::settings::store::try_client(cx).is_none_or(|doc| doc.confirm_terminal_close())
             && let Some(window) = cx.active_window().or_else(|| cx.windows().into_iter().next())
         {
             let entity = cx.entity();

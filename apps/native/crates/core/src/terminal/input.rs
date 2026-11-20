@@ -27,6 +27,8 @@ const LINE_START: &str = "\x01";
 const LINE_END: &str = "\x05";
 const DELETE_TO_LINE_START: &str = "\x15";
 const CLEAR: &str = "\x0c";
+/// Bracketed paste closing sequence (`pingdotgg/t3code#37103` interrupted-paste recovery).
+pub const BRACKETED_PASTE_END: &str = "\x1b[201~";
 /// `terminal.write` caps `data` at 65,536 UTF-16 units; pastes are split well under it.
 const MAX_CHUNK_UTF16: usize = 16_384;
 
@@ -151,7 +153,7 @@ pub fn encode_key(key: &KeyInput, app_cursor: bool) -> Option<Vec<u8>> {
         Some(out)
     };
     match key.key {
-        "enter" => with_alt(b"\r"),
+        "enter" | "numpadenter" => with_alt(b"\r"),
         "backspace" => with_alt(if key.control { &[0x08] } else { &[0x7f] }),
         "tab" => with_alt(if key.shift { b"\x1b[Z" } else { b"\t" }),
         "escape" => with_alt(&[0x1b]),
@@ -182,6 +184,7 @@ fn navigation_sequence(name: &str, modifier: u8, app_cursor: bool) -> Option<Str
         "down" => cursor('B'),
         "right" => cursor('C'),
         "left" => cursor('D'),
+        "clear" => cursor('E'),
         "home" => cursor('H'),
         "end" => cursor('F'),
         "insert" => tilde(2),
@@ -252,4 +255,10 @@ pub fn paste_chunks(data: &str) -> Vec<&str> {
         chunks.push(&data[start..]);
     }
     chunks
+}
+
+/// Whether a multi-chunk write is framed as a bracketed paste so an interrupted write must close it
+/// with [`BRACKETED_PASTE_END`] (`pingdotgg/t3code#37103`).
+pub fn is_chunked_bracketed_paste(data: &str, chunk_count: usize) -> bool {
+    chunk_count > 1 && data.starts_with("\x1b[200~") && data.ends_with(BRACKETED_PASTE_END)
 }
