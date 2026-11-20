@@ -11,6 +11,7 @@
 //! SSH hosts): their detail is read each time the tab shows and every action answers with the
 //! detail it confirmed (`useDeviceControls.ts`). The tools panel is `tools`.
 
+pub(super) mod float;
 mod tools;
 
 use std::sync::Arc;
@@ -25,13 +26,13 @@ use gpui_component::input::InputState;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::{Selectable, v_flex};
 use t3_client::device_stream::{
-    DeviceInput, DeviceStream, DeviceStreamEvent, DeviceTarget, Frame, InputSender, capture_screenshot, fetch_ax_tree, read_android_fold, set_android_fold,
-    subscribe_event_log, subscribe_foreground,
+    DeviceInput, DeviceStream, DeviceStreamEvent, DeviceTarget, Frame, InputSender, StreamOptions, capture_screenshot, fetch_ax_tree, open_with_options,
+    read_android_fold, set_android_fold, subscribe_event_log, subscribe_foreground,
 };
 use t3_core::device::hub::{AX_POLL_INTERVAL_MS, AndroidFoldState, AxElement, EventLogEntry, FoldActionPosture, ForegroundInfo};
 use t3_core::device::stream::{
-    CONNECTING_VIDEO, HardwareButton, KeyPhase, Screen, StreamStatus, TouchPhase, fit_frame, input_disconnected_label, screen_aspect, screen_rotation,
-    transport,
+    CONNECTING_VIDEO, DuoCommand, DuoControlState, DuoFoldShape, DuoPose, HardwareButton, KeyPhase, Screen, StreamStatus, TouchPhase, duo_fold_state,
+    duo_hold_orientation, fit_frame, input_disconnected_label, screen_aspect, screen_rotation, transport,
 };
 use t3_core::device::tools::{
     Action, Controls, RAIL_ORIENTATIONS, SCREENSHOT_FAILED, TextSize, appearance_label, next_appearance, offers_screenshot, runs_host_commands, screenshot_file_name,
@@ -96,17 +97,32 @@ struct Decoded {
     size: (u32, u32),
 }
 
-/// Decodes a JPEG and turns serve-sim's raw portrait framebuffer upright (`screenRotation`).
-fn decode(bytes: &[u8], rotation: i32) -> Option<Decoded> {
-    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).ok()?;
-    let image = match rotation {
-        90 => image.rotate90(),
-        -90 => image.rotate270(),
-        180 => image.rotate180(),
-        _ => image,
+/// Decodes a JPEG or uploads raw RGBA pixels directly into a GPUI `RenderImage`, turning
+/// serve-sim's raw portrait framebuffer upright (`screenRotation`) and converting RGBA -> BGRA for
+/// GPUI's texture atlas.
+fn decode(frame: &Frame, rotation: i32) -> Option<Decoded> {
+    let mut pixels = match frame {
+        Frame::Jpeg(bytes) => {
+            let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).ok()?;
+            let image = match rotation {
+                90 => image.rotate90(),
+                -90 => image.rotate270(),
+                180 => image.rotate180(),
+                _ => image,
+            };
+            image.into_rgba8()
+        }
+        Frame::Rgba { width, height, bytes } => {
+            let raw = image::RgbaImage::from_raw(*width, *height, bytes.to_vec())?;
+            match rotation {
+                90 => image::imageops::rotate90(&raw),
+                -90 => image::imageops::rotate270(&raw),
+                180 => image::imageops::rotate180(&raw),
+                _ => raw,
+            }
+        }
     };
-    let size = (image.width(), image.height());
-    let mut pixels = image.into_rgba8();
+    let size = (pixels.width(), pixels.height());
     // GPUI's atlas takes BGRA.
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
@@ -121,6 +137,7 @@ struct Live {
     _decoder: Abort,
     _frames: Task<()>,
     _events: Task<()>,
+    _duo: Task<()>,
 }
 
 pub struct DeviceScreen {
@@ -129,12 +146,17 @@ pub struct DeviceScreen {
     thread_id: String,
     surface_id: String,
     device: Device,
+    /// True when rendered inside a floating secondary window (`FloatingDeviceWindow`).
+    floating: bool,
     visible: bool,
     live: Option<Live>,
     status: StreamStatus,
     input_connected: bool,
     input_detail: Option<String>,
     screen: Option<Screen>,
+    duo_state: DuoControlState,
+    duo_settled_vertical: Option<bool>,
+    duo_stand_vertical: Option<bool>,
     image: Option<Arc<RenderImage>>,
     /// The frame before `image`, freed once the next one replaces it so the atlas never drops a
     /// tile the last drawn scene still uses.
@@ -177,6 +199,14 @@ pub struct DeviceScreen {
 
 impl DeviceScreen {
     pub fn new(state: Entity<AppState>, devices: Entity<Devices>, thread_id: String, surface_id: String, device: Device, cx: &mut Context<Self>) -> Self {
+        Self::create(state, devices, thread_id, surface_id, device, false, cx)
+    }
+
+    pub(super) fn new_floating(state: Entity<AppState>, devices: Entity<Devices>, thread_id: String, surface_id: String, device: Device, cx: &mut Context<Self>) -> Self {
+        Self::create(state, devices, thread_id, surface_id, device, true, cx)
+    }
+
+    fn create(state: Entity<AppState>, devices: Entity<Devices>, thread_id: String, surface_id: String, device: Device, floating: bool, cx: &mut Context<Self>) -> Self {
         let connection_id = state.read(cx).connection_id();
         let state_sub = cx.subscribe(&state, |this, _, event: &AppEvent, cx| {
             if *event == AppEvent::Phase {
@@ -195,12 +225,16 @@ impl DeviceScreen {
             thread_id,
             surface_id,
             device,
+            floating,
             visible: false,
             live: None,
             status: StreamStatus::Connecting,
             input_connected: false,
             input_detail: None,
             screen: None,
+            duo_state: DuoControlState::default(),
+            duo_settled_vertical: None,
+            duo_stand_vertical: None,
             image: None,
             retired: None,
             frame_size: (0, 0),
@@ -582,16 +616,19 @@ impl DeviceScreen {
         self.status = StreamStatus::Connecting;
         self.input_connected = false;
         self.input_detail = None;
-        if let Err(detail) = transport(self.device.platform, self.host_kind(cx)) {
+        let host_kind = self.host_kind(cx);
+        if let Err(detail) = transport(self.device.platform, host_kind) {
             self.status = StreamStatus::Error(detail.to_owned());
             cx.notify();
             return;
         }
         let state = self.state.read(cx);
         let Some(client) = state.client_handle() else { return };
+        let credentials = Arc::new(client.credentials().clone());
         let runtime = state.runtime().clone();
         let target = DeviceTarget { host_id: self.device.host_id.clone(), device_id: self.device.id.clone() };
-        let DeviceStream { input, mut frames, mut events } = client.device_stream(&runtime, target);
+        let options = StreamOptions { platform: self.device.platform, host_kind, panel_id: None };
+        let DeviceStream { input, mut frames, mut events, mut duo } = open_with_options(&runtime, credentials, target, options);
         let (rotation, mut rotations) = tokio::sync::watch::channel(screen_rotation(self.device.platform, self.screen.as_ref()));
         let (decoded_tx, mut decoded) = tokio::sync::watch::channel::<Option<Arc<Decoded>>>(None);
         let decoder = runtime.spawn(async move {
@@ -600,9 +637,9 @@ impl DeviceScreen {
                     changed = frames.changed() => if changed.is_err() { return },
                     changed = rotations.changed() => if changed.is_err() { return },
                 }
-                let Some(bytes): Option<Frame> = frames.borrow_and_update().clone() else { continue };
+                let Some(frame): Option<Frame> = frames.borrow_and_update().clone() else { continue };
                 let rotation = *rotations.borrow_and_update();
-                let Ok(Some(image)) = tokio::task::spawn_blocking(move || decode(&bytes, rotation)).await else { continue };
+                let Ok(Some(image)) = tokio::task::spawn_blocking(move || decode(&frame, rotation)).await else { continue };
                 if decoded_tx.send(Some(Arc::new(image))).is_err() {
                     return;
                 }
@@ -633,7 +670,21 @@ impl DeviceScreen {
                 }
             }
         });
-        self.live = Some(Live { input, rotation, _decoder: Abort(decoder), _frames: frames, _events: events });
+        let duo_task = cx.spawn(async move |this, cx| {
+            while duo.changed().await.is_ok() {
+                let next = duo.borrow_and_update().clone();
+                let updated = this.update(cx, |this, cx| {
+                    if this.duo_state != next {
+                        this.duo_state = next;
+                        cx.notify();
+                    }
+                });
+                if updated.is_err() {
+                    return;
+                }
+            }
+        });
+        self.live = Some(Live { input, rotation, _decoder: Abort(decoder), _frames: frames, _events: events, _duo: duo_task });
         cx.notify();
     }
 
@@ -642,6 +693,7 @@ impl DeviceScreen {
         self.live = None;
         self.touching = false;
         self.held = Modifiers::default();
+        self.duo_state = DuoControlState::default();
         for image in [self.image.take(), self.retired.take()].into_iter().flatten() {
             cx.drop_image(image, None);
         }
@@ -666,6 +718,12 @@ impl DeviceScreen {
         match event {
             DeviceStreamEvent::Status(status) => self.status = status,
             DeviceStreamEvent::Screen(screen) => {
+                if screen.supports_hinge_angle {
+                    let fold = duo_fold_state(&screen);
+                    if fold.settled || self.duo_settled_vertical.is_none() {
+                        self.duo_settled_vertical = Some(fold.phone_vertical);
+                    }
+                }
                 self.screen = Some(screen);
                 if let Some(live) = &self.live {
                     live.rotation.send_if_modified(|rotation| {
@@ -688,6 +746,10 @@ impl DeviceScreen {
         if let Some(live) = &self.live {
             live.input.send(input);
         }
+    }
+
+    fn is_serve_emu(&self, cx: &App) -> bool {
+        self.device.platform == Platform::Android && self.host_kind(cx) != Some(HostKind::Simlock)
     }
 
     /// `normalizedPoint`: a window position as 0..1 in the screen's box, clamped.
@@ -732,9 +794,58 @@ impl DeviceScreen {
         }
     }
 
-    /// `sendKey`: the key's DOM code as HID. Command shortcuts stay the app's, except Command-R.
+    /// `sendKey` / `sendText`: HID key codes on iOS/Simlock; Android `serve-emu` forwards DOM keys,
+    /// printable text, and clipboard paste (`Cmd+V`/`Ctrl+V` -> `DeviceInput::Text`).
     fn key(&mut self, phase: KeyPhase, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.focus.is_focused(window) || (keystroke.modifiers.platform && keystroke.key != "r") {
+        if !self.focus.is_focused(window) {
+            return;
+        }
+        let serve_emu = self.is_serve_emu(cx);
+        if serve_emu {
+            let paste = (keystroke.modifiers.platform || keystroke.modifiers.control) && keystroke.key.eq_ignore_ascii_case("v");
+            if paste {
+                if phase == KeyPhase::Down
+                    && let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                    && !text.is_empty()
+                {
+                    cx.stop_propagation();
+                    self.send(DeviceInput::Text(text));
+                }
+                return;
+            }
+            if keystroke.modifiers.platform && keystroke.key != "r" {
+                return;
+            }
+            let shortcut = keystroke.modifiers.control || keystroke.modifiers.platform;
+            let key_name = match keystroke.key.as_str() {
+                "escape" => Some("Escape".to_owned()),
+                "enter" => Some("Enter".to_owned()),
+                "backspace" => Some("Backspace".to_owned()),
+                "tab" => Some("Tab".to_owned()),
+                "delete" => Some("Delete".to_owned()),
+                "up" => Some("ArrowUp".to_owned()),
+                "down" => Some("ArrowDown".to_owned()),
+                "left" => Some("ArrowLeft".to_owned()),
+                "right" => Some("ArrowRight".to_owned()),
+                "home" => Some("Home".to_owned()),
+                "end" => Some("End".to_owned()),
+                "pageup" => Some("PageUp".to_owned()),
+                "pagedown" => Some("PageDown".to_owned()),
+                "space" => Some(" ".to_owned()),
+                _ => keystroke.key_char.clone().or_else(|| (keystroke.key.chars().count() == 1).then(|| keystroke.key.clone())),
+            };
+            if let Some(key_name) = key_name {
+                cx.stop_propagation();
+                self.send(DeviceInput::AndroidKey {
+                    phase,
+                    key: key_name,
+                    ctrl: shortcut && keystroke.modifiers.control,
+                    meta: keystroke.modifiers.platform,
+                });
+            }
+            return;
+        }
+        if keystroke.modifiers.platform && keystroke.key != "r" {
             return;
         }
         let shortcut = keystroke.modifiers.control || keystroke.modifiers.platform;
@@ -747,9 +858,9 @@ impl DeviceScreen {
     }
 
     /// The browser sends Shift, Control and Option as keys of their own; GPUI reports them as
-    /// modifier changes.
-    fn modifiers_changed(&mut self, event: &ModifiersChangedEvent, window: &mut Window) {
-        if !self.focus.is_focused(window) {
+    /// modifier changes. Only serve-sim HID sockets consume standalone modifier keys.
+    fn modifiers_changed(&mut self, event: &ModifiersChangedEvent, window: &mut Window, cx: &App) {
+        if !self.focus.is_focused(window) || self.is_serve_emu(cx) {
             return;
         }
         let next = event.modifiers;
@@ -759,6 +870,98 @@ impl DeviceScreen {
             }
         }
         self.held = next;
+    }
+
+    /// Renders `DeviceDuoControls` (hinge angle & posture presets) when `screen.supports_hinge_angle`.
+    fn render_duo_controls(&self, screen: Screen, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let p = palette(cx);
+        let state = duo_fold_state(&screen);
+        let settled_vertical = self.duo_settled_vertical.unwrap_or(state.phone_vertical);
+        let stand_vertical = self.duo_stand_vertical.unwrap_or(settled_vertical);
+        let phone_vertical = if state.stand { stand_vertical } else { settled_vertical };
+        let fold_waits = self.duo_state.pending && (state.stand || matches!(self.duo_state.requested, Some(DuoCommand::Pose(_))));
+        let enabled = self.input_connected;
+        let current_angle = screen.hinge_angle.unwrap_or(if screen.screen_id == Some(1) { 0.0 } else { 180.0 });
+        let is_peek = !state.stand && current_angle > 0.0 && current_angle < 60.0;
+        let is_half = !state.stand && state.fold == DuoFoldShape::Half && !is_peek;
+
+        let fold_presets: [(&'static str, f64, Icon, &'static str, bool); 4] = [
+            ("device-duo-closed", 0.0, Icon::Minimize2, "Closed (0°)", !state.stand && state.fold == DuoFoldShape::Closed),
+            ("device-duo-peek", 30.0, Icon::Eye, "Peek (30°)", is_peek),
+            ("device-duo-half", 90.0, Icon::Columns2, if phone_vertical { "Book (90°)" } else { "Laptop (90°)" }, is_half),
+            ("device-duo-open", 180.0, Icon::Maximize2, "Open / Flat (180°)", !state.stand && state.fold == DuoFoldShape::Open),
+        ];
+
+        let pill = |cx: &App| {
+            let p = palette(cx);
+            v_flex()
+                .items_center()
+                .gap(px(4.))
+                .p(px(4.))
+                .rounded_full()
+                .border_1()
+                .border_color(hsla(p.border).opacity(0.5))
+                .bg(hsla(p.background).opacity(0.8))
+                .shadow_sm()
+        };
+
+        let fold_group = pill(cx).children(fold_presets.into_iter().map(|(id, angle, icon, label, pressed)| {
+            let screen_id = screen.screen_id;
+            let in_stand = state.stand;
+            Button::new(id)
+                .variant(Variant::Ghost)
+                .size(Size::IconSm)
+                .icon(icon)
+                .tooltip(label)
+                .pressed(pressed)
+                .disabled(!enabled || fold_waits)
+                .on_click(cx.listener(move |this, _, _, _| {
+                    if in_stand {
+                        let hold = this.duo_stand_vertical.unwrap_or(settled_vertical);
+                        this.send(DeviceInput::Duo(DuoCommand::Orientation(duo_hold_orientation(hold, screen_id))));
+                    }
+                    this.send(DeviceInput::Duo(DuoCommand::Angle(angle)));
+                }))
+        }));
+
+        let stand_presets: [(&'static str, DuoPose, Icon, &'static str); 2] = [
+            ("device-duo-stand-laptop", DuoPose::Laptop, Icon::Laptop, "Laptop stand"),
+            ("device-duo-stand-tent", DuoPose::Tent, Icon::ChevronUp, "Tent stand"),
+        ];
+        let stand_group = pill(cx).children(stand_presets.into_iter().map(|(id, pose, icon, label)| {
+            let in_stand = state.stand;
+            Button::new(id)
+                .variant(Variant::Ghost)
+                .size(Size::IconSm)
+                .icon(icon)
+                .tooltip(label)
+                .pressed(screen.hinge_pose == Some(pose))
+                .disabled(!enabled)
+                .on_click(cx.listener(move |this, _, _, _| {
+                    if !in_stand {
+                        this.duo_stand_vertical = Some(settled_vertical);
+                    }
+                    this.send(DeviceInput::Duo(DuoCommand::Pose(pose)));
+                }))
+        }));
+
+        let error_badge = self.duo_state.error.clone().map(|error| {
+            Button::new("device-duo-error")
+                .variant(Variant::Ghost)
+                .size(Size::IconXs)
+                .icon(Icon::CircleAlert)
+                .tooltip(error)
+                .text_color(hsla(p.destructive))
+        });
+
+        v_flex()
+            .id("device-duo-controls")
+            .items_center()
+            .gap(px(6.))
+            .child(fold_group)
+            .child(stand_group)
+            .children(error_badge)
+            .into_any_element()
     }
 
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -771,19 +974,38 @@ impl DeviceScreen {
         let controls_disabled = self.controls.disabled(self.controls_visible(cx));
         let settings = self.controls.settings();
         let view = cx.entity().downgrade();
-        let (devices, thread, surface) = (self.devices.clone(), self.thread_id.clone(), self.surface_id.clone());
+        let floating = self.floating;
+        let (devices, thread, surface, device_clone) = (self.devices.clone(), self.thread_id.clone(), self.surface_id.clone(), self.device.clone());
         let session = (self.device.host_id.clone(), self.device.id.clone());
         let more = MenuButton(Button::new("device-more").variant(Variant::Ghost).size(Size::IconSm).icon(Icon::Ellipsis), "More device actions").dropdown_menu(move |menu, _, _| {
+            let (float_devices, float_thread, float_surface, float_device) = (devices.clone(), thread.clone(), surface.clone(), device_clone.clone());
             let (close_devices, close_thread, close_surface) = (devices.clone(), thread.clone(), surface.clone());
             let (power_devices, power_thread, power_surface, power_session) = (devices.clone(), thread.clone(), surface.clone(), session.clone());
-            menu.item(PopupMenuItem::new("Close device panel").on_click(move |_, _, cx| {
-                close_devices.update(cx, |devices, cx| devices.close_device(&close_thread, &close_surface, None, false, cx));
-            }))
-            .separator()
-            .item(PopupMenuItem::new(if simlock { "Return device to the pool" } else { "Power off device" }).on_click(move |_, _, cx| {
-                let session = Some(power_session.clone());
-                power_devices.update(cx, |devices, cx| devices.close_device(&power_thread, &power_surface, session, true, cx));
-            }))
+            let menu = if floating {
+                menu.item(PopupMenuItem::new("Dock back to panel").on_click(move |_, window, cx| {
+                    float_devices.update(cx, |devices, cx| devices.dock_device(&float_thread, &float_device, cx));
+                    window.remove_window();
+                }))
+                .item(PopupMenuItem::new("Close floating window").on_click(|_, window, _| {
+                    window.remove_window();
+                }))
+            } else {
+                menu.item(PopupMenuItem::new("Float device over chat").on_click(move |_, _, cx| {
+                    float_devices.update(cx, |devices, cx| devices.float_device(&float_thread, &float_surface, float_device.clone(), cx));
+                }))
+                .item(PopupMenuItem::new("Close device panel").on_click(move |_, _, cx| {
+                    close_devices.update(cx, |devices, cx| devices.close_device(&close_thread, &close_surface, None, false, cx));
+                }))
+            };
+            menu.separator().item(
+                PopupMenuItem::new(if simlock { "Return device to the pool" } else { "Power off device" }).on_click(move |_, window, cx| {
+                    let session = Some(power_session.clone());
+                    power_devices.update(cx, |devices, cx| devices.close_device(&power_thread, &power_surface, session, true, cx));
+                    if floating {
+                        window.remove_window();
+                    }
+                }),
+            )
         });
         // Android rotates through a host command, iOS through its input socket.
         let rotate = match platform {
@@ -863,6 +1085,7 @@ impl DeviceScreen {
                 .disabled(self.status != StreamStatus::Streaming || self.screenshot_pending)
                 .on_click(cx.listener(|this, _, _, cx| this.save_screenshot(cx)))
         });
+        let duo_controls = self.screen.filter(|screen| screen.supports_hinge_angle).map(|screen| self.render_duo_controls(screen, cx));
         div()
             .absolute()
             .top_0()
@@ -873,6 +1096,7 @@ impl DeviceScreen {
             .flex_col()
             .items_center()
             .justify_center()
+            .gap(px(8.))
             .py(px(12.))
             .pr(px(8.))
             .child(
@@ -919,6 +1143,7 @@ impl DeviceScreen {
                     .children(screenshot)
                     .child(more),
             )
+            .children(duo_controls)
     }
 }
 
@@ -1035,7 +1260,7 @@ impl Render for DeviceScreen {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| this.key(KeyPhase::Down, &event.keystroke, window, cx)))
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, window, cx| this.key(KeyPhase::Up, &event.keystroke, window, cx)))
-            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, window, _| this.modifiers_changed(event, window)))
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, window, cx| this.modifiers_changed(event, window, cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .child(page)
             .children(input_bar)
@@ -1047,5 +1272,99 @@ impl Render for DeviceScreen {
             .size_full()
             .child(div().flex().flex_col().flex_1().min_w_0().h_full().children(alert).child(screen))
             .children(tools)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use t3_core::device::stream::Orientation;
+
+    #[test]
+    fn decode_rgba_converts_to_bgra_and_rotates_cleanly() {
+        // 2x1 RGBA image: pixel 0 = red (255, 0, 0, 255), pixel 1 = blue (0, 0, 255, 255).
+        let rgba: Arc<[u8]> = Arc::from([255u8, 0, 0, 255, 0, 0, 255, 255]);
+        let frame = Frame::Rgba { width: 2, height: 1, bytes: rgba };
+
+        let flat = decode(&frame, 0).expect("decodes unrotated RGBA");
+        assert_eq!(flat.size, (2, 1));
+        assert_eq!(flat.image.as_bytes(0), Some([0u8, 0, 255, 255, 255, 0, 0, 255].as_slice()), "GPUI atlas takes BGRA");
+
+        let rotated = decode(&frame, 90).expect("decodes 90-degree rotated RGBA");
+        assert_eq!(rotated.size, (1, 2));
+        assert_eq!(rotated.image.as_bytes(0), Some([0u8, 0, 255, 255, 255, 0, 0, 255].as_slice()));
+
+        let rotated_ccw = decode(&frame, -90).expect("decodes -90-degree rotated RGBA");
+        assert_eq!(rotated_ccw.size, (1, 2));
+        assert_eq!(rotated_ccw.image.as_bytes(0), Some([255u8, 0, 0, 255, 0, 0, 255, 255].as_slice()));
+    }
+
+    #[gpui::test]
+    fn float_and_dock_device_toggles_right_panel_and_renders_floating_window(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (state, devices) = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            crate::settings::store::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            let devices = cx.new(|cx| Devices::new(state.clone(), cx));
+            (state, devices)
+        });
+        let sim = Device {
+            host_id: "local".into(),
+            id: "duo-1".into(),
+            platform: Platform::Ios,
+            name: "iPhone Duo".into(),
+            version: "iOS 19".into(),
+            booted: true,
+        };
+        let target = t3_core::right_panel::DeviceTarget {
+            host_id: sim.host_id.clone(),
+            device_id: sim.id.clone(),
+            platform: sim.platform,
+            name: sim.name.clone(),
+        };
+        state.update(cx, |s, _| {
+            s.panels.panels.open_device("t-1", target);
+            assert!(s.panels.panels.panel("t-1").is_open);
+        });
+
+        // Floating hides the docked right panel and marks the device as floating (guarded off from spawning real OS windows).
+        devices.update(cx, |d, cx| d.float_device("t-1", "s-1", sim.clone(), cx));
+        assert!(devices.read_with(cx, |d, _| d.is_floating("local", "duo-1")));
+        assert!(!state.read_with(cx, |s, _| s.panels.panels.panel("t-1").is_open));
+
+        // Docking back reopens the thread's right panel on that device and clears floating state.
+        devices.update(cx, |d, cx| d.dock_device("t-1", &sim, cx));
+        assert!(!devices.read_with(cx, |d, _| d.is_floating("local", "duo-1")));
+        assert!(state.read_with(cx, |s, _| s.panels.panels.panel("t-1").is_open));
+
+        // Rendering FloatingDeviceWindow and Duo controls in a headless test window succeeds cleanly.
+        let window = cx.open_window(size(px(360.), px(680.)), |_window, cx| {
+            float::FloatingDeviceWindow::new(state.clone(), devices.clone(), "t-1".into(), "s-1".into(), sim.clone(), cx)
+        });
+        let _ = window.update(cx, |_, window, cx| {
+            window.refresh();
+            let _ = cx;
+        });
+
+        // Rendering a DeviceScreen with Duo hinge support exercises DeviceDuoControls cleanly.
+        let duo_window = cx.open_window(size(px(420.), px(720.)), |_window, cx| {
+            let mut screen = DeviceScreen::new(state.clone(), devices.clone(), "t-1".into(), "s-1".into(), sim.clone(), cx);
+            screen.on_event(DeviceStreamEvent::Screen(Screen {
+                screen_id: Some(3),
+                supports_hinge_angle: true,
+                supports_physical_orientation: true,
+                hinge_angle: Some(90.0),
+                hinge_pose: Some(DuoPose::Book),
+                ..Screen::new(1200., 2000., Orientation::Portrait)
+            }));
+            screen.on_event(DeviceStreamEvent::Input { connected: true, detail: None });
+            screen
+        });
+        let _ = duo_window.update(cx, |_, window, cx| {
+            window.refresh();
+            let _ = cx;
+        });
     }
 }

@@ -9,9 +9,10 @@ mod pane;
 mod screen;
 mod setup;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
-use gpui::{App, AppContext, Context, Entity, EventEmitter, Global, Subscription, Task};
+use gpui::{AnyWindowHandle, App, AppContext, Context, Entity, EventEmitter, Global, Subscription, Task};
 use serde_json::{Value, json};
 use t3_client::session::RpcError;
 use t3_core::device::tools::{Action, Detail, action_payload, detail_payload};
@@ -50,6 +51,8 @@ pub struct Devices {
     operations: Operations,
     /// Tracks new device sessions opened by agents (`agentOpenedPreviews.ts`).
     agent_sessions: AgentSessionTracker,
+    /// Open floating device windows keyed by `(host_id, device_id)`.
+    floating: HashMap<(String, String), Option<AnyWindowHandle>>,
     /// The thread the launcher asked to set devices up for.
     setup_requested: Option<String>,
     subscription: Option<(Abort, Task<()>)>,
@@ -119,6 +122,7 @@ impl Devices {
             can_configure: None,
             operations: Operations::default(),
             agent_sessions: AgentSessionTracker::default(),
+            floating: HashMap::new(),
             setup_requested: None,
             subscription: None,
             grants: None,
@@ -151,8 +155,10 @@ impl Devices {
 
     /// A new connection starts over: its devices and grants are its own.
     fn sync_connection(&mut self, cx: &mut Context<Self>) {
-        let state = self.state.read(cx);
-        let current = state.connection_id();
+        let (current, client) = {
+            let state = self.state.read(cx);
+            (state.connection_id(), state.client_handle())
+        };
         if current == self.connection {
             return;
         }
@@ -161,9 +167,10 @@ impl Devices {
         self.can_configure = None;
         self.operations.reset();
         self.agent_sessions.reset();
+        self.close_all_floating(cx);
         self.subscription = None;
         self.grants = None;
-        if let Some(client) = state.client_handle() {
+        if let Some(client) = client {
             let mut grants = client.session_state();
             self.can_configure = grants.borrow_and_update().as_ref().map(|state| state.grants(SETTINGS_WRITE_SCOPE));
             self.grants = Some(cx.spawn(async move |this, cx| {
@@ -396,6 +403,8 @@ impl Devices {
                 }
                 let error = match result {
                     Ok(_) => {
+                        let key = (host_id.clone(), device_id.clone());
+                        this.close_floating_key(&key, cx);
                         this.state.update(cx, |state, cx| edit_panels(state, &thread_id, cx, |panels, thread| panels.close_surface(thread, &surface_id)));
                         None
                     }
@@ -407,6 +416,63 @@ impl Devices {
             });
         })
         .detach();
+    }
+
+    /// `floatActive` (`DevicePanel.tsx`): hides the docked right panel and opens a dedicated
+    /// floating secondary GPUI window for the device (guarded off in test/snapshot builds).
+    pub fn float_device(&mut self, thread_id: &str, surface_id: &str, device: Device, cx: &mut Context<Self>) {
+        let key = (device.host_id.clone(), device.id.clone());
+        let thread = thread_id.to_owned();
+        self.state.update(cx, |state, cx| edit_panels(state, &thread, cx, |panels, thread| panels.hide(thread)));
+        if let Some(Some(handle)) = self.floating.get(&key).copied() {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+            return;
+        }
+        let state = self.state.clone();
+        let devices = cx.entity();
+        let surface = surface_id.to_owned();
+        let handle = screen::float::open_floating_window(state, devices, thread, surface, device, cx);
+        self.floating.insert(key, handle);
+        cx.emit(DevicesEvent::Changed);
+    }
+
+    /// Docks a floating device back into its thread's right panel tab.
+    pub fn dock_device(&mut self, thread_id: &str, device: &Device, cx: &mut Context<Self>) {
+        let key = (device.host_id.clone(), device.id.clone());
+        self.floating.remove(&key);
+        let target = DeviceTarget {
+            host_id: device.host_id.clone(),
+            device_id: device.id.clone(),
+            platform: device.platform,
+            name: device.name.clone(),
+        };
+        let thread = thread_id.to_owned();
+        self.state.update(cx, |state, cx| edit_panels(state, &thread, cx, |panels, thread| panels.open_device(thread, target)));
+        cx.emit(DevicesEvent::Changed);
+    }
+
+    #[cfg(test)]
+    pub fn is_floating(&self, host_id: &str, device_id: &str) -> bool {
+        self.floating.contains_key(&(host_id.to_owned(), device_id.to_owned()))
+    }
+
+    pub(crate) fn clear_floating_key(&mut self, key: &(String, String), cx: &mut Context<Self>) {
+        if self.floating.remove(key).is_some() {
+            cx.emit(DevicesEvent::Changed);
+        }
+    }
+
+    fn close_floating_key(&mut self, key: &(String, String), cx: &mut Context<Self>) {
+        if let Some(Some(handle)) = self.floating.remove(key) {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
+    fn close_all_floating(&mut self, cx: &mut Context<Self>) {
+        let handles: Vec<AnyWindowHandle> = self.floating.drain().filter_map(|(_, handle)| handle).collect();
+        for handle in handles {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
     }
 
     /// The launcher asked for setup on a thread whose devices are off or not set up.
