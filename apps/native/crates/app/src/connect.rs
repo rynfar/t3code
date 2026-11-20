@@ -18,14 +18,17 @@ use t3_client::ssh::{DiscoveredSshHost, SshTarget};
 use t3_client::status::{DotTone, HopResult, connection_diagnosis_text, diagnose, host_freeze_notice};
 use t3_client::store::SavedEnvironment;
 use t3_core::compatibility::resolve_version_mismatch;
+use t3_core::connect::{FirstFactorKind, SecondFactorKind, SocialProvider};
 use t3_core::local_server::{LocalServerFailure, LocalServerFailureKind, LocalServerPhase, describe_startup_recovery_offer};
 use t3_core::pairing::{
     ANOTHER_ADDRESS, LinkMachineBadge, LinkableMachine, link_destination, link_machine_badge as resolve_link_machine_badge,
     link_machine_select_label, session_has_legacy_permissions,
 };
+use t3_core::relay::EnvironmentHealth;
 use t3_core::ssh::{filter_hosts, format_target, parse_manual_target};
 
 use crate::app_state::{AppEvent, AppState};
+use crate::cloud::CloudAuthFlow;
 use crate::environments::{ConnectScreen, PairingSource};
 use crate::icons::Icon;
 use crate::settings::controls::{Button, ButtonSize, ButtonVariant};
@@ -46,6 +49,12 @@ pub struct ConnectView {
     state: Entity<AppState>,
     link: Entity<InputState>,
     code: Entity<InputState>,
+    cloud_email: Entity<InputState>,
+    cloud_code: Entity<InputState>,
+    cloud_password: Entity<InputState>,
+    cloud_second_factor: Entity<InputState>,
+    cloud_first_factor: FirstFactorKind,
+    cloud_second_factor_kind: SecondFactorKind,
     mode: AddMode,
     ssh_host: Entity<InputState>,
     ssh_username: Entity<InputState>,
@@ -113,7 +122,7 @@ fn render_refused_routes_list(refused_route_ids: &[String], cx: &App) -> Div {
                                 .bg(hsla(p.destructive).opacity(0.1))
                                 .text_xs()
                                 .text_color(hsla(p.destructive_foreground))
-                                .child("Sign-in refused"),
+                                .child(crate::i18n::t(cx, "Sign-in refused")),
                         )
                         .child(
                             div()
@@ -129,7 +138,7 @@ fn render_refused_routes_list(refused_route_ids: &[String], cx: &App) -> Div {
                     div()
                         .text_xs()
                         .text_color(hsla(p.muted_foreground))
-                        .child("The host refused this device's sign-in. Pair this address again with Add route."),
+                        .child(crate::i18n::t(cx, "The host refused this device's sign-in. Pair this address again with Add route.")),
                 )
         }))
 }
@@ -177,14 +186,14 @@ pub fn link_address_warning(address: &str, cx: &App) -> Div {
                 .gap(px(6.))
                 .items_center()
                 .child(Icon::TriangleAlert.render(px(14.), hsla(p.warning_foreground)))
-                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.warning_foreground)).child("Check this address")),
+                .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.warning_foreground)).child(crate::i18n::t(cx, "Check this address"))),
         )
         .child(
             div()
                 .text_xs()
                 .line_height(px(18.))
                 .text_color(hsla(p.muted_foreground))
-                .child("This app cannot confirm it is one of your machines. The pairing code you paste is sent there."),
+                .child(crate::i18n::t(cx, "This app cannot confirm it is one of your machines. The pairing code you paste is sent there.")),
         )
         .child(
             div()
@@ -215,7 +224,7 @@ pub fn link_machine_badge(machine: &LinkableMachine, cx: &App) -> Option<Div> {
             .text_xs()
             .font_weight(FontWeight::MEDIUM)
             .text_color(fg)
-            .child(badge.label()),
+            .child(crate::i18n::t(cx, badge.label())),
     )
 }
 
@@ -278,7 +287,7 @@ pub fn render_link_machine_select(
 
     let mut container = v_flex()
         .gap(px(6.))
-        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("Machine"))
+        .child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Machine")))
         .child(trigger);
 
     if open && !disabled {
@@ -337,7 +346,7 @@ pub fn render_link_machine_select(
                 .when(another_selected, |this| this.bg(hsla(p.accent)))
                 .hover(|this| this.bg(hsla(p.accent)))
                 .on_click(move |_, window, cx| select_another(ANOTHER_ADDRESS.to_owned(), window, cx))
-                .child(div().text_sm().text_color(hsla(p.foreground)).child("Another address\u{2026}")),
+                .child(div().text_sm().text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Another address…"))),
         );
         container = container.child(list);
     }
@@ -391,8 +400,8 @@ fn error_alert(text: impl Into<SharedString>, cx: &App) -> Div {
 }
 
 /// A field label: `text-xs font-medium text-foreground`, 6px above the control.
-fn field(label: &'static str, control: impl IntoElement, cx: &App) -> Div {
-    v_flex().gap(px(6.)).child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(palette(cx).foreground)).child(label)).child(control)
+fn field(label: &str, control: impl IntoElement, cx: &App) -> Div {
+    v_flex().gap(px(6.)).child(div().text_xs().font_weight(FontWeight::MEDIUM).text_color(hsla(palette(cx).foreground)).child(crate::i18n::t(cx, label).to_owned())).child(control)
 }
 
 /// `SettingsGroup`: radius 12, `border` at 60%, `card` at 40%.
@@ -403,8 +412,12 @@ fn card(cx: &App) -> Div {
 
 impl ConnectView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let link = cx.new(|cx| InputState::new(window, cx).placeholder("https://your-server:3773/pair#token=… or host:3773"));
-        let code = cx.new(|cx| InputState::new(window, cx).placeholder("Optional pairing code"));
+        let link = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "https://your-server:3773/pair#token=… or host:3773")));
+        let code = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Optional pairing code")));
+        let cloud_email = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "you@example.com")));
+        let cloud_code = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "6-digit code")));
+        let cloud_password = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(crate::i18n::t(cx, "Password")));
+        let cloud_second_factor = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Verification code")));
         let ssh_host = cx.new(|cx| InputState::new(window, cx).placeholder(crate::i18n::t(cx, "Search hosts or type devbox")));
         let ssh_username = cx.new(|cx| InputState::new(window, cx).placeholder("root"));
         let ssh_port = cx.new(|cx| InputState::new(window, cx).placeholder("22"));
@@ -419,14 +432,47 @@ impl ConnectView {
                     this.add(cx);
                 }
             }),
+            cx.subscribe_in(&cloud_email, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.submit_cloud_email(cx);
+                }
+            }),
+            cx.subscribe_in(&cloud_code, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.submit_cloud_first_factor(FirstFactorKind::EmailCode, cx);
+                }
+            }),
+            cx.subscribe_in(&cloud_password, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.submit_cloud_first_factor(FirstFactorKind::Password, cx);
+                }
+            }),
+            cx.subscribe_in(&cloud_second_factor, window, |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    let kind = this.cloud_second_factor_kind;
+                    this.submit_cloud_second_factor(kind, cx);
+                }
+            }),
             cx.subscribe_in(&state, window, |this, state, event: &AppEvent, window, cx| {
                 if !matches!(event, AppEvent::Phase) {
                     return;
                 }
-                let (pairing, failed) = {
-                    let connect = &state.read(cx).connect;
-                    (connect.pairing.is_some(), connect.error.is_some())
+                let (pairing, failed, clerk_signed_in, flow_idle) = {
+                    let app = state.read(cx);
+                    (
+                        app.connect.pairing.is_some(),
+                        app.connect.error.is_some(),
+                        app.cloud.has_clerk_session,
+                        matches!(app.cloud.auth_flow, CloudAuthFlow::Idle),
+                    )
                 };
+                if clerk_signed_in && flow_idle {
+                    for input in [&this.cloud_email, &this.cloud_code, &this.cloud_password, &this.cloud_second_factor] {
+                        if !input.read(cx).value().is_empty() {
+                            input.update(cx, |input, cx| input.set_value("", window, cx));
+                        }
+                    }
+                }
                 if this.submitted && !pairing {
                     this.submitted = false;
                     if !failed {
@@ -457,6 +503,12 @@ impl ConnectView {
             state,
             link,
             code,
+            cloud_email,
+            cloud_code,
+            cloud_password,
+            cloud_second_factor,
+            cloud_first_factor: FirstFactorKind::EmailCode,
+            cloud_second_factor_kind: SecondFactorKind::Totp,
             mode: AddMode::Link,
             ssh_host,
             ssh_username,
@@ -470,6 +522,26 @@ impl ConnectView {
             ssh_submitted: false,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn submit_cloud_email(&mut self, cx: &mut Context<Self>) {
+        let email = self.cloud_email.read(cx).value().to_string();
+        self.state.update(cx, |state, cx| state.start_email_cloud_sign_in(email, cx));
+    }
+
+    fn submit_cloud_first_factor(&mut self, kind: FirstFactorKind, cx: &mut Context<Self>) {
+        let secret = match kind {
+            FirstFactorKind::EmailCode => self.cloud_code.read(cx).value().to_string(),
+            FirstFactorKind::Password => self.cloud_password.read(cx).value().to_string(),
+        };
+        self.state
+            .update(cx, |state, cx| state.submit_email_cloud_first_factor(kind, secret, cx));
+    }
+
+    fn submit_cloud_second_factor(&mut self, kind: SecondFactorKind, cx: &mut Context<Self>) {
+        let code = self.cloud_second_factor.read(cx).value().to_string();
+        self.state
+            .update(cx, |state, cx| state.submit_cloud_second_factor(kind, code, cx));
     }
 
     fn add(&mut self, cx: &mut Context<Self>) {
@@ -514,7 +586,14 @@ impl ConnectView {
 
     fn render_header(&self, switching: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
-        let subtitle = if switching { "Switch to another environment, or pair a new one." } else { "Pick an environment, or pair with a T3 Code server." };
+        let subtitle = crate::i18n::t(
+            cx,
+            if switching {
+                "Switch to another environment, or pair a new one."
+            } else {
+                "Pick an environment, or pair with a T3 Code server."
+            },
+        );
         h_flex()
             .w_full()
             .items_start()
@@ -523,11 +602,11 @@ impl ConnectView {
                 v_flex()
                     .flex_1()
                     .gap_1()
-                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child("Connect to T3 Code"))
+                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "Connect to T3 Code")))
                     .child(div().text_sm().text_color(hsla(p.muted_foreground)).child(subtitle)),
             )
             .when(switching, |this| {
-                this.child(Button::new("connect-cancel", ButtonVariant::Outline, ButtonSize::Sm).label("Cancel").on_click(cx.listener(|this, _, _, cx| {
+                this.child(Button::new("connect-cancel", ButtonVariant::Outline, ButtonSize::Sm).label(crate::i18n::t(cx, "Cancel")).on_click(cx.listener(|this, _, _, cx| {
                     this.state.update(cx, |state, cx| state.close_switcher(cx));
                 })))
             })
@@ -545,6 +624,26 @@ impl ConnectView {
             .trace_id
             .clone()
             .or_else(|| t3_client::status::extract_trace_id(&rejected.reason).map(str::to_owned));
+        let heading = crate::i18n::t_fmt(
+            cx,
+            "T3 Code on {host} did not accept this device",
+            &[("host", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&rejected.label)))],
+        );
+        let body = if can_pair_again {
+            crate::i18n::t_fmt(
+                cx,
+                "This device's sign-in to {host} expired or was revoked. Pair again to reconnect.",
+                &[("host", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&rejected.label)))],
+            )
+        } else {
+            crate::i18n::t_fmt(
+                cx,
+                "This device's sign-in to {host} expired or was revoked. Pair it again with a new pairing link from {host}.",
+                &[("host", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&rejected.label)))],
+            )
+        };
+        let trace_prefix = crate::i18n::t(cx, "Trace ID");
+        let repair_label = crate::i18n::t(cx, if busy { "Pairing…" } else { "Pair again" });
         Some(
             v_flex()
                 .px(px(14.))
@@ -556,29 +655,22 @@ impl ConnectView {
                 .bg(hsla(p.error_surface))
                 .text_sm()
                 .text_color(hsla(p.error_foreground))
-                .child(div().font_weight(FontWeight::MEDIUM).child(format!("T3 Code on {} did not accept this device", rejected.label)))
-                .child(div().opacity(0.85).child(if can_pair_again {
-                    format!("This device's sign-in to {} expired or was revoked. Pair again to reconnect.", rejected.label)
-                } else {
-                    format!(
-                        "This device's sign-in to {} expired or was revoked. Pair it again with a new pairing link from {}.",
-                        rejected.label, rejected.label
-                    )
-                }))
+                .child(div().font_weight(FontWeight::MEDIUM).child(heading))
+                .child(div().opacity(0.85).child(body))
                 .when_some(trace_id, |this, trace| {
                     this.child(
                         div()
                             .text_xs()
                             .font_family(cx.theme().mono_font_family.clone())
                             .opacity(0.85)
-                            .child(format!("Trace ID: {trace}")),
+                            .child(format!("{trace_prefix}: {trace}")),
                     )
                 })
                 .when(can_pair_again, |this| {
                     let (id, ssh) = (rejected.id.clone(), rejected.ssh);
                     this.child(div().pt(px(2.)).child(
                         Button::new("connect-repair", ButtonVariant::Default, ButtonSize::Sm)
-                            .label(if busy { "Pairing…" } else { "Pair again" })
+                            .label(repair_label)
                             .disabled(busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.state.update(cx, |state, cx| if ssh { state.pair_ssh_again(&id, cx) } else { state.pair_local(cx) })
@@ -619,7 +711,7 @@ impl ConnectView {
                     div()
                         .line_height(px(18.))
                         .text_color(hsla(p.muted_foreground))
-                        .child("Automatic restart is disabled for this error."),
+                        .child(crate::i18n::t(cx, "Automatic restart is disabled for this error.")),
                 )
             })
             .child(
@@ -689,24 +781,28 @@ impl ConnectView {
                 if auto_start { ButtonVariant::Outline } else { ButtonVariant::GhostMuted },
                 ButtonSize::Compact,
             )
-            .label("Auto-start")
-            .tooltip("Start the local T3 Code server automatically when opening this app.")
+            .label(crate::i18n::t(cx, "Auto-start"))
+            .tooltip(crate::i18n::t(cx, "Start the local T3 Code server automatically when opening this app."))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.state.update(cx, |state, cx| state.set_local_server_auto_start(!auto_start, cx));
             }));
             if auto_start { button.icon(Icon::Check) } else { button }
         };
 
+        let local_title = crate::i18n::t(cx, "T3 Code on this Mac");
         let Some(server) = connect.local_server.clone() else {
-            let message = if starting {
-                "Starting T3 Code on this Mac…"
-            } else if stopping {
-                "Stopping T3 Code on this Mac…"
-            } else {
-                discovery_message(connect.discovering)
-            };
+            let message = crate::i18n::t(
+                cx,
+                if starting {
+                    "Starting T3 Code on this Mac…"
+                } else if stopping {
+                    "Stopping T3 Code on this Mac…"
+                } else {
+                    discovery_message(connect.discovering)
+                },
+            );
             let primary_start = state.environments.environments.is_empty();
-            let start_label = if starting { crate::i18n::t(cx, "Starting…") } else { "Start local server" };
+            let start_label = crate::i18n::t(cx, if starting { "Starting…" } else { "Start local server" });
             let check_label = crate::i18n::t(cx, "Check again");
             return card(cx)
                 .px(px(16.))
@@ -730,7 +826,7 @@ impl ConnectView {
                                                 .text_sm()
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .text_color(hsla(p.foreground))
-                                                .child("T3 Code on this Mac"),
+                                                .child(local_title),
                                         )
                                         .when_some(status_badge, |this, (tone, text)| {
                                             this.child(
@@ -781,8 +877,8 @@ impl ConnectView {
 
         let busy = connect.pairing == Some(PairingSource::Local);
         let (details, blocked) = local_details(&server);
-        let connect_label = if busy { crate::i18n::t(cx, "Connecting…") } else { "Connect to T3 Code on this Mac" };
-        let stop_label = if stopping { crate::i18n::t(cx, "Stopping…") } else { crate::i18n::t(cx, "Stop server") };
+        let connect_label = crate::i18n::t(cx, if busy { "Connecting…" } else { "Connect to T3 Code on this Mac" });
+        let stop_label = crate::i18n::t(cx, if stopping { "Stopping…" } else { "Stop server" });
         card(cx)
             .px(px(16.))
             .py(px(14.))
@@ -804,7 +900,7 @@ impl ConnectView {
                                             .text_sm()
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(hsla(p.foreground))
-                                            .child("T3 Code on this Mac"),
+                                            .child(local_title),
                                     )
                                     .when_some(status_badge, |this, (tone, text)| {
                                         this.child(
@@ -847,37 +943,307 @@ impl ConnectView {
             .into_any_element()
     }
 
-    fn render_cloud(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_cloud_auth_controls(&self, cx: &mut Context<Self>) -> Div {
         let cloud = &self.state.read(cx).cloud;
-        let p = palette(cx);
         let busy = cloud.busy;
-        let signing_in = cloud.signing_in;
-        let signed_in = cloud.identity.is_some();
-        let auth = Button::new("cloud-auth", ButtonVariant::Outline, ButtonSize::Sm)
-            .label(if signing_in {
-                "Waiting for browser…"
-            } else if signed_in {
-                "Sign out"
-            } else {
-                "Sign in"
-            })
-            .disabled(busy)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.state.update(cx, |state, cx| {
-                    if signed_in {
-                        state.sign_out_cloud(cx);
-                    } else {
-                        state.sign_in_cloud(cx);
+        let flow = cloud.auth_flow.clone();
+        match flow {
+            CloudAuthFlow::OAuth(provider) => {
+                let waiting = crate::i18n::t_fmt(
+                    cx,
+                    "Signing in with {provider}…",
+                    &[("provider", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(provider.label())))],
+                );
+                h_flex()
+                    .gap(px(8.))
+                    .items_center()
+                    .child(muted(waiting, cx))
+                    .child(
+                        Button::new("cloud-cancel", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                            .label(crate::i18n::t(cx, "Cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.update(cx, |state, cx| state.cancel_cloud_sign_in(cx));
+                            })),
+                    )
+            }
+            CloudAuthFlow::EmailFirstFactor { pending, code_sent } => {
+                let supports_code = pending.challenge.supports_email_code;
+                let supports_password = pending.challenge.supports_password;
+                let active_kind = if self.cloud_first_factor == FirstFactorKind::Password && supports_password {
+                    FirstFactorKind::Password
+                } else if supports_code {
+                    FirstFactorKind::EmailCode
+                } else {
+                    FirstFactorKind::Password
+                };
+                let mut panel = v_flex()
+                    .gap(px(8.))
+                    .child(muted(pending.challenge.identifier.clone(), cx));
+                if supports_code && supports_password {
+                    panel = panel.child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(
+                                Button::new(
+                                    "cloud-factor-code",
+                                    if active_kind == FirstFactorKind::EmailCode {
+                                        ButtonVariant::Default
+                                    } else {
+                                        ButtonVariant::Outline
+                                    },
+                                    ButtonSize::Compact,
+                                )
+                                .label(crate::i18n::t(cx, "Email code"))
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cloud_first_factor = FirstFactorKind::EmailCode;
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                Button::new(
+                                    "cloud-factor-password",
+                                    if active_kind == FirstFactorKind::Password {
+                                        ButtonVariant::Default
+                                    } else {
+                                        ButtonVariant::Outline
+                                    },
+                                    ButtonSize::Compact,
+                                )
+                                .label(crate::i18n::t(cx, "Password"))
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cloud_first_factor = FirstFactorKind::Password;
+                                    cx.notify();
+                                })),
+                            ),
+                    );
+                }
+                match active_kind {
+                    FirstFactorKind::EmailCode => {
+                        if !code_sent {
+                            panel = panel.child(
+                                h_flex()
+                                    .gap(px(8.))
+                                    .child(
+                                        Button::new("cloud-send-code", ButtonVariant::Default, ButtonSize::Sm)
+                                            .label(crate::i18n::t(cx, "Send verification code"))
+                                            .disabled(busy)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.update(cx, |state, cx| state.send_email_cloud_code(cx));
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("cloud-email-back", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                                            .label(crate::i18n::t(cx, "Back"))
+                                            .disabled(busy)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.update(cx, |state, cx| state.cancel_cloud_sign_in(cx));
+                                            })),
+                                    ),
+                            );
+                        } else {
+                            panel = panel
+                                .child(field("Verification code", Input::new(&self.cloud_code).disabled(busy), cx))
+                                .child(
+                                    h_flex()
+                                        .gap(px(8.))
+                                        .child(
+                                            Button::new("cloud-verify-code", ButtonVariant::Default, ButtonSize::Sm)
+                                                .label(crate::i18n::t(cx, "Verify"))
+                                                .disabled(busy)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.submit_cloud_first_factor(FirstFactorKind::EmailCode, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("cloud-resend-code", ButtonVariant::Outline, ButtonSize::Sm)
+                                                .label(crate::i18n::t(cx, "Resend code"))
+                                                .disabled(busy)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.state.update(cx, |state, cx| state.send_email_cloud_code(cx));
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("cloud-code-back", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                                                .label(crate::i18n::t(cx, "Back"))
+                                                .disabled(busy)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.state.update(cx, |state, cx| state.cancel_cloud_sign_in(cx));
+                                                })),
+                                        ),
+                                );
+                        }
                     }
-                })
-            }));
-        let actions = h_flex().gap(px(8.)).child(auth).when(signing_in, |this| {
-            this.child(
-                Button::new("cloud-cancel", ButtonVariant::GhostMuted, ButtonSize::Sm)
-                    .label(crate::i18n::t(cx, "Cancel"))
-                    .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.cancel_cloud_sign_in(cx)))),
+                    FirstFactorKind::Password => {
+                        panel = panel
+                            .child(field("Password", Input::new(&self.cloud_password).disabled(busy), cx))
+                            .child(
+                                h_flex()
+                                    .gap(px(8.))
+                                    .child(
+                                        Button::new("cloud-submit-password", ButtonVariant::Default, ButtonSize::Sm)
+                                            .label(crate::i18n::t(cx, "Sign in"))
+                                            .disabled(busy)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_cloud_first_factor(FirstFactorKind::Password, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("cloud-password-back", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                                            .label(crate::i18n::t(cx, "Back"))
+                                            .disabled(busy)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.update(cx, |state, cx| state.cancel_cloud_sign_in(cx));
+                                            })),
+                                    ),
+                            );
+                    }
+                }
+                panel
+            }
+            CloudAuthFlow::SecondFactor(pending) => {
+                let supports_totp = pending.challenge.supports_totp;
+                let supports_backup = pending.challenge.supports_backup_code;
+                let active_kind = if self.cloud_second_factor_kind == SecondFactorKind::BackupCode && supports_backup {
+                    SecondFactorKind::BackupCode
+                } else if supports_totp {
+                    SecondFactorKind::Totp
+                } else {
+                    SecondFactorKind::BackupCode
+                };
+                let mut panel = v_flex()
+                    .gap(px(8.))
+                    .child(muted(crate::i18n::t(cx, "Two-factor verification"), cx));
+                if supports_totp && supports_backup {
+                    panel = panel.child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(
+                                Button::new(
+                                    "cloud-2fa-totp",
+                                    if active_kind == SecondFactorKind::Totp {
+                                        ButtonVariant::Default
+                                    } else {
+                                        ButtonVariant::Outline
+                                    },
+                                    ButtonSize::Compact,
+                                )
+                                .label(crate::i18n::t(cx, "Authenticator app"))
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cloud_second_factor_kind = SecondFactorKind::Totp;
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                Button::new(
+                                    "cloud-2fa-backup",
+                                    if active_kind == SecondFactorKind::BackupCode {
+                                        ButtonVariant::Default
+                                    } else {
+                                        ButtonVariant::Outline
+                                    },
+                                    ButtonSize::Compact,
+                                )
+                                .label(crate::i18n::t(cx, "Backup code"))
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cloud_second_factor_kind = SecondFactorKind::BackupCode;
+                                    cx.notify();
+                                })),
+                            ),
+                    );
+                }
+                panel
+                    .child(field(
+                        if active_kind == SecondFactorKind::BackupCode {
+                            "Backup code"
+                        } else {
+                            "Authenticator code"
+                        },
+                        Input::new(&self.cloud_second_factor).disabled(busy),
+                        cx,
+                    ))
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .child(
+                                Button::new("cloud-2fa-verify", ButtonVariant::Default, ButtonSize::Sm)
+                                    .label(crate::i18n::t(cx, "Verify"))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.submit_cloud_second_factor(active_kind, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("cloud-2fa-cancel", ButtonVariant::GhostMuted, ButtonSize::Sm)
+                                    .label(crate::i18n::t(cx, "Cancel"))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.update(cx, |state, cx| state.cancel_cloud_sign_in(cx));
+                                    })),
+                            ),
+                    )
+            }
+            CloudAuthFlow::Idle => {
+                let mut oauth_row = h_flex().gap(px(6.)).flex_wrap();
+                for provider in SocialProvider::ALL {
+                    oauth_row = oauth_row.child(
+                        Button::new(
+                            SharedString::from(format!("cloud-oauth-{}", provider.strategy())),
+                            ButtonVariant::Outline,
+                            ButtonSize::Sm,
+                        )
+                        .label(provider.label())
+                        .disabled(busy)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.state
+                                .update(cx, |state, cx| state.sign_in_cloud_oauth(provider, cx));
+                        })),
+                    );
+                }
+                v_flex()
+                    .gap(px(10.))
+                    .child(oauth_row)
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .items_end()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(field("Email", Input::new(&self.cloud_email).disabled(busy), cx)),
+                            )
+                            .child(
+                                Button::new("cloud-email-continue", ButtonVariant::Outline, ButtonSize::Default)
+                                    .label(crate::i18n::t(cx, "Continue"))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| this.submit_cloud_email(cx))),
+                            ),
+                    )
+            }
+        }
+    }
+
+    fn render_cloud(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (busy, identity, has_clerk_session, cloud_error, refreshing, listed, env_count) = {
+            let cloud = &self.state.read(cx).cloud;
+            (
+                cloud.busy,
+                cloud.identity.clone(),
+                cloud.has_clerk_session,
+                cloud.error.clone(),
+                cloud.discovery.refreshing,
+                cloud.discovery.listed,
+                cloud.discovery.environments.len(),
             )
-        });
+        };
+        let p = palette(cx);
+        let signed_in = identity.is_some();
+        let legacy_oauth_only = signed_in && !has_clerk_session;
+
         let heading = h_flex()
             .gap(px(8.))
             .child(
@@ -889,47 +1255,69 @@ impl ConnectView {
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(hsla(p.foreground))
-                            .child("T3 Connect"),
+                            .child(crate::i18n::t(cx, "T3 Connect")),
                     )
                     .child(muted(
-                        cloud.identity.clone().unwrap_or_else(|| crate::i18n::t(cx, "Sign in to T3 Connect to connect this environment.").into()),
+                        identity.unwrap_or_else(|| {
+                            crate::i18n::t(cx, "Sign in to T3 Connect to connect this environment.").into()
+                        }),
                         cx,
                     )),
             )
+            .when(signed_in, |this| {
+                this.child(
+                    Button::new("cloud-sign-out", ButtonVariant::Outline, ButtonSize::Compact)
+                        .label(crate::i18n::t(cx, "Sign out"))
+                        .disabled(busy)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.update(cx, |state, cx| state.sign_out_cloud(cx));
+                        })),
+                )
+            })
             .child(
                 Button::new("cloud-refresh", ButtonVariant::GhostMuted, ButtonSize::IconSm)
                     .icon(Icon::RefreshCw)
-                    .tooltip("Refresh T3 Connect environments")
+                    .tooltip(crate::i18n::t(cx, "Refresh T3 Connect environments"))
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, _, cx| this.state.update(cx, |state, cx| state.refresh_cloud(cx)))),
             );
+
+        let auth_controls = (!has_clerk_session).then(|| self.render_cloud_auth_controls(cx));
+
         let mut body = card(cx)
             .px(px(16.))
             .py(px(14.))
             .gap(px(12.))
             .child(heading)
-            .child(actions)
-            .when(signed_in, |this| this.child(muted(t3_core::relay::CONNECTION_UNAVAILABLE, cx)))
-            .children(cloud.error.clone().map(|error| error_text(error, cx)));
-        if signed_in && cloud.discovery.refreshing {
-            body = body.child(muted("Loading T3 Connect environments…", cx));
+            .when(legacy_oauth_only, |this| {
+                this.child(muted(crate::i18n::t(cx, t3_core::relay::LEGACY_OAUTH_NOTICE), cx))
+            })
+            .children(auth_controls)
+            .children(cloud_error.map(|error| error_text(error, cx)));
+
+        if signed_in && refreshing {
+            body = body.child(muted(crate::i18n::t(cx, "Loading T3 Connect environments…"), cx));
         }
-        if signed_in && cloud.discovery.listed && cloud.discovery.environments.is_empty() {
+        if signed_in && listed && env_count == 0 {
             body = body.child(muted(
-                "No other environments are published to your account yet. Publish one from another device to connect here.",
+                crate::i18n::t(
+                    cx,
+                    "No other environments are published to your account yet. Publish one from another device to connect here.",
+                ),
                 cx,
             ));
         }
-        let count = cloud.discovery.environments.len();
-        if count > 0 {
+        if env_count > 0 {
             body = body.child(
                 uniform_list(
                     "cloud-environments",
-                    count,
-                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| range.map(|index| this.render_cloud_row(index, cx)).collect::<Vec<_>>()),
+                    env_count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                        range.map(|index| this.render_cloud_row(index, cx)).collect::<Vec<_>>()
+                    }),
                 )
                 .w_full()
-                .h(px((count as f32 * 64.).min(288.))),
+                .h(px((env_count as f32 * 64.).min(288.))),
             );
         }
         body
@@ -942,13 +1330,112 @@ impl ConnectView {
             return div().h(px(64.)).into_any_element();
         };
         let environment = entry.clone();
-        let status = "T3 Connect · Connection unavailable";
+        let has_clerk_session = cloud.has_clerk_session;
+        let connecting = cloud.connecting_env_id.as_deref() == Some(environment.environment_id.as_str());
+        let any_connecting = cloud.connecting_env_id.is_some();
+        let active_connected = state.active_environment().is_some_and(|saved| {
+            saved.environment_id.as_deref() == Some(environment.environment_id.as_str())
+                && state.client_handle().is_some()
+        });
+
+        let (dot_tone, status_text, tooltip_text): (Option<DotTone>, String, Option<String>) = if !has_clerk_session {
+            let notice = crate::i18n::t(cx, t3_core::relay::LEGACY_OAUTH_NOTICE).to_owned();
+            (
+                None,
+                format!("{} · {}", crate::i18n::t(cx, "T3 Connect"), crate::i18n::t(cx, "Sign in required")),
+                Some(notice),
+            )
+        } else {
+            match cloud.statuses.get(&environment.environment_id) {
+                Some(EnvironmentHealth::Online) => (
+                    Some(DotTone::Success),
+                    format!("{} · {}", crate::i18n::t(cx, "T3 Connect"), crate::i18n::t(cx, "Online")),
+                    None,
+                ),
+                Some(EnvironmentHealth::Offline {
+                    offline_reason,
+                    error,
+                    trace_id,
+                }) => {
+                    let mut tip = t3_core::relay::offline_reason_message(offline_reason.as_deref())
+                        .map(|m| crate::i18n::t(cx, m).to_owned())
+                        .or_else(|| error.clone())
+                        .unwrap_or_else(|| crate::i18n::t(cx, "Offline").to_owned());
+                    if let Some(trace) = trace_id.as_deref().filter(|t| !t.is_empty()) {
+                        tip.push_str(&format!(" ({}: {trace})", crate::i18n::t(cx, "Trace ID")));
+                    }
+                    (
+                        Some(DotTone::Destructive),
+                        format!("{} · {}", crate::i18n::t(cx, "T3 Connect"), crate::i18n::t(cx, "Offline")),
+                        Some(tip),
+                    )
+                }
+                Some(EnvironmentHealth::Error(err)) => (
+                    Some(DotTone::Destructive),
+                    format!("{} · {}", crate::i18n::t(cx, "T3 Connect"), crate::i18n::t(cx, "Status unavailable")),
+                    Some(err.clone()),
+                ),
+                Some(EnvironmentHealth::Checking) | None => (
+                    Some(DotTone::Warning),
+                    format!("{} · {}", crate::i18n::t(cx, "T3 Connect"), crate::i18n::t(cx, "Checking…")),
+                    None,
+                ),
+            }
+        };
+
+        let status_div = {
+            let base = div()
+                .id(SharedString::from(format!("relay-status-{}", environment.environment_id)))
+                .truncate()
+                .text_xs()
+                .text_color(hsla(palette(cx).muted_foreground))
+                .child(status_text);
+            if let Some(tip) = tooltip_text.clone() {
+                base.tooltip(crate::settings::controls::tooltip(tip.into()))
+            } else {
+                base
+            }
+        };
+
+        let action_button = if !has_clerk_session {
+            Button::new(
+                SharedString::from(format!("relay-{}", environment.environment_id)),
+                ButtonVariant::Outline,
+                ButtonSize::Compact,
+            )
+            .label(crate::i18n::t(cx, "Sign in"))
+            .disabled(true)
+            .tooltip(crate::i18n::t(cx, t3_core::relay::LEGACY_OAUTH_NOTICE))
+        } else if active_connected {
+            Button::new(
+                SharedString::from(format!("relay-{}", environment.environment_id)),
+                ButtonVariant::GhostMuted,
+                ButtonSize::Compact,
+            )
+            .label(crate::i18n::t(cx, "Connected"))
+            .disabled(true)
+        } else {
+            let env_to_connect = environment.clone();
+            Button::new(
+                SharedString::from(format!("relay-{}", environment.environment_id)),
+                ButtonVariant::Outline,
+                ButtonSize::Compact,
+            )
+            .label(crate::i18n::t(cx, if connecting { "Connecting…" } else { "Connect" }))
+            .disabled(any_connecting)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let env = env_to_connect.clone();
+                this.state
+                    .update(cx, |state, cx| state.connect_cloud_environment(env, cx));
+            }))
+        };
+
         h_flex()
             .w_full()
             .min_w_0()
             .h(px(64.))
             .gap(px(10.))
-            .child(status_dot(None, cx))
+            .child(status_dot(dot_tone, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -963,26 +1450,9 @@ impl ConnectView {
                             .text_color(hsla(palette(cx).foreground))
                             .child(environment.label.clone()),
                     )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("relay-status-{}", environment.environment_id)))
-                            .truncate()
-                            .text_xs()
-                            .text_color(hsla(palette(cx).muted_foreground))
-                            .child(status)
-                            .tooltip(crate::settings::controls::tooltip(t3_core::relay::CONNECTION_UNAVAILABLE.into())),
-                    ),
+                    .child(status_div),
             )
-            .child(
-                Button::new(
-                    SharedString::from(format!("relay-{}", environment.environment_id)),
-                    ButtonVariant::Outline,
-                    ButtonSize::Compact,
-                )
-                .label("Unavailable")
-                .disabled(true)
-                .tooltip(t3_core::relay::CONNECTION_UNAVAILABLE),
-            )
+            .child(action_button)
             .into_any_element()
     }
 
@@ -1021,18 +1491,27 @@ impl ConnectView {
                 .border_color(hsla(p.warning).opacity(0.35))
                 .bg(hsla(p.warning).opacity(0.08))
                 .text_sm()
-                .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(format!("Permissions have changed for {label}")))
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(p.foreground))
+                        .child(crate::i18n::t_fmt(
+                            cx,
+                            "Permissions have changed for {environment}",
+                            &[("environment", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(&label)))],
+                        )),
+                )
                 .child(
                     div()
                         .text_xs()
                         .line_height(px(18.))
                         .text_color(hsla(p.muted_foreground))
-                        .child("This connection still uses the old permissions, so some actions may no longer be available. Pair again using a new link with the permissions you need."),
+                        .child(crate::i18n::t(cx, "This connection still uses the old permissions, so some actions may no longer be available. Pair again using a new link with the permissions you need.")),
                 )
                 .child(
                     h_flex().gap(px(8.)).pt(px(2.)).child(
                         Button::new("connect-legacy-perms-dismiss", ButtonVariant::GhostMuted, ButtonSize::Compact)
-                            .label("Dismiss")
+                            .label(crate::i18n::t(cx, "Dismiss"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.dismissed_permission_notice.insert(dismiss_env.clone(), true);
                                 t3_client::store::save_ui_state(&dismiss_key, &serde_json::Value::Bool(true));
@@ -1050,12 +1529,12 @@ impl ConnectView {
         let active = state.environments.active.as_deref() == Some(environment.id.as_str()) && state.client_handle().is_some();
         let status_opt = state.environment_statuses.get(&environment.id).cloned();
         let (tone, status, error_tone) = match &status_opt {
-            _ if environment.access_token.is_none() => (Some(DotTone::Destructive), "Needs pairing again".to_owned(), true),
+            _ if environment.access_token.is_none() => (Some(DotTone::Destructive), crate::i18n::t(cx, "Needs pairing again").to_owned(), true),
             Some(status) => {
                 let (text, error) = status.summary();
-                (Some(status.dot()), text, error)
+                (Some(status.dot()), crate::i18n::t(cx, &text).to_owned(), error)
             }
-            _ => (None, "Not connected".to_owned(), false),
+            _ => (None, crate::i18n::t(cx, "Not connected").to_owned(), false),
         };
         let diagnosis = status_opt.as_ref().and_then(|s| diagnose(s, &environment.label));
         let expanded = self.expanded_diagnosis.contains(&environment.id);
@@ -1076,11 +1555,11 @@ impl ConnectView {
             let (remove, keep) = (id.clone(), id.clone());
             h_flex()
                 .gap_1()
-                .child(Button::new(SharedString::from(format!("remove-confirm-{remove}")), ButtonVariant::DestructiveOutline, ButtonSize::Compact).label("Remove").on_click(cx.listener(move |this, _, _, cx| {
+                .child(Button::new(SharedString::from(format!("remove-confirm-{remove}")), ButtonVariant::DestructiveOutline, ButtonSize::Compact).label(crate::i18n::t(cx, "Remove")).on_click(cx.listener(move |this, _, _, cx| {
                     this.confirm_remove = None;
                     this.state.update(cx, |state, cx| state.remove_environment(&remove, cx));
                 })))
-                .child(Button::new(SharedString::from(format!("remove-cancel-{keep}")), ButtonVariant::GhostMuted, ButtonSize::Compact).label("Keep").on_click(cx.listener(
+                .child(Button::new(SharedString::from(format!("remove-cancel-{keep}")), ButtonVariant::GhostMuted, ButtonSize::Compact).label(crate::i18n::t(cx, "Keep")).on_click(cx.listener(
                     |this, _, _, cx| {
                         this.confirm_remove = None;
                         cx.notify();
@@ -1088,13 +1567,19 @@ impl ConnectView {
                 )))
         } else {
             let (connect, remove, diag_id) = (id.clone(), id.clone(), id.clone());
-            let action = if active { None } else if environment.access_token.is_some() { Some("Connect") } else { Some("Pair again") };
+            let action = if active {
+                None
+            } else if environment.access_token.is_some() || environment.is_relay_managed() {
+                Some(crate::i18n::t(cx, "Connect"))
+            } else {
+                Some(crate::i18n::t(cx, "Pair again"))
+            };
             h_flex()
                 .gap_1()
                 .when(diagnosis.is_some(), |this| {
                     this.child(
                         Button::new(SharedString::from(format!("details-{diag_id}")), ButtonVariant::GhostMuted, ButtonSize::Compact)
-                            .label(if expanded { "Hide details" } else { "Details" })
+                            .label(crate::i18n::t(cx, if expanded { "Hide details" } else { "Details" }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.expanded_diagnosis.remove(&diag_id) {
                                     this.expanded_diagnosis.insert(diag_id.clone());
@@ -1108,7 +1593,7 @@ impl ConnectView {
                         move |this, _, _, cx| this.state.update(cx, |state, cx| state.connect_environment(&connect, cx)),
                     ))
                 }))
-                .child(Button::new(SharedString::from(format!("remove-{remove}")), ButtonVariant::GhostMuted, ButtonSize::IconSm).icon(Icon::Trash2).tooltip("Remove from this device…").on_click(
+                .child(Button::new(SharedString::from(format!("remove-{remove}")), ButtonVariant::GhostMuted, ButtonSize::IconSm).icon(Icon::Trash2).tooltip(crate::i18n::t(cx, "Remove from this device…")).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.confirm_remove = Some(remove.clone());
                         cx.notify();
@@ -1145,7 +1630,7 @@ impl ConnectView {
                     this.child(
                         v_flex()
                             .gap(px(2.))
-                            .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child("What to try"))
+                            .child(div().font_weight(FontWeight::MEDIUM).text_color(hsla(p.foreground)).child(crate::i18n::t(cx, "What to try")))
                             .children(diag.steps.iter().map(|step| div().text_color(hsla(p.muted_foreground)).child(format!("• {step}")))),
                     )
                 })
@@ -1165,7 +1650,7 @@ impl ConnectView {
                         .when(can_retry, |this| {
                             this.child(
                                 Button::new(SharedString::from(format!("diag-retry-{retry_id}")), ButtonVariant::Outline, ButtonSize::Compact)
-                                    .label("Retry now")
+                                    .label(crate::i18n::t(cx, "Retry now"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.state.read(cx).retry_environment(&retry_id);
                                     })),
@@ -1174,7 +1659,7 @@ impl ConnectView {
                         .child(
                             Button::new(SharedString::from(format!("diag-copy-{id}")), ButtonVariant::Outline, ButtonSize::Compact)
                                 .icon(Icon::Copy)
-                                .label("Copy diagnostics")
+                                .label(crate::i18n::t(cx, "Copy diagnostics"))
                                 .on_click(move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                                 }),
@@ -1248,12 +1733,12 @@ impl ConnectView {
         let header = h_flex()
             .justify_between()
             .items_center()
-            .child(label("Saved environments", cx))
+            .child(label(crate::i18n::t(cx, "Saved environments"), cx))
             .when(lb_enabled && connected_count >= 2, |this| {
                 let weights: HashMap<String, f64> = lb_weights.into_iter().map(|(k, v)| (k, f64::from(v))).collect();
                 this.child(
                     Button::new("connect-auto-balance", ButtonVariant::Outline, ButtonSize::Compact)
-                        .label("Auto balance")
+                        .label(crate::i18n::t(cx, "Auto balance"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let weights = weights.clone();
                             this.state.update(cx, |state, cx| {
@@ -1266,10 +1751,12 @@ impl ConnectView {
     }
 
     /// `renderConnectionModeCard`.
-    fn mode_card(&self, mode: AddMode, title: &'static str, description: &'static str, glyph: Icon, cx: &mut Context<Self>) -> impl IntoElement {
+    fn mode_card(&self, mode: AddMode, title: &str, description: &str, glyph: Icon, cx: &mut Context<Self>) -> impl IntoElement {
         let p = palette(cx);
         let selected = self.mode == mode;
         let disabled = self.state.read(cx).connect.pairing.is_some();
+        let title = crate::i18n::t(cx, title).to_owned();
+        let description = crate::i18n::t(cx, description).to_owned();
         h_flex()
             .id(match mode {
                 AddMode::Link => "connect-mode-link",
@@ -1319,7 +1806,10 @@ impl ConnectView {
         v_flex()
             .gap(px(8.))
             .child(muted(
-                "On the machine running T3 Code, open Settings → Sharing & access and create a pairing link, or run `t3 pair` there. Paste the pairing URL, or enter a host and code.",
+                crate::i18n::t(
+                    cx,
+                    "On the machine running T3 Code, open Settings → Sharing & access and create a pairing link, or run `t3 pair` there. Paste the pairing URL, or enter a host and code.",
+                ),
                 cx,
             ))
             .child(field("Pairing link or host", Input::new(&self.link).disabled(state.connect.pairing.is_some()), cx))
@@ -1330,7 +1820,7 @@ impl ConnectView {
                     .child(div().flex_1().min_w_0().child(field("Pairing code (if not in URL)", Input::new(&self.code).disabled(state.connect.pairing.is_some()), cx)))
                     .child(
                         Button::new("connect-add", if primary { ButtonVariant::Default } else { ButtonVariant::Outline }, ButtonSize::Default)
-                            .label(if busy { "Adding…" } else { "Add environment" })
+                            .label(crate::i18n::t(cx, if busy { "Adding…" } else { "Add environment" }))
                             .disabled(state.connect.pairing.is_some())
                             .on_click(cx.listener(|this, _, _, cx| this.add(cx))),
                     ),
@@ -1377,11 +1867,16 @@ impl ConnectView {
         self.ssh_matches = filter_hosts(&unsaved, &query).into_iter().cloned().collect();
         let empty = |text: String| div().px(px(12.)).py(px(8.)).text_xs().text_color(hsla(p.muted_foreground)).child(text);
         let body = if loading {
-            empty("Loading hosts…".to_owned()).into_any_element()
+            empty(crate::i18n::t(cx, "Loading hosts…").to_owned()).into_any_element()
         } else if unsaved.is_empty() {
             return None;
         } else if self.ssh_matches.is_empty() {
-            empty(format!("No hosts match \"{}\".", query.trim())).into_any_element()
+            empty(crate::i18n::t_fmt(
+                cx,
+                "No hosts match \"{query}\".",
+                &[("query", t3_core::i18n::IcuArg::Text(std::borrow::Cow::Borrowed(query.trim())))],
+            ))
+            .into_any_element()
         } else {
             let count = self.ssh_matches.len();
             uniform_list("ssh-hosts", count, cx.processor(|this, range: std::ops::Range<usize>, _, cx| range.map(|index| this.render_host_row(index, cx)).collect::<Vec<_>>()))
@@ -1423,7 +1918,7 @@ impl ConnectView {
             .child(
                 Button::new("connect-add-ssh", ButtonVariant::Outline, ButtonSize::Default)
                     .icon(Icon::Plus)
-                    .label(if adding { "Adding…" } else { "Add environment" })
+                    .label(crate::i18n::t(cx, if adding { "Adding…" } else { "Add environment" }))
                     .disabled(busy)
                     .full_width()
                     .on_click(cx.listener(|this, _, _, cx| this.add_ssh(cx))),
@@ -1437,7 +1932,7 @@ impl ConnectView {
         };
         v_flex()
             .gap(px(12.))
-            .child(label("Add environment", cx))
+            .child(label(crate::i18n::t(cx, "Add environment"), cx))
             .child(
                 h_flex()
                     .gap(px(12.))
@@ -1701,6 +2196,92 @@ mod tests {
                 cx,
             );
             assert!(state.is_hosting_local_server());
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        state.update(cx, |state, _| state.stop_pump());
+        cx.update(|cx| {
+            cx.shutdown();
+            cx.clear_globals();
+        });
+        runtime.shutdown_background();
+        cx.run_until_parked();
+    }
+
+    #[cfg(feature = "snapshot")]
+    #[gpui::test]
+    async fn connect_view_renders_clerk_relay_environments_and_auth_flows(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+            let state = cx.new(|cx| AppState::new(runtime.handle().clone(), cx));
+            crate::settings::init(state.clone(), cx);
+            state
+        });
+        let window = cx.open_window(gpui::size(px(640.), px(780.)), |window, cx| {
+            ConnectView::new(state.clone(), window, cx)
+        });
+
+        // 1. Signed out (social OAuth + inline email form).
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        // 2. Signed in with Clerk session + online/offline discovered T3 Connect environments.
+        state.update(cx, |state, _| {
+            state.cloud.identity = Some("alice@example.test".into());
+            state.cloud.has_clerk_session = true;
+            state.cloud.discovery = t3_core::relay::Discovery {
+                listed: true,
+                refreshing: false,
+                environments: vec![
+                    t3_core::relay::Environment {
+                        environment_id: "env-online".into(),
+                        label: "Mac Studio".into(),
+                        endpoint: t3_core::relay::Endpoint {
+                            http_base_url: "https://studio.t3.codes".into(),
+                            ws_base_url: "wss://studio.t3.codes/ws".into(),
+                            provider_kind: "cloudflare_tunnel".into(),
+                        },
+                    },
+                    t3_core::relay::Environment {
+                        environment_id: "env-offline".into(),
+                        label: "Devbox".into(),
+                        endpoint: t3_core::relay::Endpoint {
+                            http_base_url: "https://devbox.t3.codes".into(),
+                            ws_base_url: "wss://devbox.t3.codes/ws".into(),
+                            provider_kind: "cloudflare_tunnel".into(),
+                        },
+                    },
+                ],
+            };
+            state
+                .cloud
+                .statuses
+                .insert("env-online".into(), EnvironmentHealth::Online);
+            state.cloud.statuses.insert(
+                "env-offline".into(),
+                EnvironmentHealth::Offline {
+                    offline_reason: Some("tunnel_released".into()),
+                    error: None,
+                    trace_id: Some("trace-off".into()),
+                },
+            );
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        // 3. Legacy OAuth session without Clerk session.
+        state.update(cx, |state, _| {
+            state.cloud.has_clerk_session = false;
         });
         cx.update_window(window.into(), |_, window, cx| {
             window.draw(cx).clear();

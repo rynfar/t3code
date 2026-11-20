@@ -1,5 +1,6 @@
 mod app_state;
 mod announcements;
+mod auth_session_macos;
 mod components;
 mod chat_header;
 mod composer;

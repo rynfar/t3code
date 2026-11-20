@@ -288,12 +288,98 @@ impl AppState {
         self.show_toast(Toast::new(ToastKind::Success, "Environment connected").description(format!("{alias} is ready over an SSH-managed tunnel.")), cx);
     }
 
+    /// Saves a T3 Connect relay-managed environment and connects it with a `Prepare` hook that
+    /// transparently refreshes its DPoP relay credential before reconnecting.
+    pub(crate) fn adopt_relay_environment(
+        &mut self,
+        resp: t3_core::relay::EnvironmentConnectResponse,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.environments.upsert_relay(
+            &resp.environment_id,
+            &label,
+            &resp.endpoint.http_base_url,
+            &resp.credential,
+        );
+        self.persist_environments();
+        self.reset_connect_screen();
+        self.reset_connection(cx);
+        self.connections.remove(&id);
+        self.retire_environment_notifications(&id, cx);
+        self.start_environment(&id, cx);
+        self.connections.activate(Some(&id));
+        self.show_toast(
+            Toast::new(ToastKind::Success, "Environment added")
+                .description(format!("Connecting to {label} through T3 Connect.")),
+            cx,
+        );
+    }
+
     /// Starts the client for a saved environment with a credential. An SSH environment connects
     /// through its tunnel on this session's port, which the supervisor readies before each attempt.
+    /// A T3 Connect relay environment refreshes its relay credential before reconnecting.
     /// Direct environments pass any persisted alternate routes for multi-route candidate fallback.
     pub(crate) fn start_environment(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(environment) = self.environments.get(id).cloned() else { return };
         let Some(access_token) = environment.access_token.clone() else { return };
+        if environment.ssh.is_none()
+            && environment.is_relay_managed()
+            && let Some(relay_env_id) = environment.environment_id.clone()
+        {
+            let cloud = self.cloud.service.clone();
+            let http_base = environment.http_base.clone();
+            let seed_token = access_token.clone();
+            let first_attempt = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let prepare: Prepare = Arc::new(move || {
+                let (cloud, relay_env_id, http_base, seed_token, first_attempt) = (
+                    cloud.clone(),
+                    relay_env_id.clone(),
+                    http_base.clone(),
+                    seed_token.clone(),
+                    first_attempt.clone(),
+                );
+                Box::pin(async move {
+                    let is_first = first_attempt.swap(false, std::sync::atomic::Ordering::AcqRel);
+                    let now = t3_client::dpop::now_epoch_ms();
+                    if is_first
+                        && let Some((_, existing)) =
+                            t3_client::dpop::find_direct_credential(&http_base, &seed_token)
+                        && existing.expires_at_epoch_ms
+                            > now.saturating_add(t3_client::dpop::DPOP_ACCESS_TOKEN_REFRESH_SKEW_MS)
+                    {
+                        return Ok(());
+                    }
+                    if !cloud.has_clerk_session().await.unwrap_or(false) {
+                        return Err(t3_client::supervisor::PrepareError::Blocked(
+                            t3_core::relay::LEGACY_OAUTH_NOTICE.to_owned(),
+                        ));
+                    }
+                    let resp = cloud
+                        .connect_and_register_environment(&relay_env_id, Some(&seed_token))
+                        .await
+                        .map_err(t3_client::supervisor::PrepareError::Transient)?;
+                    if resp.endpoint.http_base_url.trim_end_matches('/')
+                        != http_base.trim_end_matches('/')
+                    {
+                        return Err(t3_client::supervisor::PrepareError::Moved(
+                            resp.endpoint.http_base_url,
+                        ));
+                    }
+                    Ok(())
+                })
+            });
+            return self.connections.watch_with_routes(
+                id,
+                Credentials {
+                    http_base: environment.http_base,
+                    access_token,
+                },
+                Vec::new(),
+                environment.environment_id,
+                Some(prepare),
+            );
+        }
         let Some(target) = environment.ssh.clone() else {
             let alternate_routes = store::load_alternate_routes().remove(id).unwrap_or_default();
             return self.connections.watch_with_routes(
@@ -830,6 +916,21 @@ impl AppState {
             }
             if environment.ssh.is_some() {
                 return self.pair_ssh_again(&environment.id, cx);
+            }
+            if environment.is_relay_managed()
+                && self.cloud.has_clerk_session
+                && let Some(env_id) = environment.environment_id.clone()
+            {
+                let relay_env = t3_core::relay::Environment {
+                    environment_id: env_id,
+                    label: environment.label.clone(),
+                    endpoint: t3_core::relay::Endpoint {
+                        http_base_url: environment.http_base.clone(),
+                        ws_base_url: environment.http_base.clone(),
+                        provider_kind: "cloudflare_tunnel".into(),
+                    },
+                };
+                return self.connect_cloud_environment(relay_env, cx);
             }
             let message = format!("Paste a new pairing link from {} to connect it again.", environment.label);
             return self.fail_pairing(PairingSource::Link, message, cx);
