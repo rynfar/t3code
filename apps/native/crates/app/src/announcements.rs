@@ -114,7 +114,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 let now = state.announcements.clock.elapsed().as_millis() as u64;
                 if let Some(message) = state.announcements.queue.flush(now) {
-                    post(&message);
+                    post(&message, state.runtime());
                 } else if state.announcements.queue.due().is_some() {
                     state.schedule_announcement(cx);
                 }
@@ -381,8 +381,25 @@ impl FocusObserver {
         });
     }
 }
+#[cfg(any(target_os = "linux", test))]
+fn build_spd_say_args(message: &announcements::Announcement) -> Option<Vec<String>> {
+    if message.message.trim().is_empty() {
+        return None;
+    }
+    let priority = match message.priority {
+        Priority::Assertive => "important",
+        Priority::Polite => "message",
+    };
+    Some(vec![
+        "-p".to_owned(),
+        priority.to_owned(),
+        "--".to_owned(),
+        message.message.clone(),
+    ])
+}
+
 #[cfg(target_os = "macos")]
-fn post(message: &announcements::Announcement) {
+fn post(message: &announcements::Announcement, _runtime: &tokio::runtime::Handle) {
     use objc2::{MainThreadMarker, runtime::AnyObject};
     use objc2_app_kit::{
         NSAccessibilityAnnouncementKey, NSAccessibilityAnnouncementRequestedNotification,
@@ -414,7 +431,98 @@ fn post(message: &announcements::Announcement) {
     }
     tracing::info!(text = %message.message, priority = ?message.priority, host = "NSApplication", "accessibility announcement posted");
 }
-#[cfg(not(target_os = "macos"))]
-fn post(message: &announcements::Announcement) {
-    tracing::info!(text = %message.message, "accessibility announcement (platform unsupported)");
+#[cfg(target_os = "linux")]
+fn post(message: &announcements::Announcement, runtime: &tokio::runtime::Handle) {
+    #[cfg(test)]
+    {
+        let _ = (message, runtime);
+    }
+    #[cfg(not(test))]
+    {
+        let Some(args) = build_spd_say_args(message) else {
+            return;
+        };
+        let text = message.message.clone();
+        let priority = message.priority;
+        runtime.spawn(async move {
+            match tokio::process::Command::new("spd-say")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+            {
+                Ok(status) if status.success() => {
+                    tracing::info!(text = %text, ?priority, host = "spd-say", "accessibility announcement posted");
+                }
+                Ok(status) => {
+                    tracing::debug!(text = %text, ?priority, code = ?status.code(), "spd-say exited non-zero");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(text = %text, ?priority, "spd-say unavailable on PATH");
+                }
+                Err(error) => {
+                    tracing::debug!(text = %text, ?priority, %error, "spd-say failed to spawn");
+                }
+            }
+        });
+    }
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn post(message: &announcements::Announcement, _runtime: &tokio::runtime::Handle) {
+    tracing::info!(text = %message.message, priority = ?message.priority, "accessibility announcement (platform fallback)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use t3_core::announcements::{Announcement, Priority};
+
+    #[test]
+    fn spd_say_args_map_priority_and_guard_leading_dashes() {
+        assert_eq!(
+            build_spd_say_args(&Announcement {
+                message: "Done: Build".into(),
+                priority: Priority::Polite,
+            }),
+            Some(vec![
+                "-p".into(),
+                "message".into(),
+                "--".into(),
+                "Done: Build".into(),
+            ])
+        );
+        assert_eq!(
+            build_spd_say_args(&Announcement {
+                message: "Needs approval".into(),
+                priority: Priority::Assertive,
+            }),
+            Some(vec![
+                "-p".into(),
+                "important".into(),
+                "--".into(),
+                "Needs approval".into(),
+            ])
+        );
+        assert_eq!(
+            build_spd_say_args(&Announcement {
+                message: "-r 100".into(),
+                priority: Priority::Polite,
+            }),
+            Some(vec![
+                "-p".into(),
+                "message".into(),
+                "--".into(),
+                "-r 100".into(),
+            ])
+        );
+        assert_eq!(
+            build_spd_say_args(&Announcement {
+                message: "   ".into(),
+                priority: Priority::Polite,
+            }),
+            None
+        );
+    }
 }

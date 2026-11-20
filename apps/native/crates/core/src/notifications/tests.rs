@@ -522,3 +522,60 @@ fn environment_notifications_flush_due_respects_grace_pause_and_visibility() {
     assert!(watched.observe_linked_at("env", &shell, &visibility, &linked, 26_000).is_empty());
     assert!(watched.flush_due(&visibility, 40_000).is_empty());
 }
+
+#[test]
+fn snoozed_threads_suppress_completions_but_keep_input_alerts() {
+    use crate::sidebar::time::parse_iso;
+
+    let mut watcher = Watched::default();
+    let snoozed_at = "2026-11-01T00:05:00.000Z";
+    let snoozed_until = "2026-11-01T01:00:00.000Z";
+    watcher.observe(&[thread(
+        "s",
+        "running",
+        json!({"snoozedAt": snoozed_at, "snoozedUntil": snoozed_until}),
+    )]);
+
+    // Completion landing during the snooze window is suppressed and marked skipped.
+    let done_during_snooze = thread(
+        "s",
+        "completed",
+        json!({
+            "snoozedAt": snoozed_at,
+            "snoozedUntil": snoozed_until,
+            "latestRunCompletedAt": "2026-11-01T00:30:00.000Z",
+        }),
+    );
+    assert!(watcher.observe(std::slice::from_ref(&done_during_snooze)).is_empty());
+
+    // After unsnoozing, that already-skipped completion does not replay.
+    let unsnoozed = thread(
+        "s",
+        "completed",
+        json!({"latestRunCompletedAt": "2026-11-01T00:30:00.000Z"}),
+    );
+    assert!(watcher.observe(&[unsnoozed]).is_empty());
+
+    // An approval/input request on a snoozed thread still notifies immediately.
+    let approval = thread(
+        "s",
+        "waiting",
+        json!({
+            "snoozedAt": snoozed_at,
+            "snoozedUntil": snoozed_until,
+            "pendingRuntimeRequest": {"id": "req-snooze", "kind": "command_approval", "createdAt": "2026-11-01T00:35:00.000Z"},
+        }),
+    );
+    assert_eq!(kinds(&watcher.observe(&[approval])), [("s", "Approval needed")]);
+
+    // Direct `is_snoozed_for_notification` check matches web's `isSnoozedForNotification`:
+    // completion during snooze stays suppressed even when evaluated after wake (`now > snoozed_until`).
+    let presented = present_thread(&done_during_snooze, None);
+    let after_wake = parse_iso("2026-11-01T02:00:00.000Z").unwrap();
+    let during_snooze = parse_iso("2026-11-01T00:30:00.000Z").unwrap();
+    let before_snooze = parse_iso("2026-11-01T00:01:00.000Z").unwrap();
+    assert!(is_snoozed_for_notification(&presented, Some(during_snooze), after_wake));
+    assert!(!is_snoozed_for_notification(&presented, Some(before_snooze), after_wake));
+    assert!(is_snoozed_for_notification(&presented, Some(before_snooze), during_snooze));
+    assert!(!is_snoozed_for_notification(&presented, None, after_wake));
+}
