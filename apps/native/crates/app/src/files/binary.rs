@@ -102,13 +102,14 @@ pub struct SqliteViewer {
 }
 
 impl SqliteViewer {
-    fn new(db: SqliteDatabaseHandle, initial_page: Option<SqlitePageData>) -> Self {
+    fn new(db: SqliteDatabaseHandle, initial_page: Option<Result<SqlitePageData, String>>) -> Self {
         let selected_table = db.tables().first().map(|table| table.name.clone());
         let (page_state, column_widths) = match initial_page {
-            Some(page_data) => {
+            Some(Ok(page_data)) => {
                 let widths = compute_column_widths(&page_data);
                 (SqlitePageState::Ready(page_data), widths)
             }
+            Some(Err(error)) => (SqlitePageState::Failed(error), Vec::new()),
             None => (SqlitePageState::Loading, Vec::new()),
         };
         Self {
@@ -173,7 +174,7 @@ pub enum SqliteData {
 }
 
 pub enum DecodedSqlite {
-    Ready { db: SqliteDatabaseHandle, initial_page: Option<SqlitePageData> },
+    Ready { db: SqliteDatabaseHandle, initial_page: Option<Result<SqlitePageData, String>> },
     Failed(String),
 }
 
@@ -1002,7 +1003,7 @@ impl Preview {
                 .justify_center()
                 .text_xs()
                 .text_color(hsla(p.muted_foreground))
-                .child("Loading rows…")
+                .child(t(cx, "Loading…").to_owned())
                 .into_any_element()
         } else if let Some(err) = page_error {
             v_flex()

@@ -183,6 +183,36 @@ pub fn quote_sqlite_identifier(name: &str) -> String {
     quoted
 }
 
+/// Builds a percent-encoded SQLite URI (`file:<path>?immutable=1`) suitable for
+/// `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX | SQLITE_OPEN_URI`.
+/// Opening an isolated snapshot with `immutable=1` allows SQLite to read WAL-mode databases
+/// (header bytes `18..=19 == [2, 2]`) without requiring or creating `-wal`/`-shm` sidecar files.
+pub fn sqlite_immutable_file_uri(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let mut uri = String::with_capacity(normalized.len() + 24);
+    uri.push_str("file:");
+    if normalized.starts_with('/') {
+        uri.push_str("//");
+    } else if normalized.as_bytes().get(1) == Some(&b':')
+        && normalized.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+    {
+        uri.push_str("///");
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &byte in normalized.as_bytes() {
+        let keep = byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~' | b':');
+        if keep {
+            uri.push(byte as char);
+        } else {
+            uri.push('%');
+            uri.push(HEX[(byte >> 4) as usize] as char);
+            uri.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
 /// Returns true for internal SQLite catalog tables (`sqlite_%`).
 pub fn is_internal_sqlite_table(name: &str) -> bool {
     name.len() >= 7 && name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_")
@@ -393,5 +423,17 @@ mod tests {
         assert!(sql.contains("\"order\""));
         assert!(sql.contains("\"a\"\"b\""));
         assert!(build_sqlite_page_select_sql("empty", &[]).is_none());
+    }
+
+    #[test]
+    fn builds_percent_encoded_immutable_file_uri() {
+        assert_eq!(
+            sqlite_immutable_file_uri("/tmp/my db #1?x%20.sqlite"),
+            "file:///tmp/my%20db%20%231%3Fx%2520.sqlite?immutable=1"
+        );
+        assert_eq!(
+            sqlite_immutable_file_uri(r"C:\Users\me\state v2.sqlite"),
+            "file:///C:/Users/me/state%20v2.sqlite?immutable=1"
+        );
     }
 }

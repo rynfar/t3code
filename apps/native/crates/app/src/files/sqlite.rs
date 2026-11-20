@@ -15,7 +15,8 @@ use t3_core::files::sqlite::{
     SQLITE_MAX_COLUMNS, SQLITE_MAX_TABLES, SQLITE_PAGE_SIZE, SQLITE_PREVIEW_MAX_BYTES, SqliteCell,
     SqliteColumnInfo, SqliteObjectKind, SqlitePageData, SqliteTableInfo,
     build_sqlite_page_select_sql, include_table_xinfo_column, is_generated_xinfo_column,
-    is_internal_sqlite_table, is_virtual_table_sql, quote_sqlite_identifier, sqlite_page_range,
+    is_internal_sqlite_table, is_virtual_table_sql, quote_sqlite_identifier,
+    sqlite_immutable_file_uri, sqlite_page_range,
 };
 
 /// Temporary file holding downloaded SQLite bytes, cleaned up unconditionally when the last handle drops.
@@ -64,16 +65,14 @@ pub struct SqliteDatabaseHandle {
 
 impl SqliteDatabaseHandle {
     /// Opens downloaded SQLite bytes read-only, lists user tables & views with row counts, and
-    /// immediately loads page 0 of the first table (when one exists).
-    pub fn open(bytes: &[u8]) -> Result<(Self, Option<SqlitePageData>), String> {
+    /// immediately attempts to load page 0 of the first table (when one exists). A failure reading
+    /// that initial table is returned in `Option<Result<SqlitePageData, String>>` so the database's
+    /// table list stays accessible and other tables remain selectable.
+    pub fn open(bytes: &[u8]) -> Result<(Self, Option<Result<SqlitePageData, String>>), String> {
         let temp = TempSqliteFile::write(bytes)?;
         let conn = open_readonly(&temp.path)?;
         let tables = list_tables(&conn)?;
-        let initial_page = if let Some(first) = tables.first() {
-            Some(query_page_on_conn(&conn, first, 0)?)
-        } else {
-            None
-        };
+        let initial_page = tables.first().map(|first| query_page_on_conn(&conn, first, 0));
         Ok((Self { temp, tables }, initial_page))
     }
 
@@ -96,8 +95,10 @@ impl SqliteDatabaseHandle {
 }
 
 fn open_readonly(path: &Path) -> Result<Connection, String> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags).map_err(|err| classify_sqlite_error(&err))?;
+    let flags =
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
+    let uri = sqlite_immutable_file_uri(&path.to_string_lossy());
+    let conn = Connection::open_with_flags(&uri, flags).map_err(|err| classify_sqlite_error(&err))?;
     conn.execute_batch("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF; PRAGMA busy_timeout = 1000;")
         .map_err(|err| classify_sqlite_error(&err))?;
     Ok(conn)
@@ -338,7 +339,7 @@ mod tests {
         );
 
         // Initial page is the first listed object (`expensive_orders` view).
-        let first_page = initial_page.expect("initial page loaded");
+        let first_page = initial_page.expect("initial page loaded").expect("initial page ok");
         assert_eq!(first_page.table, "expensive_orders");
         assert_eq!(first_page.rows.len(), 1);
         assert_eq!(first_page.rows[0][0].display, "7");
@@ -399,7 +400,7 @@ mod tests {
         let (handle, page0) = SqliteDatabaseHandle::open(&bytes).expect("open paged db");
         assert_eq!(handle.tables()[0].row_count, 125);
 
-        let p0 = page0.expect("page 0");
+        let p0 = page0.expect("page 0").expect("page 0 ok");
         assert_eq!(p0.rows.len(), SQLITE_PAGE_SIZE);
         assert_eq!(p0.rows[0][0].display, "1");
         assert_eq!(p0.rows[0][1].display.chars().count(), SQLITE_MAX_CELL_CHARS);
@@ -444,5 +445,41 @@ mod tests {
             SqliteDatabaseHandle::open(&many_bytes).unwrap_err(),
             "Database previews are limited to 100 tables."
         );
+    }
+
+    #[test]
+    fn opens_isolated_wal_mode_database_bytes_without_sidecar_files() {
+        let path = std::env::temp_dir().join(format!("t3-sqlite-wal-fixture-{}.sqlite", uuid::Uuid::new_v4()));
+        let conn = Connection::open(&path).expect("create wal fixture");
+        let mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+            .expect("enable WAL journal_mode");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        conn.execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, label TEXT);
+             INSERT INTO events VALUES (1, 'boot'), (2, 'ready');
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("seed and checkpoint wal fixture");
+        drop(conn);
+
+        // Read ONLY the main `.sqlite` file bytes (no `-wal`/`-shm` sidecars) and remove fixture files.
+        let wal_bytes = fs::read(&path).expect("read wal sqlite bytes");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+
+        // Header bytes 18..=19 must still indicate WAL format (2, 2).
+        assert_eq!(&wal_bytes[18..=19], &[2, 2]);
+
+        let (handle, initial_page) =
+            SqliteDatabaseHandle::open(&wal_bytes).expect("open isolated WAL-mode snapshot");
+        assert_eq!(handle.tables().len(), 1);
+        assert_eq!(handle.tables()[0].name, "events");
+        assert_eq!(handle.tables()[0].row_count, 2);
+        let page = initial_page.expect("initial page").expect("initial page ok");
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rows[0][1].display, "boot");
+        assert_eq!(page.rows[1][1].display, "ready");
     }
 }
